@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "memstack-python-client"
+version = "0.1.0"
+description = ""
+authors = ["Erica Windisch <erica@cyberdione.ai>"]
+readme = "README.md"
+packages = [{include = "memstack_python_client"}]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+pyarrow = "^18.1.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.scripts]
+client = "client:main"

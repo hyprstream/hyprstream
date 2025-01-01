@@ -14,53 +14,19 @@ use std::sync::Arc;
 use std::pin::Pin;
 use tokio::sync::Mutex;
 use tonic::{transport::Server, Request, Response, Status};
+mod storage;
+use storage::{StorageBackend, MetricRecord};
 
-// Shared DuckDB connection pool
+// Replace the Db struct with StorageWrapper
 #[derive(Clone)]
-struct Db {
-    conn: Arc<Mutex<Connection>>,
+struct StorageWrapper {
+    backend: Arc<dyn StorageBackend>,
 }
 
-impl Db {
-    fn new() -> Self {
-        let conn = Connection::open_in_memory().unwrap();
-        Db {
-            conn: Arc::new(Mutex::new(conn)),
-        }
-    }
-
-    async fn execute_query(&self, query: &str) -> Result<(), Status> {
-        let conn = self.conn.lock().await;
-        conn.execute_batch(query).map_err(|e| Status::internal(format!("Query failed: {}", e)))
-    }
-
-    async fn query(&self, query: &str) -> Result<Vec<(String, i64, f64, f64, i64)>, Status> {
-        let conn = self.conn.lock().await;
-        let mut stmt = conn.prepare(query).map_err(|e| Status::internal(format!("Prepare failed: {}", e)))?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, f64>(2)?,
-                    row.get::<_, f64>(3)?,
-                    row.get::<_, i64>(4)?,
-                ))
-            })
-            .map_err(|e| Status::internal(format!("Query execution failed: {}", e)))?;
-        
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.map_err(|e| Status::internal(format!("Row mapping failed: {}", e)))?);
-        }
-        Ok(results)
-    }
-}
-
-// FlightService implementation
+// Update FlightServiceImpl to use StorageWrapper
 #[derive(Clone)]
 struct FlightServiceImpl {
-    db: Db,
+    storage: StorageWrapper,
 }
 
 #[tonic::async_trait]
@@ -115,22 +81,40 @@ impl FlightService for FlightServiceImpl {
         Err(Status::unimplemented("get_schema not implemented"))
     }
 
+    /*async fn do_get(
+        &self,
+        request: Request<Ticket>,
+    ) -> Result<Response<Self::DoGetStream>, Status> {
+        let ticket = String::from_utf8(request.into_inner().ticket.to_vec())
+            .map_err(|e| Status::invalid_argument(format!("Invalid ticket: {}", e)))?;*/
+
+    // In the do_get implementation, replace the db.query with:
     async fn do_get(
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let ticket = String::from_utf8(request.into_inner().ticket.to_vec())
             .map_err(|e| Status::invalid_argument(format!("Invalid ticket: {}", e)))?;
-
-        let query = format!(
-            "SELECT metric_id, timestamp, valueRunningWindowSum, valueRunningWindowAvg, valueRunningWindowCount \
-            FROM metrics WHERE timestamp >= '{}' LIMIT 100;",
-            ticket
-        );
-
-        let rows = self.db.query(&query).await?;
         
-        // Convert rows to Arrow RecordBatch
+        // Parse start and end timestamps from comma-separated ticket
+        let timestamps: Vec<&str> = ticket.split(',').collect();
+        if timestamps.len() != 2 {
+            return Err(Status::invalid_argument("Ticket must contain start,end timestamps"));
+        }
+
+        let start_timestamp = timestamps[0].parse::<i64>()
+            .map_err(|e| Status::invalid_argument(format!("Invalid start timestamp: {}", e)))?;
+        let end_timestamp = timestamps[1].parse::<i64>()
+            .map_err(|e| Status::invalid_argument(format!("Invalid end timestamp: {}", e)))?;
+
+        let records = self.storage.backend.query_metrics(start_timestamp).await?;
+        
+        // Filter records within time window
+        let records: Vec<_> = records.into_iter()
+            .filter(|r| r.timestamp >= start_timestamp && r.timestamp <= end_timestamp)
+            .collect();
+
+        // Convert records to Arrow RecordBatch
         let schema = Arc::new(Schema::new(vec![
             Field::new("metric_id", DataType::Utf8, false),
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
@@ -140,14 +124,14 @@ impl FlightService for FlightServiceImpl {
         ]));
 
         let (metric_id, timestamp, sum, avg, count): (Vec<String>, Vec<i64>, Vec<f64>, Vec<f64>, Vec<i64>) = 
-            rows.into_iter().fold(
+            records.into_iter().fold(
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()),
-                |mut acc, row| {
-                    acc.0.push(row.0);
-                    acc.1.push(row.1);
-                    acc.2.push(row.2);
-                    acc.3.push(row.3);
-                    acc.4.push(row.4);
+                |mut acc, record| {
+                    acc.0.push(record.metric_id);
+                    acc.1.push(record.timestamp);
+                    acc.2.push(record.value_running_window_sum);
+                    acc.3.push(record.value_running_window_avg);
+                    acc.4.push(record.value_running_window_count);
                     acc
                 }
             );
@@ -174,6 +158,7 @@ impl FlightService for FlightServiceImpl {
         _request: Request<tonic::Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
         let output = stream::once(async move { Ok(PutResult::default()) });
+        println!("do_put called");
         Ok(Response::new(Box::pin(output)))
     }
 
@@ -224,21 +209,26 @@ fn flight_data_from_batch(batch: &RecordBatch) -> Vec<FlightData> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "127.0.0.1:50051".parse()?;
-    let db = Db::new();
+    
+    // Initialize both backends
+    let duckdb_backend = storage::duckdb::DuckDbBackend::new();
+    let redis_backend = storage::redis::RedisBackend::new("redis://127.0.0.1/")?;
+    
+    // Create cached storage with DuckDB as cache and Redis as backing store
+    let backend = storage::cached::CachedStorageBackend::new(
+        Arc::new(duckdb_backend),
+        Arc::new(redis_backend),
+        3600, // Cache data for 1 hour
+    );
+    
+    let storage = StorageWrapper {
+        backend: Arc::new(backend),
+    };
 
-    // Create DuckDB table
-    db.execute_query(
-        "CREATE TABLE metrics (
-            metric_id TEXT,
-            timestamp TIMESTAMP,
-            valueRunningWindowSum DOUBLE,
-            valueRunningWindowAvg DOUBLE,
-            valueRunningWindowCount INTEGER
-        );",
-    )
-    .await?;
+    // Initialize the storage
+    storage.backend.init().await?;
 
-    let service = FlightServiceImpl { db };
+    let service = FlightServiceImpl { storage };
 
     Server::builder()
         .add_service(FlightServiceServer::new(service))
