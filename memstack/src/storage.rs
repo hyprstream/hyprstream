@@ -20,7 +20,7 @@ pub trait StorageBackend: Send + Sync + 'static {
 // DuckDB Implementation
 pub mod duckdb {
     use super::*;
-    use ::duckdb::Connection;
+    use ::duckdb::{params, Connection};
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -43,31 +43,40 @@ pub mod duckdb {
             let conn = self.conn.lock().await;
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS metrics (
-                    metric_id TEXT,
-                    timestamp TIMESTAMP,
-                    valueRunningWindowSum DOUBLE,
-                    valueRunningWindowAvg DOUBLE,
-                    valueRunningWindowCount INTEGER
-                );"
-            ).map_err(|e| Status::internal(format!("Failed to create table: {}", e)))
+                    metric_id TEXT NOT NULL,
+                    timestamp BIGINT NOT NULL,
+                    valueRunningWindowSum DOUBLE NOT NULL,
+                    valueRunningWindowAvg DOUBLE NOT NULL,
+                    valueRunningWindowCount BIGINT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics(timestamp);
+                CREATE INDEX IF NOT EXISTS idx_metrics_metric_id ON metrics(metric_id);
+                CREATE INDEX IF NOT EXISTS idx_metrics_combined ON metrics(metric_id, timestamp);",
+            )
+            .map_err(|e| Status::internal(format!("Failed to create table and indexes: {}", e)))
         }
 
         async fn insert_metrics(&self, metrics: Vec<MetricRecord>) -> Result<(), Status> {
             let mut conn = self.conn.lock().await;
-            let tx = conn.transaction()
+            let tx = conn
+                .transaction()
                 .map_err(|e| Status::internal(format!("Failed to start transaction: {}", e)))?;
 
+            // Prepare the statement once for better performance
+            let mut stmt = tx.prepare(
+                "INSERT INTO metrics (metric_id, timestamp, valueRunningWindowSum, valueRunningWindowAvg, valueRunningWindowCount) 
+                 VALUES (?1, ?2, ?3, ?4, ?5)"
+            ).map_err(|e| Status::internal(format!("Failed to prepare statement: {}", e)))?;
+
             for metric in metrics {
-                tx.execute(
-                    "INSERT INTO metrics VALUES (?1, ?2, ?3, ?4, ?5)",
-                    [
-                        &metric.metric_id,
-                        &metric.timestamp.to_string(),
-                        &metric.value_running_window_sum.to_string(),
-                        &metric.value_running_window_avg.to_string(),
-                        &metric.value_running_window_count.to_string(),
-                    ],
-                ).map_err(|e| Status::internal(format!("Failed to insert metric: {}", e)))?;
+                stmt.execute(params![
+                    metric.metric_id,
+                    metric.timestamp,
+                    metric.value_running_window_sum,
+                    metric.value_running_window_avg,
+                    metric.value_running_window_count,
+                ])
+                .map_err(|e| Status::internal(format!("Failed to insert metric: {}", e)))?;
             }
 
             tx.commit()
@@ -78,22 +87,28 @@ pub mod duckdb {
             let conn = self.conn.lock().await;
             let mut stmt = conn.prepare(
                 "SELECT metric_id, timestamp, valueRunningWindowSum, valueRunningWindowAvg, valueRunningWindowCount 
-                 FROM metrics WHERE timestamp >= ?1 LIMIT 100"
+                 FROM metrics 
+                 WHERE timestamp >= ?1 
+                 ORDER BY timestamp ASC, metric_id ASC
+                 LIMIT 100"
             ).map_err(|e| Status::internal(format!("Failed to prepare query: {}", e)))?;
 
-            let rows = stmt.query_map([from_timestamp], |row| {
-                Ok(MetricRecord {
-                    metric_id: row.get(0)?,
-                    timestamp: row.get(1)?,
-                    value_running_window_sum: row.get(2)?,
-                    value_running_window_avg: row.get(3)?,
-                    value_running_window_count: row.get(4)?,
+            let rows = stmt
+                .query_map([from_timestamp], |row| {
+                    Ok(MetricRecord {
+                        metric_id: row.get(0)?,
+                        timestamp: row.get(1)?,
+                        value_running_window_sum: row.get(2)?,
+                        value_running_window_avg: row.get(3)?,
+                        value_running_window_count: row.get(4)?,
+                    })
                 })
-            }).map_err(|e| Status::internal(format!("Query execution failed: {}", e)))?;
+                .map_err(|e| Status::internal(format!("Query execution failed: {}", e)))?;
 
             let mut results = Vec::new();
             for row in rows {
-                results.push(row.map_err(|e| Status::internal(format!("Row mapping failed: {}", e)))?);
+                results
+                    .push(row.map_err(|e| Status::internal(format!("Row mapping failed: {}", e)))?);
             }
             Ok(results)
         }
@@ -103,7 +118,7 @@ pub mod duckdb {
 // Redis Implementation
 pub mod redis {
     use super::*;
-    use ::redis::{Client, Commands, Connection, RedisError, cmd};
+    use ::redis::{cmd, Client, Connection, RedisError};
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -129,29 +144,27 @@ pub mod redis {
 
         async fn insert_metrics(&self, metrics: Vec<MetricRecord>) -> Result<(), Status> {
             let mut conn = self.conn.lock().await;
-            
+
             for metric in metrics {
                 let key = format!("metric:{}:{}", metric.metric_id, metric.timestamp);
-                let value = format!("{}:{}:{}:{}",
+                let value = format!(
+                    "{}:{}:{}:{}",
                     metric.metric_id,
                     metric.value_running_window_sum,
                     metric.value_running_window_avg,
                     metric.value_running_window_count
                 );
-                
-                redis::cmd("SET")
-                    .arg(&key)
-                    .arg(&value)
-                    .execute(&mut *conn);
-                    //#.map_err(|e| Status::internal(format!("Failed to insert metric: {}", e)));
+
+                redis::cmd("SET").arg(&key).arg(&value).execute(&mut *conn);
+                //#.map_err(|e| Status::internal(format!("Failed to insert metric: {}", e)));
             }
-            
+
             Ok(())
         }
 
         async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<MetricRecord>, Status> {
             let mut conn = self.conn.lock().await;
-            
+
             // Get all keys matching the pattern
             let keys: Vec<String> = redis::cmd("KEYS")
                 .arg("metric:*")
@@ -167,10 +180,12 @@ pub mod redis {
 
                 let parts: Vec<&str> = value.split(':').collect();
                 if parts.len() == 4 {
-                    let timestamp = key.split(':').nth(2)
+                    let timestamp = key
+                        .split(':')
+                        .nth(2)
                         .and_then(|ts| ts.parse().ok())
                         .unwrap_or(0);
-                    
+
                     if timestamp >= from_timestamp {
                         results.push(MetricRecord {
                             metric_id: parts[0].to_string(),
@@ -195,6 +210,7 @@ pub mod cached {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[derive(Clone)]
     pub struct CachedStorageBackend {
         cache: Arc<dyn StorageBackend>,
         backing_store: Arc<dyn StorageBackend>,
@@ -241,7 +257,7 @@ pub mod cached {
         async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<MetricRecord>, Status> {
             // First try to get from cache
             let cache_results = self.cache.query_metrics(from_timestamp).await;
-            
+
             match cache_results {
                 Ok(results) if !results.is_empty() => {
                     // Cache hit
@@ -250,7 +266,7 @@ pub mod cached {
                 _ => {
                     // Cache miss - get from backing store
                     let results = self.backing_store.query_metrics(from_timestamp).await?;
-                    
+
                     if !results.is_empty() {
                         // Update cache with results
                         // Only cache data that's within our cache window
@@ -260,16 +276,16 @@ pub mod cached {
                             .filter(|r| r.timestamp >= cache_cutoff)
                             .cloned()
                             .collect();
-                        
+
                         if !to_cache.is_empty() {
                             // Don't propagate cache update errors to the client
                             let _ = self.cache.insert_metrics(to_cache).await;
                         }
                     }
-                    
+
                     Ok(results)
                 }
             }
         }
     }
-} 
+}
