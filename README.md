@@ -1,6 +1,6 @@
-# Hyprstream: High-Performance Cache for Apache Arrow Flight SQL 🚀
+# Hyprstream: Real-time Aggregation and High-Performance Cache for Apache Arrow Flight SQL 🚀
 
-Hyprstream is a cutting-edge application for real-time data ingestion, caching, and serving. Built on Apache Arrow Flight and DuckDB, Hyprstream delivers blazing-fast data workflows, intelligent caching, and seamless integration with ADBC-compliant datastores. 💾✨
+Hyprstream is a next-generation application for real-time data ingestion, aggregation, caching, and serving. Built on Apache Arrow Flight and DuckDB, Hyprstream dynamically calculates metrics like running sums, counts, and averages, enabling blazing-fast data workflows, intelligent caching, and seamless integration with ADBC-compliant datastores. Its real-time aggregation capabilities empower AI/ML pipelines and analytics with instant insights. 💾✨
 
 ---
 
@@ -30,6 +30,12 @@ Hyprstream is a cutting-edge application for real-time data ingestion, caching, 
   - Analytical queries for real-time insights.
 - **Downstream Integration**: Connects seamlessly with analytics and visualization tools.
 
+### ⚡ Real-Time Aggregation
+- **Dynamic Metrics**: Maintains running sums, counts, and averages for real-time insights.
+- **Lightweight State Management**: Avoids storing the full dataset by maintaining only aggregate states.
+- **Dynamic Weight Computation**: Enables the calculation of weights and biases in real time for AI/ML pipelines.
+- **Instant Feedback**: Provides immediate access to derived metrics for analytics and inference.
+
 ---
 
 ## Application Workflow 🔧
@@ -38,6 +44,7 @@ Hyprstream is a cutting-edge application for real-time data ingestion, caching, 
 
 1. Data producers send data to Hyprstream via the **Arrow Flight ingestion API**.
 2. The data is processed and stored in the in-memory **DuckDB cache**.
+3. Aggregates for sums, counts, and averages are dynamically updated as new data arrives.
 
 ### 2️⃣ Query Processing
 
@@ -46,6 +53,7 @@ Hyprstream is a cutting-edge application for real-time data ingestion, caching, 
    - **Cache Hit**: Data is retrieved directly from the **DuckDB cache**.
    - **Cache Miss**: Queries are routed to ADBC-compliant backend datastores, ensuring reliable data access.
 3. Results from cache misses are written back to the cache for future requests.
+4. Pre-computed aggregates (e.g., averages, running totals) are served for metrics queries, minimizing processing latency.
 
 ### 3️⃣ Cache Expiry
 
@@ -60,6 +68,7 @@ Hyprstream is a cutting-edge application for real-time data ingestion, caching, 
 - **⚙️ Scalable**: Handles large-scale data workflows with ease.
 - **🔗 Flexible**: Integrates seamlessly with multiple backend systems like Postgres, Redis, and Snowflake.
 - **🤖 AI/ML Ready**: Designed to support vectorized data for AI/ML inference pipelines.
+- **📈 Real-Time Metrics**: Dynamically calculate and serve statistical metrics (e.g., averages) for monitoring and inference.
 
 ---
 
@@ -70,6 +79,7 @@ To get started, check out our **[Python Client Example](examples/client/python)*
 - Ingest data into Hyprstream using Arrow Flight.
 - Query data with Arrow Flight SQL.
 - Interact with the DuckDB cache and underlying ADBC datastores.
+- Query pre-computed aggregates for real-time metrics.
 
 ---
 
