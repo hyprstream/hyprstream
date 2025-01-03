@@ -1,4 +1,4 @@
-# Hyprstream: High-Performance Caching and Data Serving Application 🚀
+# Hyprstream: High-Performance Cache for Apache Arrow Flight SQL 🚀
 
 Hyprstream is a cutting-edge application for real-time data ingestion, caching, and serving. Built on Apache Arrow Flight and DuckDB, Hyprstream delivers blazing-fast data workflows, intelligent caching, and seamless integration with ADBC-compliant datastores. 💾✨
 
