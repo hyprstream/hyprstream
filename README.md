@@ -1,6 +1,6 @@
-# Hyprstream: Real-time Aggregation and High-Performance Cache for Apache Arrow Flight SQL 🚀
+# Hyprstream: Real-time Aggregation Windows and High-Performance Cache for Apache Arrow Flight SQL 🚀
 
-Hyprstream is a next-generation application for real-time data ingestion, aggregation, caching, and serving. Built on Apache Arrow Flight and DuckDB, Hyprstream dynamically calculates metrics like running sums, counts, and averages, enabling blazing-fast data workflows, intelligent caching, and seamless integration with ADBC-compliant datastores. Its real-time aggregation capabilities empower AI/ML pipelines and analytics with instant insights. 💾✨
+Hyprstream is a next-generation application for real-time data ingestion, windowed aggregation, caching, and serving. Built on Apache Arrow Flight and DuckDB, Hyprstream dynamically calculates metrics like running sums, counts, and averages, enabling blazing-fast data workflows, intelligent caching, and seamless integration with ADBC-compliant datastores. Its real-time aggregation capabilities empower AI/ML pipelines and analytics with instant insights. 💾✨
 
 ---
 
@@ -35,6 +35,7 @@ Hyprstream is a next-generation application for real-time data ingestion, aggreg
 - **Lightweight State Management**: Avoids storing the full dataset by maintaining only aggregate states.
 - **Dynamic Weight Computation**: Enables the calculation of weights and biases in real time for AI/ML pipelines.
 - **Instant Feedback**: Provides immediate access to derived metrics for analytics and inference.
+- **Time Window Partitioning**: Supports partitioning aggregate calculations into fixed time windows for granular analysis.
 
 ---
 
@@ -45,6 +46,7 @@ Hyprstream is a next-generation application for real-time data ingestion, aggreg
 1. Data producers send data to Hyprstream via the **Arrow Flight ingestion API**.
 2. The data is processed and stored in the in-memory **DuckDB cache**.
 3. Aggregates for sums, counts, and averages are dynamically updated as new data arrives.
+4. Aggregate calculations can be partitioned into **time windows** (e.g., 5m, 30m, hourly, daily, weekly) for advanced insights.
 
 ### 2️⃣ Query Processing
 
@@ -54,11 +56,13 @@ Hyprstream is a next-generation application for real-time data ingestion, aggreg
    - **Cache Miss**: Queries are routed to ADBC-compliant backend datastores, ensuring reliable data access.
 3. Results from cache misses are written back to the cache for future requests.
 4. Pre-computed aggregates (e.g., averages, running totals) are served for metrics queries, minimizing processing latency.
+5. Queries can retrieve **aggregates by time window** for granular metrics (e.g., sales by hour, user activity by day).
 
 ### 3️⃣ Cache Expiry
 
 - **Periodic Evaluation**: Evaluates cached data regularly to maintain optimal resource utilization.
 - **Automatic Eviction**: Frees up memory by expiring outdated or unused entries.
+- **Window Expiry**: Removes data for expired time windows to conserve resources while retaining recent insights.
 
 ---
 
@@ -69,6 +73,7 @@ Hyprstream is a next-generation application for real-time data ingestion, aggreg
 - **🔗 Flexible**: Integrates seamlessly with multiple backend systems like Postgres, Redis, and Snowflake.
 - **🤖 AI/ML Ready**: Designed to support vectorized data for AI/ML inference pipelines.
 - **📈 Real-Time Metrics**: Dynamically calculate and serve statistical metrics (e.g., averages) for monitoring and inference.
+- **Time-Partitioned Insights**: Gain granular control of metrics with support for fixed time windows.
 
 ---
 
@@ -80,6 +85,7 @@ To get started, check out our **[Python Client Example](examples/client/python)*
 - Query data with Arrow Flight SQL.
 - Interact with the DuckDB cache and underlying ADBC datastores.
 - Query pre-computed aggregates for real-time metrics.
+- Retrieve aggregate metrics for specific **time windows** (e.g., last hour, past 7 days).
 
 ---
 
