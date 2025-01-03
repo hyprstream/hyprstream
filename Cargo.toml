@@ -1,5 +1,5 @@
 [package]
-name = "memstack"
+name = "hyprstream"
 version = "0.1.0"
 edition = "2021"
 
@@ -19,4 +19,5 @@ tokio = { version = "1.42.0", features = ["macros", "rt", "rt-multi-thread"] }
 tokio-rustls = "0.26.1"
 tonic = { version = "0.12.3", features = ["transport", "codegen", "prost"] }
 async-trait = "0.1"
-redis = "0.23"
+sqlparser = "0.39.0"
+adbc_core = { version = "0.15.0", features = ["driver_manager"] }
