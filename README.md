@@ -1,6 +1,6 @@
 # Hyprstream: Real-time Aggregation Windows and High-Performance Cache for Apache Arrow Flight SQL 🚀
 
-Hyprstream is a next-generation application for real-time data ingestion, windowed aggregation, caching, and serving. Built on Apache Arrow Flight and DuckDB, Hyprstream dynamically calculates metrics like running sums, counts, and averages, enabling blazing-fast data workflows, intelligent caching, and seamless integration with ADBC-compliant datastores. Its real-time aggregation capabilities empower AI/ML pipelines and analytics with instant insights. 💾✨
+Hyprstream is a next-generation application for real-time data ingestion, windowed aggregation, caching, and serving. Built on Apache Arrow Flight and DuckDB, and developed in Rust, Hyprstream dynamically calculates metrics like running sums, counts, and averages, enabling blazing-fast data workflows, intelligent caching, and seamless integration with ADBC-compliant datastores. Its real-time aggregation capabilities empower AI/ML pipelines and analytics with instant insights. 💾✨
 
 ---
 
@@ -73,7 +73,8 @@ Hyprstream is a next-generation application for real-time data ingestion, window
 - **🔗 Flexible**: Integrates seamlessly with multiple backend systems like Postgres, Redis, and Snowflake.
 - **🤖 AI/ML Ready**: Designed to support vectorized data for AI/ML inference pipelines.
 - **📈 Real-Time Metrics**: Dynamically calculate and serve statistical metrics (e.g., averages) for monitoring and inference.
-- **Time-Partitioned Insights**: Gain granular control of metrics with support for fixed time windows.
+- **⌛ Time-Partitioned Insights**: Gain granular control of metrics with support for fixed time windows.
+- **⛭ Rust-Powered**: Built using the high-performance, memory-safe Rust programming language, ensuring reliability and speed.
 
 ---
 
