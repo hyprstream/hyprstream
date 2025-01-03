@@ -2,8 +2,6 @@
 
 Hyprstream is a next-generation application for real-time data ingestion, windowed aggregation, caching, and serving. Built on Apache Arrow Flight and DuckDB, and developed in Rust, Hyprstream dynamically calculates metrics like running sums, counts, and averages, enabling blazing-fast data workflows, intelligent caching, and seamless integration with ADBC-compliant datastores. Its real-time aggregation capabilities empower AI/ML pipelines and analytics with instant insights. 💾✨
 
----
-
 ## Key Features 🎯
 
 ### 🔄 Data Ingestion via Apache Arrow Flight
@@ -37,8 +35,6 @@ Hyprstream is a next-generation application for real-time data ingestion, window
 - **Instant Feedback**: Provides immediate access to derived metrics for analytics and inference.
 - **Time Window Partitioning**: Supports partitioning aggregate calculations into fixed time windows for granular analysis.
 
----
-
 ## Application Workflow 🔧
 
 ### 1️⃣ Data Ingestion
@@ -64,8 +60,6 @@ Hyprstream is a next-generation application for real-time data ingestion, window
 - **Automatic Eviction**: Frees up memory by expiring outdated or unused entries.
 - **Window Expiry**: Removes data for expired time windows to conserve resources while retaining recent insights.
 
----
-
 ## Benefits 🌟
 
 - **🚀 Blazing Fast**: Achieve ultra-low latency with in-memory caching and efficient query routing.
@@ -76,7 +70,21 @@ Hyprstream is a next-generation application for real-time data ingestion, window
 - **⌛ Time-Partitioned Insights**: Gain granular control of metrics with support for fixed time windows.
 - **⛭ Rust-Powered**: Built using the high-performance, memory-safe Rust programming language, ensuring reliability and speed.
 
----
+## Comparisons 🆚
+
+Hyprstream is designed to complement and, in some cases, simplify workflows compared to heavier stream processing tools like Apache Flink and integrate into existing workflows. Below is a summary of how Hyprstream compares:
+
+| **Feature**             | **Hyprstream**                           | **Apache Flink**                           |
+| ----------------------- | ---------------------------------------- | ------------------------------------------ |
+| **Direct Querying**     | ✅ Native via Arrow Flight SQL            | ❌ Requires external sinks like Kafka or DB |
+| **Focus**               | Real-time aggregation, caching, querying | General-purpose stream processing          |
+| **Integration**         | Microservices-friendly                   | Requires external storage for query access |
+| **Complexity**          | Low                                      | High (cluster, jobs, state management)     |
+| **Latency**             | Ultra-low (direct in-memory querying)    | Higher (data must be written to sinks)     |
+| **Aggregation Support** | Fixed-time windowing, simple metrics     | Advanced, customizable windowing           |
+| **Best for**            | Lightweight metrics and analytics        | Complex event-driven architectures         |
+
+Hyprstream offers lightweight, low-latency solutions for teams that prioritize simplicity and integration into microservices, and accelerates workflows built on Apache Arrow. By contrast, Flink excels in handling large-scale, complex event processing workflows, making it an excellent choice for teams with advanced stream processing needs and less latency-critical workflows. Hyprstream and Flink can work together to deliver a comprehensive solution, combining real-time aggregation and caching with powerful stream processing capabilities.
 
 ## Example Usage 💡
 
@@ -89,5 +97,4 @@ To get started, check out our **[Python Client Example](examples/client/python)*
 - Retrieve aggregate metrics for specific **time windows** (e.g., last hour, past 7 days).
 
 ---
-
 For inquiries or support, contact us at **[support@hyprstream.com](mailto:support@hyprstream.com)** or visit our GitHub repository to contribute! 🌐
