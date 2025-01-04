@@ -32,8 +32,9 @@ impl StorageBackend for DuckDbBackend {
             );
             CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics(timestamp);
             CREATE INDEX IF NOT EXISTS idx_metrics_metric_id ON metrics(metric_id);
-            CREATE INDEX IF NOT EXISTS idx_metrics_combined ON metrics(metric_id, timestamp);"
-        ).map_err(|e| Status::internal(format!("Failed to create table and indexes: {}", e)))
+            CREATE INDEX IF NOT EXISTS idx_metrics_combined ON metrics(metric_id, timestamp);",
+        )
+        .map_err(|e| Status::internal(format!("Failed to create table and indexes: {}", e)))
     }
 
     async fn insert_metrics(&self, metrics: Vec<MetricRecord>) -> Result<(), Status> {
@@ -96,7 +97,7 @@ impl StorageBackend for DuckDbBackend {
         let conn = self.conn.lock().await;
         conn.prepare(query)
             .map_err(|e| Status::invalid_argument(format!("Invalid SQL: {}", e)))?;
-        
+
         // Return the validated SQL as the handle
         Ok(query.as_bytes().to_vec())
     }
@@ -106,7 +107,8 @@ impl StorageBackend for DuckDbBackend {
             .map_err(|e| Status::internal(format!("Invalid SQL handle: {}", e)))?;
 
         let conn = self.conn.lock().await;
-        let mut stmt = conn.prepare(&sql)
+        let mut stmt = conn
+            .prepare(&sql)
             .map_err(|e| Status::internal(format!("Failed to prepare statement: {}", e)))?;
 
         let rows = stmt
@@ -127,4 +129,4 @@ impl StorageBackend for DuckDbBackend {
         }
         Ok(results)
     }
-} 
+}

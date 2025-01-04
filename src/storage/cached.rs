@@ -91,4 +91,4 @@ impl StorageBackend for CachedStorageBackend {
         // Delegate to backing store
         self.backing_store.query_sql(statement_handle).await
     }
-} 
+}

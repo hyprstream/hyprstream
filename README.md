@@ -116,6 +116,84 @@ For example, in a RAG workload, Hyprstream can serve live data or cached insight
 | **ML Real-Time Inference**| ✅ Perfect for quick, microservice-based model scoring                                             | ❌ More aligned with batch or interactive queries; limited continuous streaming support               |
 | **ML Tools Integration**  | Arrow-native data; easily exported to Python/R or microservices for ML pipelines                   | Relies on DuckDB for data prep and merges well with local or cloud ML environments                   |
 
+## Configuration 🔧
+
+Hyprstream uses TOML configuration files and environment variables for configuration. The configuration is loaded in the following order:
+
+1. Default configuration (embedded in binary from `config/default.toml`)
+2. System-wide configuration (`/etc/hyprstream/config.toml` - optional)
+3. User-specified configuration file (via `--config` CLI option - optional)
+4. Environment variables (prefixed with `HYPRSTREAM_`)
+5. Command-line arguments (highest precedence)
+
+### Environment Variables
+
+The following environment variables are supported:
+
+```bash
+# Server configuration
+HYPRSTREAM_SERVER_HOST=0.0.0.0
+HYPRSTREAM_SERVER_PORT=8080
+
+# Cache configuration
+HYPRSTREAM_CACHE_DURATION=7200
+
+# ADBC configuration
+HYPRSTREAM_ADBC_DRIVER_PATH=/usr/local/lib/libadbc_driver_postgresql.so
+HYPRSTREAM_ADBC_URL=postgresql://db.example.com:5432
+HYPRSTREAM_ADBC_USERNAME=app_user
+HYPRSTREAM_ADBC_DATABASE=metrics
+```
+
+### Command Line Arguments
+
+All configuration options can also be set via command line arguments:
+
+```bash
+hyprstream \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --cache-duration 7200 \
+  --driver-path /usr/local/lib/libadbc_driver_postgresql.so \
+  --db-url postgresql://db.example.com:5432 \
+  --db-user app_user \
+  --db-name metrics \
+  --config /path/to/custom/config.toml
+```
+
+### Configuration File Example
+
+Here's an example of the TOML configuration file format:
+
+```toml
+[server]
+host = "127.0.0.1"
+port = 50051
+
+[cache]
+duration_secs = 3600  # 1 hour
+
+[adbc]
+driver_path = "/usr/local/lib/libadbc_driver_postgresql.so"
+url = "postgresql://localhost:5432"
+username = "postgres"
+password = ""
+database = "metrics"
+
+# Optional: Database-specific configurations
+[adbc.options]
+application_name = "hyprstream"
+connect_timeout = "10"
+
+# Optional: Connection pool settings
+[adbc.pool]
+max_connections = 10
+min_connections = 1
+acquire_timeout_secs = 30
+```
+
+Note: Command line arguments and environment variables take precedence over configuration files. The `--config` option allows you to specify a custom configuration file path.
+
 ## Example Usage 💡
 
 To get started, check out our **[Python Client Example](examples/client/python)**. This example demonstrates how to:
@@ -125,6 +203,45 @@ To get started, check out our **[Python Client Example](examples/client/python)*
 - Interact with the DuckDB cache and underlying ADBC datastores.
 - Query pre-computed aggregates for real-time metrics.
 - Retrieve aggregate metrics for specific **time windows** (e.g., last hour, past 7 days).
+
+## Environment Variables 🔧
+
+Hyprstream uses environment variables for configuring the ADBC backend connection. These must be set before starting the server:
+
+### Required Variables
+
+- `ADBC_DRIVER`: Path to the ADBC driver shared library (e.g., `/usr/local/lib/libadbc_postgres.so`)
+- `ADBC_URL`: Database connection URL (e.g., `postgresql://localhost:5432`)
+
+### Optional Variables
+
+- `ADBC_USERNAME`: Database username (defaults to empty string)
+- `ADBC_PASSWORD`: Database password (defaults to empty string)
+- `ADBC_DATABASE`: Database name (defaults to empty string)
+
+### Example Configuration
+
+```bash
+# PostgreSQL Example
+export ADBC_DRIVER=/usr/local/lib/libadbc_postgres.so
+export ADBC_URL=postgresql://localhost:5432
+export ADBC_USERNAME=myuser
+export ADBC_PASSWORD=mypassword
+export ADBC_DATABASE=metrics
+
+# SQLite Example
+export ADBC_DRIVER=/usr/local/lib/libadbc_sqlite.so
+export ADBC_URL=file:metrics.db
+
+# Snowflake Example
+export ADBC_DRIVER=/usr/local/lib/libadbc_snowflake.so
+export ADBC_URL=https://myorg.snowflakecomputing.com
+export ADBC_USERNAME=myuser
+export ADBC_PASSWORD=mypassword
+export ADBC_DATABASE=MYDB
+```
+
+The ADBC backend will automatically use these environment variables to establish a connection to your chosen database. Make sure the appropriate ADBC driver is installed and accessible at the specified path.
 
 ---
 For inquiries or support, contact us at **[support@hyprstream.com](mailto:support@hyprstream.com)** or visit our GitHub repository to contribute! 🌐

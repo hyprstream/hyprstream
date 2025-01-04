@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use tonic::Status;
 
 pub mod adbc;
-pub mod duckdb;
 pub mod cached;
+pub mod duckdb;
 
 #[derive(Debug, Clone)]
 pub struct MetricRecord {
@@ -24,5 +24,5 @@ pub trait StorageBackend: Send + Sync + 'static {
 }
 
 pub use self::adbc::AdbcBackend;
-pub use self::duckdb::DuckDbBackend;
 pub use self::cached::CachedStorageBackend;
+pub use self::duckdb::DuckDbBackend;

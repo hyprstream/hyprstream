@@ -5,23 +5,24 @@ use arrow::record_batch::RecordBatch;
 use arrow_flight::{
     flight_service_server::FlightServiceServer,
     sql::{
-        server::FlightSqlService,
-        CommandGetCatalogs, CommandGetDbSchemas, CommandGetSqlInfo, CommandGetTableTypes,
-        CommandGetTables, TicketStatementQuery, SqlInfo,
-        CommandPreparedStatementQuery,
+        server::FlightSqlService, CommandGetCatalogs, CommandGetDbSchemas, CommandGetSqlInfo,
+        CommandGetTableTypes, CommandGetTables, CommandPreparedStatementQuery, SqlInfo,
+        TicketStatementQuery,
     },
     FlightData, Ticket,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{stream, Stream};
-use sqlparser::ast::{Expr, BinaryOperator, Value};
+use sqlparser::ast::{BinaryOperator, Expr, Value};
 use std::pin::Pin;
 use std::sync::Arc;
 use tonic::{transport::Server, Request, Response, Status};
 
 mod storage;
 use storage::{MetricRecord, StorageBackend};
+
+mod config;
 
 #[derive(Clone)]
 struct FlightServiceImpl {
@@ -65,7 +66,8 @@ impl FlightSqlService for FlightServiceImpl {
                 Arc::new(StringArray::from(vec!["metrics"])),
                 Arc::new(StringArray::from(vec!["TABLE"])),
             ],
-        ).map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))?;
+        )
+        .map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))?;
 
         let (header, body) = encode_record_batch(&batch)?;
 
@@ -85,17 +87,14 @@ impl FlightSqlService for FlightServiceImpl {
         _request: Request<Ticket>,
     ) -> Result<Response<DoGetStream>, Status> {
         // Create a schema for table types
-        let schema = Schema::new(vec![
-            Field::new("table_type", DataType::Utf8, false),
-        ]);
+        let schema = Schema::new(vec![Field::new("table_type", DataType::Utf8, false)]);
 
         // Create a record batch with our table types
         let batch = RecordBatch::try_new(
             Arc::new(schema.clone()),
-            vec![
-                Arc::new(StringArray::from(vec!["TABLE"])),
-            ],
-        ).map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))?;
+            vec![Arc::new(StringArray::from(vec!["TABLE"]))],
+        )
+        .map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))?;
 
         let (header, body) = encode_record_batch(&batch)?;
 
@@ -115,17 +114,14 @@ impl FlightSqlService for FlightServiceImpl {
         _request: Request<Ticket>,
     ) -> Result<Response<DoGetStream>, Status> {
         // Create a schema for catalogs
-        let schema = Schema::new(vec![
-            Field::new("catalog_name", DataType::Utf8, true),
-        ]);
+        let schema = Schema::new(vec![Field::new("catalog_name", DataType::Utf8, true)]);
 
         // Create a record batch with our catalog info
         let batch = RecordBatch::try_new(
             Arc::new(schema.clone()),
-            vec![
-                Arc::new(StringArray::from(vec![Some("memstack")])),
-            ],
-        ).map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))?;
+            vec![Arc::new(StringArray::from(vec![Some("memstack")]))],
+        )
+        .map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))?;
 
         let (header, body) = encode_record_batch(&batch)?;
 
@@ -157,7 +153,8 @@ impl FlightSqlService for FlightServiceImpl {
                 Arc::new(StringArray::from(vec![Some("memstack")])),
                 Arc::new(StringArray::from(vec!["public"])),
             ],
-        ).map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))?;
+        )
+        .map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))?;
 
         let (header, body) = encode_record_batch(&batch)?;
 
@@ -197,8 +194,10 @@ impl FlightSqlService for FlightServiceImpl {
         _request: Request<Ticket>,
     ) -> Result<Response<DoGetStream>, Status> {
         // Convert bytes to string for the prepared statement handle
-        let statement_handle = std::str::from_utf8(&query.prepared_statement_handle)
-            .map_err(|e| Status::internal(format!("Invalid UTF-8 in prepared statement handle: {}", e)))?;
+        let statement_handle =
+            std::str::from_utf8(&query.prepared_statement_handle).map_err(|e| {
+                Status::internal(format!("Invalid UTF-8 in prepared statement handle: {}", e))
+            })?;
 
         // Let the backend prepare the statement
         let prepared_handle = self.backend.prepare_sql(statement_handle).await?;
@@ -209,7 +208,8 @@ impl FlightSqlService for FlightServiceImpl {
         {
             let mut writer = StreamWriter::try_new(&mut schema_buffer, &schema)
                 .map_err(|e| Status::internal(format!("Failed to create schema writer: {}", e)))?;
-            writer.finish()
+            writer
+                .finish()
                 .map_err(|e| Status::internal(format!("Failed to write schema: {}", e)))?;
         }
 
@@ -317,7 +317,11 @@ fn encode_record_batch(batch: &RecordBatch) -> Result<(Vec<u8>, Vec<u8>), Status
 fn get_metrics_schema() -> Schema {
     Schema::new(vec![
         Field::new("metric_id", DataType::Utf8, false),
-        Field::new("timestamp", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
         Field::new("value_running_window_sum", DataType::Float64, false),
         Field::new("value_running_window_avg", DataType::Float64, false),
         Field::new("value_running_window_count", DataType::Int64, false),
@@ -332,12 +336,8 @@ fn extract_timestamp_condition(expr: &Expr) -> Option<i64> {
             if let Expr::Identifier(ident) = left.as_ref() {
                 if ident.value.to_lowercase() == "timestamp" {
                     match (op, right.as_ref()) {
-                        (BinaryOperator::GtEq, Expr::Value(Value::Number(n, _))) => {
-                            n.parse().ok()
-                        }
-                        (BinaryOperator::LtEq, Expr::Value(Value::Number(n, _))) => {
-                            n.parse().ok()
-                        }
+                        (BinaryOperator::GtEq, Expr::Value(Value::Number(n, _))) => n.parse().ok(),
+                        (BinaryOperator::LtEq, Expr::Value(Value::Number(n, _))) => n.parse().ok(),
                         _ => None,
                     }
                 } else {
@@ -359,8 +359,8 @@ fn is_valid_timestamp_condition(expr: &Expr) -> bool {
             if let Expr::Identifier(ident) = left.as_ref() {
                 if ident.value.to_lowercase() == "timestamp" {
                     match (op, right.as_ref()) {
-                        (BinaryOperator::GtEq, Expr::Value(Value::Number(_, _))) |
-                        (BinaryOperator::LtEq, Expr::Value(Value::Number(_, _))) => true,
+                        (BinaryOperator::GtEq, Expr::Value(Value::Number(_, _)))
+                        | (BinaryOperator::LtEq, Expr::Value(Value::Number(_, _))) => true,
                         _ => false,
                     }
                 } else {
@@ -376,27 +376,22 @@ fn is_valid_timestamp_condition(expr: &Expr) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = "[::1]:50051".parse()?;
+    // Load configuration
+    let settings = config::Settings::new()?;
+    let addr = format!("{}:{}", settings.server.host, settings.server.port).parse()?;
 
     // Initialize backends
     let duckdb = Arc::new(storage::duckdb::DuckDbBackend::new());
-    
-    // Create ADBC backend with driver path and options
-    let adbc = Arc::new(storage::AdbcBackend::with_options(
-        "/usr/local/lib/libadbc_driver.so",  // Example driver path
-        &[
-            // Example driver options - these would be specific to the driver being used
-            (adbc_core::options::DriverConfigKey::Url, "localhost:5432".to_string()),
-            (adbc_core::options::DriverConfigKey::Username, "user".to_string()),
-            (adbc_core::options::DriverConfigKey::Password, "pass".to_string()),
-        ],
-    )?);
+
+    // Create ADBC backend with configuration
+    let adbc = Arc::new(storage::AdbcBackend::new(&settings.adbc)
+        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?);
 
     // Create cached backend using DuckDB as cache and ADBC as backing store
     let backend = Arc::new(storage::cached::CachedStorageBackend::new(
-        duckdb,  // Use DuckDB as the cache
-        adbc,    // Use ADBC as the backing store
-        3600,    // Cache duration in seconds
+        duckdb,                       // Use DuckDB as the cache
+        adbc,                         // Use ADBC as the backing store
+        settings.cache.duration_secs, // Cache duration from config
     ));
 
     // Initialize the backend
