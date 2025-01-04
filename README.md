@@ -9,7 +9,7 @@ Hyprstream is a next-generation application for real-time data ingestion, window
 - **Streamlined Ingestion**: Ingests data efficiently using **Arrow Flight**, an advanced columnar data transport protocol.
 - **Real-Time Streaming**: Supports real-time metrics, datasets, and vectorized data, making it perfect for analytics and AI/ML workflows.
 - **Seamless Integration**: Works effortlessly with data producers for high-throughput ingestion.
-- **Write-Through to ADBC Datastores**: Ensures eventual data consistency by writing cache-miss results to backend datastores such as Postgres, Redis, and Snowflake via ADBC.
+- **Write-Through to ADBC Datastores**: Ensures eventual data consistency with immediate caching and write-through to backend datastores such as Postgres, Redis, and Snowflake via ADBC.
 
 ### 🧠 Intelligent Read Caching with DuckDB
 
