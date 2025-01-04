@@ -72,7 +72,11 @@ Hyprstream is a next-generation application for real-time data ingestion, window
 
 ## Comparisons 🆚
 
-**Better together,** Hyprstream is designed to complement Flink and MotherDuck by providing real-time, low-latency answers while they handle batch or complex processing. For example, in a RAG workload, Hyprstream can serve live data or cached insights for quick responses, while Flink processes large-scale data streams for embedding generation, and MotherDuck performs historical trend analysis or offline data prep. This hybrid approach ensures data freshness and responsiveness, with Hyprstream bridging the gap between real-time demands and the medium-to-high latency of Flink and MotherDuck, enabling seamless integration for streaming, batch, and analytics pipelines.
+**Better together,** Hyprstream is designed to complement Flink and MotherDuck by providing real-time, low-latency answers while they handle batch or complex processing.
+
+Hyprstream is positioned as a bridge between simplicity and power, combining the ease of use of MotherDuck with the real-time capabilities of Flink. It’s ideal for workflows where teams need low-latency insights and streaming features without the full complexity of large-scale event-driven systems.
+
+For example, in a RAG workload, Hyprstream can serve live data or cached insights for quick responses, while Flink processes large-scale data streams for embedding generation, and MotherDuck performs historical trend analysis or offline data prep. This hybrid approach ensures data freshness and responsiveness, with Hyprstream bridging the gap between real-time demands and the medium-to-high latency of Flink and MotherDuck, enabling seamless integration for streaming, batch, and analytics pipelines.
 
 ### Hyprstream vs. Apache Flink
 
