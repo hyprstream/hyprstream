@@ -72,19 +72,45 @@ Hyprstream is a next-generation application for real-time data ingestion, window
 
 ## Comparisons 🆚
 
-Hyprstream is designed to complement and, in some cases, simplify workflows compared to heavier stream processing tools like Apache Flink and integrate into existing workflows. Below is a summary of how Hyprstream compares:
+**Better together,** Hyprstream is designed to complement Flink and MotherDuck by providing real-time, low-latency answers while they handle batch or complex processing. For example, in a RAG workload, Hyprstream can serve live data or cached insights for quick responses, while Flink processes large-scale data streams for embedding generation, and MotherDuck performs historical trend analysis or offline data prep. This hybrid approach ensures data freshness and responsiveness, with Hyprstream bridging the gap between real-time demands and the medium-to-high latency of Flink and MotherDuck, enabling seamless integration for streaming, batch, and analytics pipelines.
 
-| **Feature**             | **Hyprstream**                           | **Apache Flink**                           |
-| ----------------------- | ---------------------------------------- | ------------------------------------------ |
-| **Direct Querying**     | ✅ Native via Arrow Flight SQL            | ❌ Requires external sinks like Kafka or DB |
-| **Focus**               | Real-time aggregation, caching, querying | General-purpose stream processing          |
-| **Integration**         | Microservices-friendly                   | Requires external storage for query access |
-| **Complexity**          | Low                                      | High (cluster, jobs, state management)     |
-| **Latency**             | Ultra-low (direct in-memory querying)    | Higher (data must be written to sinks)     |
-| **Aggregation Support** | Fixed-time windowing, simple metrics     | Advanced, customizable windowing           |
-| **Best for**            | Lightweight metrics and analytics        | Complex event-driven architectures         |
+### Hyprstream vs. Apache Flink
 
-Hyprstream offers lightweight, low-latency solutions for teams that prioritize simplicity and integration into microservices, and accelerates workflows built on Apache Arrow. By contrast, Flink excels in handling large-scale, complex event processing workflows, making it an excellent choice for teams with advanced stream processing needs and less latency-critical workflows. Hyprstream and Flink can work together to deliver a comprehensive solution, combining real-time aggregation and caching with powerful stream processing capabilities.
+| **Feature**               | **Hyprstream**                                                                                   | **Apache Flink**                                                                                          |
+| ------------------------- | ------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| **Direct Querying**       | ✅ Yes, via Arrow Flight SQL (no external sink needed)                                            | ❌ Must write to external sinks (e.g., Kafka, databases)                                                   |
+| **Focus**                 | Real-time aggregation, caching, and ultra-low-latency querying                                    | General-purpose streaming and batch (large-scale event processing)                                         |
+| **Integration**           | Microservices-friendly; easy to embed in modern pipelines (Kafka, Spark); minimal configuration   | Integrates with broader ecosystems; requires more setup (clusters, stateful ops)                           |
+| **Complexity**            | Low (lightweight deployment, minimal overhead)                                                   | Higher (requires job managers, checkpointing, cluster management)                                          |
+| **Latency**               | Ultra-low; queries run in memory with Arrow + DuckDB                                              | Medium-to-high; data typically flows to external sinks before being queried                                |
+| **Data Freshness**        | ✅ Near real-time; cached or streaming data ensures up-to-date retrieval                          | ✅ Supports real-time updates but with slightly higher lag due to processing overhead                      |
+| **Aggregation Support**   | Basic time windows and metrics; great for real-time dashboards                                    | Advanced, customizable windowing (tumbling, sliding, session windows)                                      |
+| **Best For**              | Quick real-time insights, dashboards, streaming metrics, IoT data                                 | Complex, large-scale event-driven architectures, streaming + batch workloads                               |
+| **RAG Workloads**         | ✅ Ideal for fast data retrieval and live augmentation                                            | ✅ Suitable for large-scale RAG pipelines; better for batch + stream combination workflows                  |
+| **Continuous Bias Training**| ✅ Excellent for streaming bias detection and incremental updates                                | ✅ Good for both real-time bias updates and large-scale batch retraining                                    |
+| **ML Batch Workloads**    | Feeds small, real-time data slices to external ML frameworks; no built-in batch processing        | Built-in batch APIs (Table/DataSet) for large-scale ML preprocessing                                       |
+| **ML Real-Time Inference**| ✅ Ideal for on-the-fly scoring (microservices)                                                   | ✅ Can handle large-scale streaming inference with higher overhead                                          |
+| **ML Tools Integration**  | Arrow-based data export to Python/R or other ML frameworks; easy microservice integration         | Integrates with Flink ML libs and external frameworks for both batch and streaming ML                      |
+
+---
+
+### Hyprstream vs. MotherDuck
+
+| **Feature**               | **Hyprstream**                                                                                      | **MotherDuck**                                                                                      |
+| ------------------------- | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| **Direct Querying**       | ✅ Yes, via Arrow Flight SQL (real-time)                                                            | ✅ In-process DuckDB + serverless cloud queries                                                      |
+| **Focus**                 | Real-time aggregation, caching, and sub-second querying                                            | Hybrid local-cloud analytics (batch and interactive)                                                 |
+| **Integration**           | Fits easily with streaming pipelines (Flink, Kafka) and microservices                              | Integrates with BI/data tools and can offload big data to the cloud                                  |
+| **Complexity**            | Low (lightweight microservice or embedded library)                                                 | Low/Medium (local DuckDB + optional cloud scaling)                                                   |
+| **Latency**               | Ultra-low (in-memory operations, optimized for streaming data)                                     | Medium; suited for interactive queries but not optimized for sub-second real-time use                |
+| **Data Freshness**        | ✅ Real-time; supports live streaming and cached data                                              | ❌ Batch or semi-static; relies on periodic updates for freshness                                    |
+| **Aggregation Support**   | Basic time windows, rolling metrics, real-time updates                                             | Full SQL with DuckDB, scalable to larger datasets when using cloud resources                         |
+| **Best For**              | Real-time dashboards, IoT metrics, live data monitoring                                            | Ad-hoc SQL analytics, BI reporting, hybrid on-prem/cloud workloads                                   |
+| **RAG Workloads**         | ✅ Perfect for live data augmentation in real-time RAG systems                                      | ❌ Better suited for static/batch RAG use cases                                                     |
+| **Continuous Bias Training**| ✅ Strong in streaming bias metrics and preprocessing for adaptive models                        | ❌ Limited to batch bias correction workflows                                                        |
+| **ML Batch Workloads**    | Supplies real-time feature data for external ML; does not provide large-scale batch engine         | Well-suited for batch data prep; can push big datasets to cloud for ML training                      |
+| **ML Real-Time Inference**| ✅ Perfect for quick, microservice-based model scoring                                             | ❌ More aligned with batch or interactive queries; limited continuous streaming support               |
+| **ML Tools Integration**  | Arrow-native data; easily exported to Python/R or microservices for ML pipelines                   | Relies on DuckDB for data prep and merges well with local or cloud ML environments                   |
 
 ## Example Usage 💡
 
