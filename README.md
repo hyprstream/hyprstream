@@ -131,7 +131,9 @@ For more examples and detailed documentation:
 
 ## Better Together: Ecosystem Integration 🔄
 
-Hyprstream enhances modern data architectures by filling critical gaps in the real-time data stack. While tools like Flink excel at complex stream processing and MotherDuck provides scalable cloud analytics, Hyprstream adds the missing piece: instant, SQL-based access to streaming data and real-time metrics. By supporting any ADBC-compliant database as a backend, including MotherDuck, Hyprstream enables architectures that combine cloud-scale storage with edge performance.
+Hyprstream enhances modern data architectures by filling critical gaps in the real-time data stack. While tools like Flink excel at complex stream processing, Hyprstream adds the missing piece: instant, SQL-based access to streaming data and real-time metrics. With support for any ADBC-compliant database backend, Hyprstream enables high-performance architectures that combine cloud-scale storage with edge performance. 
+
+Additionally, through its DuckDB backend integration, Hyprstream can serve as a high-performance caching layer for cloud analytics services like MotherDuck.
 
 ### Comparison with Stream Processing & Analytics Tools
 
