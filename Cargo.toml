@@ -31,3 +31,6 @@ arrow-schema = "53.1.0"
 # Configuration
 config = { version = "0.13", features = ["toml"] }
 clap = { version = "4.4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bincode = "1.3.3"

@@ -18,6 +18,7 @@ use sqlparser::ast::{BinaryOperator, Expr, Value};
 use std::pin::Pin;
 use std::sync::Arc;
 use tonic::{transport::Server, Request, Response, Status};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod storage;
 use storage::{MetricRecord, StorageBackend};
@@ -376,6 +377,12 @@ fn is_valid_timestamp_condition(expr: &Expr) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize tracing
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
     // Load configuration
     let settings = config::Settings::new()?;
     let addr = format!("{}:{}", settings.server.host, settings.server.port).parse()?;
@@ -384,7 +391,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let duckdb = Arc::new(storage::duckdb::DuckDbBackend::new());
 
     // Create ADBC backend with configuration
-    let adbc = Arc::new(storage::AdbcBackend::new(&settings.adbc)
+    let adbc = Arc::new(storage::adbc::AdbcBackend::new(&settings.adbc)
         .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?);
 
     // Create cached backend using DuckDB as cache and ADBC as backing store

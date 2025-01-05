@@ -35,60 +35,56 @@ impl CachedStorageBackend {
 #[async_trait]
 impl StorageBackend for CachedStorageBackend {
     async fn init(&self) -> Result<(), Status> {
-        // Initialize both storage backends
+        // Initialize both cache and backing store
         self.cache.init().await?;
         self.backing_store.init().await?;
         Ok(())
     }
 
     async fn insert_metrics(&self, metrics: Vec<MetricRecord>) -> Result<(), Status> {
-        // Write to both cache and backing store
-        self.cache.insert_metrics(metrics.clone()).await?;
-        self.backing_store.insert_metrics(metrics).await?;
+        // Insert into both cache and backing store
+        let cache_fut = self.cache.insert_metrics(metrics.clone());
+        let backing_fut = self.backing_store.insert_metrics(metrics);
+        
+        // Execute both operations concurrently
+        let (cache_res, backing_res) = tokio::join!(cache_fut, backing_fut);
+        
+        // If backing store fails, we must fail the operation
+        backing_res?;
+        
+        // If cache fails, log warning but continue
+        if let Err(e) = cache_res {
+            tracing::warn!("Failed to update cache: {}", e);
+        }
+        
         Ok(())
     }
 
     async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<MetricRecord>, Status> {
-        // First try to get from cache
-        let cache_results = self.cache.query_metrics(from_timestamp).await;
-
-        match cache_results {
-            Ok(results) if !results.is_empty() => {
-                // Cache hit
-                Ok(results)
-            }
-            _ => {
-                // Cache miss - get from backing store
+        // Try cache first
+        match self.cache.query_metrics(from_timestamp).await {
+            Ok(results) => Ok(results),
+            Err(_) => {
+                // Cache miss or error, query backing store
                 let results = self.backing_store.query_metrics(from_timestamp).await?;
-
-                if !results.is_empty() {
-                    // Update cache with results
-                    // Only cache data that's within our cache window
-                    let cache_cutoff = Self::current_timestamp() - self.cache_duration_secs;
-                    let to_cache: Vec<MetricRecord> = results
-                        .iter()
-                        .filter(|r| r.timestamp >= cache_cutoff)
-                        .cloned()
-                        .collect();
-
-                    if !to_cache.is_empty() {
-                        // Don't propagate cache update errors to the client
-                        let _ = self.cache.insert_metrics(to_cache).await;
-                    }
+                
+                // Update cache with new results
+                if let Err(e) = self.cache.insert_metrics(results.clone()).await {
+                    tracing::warn!("Failed to update cache: {}", e);
                 }
-
+                
                 Ok(results)
             }
         }
     }
 
     async fn prepare_sql(&self, query: &str) -> Result<Vec<u8>, Status> {
-        // Delegate to backing store
+        // Prepare on backing store only - cache doesn't need prepared statements
         self.backing_store.prepare_sql(query).await
     }
 
     async fn query_sql(&self, statement_handle: &[u8]) -> Result<Vec<MetricRecord>, Status> {
-        // Delegate to backing store
+        // Execute directly on backing store - prepared statements bypass cache
         self.backing_store.query_sql(statement_handle).await
     }
 }

@@ -1,5 +1,5 @@
 use clap::Parser;
-use config::{Config, ConfigError, Environment, File};
+use config::{Config, ConfigError, File};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
