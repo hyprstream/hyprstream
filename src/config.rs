@@ -1,7 +1,6 @@
 use clap::Parser;
 use config::{Config, ConfigError, File};
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 const DEFAULT_CONFIG: &str = include_str!("../config/default.toml");
@@ -70,8 +69,6 @@ pub struct AdbcConfig {
     pub password: String,
     pub database: String,
     #[serde(default)]
-    pub options: HashMap<String, String>,
-    #[serde(default)]
     pub pool: PoolConfig,
 }
 
@@ -85,9 +82,15 @@ pub struct PoolConfig {
     pub acquire_timeout_secs: u32,
 }
 
-fn default_max_connections() -> u32 { 10 }
-fn default_min_connections() -> u32 { 1 }
-fn default_acquire_timeout() -> u32 { 30 }
+fn default_max_connections() -> u32 {
+    10
+}
+fn default_min_connections() -> u32 {
+    1
+}
+fn default_acquire_timeout() -> u32 {
+    30
+}
 
 impl Settings {
     pub fn new() -> Result<Self, ConfigError> {
@@ -133,29 +136,5 @@ impl Settings {
 
         // Build and deserialize
         builder.build()?.try_deserialize()
-    }
-}
-
-impl AdbcConfig {
-    pub fn into_driver_options(&self) -> Vec<(&str, String)> {
-        let mut options = vec![
-            ("driver", self.driver_path.clone()),
-            ("url", self.url.clone()),
-            ("username", self.username.clone()),
-            ("password", self.password.clone()),
-            ("database", self.database.clone()),
-        ];
-
-        // Add any additional database-specific options
-        for (key, value) in &self.options {
-            options.push((key.as_str(), value.clone()));
-        }
-
-        // Add pool configuration
-        options.push(("pool.max_connections", self.pool.max_connections.to_string()));
-        options.push(("pool.min_connections", self.pool.min_connections.to_string()));
-        options.push(("pool.acquire_timeout", self.pool.acquire_timeout_secs.to_string()));
-
-        options
     }
 }

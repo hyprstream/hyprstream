@@ -1,4 +1,4 @@
-use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use duckdb::Connection;
 use std::sync::{Arc, Mutex};
@@ -50,9 +50,12 @@ impl DuckDbBackend {
 
         let metric_ids = StringArray::from_iter(metrics.iter().map(|m| Some(m.metric_id.as_str())));
         let timestamps = Int64Array::from_iter(metrics.iter().map(|m| Some(m.timestamp)));
-        let sums = Float64Array::from_iter(metrics.iter().map(|m| Some(m.value_running_window_sum)));
-        let avgs = Float64Array::from_iter(metrics.iter().map(|m| Some(m.value_running_window_avg)));
-        let counts = Int64Array::from_iter(metrics.iter().map(|m| Some(m.value_running_window_count)));
+        let sums =
+            Float64Array::from_iter(metrics.iter().map(|m| Some(m.value_running_window_sum)));
+        let avgs =
+            Float64Array::from_iter(metrics.iter().map(|m| Some(m.value_running_window_avg)));
+        let counts =
+            Int64Array::from_iter(metrics.iter().map(|m| Some(m.value_running_window_count)));
 
         RecordBatch::try_new(
             Arc::new(schema),
@@ -82,9 +85,15 @@ impl DuckDbBackend {
             metrics.push(MetricRecord {
                 metric_id: row.get(0).map_err(|e| Status::internal(e.to_string()))?,
                 timestamp: row.get(1).map_err(|e| Status::internal(e.to_string()))?,
-                value_running_window_sum: row.get(2).map_err(|e| Status::internal(e.to_string()))?,
-                value_running_window_avg: row.get(3).map_err(|e| Status::internal(e.to_string()))?,
-                value_running_window_count: row.get(4).map_err(|e| Status::internal(e.to_string()))?,
+                value_running_window_sum: row
+                    .get(2)
+                    .map_err(|e| Status::internal(e.to_string()))?,
+                value_running_window_avg: row
+                    .get(3)
+                    .map_err(|e| Status::internal(e.to_string()))?,
+                value_running_window_count: row
+                    .get(4)
+                    .map_err(|e| Status::internal(e.to_string()))?,
             });
         }
 
@@ -93,7 +102,7 @@ impl DuckDbBackend {
 
     async fn upsert_batch(&self, batch: &RecordBatch) -> Result<(), Status> {
         let mut conn = self.get_connection().await?;
-        let mut tx = conn
+        let tx = conn
             .transaction()
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -121,17 +130,58 @@ impl DuckDbBackend {
 
             // Format values into the reused strings
             use std::fmt::Write;
-            write!(timestamp_str, "{}", batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap().value(i))
-                .map_err(|e| Status::internal(e.to_string()))?;
-            write!(sum_str, "{}", batch.column(2).as_any().downcast_ref::<Float64Array>().unwrap().value(i))
-                .map_err(|e| Status::internal(e.to_string()))?;
-            write!(avg_str, "{}", batch.column(3).as_any().downcast_ref::<Float64Array>().unwrap().value(i))
-                .map_err(|e| Status::internal(e.to_string()))?;
-            write!(count_str, "{}", batch.column(4).as_any().downcast_ref::<Int64Array>().unwrap().value(i))
-                .map_err(|e| Status::internal(e.to_string()))?;
+            write!(
+                timestamp_str,
+                "{}",
+                batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(i)
+            )
+            .map_err(|e| Status::internal(e.to_string()))?;
+            write!(
+                sum_str,
+                "{}",
+                batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .value(i)
+            )
+            .map_err(|e| Status::internal(e.to_string()))?;
+            write!(
+                avg_str,
+                "{}",
+                batch
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .value(i)
+            )
+            .map_err(|e| Status::internal(e.to_string()))?;
+            write!(
+                count_str,
+                "{}",
+                batch
+                    .column(4)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(i)
+            )
+            .map_err(|e| Status::internal(e.to_string()))?;
 
             stmt.execute([
-                batch.column(0).as_any().downcast_ref::<StringArray>().unwrap().value(i),
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(i),
                 &timestamp_str,
                 &sum_str,
                 &avg_str,
@@ -176,7 +226,7 @@ impl super::StorageBackend for DuckDbBackend {
         // Convert bytes back to SQL string
         let sql = std::str::from_utf8(statement_handle)
             .map_err(|e| Status::internal(format!("Invalid UTF-8 in statement handle: {}", e)))?;
-        
+
         self.execute_query(sql).await
     }
 }

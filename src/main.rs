@@ -174,19 +174,46 @@ impl FlightSqlService for FlightServiceImpl {
         query: TicketStatementQuery,
         _request: Request<Ticket>,
     ) -> Result<Response<DoGetStream>, Status> {
-        // Query the metrics using the backend's SQL capabilities
-        let data = self.backend.query_sql(&query.statement_handle).await?;
-        let batch = create_record_batch(data)?;
-        let (header, body) = encode_record_batch(&batch)?;
+        // Parse the SQL query to validate timestamp conditions
+        if let Ok(ast) = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::GenericDialect {},
+            std::str::from_utf8(&query.statement_handle)
+                .map_err(|e| Status::internal(format!("Invalid UTF-8 in statement: {}", e)))?,
+        ) {
+            if let Some(first_stmt) = ast.first() {
+                if let sqlparser::ast::Statement::Query(box_query) = first_stmt {
+                    if let sqlparser::ast::SetExpr::Select(select) = box_query.body.as_ref() {
+                        if let Some(selection) = &select.selection {
+                            // Validate timestamp conditions
+                            if !is_valid_timestamp_condition(selection) {
+                                return Err(Status::invalid_argument(
+                                    "Query must include valid timestamp conditions",
+                                ));
+                            }
+                            
+                            // Extract timestamp for optimization
+                            if let Some(from_timestamp) = extract_timestamp_condition(selection) {
+                                // Query the metrics using the backend's SQL capabilities
+                                let data = self.backend.query_metrics(from_timestamp).await?;
+                                let batch = create_record_batch(data)?;
+                                let (header, body) = encode_record_batch(&batch)?;
 
-        Ok(Response::new(Box::pin(stream::once(async move {
-            Ok(FlightData {
-                flight_descriptor: None,
-                data_header: header.into(),
-                data_body: body.into(),
-                app_metadata: Bytes::new(),
-            })
-        }))))
+                                return Ok(Response::new(Box::pin(stream::once(async move {
+                                    Ok(FlightData {
+                                        flight_descriptor: None,
+                                        data_header: header.into(),
+                                        data_body: body.into(),
+                                        app_metadata: Bytes::new(),
+                                    })
+                                }))));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Err(Status::invalid_argument("Invalid SQL query"))
     }
 
     async fn do_get_prepared_statement(
@@ -230,29 +257,6 @@ impl FlightSqlService for FlightServiceImpl {
 }
 
 // Helper functions
-fn parse_sql_timestamps(sql: &str) -> Option<(i64, i64)> {
-    let sql = sql.to_lowercase();
-    if let (Some(start_idx), Some(end_idx)) =
-        (sql.find("timestamp >= "), sql.find("and timestamp <= "))
-    {
-        let start_time = sql[start_idx + 12..]
-            .split_whitespace()
-            .next()?
-            .parse::<i64>()
-            .ok()?;
-
-        let end_time = sql[end_idx + 15..]
-            .split_whitespace()
-            .next()?
-            .parse::<i64>()
-            .ok()?;
-
-        Some((start_time, end_time))
-    } else {
-        None
-    }
-}
-
 fn create_record_batch(records: Vec<MetricRecord>) -> Result<RecordBatch, Status> {
     let schema = Schema::new(vec![
         Field::new("metric_id", DataType::Utf8, false),
@@ -391,8 +395,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let duckdb = Arc::new(storage::duckdb::DuckDbBackend::new());
 
     // Create ADBC backend with configuration
-    let adbc = Arc::new(storage::adbc::AdbcBackend::new(&settings.adbc)
-        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?);
+    let adbc = Arc::new(
+        storage::adbc::AdbcBackend::new(&settings.adbc)
+            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?,
+    );
 
     // Create cached backend using DuckDB as cache and ADBC as backing store
     let backend = Arc::new(storage::cached::CachedStorageBackend::new(

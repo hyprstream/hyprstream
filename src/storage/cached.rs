@@ -45,36 +45,45 @@ impl StorageBackend for CachedStorageBackend {
         // Insert into both cache and backing store
         let cache_fut = self.cache.insert_metrics(metrics.clone());
         let backing_fut = self.backing_store.insert_metrics(metrics);
-        
+
         // Execute both operations concurrently
         let (cache_res, backing_res) = tokio::join!(cache_fut, backing_fut);
-        
+
         // If backing store fails, we must fail the operation
         backing_res?;
-        
+
         // If cache fails, log warning but continue
         if let Err(e) = cache_res {
             tracing::warn!("Failed to update cache: {}", e);
         }
-        
+
         Ok(())
     }
 
     async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<MetricRecord>, Status> {
-        // Try cache first
-        match self.cache.query_metrics(from_timestamp).await {
-            Ok(results) => Ok(results),
-            Err(_) => {
-                // Cache miss or error, query backing store
-                let results = self.backing_store.query_metrics(from_timestamp).await?;
-                
-                // Update cache with new results
-                if let Err(e) = self.cache.insert_metrics(results.clone()).await {
-                    tracing::warn!("Failed to update cache: {}", e);
+        // Calculate cache invalidation time
+        let current_time = Self::current_timestamp();
+        let cache_valid_after = current_time - self.cache_duration_secs;
+
+        // If querying data newer than cache_valid_after, try cache first
+        if from_timestamp >= cache_valid_after {
+            match self.cache.query_metrics(from_timestamp).await {
+                Ok(results) => Ok(results),
+                Err(_) => {
+                    // Cache miss or error, query backing store
+                    let results = self.backing_store.query_metrics(from_timestamp).await?;
+
+                    // Update cache with new results
+                    if let Err(e) = self.cache.insert_metrics(results.clone()).await {
+                        tracing::warn!("Failed to update cache: {}", e);
+                    }
+
+                    Ok(results)
                 }
-                
-                Ok(results)
             }
+        } else {
+            // For older data, go directly to backing store
+            self.backing_store.query_metrics(from_timestamp).await
         }
     }
 
