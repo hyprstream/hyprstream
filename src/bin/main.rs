@@ -47,9 +47,9 @@
 //! duration_secs = 3600
 //! ```
 
-use hyprstream::config::Settings;
-use hyprstream::service::FlightServiceImpl;
-use hyprstream::storage::{adbc::AdbcBackend, cached::CachedStorageBackend, duckdb::DuckDbBackend, StorageBackend};
+use hyprstream_core::config::Settings;
+use hyprstream_core::service::FlightServiceImpl;
+use hyprstream_core::storage::{adbc::AdbcBackend, cached::CachedStorageBackend, duckdb::DuckDbBackend, StorageBackend};
 use std::sync::Arc;
 use tonic::transport::Server;
 
