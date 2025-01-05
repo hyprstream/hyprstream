@@ -33,6 +33,10 @@ pub struct CliArgs {
     #[arg(long, env = "HYPRSTREAM_CACHE_DURATION")]
     cache_duration: Option<i64>,
 
+    /// DuckDB connection string
+    #[arg(long, env = "HYPRSTREAM_DUCKDB_CONNECTION")]
+    duckdb_connection: Option<String>,
+
     /// ADBC driver path
     #[arg(long, env = "HYPRSTREAM_ADBC_DRIVER_PATH")]
     driver_path: Option<String>,
@@ -56,6 +60,7 @@ pub struct Settings {
     pub storage: StorageConfig,
     pub cache: CacheConfig,
     pub adbc: AdbcConfig,
+    pub duckdb: DuckDbConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,6 +78,12 @@ pub struct StorageConfig {
 pub struct CacheConfig {
     pub backend: String,
     pub duration_secs: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DuckDbConfig {
+    #[serde(default = "default_duckdb_connection")]
+    pub connection_string: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +106,10 @@ pub struct PoolConfig {
     pub min_connections: u32,
     #[serde(default = "default_acquire_timeout")]
     pub acquire_timeout_secs: u32,
+}
+
+fn default_duckdb_connection() -> String {
+    ":memory:".to_string()
 }
 
 fn default_max_connections() -> u32 {
@@ -141,6 +156,9 @@ impl Settings {
         }
         if let Some(duration) = cli.cache_duration {
             builder = builder.set_override("cache.duration_secs", duration)?;
+        }
+        if let Some(connection) = cli.duckdb_connection {
+            builder = builder.set_override("duckdb.connection_string", connection)?;
         }
         if let Some(driver_path) = cli.driver_path {
             builder = builder.set_override("adbc.driver_path", driver_path)?;

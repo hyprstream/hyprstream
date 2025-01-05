@@ -1,3 +1,4 @@
+use crate::config::DuckDbConfig;
 use crate::metrics::MetricRecord;
 use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -16,6 +17,14 @@ impl DuckDbBackend {
         Self {
             conn: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
         }
+    }
+
+    pub fn with_config(config: &DuckDbConfig) -> Result<Self, Status> {
+        let conn = Connection::open(&config.connection_string)
+            .map_err(|e| Status::internal(format!("Failed to open DuckDB connection: {}", e)))?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     async fn create_tables(&self) -> Result<(), Status> {
@@ -42,11 +51,11 @@ impl DuckDbBackend {
 
     fn metrics_to_record_batch(&self, metrics: Vec<MetricRecord>) -> Result<RecordBatch, Status> {
         let schema = Schema::new(vec![
-            Field::new("metric_id", DataType::Utf8, false),
-            Field::new("timestamp", DataType::Int64, false),
-            Field::new("value_running_window_sum", DataType::Float64, false),
-            Field::new("value_running_window_avg", DataType::Float64, false),
-            Field::new("value_running_window_count", DataType::Int64, false),
+            Arc::new(Field::new("metric_id", DataType::Utf8, false)),
+            Arc::new(Field::new("timestamp", DataType::Int64, false)),
+            Arc::new(Field::new("value_running_window_sum", DataType::Float64, false)),
+            Arc::new(Field::new("value_running_window_avg", DataType::Float64, false)),
+            Arc::new(Field::new("value_running_window_count", DataType::Int64, false)),
         ]);
 
         let metric_ids = StringArray::from_iter(metrics.iter().map(|m| Some(m.metric_id.as_str())));

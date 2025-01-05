@@ -11,14 +11,14 @@ mod storage;
 
 fn create_storage_backend(settings: &config::Settings) -> Result<Arc<dyn StorageBackend>, Box<dyn std::error::Error>> {
     match settings.storage.backend.as_str() {
-        "duckdb" => Ok(Arc::new(storage::duckdb::DuckDbBackend::new()) as Arc<dyn StorageBackend>),
+        "duckdb" => Ok(Arc::new(storage::duckdb::DuckDbBackend::with_config(&settings.duckdb)?) as Arc<dyn StorageBackend>),
         "adbc" => Ok(Arc::new(
             storage::adbc::AdbcBackend::new(&settings.adbc)
                 .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?,
         ) as Arc<dyn StorageBackend>),
         "cached" => {
             let cache: Arc<dyn StorageBackend> = match settings.cache.backend.as_str() {
-                "duckdb" => Arc::new(storage::duckdb::DuckDbBackend::new()),
+                "duckdb" => Arc::new(storage::duckdb::DuckDbBackend::with_config(&settings.duckdb)?),
                 "adbc" => Arc::new(
                     storage::adbc::AdbcBackend::new(&settings.adbc)
                         .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?,

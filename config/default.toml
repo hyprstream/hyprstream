@@ -10,6 +10,9 @@ backend = "duckdb"  # Options: "duckdb", "adbc", "cached"
 backend = "adbc"  # Options: "duckdb", "adbc"
 duration_secs = 3600  # 1 hour
 
+[duckdb]
+connection_string = ":memory:"  # Use ":memory:" for in-memory database or a file path for persistence
+
 # ADBC Configuration
 [adbc]
 driver_path = "libadbc_driver_postgresql.so"

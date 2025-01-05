@@ -126,58 +126,72 @@ Hyprstream uses TOML configuration files and environment variables for configura
 4. Environment variables (prefixed with `HYPRSTREAM_`)
 5. Command-line arguments (highest precedence)
 
-### Environment Variables
+### Storage Backend Configuration
 
-The following environment variables are supported:
+The service supports multiple storage backends:
 
-```bash
-# Server configuration
-HYPRSTREAM_SERVER_HOST=0.0.0.0
-HYPRSTREAM_SERVER_PORT=8080
+- `duckdb`: Embedded database with high performance
+- `adbc`: Arrow Database Connectivity for external databases
+- `cached`: Two-tier storage with configurable cache and backing store
 
-# Cache configuration
-HYPRSTREAM_CACHE_DURATION=7200
+### DuckDB Configuration
 
-# ADBC configuration
-HYPRSTREAM_ADBC_DRIVER_PATH=/usr/local/lib/libadbc_driver_postgresql.so
-HYPRSTREAM_ADBC_URL=postgresql://db.example.com:5432
-HYPRSTREAM_ADBC_USERNAME=app_user
-HYPRSTREAM_ADBC_DATABASE=metrics
-```
+When using DuckDB as either the main storage or cache backend, you can configure its behavior through the `connection_string` setting:
 
-### Command Line Arguments
+- `:memory:`: Creates an in-memory database (default)
+- `path/to/file.duckdb`: Creates/opens a persistent database file
 
-All configuration options can also be set via command line arguments:
+#### DuckDB Storage Considerations
 
-```bash
-hyprstream \
-  --host 0.0.0.0 \
-  --port 8080 \
-  --cache-duration 7200 \
-  --driver-path /usr/local/lib/libadbc_driver_postgresql.so \
-  --db-url postgresql://db.example.com:5432 \
-  --db-user app_user \
-  --db-name metrics \
-  --config /path/to/custom/config.toml
-```
+1. In-Memory Database (`:memory:`):
+   - Fastest performance
+   - Data is lost when service restarts
+   - Good for caching or temporary storage
 
-### Configuration File Example
+2. Persistent Database (file path):
+   - Data persists across service restarts
+   - Slightly lower performance than in-memory
+   - Good for primary storage
+   - Files can be backed up and restored
 
-Here's an example of the TOML configuration file format:
+3. Shared Database:
+   - When using DuckDB for both cache and main storage with the same connection string,
+     the database will be shared
+   - Can save memory but may impact cache performance
+
+### Cache Configuration
+
+When using the cached storage backend, configure both the cache type and duration. The cache can use either DuckDB or ADBC as its storage engine. When using DuckDB, the same configuration options apply as described in the DuckDB Configuration section.
+
+### Configuration Example
+
+All configuration options can be set via environment variables, command line arguments, or a TOML configuration file. Here's a complete example showing all available options:
 
 ```toml
+# Server Configuration
 [server]
 host = "127.0.0.1"
 port = 50051
 
+# Storage Configuration
+[storage]
+backend = "cached"  # Options: "duckdb", "adbc", "cached"
+
+# Cache Configuration
 [cache]
+backend = "duckdb"  # Options: "duckdb", "adbc"
 duration_secs = 3600  # 1 hour
 
+# DuckDB Configuration
+[duckdb]
+connection_string = ":memory:"  # Use ":memory:" for in-memory database or a file path for persistence
+
+# ADBC Configuration
 [adbc]
-driver_path = "/usr/local/lib/libadbc_driver_postgresql.so"
+driver_path = "libadbc_driver_postgresql.so"
 url = "postgresql://localhost:5432"
 username = "postgres"
-password = ""
+password = ""  # Set via environment variable
 database = "metrics"
 
 # Optional: Database-specific configurations
@@ -192,7 +206,43 @@ min_connections = 1
 acquire_timeout_secs = 30
 ```
 
-Note: Command line arguments and environment variables take precedence over configuration files. The `--config` option allows you to specify a custom configuration file path.
+The same configuration can be set using environment variables:
+
+```bash
+# Server settings
+export HYPRSTREAM_SERVER_HOST=127.0.0.1
+export HYPRSTREAM_SERVER_PORT=50051
+
+# Storage and cache settings
+export HYPRSTREAM_STORAGE_BACKEND=cached
+export HYPRSTREAM_CACHE_BACKEND=duckdb
+export HYPRSTREAM_CACHE_DURATION=3600
+export HYPRSTREAM_DUCKDB_CONNECTION=":memory:"
+
+# ADBC settings
+export HYPRSTREAM_ADBC_DRIVER_PATH=/usr/local/lib/libadbc_driver_postgresql.so
+export HYPRSTREAM_ADBC_URL=postgresql://localhost:5432
+export HYPRSTREAM_ADBC_USERNAME=postgres
+export HYPRSTREAM_ADBC_DATABASE=metrics
+```
+
+Or using command line arguments:
+
+```bash
+hyprstream \
+  --host 127.0.0.1 \
+  --port 50051 \
+  --storage-backend cached \
+  --cache-backend duckdb \
+  --cache-duration 3600 \
+  --duckdb-connection ":memory:" \
+  --driver-path /usr/local/lib/libadbc_driver_postgresql.so \
+  --db-url postgresql://localhost:5432 \
+  --db-user postgres \
+  --db-name metrics
+```
+
+This configuration sets up a cached storage backend using DuckDB for caching and PostgreSQL (via ADBC) as the backing store. Command line arguments and environment variables take precedence over configuration files. The `--config` option allows you to specify a custom configuration file path.
 
 ## Example Usage 💡
 
