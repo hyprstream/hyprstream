@@ -2,18 +2,10 @@ pub mod adbc;
 pub mod cached;
 pub mod duckdb;
 
+use crate::metrics::MetricRecord;
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use tonic::Status;
-
-#[derive(Debug, Clone)]
-pub struct MetricRecord {
-    pub metric_id: String,
-    pub timestamp: i64,
-    pub value_running_window_sum: f64,
-    pub value_running_window_avg: f64,
-    pub value_running_window_count: i64,
-}
 
 #[async_trait]
 pub trait StorageBackend: Send + Sync + 'static {

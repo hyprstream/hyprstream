@@ -1,4 +1,5 @@
-use crate::storage::{MetricRecord, StorageBackend};
+use crate::metrics::MetricRecord;
+use crate::storage::StorageBackend;
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};

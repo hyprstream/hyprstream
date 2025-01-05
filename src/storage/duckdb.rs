@@ -1,10 +1,11 @@
+use crate::metrics::MetricRecord;
 use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use duckdb::Connection;
 use std::sync::{Arc, Mutex};
 use tonic::Status;
 
-use crate::storage::MetricRecord;
+use crate::storage::StorageBackend;
 
 pub struct DuckDbBackend {
     conn: Arc<Mutex<Connection>>,
@@ -196,7 +197,7 @@ impl DuckDbBackend {
 }
 
 #[async_trait::async_trait]
-impl super::StorageBackend for DuckDbBackend {
+impl StorageBackend for DuckDbBackend {
     async fn init(&self) -> Result<(), Status> {
         self.create_tables().await
     }

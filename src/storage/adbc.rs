@@ -1,5 +1,6 @@
 use crate::config::AdbcConfig;
-use crate::storage::{MetricRecord, StorageBackend};
+use crate::metrics::MetricRecord;
+use crate::storage::StorageBackend;
 use adbc_core::{
     driver_manager::{ManagedConnection, ManagedDriver},
     options::{AdbcVersion, OptionDatabase},
