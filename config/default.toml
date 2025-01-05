@@ -3,8 +3,11 @@
 host = "127.0.0.1"
 port = 50051
 
-# Cache Configuration
+[storage]
+backend = "duckdb"  # Options: "duckdb", "adbc", "cached"
+
 [cache]
+backend = "adbc"  # Options: "duckdb", "adbc"
 duration_secs = 3600  # 1 hour
 
 # ADBC Configuration
@@ -14,12 +17,6 @@ url = "postgresql://localhost:5432"
 username = "postgres"
 password = ""  # Set via environment variable ADBC_PASSWORD
 database = "metrics"
-
-# Optional: Database-specific configurations
-[adbc.options]
-# PostgreSQL-specific options
-application_name = "hyprstream"
-connect_timeout = 10
 
 # Optional: Connection pool settings
 [adbc.pool]

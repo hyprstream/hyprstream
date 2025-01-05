@@ -21,6 +21,14 @@ pub struct CliArgs {
     #[arg(long, env = "HYPRSTREAM_SERVER_PORT")]
     port: Option<u16>,
 
+    /// Storage backend type
+    #[arg(long, env = "HYPRSTREAM_STORAGE_BACKEND")]
+    storage_backend: Option<String>,
+
+    /// Cache backend type
+    #[arg(long, env = "HYPRSTREAM_CACHE_BACKEND")]
+    cache_backend: Option<String>,
+
     /// Cache duration in seconds
     #[arg(long, env = "HYPRSTREAM_CACHE_DURATION")]
     cache_duration: Option<i64>,
@@ -45,6 +53,7 @@ pub struct CliArgs {
 #[derive(Debug, Deserialize)]
 pub struct Settings {
     pub server: ServerConfig,
+    pub storage: StorageConfig,
     pub cache: CacheConfig,
     pub adbc: AdbcConfig,
 }
@@ -56,7 +65,13 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct StorageConfig {
+    pub backend: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CacheConfig {
+    pub backend: String,
     pub duration_secs: i64,
 }
 
@@ -117,6 +132,12 @@ impl Settings {
         }
         if let Some(port) = cli.port {
             builder = builder.set_override("server.port", port)?;
+        }
+        if let Some(storage_backend) = cli.storage_backend {
+            builder = builder.set_override("storage.backend", storage_backend)?;
+        }
+        if let Some(cache_backend) = cli.cache_backend {
+            builder = builder.set_override("cache.backend", cache_backend)?;
         }
         if let Some(duration) = cli.cache_duration {
             builder = builder.set_override("cache.duration_secs", duration)?;

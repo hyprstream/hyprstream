@@ -9,6 +9,38 @@ mod metrics;
 mod service;
 mod storage;
 
+fn create_storage_backend(settings: &config::Settings) -> Result<Arc<dyn StorageBackend>, Box<dyn std::error::Error>> {
+    match settings.storage.backend.as_str() {
+        "duckdb" => Ok(Arc::new(storage::duckdb::DuckDbBackend::new()) as Arc<dyn StorageBackend>),
+        "adbc" => Ok(Arc::new(
+            storage::adbc::AdbcBackend::new(&settings.adbc)
+                .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?,
+        ) as Arc<dyn StorageBackend>),
+        "cached" => {
+            let cache: Arc<dyn StorageBackend> = match settings.cache.backend.as_str() {
+                "duckdb" => Arc::new(storage::duckdb::DuckDbBackend::new()),
+                "adbc" => Arc::new(
+                    storage::adbc::AdbcBackend::new(&settings.adbc)
+                        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?,
+                ),
+                _ => return Err("Invalid cache backend type".into()),
+            };
+
+            let backing_store: Arc<dyn StorageBackend> = Arc::new(
+                storage::adbc::AdbcBackend::new(&settings.adbc)
+                    .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?,
+            );
+
+            Ok(Arc::new(storage::cached::CachedStorageBackend::new(
+                cache,
+                backing_store,
+                settings.cache.duration_secs,
+            )))
+        }
+        _ => Err("Invalid storage backend type".into()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing
@@ -21,24 +53,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings = config::Settings::new()?;
     let addr = format!("{}:{}", settings.server.host, settings.server.port).parse()?;
 
-    // Initialize backends
-    let duckdb = Arc::new(storage::duckdb::DuckDbBackend::new());
-
-    // Create ADBC backend with configuration
-    let adbc = Arc::new(
-        storage::adbc::AdbcBackend::new(&settings.adbc)
-            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?,
-    );
-
-    // Create cached backend using DuckDB as cache and ADBC as backing store
-    /*let backend = Arc::new(storage::cached::CachedStorageBackend::new(
-        duckdb,                       // Use DuckDB as the cache
-        adbc,                         // Use ADBC as the backing store
-        settings.cache.duration_secs, // Cache duration from config
-    ));*/
-    let backend = duckdb;
-
-    // Initialize the backend
+    // Create and initialize the configured storage backend
+    let backend = create_storage_backend(&settings)?;
     backend.init().await?;
 
     let service = service::FlightServiceImpl::new(backend);
