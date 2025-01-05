@@ -1,3 +1,14 @@
+//! Arrow Flight SQL service implementation for high-performance data transport.
+//!
+//! This module provides the core Flight SQL service implementation that enables:
+//! - High-performance data queries via Arrow Flight protocol
+//! - Support for vectorized data operations
+//! - Real-time metric aggregation queries
+//! - Time-windowed data access
+//!
+//! The service implementation is designed to work with multiple storage backends
+//! while maintaining consistent query semantics and high performance.
+
 use crate::metrics::{create_record_batch, encode_record_batch, METRICS_SCHEMA};
 use crate::storage::StorageBackend;
 use arrow::array::{RecordBatch, StringArray};
@@ -21,17 +32,41 @@ use tonic::{Request, Response, Status};
 
 type DoGetStream = Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + 'static>>;
 
+/// Implementation of the Arrow Flight SQL service.
+///
+/// This service provides:
+/// - SQL query execution over Arrow Flight protocol
+/// - Real-time metric aggregation and windowed queries
+/// - Integration with configurable storage backends
+/// - High-performance data transport using Arrow's columnar format
 #[derive(Clone)]
 pub struct FlightServiceImpl {
+    /// Storage backend for executing queries and storing data
     backend: Arc<dyn StorageBackend>,
 }
 
 impl FlightServiceImpl {
+    /// Creates a new Flight SQL service with the specified storage backend.
+    ///
+    /// # Arguments
+    ///
+    /// * `backend` - Arc-wrapped storage backend implementing the StorageBackend trait
     pub fn new(backend: Arc<dyn StorageBackend>) -> Self {
         Self { backend }
     }
 
-    /// Extract timestamp condition from an expression
+    /// Extracts timestamp conditions from SQL expressions for query optimization.
+    ///
+    /// This function analyzes SQL expressions to identify timestamp-based filters,
+    /// enabling efficient time-window queries.
+    ///
+    /// # Arguments
+    ///
+    /// * `expr` - SQL expression to analyze
+    ///
+    /// # Returns
+    ///
+    /// * `Option<i64>` - Extracted timestamp value if found
     fn extract_timestamp_condition(expr: &Expr) -> Option<i64> {
         match expr {
             Expr::BinaryOp { left, op, right } => {
@@ -58,7 +93,18 @@ impl FlightServiceImpl {
         }
     }
 
-    /// Check if an expression is a valid timestamp condition
+    /// Validates timestamp conditions in SQL expressions.
+    ///
+    /// This function checks if a SQL expression contains valid timestamp-based
+    /// filters, ensuring queries can be properly optimized for time-window access.
+    ///
+    /// # Arguments
+    ///
+    /// * `expr` - SQL expression to validate
+    ///
+    /// # Returns
+    ///
+    /// * `bool` - True if the expression contains valid timestamp conditions
     fn is_valid_timestamp_condition(expr: &Expr) -> bool {
         match expr {
             Expr::BinaryOp { left, op, right } => {
@@ -86,15 +132,25 @@ impl FlightServiceImpl {
 impl FlightSqlService for FlightServiceImpl {
     type FlightService = Self;
 
+    /// Handles SQL information requests.
+    ///
+    /// Currently returns an empty stream as basic SQL info is sufficient
+    /// for most client operations.
     async fn do_get_sql_info(
         &self,
         _cmd: CommandGetSqlInfo,
         _request: Request<Ticket>,
     ) -> Result<Response<DoGetStream>, Status> {
-        // Return basic SQL info
         Ok(Response::new(Box::pin(stream::empty())))
     }
 
+    /// Returns information about available tables.
+    ///
+    /// Provides metadata about the metrics table including:
+    /// - Catalog name
+    /// - Schema name
+    /// - Table name
+    /// - Table type
     async fn do_get_tables<'a>(
         &'a self,
         _cmd: CommandGetTables,
@@ -132,6 +188,9 @@ impl FlightSqlService for FlightServiceImpl {
         }))))
     }
 
+    /// Returns information about available table types.
+    ///
+    /// Currently only supports the "TABLE" type for metrics storage.
     async fn do_get_table_types<'a>(
         &'a self,
         _cmd: CommandGetTableTypes,
@@ -163,6 +222,9 @@ impl FlightSqlService for FlightServiceImpl {
         }))))
     }
 
+    /// Returns information about available catalogs.
+    ///
+    /// Currently supports a single "memstack" catalog for metrics storage.
     async fn do_get_catalogs<'a>(
         &'a self,
         _cmd: CommandGetCatalogs,
@@ -194,6 +256,9 @@ impl FlightSqlService for FlightServiceImpl {
         }))))
     }
 
+    /// Returns information about available database schemas.
+    ///
+    /// Currently supports a single "public" schema in the "memstack" catalog.
     async fn do_get_schemas<'a>(
         &'a self,
         _cmd: CommandGetDbSchemas,
@@ -227,6 +292,13 @@ impl FlightSqlService for FlightServiceImpl {
         }))))
     }
 
+    /// Executes a SQL statement and returns the results.
+    ///
+    /// This method:
+    /// 1. Validates the SQL query contains proper timestamp conditions
+    /// 2. Extracts timestamp filters for optimization
+    /// 3. Queries the storage backend with the optimized parameters
+    /// 4. Returns results in Arrow Flight format
     async fn do_get_statement(
         &self,
         query: TicketStatementQuery,
@@ -250,9 +322,7 @@ impl FlightSqlService for FlightServiceImpl {
                             }
 
                             // Extract timestamp for optimization
-                            if let Some(from_timestamp) =
-                                Self::extract_timestamp_condition(selection)
-                            {
+                            if let Some(from_timestamp) = Self::extract_timestamp_condition(selection) {
                                 // Query the metrics using the backend's SQL capabilities
                                 let data = self.backend.query_metrics(from_timestamp).await?;
                                 let batch = create_record_batch(data)?;
@@ -276,6 +346,11 @@ impl FlightSqlService for FlightServiceImpl {
         Err(Status::invalid_argument("Invalid SQL query"))
     }
 
+    /// Handles prepared statement execution.
+    ///
+    /// This method:
+    /// 1. Prepares the SQL statement using the storage backend
+    /// 2. Returns the schema for the prepared statement results
     async fn do_get_prepared_statement(
         &self,
         query: CommandPreparedStatementQuery,
@@ -311,6 +386,9 @@ impl FlightSqlService for FlightServiceImpl {
         }))))
     }
 
+    /// Registers SQL information for the service.
+    ///
+    /// Currently a no-op as basic SQL info is sufficient.
     async fn register_sql_info(&self, _info_id: i32, _info: &SqlInfo) {
         // No-op for now
     }
