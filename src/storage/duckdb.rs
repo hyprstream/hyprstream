@@ -1,4 +1,3 @@
-use crate::config::DuckDbConfig;
 use crate::metrics::MetricRecord;
 use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -13,15 +12,31 @@ pub struct DuckDbBackend {
 }
 
 impl DuckDbBackend {
-    pub fn new() -> Self {
+    /// Creates a new DuckDB backend with an in-memory database.
+    pub fn new_in_memory() -> Self {
         Self {
             conn: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
         }
     }
 
-    pub fn with_config(config: &DuckDbConfig) -> Result<Self, Status> {
-        let conn = Connection::open(&config.connection_string)
-            .map_err(|e| Status::internal(format!("Failed to open DuckDB connection: {}", e)))?;
+    /// Creates a new DuckDB backend with the specified connection string.
+    ///
+    /// # Arguments
+    ///
+    /// * `connection_string` - The connection string to use. Can be ":memory:" for an in-memory
+    ///   database or a path to a file for persistent storage.
+    ///
+    /// # Returns
+    ///
+    /// A Result containing either the backend or a Status error.
+    pub fn new(connection_string: &str) -> Result<Self, Status> {
+        let conn = if connection_string == ":memory:" {
+            Connection::open_in_memory()
+        } else {
+            Connection::open(connection_string)
+        }
+        .map_err(|e| Status::internal(format!("Failed to open DuckDB connection: {}", e)))?;
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
