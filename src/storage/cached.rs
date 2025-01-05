@@ -42,18 +42,11 @@ impl StorageBackend for CachedStorageBackend {
     }
 
     async fn insert_metrics(&self, metrics: Vec<MetricRecord>) -> Result<(), Status> {
-        // Insert into both cache and backing store
-        let cache_fut = self.cache.insert_metrics(metrics.clone());
-        let backing_fut = self.backing_store.insert_metrics(metrics);
-
-        // Execute both operations concurrently
-        let (cache_res, backing_res) = tokio::join!(cache_fut, backing_fut);
-
-        // If backing store fails, we must fail the operation
-        backing_res?;
-
-        // If cache fails, log warning but continue
-        if let Err(e) = cache_res {
+        // Insert into backing store first
+        self.backing_store.insert_metrics(metrics.clone()).await?;
+        
+        // Then update cache, reusing the metrics vector
+        if let Err(e) = self.cache.insert_metrics(metrics).await {
             tracing::warn!("Failed to update cache: {}", e);
         }
 

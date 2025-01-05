@@ -1707,6 +1707,7 @@ dependencies = [
  "config",
  "duckdb",
  "futures",
+ "lazy_static",
  "polars",
  "serde",
  "serde_derive",

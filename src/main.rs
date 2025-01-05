@@ -1,7 +1,6 @@
-use arrow::array::{Float64Array, Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
-use arrow::record_batch::RecordBatch;
 use arrow_flight::{
     flight_service_server::FlightServiceServer,
     sql::{
@@ -19,6 +18,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tonic::{transport::Server, Request, Response, Status};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use lazy_static;
 
 mod storage;
 use storage::{MetricRecord, StorageBackend};
@@ -190,7 +190,7 @@ impl FlightSqlService for FlightServiceImpl {
                                     "Query must include valid timestamp conditions",
                                 ));
                             }
-                            
+
                             // Extract timestamp for optimization
                             if let Some(from_timestamp) = extract_timestamp_condition(selection) {
                                 // Query the metrics using the backend's SQL capabilities
@@ -256,38 +256,42 @@ impl FlightSqlService for FlightServiceImpl {
     }
 }
 
-// Helper functions
-fn create_record_batch(records: Vec<MetricRecord>) -> Result<RecordBatch, Status> {
-    let schema = Schema::new(vec![
+// Helper function to get the metrics schema - use lazy_static for zero-copy reuse
+lazy_static::lazy_static! {
+    static ref METRICS_SCHEMA: Schema = Schema::new(vec![
         Field::new("metric_id", DataType::Utf8, false),
         Field::new("timestamp", DataType::Int64, false),
         Field::new("value_running_window_sum", DataType::Float64, false),
         Field::new("value_running_window_avg", DataType::Float64, false),
         Field::new("value_running_window_count", DataType::Int64, false),
     ]);
+}
 
-    let metric_ids = StringArray::from(
-        records
-            .iter()
-            .map(|r| r.metric_id.as_str())
-            .collect::<Vec<&str>>(),
-    );
-    let timestamps: Int64Array = records.iter().map(|r| r.timestamp).collect();
-    let sums: Float64Array = records.iter().map(|r| r.value_running_window_sum).collect();
-    let avgs: Float64Array = records.iter().map(|r| r.value_running_window_avg).collect();
-    let counts: Int64Array = records
-        .iter()
-        .map(|r| r.value_running_window_count)
-        .collect();
+fn create_record_batch(records: Vec<MetricRecord>) -> Result<RecordBatch, Status> {
+    // Pre-allocate vectors with known capacity
+    let mut metric_ids = Vec::with_capacity(records.len());
+    let mut timestamps = Vec::with_capacity(records.len());
+    let mut sums = Vec::with_capacity(records.len());
+    let mut avgs = Vec::with_capacity(records.len());
+    let mut counts = Vec::with_capacity(records.len());
+
+    // Single pass over records to fill all vectors
+    for record in &records {
+        metric_ids.push(record.metric_id.as_str());
+        timestamps.push(record.timestamp);
+        sums.push(record.value_running_window_sum);
+        avgs.push(record.value_running_window_avg);
+        counts.push(record.value_running_window_count);
+    }
 
     RecordBatch::try_new(
-        Arc::new(schema),
+        Arc::new(METRICS_SCHEMA.clone()),
         vec![
-            Arc::new(metric_ids),
-            Arc::new(timestamps),
-            Arc::new(sums),
-            Arc::new(avgs),
-            Arc::new(counts),
+            Arc::new(StringArray::from(metric_ids)),
+            Arc::new(Int64Array::from(timestamps)),
+            Arc::new(Float64Array::from(sums)),
+            Arc::new(Float64Array::from(avgs)),
+            Arc::new(Int64Array::from(counts)),
         ],
     )
     .map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))
@@ -318,19 +322,9 @@ fn encode_record_batch(batch: &RecordBatch) -> Result<(Vec<u8>, Vec<u8>), Status
     Ok((schema_buffer, data_buffer))
 }
 
-// Helper function to get the metrics schema
+// Update get_metrics_schema to use the static schema
 fn get_metrics_schema() -> Schema {
-    Schema::new(vec![
-        Field::new("metric_id", DataType::Utf8, false),
-        Field::new(
-            "timestamp",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            false,
-        ),
-        Field::new("value_running_window_sum", DataType::Float64, false),
-        Field::new("value_running_window_avg", DataType::Float64, false),
-        Field::new("value_running_window_count", DataType::Int64, false),
-    ])
+    METRICS_SCHEMA.clone()
 }
 
 /// Extract timestamp condition from an expression
