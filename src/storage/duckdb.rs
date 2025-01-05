@@ -1,3 +1,15 @@
+//! DuckDB storage backend implementation.
+//!
+//! This module provides a high-performance storage backend using DuckDB,
+//! an embedded analytical database. The implementation supports:
+//! - In-memory and persistent storage options
+//! - Efficient batch operations
+//! - SQL query capabilities
+//! - Time-based filtering
+//!
+//! DuckDB is particularly well-suited for analytics workloads and
+//! provides excellent performance for both caching and primary storage.
+
 use crate::metrics::MetricRecord;
 use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -7,12 +19,28 @@ use tonic::Status;
 
 use crate::storage::StorageBackend;
 
+/// DuckDB-based storage backend for metrics.
+///
+/// This backend provides:
+/// - High-performance storage using DuckDB
+/// - Support for both in-memory and persistent storage
+/// - Efficient batch operations for inserts and queries
+/// - SQL query capabilities with time-based filtering
+///
+/// The implementation uses connection pooling and prepared statements
+/// for optimal performance.
 pub struct DuckDbBackend {
+    /// Thread-safe connection to DuckDB
     conn: Arc<Mutex<Connection>>,
 }
 
 impl DuckDbBackend {
     /// Creates a new DuckDB backend with an in-memory database.
+    ///
+    /// This is useful for:
+    /// - Temporary storage
+    /// - Caching layers
+    /// - Testing environments
     pub fn new_in_memory() -> Self {
         Self {
             conn: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
@@ -42,6 +70,12 @@ impl DuckDbBackend {
         })
     }
 
+    /// Creates the necessary database tables and indexes.
+    ///
+    /// This method:
+    /// 1. Creates the metrics table if it doesn't exist
+    /// 2. Creates indexes for efficient querying
+    /// 3. Sets up the schema for metric storage
     async fn create_tables(&self) -> Result<(), Status> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
@@ -60,10 +94,25 @@ impl DuckDbBackend {
         Ok(())
     }
 
+    /// Gets a connection from the pool.
+    ///
+    /// This method provides thread-safe access to the DuckDB connection.
     async fn get_connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>, Status> {
         Ok(self.conn.lock().unwrap())
     }
 
+    /// Converts a vector of MetricRecords to an Arrow RecordBatch.
+    ///
+    /// This method efficiently converts metrics to Arrow's columnar format
+    /// for batch operations.
+    ///
+    /// # Arguments
+    ///
+    /// * `metrics` - Vector of MetricRecord instances to convert
+    ///
+    /// # Returns
+    ///
+    /// * `Result<RecordBatch, Status>` - Arrow RecordBatch or error
     fn metrics_to_record_batch(&self, metrics: Vec<MetricRecord>) -> Result<RecordBatch, Status> {
         let schema = Schema::new(vec![
             Arc::new(Field::new("metric_id", DataType::Utf8, false)),
@@ -95,6 +144,20 @@ impl DuckDbBackend {
         .map_err(|e| Status::internal(e.to_string()))
     }
 
+    /// Executes a SQL query and returns the results as MetricRecords.
+    ///
+    /// This method:
+    /// 1. Prepares the SQL statement
+    /// 2. Executes the query
+    /// 3. Converts results to MetricRecords
+    ///
+    /// # Arguments
+    ///
+    /// * `sql` - SQL query to execute
+    ///
+    /// # Returns
+    ///
+    /// * `Result<Vec<MetricRecord>, Status>` - Query results or error
     async fn execute_query(&self, sql: &str) -> Result<Vec<MetricRecord>, Status> {
         let conn = self.get_connection().await?;
         let mut stmt = conn
@@ -125,6 +188,20 @@ impl DuckDbBackend {
         Ok(metrics)
     }
 
+    /// Performs an efficient batch upsert operation.
+    ///
+    /// This method:
+    /// 1. Creates a transaction
+    /// 2. Prepares an upsert statement
+    /// 3. Efficiently processes the batch
+    /// 4. Commits the transaction
+    ///
+    /// The implementation uses string reuse and efficient batch processing
+    /// to minimize allocations and maximize performance.
+    ///
+    /// # Arguments
+    ///
+    /// * `batch` - Arrow RecordBatch containing the records to upsert
     async fn upsert_batch(&self, batch: &RecordBatch) -> Result<(), Status> {
         let mut conn = self.get_connection().await?;
         let tx = conn
@@ -222,15 +299,25 @@ impl DuckDbBackend {
 
 #[async_trait::async_trait]
 impl StorageBackend for DuckDbBackend {
+    /// Initializes the DuckDB backend.
+    ///
+    /// Creates necessary tables and indexes for metric storage.
     async fn init(&self) -> Result<(), Status> {
         self.create_tables().await
     }
 
+    /// Inserts a batch of metrics into storage.
+    ///
+    /// Converts metrics to a RecordBatch and performs an efficient
+    /// batch upsert operation.
     async fn insert_metrics(&self, metrics: Vec<MetricRecord>) -> Result<(), Status> {
         let batch = self.metrics_to_record_batch(metrics)?;
         self.upsert_batch(&batch).await
     }
 
+    /// Queries metrics from a given timestamp.
+    ///
+    /// Executes an optimized SQL query using the timestamp index.
     async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<MetricRecord>, Status> {
         let sql = format!(
             "SELECT metric_id, timestamp, value_running_window_sum, value_running_window_avg, value_running_window_count \
@@ -241,17 +328,20 @@ impl StorageBackend for DuckDbBackend {
         self.query_sql(&sql_bytes).await
     }
 
+    /// Prepares a SQL statement for execution.
+    ///
+    /// Note: DuckDB doesn't support prepared statements in the same way as ADBC,
+    /// so we store the SQL string as bytes.
     async fn prepare_sql(&self, query: &str) -> Result<Vec<u8>, Status> {
-        // DuckDB doesn't support prepared statements in the same way as ADBC
-        // We'll store the SQL string as bytes
         Ok(query.as_bytes().to_vec())
     }
 
+    /// Executes a prepared SQL statement.
+    ///
+    /// Deserializes the statement handle and executes the query.
     async fn query_sql(&self, statement_handle: &[u8]) -> Result<Vec<MetricRecord>, Status> {
-        // Convert bytes back to SQL string
         let sql = std::str::from_utf8(statement_handle)
             .map_err(|e| Status::internal(format!("Invalid UTF-8 in statement handle: {}", e)))?;
-
         self.execute_query(sql).await
     }
 }

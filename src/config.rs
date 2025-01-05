@@ -1,3 +1,15 @@
+//! Configuration management for Hyprstream service.
+//!
+//! This module provides configuration handling through multiple sources:
+//! 1. Default configuration (embedded in binary)
+//! 2. System-wide configuration file (`/etc/hyprstream/config.toml`)
+//! 3. User-specified configuration file
+//! 4. Environment variables
+//! 5. Command-line arguments
+//!
+//! Configuration options are loaded in order of precedence, with later sources
+//! overriding earlier ones.
+
 use clap::Parser;
 use config::{Config, ConfigError, File};
 use serde::Deserialize;
@@ -6,6 +18,11 @@ use std::path::PathBuf;
 const DEFAULT_CONFIG: &str = include_str!("../config/default.toml");
 const DEFAULT_CONFIG_PATH: &str = "/etc/hyprstream/config.toml";
 
+/// Command-line arguments parser.
+///
+/// This structure defines all available command-line options and their
+/// corresponding environment variables. It uses clap for parsing and
+/// supports both short and long option forms.
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 pub struct CliArgs {
@@ -54,75 +71,139 @@ pub struct CliArgs {
     db_name: Option<String>,
 }
 
+/// Complete service configuration.
+///
+/// This structure holds all configuration options for the service,
+/// including server settings, storage backend configuration, and
+/// cache settings.
 #[derive(Debug, Deserialize)]
 pub struct Settings {
+    /// Server configuration options
     pub server: ServerConfig,
+    /// Storage backend configuration
     pub storage: StorageConfig,
+    /// Cache configuration
     pub cache: CacheConfig,
+    /// ADBC backend configuration
     pub adbc: AdbcConfig,
+    /// DuckDB backend configuration
     pub duckdb: DuckDbConfig,
 }
 
+/// Server configuration options.
+///
+/// Defines the network interface and port for the Flight SQL service.
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
+    /// Host address to bind to
     pub host: String,
+    /// Port number to listen on
     pub port: u16,
 }
 
+/// Storage backend configuration.
+///
+/// Specifies which storage backend to use for metric data.
 #[derive(Debug, Deserialize)]
 pub struct StorageConfig {
+    /// Backend type ("duckdb", "adbc", or "cached")
     pub backend: String,
 }
 
+/// Cache configuration options.
+///
+/// Defines caching behavior and expiry policies.
 #[derive(Debug, Deserialize)]
 pub struct CacheConfig {
+    /// Cache backend type ("duckdb" or "adbc")
     pub backend: String,
+    /// Cache entry lifetime in seconds
     pub duration_secs: i64,
 }
 
+/// DuckDB configuration options.
+///
+/// Specifies connection settings for DuckDB backend.
 #[derive(Debug, Deserialize)]
 pub struct DuckDbConfig {
+    /// DuckDB connection string (defaults to ":memory:")
     #[serde(default = "default_duckdb_connection")]
     pub connection_string: String,
 }
 
+/// ADBC configuration options.
+///
+/// Defines connection settings for ADBC-compliant databases.
 #[derive(Debug, Deserialize)]
 pub struct AdbcConfig {
+    /// Path to ADBC driver library
     pub driver_path: String,
+    /// Database connection URL
     pub url: String,
+    /// Database username
     pub username: String,
+    /// Database password (optional)
     #[serde(default)]
     pub password: String,
+    /// Database name
     pub database: String,
+    /// Connection pool settings
     #[serde(default)]
     pub pool: PoolConfig,
 }
 
+/// Database connection pool configuration.
+///
+/// Controls the behavior of the connection pool for ADBC backends.
 #[derive(Debug, Default, Deserialize)]
 pub struct PoolConfig {
+    /// Maximum number of connections in the pool
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
+    /// Minimum number of connections to maintain
     #[serde(default = "default_min_connections")]
     pub min_connections: u32,
+    /// Timeout when acquiring connections (seconds)
     #[serde(default = "default_acquire_timeout")]
     pub acquire_timeout_secs: u32,
 }
 
+/// Default DuckDB connection string (in-memory database)
 fn default_duckdb_connection() -> String {
     ":memory:".to_string()
 }
 
+/// Default maximum connections for the pool
 fn default_max_connections() -> u32 {
     10
 }
+
+/// Default minimum connections for the pool
 fn default_min_connections() -> u32 {
     1
 }
+
+/// Default connection acquisition timeout
 fn default_acquire_timeout() -> u32 {
     30
 }
 
 impl Settings {
+    /// Creates a new Settings instance from all configuration sources.
+    ///
+    /// This method loads and merges configuration from:
+    /// 1. Default configuration
+    /// 2. System configuration file
+    /// 3. User configuration file
+    /// 4. Environment variables
+    /// 5. Command-line arguments
+    ///
+    /// Later sources override earlier ones, allowing for flexible configuration
+    /// management.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<Settings, ConfigError>` - Parsed settings or error
     pub fn new() -> Result<Self, ConfigError> {
         let cli = CliArgs::parse();
         let mut builder = Config::builder();

@@ -1,3 +1,14 @@
+//! ADBC (Arrow Database Connectivity) storage backend implementation.
+//!
+//! This module provides a storage backend using ADBC, enabling:
+//! - Connection to any ADBC-compliant database
+//! - High-performance data transport using Arrow's columnar format
+//! - Connection pooling and prepared statements
+//! - Support for various database systems (PostgreSQL, MySQL, etc.)
+//!
+//! The implementation is optimized for efficient data transfer and
+//! query execution using Arrow's native formats.
+
 use crate::config::AdbcConfig;
 use crate::metrics::MetricRecord;
 use crate::storage::StorageBackend;
@@ -14,13 +25,40 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tonic::Status;
 
+/// ADBC-based storage backend for metrics.
+///
+/// This backend provides:
+/// - Integration with ADBC-compliant databases
+/// - Connection pooling for optimal performance
+/// - Prepared statement management
+/// - Efficient data transport using Arrow format
+///
+/// The implementation supports multiple database systems through
+/// ADBC drivers and handles connection management automatically.
 pub struct AdbcBackend {
+    /// Thread-safe connection to the database
     conn: Arc<Mutex<ManagedConnection>>,
+    /// Counter for generating unique statement handles
     statement_counter: AtomicU64,
+    /// Cache of prepared statements
     prepared_statements: Arc<Mutex<Vec<(u64, String)>>>,
 }
 
 impl AdbcBackend {
+    /// Creates a new ADBC backend with the specified configuration.
+    ///
+    /// This method:
+    /// 1. Loads the ADBC driver
+    /// 2. Configures the database connection
+    /// 3. Sets up the connection pool
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - ADBC configuration including driver path and connection settings
+    ///
+    /// # Returns
+    ///
+    /// * `Result<Self, Status>` - Configured backend or error
     pub fn new(config: &AdbcConfig) -> Result<Self, Status> {
         let mut driver =
             ManagedDriver::load_dynamic_from_filename(&config.driver_path, None, AdbcVersion::V100)
@@ -63,12 +101,21 @@ impl AdbcBackend {
         })
     }
 
+    /// Gets a connection from the pool.
+    ///
+    /// This method provides thread-safe access to the database connection.
     async fn get_connection(
         &self,
     ) -> Result<tokio::sync::MutexGuard<'_, ManagedConnection>, Status> {
         Ok(self.conn.lock().await)
     }
 
+    /// Creates the necessary database tables and indexes.
+    ///
+    /// This method:
+    /// 1. Creates the metrics table if it doesn't exist
+    /// 2. Sets up appropriate column types for metric data
+    /// 3. Creates a primary key for efficient lookups
     async fn create_tables(&self) -> Result<(), Status> {
         let mut conn = self.get_connection().await?;
         let mut stmt = conn
@@ -93,6 +140,18 @@ impl AdbcBackend {
         Ok(())
     }
 
+    /// Converts metrics to an Arrow RecordBatch.
+    ///
+    /// This method efficiently converts metric records to Arrow's columnar
+    /// format for optimal data transport.
+    ///
+    /// # Arguments
+    ///
+    /// * `metrics` - Slice of MetricRecord instances to convert
+    ///
+    /// # Returns
+    ///
+    /// * `Result<RecordBatch, Status>` - Arrow RecordBatch or error
     fn metrics_to_record_batch(metrics: &[MetricRecord]) -> Result<RecordBatch, Status> {
         let schema = Schema::new(vec![
             Field::new("metric_id", DataType::Utf8, false),
@@ -127,10 +186,19 @@ impl AdbcBackend {
 
 #[async_trait]
 impl StorageBackend for AdbcBackend {
+    /// Initializes the ADBC backend.
+    ///
+    /// Creates necessary tables and indexes for metric storage.
     async fn init(&self) -> Result<(), Status> {
         self.create_tables().await
     }
 
+    /// Inserts a batch of metrics into storage.
+    ///
+    /// This method:
+    /// 1. Converts metrics to Arrow format
+    /// 2. Prepares an insert statement
+    /// 3. Binds the data and executes the insert
     async fn insert_metrics(&self, metrics: Vec<MetricRecord>) -> Result<(), Status> {
         let batch = Self::metrics_to_record_batch(&metrics)?;
 
@@ -156,6 +224,12 @@ impl StorageBackend for AdbcBackend {
         Ok(())
     }
 
+    /// Queries metrics from a given timestamp.
+    ///
+    /// This method:
+    /// 1. Prepares a parameterized query
+    /// 2. Binds the timestamp parameter
+    /// 3. Executes the query and processes results
     async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<MetricRecord>, Status> {
         let mut conn = self.get_connection().await?;
         let mut stmt = conn
@@ -201,6 +275,12 @@ impl StorageBackend for AdbcBackend {
         Ok(metrics)
     }
 
+    /// Prepares a SQL statement for execution.
+    ///
+    /// This method:
+    /// 1. Generates a unique statement handle
+    /// 2. Caches the SQL query
+    /// 3. Returns the serialized handle
     async fn prepare_sql(&self, query: &str) -> Result<Vec<u8>, Status> {
         let handle = self.statement_counter.fetch_add(1, Ordering::SeqCst);
         let mut statements = self.prepared_statements.lock().await;
@@ -209,6 +289,12 @@ impl StorageBackend for AdbcBackend {
         Ok(handle.to_le_bytes().to_vec())
     }
 
+    /// Executes a prepared SQL statement.
+    ///
+    /// This method:
+    /// 1. Deserializes the statement handle
+    /// 2. Retrieves the cached SQL query
+    /// 3. Executes the query and processes results
     async fn query_sql(&self, statement_handle: &[u8]) -> Result<Vec<MetricRecord>, Status> {
         let handle = u64::from_le_bytes(
             statement_handle
