@@ -13,12 +13,12 @@ use arrow_flight::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{stream, Stream};
+use lazy_static;
 use sqlparser::ast::{BinaryOperator, Expr, Value};
 use std::pin::Pin;
 use std::sync::Arc;
 use tonic::{transport::Server, Request, Response, Status};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use lazy_static;
 
 mod storage;
 use storage::{MetricRecord, StorageBackend};

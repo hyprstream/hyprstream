@@ -44,7 +44,7 @@ impl StorageBackend for CachedStorageBackend {
     async fn insert_metrics(&self, metrics: Vec<MetricRecord>) -> Result<(), Status> {
         // Insert into backing store first
         self.backing_store.insert_metrics(metrics.clone()).await?;
-        
+
         // Then update cache, reusing the metrics vector
         if let Err(e) = self.cache.insert_metrics(metrics).await {
             tracing::warn!("Failed to update cache: {}", e);
