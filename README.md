@@ -6,253 +6,156 @@ Hyprstream is a next-generation application for real-time data ingestion, window
 
 ### 🔄 Data Ingestion via Apache Arrow Flight
 
-- **Streamlined Ingestion**: Ingests data efficiently using **Arrow Flight**, an advanced columnar data transport protocol.
-- **Real-Time Streaming**: Supports real-time metrics, datasets, and vectorized data, making it perfect for analytics and AI/ML workflows.
-- **Seamless Integration**: Works effortlessly with data producers for high-throughput ingestion.
-- **Write-Through to ADBC Datastores**: Ensures eventual data consistency with immediate caching and write-through to backend datastores such as Postgres, Redis, and Snowflake via ADBC.
+- **Streamlined Ingestion**: Ingests data efficiently using **Arrow Flight**, an advanced columnar data transport protocol
+- **Real-Time Streaming**: Supports real-time metrics, datasets, and vectorized data for analytics and AI/ML workflows
+- **Write-Through to ADBC**: Ensures data consistency with immediate caching and write-through to backend datastores
 
 ### 🧠 Intelligent Read Caching with DuckDB
 
-- **In-Memory Performance**: Uses **DuckDB** for lightning-fast caching of frequently accessed data.
-- **Optimized Querying**: Stores query results and intermediate computations for analytics workloads.
-- **Automatic Management**: Handles caching transparently, reducing manual effort.
-- **Expiry Policies**:
-  - **Time-Based**: Automatically expires data after a configurable duration.
-  - **LRU/LFU (Work in Progress)**: Future enhancements for intelligent cache eviction.
+- **In-Memory Performance**: Uses **DuckDB** for lightning-fast caching of frequently accessed data
+- **Optimized Querying**: Stores query results and intermediate computations for analytics workloads
+- **Automatic Management**: Handles caching transparently with configurable expiry policies
+
+### ⚡ Real-Time Aggregation
+
+- **Dynamic Metrics**: Maintains running sums, counts, and averages for real-time insights
+- **Time Window Partitioning**: Supports fixed time windows (e.g., 5m, 30m, hourly, daily) for granular analysis
+- **Lightweight State**: Maintains only aggregate states for efficient memory usage
 
 ### 🌐 Data Serving with Arrow Flight SQL
 
-- **High-Performance Queries**: Serves cached data via **Arrow Flight SQL** for minimal latency.
-- **Supports Advanced Workflows**:
-  - Vectorized data for AI/ML pipelines.
-  - Analytical queries for real-time insights.
-- **Downstream Integration**: Connects seamlessly with analytics and visualization tools.
-
-### ⚡ Real-Time Aggregation
-- **Dynamic Metrics**: Maintains running sums, counts, and averages for real-time insights.
-- **Lightweight State Management**: Avoids storing the full dataset by maintaining only aggregate states.
-- **Dynamic Weight Computation**: Enables the calculation of weights and biases in real time for AI/ML pipelines.
-- **Instant Feedback**: Provides immediate access to derived metrics for analytics and inference.
-- **Time Window Partitioning**: Supports partitioning aggregate calculations into fixed time windows for granular analysis.
-
-## Application Workflow 🔧
-
-### 1️⃣ Data Ingestion
-
-1. Data producers send data to Hyprstream via the **Arrow Flight ingestion API**.
-2. The data is processed and stored in the in-memory **DuckDB cache**.
-3. Aggregates for sums, counts, and averages are dynamically updated as new data arrives.
-4. Aggregate calculations can be partitioned into **time windows** (e.g., 5m, 30m, hourly, daily, weekly) for advanced insights.
-
-### 2️⃣ Query Processing
-
-1. Consumers send queries via **Arrow Flight SQL**.
-2. Hyprstream handles queries intelligently:
-   - **Cache Hit**: Data is retrieved directly from the **DuckDB cache**.
-   - **Cache Miss**: Queries are routed to ADBC-compliant backend datastores, ensuring reliable data access.
-3. Results from cache misses are written back to the cache for future requests.
-4. Pre-computed aggregates (e.g., averages, running totals) are served for metrics queries, minimizing processing latency.
-5. Queries can retrieve **aggregates by time window** for granular metrics (e.g., sales by hour, user activity by day).
-
-### 3️⃣ Cache Expiry
-
-- **Periodic Evaluation**: Evaluates cached data regularly to maintain optimal resource utilization.
-- **Automatic Eviction**: Frees up memory by expiring outdated or unused entries.
-- **Window Expiry**: Removes data for expired time windows to conserve resources while retaining recent insights.
+- **High-Performance Queries**: Serves cached data via Arrow Flight SQL for minimal latency
+- **Vectorized Data**: Optimized for AI/ML pipelines and analytical queries
+- **Seamless Integration**: Connects with analytics and visualization tools
 
 ## Benefits 🌟
 
-- **🚀 Blazing Fast**: Achieve ultra-low latency with in-memory caching and efficient query routing.
-- **⚙️ Scalable**: Handles large-scale data workflows with ease.
-- **🔗 Flexible**: Integrates seamlessly with multiple backend systems like Postgres, Redis, and Snowflake.
-- **🤖 AI/ML Ready**: Designed to support vectorized data for AI/ML inference pipelines.
-- **📈 Real-Time Metrics**: Dynamically calculate and serve statistical metrics (e.g., averages) for monitoring and inference.
-- **⌛ Time-Partitioned Insights**: Gain granular control of metrics with support for fixed time windows.
-- **⛭ Rust-Powered**: Built using the high-performance, memory-safe Rust programming language, ensuring reliability and speed.
+- **🚀 Low Latency**: Millisecond-level query responses for cached data
+- **⚙️ Scalable**: Handles large-scale data workflows with ease
+- **🔗 Flexible**: Integrates with Postgres, Redis, Snowflake, and other ADBC datastores
+- **🤖 AI/ML Ready**: Optimized for vectorized data and inference pipelines
+- **📈 Real-Time Metrics**: Dynamic calculation of statistical metrics
+- **⌛ Time Windows**: Granular control of metrics with configurable windows
+- **⛭ Rust-Powered**: High-performance, memory-safe implementation
 
-## Comparisons 🆚
+## Getting Started 🚀
 
-**Better together,** Hyprstream is designed to complement Flink and MotherDuck by providing real-time, low-latency answers while they handle batch or complex processing.
+1. Install Hyprstream:
+   ```bash
+   cargo install hyprstream
+   ```
 
-Hyprstream is positioned as a bridge between simplicity and power, combining the ease of use of MotherDuck with the real-time capabilities of Flink. It’s ideal for workflows where teams need low-latency insights and streaming features without the full complexity of large-scale event-driven systems.
+2. Start the server with default configuration:
+   ```bash
+   hyprstream
+   ```
 
-For example, in a RAG workload, Hyprstream can serve live data or cached insights for quick responses, while Flink processes large-scale data streams for embedding generation, and MotherDuck performs historical trend analysis or offline data prep. This hybrid approach ensures data freshness and responsiveness, with Hyprstream bridging the gap between real-time demands and the medium-to-high latency of Flink and MotherDuck, enabling seamless integration for streaming, batch, and analytics pipelines.
+3. Use with custom configuration:
+   ```bash
+   hyprstream --config /path/to/config.toml
+   ```
 
-### Hyprstream vs. Apache Flink
-
-| **Feature**               | **Hyprstream**                                                                                   | **Apache Flink**                                                                                          |
-| ------------------------- | ------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
-| **Direct Querying**       | ✅ Yes, via Arrow Flight SQL (no external sink needed)                                            | ❌ Must write to external sinks (e.g., Kafka, databases)                                                   |
-| **Focus**                 | Real-time aggregation, caching, and ultra-low-latency querying                                    | General-purpose streaming and batch (large-scale event processing)                                         |
-| **Integration**           | Microservices-friendly; easy to embed in modern pipelines (Kafka, Spark); minimal configuration   | Integrates with broader ecosystems; requires more setup (clusters, stateful ops)                           |
-| **Complexity**            | Low (lightweight deployment, minimal overhead)                                                   | Higher (requires job managers, checkpointing, cluster management)                                          |
-| **Latency**               | Ultra-low; queries run in memory with Arrow + DuckDB                                              | Medium-to-high; data typically flows to external sinks before being queried                                |
-| **Data Freshness**        | ✅ Near real-time; cached or streaming data ensures up-to-date retrieval                          | ✅ Supports real-time updates but with slightly higher lag due to processing overhead                      |
-| **Aggregation Support**   | Basic time windows and metrics; great for real-time dashboards                                    | Advanced, customizable windowing (tumbling, sliding, session windows)                                      |
-| **Best For**              | Quick real-time insights, dashboards, streaming metrics, IoT data                                 | Complex, large-scale event-driven architectures, streaming + batch workloads                               |
-| **RAG Workloads**         | ✅ Ideal for fast data retrieval and live augmentation                                            | ✅ Suitable for large-scale RAG pipelines; better for batch + stream combination workflows                  |
-| **Continuous Bias Training**| ✅ Excellent for streaming bias detection and incremental updates                                | ✅ Good for both real-time bias updates and large-scale batch retraining                                    |
-| **ML Batch Workloads**    | Feeds small, real-time data slices to external ML frameworks; no built-in batch processing        | Built-in batch APIs (Table/DataSet) for large-scale ML preprocessing                                       |
-| **ML Real-Time Inference**| ✅ Ideal for on-the-fly scoring (microservices)                                                   | ✅ Can handle large-scale streaming inference with higher overhead                                          |
-| **ML Tools Integration**  | Arrow-based data export to Python/R or other ML frameworks; easy microservice integration         | Integrates with Flink ML libs and external frameworks for both batch and streaming ML                      |
-
----
-
-### Hyprstream vs. MotherDuck
-
-| **Feature**               | **Hyprstream**                                                                                      | **MotherDuck**                                                                                      |
-| ------------------------- | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| **Direct Querying**       | ✅ Yes, via Arrow Flight SQL (real-time)                                                            | ✅ In-process DuckDB + serverless cloud queries                                                      |
-| **Focus**                 | Real-time aggregation, caching, and sub-second querying                                            | Hybrid local-cloud analytics (batch and interactive)                                                 |
-| **Integration**           | Fits easily with streaming pipelines (Flink, Kafka) and microservices                              | Integrates with BI/data tools and can offload big data to the cloud                                  |
-| **Complexity**            | Low (lightweight microservice or embedded library)                                                 | Low/Medium (local DuckDB + optional cloud scaling)                                                   |
-| **Latency**               | Ultra-low (in-memory operations, optimized for streaming data)                                     | Medium; suited for interactive queries but not optimized for sub-second real-time use                |
-| **Data Freshness**        | ✅ Real-time; supports live streaming and cached data                                              | ❌ Batch or semi-static; relies on periodic updates for freshness                                    |
-| **Aggregation Support**   | Basic time windows, rolling metrics, real-time updates                                             | Full SQL with DuckDB, scalable to larger datasets when using cloud resources                         |
-| **Best For**              | Real-time dashboards, IoT metrics, live data monitoring                                            | Ad-hoc SQL analytics, BI reporting, hybrid on-prem/cloud workloads                                   |
-| **RAG Workloads**         | ✅ Perfect for live data augmentation in real-time RAG systems                                      | ❌ Better suited for static/batch RAG use cases                                                     |
-| **Continuous Bias Training**| ✅ Strong in streaming bias metrics and preprocessing for adaptive models                        | ❌ Limited to batch bias correction workflows                                                        |
-| **ML Batch Workloads**    | Supplies real-time feature data for external ML; does not provide large-scale batch engine         | Well-suited for batch data prep; can push big datasets to cloud for ML training                      |
-| **ML Real-Time Inference**| ✅ Perfect for quick, microservice-based model scoring                                             | ❌ More aligned with batch or interactive queries; limited continuous streaming support               |
-| **ML Tools Integration**  | Arrow-native data; easily exported to Python/R or microservices for ML pipelines                   | Relies on DuckDB for data prep and merges well with local or cloud ML environments                   |
-
-## Configuration 🔧
-
-Hyprstream uses TOML configuration files and environment variables for configuration. The configuration is loaded in the following order:
-
-1. Default configuration (embedded in binary from `config/default.toml`)
-2. System-wide configuration (`/etc/hyprstream/config.toml` - optional)
-3. User-specified configuration file (via `--config` CLI option - optional)
-4. Environment variables (prefixed with `HYPRSTREAM_`)
-5. Command-line arguments (highest precedence)
-
-### Storage Backend Configuration
-
-The service supports multiple storage backends:
-
-- `duckdb`: Embedded database with high performance
-- `adbc`: Arrow Database Connectivity for external databases
-- `cached`: Two-tier storage with configurable cache and backing store
-
-### DuckDB Configuration
-
-When using DuckDB as either the main storage or cache backend, you can configure its behavior through the `connection_string` setting:
-
-- `:memory:`: Creates an in-memory database (default)
-- `path/to/file.duckdb`: Creates/opens a persistent database file
-
-#### DuckDB Storage Considerations
-
-1. In-Memory Database (`:memory:`):
-   - Fastest performance
-   - Data is lost when service restarts
-   - Good for caching or temporary storage
-
-2. Persistent Database (file path):
-   - Data persists across service restarts
-   - Slightly lower performance than in-memory
-   - Good for primary storage
-   - Files can be backed up and restored
-
-3. Shared Database:
-   - When using DuckDB for both cache and main storage with the same connection string,
-     the database will be shared
-   - Can save memory but may impact cache performance
-
-### Cache Configuration
-
-When using the cached storage backend, configure both the cache type and duration. The cache can use either DuckDB or ADBC as its storage engine. When using DuckDB, the same configuration options apply as described in the DuckDB Configuration section.
-
-### Configuration Example
-
-All configuration options can be set via environment variables, command line arguments, or a TOML configuration file. Here's a complete example showing all available options:
-
-```toml
-# Server Configuration
-[server]
-host = "127.0.0.1"
-port = 50051
-
-# Storage Configuration
-[storage]
-backend = "cached"  # Options: "duckdb", "adbc", "cached"
-
-# Cache Configuration
-[cache]
-backend = "duckdb"  # Options: "duckdb", "adbc"
-duration_secs = 3600  # 1 hour
-
-# DuckDB Configuration
-[duckdb]
-connection_string = ":memory:"  # Use ":memory:" for in-memory database or a file path for persistence
-
-# ADBC Configuration
-[adbc]
-driver_path = "libadbc_driver_postgresql.so"
-url = "postgresql://localhost:5432"
-username = "postgres"
-password = ""  # Set via environment variable
-database = "metrics"
-
-# Optional: Database-specific configurations
-[adbc.options]
-application_name = "hyprstream"
-connect_timeout = "10"
-
-# Optional: Connection pool settings
-[adbc.pool]
-max_connections = 10
-min_connections = 1
-acquire_timeout_secs = 30
-```
-
-The same configuration can be set using environment variables:
-
+For configuration options and detailed documentation, run:
 ```bash
-# Server settings
-export HYPRSTREAM_SERVER_HOST=127.0.0.1
-export HYPRSTREAM_SERVER_PORT=50051
-
-# Storage and cache settings
-export HYPRSTREAM_STORAGE_BACKEND=cached
-export HYPRSTREAM_CACHE_BACKEND=duckdb
-export HYPRSTREAM_CACHE_DURATION=3600
-export HYPRSTREAM_DUCKDB_CONNECTION=":memory:"
-
-# ADBC settings
-export HYPRSTREAM_ADBC_DRIVER_PATH=/usr/local/lib/libadbc_driver_postgresql.so
-export HYPRSTREAM_ADBC_URL=postgresql://localhost:5432
-export HYPRSTREAM_ADBC_USERNAME=postgres
-export HYPRSTREAM_ADBC_DATABASE=metrics
+hyprstream --help
 ```
 
-Or using command line arguments:
-
-```bash
-hyprstream \
-  --host 127.0.0.1 \
-  --port 50051 \
-  --storage-backend cached \
-  --cache-backend duckdb \
-  --cache-duration 3600 \
-  --duckdb-connection ":memory:" \
-  --driver-path /usr/local/lib/libadbc_driver_postgresql.so \
-  --db-url postgresql://localhost:5432 \
-  --db-user postgres \
-  --db-name metrics
-```
-
-This configuration sets up a cached storage backend using DuckDB for caching and PostgreSQL (via ADBC) as the backing store. Command line arguments and environment variables take precedence over configuration files. The `--config` option allows you to specify a custom configuration file path.
+Or visit our [API Documentation](https://docs.rs/hyprstream) for comprehensive guides and examples.
 
 ## Example Usage 💡
 
-To get started, check out our **[Python Client Example](examples/client/python)**. This example demonstrates how to:
+### Quick Start with ADBC
 
-- Ingest data into Hyprstream using Arrow Flight.
-- Query data with Arrow Flight SQL.
-- Interact with the DuckDB cache and underlying ADBC datastores.
-- Query pre-computed aggregates for real-time metrics.
-- Retrieve aggregate metrics for specific **time windows** (e.g., last hour, past 7 days).
+Hyprstream implements the Arrow Flight SQL protocol, making it compatible with any ADBC-compliant client:
+
+```python
+import adbc_driver_flightsql.dbapi
+
+# Connect to Hyprstream using standard ADBC
+conn = adbc_driver_flightsql.dbapi.connect("grpc://localhost:50051")
+
+try:
+    cursor = conn.cursor()
+    
+    # Query metrics with time windows
+    cursor.execute("""
+        SELECT 
+            metric_id,
+            COUNT(*) as samples,
+            AVG(value_running_window_avg) as avg_value
+        FROM metrics
+        WHERE timestamp >= NOW() - INTERVAL '1 hour'
+        GROUP BY metric_id
+        ORDER BY avg_value DESC
+    """)
+    
+    results = cursor.fetch_arrow_table()
+    print(results.to_pandas())
+    
+finally:
+    cursor.close()
+    conn.close()
+```
+
+### Using as a Cache Layer
+
+Hyprstream can act as a high-performance cache in front of any ADBC-compliant database:
+
+```bash
+# Start with PostgreSQL backend and DuckDB cache
+hyprstream \
+  --storage-backend cached \
+  --cache-backend duckdb \
+  --cache-duration 3600 \
+  --driver-path /usr/local/lib/libadbc_driver_postgresql.so \
+  --db-url postgresql://localhost:5432 \
+  --db-name metrics
+```
+
+Queries automatically use the cache:
+```python
+import adbc_driver_flightsql.dbapi
+
+with adbc_driver_flightsql.dbapi.connect("grpc://localhost:50051") as conn:
+    cursor = conn.cursor()
+    
+    # First query fetches from PostgreSQL and caches
+    cursor.execute("SELECT * FROM large_table WHERE region = ?", ["us-west"])
+    results = cursor.fetch_arrow_table()
+```
+
+For more examples and detailed documentation:
+- [Python Client Examples](examples/client/python)
+- [API Documentation](https://docs.rs/hyprstream)
+- Run `hyprstream --help` for configuration options
+
+## Better Together: Ecosystem Integration 🔄
+
+Hyprstream enhances modern data architectures by filling critical gaps in the real-time data stack. While tools like Flink excel at complex stream processing and MotherDuck provides scalable cloud analytics, Hyprstream adds the missing piece: instant, SQL-based access to streaming data and real-time metrics. By supporting any ADBC-compliant database as a backend, including MotherDuck, Hyprstream enables architectures that combine cloud-scale storage with edge performance.
+
+### Comparison with Stream Processing & Analytics Tools
+
+| Feature | Hyprstream | Apache Flink | MotherDuck |
+|---------|------------|--------------|------------|
+| **Ingest-to-Query Latency** | 1-10ms* | Seconds-minutes** | 100ms-seconds |
+| **Query Interface** | Direct SQL | External sink required | Direct SQL |
+| **Storage Model** | In-memory + ADBC | External systems | Cloud-native |
+| **Deployment** | Single binary | Cluster + job manager | Cloud service |
+| **Scale Focus** | Hot data, edge | Stream processing | Cloud analytics |
+| **State Management** | Time windows, metrics | Full event state | Full dataset |
+| **Data Access** | Arrow Flight SQL | Custom operators | DuckDB/SQL |
+| **Cost Model** | Compute-focused | Compute-focused | Storage-focused |
+
+\* *For cached data; backend queries add typical ADBC database latency*
+\** *End-to-end latency including writing to external storage and querying*
+
+## Contributing 🤝
+
+We welcome contributions! Please feel free to submit a Pull Request.
+
+## License 📄
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ---
-For inquiries or support, contact us at **[support@hyprstream.com](mailto:support@hyprstream.com)** or visit our GitHub repository to contribute! 🌐
+For inquiries or support, contact us at [support@hyprstream.com](mailto:support@hyprstream.com) or visit our GitHub repository to contribute! 🌐
