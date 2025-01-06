@@ -27,14 +27,14 @@
 //!   -c, --config <FILE>             Path to configuration file
 //!       --host <HOST>               Server host address [env: HYPRSTREAM_SERVER_HOST]
 //!       --port <PORT>               Server port [env: HYPRSTREAM_SERVER_PORT]
-//!       --storage-backend <TYPE>    Storage backend type [env: HYPRSTREAM_STORAGE_BACKEND]
-//!       --cache-backend <TYPE>      Cache backend type [env: HYPRSTREAM_CACHE_BACKEND]
-//!       --cache-duration <SECS>     Cache duration in seconds [env: HYPRSTREAM_CACHE_DURATION]
-//!       --duckdb-connection <STR>   DuckDB connection string [env: HYPRSTREAM_DUCKDB_CONNECTION]
-//!       --driver-path <PATH>        ADBC driver path [env: HYPRSTREAM_ADBC_DRIVER_PATH]
-//!       --db-url <URL>              Database URL [env: HYPRSTREAM_ADBC_URL]
-//!       --db-user <USER>            Database username [env: HYPRSTREAM_ADBC_USERNAME]
-//!       --db-name <NAME>            Database name [env: HYPRSTREAM_ADBC_DATABASE]
+//!       --engine <TYPE>             Primary storage engine type [env: HYPRSTREAM_ENGINE]
+//!       --engine-connection <STR>   Engine connection string [env: HYPRSTREAM_ENGINE_CONNECTION]
+//!       --engine-options <KEY=VAL>  Engine options (can be specified multiple times) [env: HYPRSTREAM_ENGINE_OPTIONS]
+//!       --enable-cache              Enable caching [env: HYPRSTREAM_ENABLE_CACHE]
+//!       --cache-engine <TYPE>       Cache engine type [env: HYPRSTREAM_CACHE_ENGINE]
+//!       --cache-connection <STR>    Cache connection string [env: HYPRSTREAM_CACHE_CONNECTION]
+//!       --cache-options <KEY=VAL>   Cache options (can be specified multiple times) [env: HYPRSTREAM_CACHE_OPTIONS]
+//!       --cache-max-duration <SECS> Cache max duration in seconds [env: HYPRSTREAM_CACHE_MAX_DURATION]
 //! ```
 //!
 //! ## Configuration File Format (TOML)
@@ -45,32 +45,19 @@
 //! host = "127.0.0.1"     # Server host address
 //! port = 50051           # Server port number
 //!
-//! # Storage Configuration
-//! [storage]
-//! backend = "cached"     # Options: "duckdb", "adbc", "cached"
+//! # Engine Configuration
+//! [engine]
+//! engine = "duckdb"      # Options: "duckdb", "adbc"
+//! connection = ":memory:"
+//! options = { }          # Engine-specific options
 //!
 //! # Cache Configuration
 //! [cache]
-//! backend = "duckdb"     # Options: "duckdb", "adbc"
-//! duration_secs = 3600   # Cache entry lifetime
-//!
-//! # DuckDB Configuration
-//! [duckdb]
-//! connection_string = ":memory:"  # Use ":memory:" for in-memory or file path
-//!
-//! # ADBC Configuration
-//! [adbc]
-//! driver_path = "/path/to/driver.so"  # ADBC driver library path
-//! url = "postgresql://localhost:5432"  # Database connection URL
-//! username = "user"                    # Database username
-//! password = ""                        # Database password
-//! database = "dbname"                  # Database name
-//!
-//! # Optional: Connection pool settings
-//! [adbc.pool]
-//! max_connections = 10        # Maximum pool connections
-//! min_connections = 1         # Minimum pool connections
-//! acquire_timeout_secs = 30   # Connection acquisition timeout
+//! enabled = true         # Enable caching
+//! engine = "duckdb"      # Options: "duckdb", "adbc"
+//! connection = ":memory:"
+//! max_duration_secs = 3600
+//! options = { }          # Cache-specific options
 //! ```
 //!
 //! ## Storage Backends
@@ -79,26 +66,54 @@
 //!
 //! The DuckDB backend provides high-performance embedded storage:
 //!
-//! - Use `:memory:` for in-memory database (fastest, non-persistent)
-//! - Use a file path for persistent storage
-//! - Ideal for caching and local storage
+//! ```toml
+//! [engine]
+//! engine = "duckdb"
+//! connection = ":memory:"  # Use ":memory:" for in-memory or file path
+//! options = {
+//!     threads = "4",      # Number of threads (optional)
+//!     read_only = "false" # Read-only mode (optional)
+//! }
+//! ```
 //!
 //! ### ADBC Backend
 //!
 //! The ADBC backend enables connection to external databases:
 //!
-//! - Supports any ADBC-compliant database
-//! - Configurable connection pooling
-//! - Requires appropriate ADBC driver
+//! ```toml
+//! [engine]
+//! engine = "adbc"
+//! connection = "postgresql://localhost:5432"
+//! options = {
+//!     driver_path = "/usr/local/lib/libadbc_driver_postgresql.so",  # Required
+//!     username = "postgres",                                        # Optional
+//!     password = "secret",                                         # Optional
+//!     database = "metrics",                                        # Optional
+//!     pool_max = "10",                                            # Optional
+//!     pool_min = "1",                                             # Optional
+//!     connect_timeout = "30"                                      # Optional
+//! }
+//! ```
 //!
 //! ### Cached Backend
 //!
 //! The cached backend implements a two-tier storage system:
 //!
-//! - Fast in-memory cache (using DuckDB or ADBC)
-//! - Persistent backing store (using DuckDB or ADBC)
-//! - Configurable cache duration
-//! - Automatic cache management
+//! ```toml
+//! [engine]
+//! engine = "duckdb"
+//! connection = "data.db"
+//! options = { }
+//!
+//! [cache]
+//! enabled = true
+//! engine = "duckdb"
+//! connection = ":memory:"
+//! max_duration_secs = 3600
+//! options = {
+//!     threads = "2"
+//! }
+//! ```
 //!
 //! # Examples
 //!
@@ -118,95 +133,110 @@
 //! ## Advanced Configuration
 //!
 //! ```bash
-//! # Run with cached storage and DuckDB cache
+//! # Run with DuckDB storage and caching
 //! hyprstream \
-//!   --storage-backend cached \
-//!   --cache-backend duckdb \
-//!   --cache-duration 3600 \
-//!   --duckdb-connection ":memory:"
+//!   --engine duckdb \
+//!   --engine-connection ":memory:" \
+//!   --engine-options threads=4 \
+//!   --enable-cache \
+//!   --cache-engine duckdb \
+//!   --cache-connection ":memory:" \
+//!   --cache-max-duration 3600
 //!
-//! # Run with ADBC backend
+//! # Run with ADBC PostgreSQL backend
 //! hyprstream \
-//!   --storage-backend adbc \
-//!   --driver-path /usr/local/lib/libadbc_driver_postgresql.so \
-//!   --db-url postgresql://localhost:5432 \
-//!   --db-user postgres \
-//!   --db-name metrics
+//!   --engine adbc \
+//!   --engine-connection "postgresql://localhost:5432" \
+//!   --engine-options driver_path=/usr/local/lib/libadbc_driver_postgresql.so \
+//!   --engine-options username=postgres \
+//!   --engine-options database=metrics \
+//!   --engine-options pool_max=10
+//!
+//! # Run with ADBC backend and DuckDB cache
+//! hyprstream \
+//!   --engine adbc \
+//!   --engine-connection "postgresql://localhost:5432" \
+//!   --engine-options driver_path=/usr/local/lib/libadbc_driver_postgresql.so \
+//!   --engine-options username=postgres \
+//!   --enable-cache \
+//!   --cache-engine duckdb \
+//!   --cache-connection ":memory:" \
+//!   --cache-options threads=2 \
+//!   --cache-max-duration 3600
 //! ```
 //!
 //! For more examples and detailed API documentation, visit the
 //! [Hyprstream documentation](https://docs.rs/hyprstream).
 
-use hyprstream_core::config::Settings;
-use hyprstream_core::service::FlightServiceImpl;
-use hyprstream_core::storage::{
-    adbc::AdbcBackend, cached::CachedStorageBackend, duckdb::DuckDbBackend, StorageBackend,
+use clap::Parser;
+use hyprstream_core::{
+    config::{CliArgs, Settings},
+    service::FlightServiceImpl,
+    storage::{
+        adbc::AdbcBackend,
+        duckdb::DuckDbBackend,
+        StorageBackend,
+    },
 };
 use std::sync::Arc;
 use tonic::transport::Server;
+use arrow_flight::flight_service_server::FlightServiceServer;
 
-/// Main entry point for the Hyprstream server.
-///
-/// This function:
-/// 1. Initializes logging
-/// 2. Loads configuration
-/// 3. Sets up the appropriate storage backend
-/// 4. Starts the Flight SQL service
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging
-    tracing_subscriber::fmt::init();
+    // Parse command line arguments
+    let cli_args = CliArgs::parse();
+    
+    // Initialize settings with CLI args
+    let settings = Settings::new(cli_args)?;
 
-    // Load configuration
-    let settings = Settings::new()?;
-
-    // Create storage backend based on configuration
-    let backend = match settings.engine.engine.as_str() {
-        "duckdb" => {
-            let backend = DuckDbBackend::new(&settings.engine.connection)?;
-            Arc::new(backend) as Arc<dyn StorageBackend>
-        }
-        "adbc" => {
-            let backend = AdbcBackend::new_with_options(
+    // Create the engine backend
+    let engine_backend: Arc<dyn StorageBackend> = match settings.engine.engine.as_str() {
+        "adbc" => Arc::new(
+            AdbcBackend::new_with_options(
                 &settings.engine.connection,
                 &settings.engine.options,
-            )?;
-            Arc::new(backend) as Arc<dyn StorageBackend>
-        }
-        _ => return Err("Invalid engine type".into()),
+                settings.engine.credentials.as_ref(),
+            )?
+        ),
+        "duckdb" => Arc::new(DuckDbBackend::new_with_options(
+            &settings.engine.connection,
+            &settings.engine.options,
+            None,
+        )?),
+        _ => panic!("Unsupported engine backend"),
     };
 
-    // Add caching if enabled
-    let backend = if settings.cache.enabled {
-        let cache: Arc<dyn StorageBackend> = match settings.cache.engine.as_str() {
-            "duckdb" => Arc::new(DuckDbBackend::new(&settings.cache.connection)?),
-            "adbc" => Arc::new(AdbcBackend::new_with_options(
+    // Create the cache backend if configured
+    let cache_backend = if settings.cache.enabled {
+        match settings.cache.engine.as_str() {
+            "adbc" => Some(Arc::new(
+                AdbcBackend::new_with_options(
+                    &settings.cache.connection,
+                    &settings.cache.options,
+                    settings.cache.credentials.as_ref(),
+                )?
+            ) as Arc<dyn StorageBackend>),
+            "duckdb" => Some(Arc::new(DuckDbBackend::new_with_options(
                 &settings.cache.connection,
                 &settings.cache.options,
-            )?),
-            _ => return Err("Invalid cache engine type".into()),
-        };
-        Arc::new(CachedStorageBackend::new(
-            cache,
-            backend,
-            settings.cache.max_duration_secs,
-        ))
+                None,
+            )?) as Arc<dyn StorageBackend>),
+            _ => panic!("Unsupported cache backend"),
+        }
     } else {
-        backend
+        None
     };
 
-    // Initialize storage backend
-    backend.init().await?;
-
-    // Create and start the Flight SQL service
-    let addr = format!("{}:{}", settings.server.host, settings.server.port)
-        .parse()
-        .unwrap();
-    let service = FlightServiceImpl::new(backend);
+    // Create and start the service
+    let addr = format!("{}:{}", settings.server.host, settings.server.port).parse()?;
+    let service = FlightServiceImpl::new(engine_backend);
+    let service = FlightServiceServer::new(service);
 
     println!("Starting server on {}", addr);
+
     Server::builder()
-        .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(service))
+        .add_service(service)
         .serve(addr)
         .await?;
 

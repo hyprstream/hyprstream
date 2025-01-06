@@ -4,16 +4,26 @@
 //! 1. Default configuration (embedded in binary)
 //! 2. System-wide configuration file (`/etc/hyprstream/config.toml`)
 //! 3. User-specified configuration file
-//! 4. Environment variables
+//! 4. Environment variables (prefixed with `HYPRSTREAM_`)
 //! 5. Command-line arguments
 //!
 //! Configuration options are loaded in order of precedence, with later sources
 //! overriding earlier ones.
+//!
+//! # Environment Variables
+//!
+//! Backend-specific credentials should be provided via environment variables:
+//! - `HYPRSTREAM_ENGINE_USERNAME` - Primary storage backend username
+//! - `HYPRSTREAM_ENGINE_PASSWORD` - Primary storage backend password
+//! - `HYPRSTREAM_CACHE_USERNAME` - Cache backend username (if needed)
+//! - `HYPRSTREAM_CACHE_PASSWORD` - Cache backend password (if needed)
 
 use clap::Parser;
 use config::{Config, ConfigError, File};
 use serde::Deserialize;
+use std::env;
 use std::path::PathBuf;
+use tracing as log;
 
 const DEFAULT_CONFIG: &str = include_str!("../config/default.toml");
 const DEFAULT_CONFIG_PATH: &str = "/etc/hyprstream/config.toml";
@@ -69,6 +79,22 @@ pub struct CliArgs {
     /// Cache maximum duration in seconds
     #[arg(long, env = "HYPRSTREAM_CACHE_MAX_DURATION")]
     cache_max_duration: Option<u64>,
+
+    /// Primary storage engine username
+    #[arg(long, env = "HYPRSTREAM_ENGINE_USERNAME")]
+    engine_username: Option<String>,
+
+    /// Primary storage engine password
+    #[arg(long, env = "HYPRSTREAM_ENGINE_PASSWORD")]
+    engine_password: Option<String>,
+
+    /// Cache engine username
+    #[arg(long, env = "HYPRSTREAM_CACHE_USERNAME")]
+    cache_username: Option<String>,
+
+    /// Cache engine password
+    #[arg(long, env = "HYPRSTREAM_CACHE_PASSWORD")]
+    cache_password: Option<String>,
 }
 
 /// Complete service configuration.
@@ -109,6 +135,9 @@ pub struct EngineConfig {
     /// Engine-specific options
     #[serde(default)]
     pub options: std::collections::HashMap<String, String>,
+    /// Authentication credentials (not serialized)
+    #[serde(skip)]
+    pub credentials: Option<Credentials>,
 }
 
 /// Cache configuration options.
@@ -131,6 +160,20 @@ pub struct CacheConfig {
     /// Maximum cache duration in seconds
     #[serde(default = "default_cache_duration")]
     pub max_duration_secs: u64,
+    /// Authentication credentials (not serialized)
+    #[serde(skip)]
+    pub credentials: Option<Credentials>,
+}
+
+/// Authentication credentials.
+///
+/// Holds username and password for database authentication.
+/// These values are loaded from environment variables and never
+/// serialized to configuration files.
+#[derive(Debug, Clone)]
+pub struct Credentials {
+    pub username: String,
+    pub password: String,
 }
 
 fn default_cache_engine() -> String {
@@ -146,55 +189,49 @@ fn default_cache_duration() -> u64 {
 }
 
 impl Settings {
-    /// Creates a new Settings instance from all configuration sources.
-    ///
-    /// This method loads and merges configuration from:
-    /// 1. Default configuration
-    /// 2. System configuration file
-    /// 3. User configuration file
-    /// 4. Environment variables
-    /// 5. Command-line arguments
-    ///
-    /// Later sources override earlier ones, allowing for flexible configuration
-    /// management.
-    ///
-    /// # Returns
-    ///
-    /// * `Result<Settings, ConfigError>` - Parsed settings or error
-    pub fn new() -> Result<Self, ConfigError> {
-        let cli = CliArgs::parse();
+    /// Loads configuration from all available sources.
+    pub fn new(cli: CliArgs) -> Result<Self, ConfigError> {
         let mut builder = Config::builder();
 
-        // Start with default configuration
+        // Load default configuration
         builder = builder.add_source(config::File::from_str(
             DEFAULT_CONFIG,
             config::FileFormat::Toml,
         ));
 
-        // Add system-wide configuration
-        builder = builder.add_source(File::with_name(DEFAULT_CONFIG_PATH).required(false));
-
-        // Add user configuration file
-        if let Some(config_path) = cli.config {
-            builder = builder.add_source(File::from(config_path).required(true));
+        // Load system configuration if it exists
+        if let Ok(metadata) = std::fs::metadata(DEFAULT_CONFIG_PATH) {
+            if metadata.is_file() {
+                builder = builder.add_source(config::File::from(PathBuf::from(DEFAULT_CONFIG_PATH)));
+            }
         }
 
-        // Add CLI overrides
-        if let Some(host) = cli.host {
-            builder = builder.set_override("server.host", host)?;
+        // Load user configuration if specified
+        if let Some(ref config_path) = cli.config {
+            builder = builder.add_source(config::File::from(config_path.clone()));
+        }
+
+        // Add environment variables (prefixed with HYPRSTREAM_)
+        builder = builder.add_source(config::Environment::with_prefix("HYPRSTREAM"));
+
+        // Override with command line arguments
+        if let Some(ref host) = cli.host {
+            builder = builder.set_override("server.host", host.as_str())?;
         }
         if let Some(port) = cli.port {
             builder = builder.set_override("server.port", port)?;
         }
-        if let Some(engine) = cli.engine {
-            builder = builder.set_override("engine.engine", engine)?;
+
+        // Engine settings
+        if let Some(ref engine) = cli.engine {
+            builder = builder.set_override("engine.engine", engine.as_str())?;
         }
-        if let Some(connection) = cli.engine_connection {
-            builder = builder.set_override("engine.connection", connection)?;
+        if let Some(ref connection) = cli.engine_connection {
+            builder = builder.set_override("engine.connection", connection.as_str())?;
         }
-        if let Some(options) = cli.engine_options {
+        if let Some(ref options) = cli.engine_options {
             let options: std::collections::HashMap<String, String> = options
-                .into_iter()
+                .iter()
                 .filter_map(|opt| {
                     let parts: Vec<&str> = opt.split('=').collect();
                     if parts.len() == 2 {
@@ -211,15 +248,15 @@ impl Settings {
         if let Some(enabled) = cli.enable_cache {
             builder = builder.set_override("cache.enabled", enabled)?;
         }
-        if let Some(engine) = cli.cache_engine {
-            builder = builder.set_override("cache.engine", engine)?;
+        if let Some(ref engine) = cli.cache_engine {
+            builder = builder.set_override("cache.engine", engine.as_str())?;
         }
-        if let Some(connection) = cli.cache_connection {
-            builder = builder.set_override("cache.connection", connection)?;
+        if let Some(ref connection) = cli.cache_connection {
+            builder = builder.set_override("cache.connection", connection.as_str())?;
         }
-        if let Some(options) = cli.cache_options {
+        if let Some(ref options) = cli.cache_options {
             let options: std::collections::HashMap<String, String> = options
-                .into_iter()
+                .iter()
                 .filter_map(|opt| {
                     let parts: Vec<&str> = opt.split('=').collect();
                     if parts.len() == 2 {
@@ -235,7 +272,61 @@ impl Settings {
             builder = builder.set_override("cache.max_duration_secs", duration)?;
         }
 
-        // Build and deserialize
-        builder.build()?.try_deserialize()
+        // Build initial settings
+        let mut settings: Settings = builder.build()?.try_deserialize()?;
+
+        // Load credentials from environment variables and CLI args
+        settings.engine.credentials = Self::load_engine_credentials(&cli);
+        settings.cache.credentials = Self::load_cache_credentials(&cli);
+
+        Ok(settings)
+    }
+
+    /// Load engine credentials from all available sources.
+    /// Priority order (highest to lowest):
+    /// 1. Environment variables
+    /// 2. Command line arguments
+    fn load_engine_credentials(cli: &CliArgs) -> Option<Credentials> {
+        // Try environment variables first
+        if let (Some(username), Some(password)) = (
+            env::var("HYPRSTREAM_ENGINE_USERNAME").ok(),
+            env::var("HYPRSTREAM_ENGINE_PASSWORD").ok(),
+        ) {
+            return Some(Credentials { username, password });
+        }
+
+        // Try command line arguments
+        if let (Some(username), Some(password)) = (&cli.engine_username, &cli.engine_password) {
+            return Some(Credentials {
+                username: username.clone(),
+                password: password.clone(),
+            });
+        }
+
+        None
+    }
+
+    /// Load cache credentials from all available sources.
+    /// Priority order (highest to lowest):
+    /// 1. Environment variables
+    /// 2. Command line arguments
+    fn load_cache_credentials(cli: &CliArgs) -> Option<Credentials> {
+        // Try environment variables first
+        if let (Some(username), Some(password)) = (
+            env::var("HYPRSTREAM_CACHE_USERNAME").ok(),
+            env::var("HYPRSTREAM_CACHE_PASSWORD").ok(),
+        ) {
+            return Some(Credentials { username, password });
+        }
+
+        // Try command line arguments
+        if let (Some(username), Some(password)) = (&cli.cache_username, &cli.cache_password) {
+            return Some(Credentials {
+                username: username.clone(),
+                password: password.clone(),
+            });
+        }
+
+        None
     }
 }

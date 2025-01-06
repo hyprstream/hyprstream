@@ -6,174 +6,164 @@
 //! - Connection pooling and prepared statements
 //! - Support for various database systems (PostgreSQL, MySQL, etc.)
 //!
+//! # Configuration
+//!
+//! The ADBC backend can be configured using the following options:
+//!
+//! ```toml
+//! [engine]
+//! engine = "adbc"
+//! # Base connection without credentials
+//! connection = "postgresql://localhost:5432/metrics"
+//! options = {
+//!     driver_path = "/usr/local/lib/libadbc_driver_postgresql.so",  # Required: Path to ADBC driver
+//!     pool_max = "10",                                            # Optional: Maximum pool connections
+//!     pool_min = "1",                                             # Optional: Minimum pool connections
+//!     connect_timeout = "30"                                      # Optional: Connection timeout in seconds
+//! }
+//! ```
+//!
+//! For security, credentials should be provided via environment variables:
+//! ```bash
+//! export HYPRSTREAM_DB_USERNAME=postgres
+//! export HYPRSTREAM_DB_PASSWORD=secret
+//! ```
+//!
+//! Or via command line:
+//!
+//! ```bash
+//! hyprstream \
+//!   --engine adbc \
+//!   --engine-connection "postgresql://localhost:5432/metrics" \
+//!   --engine-options driver_path=/usr/local/lib/libadbc_driver_postgresql.so \
+//!   --engine-options pool_max=10
+//! ```
+//!
 //! The implementation is optimized for efficient data transfer and
 //! query execution using Arrow's native formats.
 
+use crate::config::Credentials;
 use crate::metrics::MetricRecord;
 use crate::storage::StorageBackend;
 use adbc_core::{
-    driver_manager::{ManagedConnection, ManagedDriver},
-    options::{AdbcVersion, OptionDatabase},
-    Connection, Database, Driver, Statement,
+    driver_manager::{ManagedConnection, ManagedDatabase, ManagedDriver},
+    options::{AdbcVersion, OptionDatabase, OptionValue},
+    Connection, Database, Driver, Statement, Optionable,
 };
-use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 use tonic::Status;
 
-/// ADBC-based storage backend for metrics.
-///
-/// This backend provides:
-/// - Integration with ADBC-compliant databases
-/// - Connection pooling for optimal performance
-/// - Prepared statement management
-/// - Efficient data transport using Arrow format
-///
-/// The implementation supports multiple database systems through
-/// ADBC drivers and handles connection management automatically.
 pub struct AdbcBackend {
-    /// Thread-safe connection to the database
+    database: Arc<ManagedDatabase>,
     conn: Arc<Mutex<ManagedConnection>>,
-    /// Counter for generating unique statement handles
     statement_counter: AtomicU64,
-    /// Cache of prepared statements
     prepared_statements: Arc<Mutex<Vec<(u64, String)>>>,
-    connection_string: String,
-    options: HashMap<String, String>,
 }
 
 impl AdbcBackend {
-    /// Creates a new ADBC backend with connection string and options.
-    ///
-    /// # Arguments
-    ///
-    /// * `connection_string` - The connection string for the database
-    /// * `options` - Additional options for configuring the connection
-    ///
-    /// # Returns
-    ///
-    /// * `Result<Self, Status>` - Configured backend or error
-    pub fn new_with_options(
-        connection_string: &str,
-        options: &HashMap<String, String>,
-    ) -> Result<Self, Status> {
-        // Get driver path from options
-        let driver_path = options
-            .get("driver_path")
-            .ok_or_else(|| Status::invalid_argument("driver_path option is required"))?;
+    pub fn new(driver_path: &str, connection: Option<&str>, credentials: Option<&Credentials>) -> Result<Self, Status> {
+        let mut driver = ManagedDriver::load_dynamic_from_filename(
+            driver_path,
+            None,
+            AdbcVersion::V100,
+        ).map_err(|e| Status::internal(format!("Failed to load ADBC driver: {}", e)))?;
 
-        let mut driver =
-            ManagedDriver::load_dynamic_from_filename(driver_path, None, AdbcVersion::V100)
-                .map_err(|e| Status::internal(format!("Failed to load ADBC driver: {}", e)))?;
-
-        // Build database options from connection string and options
-        let mut db_options = vec![(OptionDatabase::Uri, connection_string.into())];
-
-        // Add optional parameters if present
-        if let Some(username) = options.get("username") {
-            db_options.push((OptionDatabase::Username, username.as_str().into()));
-        }
-        if let Some(password) = options.get("password") {
-            db_options.push((OptionDatabase::Password, password.as_str().into()));
-        }
-        if let Some(database) = options.get("database") {
-            db_options.push((
-                OptionDatabase::Other("database".into()),
-                database.as_str().into(),
-            ));
-        }
-        if let Some(max_conns) = options.get("pool_max") {
-            db_options.push((
-                OptionDatabase::Other("pool.max_connections".into()),
-                max_conns.as_str().into(),
-            ));
-        }
-        if let Some(min_conns) = options.get("pool_min") {
-            db_options.push((
-                OptionDatabase::Other("pool.min_connections".into()),
-                min_conns.as_str().into(),
-            ));
-        }
-        if let Some(timeout) = options.get("connect_timeout") {
-            db_options.push((
-                OptionDatabase::Other("pool.acquire_timeout".into()),
-                timeout.as_str().into(),
-            ));
-        }
-
-        let mut database = driver
-            .new_database_with_opts(db_options)
+        let mut database = driver.new_database()
             .map_err(|e| Status::internal(format!("Failed to create database: {}", e)))?;
 
-        let connection = database
-            .new_connection()
+        // Set connection string if provided
+        if let Some(conn_str) = connection {
+            database.set_option(OptionDatabase::Uri, OptionValue::String(conn_str.to_string()))
+                .map_err(|e| Status::internal(format!("Failed to set connection string: {}", e)))?;
+        }
+
+        // Set credentials if provided
+        if let Some(creds) = credentials {
+            // Set username and password from credentials
+            database.set_option(OptionDatabase::Username, OptionValue::String(creds.username.clone()))
+                .map_err(|e| Status::internal(format!("Failed to set username: {}", e)))?;
+
+            database.set_option(OptionDatabase::Password, OptionValue::String(creds.password.clone()))
+                .map_err(|e| Status::internal(format!("Failed to set password: {}", e)))?;
+        }
+
+        let connection = database.new_connection()
             .map_err(|e| Status::internal(format!("Failed to create connection: {}", e)))?;
 
         Ok(Self {
+            database: Arc::new(database),
             conn: Arc::new(Mutex::new(connection)),
             statement_counter: AtomicU64::new(0),
             prepared_statements: Arc::new(Mutex::new(Vec::new())),
-            connection_string: connection_string.to_string(),
-            options: options.clone(),
         })
     }
 
-    /// Gets a connection from the pool.
-    ///
-    /// This method provides thread-safe access to the database connection.
-    async fn get_connection(
-        &self,
-    ) -> Result<tokio::sync::MutexGuard<'_, ManagedConnection>, Status> {
+    async fn get_connection(&self) -> Result<tokio::sync::MutexGuard<'_, ManagedConnection>, Status> {
         Ok(self.conn.lock().await)
     }
 
-    /// Creates the necessary database tables and indexes.
-    ///
-    /// This method:
-    /// 1. Creates the metrics table if it doesn't exist
-    /// 2. Sets up appropriate column types for metric data
-    /// 3. Creates a primary key for efficient lookups
-    async fn create_tables(&self) -> Result<(), Status> {
-        let mut conn = self.get_connection().await?;
-        let mut stmt = conn
-            .new_statement()
+    async fn execute_statement(&self, conn: &mut ManagedConnection, query: &str, batch: Option<RecordBatch>) -> Result<(), Status> {
+        let mut stmt = conn.new_statement()
             .map_err(|e| Status::internal(format!("Failed to create statement: {}", e)))?;
 
-        stmt.set_sql_query(
-            "CREATE TABLE IF NOT EXISTS metrics (
-                metric_id TEXT NOT NULL,
-                timestamp BIGINT NOT NULL,
-                value_running_window_sum DOUBLE PRECISION NOT NULL,
-                value_running_window_avg DOUBLE PRECISION NOT NULL,
-                value_running_window_count BIGINT NOT NULL,
-                PRIMARY KEY (metric_id, timestamp)
-            )",
-        )
-        .map_err(|e| Status::internal(format!("Failed to set query: {}", e)))?;
+        stmt.set_sql_query(query)
+            .map_err(|e| Status::internal(format!("Failed to set query: {}", e)))?;
+
+        if let Some(params) = batch {
+            stmt.bind(params)
+                .map_err(|e| Status::internal(format!("Failed to bind parameters: {}", e)))?;
+        }
 
         stmt.execute_update()
-            .map_err(|e| Status::internal(format!("Failed to execute create table: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Failed to execute statement: {}", e)))?;
 
         Ok(())
     }
 
-    /// Converts metrics to an Arrow RecordBatch.
-    ///
-    /// This method efficiently converts metric records to Arrow's columnar
-    /// format for optimal data transport.
-    ///
-    /// # Arguments
-    ///
-    /// * `metrics` - Slice of MetricRecord instances to convert
-    ///
-    /// # Returns
-    ///
-    /// * `Result<RecordBatch, Status>` - Arrow RecordBatch or error
-    fn metrics_to_record_batch(metrics: &[MetricRecord]) -> Result<RecordBatch, Status> {
+    async fn execute_query(&self, conn: &mut ManagedConnection, query: &str, params: Option<&RecordBatch>) -> Result<Vec<RecordBatch>, Status> {
+        let mut stmt = conn.new_statement()
+            .map_err(|e| Status::internal(format!("Failed to create statement: {}", e)))?;
+
+        stmt.set_sql_query(query)
+            .map_err(|e| Status::internal(format!("Failed to set query: {}", e)))?;
+
+        if let Some(batch) = params {
+            stmt.bind(batch.clone())
+                .map_err(|e| Status::internal(format!("Failed to bind parameters: {}", e)))?;
+        }
+
+        let mut reader = stmt.execute()
+            .map_err(|e| Status::internal(format!("Failed to execute query: {}", e)))?;
+
+        let mut batches = Vec::new();
+        while let Some(batch_result) = reader.next() {
+            match batch_result {
+                Ok(batch) => batches.push(batch),
+                Err(e) => return Err(Status::internal(format!("Failed to get next batch: {}", e))),
+            }
+        }
+
+        Ok(batches)
+    }
+
+    fn prepare_timestamp_param(timestamp: i64) -> Result<RecordBatch, Status> {
+        let schema = Schema::new(vec![
+            Field::new("timestamp", DataType::Int64, false),
+        ]);
+
+        let timestamps: ArrayRef = Arc::new(Int64Array::from(vec![timestamp]));
+        
+        RecordBatch::try_new(Arc::new(schema), vec![timestamps])
+            .map_err(|e| Status::internal(format!("Failed to create parameter batch: {}", e)))
+    }
+
+    fn prepare_params(metrics: &[MetricRecord]) -> Result<RecordBatch, Status> {
         let schema = Schema::new(vec![
             Field::new("metric_id", DataType::Utf8, false),
             Field::new("timestamp", DataType::Int64, false),
@@ -182,164 +172,166 @@ impl AdbcBackend {
             Field::new("value_running_window_count", DataType::Int64, false),
         ]);
 
-        let metric_ids = StringArray::from_iter(metrics.iter().map(|m| Some(m.metric_id.as_str())));
-        let timestamps = Int64Array::from_iter(metrics.iter().map(|m| Some(m.timestamp)));
-        let sums =
-            Float64Array::from_iter(metrics.iter().map(|m| Some(m.value_running_window_sum)));
-        let avgs =
-            Float64Array::from_iter(metrics.iter().map(|m| Some(m.value_running_window_avg)));
-        let counts =
-            Int64Array::from_iter(metrics.iter().map(|m| Some(m.value_running_window_count)));
+        let metric_ids = StringArray::from_iter_values(metrics.iter().map(|m| m.metric_id.as_str()));
+        let timestamps = Int64Array::from_iter_values(metrics.iter().map(|m| m.timestamp));
+        let sums = Float64Array::from_iter_values(metrics.iter().map(|m| m.value_running_window_sum));
+        let avgs = Float64Array::from_iter_values(metrics.iter().map(|m| m.value_running_window_avg));
+        let counts = Int64Array::from_iter_values(metrics.iter().map(|m| m.value_running_window_count));
 
-        RecordBatch::try_new(
-            Arc::new(schema),
-            vec![
-                Arc::new(metric_ids),
-                Arc::new(timestamps),
-                Arc::new(sums),
-                Arc::new(avgs),
-                Arc::new(counts),
-            ],
-        )
-        .map_err(|e| Status::internal(e.to_string()))
-    }
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(metric_ids),
+            Arc::new(timestamps),
+            Arc::new(sums),
+            Arc::new(avgs),
+            Arc::new(counts),
+        ];
 
-    /// Create connection options from configuration
-    fn create_connection_options(&self) -> HashMap<String, String> {
-        let mut opts = self.options.clone();
-
-        // Set defaults if not specified
-        if !opts.contains_key("pool_max") {
-            opts.insert("pool_max".to_string(), "10".to_string());
-        }
-        if !opts.contains_key("pool_min") {
-            opts.insert("pool_min".to_string(), "1".to_string());
-        }
-        if !opts.contains_key("connect_timeout") {
-            opts.insert("connect_timeout".to_string(), "30".to_string());
-        }
-
-        opts
+        RecordBatch::try_new(Arc::new(schema), arrays)
+            .map_err(|e| Status::internal(format!("Failed to create parameter batch: {}", e)))
     }
 }
 
 #[async_trait]
 impl StorageBackend for AdbcBackend {
-    /// Initializes the ADBC backend.
-    ///
-    /// Creates necessary tables and indexes for metric storage.
-    async fn init(&self) -> Result<(), Status> {
-        // Create tables and indexes
-        self.create_tables().await
+    fn new_with_options(
+        connection_string: &str,
+        options: &HashMap<String, String>,
+        credentials: Option<&Credentials>,
+    ) -> Result<Self, Status> {
+        let driver_path = options.get("driver_path")
+            .ok_or_else(|| Status::invalid_argument("driver_path is required"))?;
+
+        Self::new(
+            driver_path,
+            Some(connection_string),
+            credentials,
+        )
     }
 
-    /// Inserts a batch of metrics into storage.
-    ///
-    /// This method:
-    /// 1. Converts metrics to Arrow format
-    /// 2. Prepares an insert statement
-    /// 3. Binds the data and executes the insert
-    async fn insert_metrics(&self, metrics: Vec<MetricRecord>) -> Result<(), Status> {
-        let batch = Self::metrics_to_record_batch(&metrics)?;
-
+    async fn init(&self) -> Result<(), Status> {
         let mut conn = self.get_connection().await?;
-        let mut stmt = conn
-            .new_statement()
-            .map_err(|e| Status::internal(format!("Failed to create statement: {}", e)))?;
-
-        stmt.set_sql_query(
-            "INSERT INTO metrics (
-                metric_id, timestamp, value_running_window_sum,
-                value_running_window_avg, value_running_window_count
-            ) VALUES (?, ?, ?, ?, ?)",
-        )
-        .map_err(|e| Status::internal(format!("Failed to set query: {}", e)))?;
-
-        stmt.bind(batch)
-            .map_err(|e| Status::internal(format!("Failed to bind values: {}", e)))?;
-
-        stmt.execute_update()
-            .map_err(|e| Status::internal(format!("Failed to execute insert: {}", e)))?;
+        
+        // Create metrics table if it doesn't exist
+        self.execute_statement(&mut conn, r#"
+            CREATE TABLE IF NOT EXISTS metrics (
+                metric_id VARCHAR NOT NULL,
+                timestamp BIGINT NOT NULL,
+                value_running_window_sum DOUBLE PRECISION NOT NULL,
+                value_running_window_avg DOUBLE PRECISION NOT NULL,
+                value_running_window_count BIGINT NOT NULL,
+                PRIMARY KEY (metric_id, timestamp)
+            )
+        "#, None).await?;
 
         Ok(())
     }
 
-    /// Queries metrics from a given timestamp.
-    ///
-    /// This method:
-    /// 1. Prepares a parameterized query
-    /// 2. Binds the timestamp parameter
-    /// 3. Executes the query and processes results
-    async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<MetricRecord>, Status> {
-        let mut conn = self.get_connection().await?;
-        let mut stmt = conn
-            .new_statement()
-            .map_err(|e| Status::internal(format!("Failed to create statement: {}", e)))?;
-
-        stmt.set_sql_query(
-            "SELECT metric_id, timestamp, value_running_window_sum, value_running_window_avg, value_running_window_count 
-             FROM metrics WHERE timestamp >= ?",
-        )
-        .map_err(|e| Status::internal(format!("Failed to set query: {}", e)))?;
-
-        let param_batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(
-                "timestamp",
-                DataType::Int64,
-                false,
-            )])),
-            vec![Arc::new(Int64Array::from_iter_values([from_timestamp]))],
-        )
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-        stmt.bind(param_batch)
-            .map_err(|e| Status::internal(format!("Failed to bind values: {}", e)))?;
-
-        let mut reader = stmt
-            .execute()
-            .map_err(|e| Status::internal(format!("Failed to execute query: {}", e)))?;
-
-        let mut metrics = Vec::new();
-        while let Some(batch_result) = reader.next() {
-            let batch = batch_result
-                .map_err(|e| Status::internal(format!("Failed to get record batch: {}", e)))?;
-            metrics.extend(self.record_batch_to_metrics(&batch)?);
+    async fn insert_metrics(&self, metrics: Vec<MetricRecord>) -> Result<(), Status> {
+        if metrics.is_empty() {
+            return Ok(());
         }
 
-        if metrics.is_empty() {
-            return Err(Status::not_found(
-                "No metrics found for the given timestamp",
-            ));
+        let mut conn = self.get_connection().await?;
+        let mut stmt = conn.new_statement()
+            .map_err(|e| Status::internal(format!("Failed to create statement: {}", e)))?;
+
+        // Build parameterized insert statement
+        let placeholders: Vec<_> = (0..metrics.len())
+            .map(|i| format!("(${},${},${},${},${})", i*5+1, i*5+2, i*5+3, i*5+4, i*5+5))
+            .collect();
+
+        let query = format!(
+            r#"
+            INSERT INTO metrics (
+                metric_id,
+                timestamp,
+                value_running_window_sum,
+                value_running_window_avg,
+                value_running_window_count
+            ) VALUES {}
+            "#,
+            placeholders.join(",")
+        );
+
+        stmt.set_sql_query(&query)
+            .map_err(|e| Status::internal(format!("Failed to set query: {}", e)))?;
+
+        // Bind parameters
+        let batch = Self::prepare_params(&metrics)?;
+        stmt.bind(batch)
+            .map_err(|e| Status::internal(format!("Failed to bind parameters: {}", e)))?;
+
+        stmt.execute_update()
+            .map_err(|e| Status::internal(format!("Failed to insert metrics: {}", e)))?;
+
+        Ok(())
+    }
+
+    async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<MetricRecord>, Status> {
+        let mut conn = self.get_connection().await?;
+        
+        let query = r#"
+            SELECT
+                metric_id,
+                timestamp,
+                value_running_window_sum,
+                value_running_window_avg,
+                value_running_window_count
+            FROM metrics
+            WHERE timestamp >= ?
+            ORDER BY timestamp ASC
+        "#;
+
+        let params = Self::prepare_timestamp_param(from_timestamp)?;
+        let batches = self.execute_query(&mut conn, query, Some(&params)).await?;
+
+        let mut metrics = Vec::new();
+        for batch in batches {
+            let metric_ids = batch.column_by_name("metric_id")
+                .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| Status::internal("Invalid metric_id column"))?;
+
+            let timestamps = batch.column_by_name("timestamp")
+                .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
+                .ok_or_else(|| Status::internal("Invalid timestamp column"))?;
+
+            let sums = batch.column_by_name("value_running_window_sum")
+                .and_then(|col| col.as_any().downcast_ref::<Float64Array>())
+                .ok_or_else(|| Status::internal("Invalid value_running_window_sum column"))?;
+
+            let avgs = batch.column_by_name("value_running_window_avg")
+                .and_then(|col| col.as_any().downcast_ref::<Float64Array>())
+                .ok_or_else(|| Status::internal("Invalid value_running_window_avg column"))?;
+
+            let counts = batch.column_by_name("value_running_window_count")
+                .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
+                .ok_or_else(|| Status::internal("Invalid value_running_window_count column"))?;
+
+            for i in 0..batch.num_rows() {
+                metrics.push(MetricRecord {
+                    metric_id: metric_ids.value(i).to_string(),
+                    timestamp: timestamps.value(i),
+                    value_running_window_sum: sums.value(i),
+                    value_running_window_avg: avgs.value(i),
+                    value_running_window_count: counts.value(i),
+                });
+            }
         }
 
         Ok(metrics)
     }
 
-    /// Prepares a SQL statement for execution.
-    ///
-    /// This method:
-    /// 1. Generates a unique statement handle
-    /// 2. Caches the SQL query
-    /// 3. Returns the serialized handle
     async fn prepare_sql(&self, query: &str) -> Result<Vec<u8>, Status> {
         let handle = self.statement_counter.fetch_add(1, Ordering::SeqCst);
         let mut statements = self.prepared_statements.lock().await;
         statements.push((handle, query.to_string()));
-
         Ok(handle.to_le_bytes().to_vec())
     }
 
-    /// Executes a prepared SQL statement.
-    ///
-    /// This method:
-    /// 1. Deserializes the statement handle
-    /// 2. Retrieves the cached SQL query
-    /// 3. Executes the query and processes results
     async fn query_sql(&self, statement_handle: &[u8]) -> Result<Vec<MetricRecord>, Status> {
         let handle = u64::from_le_bytes(
-            statement_handle
-                .try_into()
-                .map_err(|_| Status::invalid_argument("Invalid statement handle"))?,
+            statement_handle.try_into()
+                .map_err(|_| Status::invalid_argument("Invalid statement handle"))?
         );
 
         let statements = self.prepared_statements.lock().await;
@@ -350,22 +342,39 @@ impl StorageBackend for AdbcBackend {
             .ok_or_else(|| Status::invalid_argument("Statement handle not found"))?;
 
         let mut conn = self.get_connection().await?;
-        let mut stmt = conn
-            .new_statement()
-            .map_err(|e| Status::internal(format!("Failed to create statement: {}", e)))?;
-
-        stmt.set_sql_query(sql)
-            .map_err(|e| Status::internal(format!("Failed to set query: {}", e)))?;
-
-        let mut reader = stmt
-            .execute()
-            .map_err(|e| Status::internal(format!("Failed to execute query: {}", e)))?;
+        let batches = self.execute_query(&mut conn, sql, None).await?;
 
         let mut metrics = Vec::new();
-        while let Some(batch_result) = reader.next() {
-            let batch = batch_result
-                .map_err(|e| Status::internal(format!("Failed to get record batch: {}", e)))?;
-            metrics.extend(self.record_batch_to_metrics(&batch)?);
+        for batch in batches {
+            let metric_ids = batch.column_by_name("metric_id")
+                .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| Status::internal("Invalid metric_id column"))?;
+
+            let timestamps = batch.column_by_name("timestamp")
+                .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
+                .ok_or_else(|| Status::internal("Invalid timestamp column"))?;
+
+            let sums = batch.column_by_name("value_running_window_sum")
+                .and_then(|col| col.as_any().downcast_ref::<Float64Array>())
+                .ok_or_else(|| Status::internal("Invalid value_running_window_sum column"))?;
+
+            let avgs = batch.column_by_name("value_running_window_avg")
+                .and_then(|col| col.as_any().downcast_ref::<Float64Array>())
+                .ok_or_else(|| Status::internal("Invalid value_running_window_avg column"))?;
+
+            let counts = batch.column_by_name("value_running_window_count")
+                .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
+                .ok_or_else(|| Status::internal("Invalid value_running_window_count column"))?;
+
+            for i in 0..batch.num_rows() {
+                metrics.push(MetricRecord {
+                    metric_id: metric_ids.value(i).to_string(),
+                    timestamp: timestamps.value(i),
+                    value_running_window_sum: sums.value(i),
+                    value_running_window_avg: avgs.value(i),
+                    value_running_window_count: counts.value(i),
+                });
+            }
         }
 
         Ok(metrics)

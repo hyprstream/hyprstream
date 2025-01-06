@@ -33,29 +33,42 @@ ADBC-compliant datastores.
 
 ## Usage
 
-Basic usage example:
+Basic usage example with programmatic configuration:
 
 ```rust,no_run
+use hyprstream::config::{Settings, EngineConfig, CacheConfig};
 use hyprstream::service::FlightServiceImpl;
-use hyprstream::storage::duckdb::DuckDbBackend;
 use std::sync::Arc;
+use std::collections::HashMap;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create a DuckDB backend with in-memory storage
-    let backend = DuckDbBackend::new(":memory:")?;
-    let backend = Arc::new(backend);
-    backend.init().await?;
+    // Create configuration programmatically
+    let mut settings = Settings::default();
 
-    // Create the Flight SQL service
-    let service = FlightServiceImpl::new(backend);
+    // Configure primary storage engine
+    settings.engine.engine = "duckdb".to_string();
+    settings.engine.connection = ":memory:".to_string();
+    settings.engine.options.insert("threads".to_string(), "4".to_string());
+
+    // Configure caching (optional)
+    settings.cache.enabled = true;
+    settings.cache.engine = "duckdb".to_string();
+    settings.cache.connection = ":memory:".to_string();
+    settings.cache.max_duration_secs = 3600;
+
+    // Create and initialize the service
+    let service = FlightServiceImpl::from_settings(&settings).await?;
 
     // Use the service in your application...
     Ok(())
 }
 ```
 
-For more examples and detailed configuration options, see the [examples directory](examples/).
+For detailed configuration options and examples, see:
+- [`config`](crate::config) module for configuration options
+- [`storage`](crate::storage) module for storage backend details
+- [`examples`](examples/) directory for more usage examples
 */
 
 pub mod config;

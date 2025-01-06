@@ -12,135 +12,59 @@ pub mod adbc;
 pub mod cached;
 pub mod duckdb;
 
+use crate::config::Credentials;
 use crate::metrics::MetricRecord;
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
+use std::collections::HashMap;
 use tonic::Status;
 
-/// Trait defining the interface for metric storage backends.
+/// Storage backend trait for metric data persistence.
 ///
-/// This trait must be implemented by all storage backends to provide:
-/// - Metric data persistence
-/// - Query capabilities
-/// - SQL statement preparation and execution
-/// - Arrow RecordBatch conversion
-///
-/// Implementations should ensure efficient handling of time-series data
-/// and support for windowed aggregations.
+/// This trait defines the interface that all storage backends must implement.
+/// It provides methods for:
+/// - Initialization and configuration
+/// - Metric data insertion
+/// - Metric data querying
+/// - SQL query preparation and execution
 #[async_trait]
-pub trait StorageBackend: Send + Sync + 'static {
+pub trait StorageBackend: Send + Sync {
+    /// Creates a new instance of the storage backend.
+    ///
+    /// # Arguments
+    ///
+    /// * `connection_string` - The connection string for the database
+    /// * `options` - Additional options for configuring the connection
+    /// * `credentials` - Optional credentials for authentication
+    ///
+    /// # Returns
+    ///
+    /// * `Result<Self, Status>` - Configured backend or error
+    fn new_with_options(
+        connection_string: &str,
+        options: &HashMap<String, String>,
+        credentials: Option<&Credentials>,
+    ) -> Result<Self, Status>
+    where
+        Self: Sized;
+
     /// Initializes the storage backend.
     ///
     /// This method should:
-    /// - Set up any necessary database connections
-    /// - Create required tables and schemas
-    /// - Initialize caching mechanisms if applicable
+    /// 1. Create necessary tables and indexes
+    /// 2. Set up connection pools if needed
+    /// 3. Verify connectivity and permissions
     async fn init(&self) -> Result<(), Status>;
 
-    /// Inserts a batch of metric records into storage.
-    ///
-    /// # Arguments
-    ///
-    /// * `metrics` - Vector of MetricRecord instances to insert
+    /// Inserts a batch of metrics into storage.
     async fn insert_metrics(&self, metrics: Vec<MetricRecord>) -> Result<(), Status>;
 
     /// Queries metrics from a given timestamp.
-    ///
-    /// This method should efficiently retrieve metrics using time-based filtering
-    /// and apply any configured caching strategies.
-    ///
-    /// # Arguments
-    ///
-    /// * `from_timestamp` - Unix timestamp to query from
     async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<MetricRecord>, Status>;
 
     /// Prepares a SQL statement for execution.
-    ///
-    /// This method should:
-    /// 1. Parse and validate the SQL query
-    /// 2. Create an execution plan
-    /// 3. Return a serialized handle for later execution
-    ///
-    /// # Arguments
-    ///
-    /// * `query` - SQL query string to prepare
-    ///
-    /// # Returns
-    ///
-    /// * `Result<Vec<u8>, Status>` - Serialized statement handle on success
     async fn prepare_sql(&self, query: &str) -> Result<Vec<u8>, Status>;
 
     /// Executes a prepared SQL statement.
-    ///
-    /// This method should:
-    /// 1. Deserialize the statement handle
-    /// 2. Execute the prepared statement
-    /// 3. Return results as MetricRecords
-    ///
-    /// The implementation should use zero-copy operations where possible
-    /// to optimize performance.
-    ///
-    /// # Arguments
-    ///
-    /// * `statement_handle` - Serialized statement handle from prepare_sql
-    ///
-    /// # Returns
-    ///
-    /// * `Result<Vec<MetricRecord>, Status>` - Query results as MetricRecords
     async fn query_sql(&self, statement_handle: &[u8]) -> Result<Vec<MetricRecord>, Status>;
-
-    /// Converts an Arrow RecordBatch to MetricRecords.
-    ///
-    /// This is provided as a default implementation to ensure consistent
-    /// conversion across all storage backends. It handles:
-    /// - Type checking and conversion
-    /// - Null value handling
-    /// - Efficient batch processing
-    ///
-    /// # Arguments
-    ///
-    /// * `batch` - Arrow RecordBatch containing metric data
-    ///
-    /// # Returns
-    ///
-    /// * `Result<Vec<MetricRecord>, Status>` - Converted metric records
-    fn record_batch_to_metrics(&self, batch: &RecordBatch) -> Result<Vec<MetricRecord>, Status> {
-        let metric_ids = batch
-            .column_by_name("metric_id")
-            .and_then(|col| col.as_any().downcast_ref::<arrow_array::StringArray>())
-            .ok_or_else(|| Status::internal("Invalid metric_id column"))?;
-
-        let timestamps = batch
-            .column_by_name("timestamp")
-            .and_then(|col| col.as_any().downcast_ref::<arrow_array::Int64Array>())
-            .ok_or_else(|| Status::internal("Invalid timestamp column"))?;
-
-        let sums = batch
-            .column_by_name("value_running_window_sum")
-            .and_then(|col| col.as_any().downcast_ref::<arrow_array::Float64Array>())
-            .ok_or_else(|| Status::internal("Invalid value_running_window_sum column"))?;
-
-        let avgs = batch
-            .column_by_name("value_running_window_avg")
-            .and_then(|col| col.as_any().downcast_ref::<arrow_array::Float64Array>())
-            .ok_or_else(|| Status::internal("Invalid value_running_window_avg column"))?;
-
-        let counts = batch
-            .column_by_name("value_running_window_count")
-            .and_then(|col| col.as_any().downcast_ref::<arrow_array::Int64Array>())
-            .ok_or_else(|| Status::internal("Invalid value_running_window_count column"))?;
-
-        let mut metrics = Vec::with_capacity(batch.num_rows());
-        for i in 0..batch.num_rows() {
-            metrics.push(MetricRecord {
-                metric_id: metric_ids.value(i).to_string(),
-                timestamp: timestamps.value(i),
-                value_running_window_sum: sums.value(i),
-                value_running_window_avg: avgs.value(i),
-                value_running_window_count: counts.value(i),
-            });
-        }
-
-        Ok(metrics)
-    }
 }

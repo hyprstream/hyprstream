@@ -50,9 +50,20 @@ Hyprstream is a next-generation application for real-time data ingestion, window
    hyprstream
    ```
 
-3. Use with custom configuration:
+3. Use with PostgreSQL backend (requires PostgreSQL ADBC driver):
    ```bash
-   hyprstream --config /path/to/config.toml
+   # Set backend-specific credentials securely via environment variables
+   export HYPRSTREAM_ENGINE_USERNAME=postgres
+   export HYPRSTREAM_ENGINE_PASSWORD=secret
+
+   # Start Hyprstream with connection details (but without credentials)
+   hyprstream \
+     --engine adbc \
+     --engine-connection "postgresql://localhost:5432/metrics?pool_max=10&pool_min=1&connect_timeout=30" \
+     --engine-options driver_path=/usr/local/lib/libadbc_driver_postgresql.so \
+     --enable-cache \
+     --cache-engine duckdb \
+     --cache-connection ":memory:"
    ```
 
 For configuration options and detailed documentation, run:
@@ -97,37 +108,44 @@ finally:
     conn.close()
 ```
 
-### Using as a Cache Layer
+### Configuration
 
-Hyprstream can act as a high-performance cache in front of any ADBC-compliant database:
+Hyprstream supports multiple storage backends and can be configured through environment variables, command-line arguments, or configuration files.
 
-```bash
-# Start with PostgreSQL backend and DuckDB cache
-hyprstream \
-  --storage-backend cached \
-  --cache-backend duckdb \
-  --cache-duration 3600 \
-  --driver-path /usr/local/lib/libadbc_driver_postgresql.so \
-  --db-url postgresql://localhost:5432 \
-  --db-name metrics
+### ADBC Backend
+
+The ADBC backend supports PostgreSQL and other ADBC-compatible databases. Connection credentials can be provided in several ways, listed in order of precedence:
+
+1. Environment variables:
+   ```bash
+   export HYPRSTREAM_ENGINE_USERNAME=postgres
+   export HYPRSTREAM_ENGINE_PASSWORD=secret
+   ```
+
+2. Command-line arguments:
+   ```bash
+   hyprstream --engine-username postgres --engine-password secret
+   ```
+
+3. Connection URI:
+   ```
+   postgresql://postgres:secret@localhost:5432/metrics
+   ```
+
+Example configuration:
+
+```toml
+[storage]
+backend = "adbc"
+connection = "postgresql://localhost:5432/metrics"
+options = { pool_max = "10", pool_min = "1", connect_timeout = "30" }
 ```
 
-Queries automatically use the cache:
-```python
-import adbc_driver_flightsql.dbapi
-
-with adbc_driver_flightsql.dbapi.connect("grpc://localhost:50051") as conn:
-    cursor = conn.cursor()
-    
-    # First query fetches from PostgreSQL and caches
-    cursor.execute("SELECT * FROM large_table WHERE region = ?", ["us-west"])
-    results = cursor.fetch_arrow_table()
-```
-
-For more examples and detailed documentation:
-- [Python Client Examples](examples/client/python)
-- [API Documentation](https://docs.rs/hyprstream)
-- Run `hyprstream --help` for configuration options
+For security best practices:
+- Use environment variables or command-line arguments for credentials
+- Never commit credentials to version control
+- Use connection pooling to manage database connections efficiently
+- Set appropriate connection timeouts
 
 ## Better Together: Ecosystem Integration 🔄
 
@@ -161,116 +179,3 @@ This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENS
 
 ---
 For inquiries or support, contact us at [support@hyprstream.com](mailto:support@hyprstream.com) or visit our GitHub repository to contribute! 🌐
-
-## Configuration 🔧
-
-Hyprstream supports flexible configuration of storage engines and caching through CLI arguments, environment variables, or TOML configuration files.
-
-### Command Line
-
-```bash
-# Simple DuckDB setup
-hyprstream \
-  --engine duckdb \
-  --engine-connection "/path/to/db.duck"
-
-# MotherDuck with in-memory cache
-hyprstream \
-  --engine duckdb \
-  --engine-connection "md:my_database" \
-  --engine-options "token=${MOTHERDUCK_TOKEN}" \
-  --enable-cache
-
-# PostgreSQL with custom cache
-hyprstream \
-  --engine adbc \
-  --engine-connection "postgresql://main-db/metrics" \
-  --engine-options "pool_max=20" "application_name=hyprstream" \
-  --enable-cache \
-  --cache-engine adbc \
-  --cache-connection "postgresql://cache-db/metrics" \
-  --cache-options "pool_max=5" \
-  --cache-max-duration 7200
-```
-
-### Environment Variables
-
-```bash
-# Engine config
-export HYPRSTREAM_ENGINE=duckdb
-export HYPRSTREAM_ENGINE_CONNECTION="md:my_database"
-export HYPRSTREAM_ENGINE_OPTIONS="token=${MOTHERDUCK_TOKEN}"
-
-# Cache config
-export HYPRSTREAM_ENABLE_CACHE=true
-export HYPRSTREAM_CACHE_ENGINE=duckdb
-export HYPRSTREAM_CACHE_CONNECTION=":memory:"
-export HYPRSTREAM_CACHE_MAX_DURATION=3600
-```
-
-### Configuration File (TOML)
-
-```toml
-# Primary storage engine configuration
-[engine]
-engine = "duckdb"                    # Options: "duckdb", "adbc"
-connection = "md:my_database"        # Connection string
-options = { 
-    token = "${MOTHERDUCK_TOKEN}",   # Engine-specific options
-    application_name = "hyprstream"
-}
-
-# Cache configuration
-[cache]
-enabled = true
-engine = "duckdb"                    # Options: "duckdb", "adbc"
-connection = ":memory:"              # Connection string
-max_duration_secs = 3600            # Cache TTL in seconds
-options = {                         # Engine-specific options
-    pool_max = 5,
-    pool_min = 1
-}
-```
-
-### Storage Engines
-
-#### DuckDB Engine
-- **Local file**: `--engine-connection "/path/to/db.duck"`
-- **In-memory**: `--engine-connection ":memory:"`
-- **MotherDuck**: `--engine-connection "md:my_database"`
-- **Options**: 
-  - `token`: MotherDuck API token
-  - `read_only`: Enable read-only mode
-  - `threads`: Number of threads
-
-#### ADBC Engine
-- **PostgreSQL**: `--engine-connection "postgresql://host/dbname"`
-- **Snowflake**: `--engine-connection "snowflake://account/dbname"`
-- **Options**:
-  - `pool_max`: Maximum connections
-  - `pool_min`: Minimum connections
-  - `application_name`: Client identifier
-  - `connect_timeout`: Connection timeout
-
-### Cache Configuration
-
-The cache layer can be configured independently from the primary storage:
-- Use different engines for storage and cache
-- Configure separate connection pools
-- Set cache-specific options
-- Control cache duration
-
-Example combining MotherDuck storage with local cache:
-```toml
-[engine]
-engine = "duckdb"
-connection = "md:my_database"
-options = { token = "${MOTHERDUCK_TOKEN}" }
-
-[cache]
-enabled = true
-engine = "duckdb"
-connection = "/tmp/cache.duck"
-max_duration_secs = 3600
-options = { threads = 4 }
-```

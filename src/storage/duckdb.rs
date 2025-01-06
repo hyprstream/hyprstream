@@ -7,19 +7,44 @@
 //! - SQL query capabilities
 //! - Time-based filtering
 //!
+//! # Configuration
+//!
+//! The DuckDB backend can be configured using the following options:
+//!
+//! ```toml
+//! [engine]
+//! engine = "duckdb"
+//! connection = ":memory:"  # Use ":memory:" for in-memory or file path
+//! options = {
+//!     threads = "4",      # Optional: Number of threads (default: 4)
+//!     read_only = "false" # Optional: Read-only mode (default: false)
+//! }
+//! ```
+//!
+//! Or via command line:
+//!
+//! ```bash
+//! hyprstream \
+//!   --engine duckdb \
+//!   --engine-connection ":memory:" \
+//!   --engine-options threads=4 \
+//!   --engine-options read_only=false
+//! ```
+//!
 //! DuckDB is particularly well-suited for analytics workloads and
 //! provides excellent performance for both caching and primary storage.
 
+use crate::config::Credentials;
 use crate::metrics::MetricRecord;
-use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
+use crate::storage::StorageBackend;
+use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
-use duckdb::Connection;
+use duckdb::{Connection, Config};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tonic::Status;
-
-use crate::storage::StorageBackend;
 
 /// DuckDB-based storage backend for metrics.
 ///
@@ -32,9 +57,11 @@ use crate::storage::StorageBackend;
 /// The implementation uses connection pooling and prepared statements
 /// for optimal performance.
 pub struct DuckDbBackend {
-    /// Thread-safe connection to DuckDB
+    /// Connection pool
     conn: Arc<Mutex<Connection>>,
+    /// Connection string (file path or ":memory:")
     connection_string: String,
+    /// Connection options
     options: HashMap<String, String>,
 }
 
@@ -64,18 +91,8 @@ impl DuckDbBackend {
     ///
     /// A Result containing either the backend or a Status error.
     pub fn new(connection_string: &str) -> Result<Self, Status> {
-        let conn = if connection_string == ":memory:" {
-            Connection::open_in_memory()
-        } else {
-            Connection::open(connection_string)
-        }
-        .map_err(|e| Status::internal(format!("Failed to open DuckDB connection: {}", e)))?;
-
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-            connection_string: connection_string.to_string(),
-            options: HashMap::new(),
-        })
+        let config = Config::default();
+        Self::new_with_config(connection_string, config)
     }
 
     /// Creates the necessary database tables and indexes.
@@ -85,7 +102,7 @@ impl DuckDbBackend {
     /// 2. Creates indexes for efficient querying
     /// 3. Sets up the schema for metric storage
     async fn create_tables(&self) -> Result<(), Status> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().await;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS metrics (
                 metric_id TEXT NOT NULL,
@@ -105,8 +122,8 @@ impl DuckDbBackend {
     /// Gets a connection from the pool.
     ///
     /// This method provides thread-safe access to the DuckDB connection.
-    async fn get_connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>, Status> {
-        Ok(self.conn.lock().unwrap())
+    async fn get_connection(&self) -> Result<tokio::sync::MutexGuard<'_, Connection>, Status> {
+        Ok(self.conn.lock().await)
     }
 
     /// Converts a vector of MetricRecords to an Arrow RecordBatch.
@@ -330,6 +347,77 @@ impl DuckDbBackend {
 
         opts
     }
+
+    /// Creates a new DuckDB backend with configuration.
+    pub fn new_with_config(connection_string: &str, config: Config) -> Result<Self, Status> {
+        let conn = if connection_string == ":memory:" {
+            Connection::open_in_memory_with_flags(config)
+        } else {
+            Connection::open_with_flags(connection_string, config)
+        }
+        .map_err(|e| Status::internal(format!("Failed to open connection: {}", e)))?;
+        
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            connection_string: connection_string.to_string(),
+            options: HashMap::new(),
+        })
+    }
+
+    async fn execute(&self, query: &str) -> Result<(), Status> {
+        let conn = self.conn.lock().await;
+        conn.execute_batch(query)
+            .map_err(|e| Status::internal(format!("Failed to execute query: {}", e)))?;
+        Ok(())
+    }
+
+    async fn query(&self, query: &str) -> Result<RecordBatch, Status> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(query)
+            .map_err(|e| Status::internal(format!("Failed to prepare query: {}", e)))?;
+        let mut rows = stmt.query([])
+            .map_err(|e| Status::internal(format!("Failed to execute query: {}", e)))?;
+        
+        // Convert rows to RecordBatch
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        
+        let mut values = Vec::new();
+        while let Ok(Some(row)) = rows.next() {
+            let value: String = row.get(0)
+                .map_err(|e| Status::internal(format!("Failed to get value: {}", e)))?;
+            values.push(value);
+        }
+        
+        let array = StringArray::from(values);
+        Ok(RecordBatch::try_new(schema, vec![Arc::new(array)])
+            .map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))?)
+    }
+
+    fn new_with_options(
+        connection_string: &str,
+        options: &HashMap<String, String>,
+        _credentials: Option<&Credentials>,
+    ) -> Result<Self, Status> {
+        let mut config = Config::default();
+        if let Some(threads) = options.get("threads").and_then(|s| s.parse().ok()) {
+            config = config.threads(threads)
+                .map_err(|e| Status::internal(format!("Failed to set threads: {}", e)))?;
+        }
+        if let Some(read_only) = options.get("read_only").and_then(|s| s.parse().ok()) {
+            config = config.access_mode(if read_only {
+                duckdb::AccessMode::ReadOnly
+            } else {
+                duckdb::AccessMode::ReadWrite
+            })
+            .map_err(|e| Status::internal(format!("Failed to set access mode: {}", e)))?;
+        }
+
+        let mut backend = Self::new_with_config(connection_string, config)?;
+        backend.options = options.clone();
+        Ok(backend)
+    }
 }
 
 #[async_trait]
@@ -338,10 +426,23 @@ impl StorageBackend for DuckDbBackend {
     ///
     /// Creates necessary tables and indexes for metric storage.
     async fn init(&self) -> Result<(), Status> {
-        // Initialize DuckDB with connection string and options
-        let opts = self.create_connection_options();
+        let conn = self.conn.lock().await;
+        
+        // Create metrics table if it doesn't exist
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS metrics (
+                metric_id VARCHAR NOT NULL,
+                timestamp BIGINT NOT NULL,
+                value_running_window_sum DOUBLE PRECISION NOT NULL,
+                value_running_window_avg DOUBLE PRECISION NOT NULL,
+                value_running_window_count BIGINT NOT NULL,
+                PRIMARY KEY (metric_id, timestamp)
+            )
+            "#,
+        )
+        .map_err(|e| Status::internal(format!("Failed to create metrics table: {}", e)))?;
 
-        // TODO: Initialize DuckDB with connection string and options
         Ok(())
     }
 
@@ -382,5 +483,29 @@ impl StorageBackend for DuckDbBackend {
         let sql = std::str::from_utf8(statement_handle)
             .map_err(|e| Status::internal(format!("Invalid UTF-8 in statement handle: {}", e)))?;
         self.execute_query(sql).await
+    }
+
+    fn new_with_options(
+        connection_string: &str,
+        options: &HashMap<String, String>,
+        _credentials: Option<&Credentials>,
+    ) -> Result<Self, Status> {
+        let mut config = Config::default();
+        if let Some(threads) = options.get("threads").and_then(|s| s.parse().ok()) {
+            config = config.threads(threads)
+                .map_err(|e| Status::internal(format!("Failed to set threads: {}", e)))?;
+        }
+        if let Some(read_only) = options.get("read_only").and_then(|s| s.parse().ok()) {
+            config = config.access_mode(if read_only {
+                duckdb::AccessMode::ReadOnly
+            } else {
+                duckdb::AccessMode::ReadWrite
+            })
+            .map_err(|e| Status::internal(format!("Failed to set access mode: {}", e)))?;
+        }
+
+        let mut backend = Self::new_with_config(connection_string, config)?;
+        backend.options = options.clone();
+        Ok(backend)
     }
 }

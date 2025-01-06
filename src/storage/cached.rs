@@ -6,12 +6,55 @@
 //! - Configurable cache duration
 //! - Support for any StorageBackend as cache or store
 //!
+//! # Configuration
+//!
+//! The cached backend can be configured using the following options:
+//!
+//! ```toml
+//! # Primary storage configuration
+//! [engine]
+//! engine = "adbc"
+//! connection = "postgresql://localhost:5432"
+//! options = {
+//!     driver_path = "/usr/local/lib/libadbc_driver_postgresql.so",
+//!     username = "postgres",
+//!     database = "metrics"
+//! }
+//!
+//! # Cache configuration
+//! [cache]
+//! enabled = true
+//! engine = "duckdb"
+//! connection = ":memory:"
+//! max_duration_secs = 3600
+//! options = {
+//!     threads = "2"
+//! }
+//! ```
+//!
+//! Or via command line:
+//!
+//! ```bash
+//! hyprstream \
+//!   --engine adbc \
+//!   --engine-connection "postgresql://localhost:5432" \
+//!   --engine-options driver_path=/usr/local/lib/libadbc_driver_postgresql.so \
+//!   --engine-options username=postgres \
+//!   --enable-cache \
+//!   --cache-engine duckdb \
+//!   --cache-connection ":memory:" \
+//!   --cache-options threads=2 \
+//!   --cache-max-duration 3600
+//! ```
+//!
 //! The implementation follows standard caching patterns while ensuring
 //! data consistency between cache and backing store.
 
+use crate::config::Credentials;
 use crate::metrics::MetricRecord;
-use crate::storage::StorageBackend;
+use crate::storage::{StorageBackend, adbc::AdbcBackend, duckdb::DuckDbBackend};
 use std::sync::Arc;
+use std::collections::HashMap;
 use tonic::Status;
 
 /// Two-tier storage backend with caching support.
@@ -152,5 +195,51 @@ impl StorageBackend for CachedStorageBackend {
     async fn query_sql(&self, statement_handle: &[u8]) -> Result<Vec<MetricRecord>, Status> {
         // Execute on backing store only
         self.store.query_sql(statement_handle).await
+    }
+
+    fn new_with_options(
+        connection_string: &str,
+        options: &HashMap<String, String>,
+        credentials: Option<&Credentials>,
+    ) -> Result<Self, Status> {
+        // Parse cache duration from options
+        let max_duration_secs = options
+            .get("max_duration_secs")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3600);
+
+        // Create cache backend
+        let default_engine = "duckdb".to_string();
+        let default_connection = ":memory:".to_string();
+        let cache_engine = options.get("cache_engine").unwrap_or(&default_engine);
+        let cache_connection = options.get("cache_connection").unwrap_or(&default_connection);
+        let cache_options: HashMap<String, String> = options
+            .iter()
+            .filter(|(k, _)| k.starts_with("cache_"))
+            .map(|(k, v)| (k[6..].to_string(), v.clone()))
+            .collect();
+
+        let cache: Arc<dyn StorageBackend> = match cache_engine.as_str() {
+            "duckdb" => Arc::new(DuckDbBackend::new_with_options(
+                cache_connection,
+                &cache_options,
+                None,
+            )?),
+            "adbc" => Arc::new(AdbcBackend::new_with_options(
+                cache_connection,
+                &cache_options,
+                None,
+            )?),
+            _ => return Err(Status::invalid_argument("Invalid cache engine type")),
+        };
+
+        // Create store backend
+        let store = Arc::new(AdbcBackend::new_with_options(
+            connection_string,
+            options,
+            credentials,
+        )?);
+
+        Ok(Self::new(cache, store, max_duration_secs))
     }
 }
