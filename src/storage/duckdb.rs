@@ -36,9 +36,9 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use duckdb::{Connection, Config};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tonic::Status;
 use crate::metrics::MetricRecord;
 use crate::config::Credentials;
@@ -52,6 +52,8 @@ pub struct DuckDbBackend {
     connection_string: String,
     options: HashMap<String, String>,
     ttl: Option<u64>,
+    last_eviction: Arc<RwLock<SystemTime>>,
+    min_eviction_interval: Duration,
 }
 
 #[async_trait]
@@ -162,6 +164,8 @@ impl DuckDbBackend {
             connection_string,
             options,
             ttl,
+            last_eviction: Arc::new(RwLock::new(SystemTime::now())),
+            min_eviction_interval: Duration::from_secs(60), // Minimum 60s between evictions
         };
 
         // Initialize tables
@@ -181,24 +185,49 @@ impl DuckDbBackend {
     }
 
     /// Evicts expired entries from the cache based on TTL.
+    /// Uses a rate limiter to prevent too frequent evictions.
     async fn evict_expired(&self) -> Result<(), Status> {
         if let Some(ttl) = self.ttl {
             if ttl == 0 {
                 return Ok(()); // TTL of 0 means no expiration
             }
 
-            let cutoff = SystemTime::now()
+            // Check if enough time has passed since last eviction
+            let now = SystemTime::now();
+            let last = *self.last_eviction.read().await;
+            if now.duration_since(last).unwrap_or(Duration::from_secs(0)) < self.min_eviction_interval {
+                return Ok(());
+            }
+
+            // Update last eviction time before performing eviction
+            *self.last_eviction.write().await = now;
+
+            let cutoff = now
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs()
                 - ttl;
 
+            // Use an optimized DELETE with USING clause for better index utilization
             let query = format!(
-                "DELETE FROM metrics WHERE timestamp < {}",
+                "DELETE FROM metrics USING (
+                    SELECT timestamp 
+                    FROM metrics 
+                    WHERE timestamp < {} 
+                    LIMIT 10000
+                ) as expired 
+                WHERE metrics.timestamp = expired.timestamp",
                 cutoff
             );
 
-            self.execute(&query).await?;
+            // Spawn eviction in background
+            let conn = self.conn.clone();
+            tokio::spawn(async move {
+                let conn_guard = conn.lock().await;
+                if let Err(e) = conn_guard.execute_batch(&query) {
+                    eprintln!("Background eviction error: {}", e);
+                }
+            });
         }
         Ok(())
     }
@@ -217,8 +246,9 @@ impl DuckDbBackend {
 
         self.execute(create_table).await?;
 
+        // Create a more optimized index for TTL-based eviction
         let create_index = r#"
-            CREATE INDEX IF NOT EXISTS metrics_timestamp_idx ON metrics (timestamp)
+            CREATE INDEX IF NOT EXISTS metrics_timestamp_idx ON metrics(timestamp) WITH (prefetch_blocks = 8)
         "#;
 
         self.execute(create_index).await
