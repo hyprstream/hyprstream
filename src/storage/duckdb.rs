@@ -59,40 +59,29 @@ use tonic::Status;
 pub struct DuckDbBackend {
     /// Connection pool
     conn: Arc<Mutex<Connection>>,
-    /// Connection string (file path or ":memory:")
-    connection_string: String,
-    /// Connection options
-    options: HashMap<String, String>,
 }
 
 impl DuckDbBackend {
     /// Creates a new DuckDB backend with an in-memory database.
-    ///
-    /// This is useful for:
-    /// - Temporary storage
-    /// - Caching layers
-    /// - Testing environments
     pub fn new_in_memory() -> Self {
         Self {
             conn: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
-            connection_string: ":memory:".to_string(),
-            options: HashMap::new(),
         }
     }
 
     /// Creates a new DuckDB backend with the specified connection string.
-    ///
-    /// # Arguments
-    ///
-    /// * `connection_string` - The connection string to use. Can be ":memory:" for an in-memory
-    ///   database or a path to a file for persistent storage.
-    ///
-    /// # Returns
-    ///
-    /// A Result containing either the backend or a Status error.
     pub fn new(connection_string: &str) -> Result<Self, Status> {
         let config = Config::default();
-        Self::new_with_config(connection_string, config)
+        let conn = if connection_string == ":memory:" {
+            Connection::open_in_memory_with_flags(config)
+        } else {
+            Connection::open_with_flags(connection_string, config)
+        }
+        .map_err(|e| Status::internal(format!("Failed to open DuckDB connection: {}", e)))?;
+
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     /// Creates the necessary database tables and indexes.
@@ -335,16 +324,9 @@ impl DuckDbBackend {
 
     /// Create connection options from configuration
     fn create_connection_options(&self) -> HashMap<String, String> {
-        let mut opts = self.options.clone();
-
-        // Set defaults if not specified
-        if !opts.contains_key("threads") {
-            opts.insert("threads".to_string(), "4".to_string());
-        }
-        if !opts.contains_key("read_only") {
-            opts.insert("read_only".to_string(), "false".to_string());
-        }
-
+        let mut opts = HashMap::new();
+        opts.insert("threads".to_string(), "4".to_string());
+        opts.insert("read_only".to_string(), "false".to_string());
         opts
     }
 
@@ -359,8 +341,6 @@ impl DuckDbBackend {
         
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
-            connection_string: connection_string.to_string(),
-            options: HashMap::new(),
         })
     }
 
@@ -414,9 +394,16 @@ impl DuckDbBackend {
             .map_err(|e| Status::internal(format!("Failed to set access mode: {}", e)))?;
         }
 
-        let mut backend = Self::new_with_config(connection_string, config)?;
-        backend.options = options.clone();
-        Ok(backend)
+        let conn = if connection_string == ":memory:" {
+            Connection::open_in_memory_with_flags(config)
+        } else {
+            Connection::open_with_flags(connection_string, config)
+        }
+        .map_err(|e| Status::internal(format!("Failed to open DuckDB connection: {}", e)))?;
+
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 }
 
@@ -504,8 +491,15 @@ impl StorageBackend for DuckDbBackend {
             .map_err(|e| Status::internal(format!("Failed to set access mode: {}", e)))?;
         }
 
-        let mut backend = Self::new_with_config(connection_string, config)?;
-        backend.options = options.clone();
-        Ok(backend)
+        let conn = if connection_string == ":memory:" {
+            Connection::open_in_memory_with_flags(config)
+        } else {
+            Connection::open_with_flags(connection_string, config)
+        }
+        .map_err(|e| Status::internal(format!("Failed to open DuckDB connection: {}", e)))?;
+
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 }

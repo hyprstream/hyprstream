@@ -46,7 +46,7 @@ use crate::config::Credentials;
 use crate::metrics::MetricRecord;
 use crate::storage::StorageBackend;
 use adbc_core::{
-    driver_manager::{ManagedConnection, ManagedDatabase, ManagedDriver},
+    driver_manager::{ManagedConnection, ManagedDriver},
     options::{AdbcVersion, OptionDatabase, OptionValue},
     Connection, Database, Driver, Statement, Optionable,
 };
@@ -60,7 +60,6 @@ use tokio::sync::Mutex;
 use tonic::Status;
 
 pub struct AdbcBackend {
-    database: Arc<ManagedDatabase>,
     conn: Arc<Mutex<ManagedConnection>>,
     statement_counter: AtomicU64,
     prepared_statements: Arc<Mutex<Vec<(u64, String)>>>,
@@ -97,7 +96,6 @@ impl AdbcBackend {
             .map_err(|e| Status::internal(format!("Failed to create connection: {}", e)))?;
 
         Ok(Self {
-            database: Arc::new(database),
             conn: Arc::new(Mutex::new(connection)),
             statement_counter: AtomicU64::new(0),
             prepared_statements: Arc::new(Mutex::new(Vec::new())),

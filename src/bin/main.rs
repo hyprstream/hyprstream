@@ -204,11 +204,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &settings.engine.options,
             None,
         )?),
-        _ => panic!("Unsupported engine backend"),
+        engine => return Err(format!("Unsupported engine backend: {}", engine).into()),
     };
 
     // Create the cache backend if configured
-    let _cache_backend = if settings.cache.enabled {
+    let cache_backend = if settings.cache.enabled {
         match settings.cache.engine.as_str() {
             "adbc" => Some(Arc::new(
                 AdbcBackend::new_with_options(
@@ -222,15 +222,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &settings.cache.options,
                 None,
             )?) as Arc<dyn StorageBackend>),
-            _ => panic!("Unsupported cache backend"),
+            engine => return Err(format!("Unsupported cache backend: {}", engine).into()),
         }
     } else {
         None
     };
 
+    // Initialize the backends
+    engine_backend.init().await?;
+    if let Some(ref cache) = cache_backend {
+        cache.init().await?;
+    }
+
     // Create and start the service
     let addr = format!("{}:{}", settings.server.host, settings.server.port).parse()?;
-    let service = FlightServiceImpl::new(engine_backend);
+    let service = match cache_backend {
+        Some(cache) => FlightServiceImpl::new_with_cache(engine_backend, cache),
+        None => FlightServiceImpl::new(engine_backend),
+    };
     let service = FlightServiceServer::new(service);
 
     println!("Starting server on {}", addr);

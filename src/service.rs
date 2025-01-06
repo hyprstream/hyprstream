@@ -9,7 +9,7 @@
 //! The service implementation is designed to work with multiple storage backends
 //! while maintaining consistent query semantics and high performance.
 
-use crate::metrics::{create_record_batch, encode_record_batch, METRICS_SCHEMA};
+use crate::metrics::{create_record_batch, encode_record_batch, METRICS_SCHEMA, MetricRecord};
 use crate::storage::StorageBackend;
 use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -41,8 +41,10 @@ type DoGetStream = Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send 
 /// - High-performance data transport using Arrow's columnar format
 #[derive(Clone)]
 pub struct FlightServiceImpl {
-    /// Storage backend for executing queries and storing data
+    /// Primary storage backend for executing queries and storing data
     backend: Arc<dyn StorageBackend>,
+    /// Optional cache backend for improved read performance
+    cache: Option<Arc<dyn StorageBackend>>,
 }
 
 impl FlightServiceImpl {
@@ -52,7 +54,23 @@ impl FlightServiceImpl {
     ///
     /// * `backend` - Arc-wrapped storage backend implementing the StorageBackend trait
     pub fn new(backend: Arc<dyn StorageBackend>) -> Self {
-        Self { backend }
+        Self { 
+            backend,
+            cache: None,
+        }
+    }
+
+    /// Creates a new Flight SQL service with primary and cache backends.
+    ///
+    /// # Arguments
+    ///
+    /// * `backend` - Primary storage backend
+    /// * `cache` - Cache storage backend
+    pub fn new_with_cache(backend: Arc<dyn StorageBackend>, cache: Arc<dyn StorageBackend>) -> Self {
+        Self {
+            backend,
+            cache: Some(cache),
+        }
     }
 
     /// Extracts timestamp conditions from SQL expressions for query optimization.
@@ -125,6 +143,31 @@ impl FlightServiceImpl {
             }
             _ => false,
         }
+    }
+
+    async fn query_metrics_with_cache(&self, from_timestamp: i64) -> Result<Vec<MetricRecord>, Status> {
+        // Try cache first if available
+        if let Some(ref cache) = self.cache {
+            match cache.query_metrics(from_timestamp).await {
+                Ok(metrics) => return Ok(metrics),
+                Err(_) => {} // Cache miss or error, fall through to primary backend
+            }
+        }
+
+        // Query from primary backend
+        let metrics = self.backend.query_metrics(from_timestamp).await?;
+
+        // Update cache if available
+        if let Some(ref cache) = self.cache {
+            if !metrics.is_empty() {
+                if let Err(e) = cache.insert_metrics(metrics.clone()).await {
+                    // Log cache update error but don't fail the query
+                    eprintln!("Failed to update cache: {}", e);
+                }
+            }
+        }
+
+        Ok(metrics)
     }
 }
 
@@ -326,7 +369,7 @@ impl FlightSqlService for FlightServiceImpl {
                                 Self::extract_timestamp_condition(selection)
                             {
                                 // Query the metrics using the backend's SQL capabilities
-                                let data = self.backend.query_metrics(from_timestamp).await?;
+                                let data = self.query_metrics_with_cache(from_timestamp).await?;
                                 let batch = create_record_batch(data)?;
                                 let (header, body) = encode_record_batch(&batch)?;
 
