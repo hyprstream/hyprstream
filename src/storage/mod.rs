@@ -14,7 +14,6 @@ pub mod duckdb;
 
 use crate::config::Credentials;
 use crate::metrics::MetricRecord;
-use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use tonic::Status;

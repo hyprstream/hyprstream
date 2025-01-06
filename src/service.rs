@@ -15,11 +15,11 @@ use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow_flight::{
-    flight_service_server::FlightService,
     sql::{
-        server::FlightSqlService, CommandGetCatalogs, CommandGetDbSchemas, CommandGetSqlInfo,
-        CommandGetTableTypes, CommandGetTables, CommandPreparedStatementQuery, SqlInfo,
-        TicketStatementQuery,
+        server::FlightSqlService,
+        CommandGetCatalogs, CommandGetDbSchemas, CommandGetSqlInfo,
+        CommandGetTableTypes, CommandGetTables, CommandPreparedStatementQuery,
+        SqlInfo, TicketStatementQuery,
     },
     FlightData, Ticket,
 };

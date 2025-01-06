@@ -208,7 +208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Create the cache backend if configured
-    let cache_backend = if settings.cache.enabled {
+    let _cache_backend = if settings.cache.enabled {
         match settings.cache.engine.as_str() {
             "adbc" => Some(Arc::new(
                 AdbcBackend::new_with_options(

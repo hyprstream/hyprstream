@@ -37,7 +37,7 @@
 use crate::config::Credentials;
 use crate::metrics::MetricRecord;
 use crate::storage::StorageBackend;
-use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use duckdb::{Connection, Config};

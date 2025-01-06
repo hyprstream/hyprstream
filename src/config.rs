@@ -19,11 +19,10 @@
 //! - `HYPRSTREAM_CACHE_PASSWORD` - Cache backend password (if needed)
 
 use clap::Parser;
-use config::{Config, ConfigError, File};
+use config::{Config, ConfigError};
 use serde::Deserialize;
 use std::env;
 use std::path::PathBuf;
-use tracing as log;
 
 const DEFAULT_CONFIG: &str = include_str!("../config/default.toml");
 const DEFAULT_CONFIG_PATH: &str = "/etc/hyprstream/config.toml";
