@@ -36,13 +36,13 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use duckdb::{Connection, Config};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tonic::Status;
 use crate::metrics::MetricRecord;
 use crate::config::Credentials;
 use crate::storage::StorageBackend;
+use crate::storage::cache::{CacheManager, CacheEviction};
 use async_trait::async_trait;
 
 /// DuckDB-based storage backend for metrics.
@@ -51,9 +51,22 @@ pub struct DuckDbBackend {
     conn: Arc<Mutex<Connection>>,
     connection_string: String,
     options: HashMap<String, String>,
-    ttl: Option<u64>,
-    last_eviction: Arc<RwLock<SystemTime>>,
-    min_eviction_interval: Duration,
+    cache_manager: CacheManager,
+}
+
+#[async_trait]
+impl CacheEviction for DuckDbBackend {
+    async fn execute_eviction(&self, query: &str) -> Result<(), Status> {
+        let conn = self.conn.clone();
+        let query = query.to_string();
+        tokio::spawn(async move {
+            let conn_guard = conn.lock().await;
+            if let Err(e) = conn_guard.execute_batch(&query) {
+                eprintln!("Background eviction error: {}", e);
+            }
+        });
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -63,8 +76,11 @@ impl StorageBackend for DuckDbBackend {
     }
 
     async fn insert_metrics(&self, metrics: Vec<MetricRecord>) -> Result<(), Status> {
-        // Evict expired entries before inserting new ones
-        self.evict_expired().await?;
+        // Check if eviction is needed
+        if let Some(cutoff) = self.cache_manager.should_evict().await? {
+            let query = self.cache_manager.eviction_query(cutoff);
+            self.execute_eviction(&query).await?;
+        }
 
         let mut query = String::from("INSERT INTO metrics (timestamp, metric_id, value_running_window_sum, value_running_window_avg, value_running_window_count) VALUES ");
         let mut first = true;
@@ -89,8 +105,11 @@ impl StorageBackend for DuckDbBackend {
     }
 
     async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<MetricRecord>, Status> {
-        // Evict expired entries before querying
-        self.evict_expired().await?;
+        // Check if eviction is needed
+        if let Some(cutoff) = self.cache_manager.should_evict().await? {
+            let query = self.cache_manager.eviction_query(cutoff);
+            self.execute_eviction(&query).await?;
+        }
 
         let query = format!(
             "SELECT timestamp, metric_id, value_running_window_sum, value_running_window_avg, value_running_window_count \
@@ -121,8 +140,6 @@ impl StorageBackend for DuckDbBackend {
     }
 
     async fn prepare_sql(&self, query: &str) -> Result<Vec<u8>, Status> {
-        // DuckDB doesn't support prepared statement handles in the same way as ADBC,
-        // so we just store the SQL string as bytes
         Ok(query.as_bytes().to_vec())
     }
 
@@ -163,9 +180,7 @@ impl DuckDbBackend {
             conn: Arc::new(Mutex::new(conn)),
             connection_string,
             options,
-            ttl,
-            last_eviction: Arc::new(RwLock::new(SystemTime::now())),
-            min_eviction_interval: Duration::from_secs(60), // Minimum 60s between evictions
+            cache_manager: CacheManager::new(ttl),
         };
 
         // Initialize tables
@@ -182,54 +197,6 @@ impl DuckDbBackend {
     /// Creates a new DuckDB backend with an in-memory database.
     pub fn new_in_memory() -> Result<Self, Status> {
         Self::new(":memory:".to_string(), HashMap::new(), Some(0))
-    }
-
-    /// Evicts expired entries from the cache based on TTL.
-    /// Uses a rate limiter to prevent too frequent evictions.
-    async fn evict_expired(&self) -> Result<(), Status> {
-        if let Some(ttl) = self.ttl {
-            if ttl == 0 {
-                return Ok(()); // TTL of 0 means no expiration
-            }
-
-            // Check if enough time has passed since last eviction
-            let now = SystemTime::now();
-            let last = *self.last_eviction.read().await;
-            if now.duration_since(last).unwrap_or(Duration::from_secs(0)) < self.min_eviction_interval {
-                return Ok(());
-            }
-
-            // Update last eviction time before performing eviction
-            *self.last_eviction.write().await = now;
-
-            let cutoff = now
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                - ttl;
-
-            // Use an optimized DELETE with USING clause for better index utilization
-            let query = format!(
-                "DELETE FROM metrics USING (
-                    SELECT timestamp 
-                    FROM metrics 
-                    WHERE timestamp < {} 
-                    LIMIT 10000
-                ) as expired 
-                WHERE metrics.timestamp = expired.timestamp",
-                cutoff
-            );
-
-            // Spawn eviction in background
-            let conn = self.conn.clone();
-            tokio::spawn(async move {
-                let conn_guard = conn.lock().await;
-                if let Err(e) = conn_guard.execute_batch(&query) {
-                    eprintln!("Background eviction error: {}", e);
-                }
-            });
-        }
-        Ok(())
     }
 
     /// Creates the necessary tables in the database.
