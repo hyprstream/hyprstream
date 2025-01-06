@@ -71,14 +71,13 @@ For detailed configuration options and examples, see:
 - [`examples`](examples/) directory for more usage examples
 */
 
-pub mod config;
 pub mod metrics;
-pub mod service;
 pub mod storage;
+pub mod service;
+pub mod config;
+pub mod aggregation;
 
-// Re-export commonly used items
-pub use crate::metrics::MetricRecord;
-pub use crate::service::FlightServiceImpl;
-pub use crate::storage::{
-    adbc::AdbcBackend, duckdb::DuckDbBackend, StorageBackend,
-};
+pub use service::FlightSqlService;
+pub use storage::StorageBackend;
+pub use metrics::MetricRecord;
+pub use aggregation::{TimeWindow, AggregateFunction, GroupBy, AggregateResult};

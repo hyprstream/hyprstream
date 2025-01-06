@@ -171,87 +171,75 @@
 use clap::Parser;
 use hyprstream_core::{
     config::{CliArgs, Settings},
-    service::FlightServiceImpl,
-    storage::{
-        adbc::AdbcBackend,
-        duckdb::DuckDbBackend,
-        StorageBackend,
-    },
+    service::FlightSqlService,
+    storage::{StorageBackend, adbc::AdbcBackend, duckdb::DuckDbBackend},
 };
 use std::sync::Arc;
 use tonic::transport::Server;
-use arrow_flight::flight_service_server::FlightServiceServer;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Parse command line arguments
     let cli_args = CliArgs::parse();
     
-    // Initialize settings with CLI args
+    // Load settings from config file and CLI args
     let settings = Settings::new(cli_args)?;
-
-    // Create the engine backend
-    let engine_backend: Arc<dyn StorageBackend> = match settings.engine.engine.as_str() {
-        "adbc" => Arc::new(
-            AdbcBackend::new_with_options(
+    
+    // Create the storage backend based on configuration
+    let engine_backend: Box<dyn StorageBackend> = match settings.engine.engine.as_str() {
+        "adbc" => {
+            Box::new(AdbcBackend::new_with_options(
                 &settings.engine.connection,
                 &settings.engine.options,
                 settings.engine.credentials.as_ref(),
-            )?
-        ),
-        "duckdb" => Arc::new(DuckDbBackend::new_with_options(
-            &settings.engine.connection,
-            &settings.engine.options,
-            None,
-        )?),
-        engine => return Err(format!("Unsupported engine backend: {}", engine).into()),
+            )?)
+        }
+        "duckdb" => {
+            Box::new(DuckDbBackend::new_with_options(
+                &settings.engine.connection,
+                &settings.engine.options,
+                settings.engine.credentials.as_ref(),
+            )?)
+        }
+        _ => return Err("Unsupported engine type".into()),
     };
 
-    // Create the cache backend if configured
-    let cache_backend = if settings.cache.enabled {
-        // Add TTL to options if configured
-        let mut cache_options = settings.cache.options.clone();
-        if let Some(ttl) = settings.cache.ttl {
-            cache_options.insert("ttl".to_string(), ttl.to_string());
-        }
+    // Initialize the storage backend
+    engine_backend.init().await?;
 
-        match settings.cache.engine.as_str() {
-            "adbc" => Some(Arc::new(
-                AdbcBackend::new_with_options(
-                    &settings.cache.connection,
-                    &cache_options,
-                    settings.cache.credentials.as_ref(),
-                )?
-            ) as Arc<dyn StorageBackend>),
-            "duckdb" => Some(Arc::new(DuckDbBackend::new_with_options(
-                &settings.cache.connection,
-                &cache_options,
-                None,
-            )?) as Arc<dyn StorageBackend>),
-            engine => return Err(format!("Unsupported cache backend: {}", engine).into()),
-        }
+    // Create cache backend if configured
+    let cache_backend = if settings.cache.enabled {
+        let cache_config = &settings.cache;
+        let backend: Box<dyn StorageBackend> = match cache_config.engine.as_str() {
+            "adbc" => {
+                Box::new(AdbcBackend::new_with_options(
+                    &cache_config.connection,
+                    &cache_config.options,
+                    cache_config.credentials.as_ref(),
+                )?)
+            }
+            "duckdb" => {
+                Box::new(DuckDbBackend::new_with_options(
+                    &cache_config.connection,
+                    &cache_config.options,
+                    cache_config.credentials.as_ref(),
+                )?)
+            }
+            _ => return Err("Unsupported cache engine type".into()),
+        };
+        Some(backend)
     } else {
         None
     };
 
-    // Initialize the backends
-    engine_backend.init().await?;
-    if let Some(ref cache) = cache_backend {
-        cache.init().await?;
-    }
+    // Create the Flight SQL service
+    let service = FlightSqlService::new(engine_backend);
 
-    // Create and start the service
+    // Start the server
     let addr = format!("{}:{}", settings.server.host, settings.server.port).parse()?;
-    let service = match cache_backend {
-        Some(cache) => FlightServiceImpl::new_with_cache(engine_backend, cache),
-        None => FlightServiceImpl::new(engine_backend),
-    };
-    let service = FlightServiceServer::new(service);
-
     println!("Starting server on {}", addr);
-
+    
     Server::builder()
-        .add_service(service)
+        .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(service))
         .serve(addr)
         .await?;
 

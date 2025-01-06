@@ -16,74 +16,137 @@ use arrow_flight::{
     Action, ActionType, Criteria, FlightData, FlightDescriptor, FlightInfo,
     HandshakeRequest, HandshakeResponse, PutResult, SchemaResult, Ticket,
     Location, FlightEndpoint, Empty, Result as FlightResult,
+    IpcMessage,
+    PollInfo,
 };
-use arrow_ipc::{writer::StreamWriter, reader::StreamReader};
+use arrow_array::RecordBatch;
+use arrow_schema::Schema;
+use arrow_ipc::{writer, reader};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use std::pin::Pin;
 use std::sync::Arc;
 use tonic::{Request, Response, Status, Streaming};
+use crate::storage::table_manager::AggregationView;
+use serde::Deserialize;
+use serde_json;
+use arrow_ipc::{convert::fb_to_schema, root_as_message};
 
-pub struct FlightServiceImpl {
-    backend: Arc<dyn StorageBackend>,
-    cache: Option<Arc<dyn StorageBackend>>,
+/// Command types for table and view operations
+#[derive(Debug)]
+enum TableCommand {
+    CreateTable {
+        name: String,
+        schema: Arc<Schema>,
+    },
+    CreateAggregationView(AggregationView),
+    DropTable(String),
+    DropAggregationView(String),
 }
 
-impl FlightServiceImpl {
-    pub fn new(backend: Arc<dyn StorageBackend>) -> Self {
-        Self {
-            backend,
-            cache: None,
+impl TableCommand {
+    fn from_json(cmd: &[u8]) -> Result<Self, Status> {
+        #[derive(Deserialize)]
+        struct CreateTableCmd {
+            name: String,
+            schema_bytes: Vec<u8>,
         }
-    }
 
-    pub fn new_with_cache(backend: Arc<dyn StorageBackend>, cache: Arc<dyn StorageBackend>) -> Self {
-        Self {
-            backend,
-            cache: Some(cache),
+        let value: serde_json::Value = serde_json::from_slice(cmd)
+            .map_err(|e| Status::invalid_argument(format!("Invalid JSON: {}", e)))?;
+
+        match value.get("type").and_then(|t| t.as_str()) {
+            Some("create_table") => {
+                let cmd: CreateTableCmd = serde_json::from_value(value["data"].clone())
+                    .map_err(|e| Status::invalid_argument(format!("Invalid create table command: {}", e)))?;
+                
+                // Convert schema bytes to Schema using Arrow IPC
+                let message = arrow_ipc::root_as_message(&cmd.schema_bytes[..])
+                    .map_err(|e| Status::invalid_argument(format!("Invalid schema bytes: {}", e)))?;
+                let schema = message.header_as_schema()
+                    .ok_or_else(|| Status::invalid_argument("Message is not a schema"))?;
+                let schema = arrow_ipc::convert::fb_to_schema(schema);
+                
+                Ok(TableCommand::CreateTable {
+                    name: cmd.name,
+                    schema: Arc::new(schema),
+                })
+            }
+            Some("create_aggregation_view") => {
+                let view: AggregationView = serde_json::from_value(value["data"].clone())
+                    .map_err(|e| Status::invalid_argument(format!("Invalid view command: {}", e)))?;
+                Ok(TableCommand::CreateAggregationView(view))
+            }
+            Some("drop_table") => {
+                let name = value["data"]["name"].as_str()
+                    .ok_or_else(|| Status::invalid_argument("Missing table name"))?;
+                Ok(TableCommand::DropTable(name.to_string()))
+            }
+            Some("drop_aggregation_view") => {
+                let name = value["data"]["name"].as_str()
+                    .ok_or_else(|| Status::invalid_argument("Missing view name"))?;
+                Ok(TableCommand::DropAggregationView(name.to_string()))
+            }
+            _ => Err(Status::invalid_argument("Invalid command type")),
         }
     }
 }
 
-type HandshakeStream = Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send + 'static>>;
-type ListFlightsStream = Pin<Box<dyn Stream<Item = Result<FlightInfo, Status>> + Send + 'static>>;
-type DoGetStream = Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + 'static>>;
-type DoPutStream = Pin<Box<dyn Stream<Item = Result<PutResult, Status>> + Send + 'static>>;
-type DoExchangeStream = Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + 'static>>;
-type DoActionStream = Pin<Box<dyn Stream<Item = Result<FlightResult, Status>> + Send + 'static>>;
-type ListActionsStream = Pin<Box<dyn Stream<Item = Result<ActionType, Status>> + Send + 'static>>;
+pub struct FlightSqlService {
+    backend: Box<dyn StorageBackend>,
+}
+
+impl FlightSqlService {
+    pub fn new(backend: Box<dyn StorageBackend>) -> Self {
+        Self { backend }
+    }
+}
 
 #[tonic::async_trait]
-impl FlightService for FlightServiceImpl {
-    type HandshakeStream = HandshakeStream;
-    type ListFlightsStream = ListFlightsStream;
-    type DoGetStream = DoGetStream;
-    type DoPutStream = DoPutStream;
-    type DoExchangeStream = DoExchangeStream;
-    type DoActionStream = DoActionStream;
-    type ListActionsStream = ListActionsStream;
+impl FlightService for FlightSqlService {
+    type HandshakeStream = Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send + 'static>>;
+    type ListFlightsStream = Pin<Box<dyn Stream<Item = Result<FlightInfo, Status>> + Send + 'static>>;
+    type DoGetStream = Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + 'static>>;
+    type DoPutStream = Pin<Box<dyn Stream<Item = Result<PutResult, Status>> + Send + 'static>>;
+    type DoActionStream = Pin<Box<dyn Stream<Item = Result<arrow_flight::Result, Status>> + Send + 'static>>;
+    type ListActionsStream = Pin<Box<dyn Stream<Item = Result<ActionType, Status>> + Send + 'static>>;
+    type DoExchangeStream = Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + 'static>>;
+
+    async fn get_schema(
+        &self,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<SchemaResult>, Status> {
+        // Implementation here
+        todo!()
+    }
+
+    async fn do_get(
+        &self,
+        request: Request<Ticket>,
+    ) -> Result<Response<Self::DoGetStream>, Status> {
+        // Implementation here
+        todo!()
+    }
 
     async fn handshake(
         &self,
-        _request: Request<Streaming<HandshakeRequest>>,
+        request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
-        let output = vec![Ok(HandshakeResponse {
-            protocol_version: 0,
-            payload: Bytes::new(),
-        })];
-        Ok(Response::new(Box::pin(tokio_stream::iter(output))))
+        // Implementation here
+        todo!()
     }
 
     async fn list_flights(
         &self,
-        _request: Request<Criteria>,
+        request: Request<Criteria>,
     ) -> Result<Response<Self::ListFlightsStream>, Status> {
-        Ok(Response::new(Box::pin(tokio_stream::iter(vec![]))))
+        // Implementation here
+        todo!()
     }
 
     async fn get_flight_info(
         &self,
-        _request: Request<FlightDescriptor>,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         Ok(Response::new(FlightInfo {
             schema: Bytes::new(),
@@ -98,112 +161,40 @@ impl FlightService for FlightServiceImpl {
 
     async fn poll_flight_info(
         &self,
-        _request: Request<FlightDescriptor>,
-    ) -> Result<Response<arrow_flight::PollInfo>, Status> {
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<PollInfo>, Status> {
         Err(Status::unimplemented("poll_flight_info not implemented"))
-    }
-
-    async fn get_schema(
-        &self,
-        _request: Request<FlightDescriptor>,
-    ) -> Result<Response<SchemaResult>, Status> {
-        let schema = get_metrics_schema();
-        let mut schema_buffer = Vec::new();
-        let mut writer = StreamWriter::try_new(&mut schema_buffer, &schema)
-            .map_err(|e| Status::internal(format!("Failed to create writer: {}", e)))?;
-
-        writer.finish()
-            .map_err(|e| Status::internal(format!("Failed to finish writer: {}", e)))?;
-
-        Ok(Response::new(SchemaResult {
-            schema: schema_buffer.into(),
-        }))
-    }
-
-    async fn do_get(
-        &self,
-        request: Request<Ticket>,
-    ) -> Result<Response<Self::DoGetStream>, Status> {
-        let ticket = request.into_inner();
-        let metrics = self.backend.query_sql(&ticket.ticket).await?;
-        let batch = create_record_batch(&metrics)?;
-
-        let schema = get_metrics_schema();
-        let mut schema_buffer = Vec::new();
-        let mut writer = StreamWriter::try_new(&mut schema_buffer, &schema)
-            .map_err(|e| Status::internal(format!("Failed to create writer: {}", e)))?;
-
-        writer.write(&batch)
-            .map_err(|e| Status::internal(format!("Failed to write batch: {}", e)))?;
-
-        writer.finish()
-            .map_err(|e| Status::internal(format!("Failed to finish writer: {}", e)))?;
-
-        let mut data_buffer = Vec::new();
-        let mut writer = StreamWriter::try_new(&mut data_buffer, &schema)
-            .map_err(|e| Status::internal(format!("Failed to create writer: {}", e)))?;
-
-        writer.write(&batch)
-            .map_err(|e| Status::internal(format!("Failed to write batch: {}", e)))?;
-
-        writer.finish()
-            .map_err(|e| Status::internal(format!("Failed to finish writer: {}", e)))?;
-
-        let flight_data = FlightData {
-            data_header: schema_buffer.into(),
-            data_body: data_buffer.into(),
-            app_metadata: Bytes::new(),
-            ..Default::default()
-        };
-
-        Ok(Response::new(Box::pin(tokio_stream::iter(vec![Ok(flight_data)]))))
     }
 
     async fn do_put(
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        let mut stream = request.into_inner();
-        let mut metrics = Vec::new();
-
-        while let Some(data) = stream.next().await {
-            let data = data?;
-            let schema = get_metrics_schema();
-            let reader = StreamReader::try_new(&data.data_body[..], None)
-                .map_err(|e| Status::internal(format!("Failed to create reader: {}", e)))?;
-
-            for batch in reader {
-                let batch = batch.map_err(|e| Status::internal(format!("Failed to read batch: {}", e)))?;
-                let mut batch_metrics = encode_record_batch(&batch)?;
-                metrics.append(&mut batch_metrics);
-            }
-        }
-
-        self.backend.insert_metrics(metrics).await?;
-
-        Ok(Response::new(Box::pin(tokio_stream::iter(vec![Ok(PutResult {
-            app_metadata: Bytes::new(),
-        })]))))
-    }
-
-    async fn do_exchange(
-        &self,
-        _request: Request<Streaming<FlightData>>,
-    ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        Err(Status::unimplemented("do_exchange not implemented"))
+        // Implementation here
+        todo!()
     }
 
     async fn do_action(
         &self,
-        _request: Request<Action>,
+        request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
-        Err(Status::unimplemented("do_action not implemented"))
+        // Implementation here
+        todo!()
     }
 
     async fn list_actions(
         &self,
-        _request: Request<Empty>,
+        request: Request<Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
-        Ok(Response::new(Box::pin(tokio_stream::iter(vec![]))))
+        // Implementation here
+        todo!()
+    }
+
+    async fn do_exchange(
+        &self,
+        request: Request<Streaming<FlightData>>,
+    ) -> Result<Response<Self::DoExchangeStream>, Status> {
+        // Implementation here
+        todo!()
     }
 }
