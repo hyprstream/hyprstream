@@ -9,432 +9,201 @@
 //! The service implementation is designed to work with multiple storage backends
 //! while maintaining consistent query semantics and high performance.
 
-use crate::metrics::{create_record_batch, encode_record_batch, METRICS_SCHEMA, MetricRecord};
+use crate::metrics::{create_record_batch, encode_record_batch, get_metrics_schema};
 use crate::storage::StorageBackend;
-use arrow::array::{RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::ipc::writer::StreamWriter;
 use arrow_flight::{
-    sql::{
-        server::FlightSqlService,
-        CommandGetCatalogs, CommandGetDbSchemas, CommandGetSqlInfo,
-        CommandGetTableTypes, CommandGetTables, CommandPreparedStatementQuery,
-        SqlInfo, TicketStatementQuery,
-    },
-    FlightData, Ticket,
+    flight_service_server::FlightService,
+    Action, ActionType, Criteria, FlightData, FlightDescriptor, FlightInfo,
+    HandshakeRequest, HandshakeResponse, PutResult, SchemaResult, Ticket,
+    Location, FlightEndpoint, Empty, Result as FlightResult,
 };
-use bytes;
-use futures::{stream, Stream};
-use sqlparser::ast::{BinaryOperator, Expr, Value};
+use arrow_ipc::{writer::StreamWriter, reader::StreamReader};
+use bytes::Bytes;
+use futures::{Stream, StreamExt};
 use std::pin::Pin;
 use std::sync::Arc;
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, Streaming};
 
-type DoGetStream = Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + 'static>>;
-
-/// Implementation of the Arrow Flight SQL service.
-///
-/// This service provides:
-/// - SQL query execution over Arrow Flight protocol
-/// - Real-time metric aggregation and windowed queries
-/// - Integration with configurable storage backends
-/// - High-performance data transport using Arrow's columnar format
-#[derive(Clone)]
 pub struct FlightServiceImpl {
-    /// Primary storage backend for executing queries and storing data
     backend: Arc<dyn StorageBackend>,
-    /// Optional cache backend for improved read performance
     cache: Option<Arc<dyn StorageBackend>>,
 }
 
 impl FlightServiceImpl {
-    /// Creates a new Flight SQL service with the specified storage backend.
-    ///
-    /// # Arguments
-    ///
-    /// * `backend` - Arc-wrapped storage backend implementing the StorageBackend trait
     pub fn new(backend: Arc<dyn StorageBackend>) -> Self {
-        Self { 
+        Self {
             backend,
             cache: None,
         }
     }
 
-    /// Creates a new Flight SQL service with primary and cache backends.
-    ///
-    /// # Arguments
-    ///
-    /// * `backend` - Primary storage backend
-    /// * `cache` - Cache storage backend
     pub fn new_with_cache(backend: Arc<dyn StorageBackend>, cache: Arc<dyn StorageBackend>) -> Self {
         Self {
             backend,
             cache: Some(cache),
         }
     }
-
-    /// Extracts timestamp conditions from SQL expressions for query optimization.
-    ///
-    /// This function analyzes SQL expressions to identify timestamp-based filters,
-    /// enabling efficient time-window queries.
-    ///
-    /// # Arguments
-    ///
-    /// * `expr` - SQL expression to analyze
-    ///
-    /// # Returns
-    ///
-    /// * `Option<i64>` - Extracted timestamp value if found
-    fn extract_timestamp_condition(expr: &Expr) -> Option<i64> {
-        match expr {
-            Expr::BinaryOp { left, op, right } => {
-                // Check if this is a timestamp comparison
-                if let Expr::Identifier(ident) = left.as_ref() {
-                    if ident.value.to_lowercase() == "timestamp" {
-                        match (op, right.as_ref()) {
-                            (BinaryOperator::GtEq, Expr::Value(Value::Number(n, _))) => {
-                                n.parse().ok()
-                            }
-                            (BinaryOperator::LtEq, Expr::Value(Value::Number(n, _))) => {
-                                n.parse().ok()
-                            }
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
-    /// Validates timestamp conditions in SQL expressions.
-    ///
-    /// This function checks if a SQL expression contains valid timestamp-based
-    /// filters, ensuring queries can be properly optimized for time-window access.
-    ///
-    /// # Arguments
-    ///
-    /// * `expr` - SQL expression to validate
-    ///
-    /// # Returns
-    ///
-    /// * `bool` - True if the expression contains valid timestamp conditions
-    fn is_valid_timestamp_condition(expr: &Expr) -> bool {
-        match expr {
-            Expr::BinaryOp { left, op, right } => {
-                // Check if this is a timestamp comparison
-                if let Expr::Identifier(ident) = left.as_ref() {
-                    if ident.value.to_lowercase() == "timestamp" {
-                        match (op, right.as_ref()) {
-                            (BinaryOperator::GtEq, Expr::Value(Value::Number(_, _)))
-                            | (BinaryOperator::LtEq, Expr::Value(Value::Number(_, _))) => true,
-                            _ => false,
-                        }
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            _ => false,
-        }
-    }
-
-    async fn query_metrics_with_cache(&self, from_timestamp: i64) -> Result<Vec<MetricRecord>, Status> {
-        // Try cache first if available
-        if let Some(ref cache) = self.cache {
-            match cache.query_metrics(from_timestamp).await {
-                Ok(metrics) => return Ok(metrics),
-                Err(_) => {} // Cache miss or error, fall through to primary backend
-            }
-        }
-
-        // Query from primary backend
-        let metrics = self.backend.query_metrics(from_timestamp).await?;
-
-        // Update cache if available
-        if let Some(ref cache) = self.cache {
-            if !metrics.is_empty() {
-                if let Err(e) = cache.insert_metrics(metrics.clone()).await {
-                    // Log cache update error but don't fail the query
-                    eprintln!("Failed to update cache: {}", e);
-                }
-            }
-        }
-
-        Ok(metrics)
-    }
 }
 
+type HandshakeStream = Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send + 'static>>;
+type ListFlightsStream = Pin<Box<dyn Stream<Item = Result<FlightInfo, Status>> + Send + 'static>>;
+type DoGetStream = Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + 'static>>;
+type DoPutStream = Pin<Box<dyn Stream<Item = Result<PutResult, Status>> + Send + 'static>>;
+type DoExchangeStream = Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + 'static>>;
+type DoActionStream = Pin<Box<dyn Stream<Item = Result<FlightResult, Status>> + Send + 'static>>;
+type ListActionsStream = Pin<Box<dyn Stream<Item = Result<ActionType, Status>> + Send + 'static>>;
+
 #[tonic::async_trait]
-impl FlightSqlService for FlightServiceImpl {
-    type FlightService = Self;
+impl FlightService for FlightServiceImpl {
+    type HandshakeStream = HandshakeStream;
+    type ListFlightsStream = ListFlightsStream;
+    type DoGetStream = DoGetStream;
+    type DoPutStream = DoPutStream;
+    type DoExchangeStream = DoExchangeStream;
+    type DoActionStream = DoActionStream;
+    type ListActionsStream = ListActionsStream;
 
-    /// Handles SQL information requests.
-    ///
-    /// Currently returns an empty stream as basic SQL info is sufficient
-    /// for most client operations.
-    async fn do_get_sql_info(
+    async fn handshake(
         &self,
-        _cmd: CommandGetSqlInfo,
-        _request: Request<Ticket>,
-    ) -> Result<Response<DoGetStream>, Status> {
-        Ok(Response::new(Box::pin(stream::empty())))
+        _request: Request<Streaming<HandshakeRequest>>,
+    ) -> Result<Response<Self::HandshakeStream>, Status> {
+        let output = vec![Ok(HandshakeResponse {
+            protocol_version: 0,
+            payload: Bytes::new(),
+        })];
+        Ok(Response::new(Box::pin(tokio_stream::iter(output))))
     }
 
-    /// Returns information about available tables.
-    ///
-    /// Provides metadata about the metrics table including:
-    /// - Catalog name
-    /// - Schema name
-    /// - Table name
-    /// - Table type
-    async fn do_get_tables<'a>(
-        &'a self,
-        _cmd: CommandGetTables,
-        _request: Request<Ticket>,
-    ) -> Result<Response<DoGetStream>, Status> {
-        // Create a schema for table metadata
-        let schema = Schema::new(vec![
-            Arc::new(Field::new("catalog_name", DataType::Utf8, true)),
-            Arc::new(Field::new("schema_name", DataType::Utf8, true)),
-            Arc::new(Field::new("table_name", DataType::Utf8, false)),
-            Arc::new(Field::new("table_type", DataType::Utf8, false)),
-        ]);
-
-        // Create a record batch with our metrics table info
-        let batch = RecordBatch::try_new(
-            Arc::new(schema.clone()),
-            vec![
-                Arc::new(StringArray::from(vec![Some("memstack")])),
-                Arc::new(StringArray::from(vec![Some("public")])),
-                Arc::new(StringArray::from(vec!["metrics"])),
-                Arc::new(StringArray::from(vec!["TABLE"])),
-            ],
-        )
-        .map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))?;
-
-        let (header, body) = encode_record_batch(&batch)?;
-
-        Ok(Response::new(Box::pin(stream::once(async move {
-            Ok(FlightData {
-                flight_descriptor: None,
-                data_header: header.into(),
-                data_body: body.into(),
-                app_metadata: bytes::Bytes::new(),
-            })
-        }))))
-    }
-
-    /// Returns information about available table types.
-    ///
-    /// Currently only supports the "TABLE" type for metrics storage.
-    async fn do_get_table_types<'a>(
-        &'a self,
-        _cmd: CommandGetTableTypes,
-        _request: Request<Ticket>,
-    ) -> Result<Response<DoGetStream>, Status> {
-        // Create a schema for table types
-        let schema = Schema::new(vec![Arc::new(Field::new(
-            "table_type",
-            DataType::Utf8,
-            false,
-        ))]);
-
-        // Create a record batch with our table types
-        let batch = RecordBatch::try_new(
-            Arc::new(schema.clone()),
-            vec![Arc::new(StringArray::from(vec!["TABLE"]))],
-        )
-        .map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))?;
-
-        let (header, body) = encode_record_batch(&batch)?;
-
-        Ok(Response::new(Box::pin(stream::once(async move {
-            Ok(FlightData {
-                flight_descriptor: None,
-                data_header: header.into(),
-                data_body: body.into(),
-                app_metadata: bytes::Bytes::new(),
-            })
-        }))))
-    }
-
-    /// Returns information about available catalogs.
-    ///
-    /// Currently supports a single "memstack" catalog for metrics storage.
-    async fn do_get_catalogs<'a>(
-        &'a self,
-        _cmd: CommandGetCatalogs,
-        _request: Request<Ticket>,
-    ) -> Result<Response<DoGetStream>, Status> {
-        // Create a schema for catalogs
-        let schema = Schema::new(vec![Arc::new(Field::new(
-            "catalog_name",
-            DataType::Utf8,
-            true,
-        ))]);
-
-        // Create a record batch with our catalog info
-        let batch = RecordBatch::try_new(
-            Arc::new(schema.clone()),
-            vec![Arc::new(StringArray::from(vec![Some("memstack")]))],
-        )
-        .map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))?;
-
-        let (header, body) = encode_record_batch(&batch)?;
-
-        Ok(Response::new(Box::pin(stream::once(async move {
-            Ok(FlightData {
-                flight_descriptor: None,
-                data_header: header.into(),
-                data_body: body.into(),
-                app_metadata: bytes::Bytes::new(),
-            })
-        }))))
-    }
-
-    /// Returns information about available database schemas.
-    ///
-    /// Currently supports a single "public" schema in the "memstack" catalog.
-    async fn do_get_schemas<'a>(
-        &'a self,
-        _cmd: CommandGetDbSchemas,
-        _request: Request<Ticket>,
-    ) -> Result<Response<DoGetStream>, Status> {
-        // Create a schema for database schemas
-        let schema = Schema::new(vec![
-            Arc::new(Field::new("catalog_name", DataType::Utf8, true)),
-            Arc::new(Field::new("schema_name", DataType::Utf8, false)),
-        ]);
-
-        // Create a record batch with our schema info
-        let batch = RecordBatch::try_new(
-            Arc::new(schema.clone()),
-            vec![
-                Arc::new(StringArray::from(vec![Some("memstack")])),
-                Arc::new(StringArray::from(vec!["public"])),
-            ],
-        )
-        .map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))?;
-
-        let (header, body) = encode_record_batch(&batch)?;
-
-        Ok(Response::new(Box::pin(stream::once(async move {
-            Ok(FlightData {
-                flight_descriptor: None,
-                data_header: header.into(),
-                data_body: body.into(),
-                app_metadata: bytes::Bytes::new(),
-            })
-        }))))
-    }
-
-    /// Executes a SQL statement and returns the results.
-    ///
-    /// This method:
-    /// 1. Validates the SQL query contains proper timestamp conditions
-    /// 2. Extracts timestamp filters for optimization
-    /// 3. Queries the storage backend with the optimized parameters
-    /// 4. Returns results in Arrow Flight format
-    async fn do_get_statement(
+    async fn list_flights(
         &self,
-        query: TicketStatementQuery,
-        _request: Request<Ticket>,
-    ) -> Result<Response<DoGetStream>, Status> {
-        // Parse the SQL query to validate timestamp conditions
-        if let Ok(ast) = sqlparser::parser::Parser::parse_sql(
-            &sqlparser::dialect::GenericDialect {},
-            std::str::from_utf8(&query.statement_handle)
-                .map_err(|e| Status::internal(format!("Invalid UTF-8 in statement: {}", e)))?,
-        ) {
-            if let Some(first_stmt) = ast.first() {
-                if let sqlparser::ast::Statement::Query(box_query) = first_stmt {
-                    if let sqlparser::ast::SetExpr::Select(select) = box_query.body.as_ref() {
-                        if let Some(selection) = &select.selection {
-                            // Validate timestamp conditions
-                            if !Self::is_valid_timestamp_condition(selection) {
-                                return Err(Status::invalid_argument(
-                                    "Query must include valid timestamp conditions",
-                                ));
-                            }
+        _request: Request<Criteria>,
+    ) -> Result<Response<Self::ListFlightsStream>, Status> {
+        Ok(Response::new(Box::pin(tokio_stream::iter(vec![]))))
+    }
 
-                            // Extract timestamp for optimization
-                            if let Some(from_timestamp) =
-                                Self::extract_timestamp_condition(selection)
-                            {
-                                // Query the metrics using the backend's SQL capabilities
-                                let data = self.query_metrics_with_cache(from_timestamp).await?;
-                                let batch = create_record_batch(data)?;
-                                let (header, body) = encode_record_batch(&batch)?;
+    async fn get_flight_info(
+        &self,
+        _request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        Ok(Response::new(FlightInfo {
+            schema: Bytes::new(),
+            flight_descriptor: None,
+            endpoint: vec![],
+            total_records: -1,
+            total_bytes: -1,
+            app_metadata: Bytes::new(),
+            ordered: false,
+        }))
+    }
 
-                                return Ok(Response::new(Box::pin(stream::once(async move {
-                                    Ok(FlightData {
-                                        flight_descriptor: None,
-                                        data_header: header.into(),
-                                        data_body: body.into(),
-                                        app_metadata: bytes::Bytes::new(),
-                                    })
-                                }))));
-                            }
-                        }
-                    }
-                }
+    async fn poll_flight_info(
+        &self,
+        _request: Request<FlightDescriptor>,
+    ) -> Result<Response<arrow_flight::PollInfo>, Status> {
+        Err(Status::unimplemented("poll_flight_info not implemented"))
+    }
+
+    async fn get_schema(
+        &self,
+        _request: Request<FlightDescriptor>,
+    ) -> Result<Response<SchemaResult>, Status> {
+        let schema = get_metrics_schema();
+        let mut schema_buffer = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut schema_buffer, &schema)
+            .map_err(|e| Status::internal(format!("Failed to create writer: {}", e)))?;
+
+        writer.finish()
+            .map_err(|e| Status::internal(format!("Failed to finish writer: {}", e)))?;
+
+        Ok(Response::new(SchemaResult {
+            schema: schema_buffer.into(),
+        }))
+    }
+
+    async fn do_get(
+        &self,
+        request: Request<Ticket>,
+    ) -> Result<Response<Self::DoGetStream>, Status> {
+        let ticket = request.into_inner();
+        let metrics = self.backend.query_sql(&ticket.ticket).await?;
+        let batch = create_record_batch(&metrics)?;
+
+        let schema = get_metrics_schema();
+        let mut schema_buffer = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut schema_buffer, &schema)
+            .map_err(|e| Status::internal(format!("Failed to create writer: {}", e)))?;
+
+        writer.write(&batch)
+            .map_err(|e| Status::internal(format!("Failed to write batch: {}", e)))?;
+
+        writer.finish()
+            .map_err(|e| Status::internal(format!("Failed to finish writer: {}", e)))?;
+
+        let mut data_buffer = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut data_buffer, &schema)
+            .map_err(|e| Status::internal(format!("Failed to create writer: {}", e)))?;
+
+        writer.write(&batch)
+            .map_err(|e| Status::internal(format!("Failed to write batch: {}", e)))?;
+
+        writer.finish()
+            .map_err(|e| Status::internal(format!("Failed to finish writer: {}", e)))?;
+
+        let flight_data = FlightData {
+            data_header: schema_buffer.into(),
+            data_body: data_buffer.into(),
+            app_metadata: Bytes::new(),
+            ..Default::default()
+        };
+
+        Ok(Response::new(Box::pin(tokio_stream::iter(vec![Ok(flight_data)]))))
+    }
+
+    async fn do_put(
+        &self,
+        request: Request<Streaming<FlightData>>,
+    ) -> Result<Response<Self::DoPutStream>, Status> {
+        let mut stream = request.into_inner();
+        let mut metrics = Vec::new();
+
+        while let Some(data) = stream.next().await {
+            let data = data?;
+            let schema = get_metrics_schema();
+            let reader = StreamReader::try_new(&data.data_body[..], None)
+                .map_err(|e| Status::internal(format!("Failed to create reader: {}", e)))?;
+
+            for batch in reader {
+                let batch = batch.map_err(|e| Status::internal(format!("Failed to read batch: {}", e)))?;
+                let mut batch_metrics = encode_record_batch(&batch)?;
+                metrics.append(&mut batch_metrics);
             }
         }
 
-        Err(Status::invalid_argument("Invalid SQL query"))
+        self.backend.insert_metrics(metrics).await?;
+
+        Ok(Response::new(Box::pin(tokio_stream::iter(vec![Ok(PutResult {
+            app_metadata: Bytes::new(),
+        })]))))
     }
 
-    /// Handles prepared statement execution.
-    ///
-    /// This method:
-    /// 1. Prepares the SQL statement using the storage backend
-    /// 2. Returns the schema for the prepared statement results
-    async fn do_get_prepared_statement(
+    async fn do_exchange(
         &self,
-        query: CommandPreparedStatementQuery,
-        _request: Request<Ticket>,
-    ) -> Result<Response<DoGetStream>, Status> {
-        // Convert bytes to string for the prepared statement handle
-        let statement_handle =
-            std::str::from_utf8(&query.prepared_statement_handle).map_err(|e| {
-                Status::internal(format!("Invalid UTF-8 in prepared statement handle: {}", e))
-            })?;
-
-        // Let the backend prepare the statement
-        let prepared_handle = self.backend.prepare_sql(statement_handle).await?;
-
-        // Return the schema for the prepared statement
-        let schema = METRICS_SCHEMA.clone();
-        let mut schema_buffer = Vec::new();
-        {
-            let mut writer = StreamWriter::try_new(&mut schema_buffer, &schema)
-                .map_err(|e| Status::internal(format!("Failed to create schema writer: {}", e)))?;
-            writer
-                .finish()
-                .map_err(|e| Status::internal(format!("Failed to write schema: {}", e)))?;
-        }
-
-        Ok(Response::new(Box::pin(stream::once(async move {
-            Ok(FlightData {
-                flight_descriptor: None,
-                data_header: schema_buffer.into(),
-                data_body: prepared_handle.into(),
-                app_metadata: bytes::Bytes::new(),
-            })
-        }))))
+        _request: Request<Streaming<FlightData>>,
+    ) -> Result<Response<Self::DoExchangeStream>, Status> {
+        Err(Status::unimplemented("do_exchange not implemented"))
     }
 
-    /// Registers SQL information for the service.
-    ///
-    /// Currently a no-op as basic SQL info is sufficient.
-    async fn register_sql_info(&self, _info_id: i32, _info: &SqlInfo) {
-        // No-op for now
+    async fn do_action(
+        &self,
+        _request: Request<Action>,
+    ) -> Result<Response<Self::DoActionStream>, Status> {
+        Err(Status::unimplemented("do_action not implemented"))
+    }
+
+    async fn list_actions(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<Self::ListActionsStream>, Status> {
+        Ok(Response::new(Box::pin(tokio_stream::iter(vec![]))))
     }
 }

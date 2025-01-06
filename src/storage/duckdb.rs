@@ -40,6 +40,9 @@ use duckdb::{Connection, Config};
 use tokio::sync::Mutex;
 use tonic::Status;
 use crate::metrics::MetricRecord;
+use crate::metrics::aggregation::{
+    AggregateFunction, GroupBy, AggregateResult, build_aggregate_query, TimeWindow
+};
 use crate::config::Credentials;
 use crate::storage::StorageBackend;
 use crate::storage::cache::{CacheManager, CacheEviction};
@@ -149,6 +152,58 @@ impl StorageBackend for DuckDbBackend {
         self.query_metrics(sql.parse().unwrap_or(0)).await
     }
 
+    async fn aggregate_metrics(
+        &self,
+        function: AggregateFunction,
+        group_by: &GroupBy,
+        from_timestamp: i64,
+        to_timestamp: Option<i64>,
+    ) -> Result<Vec<AggregateResult>, Status> {
+        // Check if eviction is needed
+        if let Some(cutoff) = self.cache_manager.should_evict().await? {
+            let query = self.cache_manager.eviction_query(cutoff);
+            self.execute_eviction(&query).await?;
+        }
+
+        let query = build_aggregate_query(function, group_by, from_timestamp, to_timestamp);
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(&query)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let mut rows = stmt.query([])
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let mut results = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| Status::internal(e.to_string()))? {
+            let mut result = AggregateResult {
+                metric_id: None,
+                timestamp: from_timestamp,
+                window_start: from_timestamp,
+                window_end: to_timestamp.unwrap_or(i64::MAX),
+                value: row.get(0).map_err(|e| Status::internal(e.to_string()))?,
+            };
+
+            let mut col_idx = 1;
+            if group_by.metric_id {
+                result.metric_id = Some(row.get(col_idx).map_err(|e| Status::internal(e.to_string()))?);
+                col_idx += 1;
+            }
+
+            match group_by.window {
+                TimeWindow::None => {},
+                TimeWindow::Fixed(_) | TimeWindow::Sliding { .. } => {
+                    result.window_start = row.get(col_idx).map_err(|e| Status::internal(e.to_string()))?;
+                    result.window_end = row.get(col_idx + 1).map_err(|e| Status::internal(e.to_string()))?;
+                    result.timestamp = result.window_start;
+                }
+            }
+
+            results.push(result);
+        }
+
+        Ok(results)
+    }
+
     fn new_with_options(
         connection_string: &str,
         options: &HashMap<String, String>,
@@ -168,7 +223,6 @@ impl StorageBackend for DuckDbBackend {
         Self::new(connection_string.to_string(), all_options, ttl)
     }
 }
-
 impl DuckDbBackend {
     /// Creates a new DuckDB backend instance.
     pub fn new(connection_string: String, options: HashMap<String, String>, ttl: Option<u64>) -> Result<Self, Status> {
@@ -228,3 +282,4 @@ impl DuckDbBackend {
             .map_err(|e| Status::internal(e.to_string()))
     }
 }
+

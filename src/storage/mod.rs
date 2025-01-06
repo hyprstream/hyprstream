@@ -14,6 +14,7 @@ pub mod cache;
 
 use crate::config::Credentials;
 use crate::metrics::MetricRecord;
+use crate::metrics::aggregation::{AggregateFunction, GroupBy, AggregateResult};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use tonic::Status;
@@ -26,6 +27,7 @@ use tonic::Status;
 /// - Metric data insertion
 /// - Metric data querying
 /// - SQL query preparation and execution
+/// - Aggregation of metrics
 #[async_trait]
 pub trait StorageBackend: Send + Sync + 'static {
     /// Initialize the storage backend.
@@ -38,12 +40,24 @@ pub trait StorageBackend: Send + Sync + 'static {
     async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<MetricRecord>, Status>;
 
     /// Prepare a SQL query and return a handle.
+    /// The handle is backend-specific and opaque to the caller.
     async fn prepare_sql(&self, query: &str) -> Result<Vec<u8>, Status>;
 
     /// Execute a prepared SQL query using its handle.
+    /// The handle must have been obtained from prepare_sql.
     async fn query_sql(&self, statement_handle: &[u8]) -> Result<Vec<MetricRecord>, Status>;
 
+    /// Aggregate metrics using the specified function and grouping.
+    async fn aggregate_metrics(
+        &self,
+        function: AggregateFunction,
+        group_by: &GroupBy,
+        from_timestamp: i64,
+        to_timestamp: Option<i64>,
+    ) -> Result<Vec<AggregateResult>, Status>;
+
     /// Create a new instance with the given options.
+    /// The connection string and options are backend-specific.
     fn new_with_options(
         connection_string: &str,
         options: &HashMap<String, String>,
