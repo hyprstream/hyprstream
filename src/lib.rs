@@ -67,8 +67,5 @@ pub mod storage;
 pub use crate::metrics::MetricRecord;
 pub use crate::service::FlightServiceImpl;
 pub use crate::storage::{
-    adbc::AdbcBackend,
-    cached::CachedStorageBackend,
-    duckdb::DuckDbBackend,
-    StorageBackend,
-}; 
+    adbc::AdbcBackend, cached::CachedStorageBackend, duckdb::DuckDbBackend, StorageBackend,
+};

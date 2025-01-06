@@ -9,7 +9,6 @@
 //! The implementation is optimized for efficient data transfer and
 //! query execution using Arrow's native formats.
 
-use crate::config::AdbcConfig;
 use crate::metrics::MetricRecord;
 use crate::storage::StorageBackend;
 use adbc_core::{
@@ -20,6 +19,7 @@ use adbc_core::{
 use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -42,52 +42,71 @@ pub struct AdbcBackend {
     statement_counter: AtomicU64,
     /// Cache of prepared statements
     prepared_statements: Arc<Mutex<Vec<(u64, String)>>>,
+    connection_string: String,
+    options: HashMap<String, String>,
 }
 
 impl AdbcBackend {
-    /// Creates a new ADBC backend with the specified configuration.
-    ///
-    /// This method:
-    /// 1. Loads the ADBC driver
-    /// 2. Configures the database connection
-    /// 3. Sets up the connection pool
+    /// Creates a new ADBC backend with connection string and options.
     ///
     /// # Arguments
     ///
-    /// * `config` - ADBC configuration including driver path and connection settings
+    /// * `connection_string` - The connection string for the database
+    /// * `options` - Additional options for configuring the connection
     ///
     /// # Returns
     ///
     /// * `Result<Self, Status>` - Configured backend or error
-    pub fn new(config: &AdbcConfig) -> Result<Self, Status> {
+    pub fn new_with_options(
+        connection_string: &str,
+        options: &HashMap<String, String>,
+    ) -> Result<Self, Status> {
+        // Get driver path from options
+        let driver_path = options
+            .get("driver_path")
+            .ok_or_else(|| Status::invalid_argument("driver_path option is required"))?;
+
         let mut driver =
-            ManagedDriver::load_dynamic_from_filename(&config.driver_path, None, AdbcVersion::V100)
+            ManagedDriver::load_dynamic_from_filename(driver_path, None, AdbcVersion::V100)
                 .map_err(|e| Status::internal(format!("Failed to load ADBC driver: {}", e)))?;
 
-        let opts = vec![
-            (OptionDatabase::Uri, config.url.as_str().into()),
-            (OptionDatabase::Username, config.username.as_str().into()),
-            (OptionDatabase::Password, config.password.as_str().into()),
-            (
+        // Build database options from connection string and options
+        let mut db_options = vec![(OptionDatabase::Uri, connection_string.into())];
+
+        // Add optional parameters if present
+        if let Some(username) = options.get("username") {
+            db_options.push((OptionDatabase::Username, username.as_str().into()));
+        }
+        if let Some(password) = options.get("password") {
+            db_options.push((OptionDatabase::Password, password.as_str().into()));
+        }
+        if let Some(database) = options.get("database") {
+            db_options.push((
                 OptionDatabase::Other("database".into()),
-                config.database.as_str().into(),
-            ),
-            (
+                database.as_str().into(),
+            ));
+        }
+        if let Some(max_conns) = options.get("pool_max") {
+            db_options.push((
                 OptionDatabase::Other("pool.max_connections".into()),
-                config.pool.max_connections.to_string().as_str().into(),
-            ),
-            (
+                max_conns.as_str().into(),
+            ));
+        }
+        if let Some(min_conns) = options.get("pool_min") {
+            db_options.push((
                 OptionDatabase::Other("pool.min_connections".into()),
-                config.pool.min_connections.to_string().as_str().into(),
-            ),
-            (
+                min_conns.as_str().into(),
+            ));
+        }
+        if let Some(timeout) = options.get("connect_timeout") {
+            db_options.push((
                 OptionDatabase::Other("pool.acquire_timeout".into()),
-                config.pool.acquire_timeout_secs.to_string().as_str().into(),
-            ),
-        ];
+                timeout.as_str().into(),
+            ));
+        }
 
         let mut database = driver
-            .new_database_with_opts(opts)
+            .new_database_with_opts(db_options)
             .map_err(|e| Status::internal(format!("Failed to create database: {}", e)))?;
 
         let connection = database
@@ -98,6 +117,8 @@ impl AdbcBackend {
             conn: Arc::new(Mutex::new(connection)),
             statement_counter: AtomicU64::new(0),
             prepared_statements: Arc::new(Mutex::new(Vec::new())),
+            connection_string: connection_string.to_string(),
+            options: options.clone(),
         })
     }
 
@@ -182,6 +203,24 @@ impl AdbcBackend {
         )
         .map_err(|e| Status::internal(e.to_string()))
     }
+
+    /// Create connection options from configuration
+    fn create_connection_options(&self) -> HashMap<String, String> {
+        let mut opts = self.options.clone();
+
+        // Set defaults if not specified
+        if !opts.contains_key("pool_max") {
+            opts.insert("pool_max".to_string(), "10".to_string());
+        }
+        if !opts.contains_key("pool_min") {
+            opts.insert("pool_min".to_string(), "1".to_string());
+        }
+        if !opts.contains_key("connect_timeout") {
+            opts.insert("connect_timeout".to_string(), "30".to_string());
+        }
+
+        opts
+    }
 }
 
 #[async_trait]
@@ -190,6 +229,7 @@ impl StorageBackend for AdbcBackend {
     ///
     /// Creates necessary tables and indexes for metric storage.
     async fn init(&self) -> Result<(), Status> {
+        // Create tables and indexes
         self.create_tables().await
     }
 

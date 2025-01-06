@@ -3,26 +3,16 @@
 host = "127.0.0.1"
 port = 50051
 
-[storage]
-backend = "duckdb"  # Options: "duckdb", "adbc", "cached"
+# Primary Storage Engine Configuration
+[engine]
+engine = "duckdb"
+connection = ":memory:"
+options = {}
 
+# Cache Configuration
 [cache]
-backend = "adbc"  # Options: "duckdb", "adbc"
-duration_secs = 3600  # 1 hour
-
-[duckdb]
-connection_string = ":memory:"  # Use ":memory:" for in-memory database or a file path for persistence
-
-# ADBC Configuration
-[adbc]
-driver_path = "libadbc_driver_postgresql.so"
-url = "postgresql://localhost:5432"
-username = "postgres"
-password = ""  # Set via environment variable ADBC_PASSWORD
-database = "metrics"
-
-# Optional: Connection pool settings
-[adbc.pool]
-max_connections = 10
-min_connections = 1
-acquire_timeout_secs = 30 
+enabled = true
+engine = "duckdb"
+connection = ":memory:"
+max_duration_secs = 3600
+options = {} 

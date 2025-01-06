@@ -1,6 +1,6 @@
 //! Hyprstream server binary.
 //!
-//! This binary provides the main entry point for the Hyprstream service, a next-generation application 
+//! This binary provides the main entry point for the Hyprstream service, a next-generation application
 //! for real-time data ingestion, windowed aggregation, caching, and serving.
 //!
 //! # Features
@@ -139,7 +139,9 @@
 
 use hyprstream_core::config::Settings;
 use hyprstream_core::service::FlightServiceImpl;
-use hyprstream_core::storage::{adbc::AdbcBackend, cached::CachedStorageBackend, duckdb::DuckDbBackend, StorageBackend};
+use hyprstream_core::storage::{
+    adbc::AdbcBackend, cached::CachedStorageBackend, duckdb::DuckDbBackend, StorageBackend,
+};
 use std::sync::Arc;
 use tonic::transport::Server;
 
@@ -159,33 +161,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings = Settings::new()?;
 
     // Create storage backend based on configuration
-    let backend = match settings.storage.backend.as_str() {
+    let backend = match settings.engine.engine.as_str() {
         "duckdb" => {
-            let backend = DuckDbBackend::new(&settings.duckdb.connection_string)?;
+            let backend = DuckDbBackend::new(&settings.engine.connection)?;
             Arc::new(backend) as Arc<dyn StorageBackend>
         }
         "adbc" => {
-            let backend = AdbcBackend::new(&settings.adbc)?;
+            let backend = AdbcBackend::new_with_options(
+                &settings.engine.connection,
+                &settings.engine.options,
+            )?;
             Arc::new(backend) as Arc<dyn StorageBackend>
         }
-        "cached" => {
-            let cache: Arc<dyn StorageBackend> = match settings.cache.backend.as_str() {
-                "duckdb" => Arc::new(DuckDbBackend::new(":memory:")?),
-                "adbc" => Arc::new(AdbcBackend::new(&settings.adbc)?),
-                _ => return Err("Invalid cache backend type".into()),
-            };
-            let store: Arc<dyn StorageBackend> = match settings.storage.backend.as_str() {
-                "duckdb" => Arc::new(DuckDbBackend::new(&settings.duckdb.connection_string)?),
-                "adbc" => Arc::new(AdbcBackend::new(&settings.adbc)?),
-                _ => return Err("Invalid storage backend type".into()),
-            };
-            Arc::new(CachedStorageBackend::new(
-                cache,
-                store,
-                settings.cache.duration_secs,
-            ))
-        }
-        _ => return Err("Invalid storage backend type".into()),
+        _ => return Err("Invalid engine type".into()),
+    };
+
+    // Add caching if enabled
+    let backend = if settings.cache.enabled {
+        let cache: Arc<dyn StorageBackend> = match settings.cache.engine.as_str() {
+            "duckdb" => Arc::new(DuckDbBackend::new(&settings.cache.connection)?),
+            "adbc" => Arc::new(AdbcBackend::new_with_options(
+                &settings.cache.connection,
+                &settings.cache.options,
+            )?),
+            _ => return Err("Invalid cache engine type".into()),
+        };
+        Arc::new(CachedStorageBackend::new(
+            cache,
+            backend,
+            settings.cache.max_duration_secs,
+        ))
+    } else {
+        backend
     };
 
     // Initialize storage backend
@@ -199,11 +206,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Starting server on {}", addr);
     Server::builder()
-        .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(
-            service,
-        ))
+        .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(service))
         .serve(addr)
         .await?;
 
     Ok(())
-} 
+}

@@ -30,8 +30,8 @@ pub struct CachedStorageBackend {
     cache: Arc<dyn StorageBackend>,
     /// Persistent storage backend for data
     store: Arc<dyn StorageBackend>,
-    /// Cache entry lifetime in seconds
-    cache_duration: i64,
+    /// Maximum cache entry lifetime in seconds
+    max_duration_secs: u64,
 }
 
 impl CachedStorageBackend {
@@ -46,16 +46,16 @@ impl CachedStorageBackend {
     ///
     /// * `cache` - Fast storage backend for caching
     /// * `store` - Persistent storage backend
-    /// * `cache_duration` - Cache entry lifetime in seconds
+    /// * `max_duration_secs` - Maximum cache entry lifetime in seconds
     pub fn new(
         cache: Arc<dyn StorageBackend>,
         store: Arc<dyn StorageBackend>,
-        cache_duration: i64,
+        max_duration_secs: u64,
     ) -> Self {
         Self {
             cache,
             store,
-            cache_duration,
+            max_duration_secs,
         }
     }
 }
@@ -100,19 +100,30 @@ impl StorageBackend for CachedStorageBackend {
     ///
     /// * `from_timestamp` - Unix timestamp to query from
     async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<MetricRecord>, Status> {
-        // Try cache first
-        match self.cache.query_metrics(from_timestamp).await {
-            Ok(metrics) if !metrics.is_empty() => Ok(metrics),
-            _ => {
-                // Cache miss or error, query backing store
-                let metrics = self.store.query_metrics(from_timestamp).await?;
-                // Update cache with results
-                if !metrics.is_empty() {
-                    self.cache.insert_metrics(metrics.clone()).await?;
-                }
-                Ok(metrics)
+        // Calculate cache cutoff time
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let cache_cutoff = now - self.max_duration_secs as i64;
+
+        // Only use cache for data within cache window
+        if from_timestamp >= cache_cutoff {
+            match self.cache.query_metrics(from_timestamp).await {
+                Ok(metrics) if !metrics.is_empty() => return Ok(metrics),
+                _ => {}
             }
         }
+
+        // Cache miss or data too old, query backing store
+        let metrics = self.store.query_metrics(from_timestamp).await?;
+
+        // Update cache with results if within cache window
+        if !metrics.is_empty() && from_timestamp >= cache_cutoff {
+            self.cache.insert_metrics(metrics.clone()).await?;
+        }
+
+        Ok(metrics)
     }
 
     /// Prepares a SQL statement on the backing store.

@@ -38,37 +38,37 @@ pub struct CliArgs {
     #[arg(long, env = "HYPRSTREAM_SERVER_PORT")]
     port: Option<u16>,
 
-    /// Storage backend type
-    #[arg(long, env = "HYPRSTREAM_STORAGE_BACKEND")]
-    storage_backend: Option<String>,
+    /// Primary storage engine type
+    #[arg(long, env = "HYPRSTREAM_ENGINE")]
+    engine: Option<String>,
 
-    /// Cache backend type
-    #[arg(long, env = "HYPRSTREAM_CACHE_BACKEND")]
-    cache_backend: Option<String>,
+    /// Primary storage engine connection string
+    #[arg(long, env = "HYPRSTREAM_ENGINE_CONNECTION")]
+    engine_connection: Option<String>,
 
-    /// Cache duration in seconds
-    #[arg(long, env = "HYPRSTREAM_CACHE_DURATION")]
-    cache_duration: Option<i64>,
+    /// Primary storage engine options (key=value pairs)
+    #[arg(long, env = "HYPRSTREAM_ENGINE_OPTIONS")]
+    engine_options: Option<Vec<String>>,
 
-    /// DuckDB connection string
-    #[arg(long, env = "HYPRSTREAM_DUCKDB_CONNECTION")]
-    duckdb_connection: Option<String>,
+    /// Enable caching
+    #[arg(long, env = "HYPRSTREAM_ENABLE_CACHE")]
+    enable_cache: Option<bool>,
 
-    /// ADBC driver path
-    #[arg(long, env = "HYPRSTREAM_ADBC_DRIVER_PATH")]
-    driver_path: Option<String>,
+    /// Cache engine type
+    #[arg(long, env = "HYPRSTREAM_CACHE_ENGINE")]
+    cache_engine: Option<String>,
 
-    /// Database URL
-    #[arg(long, env = "HYPRSTREAM_ADBC_URL")]
-    db_url: Option<String>,
+    /// Cache engine connection string
+    #[arg(long, env = "HYPRSTREAM_CACHE_CONNECTION")]
+    cache_connection: Option<String>,
 
-    /// Database username
-    #[arg(long, env = "HYPRSTREAM_ADBC_USERNAME")]
-    db_user: Option<String>,
+    /// Cache engine options (key=value pairs)
+    #[arg(long, env = "HYPRSTREAM_CACHE_OPTIONS")]
+    cache_options: Option<Vec<String>>,
 
-    /// Database name
-    #[arg(long, env = "HYPRSTREAM_ADBC_DATABASE")]
-    db_name: Option<String>,
+    /// Cache maximum duration in seconds
+    #[arg(long, env = "HYPRSTREAM_CACHE_MAX_DURATION")]
+    cache_max_duration: Option<u64>,
 }
 
 /// Complete service configuration.
@@ -78,16 +78,12 @@ pub struct CliArgs {
 /// cache settings.
 #[derive(Debug, Deserialize)]
 pub struct Settings {
-    /// Server configuration options
+    /// Server configuration
     pub server: ServerConfig,
-    /// Storage backend configuration
-    pub storage: StorageConfig,
+    /// Engine configuration
+    pub engine: EngineConfig,
     /// Cache configuration
     pub cache: CacheConfig,
-    /// ADBC backend configuration
-    pub adbc: AdbcConfig,
-    /// DuckDB backend configuration
-    pub duckdb: DuckDbConfig,
 }
 
 /// Server configuration options.
@@ -101,13 +97,18 @@ pub struct ServerConfig {
     pub port: u16,
 }
 
-/// Storage backend configuration.
+/// Engine configuration.
 ///
-/// Specifies which storage backend to use for metric data.
+/// Specifies the primary storage engine to use for metric data.
 #[derive(Debug, Deserialize)]
-pub struct StorageConfig {
-    /// Backend type ("duckdb", "adbc", or "cached")
-    pub backend: String,
+pub struct EngineConfig {
+    /// Engine type ("duckdb" or "adbc")
+    pub engine: String,
+    /// Connection string for the engine
+    pub connection: String,
+    /// Engine-specific options
+    #[serde(default)]
+    pub options: std::collections::HashMap<String, String>,
 }
 
 /// Cache configuration options.
@@ -115,77 +116,33 @@ pub struct StorageConfig {
 /// Defines caching behavior and expiry policies.
 #[derive(Debug, Deserialize)]
 pub struct CacheConfig {
-    /// Cache backend type ("duckdb" or "adbc")
-    pub backend: String,
-    /// Cache entry lifetime in seconds
-    pub duration_secs: i64,
-}
-
-/// DuckDB configuration options.
-///
-/// Specifies connection settings for DuckDB backend.
-#[derive(Debug, Deserialize)]
-pub struct DuckDbConfig {
-    /// DuckDB connection string (defaults to ":memory:")
-    #[serde(default = "default_duckdb_connection")]
-    pub connection_string: String,
-}
-
-/// ADBC configuration options.
-///
-/// Defines connection settings for ADBC-compliant databases.
-#[derive(Debug, Deserialize)]
-pub struct AdbcConfig {
-    /// Path to ADBC driver library
-    pub driver_path: String,
-    /// Database connection URL
-    pub url: String,
-    /// Database username
-    pub username: String,
-    /// Database password (optional)
+    /// Whether caching is enabled
     #[serde(default)]
-    pub password: String,
-    /// Database name
-    pub database: String,
-    /// Connection pool settings
+    pub enabled: bool,
+    /// Cache engine type ("duckdb" or "adbc")
+    #[serde(default = "default_cache_engine")]
+    pub engine: String,
+    /// Cache connection string
+    #[serde(default = "default_cache_connection")]
+    pub connection: String,
+    /// Cache engine-specific options
     #[serde(default)]
-    pub pool: PoolConfig,
+    pub options: std::collections::HashMap<String, String>,
+    /// Maximum cache duration in seconds
+    #[serde(default = "default_cache_duration")]
+    pub max_duration_secs: u64,
 }
 
-/// Database connection pool configuration.
-///
-/// Controls the behavior of the connection pool for ADBC backends.
-#[derive(Debug, Default, Deserialize)]
-pub struct PoolConfig {
-    /// Maximum number of connections in the pool
-    #[serde(default = "default_max_connections")]
-    pub max_connections: u32,
-    /// Minimum number of connections to maintain
-    #[serde(default = "default_min_connections")]
-    pub min_connections: u32,
-    /// Timeout when acquiring connections (seconds)
-    #[serde(default = "default_acquire_timeout")]
-    pub acquire_timeout_secs: u32,
+fn default_cache_engine() -> String {
+    "duckdb".to_string()
 }
 
-/// Default DuckDB connection string (in-memory database)
-fn default_duckdb_connection() -> String {
+fn default_cache_connection() -> String {
     ":memory:".to_string()
 }
 
-/// Default maximum connections for the pool
-fn default_max_connections() -> u32 {
-    10
-}
-
-/// Default minimum connections for the pool
-fn default_min_connections() -> u32 {
-    1
-}
-
-/// Default connection acquisition timeout
-fn default_acquire_timeout() -> u32 {
-    30
+fn default_cache_duration() -> u64 {
+    3600
 }
 
 impl Settings {
@@ -208,50 +165,74 @@ impl Settings {
         let cli = CliArgs::parse();
         let mut builder = Config::builder();
 
-        // Start with default configuration embedded in the binary
+        // Start with default configuration
         builder = builder.add_source(config::File::from_str(
             DEFAULT_CONFIG,
             config::FileFormat::Toml,
         ));
 
-        // Add system-wide configuration file if it exists
+        // Add system-wide configuration
         builder = builder.add_source(File::with_name(DEFAULT_CONFIG_PATH).required(false));
 
-        // Add user-specified configuration file if provided
+        // Add user configuration file
         if let Some(config_path) = cli.config {
             builder = builder.add_source(File::from(config_path).required(true));
         }
 
-        // Add command line arguments and environment variables (handled by clap)
+        // Add CLI overrides
         if let Some(host) = cli.host {
             builder = builder.set_override("server.host", host)?;
         }
         if let Some(port) = cli.port {
             builder = builder.set_override("server.port", port)?;
         }
-        if let Some(storage_backend) = cli.storage_backend {
-            builder = builder.set_override("storage.backend", storage_backend)?;
+        if let Some(engine) = cli.engine {
+            builder = builder.set_override("engine.engine", engine)?;
         }
-        if let Some(cache_backend) = cli.cache_backend {
-            builder = builder.set_override("cache.backend", cache_backend)?;
+        if let Some(connection) = cli.engine_connection {
+            builder = builder.set_override("engine.connection", connection)?;
         }
-        if let Some(duration) = cli.cache_duration {
-            builder = builder.set_override("cache.duration_secs", duration)?;
+        if let Some(options) = cli.engine_options {
+            let options: std::collections::HashMap<String, String> = options
+                .into_iter()
+                .filter_map(|opt| {
+                    let parts: Vec<&str> = opt.split('=').collect();
+                    if parts.len() == 2 {
+                        Some((parts[0].to_string(), parts[1].to_string()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            builder = builder.set_override("engine.options", options)?;
         }
-        if let Some(connection) = cli.duckdb_connection {
-            builder = builder.set_override("duckdb.connection_string", connection)?;
+
+        // Cache settings
+        if let Some(enabled) = cli.enable_cache {
+            builder = builder.set_override("cache.enabled", enabled)?;
         }
-        if let Some(driver_path) = cli.driver_path {
-            builder = builder.set_override("adbc.driver_path", driver_path)?;
+        if let Some(engine) = cli.cache_engine {
+            builder = builder.set_override("cache.engine", engine)?;
         }
-        if let Some(url) = cli.db_url {
-            builder = builder.set_override("adbc.url", url)?;
+        if let Some(connection) = cli.cache_connection {
+            builder = builder.set_override("cache.connection", connection)?;
         }
-        if let Some(username) = cli.db_user {
-            builder = builder.set_override("adbc.username", username)?;
+        if let Some(options) = cli.cache_options {
+            let options: std::collections::HashMap<String, String> = options
+                .into_iter()
+                .filter_map(|opt| {
+                    let parts: Vec<&str> = opt.split('=').collect();
+                    if parts.len() == 2 {
+                        Some((parts[0].to_string(), parts[1].to_string()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            builder = builder.set_override("cache.options", options)?;
         }
-        if let Some(database) = cli.db_name {
-            builder = builder.set_override("adbc.database", database)?;
+        if let Some(duration) = cli.cache_max_duration {
+            builder = builder.set_override("cache.max_duration_secs", duration)?;
         }
 
         // Build and deserialize

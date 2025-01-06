@@ -322,7 +322,9 @@ impl FlightSqlService for FlightServiceImpl {
                             }
 
                             // Extract timestamp for optimization
-                            if let Some(from_timestamp) = Self::extract_timestamp_condition(selection) {
+                            if let Some(from_timestamp) =
+                                Self::extract_timestamp_condition(selection)
+                            {
                                 // Query the metrics using the backend's SQL capabilities
                                 let data = self.backend.query_metrics(from_timestamp).await?;
                                 let batch = create_record_batch(data)?;

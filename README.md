@@ -161,3 +161,116 @@ This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENS
 
 ---
 For inquiries or support, contact us at [support@hyprstream.com](mailto:support@hyprstream.com) or visit our GitHub repository to contribute! 🌐
+
+## Configuration 🔧
+
+Hyprstream supports flexible configuration of storage engines and caching through CLI arguments, environment variables, or TOML configuration files.
+
+### Command Line
+
+```bash
+# Simple DuckDB setup
+hyprstream \
+  --engine duckdb \
+  --engine-connection "/path/to/db.duck"
+
+# MotherDuck with in-memory cache
+hyprstream \
+  --engine duckdb \
+  --engine-connection "md:my_database" \
+  --engine-options "token=${MOTHERDUCK_TOKEN}" \
+  --enable-cache
+
+# PostgreSQL with custom cache
+hyprstream \
+  --engine adbc \
+  --engine-connection "postgresql://main-db/metrics" \
+  --engine-options "pool_max=20" "application_name=hyprstream" \
+  --enable-cache \
+  --cache-engine adbc \
+  --cache-connection "postgresql://cache-db/metrics" \
+  --cache-options "pool_max=5" \
+  --cache-max-duration 7200
+```
+
+### Environment Variables
+
+```bash
+# Engine config
+export HYPRSTREAM_ENGINE=duckdb
+export HYPRSTREAM_ENGINE_CONNECTION="md:my_database"
+export HYPRSTREAM_ENGINE_OPTIONS="token=${MOTHERDUCK_TOKEN}"
+
+# Cache config
+export HYPRSTREAM_ENABLE_CACHE=true
+export HYPRSTREAM_CACHE_ENGINE=duckdb
+export HYPRSTREAM_CACHE_CONNECTION=":memory:"
+export HYPRSTREAM_CACHE_MAX_DURATION=3600
+```
+
+### Configuration File (TOML)
+
+```toml
+# Primary storage engine configuration
+[engine]
+engine = "duckdb"                    # Options: "duckdb", "adbc"
+connection = "md:my_database"        # Connection string
+options = { 
+    token = "${MOTHERDUCK_TOKEN}",   # Engine-specific options
+    application_name = "hyprstream"
+}
+
+# Cache configuration
+[cache]
+enabled = true
+engine = "duckdb"                    # Options: "duckdb", "adbc"
+connection = ":memory:"              # Connection string
+max_duration_secs = 3600            # Cache TTL in seconds
+options = {                         # Engine-specific options
+    pool_max = 5,
+    pool_min = 1
+}
+```
+
+### Storage Engines
+
+#### DuckDB Engine
+- **Local file**: `--engine-connection "/path/to/db.duck"`
+- **In-memory**: `--engine-connection ":memory:"`
+- **MotherDuck**: `--engine-connection "md:my_database"`
+- **Options**: 
+  - `token`: MotherDuck API token
+  - `read_only`: Enable read-only mode
+  - `threads`: Number of threads
+
+#### ADBC Engine
+- **PostgreSQL**: `--engine-connection "postgresql://host/dbname"`
+- **Snowflake**: `--engine-connection "snowflake://account/dbname"`
+- **Options**:
+  - `pool_max`: Maximum connections
+  - `pool_min`: Minimum connections
+  - `application_name`: Client identifier
+  - `connect_timeout`: Connection timeout
+
+### Cache Configuration
+
+The cache layer can be configured independently from the primary storage:
+- Use different engines for storage and cache
+- Configure separate connection pools
+- Set cache-specific options
+- Control cache duration
+
+Example combining MotherDuck storage with local cache:
+```toml
+[engine]
+engine = "duckdb"
+connection = "md:my_database"
+options = { token = "${MOTHERDUCK_TOKEN}" }
+
+[cache]
+enabled = true
+engine = "duckdb"
+connection = "/tmp/cache.duck"
+max_duration_secs = 3600
+options = { threads = 4 }
+```

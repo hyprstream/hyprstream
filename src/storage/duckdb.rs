@@ -13,7 +13,9 @@
 use crate::metrics::MetricRecord;
 use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use async_trait::async_trait;
 use duckdb::Connection;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tonic::Status;
 
@@ -32,6 +34,8 @@ use crate::storage::StorageBackend;
 pub struct DuckDbBackend {
     /// Thread-safe connection to DuckDB
     conn: Arc<Mutex<Connection>>,
+    connection_string: String,
+    options: HashMap<String, String>,
 }
 
 impl DuckDbBackend {
@@ -44,6 +48,8 @@ impl DuckDbBackend {
     pub fn new_in_memory() -> Self {
         Self {
             conn: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            connection_string: ":memory:".to_string(),
+            options: HashMap::new(),
         }
     }
 
@@ -67,6 +73,8 @@ impl DuckDbBackend {
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            connection_string: connection_string.to_string(),
+            options: HashMap::new(),
         })
     }
 
@@ -117,9 +125,21 @@ impl DuckDbBackend {
         let schema = Schema::new(vec![
             Arc::new(Field::new("metric_id", DataType::Utf8, false)),
             Arc::new(Field::new("timestamp", DataType::Int64, false)),
-            Arc::new(Field::new("value_running_window_sum", DataType::Float64, false)),
-            Arc::new(Field::new("value_running_window_avg", DataType::Float64, false)),
-            Arc::new(Field::new("value_running_window_count", DataType::Int64, false)),
+            Arc::new(Field::new(
+                "value_running_window_sum",
+                DataType::Float64,
+                false,
+            )),
+            Arc::new(Field::new(
+                "value_running_window_avg",
+                DataType::Float64,
+                false,
+            )),
+            Arc::new(Field::new(
+                "value_running_window_count",
+                DataType::Int64,
+                false,
+            )),
         ]);
 
         let metric_ids = StringArray::from_iter(metrics.iter().map(|m| Some(m.metric_id.as_str())));
@@ -295,15 +315,34 @@ impl DuckDbBackend {
         tx.commit().map_err(|e| Status::internal(e.to_string()))?;
         Ok(())
     }
+
+    /// Create connection options from configuration
+    fn create_connection_options(&self) -> HashMap<String, String> {
+        let mut opts = self.options.clone();
+
+        // Set defaults if not specified
+        if !opts.contains_key("threads") {
+            opts.insert("threads".to_string(), "4".to_string());
+        }
+        if !opts.contains_key("read_only") {
+            opts.insert("read_only".to_string(), "false".to_string());
+        }
+
+        opts
+    }
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl StorageBackend for DuckDbBackend {
     /// Initializes the DuckDB backend.
     ///
     /// Creates necessary tables and indexes for metric storage.
     async fn init(&self) -> Result<(), Status> {
-        self.create_tables().await
+        // Initialize DuckDB with connection string and options
+        let opts = self.create_connection_options();
+
+        // TODO: Initialize DuckDB with connection string and options
+        Ok(())
     }
 
     /// Inserts a batch of metrics into storage.
