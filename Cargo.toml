@@ -5,6 +5,8 @@ edition = "2021"
 description = "High-performance metrics storage and query service using Arrow Flight SQL"
 documentation = "https://docs.rs/hyprstream"
 readme = "README.md"
+license = "Apache-2.0"
+license-file = "LICENSE"
 
 [lib]
 name = "hyprstream_core"
