@@ -45,6 +45,7 @@
 use crate::config::Credentials;
 use crate::metrics::MetricRecord;
 use crate::storage::StorageBackend;
+use crate::storage::cache::{CacheManager, CacheEviction};
 use adbc_core::{
     driver_manager::{ManagedConnection, ManagedDriver},
     options::{AdbcVersion, OptionDatabase, OptionValue},
@@ -63,7 +64,26 @@ pub struct AdbcBackend {
     conn: Arc<Mutex<ManagedConnection>>,
     statement_counter: AtomicU64,
     prepared_statements: Arc<Mutex<Vec<(u64, String)>>>,
-    ttl: u64,
+    cache_manager: CacheManager,
+}
+
+#[async_trait]
+impl CacheEviction for AdbcBackend {
+    async fn execute_eviction(&self, query: &str) -> Result<(), Status> {
+        let conn = self.conn.clone();
+        let query = query.to_string(); // Clone for background task
+        tokio::spawn(async move {
+            let mut conn_guard = conn.lock().await;
+            if let Err(e) = conn_guard.new_statement()
+                .and_then(|mut stmt| {
+                    stmt.set_sql_query(&query)?;
+                    stmt.execute_update()
+                }) {
+                eprintln!("Background eviction error: {}", e);
+            }
+        });
+        Ok(())
+    }
 }
 
 impl AdbcBackend {
@@ -85,7 +105,6 @@ impl AdbcBackend {
 
         // Set credentials if provided
         if let Some(creds) = credentials {
-            // Set username and password from credentials
             database.set_option(OptionDatabase::Username, OptionValue::String(creds.username.clone()))
                 .map_err(|e| Status::internal(format!("Failed to set username: {}", e)))?;
 
@@ -100,7 +119,7 @@ impl AdbcBackend {
             conn: Arc::new(Mutex::new(connection)),
             statement_counter: AtomicU64::new(0),
             prepared_statements: Arc::new(Mutex::new(Vec::new())),
-            ttl: 0,
+            cache_manager: CacheManager::new(None), // Initialize without TTL
         })
     }
 
@@ -189,26 +208,6 @@ impl AdbcBackend {
         RecordBatch::try_new(Arc::new(schema), arrays)
             .map_err(|e| Status::internal(format!("Failed to create parameter batch: {}", e)))
     }
-
-    /// Evicts expired entries from the cache.
-    async fn evict_expired(&self) -> Result<(), Status> {
-        if self.ttl == 0 {
-            return Ok(());
-        }
-
-        let mut conn = self.get_connection().await?;
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| Status::internal(format!("Failed to get current time: {}", e)))?
-            .as_secs() as i64;
-
-        let expiry_time = current_time - self.ttl as i64;
-        
-        self.execute_statement(&mut conn, 
-            "DELETE FROM metrics WHERE timestamp < ?", 
-            Some(Self::prepare_timestamp_param(expiry_time)?)
-        ).await
-    }
 }
 
 #[async_trait]
@@ -227,19 +226,22 @@ impl StorageBackend for AdbcBackend {
             credentials,
         )?;
 
-        // Set TTL if provided
+        // Set TTL if provided in options
         if let Some(ttl) = options.get("ttl").and_then(|s| s.parse().ok()) {
-            backend.ttl = ttl;
+            backend.cache_manager = CacheManager::new(Some(ttl));
         }
 
         Ok(backend)
     }
 
     async fn init(&self) -> Result<(), Status> {
-        let mut conn = self.get_connection().await?;
+        let mut conn = self.conn.lock().await;
         
         // Create metrics table if it doesn't exist
-        self.execute_statement(&mut conn, r#"
+        let mut stmt = conn.new_statement()
+            .map_err(|e| Status::internal(format!("Failed to create statement: {}", e)))?;
+
+        stmt.set_sql_query(r#"
             CREATE TABLE IF NOT EXISTS metrics (
                 metric_id VARCHAR NOT NULL,
                 timestamp BIGINT NOT NULL,
@@ -248,13 +250,21 @@ impl StorageBackend for AdbcBackend {
                 value_running_window_count BIGINT NOT NULL,
                 PRIMARY KEY (metric_id, timestamp)
             )
-        "#, None).await?;
+        "#).map_err(|e| Status::internal(format!("Failed to set query: {}", e)))?;
 
-        // Create index on timestamp for efficient eviction
-        self.execute_statement(&mut conn, 
-            "CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics(timestamp)",
-            None
-        ).await?;
+        stmt.execute_update()
+            .map_err(|e| Status::internal(format!("Failed to create table: {}", e)))?;
+
+        // Create index for efficient eviction
+        let mut stmt = conn.new_statement()
+            .map_err(|e| Status::internal(format!("Failed to create statement: {}", e)))?;
+
+        stmt.set_sql_query(
+            "CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics(timestamp)"
+        ).map_err(|e| Status::internal(format!("Failed to set query: {}", e)))?;
+
+        stmt.execute_update()
+            .map_err(|e| Status::internal(format!("Failed to create index: {}", e)))?;
 
         Ok(())
     }
@@ -264,10 +274,13 @@ impl StorageBackend for AdbcBackend {
             return Ok(());
         }
 
-        // Evict expired entries before inserting new ones
-        self.evict_expired().await?;
+        // Check if eviction is needed
+        if let Some(cutoff) = self.cache_manager.should_evict().await? {
+            let query = self.cache_manager.eviction_query(cutoff);
+            self.execute_eviction(&query).await?;
+        }
 
-        let mut conn = self.get_connection().await?;
+        let mut conn = self.conn.lock().await;
         let mut stmt = conn.new_statement()
             .map_err(|e| Status::internal(format!("Failed to create statement: {}", e)))?;
 
@@ -304,10 +317,13 @@ impl StorageBackend for AdbcBackend {
     }
 
     async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<MetricRecord>, Status> {
-        // Evict expired entries before querying
-        self.evict_expired().await?;
+        // Check if eviction is needed
+        if let Some(cutoff) = self.cache_manager.should_evict().await? {
+            let query = self.cache_manager.eviction_query(cutoff);
+            self.execute_eviction(&query).await?;
+        }
 
-        let mut conn = self.get_connection().await?;
+        let mut conn = self.conn.lock().await;
         
         let query = r#"
             SELECT
@@ -380,7 +396,7 @@ impl StorageBackend for AdbcBackend {
             .map(|(_, sql)| sql.as_str())
             .ok_or_else(|| Status::invalid_argument("Statement handle not found"))?;
 
-        let mut conn = self.get_connection().await?;
+        let mut conn = self.conn.lock().await;
         let batches = self.execute_query(&mut conn, sql, None).await?;
 
         let mut metrics = Vec::new();
