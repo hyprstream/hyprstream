@@ -63,6 +63,7 @@ pub struct AdbcBackend {
     conn: Arc<Mutex<ManagedConnection>>,
     statement_counter: AtomicU64,
     prepared_statements: Arc<Mutex<Vec<(u64, String)>>>,
+    ttl: u64,
 }
 
 impl AdbcBackend {
@@ -99,6 +100,7 @@ impl AdbcBackend {
             conn: Arc::new(Mutex::new(connection)),
             statement_counter: AtomicU64::new(0),
             prepared_statements: Arc::new(Mutex::new(Vec::new())),
+            ttl: 0,
         })
     }
 
@@ -187,6 +189,26 @@ impl AdbcBackend {
         RecordBatch::try_new(Arc::new(schema), arrays)
             .map_err(|e| Status::internal(format!("Failed to create parameter batch: {}", e)))
     }
+
+    /// Evicts expired entries from the cache.
+    async fn evict_expired(&self) -> Result<(), Status> {
+        if self.ttl == 0 {
+            return Ok(());
+        }
+
+        let mut conn = self.get_connection().await?;
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| Status::internal(format!("Failed to get current time: {}", e)))?
+            .as_secs() as i64;
+
+        let expiry_time = current_time - self.ttl as i64;
+        
+        self.execute_statement(&mut conn, 
+            "DELETE FROM metrics WHERE timestamp < ?", 
+            Some(Self::prepare_timestamp_param(expiry_time)?)
+        ).await
+    }
 }
 
 #[async_trait]
@@ -199,11 +221,18 @@ impl StorageBackend for AdbcBackend {
         let driver_path = options.get("driver_path")
             .ok_or_else(|| Status::invalid_argument("driver_path is required"))?;
 
-        Self::new(
+        let mut backend = Self::new(
             driver_path,
             Some(connection_string),
             credentials,
-        )
+        )?;
+
+        // Set TTL if provided
+        if let Some(ttl) = options.get("ttl").and_then(|s| s.parse().ok()) {
+            backend.ttl = ttl;
+        }
+
+        Ok(backend)
     }
 
     async fn init(&self) -> Result<(), Status> {
@@ -221,6 +250,12 @@ impl StorageBackend for AdbcBackend {
             )
         "#, None).await?;
 
+        // Create index on timestamp for efficient eviction
+        self.execute_statement(&mut conn, 
+            "CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics(timestamp)",
+            None
+        ).await?;
+
         Ok(())
     }
 
@@ -228,6 +263,9 @@ impl StorageBackend for AdbcBackend {
         if metrics.is_empty() {
             return Ok(());
         }
+
+        // Evict expired entries before inserting new ones
+        self.evict_expired().await?;
 
         let mut conn = self.get_connection().await?;
         let mut stmt = conn.new_statement()
@@ -266,6 +304,9 @@ impl StorageBackend for AdbcBackend {
     }
 
     async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<MetricRecord>, Status> {
+        // Evict expired entries before querying
+        self.evict_expired().await?;
+
         let mut conn = self.get_connection().await?;
         
         let query = r#"

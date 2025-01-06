@@ -209,17 +209,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create the cache backend if configured
     let cache_backend = if settings.cache.enabled {
+        // Add TTL to options if configured
+        let mut cache_options = settings.cache.options.clone();
+        if let Some(ttl) = settings.cache.ttl {
+            cache_options.insert("ttl".to_string(), ttl.to_string());
+        }
+
         match settings.cache.engine.as_str() {
             "adbc" => Some(Arc::new(
                 AdbcBackend::new_with_options(
                     &settings.cache.connection,
-                    &settings.cache.options,
+                    &cache_options,
                     settings.cache.credentials.as_ref(),
                 )?
             ) as Arc<dyn StorageBackend>),
             "duckdb" => Some(Arc::new(DuckDbBackend::new_with_options(
                 &settings.cache.connection,
-                &settings.cache.options,
+                &cache_options,
                 None,
             )?) as Arc<dyn StorageBackend>),
             engine => return Err(format!("Unsupported cache backend: {}", engine).into()),

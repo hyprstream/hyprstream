@@ -23,6 +23,7 @@ use config::{Config, ConfigError};
 use serde::Deserialize;
 use std::env;
 use std::path::PathBuf;
+use std::collections::HashMap;
 
 const DEFAULT_CONFIG: &str = include_str!("../config/default.toml");
 const DEFAULT_CONFIG_PATH: &str = "/etc/hyprstream/config.toml";
@@ -139,40 +140,49 @@ pub struct EngineConfig {
     pub credentials: Option<Credentials>,
 }
 
-/// Cache configuration options.
-///
-/// Defines caching behavior and expiry policies.
+/// Authentication credentials for storage backends.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Credentials {
+    /// Username for authentication
+    pub username: String,
+    /// Password for authentication
+    pub password: String,
+}
+
+/// Cache configuration for the storage backend.
 #[derive(Debug, Deserialize)]
 pub struct CacheConfig {
     /// Whether caching is enabled
-    #[serde(default)]
     pub enabled: bool,
-    /// Cache engine type ("duckdb" or "adbc")
-    #[serde(default = "default_cache_engine")]
+    /// Cache storage engine type (e.g., "duckdb", "adbc")
     pub engine: String,
     /// Cache connection string
-    #[serde(default = "default_cache_connection")]
     pub connection: String,
-    /// Cache engine-specific options
+    /// Cache engine options
+    pub options: HashMap<String, String>,
+    /// Cache credentials (optional)
     #[serde(default)]
-    pub options: std::collections::HashMap<String, String>,
-    /// Maximum cache duration in seconds
-    #[serde(default = "default_cache_duration")]
-    pub max_duration_secs: u64,
-    /// Authentication credentials (not serialized)
-    #[serde(skip)]
     pub credentials: Option<Credentials>,
+    /// Maximum duration to keep entries in cache (in seconds)
+    #[serde(default = "default_ttl")]
+    pub ttl: Option<u64>,
 }
 
-/// Authentication credentials.
-///
-/// Holds username and password for database authentication.
-/// These values are loaded from environment variables and never
-/// serialized to configuration files.
-#[derive(Debug, Clone)]
-pub struct Credentials {
-    pub username: String,
-    pub password: String,
+fn default_ttl() -> Option<u64> {
+    Some(3600) // Default 1 hour TTL
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            engine: "duckdb".to_string(),
+            connection: ":memory:".to_string(),
+            options: HashMap::new(),
+            credentials: None,
+            ttl: default_ttl(),
+        }
+    }
 }
 
 fn default_cache_engine() -> String {
