@@ -133,7 +133,7 @@ For more examples and detailed documentation:
 
 Hyprstream enhances modern data architectures by filling critical gaps in the real-time data stack. While tools like Flink excel at complex stream processing, Hyprstream adds the missing piece: instant, SQL-based access to streaming data and real-time metrics. With support for any ADBC-compliant database backend, Hyprstream enables high-performance architectures that combine cloud-scale storage with edge performance. 
 
-Additionally, through its DuckDB backend integration, Hyprstream can serve as a high-performance caching layer for cloud analytics services like MotherDuck.
+Additionally, through its DuckDB backend integration, Hyprstream can serve as a high-performance aggregation and caching layer for cloud analytics services like MotherDuck.
 
 ### Comparison with Stream Processing & Analytics Tools
 
@@ -157,7 +157,7 @@ We welcome contributions! Please feel free to submit a Pull Request.
 
 ## License 📄
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details.
 
 ---
 For inquiries or support, contact us at [support@hyprstream.com](mailto:support@hyprstream.com) or visit our GitHub repository to contribute! 🌐
