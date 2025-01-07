@@ -176,6 +176,8 @@ use hyprstream_core::{
 };
 use std::sync::Arc;
 use tonic::transport::Server;
+use tracing::{info, warn};
+use tracing_subscriber::{fmt, EnvFilter};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -183,7 +185,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Load settings from config file and CLI args
     let settings = Settings::new(cli_args)?;
-    
+
+    // Initialize tracing with a subscriber
+    let subscriber = fmt()
+        .with_env_filter(EnvFilter::new(&settings.server.log_level))
+        .finish();
+
+    // Set the subscriber as the global default
+    let _guard = tracing::subscriber::set_default(subscriber);
+
     // Create the storage backend based on configuration
     let engine_backend: Box<dyn StorageBackend> = match settings.engine.engine.as_str() {
         "adbc" => {
@@ -236,8 +246,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start the server
     let addr = format!("{}:{}", settings.server.host, settings.server.port).parse()?;
-    println!("Starting server on {}", addr);
-    
+    tracing::warn!("This is a pre-release alpha for preview purposes only.");
+    tracing::info!("Starting server on {}", addr);
     Server::builder()
         .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(service))
         .serve(addr)

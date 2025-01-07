@@ -48,6 +48,10 @@ pub struct CliArgs {
     #[arg(long, env = "HYPRSTREAM_SERVER_PORT")]
     port: Option<u16>,
 
+    /// Log level (trace, debug, info, warn, error)
+    #[arg(long, env = "HYPRSTREAM_LOG_LEVEL")]
+    log_level: Option<String>,
+
     /// Primary storage engine type
     #[arg(long, env = "HYPRSTREAM_ENGINE")]
     engine: Option<String>,
@@ -121,6 +125,13 @@ pub struct ServerConfig {
     pub host: String,
     /// Port number to listen on
     pub port: u16,
+    /// Log level (trace, debug, info, warn, error)
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
 }
 
 /// Engine configuration.
@@ -229,6 +240,11 @@ impl Settings {
         }
         if let Some(port) = cli.port {
             builder = builder.set_override("server.port", port)?;
+        }
+
+        // Set log level if provided
+        if let Some(ref log_level) = cli.log_level {
+            builder = builder.set_override("server.log_level", log_level.as_str())?;
         }
 
         // Engine settings

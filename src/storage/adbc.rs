@@ -71,6 +71,7 @@ use crate::aggregation::TimeWindow;
 use crate::storage::BatchAggregation;
 use std::time::Duration;
 use hex;
+use tracing::error;
 
 pub struct AdbcBackend {
     conn: Arc<Mutex<ManagedConnection>>,
@@ -92,7 +93,7 @@ impl CacheEviction for AdbcBackend {
                     stmt.set_sql_query(&query)?;
                     stmt.execute_update()
                 }) {
-                eprintln!("Background eviction error: {}", e);
+                tracing::error!("Background eviction error: {}", e);
             }
         });
         Ok(())

@@ -54,6 +54,7 @@ use arrow::array::builder::{
     ArrayBuilder, Int64Builder, Float64Builder, StringBuilder,
 };
 use std::time::Duration;
+use tracing::error;
 
 /// DuckDB-based storage backend for metrics.
 #[derive(Clone)]
@@ -84,7 +85,7 @@ impl DuckDbBackend {
         let backend_clone = backend.clone();
         tokio::spawn(async move {
             if let Err(e) = backend_clone.init().await {
-                eprintln!("Failed to initialize tables: {}", e);
+                tracing::error!("Failed to initialize tables: {}", e);
             }
         });
 
@@ -286,7 +287,7 @@ impl CacheEviction for DuckDbBackend {
         tokio::spawn(async move {
             let conn_guard = conn.lock().await;
             if let Err(e) = conn_guard.execute_batch(&query) {
-                eprintln!("Background eviction error: {}", e);
+                tracing::error!("Background eviction error: {}", e);
             }
         });
         Ok(())
