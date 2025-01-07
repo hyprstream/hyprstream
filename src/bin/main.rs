@@ -172,82 +172,70 @@ use clap::Parser;
 use hyprstream_core::{
     config::{CliArgs, Settings},
     service::FlightSqlService,
-    storage::{StorageBackend, adbc::AdbcBackend, duckdb::DuckDbBackend},
+    storage::{
+        StorageBackendType,
+        StorageBackend, 
+        adbc::AdbcBackend, 
+        duckdb::DuckDbBackend,
+    },
+    models::{storage::TimeSeriesModelStorage, ModelStorage},
 };
 use std::sync::Arc;
 use tonic::transport::Server;
-use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli_args = CliArgs::parse();
-    
-    // Load settings from config file and CLI args
     let settings = Settings::new(cli_args)?;
 
-    // Initialize tracing with a subscriber
+    // Initialize tracing
     let subscriber = fmt()
         .with_env_filter(EnvFilter::new(&settings.server.log_level))
         .finish();
-
-    // Set the subscriber as the global default
     let _guard = tracing::subscriber::set_default(subscriber);
 
-    // Create the storage backend based on configuration
-    let engine_backend: Box<dyn StorageBackend> = match settings.engine.engine.as_str() {
+    // Create the storage backend
+    let engine_backend: Arc<StorageBackendType> = Arc::new(match settings.engine.engine.as_str() {
         "adbc" => {
-            Box::new(AdbcBackend::new_with_options(
-                &settings.engine.connection,
-                &settings.engine.options,
-                settings.engine.credentials.as_ref(),
-            )?)
+            StorageBackendType::Adbc(
+                AdbcBackend::new_with_options(
+                    &settings.engine.connection,
+                    &settings.engine.options,
+                    settings.engine.credentials.as_ref(),
+                )?
+            )
         }
         "duckdb" => {
-            Box::new(DuckDbBackend::new_with_options(
-                &settings.engine.connection,
-                &settings.engine.options,
-                settings.engine.credentials.as_ref(),
-            )?)
+            StorageBackendType::DuckDb(
+                DuckDbBackend::new_with_options(
+                    &settings.engine.connection,
+                    &settings.engine.options,
+                    settings.engine.credentials.as_ref(),
+                )?
+            )
         }
         _ => return Err("Unsupported engine type".into()),
-    };
+    });
 
     // Initialize the storage backend
     engine_backend.init().await?;
 
-    // Create cache backend if configured
-    let cache_backend = if settings.cache.enabled {
-        let cache_config = &settings.cache;
-        let backend: Box<dyn StorageBackend> = match cache_config.engine.as_str() {
-            "adbc" => {
-                Box::new(AdbcBackend::new_with_options(
-                    &cache_config.connection,
-                    &cache_config.options,
-                    cache_config.credentials.as_ref(),
-                )?)
-            }
-            "duckdb" => {
-                Box::new(DuckDbBackend::new_with_options(
-                    &cache_config.connection,
-                    &cache_config.options,
-                    cache_config.credentials.as_ref(),
-                )?)
-            }
-            _ => return Err("Unsupported cache engine type".into()),
-        };
-        Some(backend)
-    } else {
-        None
-    };
+    // Create the model storage using the same backend
+    let model_storage = Box::new(TimeSeriesModelStorage::new(engine_backend.clone()));
+    model_storage.init().await?;
 
-    // Create the Flight SQL service
-    let service = FlightSqlService::new(engine_backend);
+    // Create the service with both backends
+    let service = FlightSqlService::new(
+        engine_backend.clone(),
+        model_storage,
+    );
 
     // Start the server
     let addr = format!("{}:{}", settings.server.host, settings.server.port).parse()?;
     tracing::warn!("This is a pre-release alpha for preview purposes only.");
     tracing::info!("Starting server on {}", addr);
+    
     Server::builder()
         .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(service))
         .serve(addr)

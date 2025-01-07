@@ -72,9 +72,10 @@ use crate::storage::BatchAggregation;
 use std::time::Duration;
 use hex;
 
+#[derive(Clone)]
 pub struct AdbcBackend {
     conn: Arc<Mutex<ManagedConnection>>,
-    statement_counter: AtomicU64,
+    statement_counter: Arc<AtomicU64>,
     prepared_statements: Arc<Mutex<Vec<(u64, String)>>>,
     cache_manager: CacheManager,
     table_manager: TableManager,
@@ -130,7 +131,7 @@ impl AdbcBackend {
 
         Ok(Self {
             conn: Arc::new(Mutex::new(connection)),
-            statement_counter: AtomicU64::new(0),
+            statement_counter: Arc::new(AtomicU64::new(0)),
             prepared_statements: Arc::new(Mutex::new(Vec::new())),
             cache_manager: CacheManager::new(None), // Initialize without TTL
             table_manager: TableManager::new(),
@@ -455,7 +456,7 @@ impl AdbcBackend {
         sql.push_str(") VALUES (");
         first = true;
 
-        for i in 0..batch.num_columns() {
+        for _i in 0..batch.num_columns() {
             if !first {
                 sql.push_str(", ");
             }
@@ -684,7 +685,7 @@ impl StorageBackend for AdbcBackend {
 
         Ok(Self {
             conn: Arc::new(Mutex::new(connection)),
-            statement_counter: AtomicU64::new(0),
+            statement_counter: Arc::new(AtomicU64::new(0)),
             prepared_statements: Arc::new(Mutex::new(Vec::new())),
             cache_manager: CacheManager::new(None), // Initialize without TTL
             table_manager: TableManager::new(),

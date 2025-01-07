@@ -9,11 +9,8 @@
 //! The service implementation is designed to work with multiple storage backends
 //! while maintaining consistent query semantics and high performance.
 
-use crate::metrics::create_record_batch;
-use crate::storage::StorageBackend;
-use crate::storage::table_manager::AggregationView;
-use crate::metrics::MetricRecord;
-use crate::aggregation::build_aggregate_query;
+use crate::storage::{StorageBackendType, StorageBackend};
+use crate::models::{Model, ModelStorage};
 use arrow_flight::{
     flight_service_server::FlightService,
     Action, ActionType, Criteria, FlightData, FlightDescriptor, FlightInfo,
@@ -28,12 +25,56 @@ use tonic::{Request, Response, Status, Streaming};
 use serde::Deserialize;
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_ipc::writer::IpcDataGenerator;
-use arrow_schema::{Field, DataType, Schema};
-use arrow_array::{
-    Array, ArrayRef, StringArray, Int64Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Float32Array, BooleanArray,
-    BinaryArray, TimestampNanosecondArray,
-};
+use arrow_schema::Schema;
+use crate::storage::table_manager::AggregationView;
+use std::sync::atomic::AtomicU64;
+use std::sync::Mutex;
+
+// Add conversion trait for Arrow errors
+trait ArrowErrorExt {
+    fn to_status(self) -> Status;
+}
+
+impl ArrowErrorExt for arrow::error::ArrowError {
+    fn to_status(self) -> Status {
+        Status::internal(format!("Arrow error: {}", self))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateTableCmd {
+    name: String,
+    schema_bytes: Vec<u8>,
+}
+
+/// Command types for operations
+#[derive(Debug)]
+enum Command {
+    Table(TableCommand),
+    Model(ModelCommand),
+}
+
+impl Command {
+    fn from_json(cmd: &[u8]) -> Result<Self, Status> {
+        let value: serde_json::Value = serde_json::from_slice(cmd)
+            .map_err(|e| Status::invalid_argument(format!("Invalid JSON: {}", e)))?;
+
+        match value.get("type").and_then(|t| t.as_str()) {
+            Some("table") => {
+                let cmd_bytes = serde_json::to_vec(&value["data"])
+                    .map_err(|e| Status::internal(format!("Failed to serialize command: {}", e)))?;
+                let cmd = TableCommand::from_json(&cmd_bytes)?;
+                Ok(Command::Table(cmd))
+            }
+            Some("model") => {
+                let cmd: ModelCommand = serde_json::from_value(value["data"].clone())
+                    .map_err(|e| Status::invalid_argument(format!("Invalid model command: {}", e)))?;
+                Ok(Command::Model(cmd))
+            }
+            _ => Err(Status::invalid_argument("Invalid command type")),
+        }
+    }
+}
 
 /// Command types for table and view operations
 #[derive(Debug)]
@@ -49,12 +90,6 @@ enum TableCommand {
 
 impl TableCommand {
     fn from_json(cmd: &[u8]) -> Result<Self, Status> {
-        #[derive(Deserialize)]
-        struct CreateTableCmd {
-            name: String,
-            schema_bytes: Vec<u8>,
-        }
-
         let value: serde_json::Value = serde_json::from_slice(cmd)
             .map_err(|e| Status::invalid_argument(format!("Invalid JSON: {}", e)))?;
 
@@ -94,15 +129,69 @@ impl TableCommand {
     }
 }
 
+/// Model management commands
+#[derive(Debug, Deserialize)]
+enum ModelCommand {
+    StoreModel {
+        model: Model,
+    },
+    LoadModel {
+        model_id: String,
+        version: Option<String>,
+    },
+    ListModels,
+    ListVersions {
+        model_id: String,
+    },
+    DeleteVersion {
+        model_id: String,
+        version: String,
+    },
+}
+
 #[derive(Clone)]
 pub struct FlightSqlService {
-    backend: Arc<Box<dyn StorageBackend>>,
+    backend: Arc<StorageBackendType>,
+    model_storage: Arc<Box<dyn ModelStorage>>,
+    statement_counter: Arc<AtomicU64>,
+    prepared_statements: Arc<Mutex<Vec<String>>>,
 }
 
 impl FlightSqlService {
-    pub fn new(backend: Box<dyn StorageBackend>) -> Self {
-        Self { 
-            backend: Arc::new(backend)
+    pub fn new(backend: Arc<StorageBackendType>, model_storage: Box<dyn ModelStorage>) -> Self {
+        Self {
+            backend,
+            model_storage: Arc::new(model_storage),
+            statement_counter: Arc::new(AtomicU64::new(0)),
+            prepared_statements: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    async fn handle_model_command(&self, cmd: ModelCommand) -> Result<Vec<u8>, Status> {
+        match cmd {
+            ModelCommand::StoreModel { model } => {
+                self.model_storage.store_model(&model).await?;
+                Ok(vec![])
+            }
+            ModelCommand::LoadModel { model_id, version } => {
+                let model = self.model_storage.load_model(&model_id, version.as_deref()).await?;
+                serde_json::to_vec(&model)
+                    .map_err(|e| Status::internal(format!("Failed to serialize model: {}", e)))
+            }
+            ModelCommand::ListModels => {
+                let models = self.model_storage.list_models().await?;
+                serde_json::to_vec(&models)
+                    .map_err(|e| Status::internal(format!("Failed to serialize models: {}", e)))
+            }
+            ModelCommand::ListVersions { model_id } => {
+                let versions = self.model_storage.list_versions(&model_id).await?;
+                serde_json::to_vec(&versions)
+                    .map_err(|e| Status::internal(format!("Failed to serialize versions: {}", e)))
+            }
+            ModelCommand::DeleteVersion { model_id, version } => {
+                self.model_storage.delete_version(&model_id, &version).await?;
+                Ok(vec![])
+            }
         }
     }
 }
@@ -154,51 +243,66 @@ impl FlightService for FlightSqlService {
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let ticket = request.into_inner();
-        
-        let _query = std::str::from_utf8(&ticket.ticket)
-            .map_err(|e| Status::invalid_argument(format!("Invalid ticket data: {}", e)))?;
+        let cmd = Command::from_json(&ticket.ticket)?;
 
-        let metrics = self.backend.query_metrics(0).await?;
-        let batch = create_record_batch(&metrics)?;
-        
-        let stream = futures::stream::once(async move {
-            let generator = IpcDataGenerator::default();
-            let options = IpcWriteOptions::default();
-            let mut dictionary_tracker = arrow_ipc::writer::DictionaryTracker::new(false);
-            let (encoded_dictionaries, encoded_batch) = generator.encoded_batch(&batch, &mut dictionary_tracker, &options)
-                .map_err(|e| Status::internal(format!("Failed to encode batch: {}", e)))?;
+        match cmd {
+            Command::Model(ModelCommand::LoadModel { model_id, version }) => {
+                let model = self.model_storage.load_model(&model_id, version.as_deref()).await?;
+                
+                let stream = async_stream::try_stream! {
+                    let generator = IpcDataGenerator::default();
+                    let options = IpcWriteOptions::default();
+                    let mut dictionary_tracker = arrow_ipc::writer::DictionaryTracker::new(false);
 
-            // First send schema message
-            let schema_data = generator.schema_to_bytes_with_dictionary_tracker(&batch.schema(), &mut dictionary_tracker, &options);
-            let mut flight_data = vec![FlightData {
-                flight_descriptor: None,
-                data_header: Bytes::from(schema_data.ipc_message),
-                data_body: Bytes::new(),
-                app_metadata: Bytes::new(),
-            }];
+                    // Convert model to record batches
+                    let batches = model.to_record_batches()
+                        .map_err(|e| Status::internal(format!("Failed to convert model: {}", e)))?;
 
-            // Then send dictionary batches if any
-            for dict_batch in encoded_dictionaries {
-                flight_data.push(FlightData {
-                    flight_descriptor: None,
-                    data_header: Bytes::from(dict_batch.ipc_message),
-                    data_body: Bytes::from(dict_batch.arrow_data),
-                    app_metadata: Bytes::new(),
-                });
+                    // Send schema message
+                    let schema_data = generator.schema_to_bytes_with_dictionary_tracker(
+                        &batches[0].schema(),
+                        &mut dictionary_tracker,
+                        &options,
+                    );
+                    yield FlightData {
+                        flight_descriptor: None,
+                        data_header: Bytes::from(schema_data.ipc_message),
+                        data_body: Bytes::new(),
+                        app_metadata: Bytes::new(),
+                    };
+
+                    // Send record batches
+                    for batch in batches {
+                        let (encoded_dicts, encoded_batch) = generator.encoded_batch(
+                            &batch,
+                            &mut dictionary_tracker,
+                            &options,
+                        ).map_err(|e| Status::internal(format!("Failed to encode batch: {}", e)))?;
+
+                        // Send dictionary batches
+                        for dict_batch in encoded_dicts {
+                            yield FlightData {
+                                flight_descriptor: None,
+                                data_header: Bytes::from(dict_batch.ipc_message),
+                                data_body: Bytes::from(dict_batch.arrow_data),
+                                app_metadata: Bytes::new(),
+                            };
+                        }
+
+                        // Send record batch
+                        yield FlightData {
+                            flight_descriptor: None,
+                            data_header: Bytes::from(encoded_batch.ipc_message),
+                            data_body: Bytes::from(encoded_batch.arrow_data),
+                            app_metadata: Bytes::new(),
+                        };
+                    }
+                };
+
+                Ok(Response::new(Box::pin(stream)))
             }
-
-            // Finally send the record batch
-            flight_data.push(FlightData {
-                flight_descriptor: None,
-                data_header: Bytes::from(encoded_batch.ipc_message),
-                data_body: Bytes::from(encoded_batch.arrow_data),
-                app_metadata: Bytes::new(),
-            });
-
-            Ok(flight_data.remove(0))
-        });
-
-        Ok(Response::new(Box::pin(stream)))
+            _ => Err(Status::invalid_argument("Invalid command for do_get")),
+        }
     }
 
     async fn handshake(
@@ -258,7 +362,7 @@ impl FlightService for FlightSqlService {
             .map_err(|_| Status::not_found(format!("Table {} not found", table_name)))?;
             
         let options = IpcWriteOptions::default();
-        let mut generator = IpcDataGenerator::default();
+        let generator = IpcDataGenerator::default();
         let mut dictionary_tracker = arrow_ipc::writer::DictionaryTracker::new(false);
         let schema_data = generator.schema_to_bytes_with_dictionary_tracker(&schema, &mut dictionary_tracker, &options);
         
@@ -285,27 +389,44 @@ impl FlightService for FlightSqlService {
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
         let mut stream = request.into_inner();
-        let mut metrics = Vec::new();
         
-        while let Some(data) = stream.next().await {
-            let data = data?;
-            
-            let reader = arrow_ipc::reader::StreamReader::try_new(
-                std::io::Cursor::new(data.data_body),
-                None,
-            ).map_err(|e| Status::internal(format!("Failed to create IPC reader: {}", e)))?;
-            
-            for batch in reader {
-                let batch = batch.map_err(|e| Status::internal(format!("Failed to read record batch: {}", e)))?;
-                let batch_metrics = MetricRecord::try_from_record_batch(&batch)
-                    .map_err(|e| Status::internal(format!("Failed to convert batch: {}", e)))?;
-                metrics.extend(batch_metrics);
+        // First message contains metadata
+        let first_msg = stream.next().await
+            .ok_or_else(|| Status::invalid_argument("Empty stream"))??;
+        
+        let cmd = Command::from_json(&first_msg.app_metadata)?;
+        
+        match cmd {
+            Command::Model(ModelCommand::StoreModel { model }) => {
+                // Process incoming model data
+                while let Some(data) = stream.next().await {
+                    let data = data?;
+                    let _batch = arrow_ipc::reader::StreamReader::try_new(
+                        std::io::Cursor::new(&data.data_header),
+                        None,
+                    )
+                    .map_err(|e| Status::internal(format!("Failed to read batch: {}", e)))?
+                    .next()
+                    .transpose()
+                    .map_err(|e| Status::internal(format!("Failed to read batch: {}", e)))?
+                    .ok_or_else(|| Status::invalid_argument("Missing batch data"))?;
+
+                    // Update model with batch data
+                    // ... handle batch data ...
+                }
+
+                // Store the model
+                self.model_storage.store_model(&model).await?;
             }
+            _ => return Err(Status::invalid_argument("Invalid command for do_put")),
         }
-        
-        self.backend.insert_metrics(metrics).await?;
-        
-        let stream = futures::stream::iter(vec![Ok(PutResult::default())]);
+
+        let stream = futures::stream::once(async move {
+            Ok(PutResult {
+                app_metadata: Bytes::new(),
+            })
+        });
+
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -315,34 +436,24 @@ impl FlightService for FlightSqlService {
     ) -> Result<Response<Self::DoActionStream>, Status> {
         let action = request.into_inner();
         
-        let cmd = TableCommand::from_json(&action.body)?;
-        
-        match cmd {
-            TableCommand::CreateTable { name, schema } => {
-                self.backend.create_table(&name, &schema).await?;
+        let result = match action.r#type.as_str() {
+            "model.store" | "model.load" | "model.list" | "model.versions" | "model.delete" => {
+                let cmd = Command::from_json(&action.body)?;
+                match cmd {
+                    Command::Model(model_cmd) => self.handle_model_command(model_cmd).await?,
+                    _ => return Err(Status::invalid_argument("Invalid command type for model action")),
+                }
             }
-            TableCommand::CreateAggregationView(view) => {
-                let columns = vec!["metric_id", "timestamp", "value_running_window_sum", 
-                                 "value_running_window_avg", "value_running_window_count"];
-                let _sql = build_aggregate_query(
-                    &view.source_table,
-                    view.function,
-                    &view.group_by,
-                    &columns,
-                    None,
-                    None
-                );
-                self.backend.create_aggregation_view(&view).await?;
-            }
-            TableCommand::DropTable(name) => {
-                self.backend.drop_table(&name).await?;
-            }
-            TableCommand::DropAggregationView(name) => {
-                self.backend.drop_aggregation_view(&name).await?;
-            }
-        }
-        
-        let stream = futures::stream::iter(vec![Ok(arrow_flight::Result::default())]);
+            // ... existing action handlers ...
+            _ => return Err(Status::unimplemented("Action type not implemented")),
+        };
+
+        let stream = futures::stream::once(async move {
+            Ok(arrow_flight::Result {
+                body: Bytes::from(result),
+            })
+        });
+
         Ok(Response::new(Box::pin(stream)))
     }
 

@@ -10,15 +10,18 @@
 //! The implementation focuses on high performance and efficient memory usage while
 //! maintaining compatibility with various model architectures.
 
-use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_array::{Array, ArrayRef, Float32Array, StringArray, Int64Array, BinaryArray, RecordBatch};
+use arrow_schema::{Schema, Field, DataType};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::Status;
-use serde;
+use serde::{Serialize, Deserialize};
+use bincode;
+
+pub mod storage;
 
 /// Represents a layer in a neural network model
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelLayer {
     /// Name of the layer
     pub name: String,
@@ -27,13 +30,14 @@ pub struct ModelLayer {
     /// Shape of the layer's weights
     pub shape: Vec<usize>,
     /// Layer weights as Arrow arrays
+    #[serde(skip)]
     pub weights: Vec<ArrayRef>,
     /// Layer-specific parameters
     pub parameters: HashMap<String, String>,
 }
 
 /// Model version information
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelVersion {
     /// Version identifier
     pub version: String,
@@ -46,7 +50,7 @@ pub struct ModelVersion {
 }
 
 /// Complete model metadata
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelMetadata {
     /// Unique model identifier
     pub model_id: String,
@@ -61,7 +65,7 @@ pub struct ModelMetadata {
 }
 
 /// Represents a complete foundational model
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Model {
     /// Model metadata
     pub metadata: ModelMetadata,
@@ -117,99 +121,24 @@ impl ModelLayer {
         }
     }
 
-    /// Converts layer weights to Arrow record batch
-    pub fn to_record_batch(&self) -> Result<RecordBatch, Status> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, false),
-            Field::new("layer_type", DataType::Utf8, false),
-            Field::new("shape", DataType::Binary, false),
-            Field::new("weights", DataType::Binary, false),
-            Field::new("parameters", DataType::Binary, false),
-        ]));
-
-        // Serialize shape and parameters
-        let shape_bytes = bincode::serialize(&self.shape)
-            .map_err(|e| Status::internal(format!("Failed to serialize shape: {}", e)))?;
-        let params_bytes = bincode::serialize(&self.parameters)
-            .map_err(|e| Status::internal(format!("Failed to serialize parameters: {}", e)))?;
-
-        // Serialize weights to bytes
-        let mut weights_bytes = Vec::new();
+    /// Validates layer weights against shape
+    pub fn validate(&self) -> Result<(), Status> {
+        // Validate that weights match the declared shape
+        let total_elements: usize = self.shape.iter().product();
         for weight in &self.weights {
             if let Some(float_array) = weight.as_any().downcast_ref::<Float32Array>() {
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(
-                        float_array.values().as_ptr() as *const u8,
-                        float_array.values().len() * 4,
-                    )
-                };
-                weights_bytes.extend_from_slice(bytes);
+                if float_array.len() != total_elements {
+                    return Err(Status::invalid_argument(format!(
+                        "Weight array length {} does not match shape product {}",
+                        float_array.len(),
+                        total_elements
+                    )));
+                }
             } else {
-                return Err(Status::internal("Unsupported weight array type"));
+                return Err(Status::invalid_argument("Unsupported weight array type"));
             }
         }
-
-        Ok(RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(arrow_array::StringArray::from(vec![self.name.as_str()])),
-                Arc::new(arrow_array::StringArray::from(vec![self.layer_type.as_str()])),
-                Arc::new(arrow_array::BinaryArray::from(vec![shape_bytes.as_slice()])),
-                Arc::new(arrow_array::BinaryArray::from(vec![weights_bytes.as_slice()])),
-                Arc::new(arrow_array::BinaryArray::from(vec![params_bytes.as_slice()])),
-            ],
-        )
-        .map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))?)
-    }
-
-    /// Creates a layer from Arrow record batch
-    pub fn from_record_batch(batch: &RecordBatch) -> Result<Self, Status> {
-        let name = batch
-            .column_by_name("name")
-            .and_then(|col| col.as_any().downcast_ref::<arrow_array::StringArray>())
-            .ok_or_else(|| Status::internal("Invalid name column"))?
-            .value(0)
-            .to_string();
-
-        let layer_type = batch
-            .column_by_name("layer_type")
-            .and_then(|col| col.as_any().downcast_ref::<arrow_array::StringArray>())
-            .ok_or_else(|| Status::internal("Invalid layer_type column"))?
-            .value(0)
-            .to_string();
-
-        let shape_bytes = batch
-            .column_by_name("shape")
-            .and_then(|col| col.as_any().downcast_ref::<arrow_array::BinaryArray>())
-            .ok_or_else(|| Status::internal("Invalid shape column"))?
-            .value(0);
-
-        let shape: Vec<usize> = bincode::deserialize(shape_bytes)
-            .map_err(|e| Status::internal(format!("Failed to deserialize shape: {}", e)))?;
-
-        let weights_bytes = batch
-            .column_by_name("weights")
-            .and_then(|col| col.as_any().downcast_ref::<arrow_array::BinaryArray>())
-            .ok_or_else(|| Status::internal("Invalid weights column"))?
-            .value(0);
-
-        let params_bytes = batch
-            .column_by_name("parameters")
-            .and_then(|col| col.as_any().downcast_ref::<arrow_array::BinaryArray>())
-            .ok_or_else(|| Status::internal("Invalid parameters column"))?
-            .value(0);
-
-        let parameters: HashMap<String, String> = bincode::deserialize(params_bytes)
-            .map_err(|e| Status::internal(format!("Failed to deserialize parameters: {}", e)))?;
-
-        // Convert weights bytes to Arrow arrays
-        let weights_slice = unsafe { std::slice::from_raw_parts(
-            weights_bytes.as_ptr() as *const f32,
-            weights_bytes.len() / 4,
-        )};
-        let weights = vec![Arc::new(Float32Array::from(weights_slice.to_vec())) as ArrayRef];
-
-        Ok(Self::new(name, layer_type, shape, weights, parameters))
+        Ok(())
     }
 }
 
@@ -219,105 +148,97 @@ impl Model {
         Self { metadata, layers }
     }
 
-    /// Converts model to Arrow record batches
+    /// Validates the model structure
+    pub fn validate(&self) -> Result<(), Status> {
+        // Validate each layer
+        for layer in &self.layers {
+            layer.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Converts the model into Arrow RecordBatches
     pub fn to_record_batches(&self) -> Result<Vec<RecordBatch>, Status> {
         let mut batches = Vec::new();
 
-        // Add metadata batch
+        // Create metadata batch
         let metadata_schema = Arc::new(Schema::new(vec![
             Field::new("model_id", DataType::Utf8, false),
             Field::new("name", DataType::Utf8, false),
             Field::new("architecture", DataType::Utf8, false),
-            Field::new("version", DataType::Binary, false),
+            Field::new("version", DataType::Utf8, false),
+            Field::new("created_at", DataType::Int64, false),
+            Field::new("description", DataType::Utf8, false),
+            Field::new("parent_version", DataType::Utf8, true),
+        ]));
+
+        // Fix array construction for optional parent_version
+        let parent_version = match &self.metadata.version.parent_version {
+            Some(v) => Some(v.as_str()),
+            None => None,
+        };
+
+        let metadata_arrays: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from_iter_values([&self.metadata.model_id])),
+            Arc::new(StringArray::from_iter_values([&self.metadata.name])),
+            Arc::new(StringArray::from_iter_values([&self.metadata.architecture])),
+            Arc::new(StringArray::from_iter_values([&self.metadata.version.version])),
+            Arc::new(Int64Array::from_iter_values([self.metadata.version.created_at])),
+            Arc::new(StringArray::from_iter_values([&self.metadata.version.description])),
+            Arc::new(StringArray::from_iter(std::iter::once(parent_version))),
+        ];
+
+        let metadata_batch = RecordBatch::try_new(metadata_schema.clone(), metadata_arrays)
+            .map_err(|e| Status::internal(format!("Failed to create metadata batch: {}", e)))?;
+        batches.push(metadata_batch);
+
+        // Create layer batches
+        let layer_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("layer_type", DataType::Utf8, false),
+            Field::new("shape", DataType::Binary, false),
+            Field::new("weights", DataType::Binary, false),
             Field::new("parameters", DataType::Binary, false),
         ]));
 
-        let version_bytes = bincode::serialize(&self.metadata.version)
-            .map_err(|e| Status::internal(format!("Failed to serialize version: {}", e)))?;
-        let params_bytes = bincode::serialize(&self.metadata.parameters)
-            .map_err(|e| Status::internal(format!("Failed to serialize parameters: {}", e)))?;
-
-        batches.push(RecordBatch::try_new(
-            metadata_schema,
-            vec![
-                Arc::new(arrow_array::StringArray::from(vec![self.metadata.model_id.as_str()])),
-                Arc::new(arrow_array::StringArray::from(vec![self.metadata.name.as_str()])),
-                Arc::new(arrow_array::StringArray::from(vec![self.metadata.architecture.as_str()])),
-                Arc::new(arrow_array::BinaryArray::from(vec![version_bytes.as_slice()])),
-                Arc::new(arrow_array::BinaryArray::from(vec![params_bytes.as_slice()])),
-            ],
-        )
-        .map_err(|e| Status::internal(format!("Failed to create metadata batch: {}", e)))?);
-
-        // Add layer batches
         for layer in &self.layers {
-            batches.push(layer.to_record_batch()?);
+            // Serialize shape
+            let shape_bytes = bincode::serialize(&layer.shape)
+                .map_err(|e| Status::internal(format!("Failed to serialize shape: {}", e)))?;
+
+            // Serialize parameters
+            let params_bytes = bincode::serialize(&layer.parameters)
+                .map_err(|e| Status::internal(format!("Failed to serialize parameters: {}", e)))?;
+
+            // Serialize weights
+            let mut weights_bytes = Vec::new();
+            for weight in &layer.weights {
+                if let Some(float_array) = weight.as_any().downcast_ref::<Float32Array>() {
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            float_array.values().as_ptr() as *const u8,
+                            float_array.values().len() * 4,
+                        )
+                    };
+                    weights_bytes.extend_from_slice(bytes);
+                } else {
+                    return Err(Status::internal("Unsupported weight array type"));
+                }
+            }
+
+            let layer_arrays: Vec<ArrayRef> = vec![
+                Arc::new(StringArray::from_iter_values([&layer.name])),
+                Arc::new(StringArray::from_iter_values([&layer.layer_type])),
+                Arc::new(BinaryArray::from_iter_values([shape_bytes.as_slice()])),
+                Arc::new(BinaryArray::from_iter_values([weights_bytes.as_slice()])),
+                Arc::new(BinaryArray::from_iter_values([params_bytes.as_slice()])),
+            ];
+
+            let layer_batch = RecordBatch::try_new(layer_schema.clone(), layer_arrays)
+                .map_err(|e| Status::internal(format!("Failed to create layer batch: {}", e)))?;
+            batches.push(layer_batch);
         }
 
         Ok(batches)
-    }
-
-    /// Creates a model from Arrow record batches
-    pub fn from_record_batches(batches: &[RecordBatch]) -> Result<Self, Status> {
-        if batches.is_empty() {
-            return Err(Status::internal("No record batches provided"));
-        }
-
-        // Parse metadata from first batch
-        let metadata_batch = &batches[0];
-        let model_id = metadata_batch
-            .column_by_name("model_id")
-            .and_then(|col| col.as_any().downcast_ref::<arrow_array::StringArray>())
-            .ok_or_else(|| Status::internal("Invalid model_id column"))?
-            .value(0)
-            .to_string();
-
-        let name = metadata_batch
-            .column_by_name("name")
-            .and_then(|col| col.as_any().downcast_ref::<arrow_array::StringArray>())
-            .ok_or_else(|| Status::internal("Invalid name column"))?
-            .value(0)
-            .to_string();
-
-        let architecture = metadata_batch
-            .column_by_name("architecture")
-            .and_then(|col| col.as_any().downcast_ref::<arrow_array::StringArray>())
-            .ok_or_else(|| Status::internal("Invalid architecture column"))?
-            .value(0)
-            .to_string();
-
-        let version_bytes = metadata_batch
-            .column_by_name("version")
-            .and_then(|col| col.as_any().downcast_ref::<arrow_array::BinaryArray>())
-            .ok_or_else(|| Status::internal("Invalid version column"))?
-            .value(0);
-
-        let version: ModelVersion = bincode::deserialize(version_bytes)
-            .map_err(|e| Status::internal(format!("Failed to deserialize version: {}", e)))?;
-
-        let params_bytes = metadata_batch
-            .column_by_name("parameters")
-            .and_then(|col| col.as_any().downcast_ref::<arrow_array::BinaryArray>())
-            .ok_or_else(|| Status::internal("Invalid parameters column"))?
-            .value(0);
-
-        let parameters: HashMap<String, String> = bincode::deserialize(params_bytes)
-            .map_err(|e| Status::internal(format!("Failed to deserialize parameters: {}", e)))?;
-
-        let metadata = ModelMetadata {
-            model_id,
-            name,
-            architecture,
-            version,
-            parameters,
-        };
-
-        // Parse layers from remaining batches
-        let mut layers = Vec::new();
-        for batch in &batches[1..] {
-            layers.push(ModelLayer::from_record_batch(batch)?);
-        }
-
-        Ok(Self::new(metadata, layers))
     }
 } 
