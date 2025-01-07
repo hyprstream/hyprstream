@@ -1,6 +1,6 @@
 [package]
 name = "hyprstream"
-version = "0.1.0-alpha-4"
+version = "0.1.0-alpha-5"
 edition = "2021"
 description = "High-performance metrics storage and query service using Arrow Flight SQL"
 documentation = "https://docs.rs/hyprstream"

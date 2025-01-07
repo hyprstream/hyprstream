@@ -2,7 +2,7 @@
 
 [![Rust](https://github.com/hyprstream/hyprstream/actions/workflows/rust.yml/badge.svg)](https://github.com/hyprstream/hyprstream/actions/workflows/rust.yml)
 
-📄 **[Read our DRAFT Technical Paper: Hyprstream: A Unified Architecture for Multimodal Data Processing and Real-Time Foundational Model Inference](HYPRSTREAM_PAPER_DRAFT.md)**
+📄 **[Read our DRAFT Technical Paper: Hyprstream: A Unified Architecture for Multimodal Data Processing and Real-Time Foundational Model Inference](https://github.com/hyprstream/hyprstream/blob/main/HYPRSTREAM_PAPER_DRAFT.md)**
 
 ⚠️ **PRE-RELEASE: This is a work in progress alpha and is not yet ready for production and is in early stages of development** ⚠️ ️
 
