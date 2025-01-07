@@ -241,4 +241,27 @@ impl Model {
 
         Ok(batches)
     }
+
+    pub fn estimated_size(&self) -> u64 {
+        // Base size for metadata
+        let mut size = std::mem::size_of::<Self>() as u64;
+        
+        // Add size of layers
+        for layer in &self.layers {
+            // Layer metadata
+            size += std::mem::size_of::<ModelLayer>() as u64;
+            
+            // Layer weights
+            size += layer.weights.iter()
+                .map(|arr| arr.len() * std::mem::size_of::<f32>())
+                .sum::<usize>() as u64;
+            
+            // Layer parameters
+            size += layer.parameters.iter()
+                .map(|(k, v)| k.len() + v.len())
+                .sum::<usize>() as u64;
+        }
+        
+        size
+    }
 } 
