@@ -148,7 +148,7 @@ pub fn build_aggregate_query(
     table_name: &str,
     function: AggregateFunction,
     group_by: &GroupBy,
-    columns: &[&str],
+    _columns: &[&str],
     from_timestamp: Option<i64>,
     to_timestamp: Option<i64>,
 ) -> String {

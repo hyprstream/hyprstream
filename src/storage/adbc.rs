@@ -71,7 +71,6 @@ use crate::aggregation::TimeWindow;
 use crate::storage::BatchAggregation;
 use std::time::Duration;
 use hex;
-use tracing::error;
 
 pub struct AdbcBackend {
     conn: Arc<Mutex<ManagedConnection>>,
@@ -282,7 +281,7 @@ impl AdbcBackend {
     }
 
     /// Inserts a batch of metrics with optimized aggregation updates.
-    async fn insert_batch_optimized(&self, metrics: &[MetricRecord], window: TimeWindow) -> Result<(), Status> {
+    async fn insert_batch_optimized(&self, metrics: &[MetricRecord], _window: TimeWindow) -> Result<(), Status> {
         // Begin transaction
         self.begin_transaction().await?;
         let mut conn = self.conn.lock().await;
@@ -726,8 +725,8 @@ impl StorageBackend for AdbcBackend {
         let schema = batch.schema();
         let mut arrays = Vec::with_capacity(batch.num_columns());
 
-        for i in 0..batch.num_columns() {
-            let col = batch.column(i);
+        for _i in 0..batch.num_columns() {
+            let col = batch.column(_i);
             let array: ArrayRef = match col.data_type() {
                 &duckdb::arrow::datatypes::DataType::Int64 => {
                     Arc::new(col.as_any().downcast_ref::<Int64Array>().unwrap().clone())
@@ -882,7 +881,11 @@ fn format_value(array: &dyn Array, index: usize) -> String {
         DataType::Binary => format!("X'{}'", hex::encode(array.as_any().downcast_ref::<BinaryArray>().unwrap().value(index))),
         DataType::Timestamp(_, _) => {
             let ts = array.as_any().downcast_ref::<TimestampNanosecondArray>().unwrap().value(index);
-            format!("'{}'", chrono::NaiveDateTime::from_timestamp(ts / 1_000_000_000, (ts % 1_000_000_000) as u32))
+            let seconds = ts / 1_000_000_000;
+            let nanos = (ts % 1_000_000_000) as u32;
+            format!("'{}'", chrono::DateTime::from_timestamp(seconds, nanos)
+                .unwrap_or_default()
+                .naive_utc())
         },
         _ => "NULL".to_string(),
     }

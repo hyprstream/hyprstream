@@ -54,7 +54,6 @@ use arrow::array::builder::{
     ArrayBuilder, Int64Builder, Float64Builder, StringBuilder,
 };
 use std::time::Duration;
-use tracing::error;
 
 /// DuckDB-based storage backend for metrics.
 #[derive(Clone)]

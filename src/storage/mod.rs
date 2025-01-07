@@ -13,16 +13,15 @@ pub mod duckdb;
 pub mod cache;
 pub mod table_manager;
 
-use crate::config::Credentials;
-use crate::metrics::MetricRecord;
-use crate::aggregation::{AggregateFunction, GroupBy, AggregateResult, TimeWindow};
-use crate::storage::table_manager::{TableManager, AggregationView};
+use arrow_array::RecordBatch;
+use arrow_schema::Schema;
 use async_trait::async_trait;
 use std::collections::HashMap;
+use crate::config::Credentials;
+use crate::metrics::MetricRecord;
+use crate::storage::table_manager::{TableManager, AggregationView};
+use crate::aggregation::{AggregateFunction, GroupBy, AggregateResult, TimeWindow};
 use tonic::Status;
-use arrow_schema::Schema;
-use arrow_array::RecordBatch;
-use std::sync::Arc;
 
 /// Batch-level aggregation state for efficient updates
 #[derive(Debug, Clone)]

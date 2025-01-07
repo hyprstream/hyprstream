@@ -20,6 +20,48 @@ pub struct MetricRecord {
     pub value_running_window_count: i64,
 }
 
+impl MetricRecord {
+    pub fn try_from_record_batch(batch: &RecordBatch) -> Result<Vec<Self>, Status> {
+        let metric_ids = batch
+            .column_by_name("metric_id")
+            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| Status::internal("Invalid metric_id column"))?;
+
+        let timestamps = batch
+            .column_by_name("timestamp")
+            .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
+            .ok_or_else(|| Status::internal("Invalid timestamp column"))?;
+
+        let sums = batch
+            .column_by_name("value_running_window_sum")
+            .and_then(|col| col.as_any().downcast_ref::<Float64Array>())
+            .ok_or_else(|| Status::internal("Invalid value_running_window_sum column"))?;
+
+        let avgs = batch
+            .column_by_name("value_running_window_avg")
+            .and_then(|col| col.as_any().downcast_ref::<Float64Array>())
+            .ok_or_else(|| Status::internal("Invalid value_running_window_avg column"))?;
+
+        let counts = batch
+            .column_by_name("value_running_window_count")
+            .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
+            .ok_or_else(|| Status::internal("Invalid value_running_window_count column"))?;
+
+        let mut metrics = Vec::with_capacity(batch.num_rows());
+        for i in 0..batch.num_rows() {
+            metrics.push(MetricRecord {
+                metric_id: metric_ids.value(i).to_string(),
+                timestamp: timestamps.value(i),
+                value_running_window_sum: sums.value(i),
+                value_running_window_avg: avgs.value(i),
+                value_running_window_count: counts.value(i),
+            });
+        }
+
+        Ok(metrics)
+    }
+}
+
 /// Gets the schema for metric records in Arrow format.
 pub fn get_metrics_schema() -> Schema {
     Schema::new(vec![
