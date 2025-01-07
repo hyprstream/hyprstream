@@ -49,17 +49,20 @@ CREATE TABLE sherlock_data (
     raw_data BLOB,           -- Image bytes or raw text
     metadata JSONB           -- Additional metadata (e.g., chapter, source)
 );
+```
 
 3.3 Foundational Model Storage
 
 Example Table Schema:
 
+```sql
 CREATE TABLE models (
     model_name TEXT PRIMARY KEY,
     layer_id INT,
     weights BLOB,         -- GPU-ready weights
     metadata JSONB        -- Layer dimensions, precision
 );
+```
 
 3.4 Workflow
 	1.	Data Ingestion: Text and image embeddings are ingested and stored.
