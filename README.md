@@ -75,6 +75,32 @@ Hyprstream is actively developing several exciting features:
 
 For detailed technical information about these upcoming features, please refer to our [technical paper](HYPRSTREAM_PAPER_DRAFT.md).
 
+### 📊 Ecosystem Integration
+
+Hyprstream is designed to work seamlessly with existing data infrastructure:
+
+#### 🔗 Storage & Analytics
+- Works with any ADBC-compliant database (PostgreSQL, Snowflake, etc.) as a backend store
+- Uses DuckDB for high-performance caching and analytics
+- Integrates with Arrow ecosystem tools for data processing and analysis
+
+#### 🔄 Real-time Processing
+- Complements stream processing systems by providing fast caching layer
+- Can serve as a real-time metrics store for monitoring solutions
+- Enables quick access to recent data while maintaining historical records
+
+#### 🤖 AI/ML Pipeline Integration (Coming Soon)
+- Will provide zero-copy access to model weights and embeddings
+- Designed to work alongside vector databases and ML serving platforms
+- Future support for real-time model updates and fine-tuning
+
+#### 🛠️ Developer Tools
+- Native Arrow Flight SQL support for seamless client integration
+- Compatible with popular data science tools and frameworks
+- Language-agnostic API for broad ecosystem compatibility
+
+Hyprstream focuses on being a great citizen in the modern data stack, enhancing rather than replacing existing tools.
+
 ## 🚀 Getting Started
 
 1. 📥 Install Hyprstream:
@@ -144,22 +170,6 @@ finally:
     cursor.close()
     conn.close()
 ```
-
-### 📊 Feature Comparison
-
-| Feature | Hyprstream | Apache Flink | MotherDuck |
-|---------|------------|--------------|------------|
-| **Ingest-to-Query Latency** | ⚡ 1-10ms* | 🕒 Seconds-minutes** | 🕐 100ms-seconds |
-| **Query Interface** | 🎯 Direct SQL | 🔄 External sink required | 🎯 Direct SQL |
-| **Storage Model** | 💾 In-memory + ADBC | 🗄️ External systems | ☁️ Cloud-native |
-| **Deployment** | 📦 Single binary | 🌐 Cluster + job manager | ☁️ Cloud service |
-| **Scale Focus** | 🔥 Hot data, edge | 🌊 Stream processing | ☁️ Cloud analytics |
-| **State Management** | ⏱️ Time windows, metrics | 📊 Full event state | 💾 Full dataset |
-| **Data Access** | 🚀 Arrow Flight SQL | 🔧 Custom operators | 🗃️ DuckDB/SQL |
-| **Cost Model** | 💻 Compute-focused | 💻 Compute-focused | 💾 Storage-focused |
-
-\* *For cached data; backend queries add typical ADBC database latency*
-\** *End-to-end latency including writing to external storage and querying*
 
 ## 🤝 Contributing
 
