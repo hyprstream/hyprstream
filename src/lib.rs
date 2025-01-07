@@ -31,6 +31,12 @@ ADBC-compliant datastores.
 - Dynamic weight computation for AI/ML pipelines
 - Time window partitioning for granular analysis
 
+### Vector-Native Model Storage
+- Zero-copy access to model weights using Arrow arrays
+- Efficient GPU transfer for inference
+- Version control and partial loading support
+- Memory-mapped storage for large models
+
 ## Usage
 
 Basic usage example with programmatic configuration:
@@ -76,8 +82,10 @@ pub mod storage;
 pub mod service;
 pub mod config;
 pub mod aggregation;
+pub mod models;
 
 pub use service::FlightSqlService;
 pub use storage::StorageBackend;
 pub use metrics::MetricRecord;
 pub use aggregation::{TimeWindow, AggregateFunction, GroupBy, AggregateResult};
+pub use models::{Model, ModelLayer, ModelMetadata, ModelVersion, ModelStorage};
