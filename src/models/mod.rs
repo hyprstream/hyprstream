@@ -71,6 +71,10 @@ pub struct Model {
     pub metadata: ModelMetadata,
     /// Model layers
     pub layers: Vec<ModelLayer>,
+    
+    /// Add required fields
+    pub id: String,
+    pub version: String,
 }
 
 /// Trait for model storage operations
@@ -145,7 +149,12 @@ impl ModelLayer {
 impl Model {
     /// Creates a new model
     pub fn new(metadata: ModelMetadata, layers: Vec<ModelLayer>) -> Self {
-        Self { metadata, layers }
+        Self {
+            id: metadata.model_id.clone(),
+            version: metadata.version.version.clone(),
+            metadata,
+            layers,
+        }
     }
 
     /// Validates the model structure
@@ -263,5 +272,20 @@ impl Model {
         }
         
         size
+    }
+
+    /// Add update_weights method
+    pub fn update_weights(&mut self, weights: Vec<ArrayRef>) -> Result<(), Status> {
+        if weights.len() != self.layers.len() {
+            return Err(Status::invalid_argument(
+                format!("Expected {} weight arrays, got {}", self.layers.len(), weights.len())
+            ));
+        }
+
+        for (layer, weight_array) in self.layers.iter_mut().zip(weights) {
+            layer.weights = vec![weight_array];
+        }
+
+        Ok(())
     }
 } 

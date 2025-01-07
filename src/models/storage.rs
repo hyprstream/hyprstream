@@ -1,13 +1,15 @@
 use super::{Model, ModelLayer, ModelMetadata, ModelVersion, ModelStorage};
 use crate::storage::{StorageBackend, StorageBackendType};
-use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, Int64Array, BinaryArray};
+use arrow_array::{
+    Array, ArrayRef, RecordBatch, StringArray, Int64Array, BinaryArray,
+    builder::Float32Builder,
+};
 use arrow_schema::{Schema, Field, DataType};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::Status;
 use async_trait::async_trait;
 use bincode;
-use arrow::array::Float32Builder;
 
 /// Get schema for model metadata table
 fn get_model_metadata_schema() -> Schema {

@@ -30,6 +30,10 @@ use crate::storage::table_manager::AggregationView;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use arrow_array::{
+    ArrayRef, Float32Array,
+    builder::Float32Builder,
+};
 
 // Add conversion trait for Arrow errors
 trait ArrowErrorExt {
@@ -197,6 +201,38 @@ struct AuthToken {
     expiry: Instant,
 }
 
+/// Flight SQL service for model management and data operations
+/// 
+/// Provides high-performance streaming operations for:
+/// - Model storage and retrieval
+/// - Weight transfer with progress tracking
+/// - Authentication and authorization
+/// 
+/// # Examples
+/// 
+/// ```rust
+/// use hyprstream_core::service::FlightSqlService;
+/// 
+/// // Store a model
+/// let request = Request::new(Action {
+///     r#type: "model.store".to_string(),
+///     body: serde_json::to_vec(&model)?,
+/// });
+/// let response = service.do_action(request).await?;
+/// 
+/// // Stream model weights
+/// let request = Request::new(Ticket {
+///     ticket: serde_json::to_vec(&ModelCommand::LoadModel {
+///         model_id: "model1".to_string(),
+///         version: Some("v1".to_string()),
+///     })?,
+/// });
+/// let mut stream = service.do_get(request).await?.into_inner();
+/// while let Some(chunk) = stream.next().await {
+///     let data = chunk?.data_header;
+///     // Process weight data...
+/// }
+/// ```
 #[derive(Clone)]
 pub struct FlightSqlService {
     backend: Arc<StorageBackendType>,
@@ -345,7 +381,7 @@ impl FlightSqlService {
         let (metadata, extensions, action) = request.into_parts();
         match Command::from_json(&action.body)? {
             Command::Table(table_cmd) => self.handle_table_command(table_cmd).await,
-            Command::Model(model_cmd) => {
+            Command::Model(_) => {
                 let model_request = Request::from_parts(
                     metadata,
                     extensions,
@@ -356,7 +392,88 @@ impl FlightSqlService {
         }
     }
 
-    // Remove do_action from here
+    // Add streaming methods for model weights
+    async fn stream_model_weights(
+        &self,
+        model_id: &str,
+        version: Option<&str>,
+        progress: Arc<TransferProgress>
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let model = self.model_storage.load_model(model_id, version).await?;
+        
+        let stream = futures::stream::iter(model.layers.into_iter())
+            .map(move |layer| {
+                let mut data = Vec::with_capacity(layer.weights.len());
+                for weights in layer.weights {
+                    let array = weights.as_any().downcast_ref::<Float32Array>()
+                        .ok_or_else(|| Status::internal("Invalid weight array type"))?;
+                    
+                    // Zero-copy access to weight data
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            array.values().as_ptr() as *const u8,
+                            array.len() * std::mem::size_of::<f32>()
+                        )
+                    };
+                    
+                    data.extend_from_slice(bytes);
+                    progress.update(bytes.len());
+                }
+                
+                Ok(FlightData {
+                    data_header: Bytes::from(data),
+                    ..Default::default()
+                })
+            });
+
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn upload_model_weights(
+        &self,
+        mut stream: Streaming<FlightData>,
+        model_id: String,
+        version: Option<String>,
+        progress: Arc<TransferProgress>
+    ) -> Result<Response<<Self as FlightService>::DoPutStream>, Status> {
+        let mut weights = Vec::new();
+        let mut total_size = 0;
+
+        // Receive chunks and build weight arrays
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            let data = chunk.data_header;
+            
+            // Zero-copy slice to f32 array
+            let float_data = unsafe {
+                std::slice::from_raw_parts(
+                    data.as_ptr() as *const f32,
+                    data.len() / std::mem::size_of::<f32>()
+                )
+            };
+            
+            // Create Arrow array with minimal copying
+            let mut builder = Float32Builder::with_capacity(float_data.len());
+            builder.append_slice(float_data);
+            weights.push(Arc::new(builder.finish()) as ArrayRef);
+            
+            total_size += data.len();
+            progress.update(data.len());
+        }
+
+        // Update model with new weights
+        let mut model = self.model_storage.load_model(&model_id, version.as_deref()).await?;
+        model.update_weights(weights)?;
+        self.model_storage.store_model(&model).await?;
+
+        let stream = futures::stream::once(async move {
+            Ok(PutResult {
+                app_metadata: Bytes::from(format!("Uploaded {} bytes", total_size)),
+            })
+        });
+
+        Ok(Response::new(Box::pin(stream)))
+    }
 }
 
 #[tonic::async_trait]
@@ -405,64 +522,13 @@ impl FlightService for FlightSqlService {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        let ticket = request.into_inner();
-        let cmd = Command::from_json(&ticket.ticket)?;
+        let cmd = serde_json::from_slice::<ModelCommand>(&request.get_ref().ticket)
+            .map_err(|e| Status::invalid_argument(format!("Invalid ticket: {}", e)))?;
 
         match cmd {
-            Command::Model(ModelCommand::LoadModel { model_id, version }) => {
-                let model = self.model_storage.load_model(&model_id, version.as_deref()).await?;
-                
-                let stream = async_stream::try_stream! {
-                    let generator = IpcDataGenerator::default();
-                    let options = IpcWriteOptions::default();
-                    let mut dictionary_tracker = arrow_ipc::writer::DictionaryTracker::new(false);
-
-                    // Convert model to record batches
-                    let batches = model.to_record_batches()
-                        .map_err(|e| Status::internal(format!("Failed to convert model: {}", e)))?;
-
-                    // Send schema message
-                    let schema_data = generator.schema_to_bytes_with_dictionary_tracker(
-                        &batches[0].schema(),
-                        &mut dictionary_tracker,
-                        &options,
-                    );
-                    yield FlightData {
-                        flight_descriptor: None,
-                        data_header: Bytes::from(schema_data.ipc_message),
-                        data_body: Bytes::new(),
-                        app_metadata: Bytes::new(),
-                    };
-
-                    // Send record batches
-                    for batch in batches {
-                        let (encoded_dicts, encoded_batch) = generator.encoded_batch(
-                            &batch,
-                            &mut dictionary_tracker,
-                            &options,
-                        ).map_err(|e| Status::internal(format!("Failed to encode batch: {}", e)))?;
-
-                        // Send dictionary batches
-                        for dict_batch in encoded_dicts {
-                            yield FlightData {
-                                flight_descriptor: None,
-                                data_header: Bytes::from(dict_batch.ipc_message),
-                                data_body: Bytes::from(dict_batch.arrow_data),
-                                app_metadata: Bytes::new(),
-                            };
-                        }
-
-                        // Send record batch
-                        yield FlightData {
-                            flight_descriptor: None,
-                            data_header: Bytes::from(encoded_batch.ipc_message),
-                            data_body: Bytes::from(encoded_batch.arrow_data),
-                            app_metadata: Bytes::new(),
-                        };
-                    }
-                };
-
-                Ok(Response::new(Box::pin(stream)))
+            ModelCommand::LoadModel { model_id, version } => {
+                let progress = Arc::new(TransferProgress::new(0)); // Size will be set later
+                self.stream_model_weights(&model_id, version.as_deref(), progress).await
             }
             _ => Err(Status::invalid_argument("Invalid command for do_get")),
         }
@@ -550,47 +616,28 @@ impl FlightService for FlightSqlService {
     async fn do_put(
         &self,
         request: Request<Streaming<FlightData>>,
-    ) -> Result<Response<Self::DoPutStream>, Status> {
-        let mut stream = request.into_inner();
-        
-        // First message contains metadata
-        let first_msg = stream.next().await
-            .ok_or_else(|| Status::invalid_argument("Empty stream"))??;
-        
-        let cmd = Command::from_json(&first_msg.app_metadata)?;
+    ) -> Result<Response<<Self as FlightService>::DoPutStream>, Status> {
+        // Fix metadata access and error handling
+        let cmd_bytes = request.metadata()
+            .get("x-command")
+            .ok_or_else(|| Status::invalid_argument("Missing x-command metadata"))?
+            .as_bytes();
+
+        let cmd = serde_json::from_slice::<ModelCommand>(cmd_bytes)
+            .map_err(|e| Status::invalid_argument(format!("Invalid command: {}", e)))?;
         
         match cmd {
-            Command::Model(ModelCommand::StoreModel { model }) => {
-                // Process incoming model data
-                while let Some(data) = stream.next().await {
-                    let data = data?;
-                    let _batch = arrow_ipc::reader::StreamReader::try_new(
-                        std::io::Cursor::new(&data.data_header),
-                        None,
-                    )
-                    .map_err(|e| Status::internal(format!("Failed to read batch: {}", e)))?
-                    .next()
-                    .transpose()
-                    .map_err(|e| Status::internal(format!("Failed to read batch: {}", e)))?
-                    .ok_or_else(|| Status::invalid_argument("Missing batch data"))?;
-
-                    // Update model with batch data
-                    // ... handle batch data ...
-                }
-
-                // Store the model
-                self.model_storage.store_model(&model).await?;
+            ModelCommand::StoreModel { model } => {
+                let progress = Arc::new(TransferProgress::new(model.estimated_size()));
+                self.upload_model_weights(
+                    request.into_inner(),
+                    model.id.clone(),
+                    Some(model.version.clone()),
+                    progress
+                ).await
             }
-            _ => return Err(Status::invalid_argument("Invalid command for do_put")),
+            _ => Err(Status::invalid_argument("Invalid command for do_put")),
         }
-
-        let stream = futures::stream::once(async move {
-            Ok(PutResult {
-                app_metadata: Bytes::new(),
-            })
-        });
-
-        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn list_actions(
