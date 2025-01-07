@@ -1695,7 +1695,7 @@ dependencies = [
 
 [[package]]
 name = "hyprstream"
-version = "0.1.0-alpha-2"
+version = "0.1.0-alpha-3"
 dependencies = [
  "adbc_core",
  "arrow 54.0.0",
@@ -1703,6 +1703,7 @@ dependencies = [
  "arrow-flight",
  "arrow-ipc",
  "arrow-schema 54.0.0",
+ "async-stream",
  "async-trait",
  "bincode",
  "bytes",
