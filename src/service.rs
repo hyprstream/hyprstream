@@ -34,6 +34,7 @@ use arrow_array::{
     ArrayRef, Float32Array,
     builder::Float32Builder,
 };
+use serde_json;
 
 // Add conversion trait for Arrow errors
 trait ArrowErrorExt {
@@ -272,18 +273,26 @@ impl FlightSqlService {
         })
     }
 
+    /// Validates a model command and returns appropriate error status
+    /// 
+    /// # Errors
+    /// 
+    /// - `Status::unauthenticated`: Token is missing, invalid, or expired
+    /// - `Status::invalid_argument`: Invalid model parameters
+    /// - `Status::not_found`: Model or version not found
+    /// - `Status::resource_exhausted`: Storage capacity exceeded
     fn validate_command(&self, cmd: &ModelCommand, token: &AuthToken) -> Result<(), Status> {
         // Check token expiry
         if token.expiry < Instant::now() {
             return Err(Status::unauthenticated("Token expired"));
         }
 
-        // Validate command-specific requirements
         match cmd {
             ModelCommand::StoreModel { model } => {
                 if model.layers.is_empty() {
                     return Err(Status::invalid_argument("Model must have at least one layer"));
                 }
+                model.validate()?;
             }
             ModelCommand::LoadModel { model_id, .. } |
             ModelCommand::ListVersions { model_id } |
@@ -376,23 +385,46 @@ impl FlightSqlService {
         }
     }
 
-    // Move implementation logic to a separate method
+    // Fix handle_action to properly handle model commands
     async fn handle_action(&self, request: Request<Action>) -> Result<Vec<u8>, Status> {
         let (metadata, extensions, action) = request.into_parts();
         match Command::from_json(&action.body)? {
             Command::Table(table_cmd) => self.handle_table_command(table_cmd).await,
-            Command::Model(_) => {
-                let model_request = Request::from_parts(
-                    metadata,
-                    extensions,
-                    action,
-                );
-                self.handle_model_command(model_request).await
+            Command::Model(model_cmd) => {
+                // Validate auth token
+                let token = self.authenticate(&Request::from_parts(metadata.clone(), extensions.clone(), ())).await?;
+                
+                match &model_cmd {
+                    ModelCommand::StoreModel { model } => {
+                        self.validate_command(&model_cmd, &token)?;
+                        self.model_storage.store_model(model).await?;
+                        Ok(vec![])
+                    }
+                    ModelCommand::LoadModel { model_id, version } => {
+                        let model = self.model_storage.load_model(&model_id, version.as_deref()).await?;
+                        serde_json::to_vec(&model)
+                            .map_err(|e| Status::internal(format!("Failed to serialize model: {}", e)))
+                    }
+                    ModelCommand::ListModels => {
+                        let models = self.model_storage.list_models().await?;
+                        serde_json::to_vec(&models)
+                            .map_err(|e| Status::internal(format!("Failed to serialize models: {}", e)))
+                    }
+                    ModelCommand::ListVersions { model_id } => {
+                        let versions = self.model_storage.list_versions(&model_id).await?;
+                        serde_json::to_vec(&versions)
+                            .map_err(|e| Status::internal(format!("Failed to serialize versions: {}", e)))
+                    }
+                    ModelCommand::DeleteVersion { model_id, version } => {
+                        self.model_storage.delete_version(&model_id, &version).await?;
+                        Ok(vec![])
+                    }
+                }
             }
         }
     }
 
-    // Add streaming methods for model weights
+    // Optimize large model transfers
     async fn stream_model_weights(
         &self,
         model_id: &str,
@@ -401,32 +433,58 @@ impl FlightSqlService {
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let model = self.model_storage.load_model(model_id, version).await?;
         
-        let stream = futures::stream::iter(model.layers.into_iter())
-            .map(move |layer| {
-                let mut data = Vec::with_capacity(layer.weights.len());
+        const CHUNK_SIZE: usize = 1024 * 1024;  // 1MB chunks
+        
+        // Create a stream that yields Result<FlightData, Status>
+        let stream = futures::stream::iter(model.layers)
+            .flat_map(move |layer| {
+                let mut chunks = Vec::new();
+                let mut current_chunk = Vec::with_capacity(CHUNK_SIZE);
+                
+                // Process weights into chunks
                 for weights in layer.weights {
-                    let array = weights.as_any().downcast_ref::<Float32Array>()
-                        .ok_or_else(|| Status::internal("Invalid weight array type"))?;
-                    
-                    // Zero-copy access to weight data
-                    let bytes = unsafe {
-                        std::slice::from_raw_parts(
-                            array.values().as_ptr() as *const u8,
-                            array.len() * std::mem::size_of::<f32>()
-                        )
-                    };
-                    
-                    data.extend_from_slice(bytes);
-                    progress.update(bytes.len());
+                    if let Some(array) = weights.as_any().downcast_ref::<Float32Array>() {
+                        // Zero-copy access to weight data
+                        let bytes = unsafe {
+                            std::slice::from_raw_parts(
+                                array.values().as_ptr() as *const u8,
+                                array.len() * std::mem::size_of::<f32>()
+                            )
+                        };
+                        
+                        // Split into optimal chunk sizes
+                        for chunk in bytes.chunks(CHUNK_SIZE) {
+                            if current_chunk.len() + chunk.len() > CHUNK_SIZE {
+                                chunks.push(Ok(FlightData {
+                                    data_header: Bytes::from(current_chunk.split_off(0)),
+                                    ..Default::default()
+                                }));
+                            }
+                            current_chunk.extend_from_slice(chunk);
+                            progress.update(chunk.len());
+                        }
+                    } else {
+                        chunks.push(Err(Status::internal("Invalid weight array type")));
+                        break;
+                    }
                 }
                 
-                Ok(FlightData {
-                    data_header: Bytes::from(data),
-                    ..Default::default()
-                })
+                // Push final chunk if any
+                if !current_chunk.is_empty() {
+                    chunks.push(Ok(FlightData {
+                        data_header: Bytes::from(current_chunk),
+                        ..Default::default()
+                    }));
+                }
+                
+                futures::stream::iter(chunks)
             });
 
-        Ok(Response::new(Box::pin(stream)))
+        // Create boxed stream with correct type
+        let stream: Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send>> = 
+            Box::pin(stream);
+
+        Ok(Response::new(stream))
     }
 
     async fn upload_model_weights(
@@ -437,9 +495,10 @@ impl FlightSqlService {
         progress: Arc<TransferProgress>
     ) -> Result<Response<<Self as FlightService>::DoPutStream>, Status> {
         let mut weights = Vec::new();
+        let mut current_layer = Vec::new();
         let mut total_size = 0;
 
-        // Receive chunks and build weight arrays
+        // Receive chunks and build weight arrays efficiently
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             let data = chunk.data_header;
@@ -452,13 +511,24 @@ impl FlightSqlService {
                 )
             };
             
-            // Create Arrow array with minimal copying
-            let mut builder = Float32Builder::with_capacity(float_data.len());
-            builder.append_slice(float_data);
-            weights.push(Arc::new(builder.finish()) as ArrayRef);
-            
+            current_layer.extend_from_slice(float_data);
             total_size += data.len();
             progress.update(data.len());
+
+            // Check if layer is complete
+            if current_layer.len() >= 1024 * 1024 {  // 1M elements per layer
+                let mut builder = Float32Builder::with_capacity(current_layer.len());
+                builder.append_slice(&current_layer);
+                weights.push(Arc::new(builder.finish()) as ArrayRef);
+                current_layer.clear();
+            }
+        }
+
+        // Handle remaining data
+        if !current_layer.is_empty() {
+            let mut builder = Float32Builder::with_capacity(current_layer.len());
+            builder.append_slice(&current_layer);
+            weights.push(Arc::new(builder.finish()) as ArrayRef);
         }
 
         // Update model with new weights

@@ -2,7 +2,6 @@ use super::{Model, ModelLayer, ModelMetadata, ModelVersion, ModelStorage};
 use crate::storage::{StorageBackend, StorageBackendType};
 use arrow_array::{
     Array, ArrayRef, RecordBatch, StringArray, Int64Array, BinaryArray,
-    builder::Float32Builder,
 };
 use arrow_schema::{Schema, Field, DataType};
 use std::collections::HashMap;
