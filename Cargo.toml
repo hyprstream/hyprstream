@@ -7,6 +7,10 @@ documentation = "https://docs.rs/hyprstream"
 readme = "README.md"
 license = "Apache-2.0"
 license-file = "LICENSE"
+exclude = [
+    "**/*.pyc",
+    "**/__pycache__/",
+]
 
 [lib]
 name = "hyprstream_core"
