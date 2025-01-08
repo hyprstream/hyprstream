@@ -11,6 +11,7 @@ exclude = [
     "**/*.pyc",
     "**/__pycache__/",
 ]
+repository = "https://github.com/hyprstream/hyprstream.git"
 
 [lib]
 name = "hyprstream_core"
