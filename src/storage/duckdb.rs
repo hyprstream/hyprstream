@@ -37,23 +37,29 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use duckdb::{Connection, Config, params, ToSql};
+use duckdb::types::Value;
 use tokio::sync::Mutex;
 use tonic::Status;
-use crate::metrics::MetricRecord;
-use crate::config::Credentials;
-use crate::storage::{StorageBackend, BatchAggregation};
+use arrow_array::{Array, ArrayRef, RecordBatch, Int64Array, Float64Array, StringArray};
+use arrow_schema::{Schema as ArrowSchema, Field as ArrowSchemaField, DataType as ArrowSchemaDataType};
+use arrow_convert::{ArrowField, ArrowSerialize};
+use arrow_convert::serialize::TryIntoArrow;
+use crate::storage::{
+    HyprStorageBackend, HyprBatchAggregation, HyprMetricRecord,
+    HyprAggregateFunction, HyprGroupBy, HyprAggregateResult,
+    HyprTimeWindow, HyprTableManager, HyprAggregationView,
+    HyprCredentials
+};
 use crate::storage::cache::{CacheManager, CacheEviction};
-use crate::storage::table_manager::{TableManager, AggregationView};
-use crate::aggregation::{TimeWindow, AggregateFunction, GroupBy, AggregateResult, build_aggregate_query};
+use crate::aggregation::build_aggregate_query;
 use async_trait::async_trait;
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow::array::{
-    Array, ArrayRef, RecordBatch, Int64Array, Float64Array, StringArray,
-};
+
 use arrow::array::builder::{
     ArrayBuilder, Int64Builder, Float64Builder, StringBuilder,
 };
 use std::time::Duration;
+use crate::TimeWindow;
 
 /// DuckDB-based storage backend for metrics.
 #[derive(Clone)]
@@ -62,7 +68,7 @@ pub struct DuckDbBackend {
     connection_string: String,
     options: HashMap<String, String>,
     cache_manager: CacheManager,
-    table_manager: TableManager,
+    table_manager: HyprTableManager,
 }
 
 impl DuckDbBackend {
@@ -77,7 +83,7 @@ impl DuckDbBackend {
             connection_string,
             options,
             cache_manager: CacheManager::new(ttl),
-            table_manager: TableManager::new(),
+            table_manager: HyprTableManager::new(),
         };
 
         // Initialize tables
@@ -97,7 +103,7 @@ impl DuckDbBackend {
     }
 
     /// Inserts a batch of metrics with optimized aggregation updates.
-    async fn insert_batch_optimized(&self, metrics: &[MetricRecord], window: TimeWindow) -> Result<(), Status> {
+    async fn insert_batch_optimized(&self, metrics: &[HyprMetricRecord], window: HyprTimeWindow) -> Result<(), Status> {
         let conn = self.conn.lock().await;
         
         // Begin transaction
@@ -156,7 +162,7 @@ impl DuckDbBackend {
         // Group metrics by ID and calculate aggregations
         let mut aggregations = HashMap::new();
         for metric in metrics {
-            let entry = aggregations.entry(metric.metric_id.clone()).or_insert_with(|| BatchAggregation {
+            let entry = aggregations.entry(metric.metric_id.clone()).or_insert_with(|| HyprBatchAggregation {
                 metric_id: metric.metric_id.clone(),
                 window_start,
                 window_end,
@@ -205,7 +211,7 @@ impl DuckDbBackend {
     }
 
     /// Prepares parameters for batch insertion
-    fn prepare_params(metrics: &[MetricRecord]) -> Result<RecordBatch, Status> {
+    fn prepare_params(metrics: &[HyprMetricRecord]) -> Result<RecordBatch, Status> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("metric_id", DataType::Utf8, false),
             Field::new("timestamp", DataType::Int64, false),
@@ -294,7 +300,7 @@ impl CacheEviction for DuckDbBackend {
 }
 
 #[async_trait]
-impl StorageBackend for DuckDbBackend {
+impl HyprStorageBackend for DuckDbBackend {
     async fn init(&self) -> Result<(), Status> {
         let conn = self.conn.lock().await;
         
@@ -329,7 +335,7 @@ impl StorageBackend for DuckDbBackend {
         Ok(())
     }
 
-    async fn insert_metrics(&self, metrics: Vec<MetricRecord>) -> Result<(), Status> {
+    async fn insert_metrics(&self, metrics: Vec<HyprMetricRecord>) -> Result<(), Status> {
         if metrics.is_empty() {
             return Ok(());
         }
@@ -350,7 +356,7 @@ impl StorageBackend for DuckDbBackend {
         self.insert_batch_optimized(&metrics, window).await
     }
 
-    async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<MetricRecord>, Status> {
+    async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<HyprMetricRecord>, Status> {
         // Check if eviction is needed
         if let Some(cutoff) = self.cache_manager.should_evict().await? {
             let query = self.cache_manager.eviction_query(cutoff);
@@ -372,7 +378,7 @@ impl StorageBackend for DuckDbBackend {
 
         let mut metrics = Vec::new();
         while let Some(row) = rows.next().map_err(|e| Status::internal(e.to_string()))? {
-            metrics.push(MetricRecord {
+            metrics.push(HyprMetricRecord {
                 metric_id: row.get(0).map_err(|e| Status::internal(e.to_string()))?,
                 timestamp: row.get(1).map_err(|e| Status::internal(e.to_string()))?,
                 value_running_window_sum: row.get(2).map_err(|e| Status::internal(e.to_string()))?,
@@ -388,7 +394,7 @@ impl StorageBackend for DuckDbBackend {
         Ok(query.as_bytes().to_vec())
     }
 
-    async fn query_sql(&self, statement_handle: &[u8]) -> Result<Vec<MetricRecord>, Status> {
+    async fn query_sql(&self, statement_handle: &[u8]) -> Result<Vec<HyprMetricRecord>, Status> {
         let sql = std::str::from_utf8(statement_handle)
             .map_err(|e| Status::internal(e.to_string()))?;
         self.query_metrics(sql.parse().unwrap_or(0)).await
@@ -396,11 +402,11 @@ impl StorageBackend for DuckDbBackend {
 
     async fn aggregate_metrics(
         &self,
-        function: AggregateFunction,
-        group_by: &GroupBy,
+        function: HyprAggregateFunction,
+        group_by: &HyprGroupBy,
         from_timestamp: i64,
         to_timestamp: Option<i64>,
-    ) -> Result<Vec<AggregateResult>, Status> {
+    ) -> Result<Vec<HyprAggregateResult>, Status> {
         // Check if eviction is needed
         if let Some(cutoff) = self.cache_manager.should_evict().await? {
             let query = self.cache_manager.eviction_query(cutoff);
@@ -428,7 +434,7 @@ impl StorageBackend for DuckDbBackend {
             let value: f64 = row.get(0).map_err(|e| Status::internal(e.to_string()))?;
             let timestamp: i64 = row.get(1).map_err(|e| Status::internal(e.to_string()))?;
             
-            results.push(AggregateResult {
+            results.push(HyprAggregateResult {
                 value,
                 timestamp,
             });
@@ -440,7 +446,7 @@ impl StorageBackend for DuckDbBackend {
     fn new_with_options(
         connection_string: &str,
         options: &HashMap<String, String>,
-        credentials: Option<&Credentials>,
+        credentials: Option<&HyprCredentials>,
     ) -> Result<Self, Status> {
         let mut all_options = options.clone();
         if let Some(creds) = credentials {
@@ -504,10 +510,6 @@ impl StorageBackend for DuckDbBackend {
     async fn query_table(&self, table_name: &str, projection: Option<Vec<String>>) -> Result<RecordBatch, Status> {
         let schema = self.table_manager.get_table_schema(table_name).await?;
         
-        let mut builders: Vec<Box<dyn ArrayBuilder>> = schema.fields().iter()
-            .map(|field| Self::create_array_builder(field))
-            .collect();
-        
         let projection = projection.unwrap_or_else(|| {
             schema.fields().iter().map(|f| f.name().clone()).collect()
         });
@@ -525,44 +527,38 @@ impl StorageBackend for DuckDbBackend {
         let mut rows = stmt.query(params![])
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        // Collect all rows
+        let mut values: Vec<Vec<duckdb::types::Value>> = Vec::new();
         while let Some(row) = rows.next().map_err(|e| Status::internal(e.to_string()))? {
-            for (i, field) in schema.fields().iter().enumerate() {
-                match field.data_type() {
-                    DataType::Int64 => {
-                        let builder = builders[i].as_any_mut().downcast_mut::<Int64Builder>().unwrap();
-                        match row.get::<usize, i64>(i) {
-                            Ok(value) => builder.append_value(value),
-                            Err(_) => builder.append_null(),
-                        }
-                    }
-                    DataType::Float64 => {
-                        let builder = builders[i].as_any_mut().downcast_mut::<Float64Builder>().unwrap();
-                        match row.get::<usize, f64>(i) {
-                            Ok(value) => builder.append_value(value),
-                            Err(_) => builder.append_null(),
-                        }
-                    }
-                    DataType::Utf8 => {
-                        let builder = builders[i].as_any_mut().downcast_mut::<StringBuilder>().unwrap();
-                        match row.get::<usize, String>(i) {
-                            Ok(value) => builder.append_value(value),
-                            Err(_) => builder.append_null(),
-                        }
-                    }
-                    _ => return Err(Status::internal("Unsupported column type")),
-                }
+            let mut row_values = Vec::new();
+            for i in 0..row.column_count() {
+                row_values.push(row.get_unwrap(i));
             }
+            values.push(row_values);
         }
 
-        let arrays: Vec<ArrayRef> = builders.into_iter()
-            .map(|mut builder| Arc::new(builder.finish()) as ArrayRef)
-            .collect();
+        if values.is_empty() {
+            // Return empty RecordBatch with schema
+            return RecordBatch::try_new(
+                Arc::new(schema.clone()),
+                schema.fields().iter().map(|_| {
+                    Arc::new(StringArray::from(Vec::<String>::new())) as ArrayRef
+                }).collect(),
+            ).map_err(|e| Status::internal(format!("Failed to create empty record batch: {}", e)));
+        }
 
-        Ok(RecordBatch::try_new(Arc::new(schema), arrays)
-            .map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))?)
+        // Convert columns to Arrow arrays
+        let mut arrays = Vec::new();
+        for (i, field) in schema.fields().iter().enumerate() {
+            let column_values: Vec<_> = values.iter().map(|row| row[i].clone()).collect();
+            arrays.push(Self::convert_to_arrow_array(&column_values, field.data_type())?);
+        }
+
+        RecordBatch::try_new(Arc::new(schema), arrays)
+            .map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))
     }
 
-    async fn create_aggregation_view(&self, view: &AggregationView) -> Result<(), Status> {
+    async fn create_aggregation_view(&self, view: &HyprAggregationView) -> Result<(), Status> {
         let columns: Vec<&str> = view.aggregate_columns.iter()
             .map(|s| s.as_str())
             .collect();
@@ -578,7 +574,41 @@ impl StorageBackend for DuckDbBackend {
         
         let view_name = format!("agg_view_{}", view.source_table);
         let conn = self.conn.lock().await;
-        conn.execute(&format!("CREATE VIEW {} AS {}", view_name, sql), params![])
+
+        // Create view with window parameters
+        let view_sql = match view.window {
+            HyprTimeWindow::Sliding { window, slide } => {
+                format!(
+                    "CREATE VIEW {} AS WITH window_params AS (
+                        SELECT 
+                            INTERVAL '{}' SECOND AS window_size,
+                            INTERVAL '{}' SECOND AS slide_interval
+                    ) {}",
+                    view_name,
+                    window.as_secs(),
+                    slide.as_secs(),
+                    sql
+                )
+            },
+            HyprTimeWindow::Fixed(timestamp) => {
+                format!(
+                    "CREATE VIEW {} AS WITH window_params AS (
+                        SELECT TIMESTAMP '{}' AS fixed_window
+                    ) {}",
+                    view_name,
+                    chrono::NaiveDateTime::from_timestamp_opt(
+                        timestamp.as_nanos() as i64 / 1_000_000_000,
+                        (timestamp.as_nanos() % 1_000_000_000) as u32
+                    ).unwrap_or_default(),
+                    sql
+                )
+            },
+            HyprTimeWindow::None => {
+                format!("CREATE VIEW {} AS {}", view_name, sql)
+            }
+        };
+
+        conn.execute(&view_sql, params![])
             .map_err(|e| Status::internal(format!("Failed to create view: {}", e)))?;
 
         // Register view in manager
@@ -616,8 +646,55 @@ impl StorageBackend for DuckDbBackend {
         Ok(())
     }
 
-    fn table_manager(&self) -> &TableManager {
+    fn table_manager(&self) -> &HyprTableManager {
         &self.table_manager
+    }
+
+    async fn update_batch_aggregations(
+        &self,
+        batch: &[HyprMetricRecord],
+        window: HyprTimeWindow,
+    ) -> Result<Vec<HyprBatchAggregation>, Status> {
+        let mut aggregations = HashMap::new();
+
+        for metric in batch {
+            let (window_start, window_end) = window.window_bounds(metric.timestamp);
+            let key = (metric.metric_id.clone(), window_start, window_end);
+
+            let agg = aggregations.entry(key).or_insert_with(|| HyprBatchAggregation {
+                metric_id: metric.metric_id.clone(),
+                window_start,
+                window_end,
+                running_sum: 0.0,
+                running_count: 0,
+                min_value: f64::INFINITY,
+                max_value: f64::NEG_INFINITY,
+            });
+
+            agg.running_sum += metric.value_running_window_sum;
+            agg.running_count += 1;
+            agg.min_value = agg.min_value.min(metric.value_running_window_sum);
+            agg.max_value = agg.max_value.max(metric.value_running_window_sum);
+        }
+
+        Ok(aggregations.into_values().collect())
+    }
+
+    async fn insert_batch_aggregations(
+        &self,
+        aggregations: Vec<HyprBatchAggregation>,
+    ) -> Result<(), Status> {
+        let mut batch = Vec::new();
+        for agg in aggregations {
+            batch.push(HyprMetricRecord {
+                metric_id: agg.metric_id,
+                timestamp: agg.window_start,
+                value_running_window_sum: agg.running_sum,
+                value_running_window_avg: agg.running_sum / agg.running_count as f64,
+                value_running_window_count: agg.running_count,
+            });
+        }
+        self.insert_metrics(batch).await
     }
 }
 
@@ -628,24 +705,6 @@ impl DuckDbBackend {
         conn.execute(query, params![])
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(())
-    }
-
-    /// Converts an Arrow schema to a DuckDB CREATE TABLE statement
-    fn schema_to_create_table_sql(table_name: &str, schema: &Schema) -> String {
-        let mut sql = format!("CREATE TABLE IF NOT EXISTS \"{}\" (", table_name);
-        let mut first = true;
-
-        for field in schema.fields() {
-            if !first {
-                sql.push_str(", ");
-            }
-            first = false;
-
-            sql.push_str(&format!("\"{}\" {}", field.name(), Self::arrow_type_to_duckdb_type(field.data_type())));
-        }
-
-        sql.push_str(")");
-        sql
     }
 
     /// Converts an Arrow data type to a DuckDB type string
@@ -670,6 +729,49 @@ impl DuckDbBackend {
             DataType::Time64(_) => "TIME",
             DataType::Timestamp(_, _) => "TIMESTAMP",
             _ => "VARCHAR", // Default to VARCHAR for unsupported types
+        }
+    }
+
+    /// Converts an Arrow schema to a DuckDB CREATE TABLE statement
+    fn schema_to_create_table_sql(table_name: &str, schema: &Schema) -> String {
+        let mut sql = format!("CREATE TABLE IF NOT EXISTS \"{}\" (", table_name);
+        let mut first = true;
+
+        for field in schema.fields() {
+            if !first {
+                sql.push_str(", ");
+            }
+            first = false;
+
+            sql.push_str(&format!("\"{}\" {}", field.name(), Self::arrow_type_to_duckdb_type(field.data_type())));
+        }
+
+        sql.push_str(")");
+        sql
+    }
+
+    /// Convert DuckDB row values to Arrow arrays
+    fn convert_to_arrow_array(values: &[duckdb::types::Value], data_type: &DataType) -> Result<ArrayRef, Status> {
+        match data_type {
+            DataType::Int64 => {
+                let array = Int64Array::from_iter(values.iter().map(|v| {
+                    v.as_i64().ok()
+                }));
+                Ok(Arc::new(array) as ArrayRef)
+            }
+            DataType::Float64 => {
+                let array = Float64Array::from_iter(values.iter().map(|v| {
+                    v.as_f64().ok()
+                }));
+                Ok(Arc::new(array) as ArrayRef)
+            }
+            DataType::Utf8 => {
+                let array = StringArray::from_iter(values.iter().map(|v| {
+                    v.as_string().ok().map(|s| s.as_str())
+                }));
+                Ok(Arc::new(array) as ArrayRef)
+            }
+            _ => Err(Status::internal(format!("Unsupported data type: {:?}", data_type))),
         }
     }
 

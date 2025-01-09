@@ -173,8 +173,8 @@ use hyprstream_core::{
     config::{CliArgs, Settings},
     service::FlightSqlService,
     storage::{
-        StorageBackendType,
-        StorageBackend, 
+        HyprStorageBackendType,
+        HyprStorageBackend, 
         adbc::AdbcBackend, 
         duckdb::DuckDbBackend,
     },
@@ -196,9 +196,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _guard = tracing::subscriber::set_default(subscriber);
 
     // Create the storage backend
-    let engine_backend: Arc<StorageBackendType> = Arc::new(match settings.engine.engine.as_str() {
+    let engine_backend: Arc<HyprStorageBackendType> = Arc::new(match settings.engine.engine.as_str() {
         "adbc" => {
-            StorageBackendType::Adbc(
+            HyprStorageBackendType::Adbc(
                 AdbcBackend::new_with_options(
                     &settings.engine.connection,
                     &settings.engine.options,
@@ -207,7 +207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         }
         "duckdb" => {
-            StorageBackendType::DuckDb(
+            HyprStorageBackendType::DuckDb(
                 DuckDbBackend::new_with_options(
                     &settings.engine.connection,
                     &settings.engine.options,

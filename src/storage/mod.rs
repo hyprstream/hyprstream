@@ -9,23 +9,23 @@
 //! interface for metric storage and retrieval operations.
 
 pub mod adbc;
+pub use adbc::AdbcBackend;
 pub mod duckdb;
 pub mod cache;
 pub mod table_manager;
+pub mod arrow_utils;
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use std::collections::HashMap;
-use crate::config::Credentials;
-use crate::metrics::MetricRecord;
-use crate::storage::table_manager::{TableManager, AggregationView};
-use crate::aggregation::{AggregateFunction, GroupBy, AggregateResult, TimeWindow};
+use crate::storage::table_manager::{HyprTableManager, HyprAggregationView};
 use tonic::Status;
+use std::time::Duration;
 
 /// Batch-level aggregation state for efficient updates
 #[derive(Debug, Clone)]
-pub struct BatchAggregation {
+pub struct HyprBatchAggregation {
     /// The metric ID this aggregation belongs to
     pub metric_id: String,
     /// Start of the time window
@@ -53,15 +53,15 @@ pub struct BatchAggregation {
 /// - Aggregation of metrics
 /// - Table and view management
 #[async_trait]
-pub trait StorageBackend: Send + Sync + 'static {
+pub trait HyprStorageBackend: Send + Sync + 'static {
     /// Initialize the storage backend.
     async fn init(&self) -> Result<(), Status>;
 
     /// Insert metrics into storage.
-    async fn insert_metrics(&self, metrics: Vec<MetricRecord>) -> Result<(), Status>;
+    async fn insert_metrics(&self, metrics: Vec<HyprMetricRecord>) -> Result<(), Status>;
 
     /// Query metrics from storage.
-    async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<MetricRecord>, Status>;
+    async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<HyprMetricRecord>, Status>;
 
     /// Prepare a SQL query and return a handle.
     /// The handle is backend-specific and opaque to the caller.
@@ -69,23 +69,23 @@ pub trait StorageBackend: Send + Sync + 'static {
 
     /// Execute a prepared SQL query using its handle.
     /// The handle must have been obtained from prepare_sql.
-    async fn query_sql(&self, statement_handle: &[u8]) -> Result<Vec<MetricRecord>, Status>;
+    async fn query_sql(&self, statement_handle: &[u8]) -> Result<Vec<HyprMetricRecord>, Status>;
 
     /// Aggregate metrics using the specified function and grouping.
     async fn aggregate_metrics(
         &self,
-        function: AggregateFunction,
-        group_by: &GroupBy,
+        function: HyprAggregateFunction,
+        group_by: &HyprGroupBy,
         from_timestamp: i64,
         to_timestamp: Option<i64>,
-    ) -> Result<Vec<AggregateResult>, Status>;
+    ) -> Result<Vec<HyprAggregateResult>, Status>;
 
     /// Create a new instance with the given options.
     /// The connection string and options are backend-specific.
     fn new_with_options(
         connection_string: &str,
         options: &HashMap<String, String>,
-        credentials: Option<&Credentials>,
+        credentials: Option<&HyprCredentials>,
     ) -> Result<Self, Status>
     where
         Self: Sized;
@@ -100,7 +100,7 @@ pub trait StorageBackend: Send + Sync + 'static {
     async fn query_table(&self, table_name: &str, projection: Option<Vec<String>>) -> Result<RecordBatch, Status>;
 
     /// Create an aggregation view
-    async fn create_aggregation_view(&self, view: &AggregationView) -> Result<(), Status>;
+    async fn create_aggregation_view(&self, view: &HyprAggregationView) -> Result<(), Status>;
 
     /// Query data from an aggregation view
     async fn query_aggregation_view(&self, view_name: &str) -> Result<RecordBatch, Status>;
@@ -112,15 +112,15 @@ pub trait StorageBackend: Send + Sync + 'static {
     async fn drop_aggregation_view(&self, view_name: &str) -> Result<(), Status>;
 
     /// Get the table manager instance
-    fn table_manager(&self) -> &TableManager;
+    fn table_manager(&self) -> &HyprTableManager;
 
     /// Update batch-level aggregations.
     /// This is called during batch writes to maintain running aggregations.
     async fn update_batch_aggregations(
         &self,
-        batch: &[MetricRecord],
-        window: TimeWindow,
-    ) -> Result<Vec<BatchAggregation>, Status> {
+        batch: &[HyprMetricRecord],
+        window: HyprTimeWindow,
+    ) -> Result<Vec<HyprBatchAggregation>, Status> {
         // Default implementation that processes the batch and updates aggregations
         let mut aggregations = HashMap::new();
 
@@ -128,7 +128,7 @@ pub trait StorageBackend: Send + Sync + 'static {
             let (window_start, window_end) = window.window_bounds(metric.timestamp);
             let key = (metric.metric_id.clone(), window_start, window_end);
 
-            let agg = aggregations.entry(key).or_insert_with(|| BatchAggregation {
+            let agg = aggregations.entry(key).or_insert_with(|| HyprBatchAggregation {
                 metric_id: metric.metric_id.clone(),
                 window_start,
                 window_end,
@@ -152,12 +152,12 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// This is called after update_batch_aggregations to persist the aggregations.
     async fn insert_batch_aggregations(
         &self,
-        aggregations: Vec<BatchAggregation>,
+        aggregations: Vec<HyprBatchAggregation>,
     ) -> Result<(), Status> {
         // Default implementation that stores aggregations in a separate table
         let mut batch = Vec::new();
         for agg in aggregations {
-            batch.push(MetricRecord {
+            batch.push(HyprMetricRecord {
                 metric_id: agg.metric_id,
                 timestamp: agg.window_start,
                 value_running_window_sum: agg.running_sum,
@@ -170,69 +170,69 @@ pub trait StorageBackend: Send + Sync + 'static {
 }
 
 #[derive(Clone)]
-pub enum StorageBackendType {
+pub enum HyprStorageBackendType {
     Adbc(adbc::AdbcBackend),
     DuckDb(duckdb::DuckDbBackend),
 }
 
-impl AsRef<dyn StorageBackend> for StorageBackendType {
-    fn as_ref(&self) -> &(dyn StorageBackend + 'static) {
+impl AsRef<dyn HyprStorageBackend> for HyprStorageBackendType {
+    fn as_ref(&self) -> &(dyn HyprStorageBackend + 'static) {
         match self {
-            StorageBackendType::Adbc(backend) => backend,
-            StorageBackendType::DuckDb(backend) => backend,
+            HyprStorageBackendType::Adbc(backend) => backend,
+            HyprStorageBackendType::DuckDb(backend) => backend,
         }
     }
 }
 
 #[async_trait::async_trait]
-impl StorageBackend for StorageBackendType {
+impl HyprStorageBackend for HyprStorageBackendType {
     async fn init(&self) -> Result<(), Status> {
         match self {
-            StorageBackendType::Adbc(backend) => backend.init().await,
-            StorageBackendType::DuckDb(backend) => backend.init().await,
+            HyprStorageBackendType::Adbc(backend) => backend.init().await,
+            HyprStorageBackendType::DuckDb(backend) => backend.init().await,
         }
     }
 
-    async fn insert_metrics(&self, metrics: Vec<MetricRecord>) -> Result<(), Status> {
+    async fn insert_metrics(&self, metrics: Vec<HyprMetricRecord>) -> Result<(), Status> {
         match self {
-            StorageBackendType::Adbc(backend) => backend.insert_metrics(metrics).await,
-            StorageBackendType::DuckDb(backend) => backend.insert_metrics(metrics).await,
+            HyprStorageBackendType::Adbc(backend) => backend.insert_metrics(metrics).await,
+            HyprStorageBackendType::DuckDb(backend) => backend.insert_metrics(metrics).await,
         }
     }
 
-    async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<MetricRecord>, Status> {
+    async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<HyprMetricRecord>, Status> {
         match self {
-            StorageBackendType::Adbc(backend) => backend.query_metrics(from_timestamp).await,
-            StorageBackendType::DuckDb(backend) => backend.query_metrics(from_timestamp).await,
+            HyprStorageBackendType::Adbc(backend) => backend.query_metrics(from_timestamp).await,
+            HyprStorageBackendType::DuckDb(backend) => backend.query_metrics(from_timestamp).await,
         }
     }
 
     async fn prepare_sql(&self, query: &str) -> Result<Vec<u8>, Status> {
         match self {
-            StorageBackendType::Adbc(backend) => backend.prepare_sql(query).await,
-            StorageBackendType::DuckDb(backend) => backend.prepare_sql(query).await,
+            HyprStorageBackendType::Adbc(backend) => backend.prepare_sql(query).await,
+            HyprStorageBackendType::DuckDb(backend) => backend.prepare_sql(query).await,
         }
     }
 
-    async fn query_sql(&self, statement_handle: &[u8]) -> Result<Vec<MetricRecord>, Status> {
+    async fn query_sql(&self, statement_handle: &[u8]) -> Result<Vec<HyprMetricRecord>, Status> {
         match self {
-            StorageBackendType::Adbc(backend) => backend.query_sql(statement_handle).await,
-            StorageBackendType::DuckDb(backend) => backend.query_sql(statement_handle).await,
+            HyprStorageBackendType::Adbc(backend) => backend.query_sql(statement_handle).await,
+            HyprStorageBackendType::DuckDb(backend) => backend.query_sql(statement_handle).await,
         }
     }
 
     async fn aggregate_metrics(
         &self,
-        function: AggregateFunction,
-        group_by: &GroupBy,
+        function: HyprAggregateFunction,
+        group_by: &HyprGroupBy,
         from_timestamp: i64,
         to_timestamp: Option<i64>,
-    ) -> Result<Vec<AggregateResult>, Status> {
+    ) -> Result<Vec<HyprAggregateResult>, Status> {
         match self {
-            StorageBackendType::Adbc(backend) => {
+            HyprStorageBackendType::Adbc(backend) => {
                 backend.aggregate_metrics(function, group_by, from_timestamp, to_timestamp).await
             },
-            StorageBackendType::DuckDb(backend) => {
+            HyprStorageBackendType::DuckDb(backend) => {
                 backend.aggregate_metrics(function, group_by, from_timestamp, to_timestamp).await
             },
         }
@@ -241,7 +241,7 @@ impl StorageBackend for StorageBackendType {
     fn new_with_options(
         connection_string: &str,
         options: &HashMap<String, String>,
-        credentials: Option<&Credentials>,
+        credentials: Option<&HyprCredentials>,
     ) -> Result<Self, Status>
     where
         Self: Sized,
@@ -250,10 +250,10 @@ impl StorageBackend for StorageBackendType {
             .ok_or_else(|| Status::invalid_argument("Missing engine type"))?;
 
         match engine_type.as_str() {
-            "adbc" => Ok(StorageBackendType::Adbc(
+            "adbc" => Ok(HyprStorageBackendType::Adbc(
                 adbc::AdbcBackend::new_with_options(connection_string, options, credentials)?
             )),
-            "duckdb" => Ok(StorageBackendType::DuckDb(
+            "duckdb" => Ok(HyprStorageBackendType::DuckDb(
                 duckdb::DuckDbBackend::new_with_options(connection_string, options, credentials)?
             )),
             _ => Err(Status::invalid_argument("Invalid engine type")),
@@ -262,78 +262,88 @@ impl StorageBackend for StorageBackendType {
 
     async fn create_table(&self, table_name: &str, schema: &Schema) -> Result<(), Status> {
         match self {
-            StorageBackendType::Adbc(backend) => backend.create_table(table_name, schema).await,
-            StorageBackendType::DuckDb(backend) => backend.create_table(table_name, schema).await,
+            HyprStorageBackendType::Adbc(backend) => backend.create_table(table_name, schema).await,
+            HyprStorageBackendType::DuckDb(backend) => backend.create_table(table_name, schema).await,
         }
     }
 
     async fn insert_into_table(&self, table_name: &str, batch: RecordBatch) -> Result<(), Status> {
         match self {
-            StorageBackendType::Adbc(backend) => backend.insert_into_table(table_name, batch).await,
-            StorageBackendType::DuckDb(backend) => backend.insert_into_table(table_name, batch).await,
+            HyprStorageBackendType::Adbc(backend) => backend.insert_into_table(table_name, batch).await,
+            HyprStorageBackendType::DuckDb(backend) => backend.insert_into_table(table_name, batch).await,
         }
     }
 
     async fn query_table(&self, table_name: &str, projection: Option<Vec<String>>) -> Result<RecordBatch, Status> {
         match self {
-            StorageBackendType::Adbc(backend) => backend.query_table(table_name, projection).await,
-            StorageBackendType::DuckDb(backend) => backend.query_table(table_name, projection).await,
+            HyprStorageBackendType::Adbc(backend) => backend.query_table(table_name, projection).await,
+            HyprStorageBackendType::DuckDb(backend) => backend.query_table(table_name, projection).await,
         }
     }
 
-    async fn create_aggregation_view(&self, view: &AggregationView) -> Result<(), Status> {
+    async fn create_aggregation_view(&self, view: &HyprAggregationView) -> Result<(), Status> {
         match self {
-            StorageBackendType::Adbc(backend) => backend.create_aggregation_view(view).await,
-            StorageBackendType::DuckDb(backend) => backend.create_aggregation_view(view).await,
+            HyprStorageBackendType::Adbc(backend) => backend.create_aggregation_view(view).await,
+            HyprStorageBackendType::DuckDb(backend) => backend.create_aggregation_view(view).await,
         }
     }
 
     async fn query_aggregation_view(&self, view_name: &str) -> Result<RecordBatch, Status> {
         match self {
-            StorageBackendType::Adbc(backend) => backend.query_aggregation_view(view_name).await,
-            StorageBackendType::DuckDb(backend) => backend.query_aggregation_view(view_name).await,
+            HyprStorageBackendType::Adbc(backend) => backend.query_aggregation_view(view_name).await,
+            HyprStorageBackendType::DuckDb(backend) => backend.query_aggregation_view(view_name).await,
         }
     }
 
     async fn drop_table(&self, table_name: &str) -> Result<(), Status> {
         match self {
-            StorageBackendType::Adbc(backend) => backend.drop_table(table_name).await,
-            StorageBackendType::DuckDb(backend) => backend.drop_table(table_name).await,
+            HyprStorageBackendType::Adbc(backend) => backend.drop_table(table_name).await,
+            HyprStorageBackendType::DuckDb(backend) => backend.drop_table(table_name).await,
         }
     }
 
     async fn drop_aggregation_view(&self, view_name: &str) -> Result<(), Status> {
         match self {
-            StorageBackendType::Adbc(backend) => backend.drop_aggregation_view(view_name).await,
-            StorageBackendType::DuckDb(backend) => backend.drop_aggregation_view(view_name).await,
+            HyprStorageBackendType::Adbc(backend) => backend.drop_aggregation_view(view_name).await,
+            HyprStorageBackendType::DuckDb(backend) => backend.drop_aggregation_view(view_name).await,
         }
     }
 
-    fn table_manager(&self) -> &TableManager {
+    fn table_manager(&self) -> &HyprTableManager {
         match self {
-            StorageBackendType::Adbc(backend) => backend.table_manager(),
-            StorageBackendType::DuckDb(backend) => backend.table_manager(),
+            HyprStorageBackendType::Adbc(backend) => backend.table_manager(),
+            HyprStorageBackendType::DuckDb(backend) => backend.table_manager(),
         }
     }
 
     async fn update_batch_aggregations(
         &self,
-        batch: &[MetricRecord],
-        window: TimeWindow,
-    ) -> Result<Vec<BatchAggregation>, Status> {
+        batch: &[HyprMetricRecord],
+        window: HyprTimeWindow,
+    ) -> Result<Vec<HyprBatchAggregation>, Status> {
         match self {
-            StorageBackendType::Adbc(backend) => backend.update_batch_aggregations(batch, window).await,
-            StorageBackendType::DuckDb(backend) => backend.update_batch_aggregations(batch, window).await,
+            HyprStorageBackendType::Adbc(backend) => backend.update_batch_aggregations(batch, window).await,
+            HyprStorageBackendType::DuckDb(backend) => backend.update_batch_aggregations(batch, window).await,
         }
     }
 
     async fn insert_batch_aggregations(
         &self,
-        aggregations: Vec<BatchAggregation>,
+        aggregations: Vec<HyprBatchAggregation>,
     ) -> Result<(), Status> {
         match self {
-            StorageBackendType::Adbc(backend) => backend.insert_batch_aggregations(aggregations).await,
-            StorageBackendType::DuckDb(backend) => backend.insert_batch_aggregations(aggregations).await,
+            HyprStorageBackendType::Adbc(backend) => backend.insert_batch_aggregations(aggregations).await,
+            HyprStorageBackendType::DuckDb(backend) => backend.insert_batch_aggregations(aggregations).await,
         }
     }
 }
+
+// Re-export types with Hypr prefix
+pub use crate::metrics::MetricRecord as HyprMetricRecord;
+pub use crate::config::Credentials as HyprCredentials;
+pub use crate::aggregation::{
+    AggregateFunction as HyprAggregateFunction,
+    GroupBy as HyprGroupBy,
+    AggregateResult as HyprAggregateResult,
+    TimeWindow as HyprTimeWindow,
+};

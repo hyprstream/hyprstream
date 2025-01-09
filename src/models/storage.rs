@@ -1,5 +1,7 @@
 use super::{Model, ModelLayer, ModelMetadata, ModelVersion, ModelStorage};
-use crate::storage::{StorageBackend, StorageBackendType};
+use crate::storage::{
+    HyprStorageBackend, HyprStorageBackendType
+};
 use arrow_array::{
     Array, ArrayRef, RecordBatch, StringArray, Int64Array, BinaryArray,
 };
@@ -38,11 +40,11 @@ fn get_model_layer_schema() -> Schema {
 }
 
 pub struct TimeSeriesModelStorage {
-    backend: Arc<StorageBackendType>,
+    backend: Arc<HyprStorageBackendType>,
 }
 
 impl TimeSeriesModelStorage {
-    pub fn new(backend: Arc<StorageBackendType>) -> Self {
+    pub fn new(backend: Arc<HyprStorageBackendType>) -> Self {
         Self { backend }
     }
 

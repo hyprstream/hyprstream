@@ -85,7 +85,8 @@ pub mod aggregation;
 pub mod models;
 
 pub use service::FlightSqlService;
-pub use storage::StorageBackend;
 pub use metrics::MetricRecord;
 pub use aggregation::{TimeWindow, AggregateFunction, GroupBy, AggregateResult};
-pub use models::{Model, ModelLayer, ModelMetadata, ModelVersion, ModelStorage};
+pub use models::{Model, ModelStorage, ModelMetadata, ModelVersion};
+pub use storage::HyprStorageBackend;
+pub use storage::HyprStorageBackendType;

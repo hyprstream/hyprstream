@@ -5,24 +5,27 @@ use arrow_schema::Schema;
 use tonic::Status;
 use serde::{Serialize, Deserialize};
 use crate::aggregation::{TimeWindow, AggregateFunction, GroupBy};
+use crate::storage::{
+    HyprAggregateFunction, HyprGroupBy, HyprTimeWindow
+};
 
 /// Configuration for an aggregation view
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AggregationView {
+pub struct HyprAggregationView {
     pub source_table: String,
-    pub function: AggregateFunction,
-    pub group_by: GroupBy,
-    pub window: TimeWindow,
+    pub function: HyprAggregateFunction,
+    pub group_by: HyprGroupBy,
+    pub window: HyprTimeWindow,
     pub aggregate_columns: Vec<String>,
 }
 
 #[derive(Debug)]
-pub struct TableManager {
+pub struct HyprTableManager {
     tables: Arc<RwLock<HashMap<String, Schema>>>,
-    views: Arc<RwLock<HashMap<String, AggregationView>>>,
+    views: Arc<RwLock<HashMap<String, HyprAggregationView>>>,
 }
 
-impl Clone for TableManager {
+impl Clone for HyprTableManager {
     fn clone(&self) -> Self {
         Self {
             tables: self.tables.clone(),
@@ -31,13 +34,13 @@ impl Clone for TableManager {
     }
 }
 
-impl Default for TableManager {
+impl Default for HyprTableManager {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl TableManager {
+impl HyprTableManager {
     pub fn new() -> Self {
         Self {
             tables: Arc::new(RwLock::new(HashMap::new())),
@@ -89,7 +92,7 @@ impl TableManager {
             }
         }
 
-        let view = AggregationView {
+        let view = HyprAggregationView {
             source_table,
             function,
             group_by,
@@ -105,7 +108,7 @@ impl TableManager {
         Ok(())
     }
 
-    pub async fn get_aggregation_view(&self, name: &str) -> Result<AggregationView, Status> {
+    pub async fn get_aggregation_view(&self, name: &str) -> Result<HyprAggregationView, Status> {
         let views = self.views.read().await;
         views.get(name)
             .cloned()

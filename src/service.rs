@@ -9,7 +9,10 @@
 //! The service implementation is designed to work with multiple storage backends
 //! while maintaining consistent query semantics and high performance.
 
-use crate::storage::{StorageBackendType, StorageBackend};
+use crate::storage::{
+    HyprStorageBackendType, HyprStorageBackend
+};
+use crate::storage::table_manager::HyprAggregationView;
 use crate::models::{Model, ModelStorage};
 use arrow_flight::{
     flight_service_server::FlightService,
@@ -26,7 +29,6 @@ use serde::Deserialize;
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_ipc::writer::IpcDataGenerator;
 use arrow_schema::Schema;
-use crate::storage::table_manager::AggregationView;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -89,7 +91,7 @@ enum TableCommand {
         name: String,
         schema: Arc<Schema>,
     },
-    CreateAggregationView(AggregationView),
+    CreateAggregationView(HyprAggregationView),
     DropTable(String),
     DropAggregationView(String),
 }
@@ -116,7 +118,7 @@ impl TableCommand {
                 })
             }
             Some("create_aggregation_view") => {
-                let view: AggregationView = serde_json::from_value(value["data"].clone())
+                let view: HyprAggregationView = serde_json::from_value(value["data"].clone())
                     .map_err(|e| Status::invalid_argument(format!("Invalid view command: {}", e)))?;
                 Ok(TableCommand::CreateAggregationView(view))
             }
@@ -236,14 +238,14 @@ struct AuthToken {
 /// ```
 #[derive(Clone)]
 pub struct FlightSqlService {
-    backend: Arc<StorageBackendType>,
+    backend: Arc<HyprStorageBackendType>,
     model_storage: Arc<Box<dyn ModelStorage>>,
     statement_counter: Arc<AtomicU64>,
     prepared_statements: Arc<Mutex<Vec<String>>>,
 }
 
 impl FlightSqlService {
-    pub fn new(backend: Arc<StorageBackendType>, model_storage: Box<dyn ModelStorage>) -> Self {
+    pub fn new(backend: Arc<HyprStorageBackendType>, model_storage: Box<dyn ModelStorage>) -> Self {
         Self {
             backend,
             model_storage: Arc::new(model_storage),

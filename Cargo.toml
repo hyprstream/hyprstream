@@ -22,6 +22,10 @@ name = "hyprstream"
 path = "src/bin/main.rs"
 doc = true
 
+[features]
+simd = ["safe_arch"]
+portable_simd = []
+
 [dependencies]
 arrow = "54.0.0"
 arrow-flight = { version = "54.0.0", features = ["cli", "flight-sql-experimental", "tls", "tokio"] }
@@ -39,6 +43,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_derive = "1.0"
 lazy_static = "1.4"
 serde_json = "1.0"
+safe_arch = { version = "0.7", optional = true }
 
 # ADBC dependencies
 arrow-array = "54.0.0"
@@ -55,3 +60,7 @@ tokio-stream = "0.1.17"
 hex = "0.4"
 chrono = "0.4"
 async-stream = "0.3"
+arrow_convert = "0.8.0"
+
+[target.'cfg(target_arch = "x86_64")'.rustflags]
+rustflags = ["-C", "target-feature=+sse2,+avx2"]
