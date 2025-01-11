@@ -43,7 +43,7 @@
 //! query execution using Arrow's native formats.
 
 use adbc_core::{
-    driver_manager::{ManagedConnection, ManagedDriver},
+    driver_manager::{ManagedConnection, ManagedDriver, ManagedStatement},
     options::{AdbcVersion, OptionDatabase, OptionValue},
     Connection, Database, Driver, Statement, Optionable,
 };
@@ -69,7 +69,7 @@ use crate::storage::{
     HyprCredentials
 };
 use arrow_convert::serialize::TryIntoArrow;
-
+use crate::storage::arrow_utils::BatchConverter;
 
 /// Safe conversion of values to ADBC option values
 trait IntoAdbcOptionValue {
@@ -156,8 +156,7 @@ impl AdbcBackend {
             .ok_or_else(|| Status::internal("No data returned"))?
             .map_err(|e| Status::internal(format!("Failed to get batch: {}", e)))?;
 
-        adbc_batch.try_into()
-            .map_err(|e| Status::internal(format!("Failed to convert to Arrow: {}", e)))
+        BatchConverter::convert_to_record_batch(Box::new(adbc_batch))
     }
 
     /// Bind values to a statement

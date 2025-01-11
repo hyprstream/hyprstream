@@ -14,6 +14,7 @@ pub mod duckdb;
 pub mod cache;
 pub mod table_manager;
 pub mod arrow_utils;
+pub mod zerocopy;
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;

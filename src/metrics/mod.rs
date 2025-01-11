@@ -1,5 +1,6 @@
 pub mod aggregation;
 
+use arrow_array::builder::{StringBuilder, Float64Builder, Int64Builder};
 use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::array::{Array, StructBuilder};
 use arrow_schema::{DataType, Field, Schema};
@@ -21,40 +22,6 @@ pub struct MetricRecord {
     pub value_running_window_avg: f64,
     /// Running count within the window
     pub value_running_window_count: i64,
-}
-
-impl ArrowField for MetricRecord {
-    fn arrow_field() -> Field {
-        Field::new("metric_record", DataType::Struct(vec![
-            Field::new("metric_id", DataType::Utf8, false),
-            Field::new("timestamp", DataType::Int64, false),
-            Field::new("value_running_window_sum", DataType::Float64, false),
-            Field::new("value_running_window_avg", DataType::Float64, false),
-            Field::new("value_running_window_count", DataType::Int64, false),
-        ]), false)
-    }
-}
-
-impl ArrowSerialize for MetricRecord {
-    fn arrow_serialize(&self) -> Result<Box<dyn Array>, Status> {
-        let schema = Self::arrow_field().data_type().clone();
-        let mut builder = arrow::array::StructBuilder::from_fields(
-            match schema {
-                DataType::Struct(fields) => fields,
-                _ => unreachable!(),
-            },
-            self.metric_id.len(),
-        );
-
-        builder.field_builder::<StringArray>(0).unwrap().append_value(&self.metric_id);
-        builder.field_builder::<Int64Array>(1).unwrap().append_value(self.timestamp);
-        builder.field_builder::<Float64Array>(2).unwrap().append_value(self.value_running_window_sum);
-        builder.field_builder::<Float64Array>(3).unwrap().append_value(self.value_running_window_avg);
-        builder.field_builder::<Int64Array>(4).unwrap().append_value(self.value_running_window_count);
-        builder.append(true);
-
-        Ok(Box::new(builder.finish()))
-    }
 }
 
 impl MetricRecord {
@@ -96,6 +63,28 @@ impl MetricRecord {
         }
 
         Ok(metrics)
+    }
+}
+
+impl<'a> TryIntoArrow for &'a MetricRecord {
+    type ArrowArray = StructArray;
+    
+    fn try_into_arrow(self) -> Result<Self::ArrowArray, ArrowError> {
+        let schema = get_metrics_schema();
+        let mut builder = StructBuilder::from_fields(
+            schema.fields().to_vec(),
+            1  // Since we're converting a single record
+        );
+
+        // Use references to maintain zero-copy where possible
+        builder.field_builder::<StringBuilder>(0).unwrap().append_value(&self.metric_id);
+        builder.field_builder::<Int64Builder>(1).unwrap().append_value(self.timestamp);
+        builder.field_builder::<Float64Builder>(2).unwrap().append_value(self.value_running_window_sum);
+        builder.field_builder::<Float64Builder>(3).unwrap().append_value(self.value_running_window_avg);
+        builder.field_builder::<Int64Builder>(4).unwrap().append_value(self.value_running_window_count);
+        builder.append(true);
+
+        Ok(builder.finish())
     }
 }
 

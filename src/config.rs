@@ -99,6 +99,10 @@ pub struct CliArgs {
     /// Cache engine password
     #[arg(long, env = "HYPRSTREAM_CACHE_PASSWORD")]
     cache_password: Option<String>,
+
+    /// Minimum number of columns for parallel processing
+    #[arg(long, env = "HYPRSTREAM_PARALLEL_THRESHOLD")]
+    parallel_threshold: Option<usize>,
 }
 
 /// Complete service configuration.
@@ -128,10 +132,17 @@ pub struct ServerConfig {
     /// Log level (trace, debug, info, warn, error)
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// Minimum number of columns required to trigger parallel processing
+    #[serde(default = "default_parallel_threshold")]
+    pub parallel_threshold: usize,
 }
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+fn default_parallel_threshold() -> usize {
+    4  // Default to 4 columns for parallelization
 }
 
 /// Engine configuration.
@@ -295,6 +306,10 @@ impl Settings {
         }
         if let Some(duration) = cli.cache_max_duration {
             builder = builder.set_override("cache.max_duration_secs", duration)?;
+        }
+
+        if let Some(threshold) = cli.parallel_threshold {
+            builder = builder.set_override("server.parallel_threshold", threshold)?;
         }
 
         // Build initial settings
