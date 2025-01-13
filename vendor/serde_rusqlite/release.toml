@@ -1,0 +1,3 @@
+allow-branch = ["master"]
+pre-release-hook = "tools/pre-release.sh"
+pre-release-commit-message = "v{{version}}"

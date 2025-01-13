@@ -1,0 +1,5 @@
+error: Interfaces must inherit from another interface like so: `interface LoneInterface: IParentInterface`
+ --> $DIR/no_supertrait.rs:5:26
+  |
+5 |     pub unsafe interface LoneInterface {
+  |                          ^^^^^^^^^^^^^

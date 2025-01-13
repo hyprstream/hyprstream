@@ -1,0 +1,16 @@
+error[E0774]: `derive` may only be applied to `struct`s, `enum`s and `union`s
+ --> tests/ui/derive_on_trait.rs:3:1
+  |
+3 |   #[derive(ArrowField)]
+  |   ^^^^^^^^^^^^^^^^^^^^^ not applicable here
+4 | / trait Test
+5 | | {}
+  | |__- not a `struct`, `enum` or `union`
+
+warning: unused import: `arrow_convert::ArrowField`
+ --> tests/ui/derive_on_trait.rs:1:5
+  |
+1 | use arrow_convert::ArrowField;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default

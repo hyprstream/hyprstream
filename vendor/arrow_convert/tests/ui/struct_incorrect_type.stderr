@@ -1,0 +1,19 @@
+error[E0277]: the trait bound `String: Borrow<Vec<u8>>` is not satisfied
+ --> tests/ui/struct_incorrect_type.rs:4:29
+  |
+4 | #[derive(Debug, ArrowField, ArrowSerialize, ArrowDeserialize)]
+  |                             ^^^^^^^^^^^^^^ the trait `Borrow<Vec<u8>>` is not implemented for `String`
+  |
+  = help: the trait `Borrow<str>` is implemented for `String`
+  = help: for that trait implementation, expected `str`, found `Vec<u8>`
+  = note: this error originates in the derive macro `ArrowSerialize` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0308]: mismatched types
+ --> tests/ui/struct_incorrect_type.rs:4:45
+  |
+4 | #[derive(Debug, ArrowField, ArrowSerialize, ArrowDeserialize)]
+  |                                             ^^^^^^^^^^^^^^^^ expected `String`, found `Vec<u8>`
+  |
+  = note: expected struct `String`
+             found struct `Vec<u8>`
+  = note: this error originates in the derive macro `ArrowDeserialize` (in Nightly builds, run with -Z macro-backtrace for more info)
