@@ -106,12 +106,30 @@ pub async fn execute_sql(
     tls_skip_verify: bool,
     verbose: bool,
 ) -> Result<()> {
+    // Set up logging
+    let level = if verbose { "debug" } else { "info" };
+    let subscriber = fmt::Subscriber::builder()
+        .with_env_filter(EnvFilter::new(level))
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_thread_names(false)
+        .with_file(false)
+        .with_line_number(false)
+        .with_level(true)
+        .compact()
+        .finish();
+
+    // Try to set the subscriber, but don't panic if it fails (e.g., if already set)
+    if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
+        eprintln!("Warning: Could not set global tracing subscriber: {}", e);
+    }
+
     // Install the default crypto provider (ignore result as it may already be installed)
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Use default host:port if not provided
     let addr = host.unwrap_or_else(|| "127.0.0.1:50051".to_string());
-    println!("Connecting to {}...", addr);
+    tracing::info!("Connecting to {}...", addr);
 
     // Ensure URL has correct scheme based on TLS configuration
     let use_tls = tls_cert.is_some() || tls_key.is_some() || tls_ca.is_some();
@@ -122,13 +140,13 @@ pub async fn execute_sql(
     };
 
     if verbose {
-        println!("Debug: Using URL {}", uri_str);
-        println!("Debug: TLS enabled: {}", use_tls);
-        println!("Debug: Connection timeout: 5s");
-        println!("Debug: Query timeout: 30s");
+        tracing::debug!("Using URL {}", uri_str);
+        tracing::debug!("TLS enabled: {}", use_tls);
+        tracing::debug!("Connection timeout: 5s");
+        tracing::debug!("Query timeout: 30s");
     }
 
-    println!("Connecting to {}...", addr);
+    tracing::info!("Connecting to {}...", addr);
 
     // Configure TLS if enabled
     let mut endpoint = tonic::transport::Channel::from_shared(uri_str.clone())?
@@ -168,9 +186,9 @@ pub async fn execute_sql(
     };
 
     if verbose {
-        println!("Debug: Executing query: {}", query);
+        tracing::debug!("Executing query: {}", query);
     }
-    println!("Executing query...");
+    tracing::info!("Executing query...");
 
     // Execute the query with timeout
     let response = match tokio::time::timeout(
@@ -210,9 +228,9 @@ pub async fn execute_sql(
     }
 
     if row_count == 0 {
-        println!("Query completed successfully (0 rows)");
+        tracing::info!("Query completed successfully (0 rows)");
     } else {
-        println!("Query completed successfully ({} rows)", row_count);
+        tracing::info!("Query completed successfully ({} rows)", row_count);
     }
 
     Ok(())
