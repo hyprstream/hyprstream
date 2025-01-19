@@ -5,30 +5,127 @@ use crate::{
     storage::{adbc::AdbcBackend, duckdb::DuckDbBackend, StorageBackend, StorageBackendType},
 };
 use anyhow::{Context, Result};
-use arrow_flight::flight_service_client::FlightServiceClient;
+use arrow_flight::{flight_service_client::FlightServiceClient, Action};
 use daemonize::Daemonize;
-use std::collections::HashMap;
-use tonic::transport::{Server, Uri};
+use rustls::{
+    pki_types::{CertificateDer, PrivateKeyDer},
+    RootCertStore,
+};
+use std::{collections::HashMap, fs::File, io::BufReader, path::Path};
+use tonic::transport::{
+    Certificate as TonicCertificate, ClientTlsConfig, Identity, Server, ServerTlsConfig, Uri,
+};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_log::LogTracer;
 use tracing_subscriber::{fmt, EnvFilter};
-use arrow_flight::Action;
 
-pub async fn execute_sql(host: Option<String>, query: String) -> Result<()> {
+fn load_certificate(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
+    let file = File::open(path).context("Failed to open certificate file")?;
+    let mut reader = BufReader::new(file);
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("Failed to parse certificate")?;
+    Ok(certs)
+}
+
+fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
+    let file = File::open(path).context("Failed to open private key file")?;
+    let mut reader = BufReader::new(file);
+    let key = rustls_pemfile::pkcs8_private_keys(&mut reader)
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No private key found"))?
+        .context("Failed to parse private key")?;
+    Ok(PrivateKeyDer::Pkcs8(key))
+}
+
+fn configure_server_tls(
+    cert_path: Option<&Path>,
+    key_path: Option<&Path>,
+    client_ca_path: Option<&Path>,
+) -> Result<Option<ServerTlsConfig>> {
+    match (cert_path, key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            let mut config = ServerTlsConfig::new();
+            config = config.identity(Identity::from_pem(
+                std::fs::read(cert_path)?,
+                std::fs::read(key_path)?,
+            ));
+
+            // Configure client authentication if CA cert is provided
+            if let Some(ca_path) = client_ca_path {
+                let mut root_store = RootCertStore::empty();
+                for cert in load_certificate(ca_path)? {
+                    root_store.add(cert).context("Failed to add CA certificate")?;
+                }
+                config = config.client_ca_root(TonicCertificate::from_pem(std::fs::read(ca_path)?));
+            }
+
+            Ok(Some(config))
+        }
+        (None, None) => Ok(None),
+        _ => anyhow::bail!("Both certificate and private key must be provided for TLS"),
+    }
+}
+
+fn configure_client_tls(
+    cert_path: Option<&Path>,
+    key_path: Option<&Path>,
+    ca_path: Option<&Path>,
+    skip_verify: bool,
+) -> Result<Option<ClientTlsConfig>> {
+    let mut config = if skip_verify {
+        ClientTlsConfig::new().domain_name("localhost")
+    } else {
+        ClientTlsConfig::new()
+    };
+
+    if let Some(ca_path) = ca_path {
+        config = config.ca_certificate(TonicCertificate::from_pem(std::fs::read(ca_path)?));
+    }
+
+    match (cert_path, key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            config = config.identity(Identity::from_pem(
+                std::fs::read(cert_path)?,
+                std::fs::read(key_path)?,
+            ));
+        }
+        (None, None) => {}
+        _ => anyhow::bail!("Both certificate and private key must be provided for mTLS"),
+    }
+
+    Ok(Some(config))
+}
+
+pub async fn execute_sql(
+    host: Option<String>,
+    query: String,
+    tls_cert: Option<&Path>,
+    tls_key: Option<&Path>,
+    tls_ca: Option<&Path>,
+    tls_skip_verify: bool,
+) -> Result<()> {
+    // Install the default crypto provider (ignore result as it may already be installed)
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Use default host:port if not provided
     let addr = host.unwrap_or_else(|| "127.0.0.1:50051".to_string());
-    // Ensure URL has http:// scheme
+    // Ensure URL has correct scheme based on TLS configuration
+    let use_tls = tls_cert.is_some() || tls_key.is_some() || tls_ca.is_some();
     let uri_str = if !addr.starts_with("http://") && !addr.starts_with("https://") {
-        format!("https://{}", addr)
+        format!("{}://{}", if use_tls { "https" } else { "http" }, addr)
     } else {
         addr
     };
-    let uri: Uri = uri_str.parse().context("Invalid server address")?;
+
+    // Configure TLS if enabled
+    let mut endpoint = tonic::transport::Channel::from_shared(uri_str)?;
+    if let Some(tls_config) = configure_client_tls(tls_cert, tls_key, tls_ca, tls_skip_verify)? {
+        endpoint = endpoint.tls_config(tls_config)?;
+    }
 
     // Connect to the server
-    let mut client = FlightServiceClient::connect(uri)
-        .await
-        .context("Failed to connect to server")?;
+    let mut client = FlightServiceClient::new(endpoint.connect().await?);
 
     // Create the SQL action
     let action = Action {
@@ -60,6 +157,9 @@ pub async fn execute_sql(host: Option<String>, query: String) -> Result<()> {
 }
 
 pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
+    // Install the default crypto provider (ignore result as it may already be installed)
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Set up logging before anything else
     LogTracer::init().context("Failed to initialize log tracer")?;
 
@@ -196,8 +296,18 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
     tracing::warn!("This is a pre-release alpha for preview purposes only.");
     tracing::info!("Starting server on {}", addr);
 
+    // Configure server with TLS if certificates are provided
+    let mut server = Server::builder();
+    if let Some(tls_config) = configure_server_tls(
+        settings.server.tls_cert.as_deref(),
+        settings.server.tls_key.as_deref(),
+        settings.server.tls_client_ca.as_deref(),
+    )? {
+        server = server.tls_config(tls_config)?;
+    }
+
     // Run the server (it's already detached if detach was true)
-    match Server::builder()
+    match server
         .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(service))
         .serve(addr)
         .await

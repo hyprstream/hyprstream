@@ -3,7 +3,7 @@ use clap::Args;
 use serde::Deserialize;
 use std::path::PathBuf;
 
-#[derive(Debug, Default, Deserialize, Args)]
+#[derive(Debug, Deserialize, Args)]
 pub struct ServerConfig {
     /// Server host address
     #[arg(long, env = "HYPRSTREAM_SERVER_HOST")]
@@ -24,6 +24,33 @@ pub struct ServerConfig {
     /// PID file location when running in detached mode
     #[arg(long, env = "HYPRSTREAM_PID_FILE")]
     pub pid_file: Option<String>,
+
+    /// Path to TLS certificate file
+    #[arg(long = "tls-cert", env = "HYPRSTREAM_TLS_CERT")]
+    pub tls_cert: Option<PathBuf>,
+
+    /// Path to TLS private key file
+    #[arg(long = "tls-key", env = "HYPRSTREAM_TLS_KEY")]
+    pub tls_key: Option<PathBuf>,
+
+    /// Path to CA certificate for client authentication (enables mTLS)
+    #[arg(long = "tls-client-ca", env = "HYPRSTREAM_TLS_CLIENT_CA")]
+    pub tls_client_ca: Option<PathBuf>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: None,
+            port: None,
+            log_level: None,
+            working_dir: None,
+            pid_file: None,
+            tls_cert: None,
+            tls_key: None,
+            tls_client_ca: None,
+        }
+    }
 }
 
 impl ConfigSection for ServerConfig {
@@ -53,6 +80,18 @@ impl ConfigSection for ServerConfig {
             )
             .with_env("HYPRSTREAM_PID_FILE")
             .with_cli("pid-file"),
+            ConfigOptionDef::new("server.tls_cert", "Path to TLS certificate file")
+                .with_env("HYPRSTREAM_TLS_CERT")
+                .with_cli("tls-cert"),
+            ConfigOptionDef::new("server.tls_key", "Path to TLS private key file")
+                .with_env("HYPRSTREAM_TLS_KEY")
+                .with_cli("tls-key"),
+            ConfigOptionDef::new(
+                "server.tls_client_ca",
+                "Path to CA certificate for client authentication (enables mTLS)",
+            )
+            .with_env("HYPRSTREAM_TLS_CLIENT_CA")
+            .with_cli("tls-client-ca"),
         ]
     }
 
@@ -67,6 +106,9 @@ impl ConfigSection for ServerConfig {
             log_level: Option<String>,
             working_dir: Option<String>,
             pid_file: Option<String>,
+            tls_cert: Option<PathBuf>,
+            tls_key: Option<PathBuf>,
+            tls_client_ca: Option<PathBuf>,
         }
 
         let config = ServerConfigFile::deserialize(deserializer)?;
@@ -76,6 +118,9 @@ impl ConfigSection for ServerConfig {
             log_level: config.log_level,
             working_dir: config.working_dir,
             pid_file: config.pid_file,
+            tls_cert: config.tls_cert,
+            tls_key: config.tls_key,
+            tls_client_ca: config.tls_client_ca,
         })
     }
 }
@@ -240,7 +285,7 @@ impl ConfigSection for CacheConfig {
     }
 }
 
-#[derive(Debug, Default, Args)]
+#[derive(Debug, Args)]
 pub struct ServerCommand {
     /// Run server in detached mode
     #[arg(short = 'd', long = "detach")]

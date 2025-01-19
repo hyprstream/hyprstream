@@ -32,7 +32,9 @@ futures = { version = "0.3.31", features = ["alloc"] }
 polars = "0.45.1"
 tokio = { version = "1.42.0", features = ["macros", "rt", "rt-multi-thread"] }
 tokio-rustls = "0.26.1"
-tonic = { version = "0.12.3", features = ["transport", "codegen", "prost"] }
+tonic = { version = "0.12.3", features = ["transport", "codegen", "prost", "tls"] }
+rustls = "0.23.1"
+rustls-pemfile = "2.1.0"
 async-trait = "0.1"
 sqlparser = "0.39.0"
 adbc_core = { version = "0.15.0", features = ["driver_manager"] }
