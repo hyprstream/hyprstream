@@ -1,6 +1,6 @@
 [package]
 name = "hyprstream"
-version = "0.1.0-alpha-6"
+version = "0.1.0-alpha-7"
 edition = "2021"
 description = "High-performance metrics storage and query service using Arrow Flight SQL"
 documentation = "https://docs.rs/hyprstream"
@@ -23,8 +23,8 @@ path = "src/bin/main.rs"
 doc = true
 
 [dependencies]
-arrow = "54.0.0"
-arrow-flight = { version = "54.0.0", features = ["cli", "flight-sql-experimental", "tls", "tokio"] }
+arrow = "53.1.0"
+arrow-flight = { version = "53.1.0", features = ["cli", "flight-sql-experimental", "tls"] }
 bytes = "1.9.0"
 duckdb = { version = "1.1.1", features = ["bundled"] }
 futures = { version = "0.3.31", features = ["alloc"] }
