@@ -18,7 +18,6 @@
 //! - `HYPRSTREAM_CACHE_USERNAME` - Cache backend username (if needed)
 //! - `HYPRSTREAM_CACHE_PASSWORD` - Cache backend password (if needed)
 
-use clap::Parser;
 use config::{Config, ConfigError};
 use serde::Deserialize;
 use std::env;
@@ -28,77 +27,59 @@ use std::collections::HashMap;
 const DEFAULT_CONFIG: &str = include_str!("../config/default.toml");
 const DEFAULT_CONFIG_PATH: &str = "/etc/hyprstream/config.toml";
 
-/// Command-line arguments parser.
+/// Configuration options container.
 ///
-/// This structure defines all available command-line options and their
-/// corresponding environment variables. It uses clap for parsing and
-/// supports both short and long option forms.
-#[derive(Parser, Debug)]
-#[command(author, version, about)]
+/// This structure holds configuration options that can be set through
+/// various sources including command-line, environment variables, and config files.
+#[derive(Debug, Default)]
 pub struct CliArgs {
     /// Path to the configuration file
-    #[arg(short, long, value_name = "FILE")]
-    config: Option<PathBuf>,
+    pub config: Option<PathBuf>,
 
     /// Server host address
-    #[arg(long, env = "HYPRSTREAM_SERVER_HOST")]
-    host: Option<String>,
+    pub host: Option<String>,
 
     /// Server port
-    #[arg(long, env = "HYPRSTREAM_SERVER_PORT")]
-    port: Option<u16>,
+    pub port: Option<u16>,
 
     /// Log level (trace, debug, info, warn, error)
-    #[arg(long, env = "HYPRSTREAM_LOG_LEVEL")]
-    log_level: Option<String>,
+    pub log_level: Option<String>,
 
     /// Primary storage engine type
-    #[arg(long, env = "HYPRSTREAM_ENGINE")]
-    engine: Option<String>,
+    pub engine: Option<String>,
 
     /// Primary storage engine connection string
-    #[arg(long, env = "HYPRSTREAM_ENGINE_CONNECTION")]
-    engine_connection: Option<String>,
+    pub engine_connection: Option<String>,
 
     /// Primary storage engine options (key=value pairs)
-    #[arg(long, env = "HYPRSTREAM_ENGINE_OPTIONS")]
-    engine_options: Option<Vec<String>>,
+    pub engine_options: Option<Vec<String>>,
 
     /// Enable caching
-    #[arg(long, env = "HYPRSTREAM_ENABLE_CACHE")]
-    enable_cache: Option<bool>,
+    pub enable_cache: Option<bool>,
 
     /// Cache engine type
-    #[arg(long, env = "HYPRSTREAM_CACHE_ENGINE")]
-    cache_engine: Option<String>,
+    pub cache_engine: Option<String>,
 
     /// Cache engine connection string
-    #[arg(long, env = "HYPRSTREAM_CACHE_CONNECTION")]
-    cache_connection: Option<String>,
+    pub cache_connection: Option<String>,
 
     /// Cache engine options (key=value pairs)
-    #[arg(long, env = "HYPRSTREAM_CACHE_OPTIONS")]
-    cache_options: Option<Vec<String>>,
+    pub cache_options: Option<Vec<String>>,
 
     /// Cache maximum duration in seconds
-    #[arg(long, env = "HYPRSTREAM_CACHE_MAX_DURATION")]
-    cache_max_duration: Option<u64>,
+    pub cache_max_duration: Option<u64>,
 
     /// Primary storage engine username
-    #[arg(long, env = "HYPRSTREAM_ENGINE_USERNAME")]
-    engine_username: Option<String>,
+    pub engine_username: Option<String>,
 
     /// Primary storage engine password
-    #[arg(long, env = "HYPRSTREAM_ENGINE_PASSWORD")]
-    engine_password: Option<String>,
+    pub engine_password: Option<String>,
 
     /// Cache engine username
-    #[arg(long, env = "HYPRSTREAM_CACHE_USERNAME")]
-    cache_username: Option<String>,
+    pub cache_username: Option<String>,
 
     /// Cache engine password
-    #[arg(long, env = "HYPRSTREAM_CACHE_PASSWORD")]
-    cache_password: Option<String>,
+    pub cache_password: Option<String>,
 }
 
 /// Complete service configuration.

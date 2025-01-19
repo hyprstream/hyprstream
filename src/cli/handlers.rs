@@ -12,7 +12,6 @@ use crate::{
     service::FlightSqlService,
 };
 use tonic::transport::Server;
-use tracing_subscriber::{fmt, EnvFilter};
 
 pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
     // Create storage backend

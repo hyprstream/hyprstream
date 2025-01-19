@@ -49,8 +49,6 @@ use async_trait::async_trait;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::array::{
     Array, ArrayRef, RecordBatch, Int64Array, Float64Array, StringArray,
-};
-use arrow::array::builder::{
     ArrayBuilder, Int64Builder, Float64Builder, StringBuilder,
 };
 use std::time::Duration;
