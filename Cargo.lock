@@ -1698,6 +1698,7 @@ name = "hyprstream"
 version = "0.1.0-alpha-6"
 dependencies = [
  "adbc_core",
+ "anyhow",
  "arrow 54.0.0",
  "arrow-array 54.0.0",
  "arrow-flight",
