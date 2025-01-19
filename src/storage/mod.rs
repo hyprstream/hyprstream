@@ -154,7 +154,6 @@ impl BatchAggregation {
 /// - Table and view management
 #[async_trait]
 pub trait StorageBackend: Send + Sync + 'static {
-
     /// Initialize the storage backend.
     async fn init(&self) -> Result<(), Status>;
 

@@ -3,9 +3,12 @@ use arrow_flight::flight_service_client::FlightServiceClient;
 use bytes::Bytes;
 use futures::StreamExt;
 use hyprstream_core::{
-    models::{Model, ModelLayer, ModelMetadata, ModelVersion, storage::TimeSeriesModelStorage, ModelStorage},
+    models::{
+        storage::TimeSeriesModelStorage, Model, ModelLayer, ModelMetadata, ModelStorage,
+        ModelVersion,
+    },
     service::FlightSqlService,
-    storage::{StorageBackend, StorageBackendType, duckdb::DuckDbBackend},
+    storage::{duckdb::DuckDbBackend, StorageBackend, StorageBackendType},
 };
 use std::{collections::HashMap, sync::Arc, time::SystemTime};
 use tempfile::tempdir;
@@ -17,13 +20,11 @@ async fn test_model_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = dir.path().join("test.db");
 
     // Create storage backend
-    let engine_backend = Arc::new(StorageBackendType::DuckDb(
-        DuckDbBackend::new_with_options(
-            db_path.to_str().unwrap(),
-            &HashMap::new(),
-            None,
-        )?
-    ));
+    let engine_backend = Arc::new(StorageBackendType::DuckDb(DuckDbBackend::new_with_options(
+        db_path.to_str().unwrap(),
+        &HashMap::new(),
+        None,
+    )?));
 
     // Initialize backend
     engine_backend.init().await?;
@@ -97,18 +98,16 @@ fn create_test_model() -> Model {
         ]),
     };
 
-    let weights: Vec<Arc<dyn Array>> = vec![
-        Arc::new(Float32Array::from(vec![1.0_f32, 2.0_f32, 3.0_f32])),
-    ];
+    let weights: Vec<Arc<dyn Array>> = vec![Arc::new(Float32Array::from(vec![
+        1.0_f32, 2.0_f32, 3.0_f32,
+    ]))];
 
     let layers = vec![ModelLayer {
         name: "layer1".to_string(),
         layer_type: "dense".to_string(),
         shape: vec![3, 1],
         weights,
-        parameters: HashMap::from([
-            ("activation".to_string(), "relu".to_string()),
-        ]),
+        parameters: HashMap::from([("activation".to_string(), "relu".to_string())]),
     }];
 
     Model::new(metadata, layers)

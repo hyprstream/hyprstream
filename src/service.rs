@@ -10,13 +10,12 @@
 //! while maintaining consistent query semantics and high performance.
 
 use crate::metrics::MetricRecord;
-use crate::models::{Model, ModelStorage};
 use crate::models::storage::TimeSeriesModelStorage;
-use crate::storage::table_manager::AggregationView;
-use crate::storage::{StorageBackend, StorageBackendType};
+use crate::models::{Model, ModelStorage};
 use crate::storage::adbc::AdbcBackend;
 use crate::storage::duckdb::DuckDbBackend;
-use std::any::{Any, TypeId};
+use crate::storage::table_manager::AggregationView;
+use crate::storage::{StorageBackend, StorageBackendType};
 use arrow_array::{builder::Float32Builder, ArrayRef, Float32Array};
 use arrow_flight::{
     flight_service_server::FlightService, Action, ActionType, Criteria, Empty, FlightData,
@@ -30,6 +29,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json;
+use std::any::{Any, TypeId};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -88,13 +88,19 @@ impl Command {
                 Ok(Command::Model(cmd))
             }
             Some("sql.execute") => {
-                let sql = String::from_utf8(value["data"].as_str().unwrap_or("").as_bytes().to_vec())
-                    .map_err(|e| Status::invalid_argument(format!("Invalid SQL string: {}", e)))?;
+                let sql =
+                    String::from_utf8(value["data"].as_str().unwrap_or("").as_bytes().to_vec())
+                        .map_err(|e| {
+                            Status::invalid_argument(format!("Invalid SQL string: {}", e))
+                        })?;
                 Ok(Command::Sql(SqlCommand::Execute(sql)))
             }
             Some("sql.query") => {
-                let sql = String::from_utf8(value["data"].as_str().unwrap_or("").as_bytes().to_vec())
-                    .map_err(|e| Status::invalid_argument(format!("Invalid SQL string: {}", e)))?;
+                let sql =
+                    String::from_utf8(value["data"].as_str().unwrap_or("").as_bytes().to_vec())
+                        .map_err(|e| {
+                            Status::invalid_argument(format!("Invalid SQL string: {}", e))
+                        })?;
                 Ok(Command::Sql(SqlCommand::Query(sql)))
             }
             _ => Err(Status::invalid_argument("Invalid command type")),
@@ -289,10 +295,7 @@ impl FlightSqlService {
         let addr = "[::]:0".parse().unwrap();
         let svc = FlightServiceServer::new(self);
 
-        Server::builder()
-            .add_service(svc)
-            .serve(addr)
-            .await
+        Server::builder().add_service(svc).serve(addr).await
     }
 
     // SQL execution methods
@@ -524,7 +527,7 @@ impl FlightSqlService {
                         Status::internal(format!("Failed to serialize query results: {}", e))
                     })
                 }
-            }
+            },
         }
     }
 

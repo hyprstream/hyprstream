@@ -133,7 +133,8 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
     match &engine_backend {
         StorageBackendType::Adbc(backend) => backend.init().await,
         StorageBackendType::DuckDb(backend) => backend.init().await,
-    }.context("Failed to initialize storage backend")?;
+    }
+    .context("Failed to initialize storage backend")?;
 
     // Create the service
     let service = FlightSqlService::new(engine_backend);

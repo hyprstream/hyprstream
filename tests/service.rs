@@ -14,12 +14,15 @@ impl FlightSqlClientExt for FlightSqlServiceClient<Channel> {
             r#type: "sql.query".to_string(),
             body: sql.into_bytes().into(),
         });
-        let mut stream = self.do_action(request).await.map_err(|e| {
-            tonic::Status::internal(format!("Failed to execute query: {}", e))
-        })?;
-        while let Some(result) = stream.message().await.map_err(|e| {
-            tonic::Status::internal(format!("Failed to read result: {}", e))
-        })? {
+        let mut stream = self
+            .do_action(request)
+            .await
+            .map_err(|e| tonic::Status::internal(format!("Failed to execute query: {}", e)))?;
+        while let Some(result) = stream
+            .message()
+            .await
+            .map_err(|e| tonic::Status::internal(format!("Failed to read result: {}", e)))?
+        {
             let _ = result;
         }
         Ok(())

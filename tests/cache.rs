@@ -7,10 +7,7 @@ use futures::StreamExt;
 use hyprstream_core::{
     aggregation::{AggregateFunction, GroupBy, TimeWindow},
     storage::{
-        duckdb::DuckDbBackend,
-        StorageBackend,
-        StorageBackendType,
-        table_manager::AggregationView,
+        duckdb::DuckDbBackend, table_manager::AggregationView, StorageBackend, StorageBackendType,
     },
 };
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -24,13 +21,11 @@ async fn test_cache_operations() -> Result<(), Status> {
     let db_path = dir.path().join("test.db");
 
     // Create backend
-    let backend = Arc::new(StorageBackendType::DuckDb(
-        DuckDbBackend::new_with_options(
-            db_path.to_str().unwrap(),
-            &HashMap::new(),
-            None,
-        )?
-    ));
+    let backend = Arc::new(StorageBackendType::DuckDb(DuckDbBackend::new_with_options(
+        db_path.to_str().unwrap(),
+        &HashMap::new(),
+        None,
+    )?));
 
     // Initialize backend
     backend.init().await?;
@@ -48,10 +43,7 @@ async fn test_cache_operations() -> Result<(), Status> {
     let values: Arc<dyn Array> = Arc::new(Float64Array::from(vec![1.0]));
     let timestamps: Arc<dyn Array> = Arc::new(Int64Array::from(vec![1000]));
 
-    let batch = RecordBatch::try_new(
-        Arc::new(schema),
-        vec![values, timestamps],
-    ).unwrap();
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![values, timestamps]).unwrap();
 
     // Insert test data
     backend.insert_into_table(table_name, batch).await?;
