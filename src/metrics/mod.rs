@@ -95,23 +95,28 @@ pub fn create_record_batch(metrics: &[MetricRecord]) -> Result<RecordBatch, Stat
 
 /// Encodes a RecordBatch into a vector of MetricRecords.
 pub fn encode_record_batch(batch: &RecordBatch) -> Result<Vec<MetricRecord>, Status> {
-    let metric_ids = batch.column_by_name("metric_id")
+    let metric_ids = batch
+        .column_by_name("metric_id")
         .and_then(|col| col.as_any().downcast_ref::<StringArray>())
         .ok_or_else(|| Status::internal("Invalid metric_id column"))?;
 
-    let timestamps = batch.column_by_name("timestamp")
+    let timestamps = batch
+        .column_by_name("timestamp")
         .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
         .ok_or_else(|| Status::internal("Invalid timestamp column"))?;
 
-    let sums = batch.column_by_name("value_running_window_sum")
+    let sums = batch
+        .column_by_name("value_running_window_sum")
         .and_then(|col| col.as_any().downcast_ref::<Float64Array>())
         .ok_or_else(|| Status::internal("Invalid value_running_window_sum column"))?;
 
-    let avgs = batch.column_by_name("value_running_window_avg")
+    let avgs = batch
+        .column_by_name("value_running_window_avg")
         .and_then(|col| col.as_any().downcast_ref::<Float64Array>())
         .ok_or_else(|| Status::internal("Invalid value_running_window_avg column"))?;
 
-    let counts = batch.column_by_name("value_running_window_count")
+    let counts = batch
+        .column_by_name("value_running_window_count")
         .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
         .ok_or_else(|| Status::internal("Invalid value_running_window_count column"))?;
 
@@ -127,4 +132,4 @@ pub fn encode_record_batch(batch: &RecordBatch) -> Result<Vec<MetricRecord>, Sta
     }
 
     Ok(metrics)
-} 
+}

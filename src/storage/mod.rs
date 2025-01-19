@@ -9,18 +9,18 @@
 //! interface for metric storage and retrieval operations.
 
 pub mod adbc;
-pub mod duckdb;
 pub mod cache;
+pub mod duckdb;
 pub mod table_manager;
 
+use crate::aggregation::{AggregateFunction, AggregateResult, GroupBy, TimeWindow};
+use crate::cli::commands::config::Credentials;
+use crate::metrics::MetricRecord;
+use crate::storage::table_manager::{AggregationView, TableManager};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use std::collections::HashMap;
-use crate::config::Credentials;
-use crate::metrics::MetricRecord;
-use crate::storage::table_manager::{TableManager, AggregationView};
-use crate::aggregation::{AggregateFunction, GroupBy, AggregateResult, TimeWindow};
 use tonic::Status;
 
 /// Batch-level aggregation state for efficient updates
@@ -97,7 +97,11 @@ pub trait StorageBackend: Send + Sync + 'static {
     async fn insert_into_table(&self, table_name: &str, batch: RecordBatch) -> Result<(), Status>;
 
     /// Query data from a table
-    async fn query_table(&self, table_name: &str, projection: Option<Vec<String>>) -> Result<RecordBatch, Status>;
+    async fn query_table(
+        &self,
+        table_name: &str,
+        projection: Option<Vec<String>>,
+    ) -> Result<RecordBatch, Status>;
 
     /// Create an aggregation view
     async fn create_aggregation_view(&self, view: &AggregationView) -> Result<(), Status>;
@@ -230,11 +234,15 @@ impl StorageBackend for StorageBackendType {
     ) -> Result<Vec<AggregateResult>, Status> {
         match self {
             StorageBackendType::Adbc(backend) => {
-                backend.aggregate_metrics(function, group_by, from_timestamp, to_timestamp).await
-            },
+                backend
+                    .aggregate_metrics(function, group_by, from_timestamp, to_timestamp)
+                    .await
+            }
             StorageBackendType::DuckDb(backend) => {
-                backend.aggregate_metrics(function, group_by, from_timestamp, to_timestamp).await
-            },
+                backend
+                    .aggregate_metrics(function, group_by, from_timestamp, to_timestamp)
+                    .await
+            }
         }
     }
 
@@ -246,15 +254,16 @@ impl StorageBackend for StorageBackendType {
     where
         Self: Sized,
     {
-        let engine_type = options.get("engine")
+        let engine_type = options
+            .get("engine")
             .ok_or_else(|| Status::invalid_argument("Missing engine type"))?;
 
         match engine_type.as_str() {
             "adbc" => Ok(StorageBackendType::Adbc(
-                adbc::AdbcBackend::new_with_options(connection_string, options, credentials)?
+                adbc::AdbcBackend::new_with_options(connection_string, options, credentials)?,
             )),
             "duckdb" => Ok(StorageBackendType::DuckDb(
-                duckdb::DuckDbBackend::new_with_options(connection_string, options, credentials)?
+                duckdb::DuckDbBackend::new_with_options(connection_string, options, credentials)?,
             )),
             _ => Err(Status::invalid_argument("Invalid engine type")),
         }
@@ -270,14 +279,22 @@ impl StorageBackend for StorageBackendType {
     async fn insert_into_table(&self, table_name: &str, batch: RecordBatch) -> Result<(), Status> {
         match self {
             StorageBackendType::Adbc(backend) => backend.insert_into_table(table_name, batch).await,
-            StorageBackendType::DuckDb(backend) => backend.insert_into_table(table_name, batch).await,
+            StorageBackendType::DuckDb(backend) => {
+                backend.insert_into_table(table_name, batch).await
+            }
         }
     }
 
-    async fn query_table(&self, table_name: &str, projection: Option<Vec<String>>) -> Result<RecordBatch, Status> {
+    async fn query_table(
+        &self,
+        table_name: &str,
+        projection: Option<Vec<String>>,
+    ) -> Result<RecordBatch, Status> {
         match self {
             StorageBackendType::Adbc(backend) => backend.query_table(table_name, projection).await,
-            StorageBackendType::DuckDb(backend) => backend.query_table(table_name, projection).await,
+            StorageBackendType::DuckDb(backend) => {
+                backend.query_table(table_name, projection).await
+            }
         }
     }
 
@@ -322,8 +339,12 @@ impl StorageBackend for StorageBackendType {
         window: TimeWindow,
     ) -> Result<Vec<BatchAggregation>, Status> {
         match self {
-            StorageBackendType::Adbc(backend) => backend.update_batch_aggregations(batch, window).await,
-            StorageBackendType::DuckDb(backend) => backend.update_batch_aggregations(batch, window).await,
+            StorageBackendType::Adbc(backend) => {
+                backend.update_batch_aggregations(batch, window).await
+            }
+            StorageBackendType::DuckDb(backend) => {
+                backend.update_batch_aggregations(batch, window).await
+            }
         }
     }
 
@@ -332,8 +353,12 @@ impl StorageBackend for StorageBackendType {
         aggregations: Vec<BatchAggregation>,
     ) -> Result<(), Status> {
         match self {
-            StorageBackendType::Adbc(backend) => backend.insert_batch_aggregations(aggregations).await,
-            StorageBackendType::DuckDb(backend) => backend.insert_batch_aggregations(aggregations).await,
+            StorageBackendType::Adbc(backend) => {
+                backend.insert_batch_aggregations(aggregations).await
+            }
+            StorageBackendType::DuckDb(backend) => {
+                backend.insert_batch_aggregations(aggregations).await
+            }
         }
     }
 }

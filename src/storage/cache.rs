@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{SystemTime, Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tonic::Status;
 
@@ -34,9 +34,11 @@ impl CacheManager {
             Some(ttl) => {
                 let now = SystemTime::now();
                 let last = *self.last_eviction.read().await;
-                
+
                 // Check if enough time has passed since last eviction
-                if now.duration_since(last).unwrap_or(Duration::from_secs(0)) < self.min_eviction_interval {
+                if now.duration_since(last).unwrap_or(Duration::from_secs(0))
+                    < self.min_eviction_interval
+                {
                     return Ok(None);
                 }
 
@@ -75,4 +77,4 @@ impl CacheManager {
 pub trait CacheEviction {
     /// Executes the eviction query in the background.
     async fn execute_eviction(&self, query: &str) -> Result<(), Status>;
-} 
+}

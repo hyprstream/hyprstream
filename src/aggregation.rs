@@ -10,9 +10,9 @@
 //! This framework is used by more specific aggregation implementations, such as
 //! the metric-specific aggregation in `crate::metrics::aggregation`.
 
-use std::time::Duration;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
+use std::time::Duration;
 
 /// Time window for aggregation
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -22,10 +22,7 @@ pub enum TimeWindow {
     /// Fixed time window (e.g., 5 minutes, 1 hour)
     Fixed(Duration),
     /// Sliding time window with window size and slide interval
-    Sliding {
-        window: Duration,
-        slide: Duration,
-    },
+    Sliding { window: Duration, slide: Duration },
 }
 
 /// Generic aggregation functions that can be applied to time-series data
@@ -78,7 +75,7 @@ impl TimeWindow {
                 let window_size = duration.as_secs() as i64;
                 let window_start = (timestamp / window_size) * window_size;
                 (window_start, window_start + window_size)
-            },
+            }
             TimeWindow::Sliding { window, slide } => {
                 let window_size = window.as_secs() as i64;
                 let slide_size = slide.as_secs() as i64;
@@ -99,7 +96,7 @@ impl TimeWindow {
                     ((timestamp / {}) + 1) * {} as window_end",
                     window_size, window_size, window_size, window_size
                 ))
-            },
+            }
             TimeWindow::Sliding { window, slide } => {
                 let window_size = window.as_secs();
                 let slide_size = slide.as_secs();
@@ -153,22 +150,22 @@ pub fn build_aggregate_query(
     to_timestamp: Option<i64>,
 ) -> String {
     let mut query = String::new();
-    
+
     // Build SELECT clause
     query.push_str("SELECT ");
-    
+
     // Add group by columns
     if !group_by.columns.is_empty() {
         let cols: Vec<&str> = group_by.columns.iter().map(|s| s.as_str()).collect();
         query.push_str(&cols.join(", "));
         query.push_str(", ");
     }
-    
+
     // Add time column if present
     if let Some(time_col) = &group_by.time_column {
         query.push_str(&format!("{}, ", time_col));
     }
-    
+
     // Add aggregation function
     match function {
         AggregateFunction::Sum => query.push_str("SUM(value)"),
@@ -177,10 +174,10 @@ pub fn build_aggregate_query(
         AggregateFunction::Min => query.push_str("MIN(value)"),
         AggregateFunction::Max => query.push_str("MAX(value)"),
     }
-    
+
     // Add FROM clause
     query.push_str(&format!(" FROM {}", table_name));
-    
+
     // Add WHERE clause for timestamp range
     if let Some(from_ts) = from_timestamp {
         query.push_str(&format!(" WHERE timestamp >= {}", from_ts));
@@ -188,23 +185,23 @@ pub fn build_aggregate_query(
             query.push_str(&format!(" AND timestamp <= {}", to_ts));
         }
     }
-    
+
     // Add GROUP BY clause
     if !group_by.columns.is_empty() || group_by.time_column.is_some() {
         query.push_str(" GROUP BY ");
         let mut group_cols = Vec::new();
-        
+
         if !group_by.columns.is_empty() {
             let cols: Vec<&str> = group_by.columns.iter().map(|s| s.as_str()).collect();
             group_cols.extend(cols);
         }
-        
+
         if let Some(time_col) = &group_by.time_column {
             group_cols.push(time_col.as_str());
         }
-        
+
         query.push_str(&group_cols.join(", "));
     }
-    
+
     query
-} 
+}
