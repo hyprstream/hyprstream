@@ -5,7 +5,7 @@
 
 use clap::Parser;
 use hyprstream_core::{
-    cli::{run_server, Cli, Commands},
+    cli::{execute_sql, run_server, Cli, Commands},
     config::Settings,
 };
 
@@ -25,6 +25,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
 
             run_server(server_cmd.detach, settings).await?;
+        }
+        Commands::Sql(sql_cmd) => {
+            execute_sql(
+                sql_cmd.host,
+                sql_cmd.query,
+                sql_cmd.tls_cert.as_deref(),
+                sql_cmd.tls_key.as_deref(),
+                sql_cmd.tls_ca.as_deref(),
+                sql_cmd.tls_skip_verify,
+                sql_cmd.verbose,
+            )
+            .await?;
         }
     }
 

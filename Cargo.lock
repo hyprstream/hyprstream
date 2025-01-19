@@ -1668,6 +1668,8 @@ dependencies = [
  "hex",
  "lazy_static",
  "polars",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_derive",
  "serde_json",
