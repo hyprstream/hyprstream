@@ -101,51 +101,43 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
     };
 
     // Create storage backend
-    let engine_backend: Arc<StorageBackendType> = Arc::new(
-        match settings.engine.engine_type.as_deref().unwrap_or("duckdb") {
-            "adbc" => StorageBackendType::Adbc(
-                AdbcBackend::new_with_options(
-                    settings
-                        .engine
-                        .engine_connection
-                        .as_deref()
-                        .unwrap_or(":memory:"),
-                    &engine_options,
-                    engine_credentials.as_ref(),
-                )
-                .context("Failed to create ADBC backend")?,
-            ),
-            "duckdb" => StorageBackendType::DuckDb(
-                DuckDbBackend::new_with_options(
-                    settings
-                        .engine
-                        .engine_connection
-                        .as_deref()
-                        .unwrap_or(":memory:"),
-                    &engine_options,
-                    engine_credentials.as_ref(),
-                )
-                .context("Failed to create DuckDB backend")?,
-            ),
-            engine_type => anyhow::bail!("Unsupported engine type: {}", engine_type),
-        },
-    );
+    let engine_backend = match settings.engine.engine_type.as_deref().unwrap_or("duckdb") {
+        "adbc" => StorageBackendType::Adbc(
+            AdbcBackend::new_with_options(
+                settings
+                    .engine
+                    .engine_connection
+                    .as_deref()
+                    .unwrap_or(":memory:"),
+                &engine_options,
+                engine_credentials.as_ref(),
+            )
+            .context("Failed to create ADBC backend")?,
+        ),
+        "duckdb" => StorageBackendType::DuckDb(
+            DuckDbBackend::new_with_options(
+                settings
+                    .engine
+                    .engine_connection
+                    .as_deref()
+                    .unwrap_or(":memory:"),
+                &engine_options,
+                engine_credentials.as_ref(),
+            )
+            .context("Failed to create DuckDB backend")?,
+        ),
+        engine_type => anyhow::bail!("Unsupported engine type: {}", engine_type),
+    };
 
     // Initialize backend
-    engine_backend
-        .init()
-        .await
-        .context("Failed to initialize storage backend")?;
-
-    // Create model storage
-    let model_storage = Box::new(TimeSeriesModelStorage::new(engine_backend.clone()));
-    model_storage
-        .init()
-        .await
-        .context("Failed to initialize model storage")?;
+    match &engine_backend {
+        StorageBackendType::Adbc(backend) => backend.init().await,
+        StorageBackendType::DuckDb(backend) => backend.init().await,
+    }
+    .context("Failed to initialize storage backend")?;
 
     // Create the service
-    let service = FlightSqlService::new(engine_backend, model_storage);
+    let service = FlightSqlService::new(engine_backend);
 
     // Start the server
     let addr = format!(

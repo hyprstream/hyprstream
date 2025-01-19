@@ -61,6 +61,10 @@ async-stream = "0.3"
 anyhow = "1.0.95"
 daemonize = "0.5.0"
 
+[dev-dependencies]
+criterion = "0.5.1"
+tempfile = "3.9.0"
+
 [source.crates-io]
 replace-with = "vendored-sources"
 

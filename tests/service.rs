@@ -1,15 +1,45 @@
 use arrow_flight::sql::client::FlightSqlServiceClient;
+use tonic::Request;
+
+use futures::StreamExt;
+use tonic::Streaming;
+
 use arrow_schema::{DataType, Field, Schema};
 use hyprstream_core::aggregation::{GroupBy, TimeWindow};
 use hyprstream_core::service::FlightSqlService;
 use hyprstream_core::storage::duckdb::DuckDbBackend;
-use hyprstream_core::storage::BatchAggregation;
+use hyprstream_core::storage::{BatchAggregation, StorageBackendType};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
 use tokio::net::TcpListener;
 use tonic::transport::Channel;
+
+trait FlightSqlClientExt {
+    async fn query_sql(&mut self, sql: String) -> Result<(), tonic::Status>;
+}
+
+impl FlightSqlClientExt for FlightSqlServiceClient<Channel> {
+    async fn query_sql(&mut self, sql: String) -> Result<(), tonic::Status> {
+        let request = Request::new(arrow_flight::Action {
+            r#type: "sql.query".to_string(),
+            body: sql.into_bytes().into(),
+        });
+        let mut stream = self
+            .do_action(request)
+            .await
+            .map_err(|e| tonic::Status::internal(format!("Failed to execute query: {}", e)))?;
+        while let Some(result) = stream
+            .message()
+            .await
+            .map_err(|e| tonic::Status::internal(format!("Failed to read result: {}", e)))?
+        {
+            let _ = result;
+        }
+        Ok(())
+    }
+}
 
 async fn create_test_service() -> (FlightSqlService, String) {
     let temp_dir = tempdir().unwrap();
@@ -22,7 +52,7 @@ async fn create_test_service() -> (FlightSqlService, String) {
     let addr = listener.local_addr().unwrap();
     drop(listener);
 
-    let service = FlightSqlService::new(Box::new(backend));
+    let service = FlightSqlService::new(StorageBackendType::DuckDb(backend));
     let endpoint = format!("http://127.0.0.1:{}", addr.port());
 
     (service, endpoint)

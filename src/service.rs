@@ -9,7 +9,11 @@
 //! The service implementation is designed to work with multiple storage backends
 //! while maintaining consistent query semantics and high performance.
 
+use crate::metrics::MetricRecord;
+use crate::models::storage::TimeSeriesModelStorage;
 use crate::models::{Model, ModelStorage};
+use crate::storage::adbc::AdbcBackend;
+use crate::storage::duckdb::DuckDbBackend;
 use crate::storage::table_manager::AggregationView;
 use crate::storage::{StorageBackend, StorageBackendType};
 use arrow_array::{builder::Float32Builder, ArrayRef, Float32Array};
@@ -25,6 +29,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json;
+use std::any::{Any, TypeId};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -54,6 +59,13 @@ struct CreateTableCmd {
 enum Command {
     Table(TableCommand),
     Model(ModelCommand),
+    Sql(SqlCommand),
+}
+
+#[derive(Debug)]
+enum SqlCommand {
+    Execute(String),
+    Query(String),
 }
 
 impl Command {
@@ -74,6 +86,22 @@ impl Command {
                         Status::invalid_argument(format!("Invalid model command: {}", e))
                     })?;
                 Ok(Command::Model(cmd))
+            }
+            Some("sql.execute") => {
+                let sql =
+                    String::from_utf8(value["data"].as_str().unwrap_or("").as_bytes().to_vec())
+                        .map_err(|e| {
+                            Status::invalid_argument(format!("Invalid SQL string: {}", e))
+                        })?;
+                Ok(Command::Sql(SqlCommand::Execute(sql)))
+            }
+            Some("sql.query") => {
+                let sql =
+                    String::from_utf8(value["data"].as_str().unwrap_or("").as_bytes().to_vec())
+                        .map_err(|e| {
+                            Status::invalid_argument(format!("Invalid SQL string: {}", e))
+                        })?;
+                Ok(Command::Sql(SqlCommand::Query(sql)))
             }
             _ => Err(Status::invalid_argument("Invalid command type")),
         }
@@ -247,13 +275,47 @@ pub struct FlightSqlService {
 }
 
 impl FlightSqlService {
-    pub fn new(backend: Arc<StorageBackendType>, model_storage: Box<dyn ModelStorage>) -> Self {
+    pub fn new(backend: StorageBackendType) -> Self {
+        let backend = Arc::new(backend);
+        let model_storage = Box::new(TimeSeriesModelStorage::new(backend.clone()));
+
         Self {
             backend,
             model_storage: Arc::new(model_storage),
             statement_counter: Arc::new(AtomicU64::new(0)),
             prepared_statements: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    pub async fn serve(self) -> Result<(), tonic::transport::Error> {
+        use arrow_flight::flight_service_server::FlightServiceServer;
+        use tonic::transport::Server;
+
+        // Bind to all interfaces on port 0 to let OS assign a port
+        let addr = "[::]:0".parse().unwrap();
+        let svc = FlightServiceServer::new(self);
+
+        Server::builder().add_service(svc).serve(addr).await
+    }
+
+    // SQL execution methods
+    pub async fn execute(&self, sql: String) -> Result<(), Status> {
+        let action = Action {
+            r#type: "sql.execute".to_string(),
+            body: sql.into_bytes().into(),
+        };
+        self.handle_action(Request::new(action)).await?;
+        Ok(())
+    }
+
+    pub async fn query_sql(&self, sql: String) -> Result<Vec<MetricRecord>, Status> {
+        let action = Action {
+            r#type: "sql.query".to_string(),
+            body: sql.into_bytes().into(),
+        };
+        let result = self.handle_action(Request::new(action)).await?;
+        serde_json::from_slice(&result)
+            .map_err(|e| Status::internal(format!("Failed to parse query result: {}", e)))
     }
 
     async fn authenticate<T>(&self, request: &Request<T>) -> Result<AuthToken, Status> {
@@ -452,6 +514,20 @@ impl FlightSqlService {
                     }
                 }
             }
+            Command::Sql(sql_cmd) => match sql_cmd {
+                SqlCommand::Execute(sql) => {
+                    let statement_handle = self.backend.prepare_sql(&sql).await?;
+                    self.backend.query_sql(&statement_handle).await?;
+                    Ok(vec![])
+                }
+                SqlCommand::Query(sql) => {
+                    let statement_handle = self.backend.prepare_sql(&sql).await?;
+                    let records = self.backend.query_sql(&statement_handle).await?;
+                    serde_json::to_vec(&records).map_err(|e| {
+                        Status::internal(format!("Failed to serialize query results: {}", e))
+                    })
+                }
+            },
         }
     }
 
