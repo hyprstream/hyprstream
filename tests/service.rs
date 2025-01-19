@@ -4,6 +4,18 @@ use tonic::Request;
 use futures::StreamExt;
 use tonic::Streaming;
 
+use arrow_schema::{DataType, Field, Schema};
+use hyprstream_core::aggregation::{GroupBy, TimeWindow};
+use hyprstream_core::service::FlightSqlService;
+use hyprstream_core::storage::duckdb::DuckDbBackend;
+use hyprstream_core::storage::{BatchAggregation, StorageBackendType};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tempfile::tempdir;
+use tokio::net::TcpListener;
+use tonic::transport::Channel;
+
 trait FlightSqlClientExt {
     async fn query_sql(&mut self, sql: String) -> Result<(), tonic::Status>;
 }
@@ -28,17 +40,6 @@ impl FlightSqlClientExt for FlightSqlServiceClient<Channel> {
         Ok(())
     }
 }
-use arrow_schema::{DataType, Field, Schema};
-use hyprstream_core::aggregation::{GroupBy, TimeWindow};
-use hyprstream_core::service::FlightSqlService;
-use hyprstream_core::storage::duckdb::DuckDbBackend;
-use hyprstream_core::storage::{BatchAggregation, StorageBackendType};
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
-use tempfile::tempdir;
-use tokio::net::TcpListener;
-use tonic::transport::Channel;
 
 async fn create_test_service() -> (FlightSqlService, String) {
     let temp_dir = tempdir().unwrap();
