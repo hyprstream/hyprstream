@@ -34,6 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sql_cmd.tls_key.as_deref(),
                 sql_cmd.tls_ca.as_deref(),
                 sql_cmd.tls_skip_verify,
+                sql_cmd.verbose,
             )
             .await?;
         }

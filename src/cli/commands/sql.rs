@@ -30,4 +30,8 @@ pub struct SqlCommand {
     /// Print help information
     #[arg(long = "help", action = clap::ArgAction::Help)]
     pub help: Option<bool>,
+
+    /// Enable verbose output
+    #[arg(short = 'v', long = "verbose")]
+    pub verbose: bool,
 }

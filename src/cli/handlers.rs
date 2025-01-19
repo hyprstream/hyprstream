@@ -11,9 +11,9 @@ use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
     RootCertStore,
 };
-use std::{collections::HashMap, fs::File, io::BufReader, path::Path};
+use std::{collections::HashMap, fs::File, io::BufReader, path::Path, time::Duration};
 use tonic::transport::{
-    Certificate as TonicCertificate, ClientTlsConfig, Identity, Server, ServerTlsConfig, Uri,
+    Certificate as TonicCertificate, ClientTlsConfig, Identity, Server, ServerTlsConfig,
 };
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_log::LogTracer;
@@ -104,43 +104,98 @@ pub async fn execute_sql(
     tls_key: Option<&Path>,
     tls_ca: Option<&Path>,
     tls_skip_verify: bool,
+    verbose: bool,
 ) -> Result<()> {
     // Install the default crypto provider (ignore result as it may already be installed)
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Use default host:port if not provided
     let addr = host.unwrap_or_else(|| "127.0.0.1:50051".to_string());
+    println!("Connecting to {}...", addr);
+
     // Ensure URL has correct scheme based on TLS configuration
     let use_tls = tls_cert.is_some() || tls_key.is_some() || tls_ca.is_some();
     let uri_str = if !addr.starts_with("http://") && !addr.starts_with("https://") {
-        format!("{}://{}", if use_tls { "https" } else { "http" }, addr)
+        format!("{}://{}", if use_tls { "https" } else { "http" }, addr.clone())
     } else {
-        addr
+        addr.clone()
     };
 
+    if verbose {
+        println!("Debug: Using URL {}", uri_str);
+        println!("Debug: TLS enabled: {}", use_tls);
+        println!("Debug: Connection timeout: 5s");
+        println!("Debug: Query timeout: 30s");
+    }
+
+    println!("Connecting to {}...", addr);
+
     // Configure TLS if enabled
-    let mut endpoint = tonic::transport::Channel::from_shared(uri_str)?;
+    let mut endpoint = tonic::transport::Channel::from_shared(uri_str.clone())?
+        .timeout(Duration::from_secs(5));
+
     if let Some(tls_config) = configure_client_tls(tls_cert, tls_key, tls_ca, tls_skip_verify)? {
         endpoint = endpoint.tls_config(tls_config)?;
     }
 
-    // Connect to the server
-    let mut client = FlightServiceClient::new(endpoint.connect().await?);
+    // Connect to the server with timeout
+    let channel = match tokio::time::timeout(
+        Duration::from_secs(5),
+        endpoint.connect()
+    )
+    .await
+    {
+        Ok(Ok(channel)) => channel,
+        Ok(Err(e)) => {
+            return Err(anyhow::anyhow!(
+                "Failed to connect: {}\nPossible reasons:\n- Server is not running (try 'hyprstream server')\n- Wrong host or port\n- Firewall blocking connection",
+                e
+            ));
+        }
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "Connection timed out after 5 seconds\nPossible reasons:\n- Server is not responding\n- Network issues\n- Firewall blocking connection"
+            ));
+        }
+    };
+
+    let mut client = FlightServiceClient::new(channel);
 
     // Create the SQL action
     let action = Action {
         r#type: "sql.query".to_string(),
-        body: query.into_bytes().into(),
+        body: query.clone().into_bytes().into(),
     };
 
-    // Execute the query
-    let response = client
-        .do_action(tonic::Request::new(action))
-        .await
-        .context("Failed to execute query")?;
+    if verbose {
+        println!("Debug: Executing query: {}", query);
+    }
+    println!("Executing query...");
+
+    // Execute the query with timeout
+    let response = match tokio::time::timeout(
+        Duration::from_secs(30),
+        client.do_action(tonic::Request::new(action)),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(e)) => {
+            return Err(anyhow::anyhow!(
+                "Query failed: {}\nPossible reasons:\n- SQL syntax error\n- Table does not exist\n- Insufficient permissions",
+                e
+            ));
+        }
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "Query timed out after 30 seconds\nThe query might be too complex or the server might be overloaded"
+            ));
+        }
+    };
 
     // Stream and print results
     let mut stream = response.into_inner();
+    let mut row_count = 0;
     while let Some(result) = stream.message().await? {
         if !result.body.is_empty() {
             // Try to parse as JSON for better formatting
@@ -150,7 +205,14 @@ pub async fn execute_sql(
                 // Fallback to string output
                 println!("{}", String::from_utf8_lossy(&result.body));
             }
+            row_count += 1;
         }
+    }
+
+    if row_count == 0 {
+        println!("Query completed successfully (0 rows)");
+    } else {
+        println!("Query completed successfully ({} rows)", row_count);
     }
 
     Ok(())
