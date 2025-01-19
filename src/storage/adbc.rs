@@ -61,7 +61,7 @@ use tokio::sync::Mutex;
 use tonic::Status;
 use crate::aggregation::{AggregateFunction, GroupBy, AggregateResult, build_aggregate_query};
 use crate::storage::table_manager::{TableManager, AggregationView};
-use crate::config::Credentials;
+use crate::cli::commands::config::Credentials;
 use crate::metrics::MetricRecord;
 use crate::storage::StorageBackend;
 use crate::storage::cache::{CacheManager, CacheEviction};

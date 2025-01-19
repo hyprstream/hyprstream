@@ -1,6 +1,7 @@
-mod server;
+pub mod config;
+pub mod server;
 
-pub use server::ServerCommand;
+pub use server::{ServerCommand, ServerConfig, EngineConfig, CacheConfig};
 
 use clap::Subcommand;
 

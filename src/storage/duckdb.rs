@@ -40,7 +40,7 @@ use duckdb::{Connection, Config, params, ToSql};
 use tokio::sync::Mutex;
 use tonic::Status;
 use crate::metrics::MetricRecord;
-use crate::config::Credentials;
+use crate::cli::commands::config::Credentials;
 use crate::storage::{StorageBackend, BatchAggregation};
 use crate::storage::cache::{CacheManager, CacheEviction};
 use crate::storage::table_manager::{TableManager, AggregationView};

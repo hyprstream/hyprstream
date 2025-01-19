@@ -17,7 +17,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use std::collections::HashMap;
-use crate::config::Credentials;
+use crate::cli::commands::config::Credentials;
 use crate::metrics::MetricRecord;
 use crate::storage::table_manager::{TableManager, AggregationView};
 use crate::aggregation::{AggregateFunction, GroupBy, AggregateResult, TimeWindow};

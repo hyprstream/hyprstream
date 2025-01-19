@@ -6,9 +6,8 @@
 use clap::Parser;
 use hyprstream_core::{
     cli::{Cli, Commands, run_server},
-    config::{Settings, CliArgs},
+    config::Settings,
 };
-use tracing_subscriber::{fmt, EnvFilter};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -17,17 +16,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Handle commands
     match cli.command {
         Commands::Server(server_cmd) => {
-            // Convert server command args to CliArgs
-            let cli_args = CliArgs::from(&server_cmd);
-            
             // Initialize settings
-            let settings = Settings::new(cli_args)?;
-
-            // Initialize tracing
-            let subscriber = fmt()
-                .with_env_filter(EnvFilter::new(&settings.server.log_level))
-                .finish();
-            let _guard = tracing::subscriber::set_default(subscriber);
+            let settings = Settings::new(
+                server_cmd.server,
+                server_cmd.engine,
+                server_cmd.cache,
+                server_cmd.config,
+            )?;
 
             run_server(server_cmd.detach, settings).await?;
         }
