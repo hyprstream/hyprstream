@@ -1,6 +1,4 @@
-use clap::Args;
 use serde::Deserialize;
-use std::path::PathBuf;
 
 /// Trait for configuration options that can be set via CLI, env vars, or config file
 pub trait ConfigOption {
