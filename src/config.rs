@@ -45,6 +45,12 @@ pub struct CliArgs {
     /// Log level (trace, debug, info, warn, error)
     pub log_level: Option<String>,
 
+    /// Working directory for the server when running in detached mode
+    pub working_dir: Option<String>,
+
+    /// PID file location when running in detached mode
+    pub pid_file: Option<String>,
+
     /// Primary storage engine type
     pub engine: Option<String>,
 
@@ -109,10 +115,24 @@ pub struct ServerConfig {
     /// Log level (trace, debug, info, warn, error)
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// Working directory for the server when running in detached mode
+    #[serde(default = "default_working_dir")]
+    pub working_dir: String,
+    /// PID file location when running in detached mode
+    #[serde(default = "default_pid_file")]
+    pub pid_file: String,
 }
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+fn default_working_dir() -> String {
+    "/tmp".to_string()
+}
+
+fn default_pid_file() -> String {
+    "/tmp/hyprstream.pid".to_string()
 }
 
 /// Engine configuration.
@@ -226,6 +246,14 @@ impl Settings {
         // Set log level if provided
         if let Some(ref log_level) = cli.log_level {
             builder = builder.set_override("server.log_level", log_level.as_str())?;
+        }
+
+        // Set working directory and pid file if provided
+        if let Some(ref working_dir) = cli.working_dir {
+            builder = builder.set_override("server.working_dir", working_dir.as_str())?;
+        }
+        if let Some(ref pid_file) = cli.pid_file {
+            builder = builder.set_override("server.pid_file", pid_file.as_str())?;
         }
 
         // Engine settings

@@ -24,7 +24,7 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
     // Set up file appender for logs
     let file_appender = RollingFileAppender::new(
         Rotation::NEVER,
-        "/tmp",
+        &settings.server.working_dir,
         "hyprstream.log",
     );
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
@@ -47,12 +47,14 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
     if detach {
         // Configure daemon
         let daemonize = Daemonize::new()
-            .pid_file("/tmp/hyprstream.pid")
+            .pid_file(&settings.server.pid_file)
             .chown_pid_file(true)
-            .working_directory("/tmp");
+            .working_directory(&settings.server.working_dir);
 
         // Start daemon
         tracing::info!("Starting server in detached mode");
+        tracing::info!("PID file: {}", settings.server.pid_file);
+        tracing::info!("Working directory: {}", settings.server.working_dir);
         daemonize.start()
             .context("Failed to start daemon")?;
     }

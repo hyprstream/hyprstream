@@ -23,6 +23,14 @@ pub struct ServerCommand {
     #[arg(long, env = "HYPRSTREAM_LOG_LEVEL")]
     pub log_level: Option<String>,
 
+    /// Working directory for the server when running in detached mode
+    #[arg(long, env = "HYPRSTREAM_WORKING_DIR")]
+    pub working_dir: Option<String>,
+
+    /// PID file location when running in detached mode
+    #[arg(long, env = "HYPRSTREAM_PID_FILE")]
+    pub pid_file: Option<String>,
+
     /// Primary storage engine type
     #[arg(long, env = "HYPRSTREAM_ENGINE")]
     pub engine: Option<String>,
@@ -79,6 +87,8 @@ impl From<&ServerCommand> for crate::config::CliArgs {
             host: cmd.host.clone(),
             port: cmd.port,
             log_level: cmd.log_level.clone(),
+            working_dir: cmd.working_dir.clone(),
+            pid_file: cmd.pid_file.clone(),
             engine: cmd.engine.clone(),
             engine_connection: cmd.engine_connection.clone(),
             engine_options: cmd.engine_options.clone(),
