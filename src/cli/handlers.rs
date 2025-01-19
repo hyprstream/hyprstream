@@ -1,18 +1,63 @@
 use crate::{
     cli::commands::config::Credentials,
     config::Settings,
-    models::{storage::TimeSeriesModelStorage, ModelStorage},
     service::FlightSqlService,
     storage::{adbc::AdbcBackend, duckdb::DuckDbBackend, StorageBackend, StorageBackendType},
 };
 use anyhow::{Context, Result};
+use arrow_flight::flight_service_client::FlightServiceClient;
 use daemonize::Daemonize;
 use std::collections::HashMap;
-use std::sync::Arc;
-use tonic::transport::Server;
+use tonic::transport::{Server, Uri};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_log::LogTracer;
 use tracing_subscriber::{fmt, EnvFilter};
+use arrow_flight::Action;
+
+pub async fn execute_sql(host: Option<String>, query: String) -> Result<()> {
+    // Use default host:port if not provided
+    let addr = host.unwrap_or_else(|| "127.0.0.1:50051".to_string());
+    // Ensure URL has http:// scheme
+    let uri_str = if !addr.starts_with("http://") && !addr.starts_with("https://") {
+        format!("https://{}", addr)
+    } else {
+        addr
+    };
+    let uri: Uri = uri_str.parse().context("Invalid server address")?;
+
+    // Connect to the server
+    let mut client = FlightServiceClient::connect(uri)
+        .await
+        .context("Failed to connect to server")?;
+
+    // Create the SQL action
+    let action = Action {
+        r#type: "sql.query".to_string(),
+        body: query.into_bytes().into(),
+    };
+
+    // Execute the query
+    let response = client
+        .do_action(tonic::Request::new(action))
+        .await
+        .context("Failed to execute query")?;
+
+    // Stream and print results
+    let mut stream = response.into_inner();
+    while let Some(result) = stream.message().await? {
+        if !result.body.is_empty() {
+            // Try to parse as JSON for better formatting
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&result.body) {
+                println!("{}", serde_json::to_string_pretty(&json)?);
+            } else {
+                // Fallback to string output
+                println!("{}", String::from_utf8_lossy(&result.body));
+            }
+        }
+    }
+
+    Ok(())
+}
 
 pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
     // Set up logging before anything else

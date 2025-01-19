@@ -240,10 +240,10 @@ impl ConfigSection for CacheConfig {
     }
 }
 
-#[derive(Args)]
+#[derive(Debug, Default, Args)]
 pub struct ServerCommand {
     /// Run server in detached mode
-    #[arg(short = 'd', long)]
+    #[arg(short = 'd', long = "detach")]
     pub detach: bool,
 
     /// Path to the configuration file
