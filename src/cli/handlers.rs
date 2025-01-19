@@ -55,7 +55,9 @@ fn configure_server_tls(
             if let Some(ca_path) = client_ca_path {
                 let mut root_store = RootCertStore::empty();
                 for cert in load_certificate(ca_path)? {
-                    root_store.add(cert).context("Failed to add CA certificate")?;
+                    root_store
+                        .add(cert)
+                        .context("Failed to add CA certificate")?;
                 }
                 config = config.client_ca_root(TonicCertificate::from_pem(std::fs::read(ca_path)?));
             }
@@ -134,7 +136,11 @@ pub async fn execute_sql(
     // Ensure URL has correct scheme based on TLS configuration
     let use_tls = tls_cert.is_some() || tls_key.is_some() || tls_ca.is_some();
     let uri_str = if !addr.starts_with("http://") && !addr.starts_with("https://") {
-        format!("{}://{}", if use_tls { "https" } else { "http" }, addr.clone())
+        format!(
+            "{}://{}",
+            if use_tls { "https" } else { "http" },
+            addr.clone()
+        )
     } else {
         addr.clone()
     };
@@ -149,20 +155,15 @@ pub async fn execute_sql(
     tracing::info!("Connecting to {}...", addr);
 
     // Configure TLS if enabled
-    let mut endpoint = tonic::transport::Channel::from_shared(uri_str.clone())?
-        .timeout(Duration::from_secs(5));
+    let mut endpoint =
+        tonic::transport::Channel::from_shared(uri_str.clone())?.timeout(Duration::from_secs(5));
 
     if let Some(tls_config) = configure_client_tls(tls_cert, tls_key, tls_ca, tls_skip_verify)? {
         endpoint = endpoint.tls_config(tls_config)?;
     }
 
     // Connect to the server with timeout
-    let channel = match tokio::time::timeout(
-        Duration::from_secs(5),
-        endpoint.connect()
-    )
-    .await
-    {
+    let channel = match tokio::time::timeout(Duration::from_secs(5), endpoint.connect()).await {
         Ok(Ok(channel)) => channel,
         Ok(Err(e)) => {
             return Err(anyhow::anyhow!(
