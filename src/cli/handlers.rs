@@ -1,7 +1,9 @@
 use anyhow::{Result, Context};
 use std::sync::Arc;
-use std::fs::File;
 use daemonize::Daemonize;
+use tracing_subscriber::{fmt, EnvFilter};
+use tracing_log::LogTracer;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use crate::{
     config::Settings,
     models::{storage::TimeSeriesModelStorage, ModelStorage},
@@ -16,20 +18,38 @@ use crate::{
 use tonic::transport::Server;
 
 pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
-    if detach {
-        // Set up daemon logging
-        let stdout = File::create("/tmp/hyprstream.out")
-            .context("Failed to create daemon stdout file")?;
-        let stderr = File::create("/tmp/hyprstream.err")
-            .context("Failed to create daemon stderr file")?;
+    // Set up logging before anything else
+    LogTracer::init().context("Failed to initialize log tracer")?;
 
+    // Set up file appender for logs
+    let file_appender = RollingFileAppender::new(
+        Rotation::NEVER,
+        "/tmp",
+        "hyprstream.log",
+    );
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    // Initialize tracing subscriber with both console and file outputs
+    fmt::Subscriber::builder()
+        .with_env_filter(EnvFilter::new(&settings.server.log_level))
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .with_target(false)
+        .with_thread_ids(true)
+        .with_thread_names(true)
+        .with_file(true)
+        .with_line_number(true)
+        .with_level(true)
+        .with_target(true)
+        .compact()
+        .init();
+
+    if detach {
         // Configure daemon
         let daemonize = Daemonize::new()
             .pid_file("/tmp/hyprstream.pid")
             .chown_pid_file(true)
-            .working_directory("/tmp")
-            .stdout(stdout)
-            .stderr(stderr);
+            .working_directory("/tmp");
 
         // Start daemon
         tracing::info!("Starting server in detached mode");
