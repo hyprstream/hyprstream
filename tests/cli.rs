@@ -3,11 +3,15 @@ use hyprstream_core::{
     service::FlightSqlService,
     storage::{duckdb::DuckDbBackend, StorageBackend, StorageBackendType},
 };
-use std::{fs::File, io::Write, path::{Path, PathBuf}};
+use std::env;
+use std::{
+    fs::File,
+    io::Write,
+    path::{Path, PathBuf},
+};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tonic::transport::Server;
-use std::env;
 
 const TEST_CERT: &[u8] = b"-----BEGIN CERTIFICATE-----
 MIIFJTCCAw2gAwIBAgIUEFC993+G2Z0JZHLRI+ZhIiFQpMkwDQYJKoZIhvcNAQEL
@@ -120,17 +124,13 @@ async fn start_test_server() -> (tokio::task::JoinHandle<()>, std::net::SocketAd
     let addr = listener.local_addr().unwrap();
 
     // Create a test database
-    let backend = StorageBackendType::DuckDb(
-        DuckDbBackend::new_in_memory().unwrap(),
-    );
+    let backend = StorageBackendType::DuckDb(DuckDbBackend::new_in_memory().unwrap());
     let service = FlightSqlService::new(backend);
 
     // Run the server in the background
     let server_handle = tokio::spawn(async move {
         Server::builder()
-            .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(
-                service,
-            ))
+            .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(service))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await
             .unwrap();
@@ -142,7 +142,10 @@ async fn start_test_server() -> (tokio::task::JoinHandle<()>, std::net::SocketAd
     (server_handle, addr)
 }
 
-async fn start_tls_test_server(cert_path: &Path, key_path: &Path) -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
+async fn start_tls_test_server(
+    cert_path: &Path,
+    key_path: &Path,
+) -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
     // Install the default crypto provider
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -151,27 +154,24 @@ async fn start_tls_test_server(cert_path: &Path, key_path: &Path) -> (tokio::tas
     let addr = listener.local_addr().unwrap();
 
     // Create a test database
-    let backend = StorageBackendType::DuckDb(
-        DuckDbBackend::new_in_memory().unwrap(),
-    );
+    let backend = StorageBackendType::DuckDb(DuckDbBackend::new_in_memory().unwrap());
     let service = FlightSqlService::new(backend);
 
     // Run the server in the background with TLS
     let server_cert = cert_path.to_path_buf();
     let server_key = key_path.to_path_buf();
     let server_handle = tokio::spawn(async move {
-        let tls_config = tonic::transport::ServerTlsConfig::new()
-            .identity(tonic::transport::Identity::from_pem(
+        let tls_config = tonic::transport::ServerTlsConfig::new().identity(
+            tonic::transport::Identity::from_pem(
                 std::fs::read(&server_cert).unwrap(),
                 std::fs::read(&server_key).unwrap(),
-            ));
+            ),
+        );
 
         Server::builder()
             .tls_config(tls_config)
             .unwrap()
-            .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(
-                service,
-            ))
+            .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(service))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await
             .unwrap();
@@ -239,8 +239,14 @@ async fn test_sql_command_tls() {
         false,
     )
     .await;
-    assert!(result.is_err(), "Expected TLS failure with wrong certificates");
-    assert!(result.unwrap_err().to_string().contains("certificate verify failed"));
+    assert!(
+        result.is_err(),
+        "Expected TLS failure with wrong certificates"
+    );
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("certificate verify failed"));
 
     // Clean up
     server_handle.abort();
@@ -266,7 +272,8 @@ async fn test_sql_command_timeout() {
     let err = result.unwrap_err().to_string();
     assert!(
         err.contains("timed out") || err.contains("connection refused"),
-        "Expected timeout or connection refused error, got: {}", err
+        "Expected timeout or connection refused error, got: {}",
+        err
     );
 
     // Test query timeout
@@ -284,7 +291,8 @@ async fn test_sql_command_timeout() {
     let err = result.unwrap_err().to_string();
     assert!(
         err.contains("timed out"),
-        "Expected timeout error but got: {}", err
+        "Expected timeout error but got: {}",
+        err
     );
 
     // Clean up
