@@ -56,6 +56,7 @@ hex = "0.4"
 chrono = "0.4"
 async-stream = "0.3"
 anyhow = "1.0.95"
+daemonize = "0.5.0"
 
 [source.crates-io]
 replace-with = "vendored-sources"

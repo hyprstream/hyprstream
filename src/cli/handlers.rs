@@ -1,5 +1,7 @@
 use anyhow::{Result, Context};
 use std::sync::Arc;
+use std::fs::File;
+use daemonize::Daemonize;
 use crate::{
     config::Settings,
     models::{storage::TimeSeriesModelStorage, ModelStorage},
@@ -14,6 +16,27 @@ use crate::{
 use tonic::transport::Server;
 
 pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
+    if detach {
+        // Set up daemon logging
+        let stdout = File::create("/tmp/hyprstream.out")
+            .context("Failed to create daemon stdout file")?;
+        let stderr = File::create("/tmp/hyprstream.err")
+            .context("Failed to create daemon stderr file")?;
+
+        // Configure daemon
+        let daemonize = Daemonize::new()
+            .pid_file("/tmp/hyprstream.pid")
+            .chown_pid_file(true)
+            .working_directory("/tmp")
+            .stdout(stdout)
+            .stderr(stderr);
+
+        // Start daemon
+        tracing::info!("Starting server in detached mode");
+        daemonize.start()
+            .context("Failed to start daemon")?;
+    }
+
     // Create storage backend
     let engine_backend: Arc<StorageBackendType> = Arc::new(match settings.engine.engine.as_str() {
         "adbc" => StorageBackendType::Adbc(
@@ -50,24 +73,12 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
     tracing::warn!("This is a pre-release alpha for preview purposes only.");
     tracing::info!("Starting server on {}", addr);
 
-    if detach {
-        tracing::info!("Running in detached mode");
-        tokio::spawn(async move {
-            if let Err(e) = Server::builder()
-                .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(service))
-                .serve(addr)
-                .await
-            {
-                tracing::error!("Server error in detached mode: {}", e);
-            }
-        });
-        Ok(())
-    } else {
-        Server::builder()
-            .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(service))
-            .serve(addr)
-            .await
-            .context("Server error")?;
-        Ok(())
-    }
+    // Run the server (it's already detached if detach was true)
+    Server::builder()
+        .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(service))
+        .serve(addr)
+        .await
+        .context("Server error")?;
+
+    Ok(())
 }
