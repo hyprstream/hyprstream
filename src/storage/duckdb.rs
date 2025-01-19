@@ -191,14 +191,13 @@ impl DuckDbBackend {
         for metric in metrics {
             let entry = aggregations
                 .entry(metric.metric_id.clone())
-                .or_insert_with(|| BatchAggregation {
-                    metric_id: metric.metric_id.clone(),
-                    window_start,
-                    window_end,
-                    running_sum: 0.0,
-                    running_count: 0,
-                    min_value: f64::INFINITY,
-                    max_value: f64::NEG_INFINITY,
+                .or_insert_with(|| {
+                    BatchAggregation::new_from_metric(
+                        metric.metric_id.clone(),
+                        window_start,
+                        window_end,
+                        window,
+                    )
                 });
 
             entry.running_sum += metric.value_running_window_sum;

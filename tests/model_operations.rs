@@ -34,7 +34,11 @@ async fn test_model_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start test server
     let addr = "127.0.0.1:50052"; // Use different port from other tests
-    let service = FlightSqlService::new(engine_backend, model_storage);
+    let backend = match &*engine_backend {
+        StorageBackendType::DuckDb(backend) => backend.clone(),
+        _ => panic!("Expected DuckDB backend"),
+    };
+    let service = FlightSqlService::new(StorageBackendType::DuckDb(backend));
     let server = tonic::transport::Server::builder()
         .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(service))
         .serve(addr.parse()?);

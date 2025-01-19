@@ -3,8 +3,10 @@ use arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
 use tonic::Status;
 
+use serde::{Deserialize, Serialize};
+
 /// A single metric record with running window calculations.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricRecord {
     /// Unique identifier for the metric
     pub metric_id: String,

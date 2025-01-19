@@ -18,9 +18,11 @@ use crate::cli::commands::config::Credentials;
 use crate::metrics::MetricRecord;
 use crate::storage::table_manager::{AggregationView, TableManager};
 use arrow_array::RecordBatch;
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
+use std::any::{Any, TypeId};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tonic::Status;
 
 /// Batch-level aggregation state for efficient updates
@@ -40,6 +42,104 @@ pub struct BatchAggregation {
     pub min_value: f64,
     /// Maximum value in the window
     pub max_value: f64,
+    /// Schema for the aggregation
+    pub schema: Arc<Schema>,
+    /// Column to aggregate
+    pub value_column: String,
+    /// Grouping specification
+    pub group_by: GroupBy,
+    /// Time window specification
+    pub window: Option<TimeWindow>,
+}
+
+impl BatchAggregation {
+    pub fn new_window(
+        metric_id: String,
+        window_start: i64,
+        window_end: i64,
+        schema: Arc<Schema>,
+        value_column: String,
+        group_by: GroupBy,
+        window: Option<TimeWindow>,
+    ) -> Self {
+        Self {
+            metric_id,
+            window_start,
+            window_end,
+            running_sum: 0.0,
+            running_count: 0,
+            min_value: f64::INFINITY,
+            max_value: f64::NEG_INFINITY,
+            schema,
+            value_column,
+            group_by,
+            window,
+        }
+    }
+
+    pub fn new_from_metric(
+        metric_id: String,
+        window_start: i64,
+        window_end: i64,
+        window: TimeWindow,
+    ) -> Self {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("metric", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+            Field::new("timestamp", DataType::Int64, false),
+        ]));
+        let group_by = GroupBy {
+            columns: vec!["metric".to_string()],
+            time_column: Some("timestamp".to_string()),
+        };
+        Self {
+            metric_id,
+            window_start,
+            window_end,
+            running_sum: 0.0,
+            running_count: 0,
+            min_value: f64::INFINITY,
+            max_value: f64::NEG_INFINITY,
+            schema,
+            value_column: "value".to_string(),
+            group_by,
+            window: Some(window),
+        }
+    }
+}
+
+impl BatchAggregation {
+    pub fn new(
+        schema: Arc<Schema>,
+        value_column: String,
+        group_by: GroupBy,
+        window: Option<TimeWindow>,
+    ) -> Self {
+        Self {
+            metric_id: String::new(), // Will be set during processing
+            window_start: 0,          // Will be set during processing
+            window_end: 0,            // Will be set during processing
+            running_sum: 0.0,
+            running_count: 0,
+            min_value: f64::INFINITY,
+            max_value: f64::NEG_INFINITY,
+            schema,
+            value_column,
+            group_by,
+            window,
+        }
+    }
+
+    pub fn build_query(&self, table_name: &str) -> String {
+        crate::aggregation::build_aggregate_query(
+            table_name,
+            AggregateFunction::Avg,
+            &self.group_by,
+            &[&self.value_column],
+            None,
+            None,
+        )
+    }
 }
 
 /// Storage backend trait for metric data persistence.
@@ -54,6 +154,7 @@ pub struct BatchAggregation {
 /// - Table and view management
 #[async_trait]
 pub trait StorageBackend: Send + Sync + 'static {
+
     /// Initialize the storage backend.
     async fn init(&self) -> Result<(), Status>;
 
@@ -132,14 +233,13 @@ pub trait StorageBackend: Send + Sync + 'static {
             let (window_start, window_end) = window.window_bounds(metric.timestamp);
             let key = (metric.metric_id.clone(), window_start, window_end);
 
-            let agg = aggregations.entry(key).or_insert_with(|| BatchAggregation {
-                metric_id: metric.metric_id.clone(),
-                window_start,
-                window_end,
-                running_sum: 0.0,
-                running_count: 0,
-                min_value: f64::INFINITY,
-                max_value: f64::NEG_INFINITY,
+            let agg = aggregations.entry(key).or_insert_with(|| {
+                BatchAggregation::new_from_metric(
+                    metric.metric_id.clone(),
+                    window_start,
+                    window_end,
+                    window,
+                )
             });
 
             // Update running aggregations
