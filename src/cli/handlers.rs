@@ -1,23 +1,18 @@
-use anyhow::{Result, Context};
-use std::sync::Arc;
-use std::collections::HashMap;
-use daemonize::Daemonize;
-use tracing_subscriber::{fmt, EnvFilter};
-use tracing_log::LogTracer;
-use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use crate::{
+    cli::commands::config::Credentials,
     config::Settings,
     models::{storage::TimeSeriesModelStorage, ModelStorage},
-    storage::{
-        StorageBackendType,
-        StorageBackend,
-        adbc::AdbcBackend,
-        duckdb::DuckDbBackend,
-    },
     service::FlightSqlService,
-    cli::commands::config::Credentials,
+    storage::{adbc::AdbcBackend, duckdb::DuckDbBackend, StorageBackend, StorageBackendType},
 };
+use anyhow::{Context, Result};
+use daemonize::Daemonize;
+use std::collections::HashMap;
+use std::sync::Arc;
 use tonic::transport::Server;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_log::LogTracer;
+use tracing_subscriber::{fmt, EnvFilter};
 
 pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
     // Set up logging before anything else
@@ -33,7 +28,9 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
 
     // Initialize tracing subscriber with both console and file outputs
     let subscriber = fmt::Subscriber::builder()
-        .with_env_filter(EnvFilter::new(settings.server.log_level.as_deref().unwrap_or("info")))
+        .with_env_filter(EnvFilter::new(
+            settings.server.log_level.as_deref().unwrap_or("info"),
+        ))
         .with_writer(non_blocking)
         .with_ansi(false)
         .with_target(false)
@@ -54,7 +51,13 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
     if detach {
         // Configure daemon
         let daemonize = Daemonize::new()
-            .pid_file(settings.server.pid_file.as_deref().unwrap_or("/tmp/hyprstream.pid"))
+            .pid_file(
+                settings
+                    .server
+                    .pid_file
+                    .as_deref()
+                    .unwrap_or("/tmp/hyprstream.pid"),
+            )
             .chown_pid_file(true)
             .working_directory(settings.server.working_dir.as_deref().unwrap_or("/tmp"));
 
@@ -62,12 +65,13 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
         tracing::info!("Starting server in detached mode");
         tracing::info!("PID file: {:?}", settings.server.pid_file);
         tracing::info!("Working directory: {:?}", settings.server.working_dir);
-        daemonize.start()
-            .context("Failed to start daemon")?;
+        daemonize.start().context("Failed to start daemon")?;
     }
 
     // Convert engine options from Vec<String> to HashMap
-    let engine_options: HashMap<String, String> = settings.engine.engine_options
+    let engine_options: HashMap<String, String> = settings
+        .engine
+        .engine_options
         .as_ref()
         .map(|opts| {
             opts.iter()
@@ -84,7 +88,10 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
         .unwrap_or_default();
 
     // Create credentials if username and password are provided
-    let engine_credentials = if let (Some(username), Some(password)) = (settings.engine.engine_username.as_ref(), settings.engine.engine_password.as_ref()) {
+    let engine_credentials = if let (Some(username), Some(password)) = (
+        settings.engine.engine_username.as_ref(),
+        settings.engine.engine_password.as_ref(),
+    ) {
         Some(Credentials {
             username: username.clone(),
             password: password.clone(),
@@ -94,40 +101,60 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
     };
 
     // Create storage backend
-    let engine_backend: Arc<StorageBackendType> = Arc::new(match settings.engine.engine_type.as_deref().unwrap_or("duckdb") {
-        "adbc" => StorageBackendType::Adbc(
-            AdbcBackend::new_with_options(
-                settings.engine.engine_connection.as_deref().unwrap_or(":memory:"),
-                &engine_options,
-                engine_credentials.as_ref(),
-            ).context("Failed to create ADBC backend")?
-        ),
-        "duckdb" => StorageBackendType::DuckDb(
-            DuckDbBackend::new_with_options(
-                settings.engine.engine_connection.as_deref().unwrap_or(":memory:"),
-                &engine_options,
-                engine_credentials.as_ref(),
-            ).context("Failed to create DuckDB backend")?
-        ),
-        engine_type => anyhow::bail!("Unsupported engine type: {}", engine_type),
-    });
+    let engine_backend: Arc<StorageBackendType> = Arc::new(
+        match settings.engine.engine_type.as_deref().unwrap_or("duckdb") {
+            "adbc" => StorageBackendType::Adbc(
+                AdbcBackend::new_with_options(
+                    settings
+                        .engine
+                        .engine_connection
+                        .as_deref()
+                        .unwrap_or(":memory:"),
+                    &engine_options,
+                    engine_credentials.as_ref(),
+                )
+                .context("Failed to create ADBC backend")?,
+            ),
+            "duckdb" => StorageBackendType::DuckDb(
+                DuckDbBackend::new_with_options(
+                    settings
+                        .engine
+                        .engine_connection
+                        .as_deref()
+                        .unwrap_or(":memory:"),
+                    &engine_options,
+                    engine_credentials.as_ref(),
+                )
+                .context("Failed to create DuckDB backend")?,
+            ),
+            engine_type => anyhow::bail!("Unsupported engine type: {}", engine_type),
+        },
+    );
 
     // Initialize backend
-    engine_backend.init().await.context("Failed to initialize storage backend")?;
+    engine_backend
+        .init()
+        .await
+        .context("Failed to initialize storage backend")?;
 
     // Create model storage
     let model_storage = Box::new(TimeSeriesModelStorage::new(engine_backend.clone()));
-    model_storage.init().await.context("Failed to initialize model storage")?;
+    model_storage
+        .init()
+        .await
+        .context("Failed to initialize model storage")?;
 
     // Create the service
     let service = FlightSqlService::new(engine_backend, model_storage);
 
     // Start the server
-    let addr = format!("{}:{}", 
+    let addr = format!(
+        "{}:{}",
         settings.server.host.as_deref().unwrap_or("127.0.0.1"),
         settings.server.port.unwrap_or(50051)
-    ).parse()
-        .context("Invalid listen address")?;
+    )
+    .parse()
+    .context("Invalid listen address")?;
 
     tracing::warn!("This is a pre-release alpha for preview purposes only.");
     tracing::info!("Starting server on {}", addr);
@@ -141,8 +168,10 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
         Ok(_) => Ok(()),
         Err(e) => {
             if e.to_string().contains("Address already in use") {
-                anyhow::bail!("Port {} is already in use. Try using a different port with --port", 
-                    settings.server.port.unwrap_or(50051));
+                anyhow::bail!(
+                    "Port {} is already in use. Try using a different port with --port",
+                    settings.server.port.unwrap_or(50051)
+                );
             } else {
                 Err(e).context("Server error")?
             }

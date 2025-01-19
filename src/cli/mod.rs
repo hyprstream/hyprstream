@@ -2,9 +2,9 @@ use clap::Parser;
 
 pub mod commands;
 mod handlers;
-pub use handlers::run_server;
-pub use commands::Commands;
 pub use commands::config;
+pub use commands::Commands;
+pub use handlers::run_server;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]

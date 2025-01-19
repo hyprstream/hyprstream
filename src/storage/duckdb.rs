@@ -34,24 +34,26 @@
 //! DuckDB is particularly well-suited for analytics workloads and
 //! provides excellent performance for both caching and primary storage.
 
+use crate::aggregation::{
+    build_aggregate_query, AggregateFunction, AggregateResult, GroupBy, TimeWindow,
+};
+use crate::cli::commands::config::Credentials;
+use crate::metrics::MetricRecord;
+use crate::storage::cache::{CacheEviction, CacheManager};
+use crate::storage::table_manager::{AggregationView, TableManager};
+use crate::storage::{BatchAggregation, StorageBackend};
+use arrow::array::{
+    Array, ArrayBuilder, ArrayRef, Float64Array, Float64Builder, Int64Array, Int64Builder,
+    RecordBatch, StringArray, StringBuilder,
+};
+use arrow::datatypes::{DataType, Field, Schema};
+use async_trait::async_trait;
+use duckdb::{params, Config, Connection, ToSql};
 use std::collections::HashMap;
 use std::sync::Arc;
-use duckdb::{Connection, Config, params, ToSql};
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tonic::Status;
-use crate::metrics::MetricRecord;
-use crate::cli::commands::config::Credentials;
-use crate::storage::{StorageBackend, BatchAggregation};
-use crate::storage::cache::{CacheManager, CacheEviction};
-use crate::storage::table_manager::{TableManager, AggregationView};
-use crate::aggregation::{TimeWindow, AggregateFunction, GroupBy, AggregateResult, build_aggregate_query};
-use async_trait::async_trait;
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::array::{
-    Array, ArrayRef, RecordBatch, Int64Array, Float64Array, StringArray,
-    ArrayBuilder, Int64Builder, Float64Builder, StringBuilder,
-};
-use std::time::Duration;
 
 /// DuckDB-based storage backend for metrics.
 #[derive(Clone)]
@@ -65,7 +67,11 @@ pub struct DuckDbBackend {
 
 impl DuckDbBackend {
     /// Creates a new DuckDB backend instance.
-    pub fn new(connection_string: String, options: HashMap<String, String>, ttl: Option<u64>) -> Result<Self, Status> {
+    pub fn new(
+        connection_string: String,
+        options: HashMap<String, String>,
+        ttl: Option<u64>,
+    ) -> Result<Self, Status> {
         let config = Config::default();
         let conn = Connection::open_with_flags(&connection_string, config)
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -95,9 +101,13 @@ impl DuckDbBackend {
     }
 
     /// Inserts a batch of metrics with optimized aggregation updates.
-    async fn insert_batch_optimized(&self, metrics: &[MetricRecord], window: TimeWindow) -> Result<(), Status> {
+    async fn insert_batch_optimized(
+        &self,
+        metrics: &[MetricRecord],
+        window: TimeWindow,
+    ) -> Result<(), Status> {
         let conn = self.conn.lock().await;
-        
+
         // Begin transaction
         conn.execute("BEGIN TRANSACTION", params![])
             .map_err(|e| Status::internal(format!("Failed to begin transaction: {}", e)))?;
@@ -106,7 +116,9 @@ impl DuckDbBackend {
         let batch = Self::prepare_params(metrics)?;
 
         // Insert metrics using prepared statement
-        let mut stmt = conn.prepare(r#"
+        let mut stmt = conn
+            .prepare(
+                r#"
             INSERT INTO metrics (
                 metric_id,
                 timestamp,
@@ -114,23 +126,45 @@ impl DuckDbBackend {
                 value_running_window_avg,
                 value_running_window_count
             ) VALUES (?, ?, ?, ?, ?)
-        "#).map_err(|e| Status::internal(format!("Failed to prepare statement: {}", e)))?;
+        "#,
+            )
+            .map_err(|e| Status::internal(format!("Failed to prepare statement: {}", e)))?;
 
         // Bind and execute in batches
         for i in 0..batch.num_rows() {
-            let metric_id = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap().value(i);
-            let timestamp = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap().value(i);
-            let sum = batch.column(2).as_any().downcast_ref::<Float64Array>().unwrap().value(i);
-            let avg = batch.column(3).as_any().downcast_ref::<Float64Array>().unwrap().value(i);
-            let count = batch.column(4).as_any().downcast_ref::<Int64Array>().unwrap().value(i);
+            let metric_id = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(i);
+            let timestamp = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(i);
+            let sum = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(i);
+            let avg = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(i);
+            let count = batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(i);
 
-            stmt.execute(params![
-                metric_id,
-                timestamp,
-                sum,
-                avg,
-                count,
-            ]).map_err(|e| Status::internal(format!("Failed to insert metrics: {}", e)))?;
+            stmt.execute(params![metric_id, timestamp, sum, avg, count,])
+                .map_err(|e| Status::internal(format!("Failed to insert metrics: {}", e)))?;
         }
 
         // Update aggregations based on window
@@ -144,9 +178,10 @@ impl DuckDbBackend {
         };
 
         let window_end = match window {
-            TimeWindow::Sliding { window: _, slide: _ } => {
-                metrics.iter().map(|m| m.timestamp).max().unwrap_or(0)
-            }
+            TimeWindow::Sliding {
+                window: _,
+                slide: _,
+            } => metrics.iter().map(|m| m.timestamp).max().unwrap_or(0),
             TimeWindow::Fixed(end) => end.as_nanos() as i64,
             TimeWindow::None => metrics.iter().map(|m| m.timestamp).max().unwrap_or(0),
         };
@@ -154,15 +189,17 @@ impl DuckDbBackend {
         // Group metrics by ID and calculate aggregations
         let mut aggregations = HashMap::new();
         for metric in metrics {
-            let entry = aggregations.entry(metric.metric_id.clone()).or_insert_with(|| BatchAggregation {
-                metric_id: metric.metric_id.clone(),
-                window_start,
-                window_end,
-                running_sum: 0.0,
-                running_count: 0,
-                min_value: f64::INFINITY,
-                max_value: f64::NEG_INFINITY,
-            });
+            let entry = aggregations
+                .entry(metric.metric_id.clone())
+                .or_insert_with(|| BatchAggregation {
+                    metric_id: metric.metric_id.clone(),
+                    window_start,
+                    window_end,
+                    running_sum: 0.0,
+                    running_count: 0,
+                    min_value: f64::INFINITY,
+                    max_value: f64::NEG_INFINITY,
+                });
 
             entry.running_sum += metric.value_running_window_sum;
             entry.running_count += metric.value_running_window_count as i64;
@@ -171,7 +208,9 @@ impl DuckDbBackend {
         }
 
         // Update aggregations table using prepared statement with proper type handling
-        let mut agg_stmt = conn.prepare(r#"
+        let mut agg_stmt = conn
+            .prepare(
+                r#"
             INSERT INTO metric_aggregations (
                 metric_id, window_start, window_end,
                 running_sum, running_count, min_value, max_value
@@ -181,18 +220,24 @@ impl DuckDbBackend {
                 running_count = metric_aggregations.running_count + EXCLUDED.running_count,
                 min_value = LEAST(metric_aggregations.min_value, EXCLUDED.min_value),
                 max_value = GREATEST(metric_aggregations.max_value, EXCLUDED.max_value)
-        "#).map_err(|e| Status::internal(format!("Failed to prepare aggregation statement: {}", e)))?;
+        "#,
+            )
+            .map_err(|e| {
+                Status::internal(format!("Failed to prepare aggregation statement: {}", e))
+            })?;
 
         for agg in aggregations.values() {
-            agg_stmt.execute(params![
-                agg.metric_id,
-                agg.window_start,
-                agg.window_end,
-                agg.running_sum,
-                agg.running_count,
-                agg.min_value,
-                agg.max_value,
-            ]).map_err(|e| Status::internal(format!("Failed to update aggregations: {}", e)))?;
+            agg_stmt
+                .execute(params![
+                    agg.metric_id,
+                    agg.window_start,
+                    agg.window_end,
+                    agg.running_sum,
+                    agg.running_count,
+                    agg.min_value,
+                    agg.max_value,
+                ])
+                .map_err(|e| Status::internal(format!("Failed to update aggregations: {}", e)))?;
         }
 
         // Commit transaction
@@ -212,11 +257,15 @@ impl DuckDbBackend {
             Field::new("value_running_window_count", DataType::Int64, false),
         ]));
 
-        let metric_ids = StringArray::from_iter_values(metrics.iter().map(|m| m.metric_id.as_str()));
+        let metric_ids =
+            StringArray::from_iter_values(metrics.iter().map(|m| m.metric_id.as_str()));
         let timestamps = Int64Array::from_iter_values(metrics.iter().map(|m| m.timestamp));
-        let sums = Float64Array::from_iter_values(metrics.iter().map(|m| m.value_running_window_sum));
-        let avgs = Float64Array::from_iter_values(metrics.iter().map(|m| m.value_running_window_avg));
-        let counts = Int64Array::from_iter_values(metrics.iter().map(|m| m.value_running_window_count));
+        let sums =
+            Float64Array::from_iter_values(metrics.iter().map(|m| m.value_running_window_sum));
+        let avgs =
+            Float64Array::from_iter_values(metrics.iter().map(|m| m.value_running_window_avg));
+        let counts =
+            Int64Array::from_iter_values(metrics.iter().map(|m| m.value_running_window_count));
 
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(metric_ids),
@@ -235,7 +284,8 @@ impl DuckDbBackend {
         let conn = self.conn.lock().await;
 
         // Create metrics table
-        conn.execute(r#"
+        conn.execute(
+            r#"
             CREATE TABLE IF NOT EXISTS metrics (
                 metric_id VARCHAR NOT NULL,
                 timestamp BIGINT NOT NULL,
@@ -244,16 +294,21 @@ impl DuckDbBackend {
                 value_running_window_count BIGINT NOT NULL,
                 PRIMARY KEY (metric_id, timestamp)
             )
-        "#, params![]).map_err(|e| Status::internal(e.to_string()))?;
+        "#,
+            params![],
+        )
+        .map_err(|e| Status::internal(e.to_string()))?;
 
         // Create index for time-based queries
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics(timestamp)",
-            params![]
-        ).map_err(|e| Status::internal(e.to_string()))?;
+            params![],
+        )
+        .map_err(|e| Status::internal(e.to_string()))?;
 
         // Create table for batch-level aggregations
-        conn.execute(r#"
+        conn.execute(
+            r#"
             CREATE TABLE IF NOT EXISTS metric_aggregations (
                 metric_id VARCHAR NOT NULL,
                 window_start BIGINT NOT NULL,
@@ -264,7 +319,10 @@ impl DuckDbBackend {
                 max_value DOUBLE NOT NULL,
                 PRIMARY KEY (metric_id, window_start, window_end)
             )
-        "#, params![]).map_err(|e| Status::internal(e.to_string()))?;
+        "#,
+            params![],
+        )
+        .map_err(|e| Status::internal(e.to_string()))?;
 
         // Create index for window-based queries
         conn.execute(
@@ -295,9 +353,10 @@ impl CacheEviction for DuckDbBackend {
 impl StorageBackend for DuckDbBackend {
     async fn init(&self) -> Result<(), Status> {
         let conn = self.conn.lock().await;
-        
+
         // Create metrics table with optimized schema
-        conn.execute_batch(r#"
+        conn.execute_batch(
+            r#"
             CREATE TABLE IF NOT EXISTS metrics (
                 metric_id VARCHAR NOT NULL,
                 timestamp BIGINT NOT NULL,
@@ -322,7 +381,9 @@ impl StorageBackend for DuckDbBackend {
 
             CREATE INDEX IF NOT EXISTS idx_aggregations_window 
             ON metric_aggregations(window_start, window_end);
-        "#).map_err(|e| Status::internal(format!("Failed to create tables: {}", e)))?;
+        "#,
+        )
+        .map_err(|e| Status::internal(format!("Failed to create tables: {}", e)))?;
 
         Ok(())
     }
@@ -362,10 +423,12 @@ impl StorageBackend for DuckDbBackend {
         );
 
         let conn = self.conn.lock().await;
-        let mut stmt = conn.prepare(&query)
+        let mut stmt = conn
+            .prepare(&query)
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let mut rows = stmt.query(params![])
+        let mut rows = stmt
+            .query(params![])
             .map_err(|e| Status::internal(e.to_string()))?;
 
         let mut metrics = Vec::new();
@@ -373,9 +436,15 @@ impl StorageBackend for DuckDbBackend {
             metrics.push(MetricRecord {
                 metric_id: row.get(0).map_err(|e| Status::internal(e.to_string()))?,
                 timestamp: row.get(1).map_err(|e| Status::internal(e.to_string()))?,
-                value_running_window_sum: row.get(2).map_err(|e| Status::internal(e.to_string()))?,
-                value_running_window_avg: row.get(3).map_err(|e| Status::internal(e.to_string()))?,
-                value_running_window_count: row.get(4).map_err(|e| Status::internal(e.to_string()))?,
+                value_running_window_sum: row
+                    .get(2)
+                    .map_err(|e| Status::internal(e.to_string()))?,
+                value_running_window_avg: row
+                    .get(3)
+                    .map_err(|e| Status::internal(e.to_string()))?,
+                value_running_window_count: row
+                    .get(4)
+                    .map_err(|e| Status::internal(e.to_string()))?,
             });
         }
 
@@ -387,8 +456,8 @@ impl StorageBackend for DuckDbBackend {
     }
 
     async fn query_sql(&self, statement_handle: &[u8]) -> Result<Vec<MetricRecord>, Status> {
-        let sql = std::str::from_utf8(statement_handle)
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let sql =
+            std::str::from_utf8(statement_handle).map_err(|e| Status::internal(e.to_string()))?;
         self.query_metrics(sql.parse().unwrap_or(0)).await
     }
 
@@ -415,21 +484,20 @@ impl StorageBackend for DuckDbBackend {
         );
 
         let conn = self.conn.lock().await;
-        let mut stmt = conn.prepare(&query)
+        let mut stmt = conn
+            .prepare(&query)
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let mut rows = stmt.query(params![])
+        let mut rows = stmt
+            .query(params![])
             .map_err(|e| Status::internal(e.to_string()))?;
 
         let mut results = Vec::new();
         while let Some(row) = rows.next().map_err(|e| Status::internal(e.to_string()))? {
             let value: f64 = row.get(0).map_err(|e| Status::internal(e.to_string()))?;
             let timestamp: i64 = row.get(1).map_err(|e| Status::internal(e.to_string()))?;
-            
-            results.push(AggregateResult {
-                value,
-                timestamp,
-            });
+
+            results.push(AggregateResult { value, timestamp });
         }
 
         Ok(results)
@@ -446,7 +514,8 @@ impl StorageBackend for DuckDbBackend {
             all_options.insert("password".to_string(), creds.password.clone());
         }
 
-        let ttl = all_options.get("ttl")
+        let ttl = all_options
+            .get("ttl")
             .and_then(|s| s.parse().ok())
             .map(|ttl| if ttl == 0 { None } else { Some(ttl) })
             .unwrap_or(None);
@@ -460,16 +529,24 @@ impl StorageBackend for DuckDbBackend {
         self.execute(&sql).await?;
 
         // Register table in manager
-        self.table_manager.create_table(table_name.to_string(), schema.clone()).await?;
+        self.table_manager
+            .create_table(table_name.to_string(), schema.clone())
+            .await?;
         Ok(())
     }
 
     async fn insert_into_table(&self, table_name: &str, batch: RecordBatch) -> Result<(), Status> {
         let conn = self.conn.lock().await;
-        let mut stmt = conn.prepare(&format!("INSERT INTO {} VALUES ({})",
-            table_name,
-            (0..batch.num_columns()).map(|_| "?").collect::<Vec<_>>().join(", ")
-        )).map_err(|e| Status::internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "INSERT INTO {} VALUES ({})",
+                table_name,
+                (0..batch.num_columns())
+                    .map(|_| "?")
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         for row_idx in 0..batch.num_rows() {
             let mut param_values: Vec<Box<dyn ToSql>> = Vec::new();
@@ -493,55 +570,68 @@ impl StorageBackend for DuckDbBackend {
             }
 
             let param_refs: Vec<&dyn ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
-            stmt.execute(param_refs.as_slice()).map_err(|e| Status::internal(e.to_string()))?;
+            stmt.execute(param_refs.as_slice())
+                .map_err(|e| Status::internal(e.to_string()))?;
         }
 
         Ok(())
     }
 
-    async fn query_table(&self, table_name: &str, projection: Option<Vec<String>>) -> Result<RecordBatch, Status> {
+    async fn query_table(
+        &self,
+        table_name: &str,
+        projection: Option<Vec<String>>,
+    ) -> Result<RecordBatch, Status> {
         let schema = self.table_manager.get_table_schema(table_name).await?;
-        
-        let mut builders: Vec<Box<dyn ArrayBuilder>> = schema.fields().iter()
+
+        let mut builders: Vec<Box<dyn ArrayBuilder>> = schema
+            .fields()
+            .iter()
             .map(|field| Self::create_array_builder(field))
             .collect();
-        
-        let projection = projection.unwrap_or_else(|| {
-            schema.fields().iter().map(|f| f.name().clone()).collect()
-        });
 
-        let sql = format!(
-            "SELECT {} FROM {}",
-            projection.join(", "),
-            table_name
-        );
+        let projection = projection
+            .unwrap_or_else(|| schema.fields().iter().map(|f| f.name().clone()).collect());
+
+        let sql = format!("SELECT {} FROM {}", projection.join(", "), table_name);
 
         let conn = self.conn.lock().await;
-        let mut stmt = conn.prepare(&sql)
+        let mut stmt = conn
+            .prepare(&sql)
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let mut rows = stmt.query(params![])
+        let mut rows = stmt
+            .query(params![])
             .map_err(|e| Status::internal(e.to_string()))?;
 
         while let Some(row) = rows.next().map_err(|e| Status::internal(e.to_string()))? {
             for (i, field) in schema.fields().iter().enumerate() {
                 match field.data_type() {
                     DataType::Int64 => {
-                        let builder = builders[i].as_any_mut().downcast_mut::<Int64Builder>().unwrap();
+                        let builder = builders[i]
+                            .as_any_mut()
+                            .downcast_mut::<Int64Builder>()
+                            .unwrap();
                         match row.get::<usize, i64>(i) {
                             Ok(value) => builder.append_value(value),
                             Err(_) => builder.append_null(),
                         }
                     }
                     DataType::Float64 => {
-                        let builder = builders[i].as_any_mut().downcast_mut::<Float64Builder>().unwrap();
+                        let builder = builders[i]
+                            .as_any_mut()
+                            .downcast_mut::<Float64Builder>()
+                            .unwrap();
                         match row.get::<usize, f64>(i) {
                             Ok(value) => builder.append_value(value),
                             Err(_) => builder.append_null(),
                         }
                     }
                     DataType::Utf8 => {
-                        let builder = builders[i].as_any_mut().downcast_mut::<StringBuilder>().unwrap();
+                        let builder = builders[i]
+                            .as_any_mut()
+                            .downcast_mut::<StringBuilder>()
+                            .unwrap();
                         match row.get::<usize, String>(i) {
                             Ok(value) => builder.append_value(value),
                             Err(_) => builder.append_null(),
@@ -552,7 +642,8 @@ impl StorageBackend for DuckDbBackend {
             }
         }
 
-        let arrays: Vec<ArrayRef> = builders.into_iter()
+        let arrays: Vec<ArrayRef> = builders
+            .into_iter()
             .map(|mut builder| Arc::new(builder.finish()) as ArrayRef)
             .collect();
 
@@ -561,33 +652,33 @@ impl StorageBackend for DuckDbBackend {
     }
 
     async fn create_aggregation_view(&self, view: &AggregationView) -> Result<(), Status> {
-        let columns: Vec<&str> = view.aggregate_columns.iter()
-            .map(|s| s.as_str())
-            .collect();
-            
+        let columns: Vec<&str> = view.aggregate_columns.iter().map(|s| s.as_str()).collect();
+
         let sql = build_aggregate_query(
             &view.source_table,
             view.function,
             &view.group_by,
             &columns,
             None,
-            None
+            None,
         );
-        
+
         let view_name = format!("agg_view_{}", view.source_table);
         let conn = self.conn.lock().await;
         conn.execute(&format!("CREATE VIEW {} AS {}", view_name, sql), params![])
             .map_err(|e| Status::internal(format!("Failed to create view: {}", e)))?;
 
         // Register view in manager
-        self.table_manager.create_aggregation_view(
-            view_name,
-            view.source_table.clone(),
-            view.function.clone(),
-            view.group_by.clone(),
-            view.window.clone(),
-            view.aggregate_columns.clone(),
-        ).await?;
+        self.table_manager
+            .create_aggregation_view(
+                view_name,
+                view.source_table.clone(),
+                view.function.clone(),
+                view.group_by.clone(),
+                view.window.clone(),
+                view.aggregate_columns.clone(),
+            )
+            .await?;
 
         Ok(())
     }
@@ -639,7 +730,11 @@ impl DuckDbBackend {
             }
             first = false;
 
-            sql.push_str(&format!("\"{}\" {}", field.name(), Self::arrow_type_to_duckdb_type(field.data_type())));
+            sql.push_str(&format!(
+                "\"{}\" {}",
+                field.name(),
+                Self::arrow_type_to_duckdb_type(field.data_type())
+            ));
         }
 
         sql.push_str(")");
@@ -680,4 +775,3 @@ impl DuckDbBackend {
         }
     }
 }
-

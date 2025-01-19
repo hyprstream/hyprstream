@@ -10,13 +10,15 @@
 //! The implementation focuses on high performance and efficient memory usage while
 //! maintaining compatibility with various model architectures.
 
-use arrow_array::{Array, ArrayRef, Float32Array, StringArray, Int64Array, BinaryArray, RecordBatch};
-use arrow_schema::{Schema, Field, DataType};
+use arrow_array::{
+    Array, ArrayRef, BinaryArray, Float32Array, Int64Array, RecordBatch, StringArray,
+};
+use arrow_schema::{DataType, Field, Schema};
+use bincode;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::Status;
-use serde::{Serialize, Deserialize};
-use bincode;
 
 pub mod storage;
 
@@ -71,7 +73,7 @@ pub struct Model {
     pub metadata: ModelMetadata,
     /// Model layers
     pub layers: Vec<ModelLayer>,
-    
+
     /// Add required fields
     pub id: String,
     pub version: String,
@@ -191,9 +193,18 @@ impl Model {
             Arc::new(StringArray::from_iter_values([&self.metadata.model_id])),
             Arc::new(StringArray::from_iter_values([&self.metadata.name])),
             Arc::new(StringArray::from_iter_values([&self.metadata.architecture])),
-            Arc::new(StringArray::from_iter_values([&self.metadata.version.version])),
-            Arc::new(Int64Array::from_iter_values([self.metadata.version.created_at])),
-            Arc::new(StringArray::from_iter_values([&self.metadata.version.description])),
+            Arc::new(StringArray::from_iter_values([&self
+                .metadata
+                .version
+                .version])),
+            Arc::new(Int64Array::from_iter_values([self
+                .metadata
+                .version
+                .created_at])),
+            Arc::new(StringArray::from_iter_values([&self
+                .metadata
+                .version
+                .description])),
             Arc::new(StringArray::from_iter(std::iter::once(parent_version))),
         ];
 
@@ -254,32 +265,38 @@ impl Model {
     pub fn estimated_size(&self) -> u64 {
         // Base size for metadata
         let mut size = std::mem::size_of::<Self>() as u64;
-        
+
         // Add size of layers
         for layer in &self.layers {
             // Layer metadata
             size += std::mem::size_of::<ModelLayer>() as u64;
-            
+
             // Layer weights
-            size += layer.weights.iter()
+            size += layer
+                .weights
+                .iter()
                 .map(|arr| arr.len() * std::mem::size_of::<f32>())
                 .sum::<usize>() as u64;
-            
+
             // Layer parameters
-            size += layer.parameters.iter()
+            size += layer
+                .parameters
+                .iter()
                 .map(|(k, v)| k.len() + v.len())
                 .sum::<usize>() as u64;
         }
-        
+
         size
     }
 
     /// Add update_weights method
     pub fn update_weights(&mut self, weights: Vec<ArrayRef>) -> Result<(), Status> {
         if weights.len() != self.layers.len() {
-            return Err(Status::invalid_argument(
-                format!("Expected {} weight arrays, got {}", self.layers.len(), weights.len())
-            ));
+            return Err(Status::invalid_argument(format!(
+                "Expected {} weight arrays, got {}",
+                self.layers.len(),
+                weights.len()
+            )));
         }
 
         for (layer, weight_array) in self.layers.iter_mut().zip(weights) {
@@ -288,4 +305,4 @@ impl Model {
 
         Ok(())
     }
-} 
+}

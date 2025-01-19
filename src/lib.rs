@@ -7,5 +7,5 @@ pub mod service;
 pub mod storage;
 
 // Re-export commonly used types
+pub use aggregation::{AggregateFunction, AggregateResult, GroupBy, TimeWindow};
 pub use service::FlightSqlService;
-pub use aggregation::{AggregateFunction, GroupBy, AggregateResult, TimeWindow};

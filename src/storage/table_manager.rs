@@ -1,10 +1,10 @@
+use crate::aggregation::{AggregateFunction, GroupBy, TimeWindow};
+use arrow_schema::Schema;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use arrow_schema::Schema;
 use tonic::Status;
-use serde::{Serialize, Deserialize};
-use crate::aggregation::{TimeWindow, AggregateFunction, GroupBy};
 
 /// Configuration for an aggregation view
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,7 +48,10 @@ impl TableManager {
     pub async fn create_table(&self, name: String, schema: Schema) -> Result<(), Status> {
         let mut tables = self.tables.write().await;
         if tables.contains_key(&name) {
-            return Err(Status::already_exists(format!("Table {} already exists", name)));
+            return Err(Status::already_exists(format!(
+                "Table {} already exists",
+                name
+            )));
         }
         tables.insert(name, schema);
         Ok(())
@@ -56,7 +59,8 @@ impl TableManager {
 
     pub async fn get_table_schema(&self, name: &str) -> Result<Schema, Status> {
         let tables = self.tables.read().await;
-        tables.get(name)
+        tables
+            .get(name)
             .cloned()
             .ok_or_else(|| Status::not_found(format!("Table {} not found", name)))
     }
@@ -74,7 +78,10 @@ impl TableManager {
         {
             let tables = self.tables.read().await;
             if !tables.contains_key(&source_table) {
-                return Err(Status::not_found(format!("Source table {} not found", source_table)));
+                return Err(Status::not_found(format!(
+                    "Source table {} not found",
+                    source_table
+                )));
             }
 
             // Verify aggregate columns exist in source table
@@ -99,7 +106,10 @@ impl TableManager {
 
         let mut views = self.views.write().await;
         if views.contains_key(&name) {
-            return Err(Status::already_exists(format!("View {} already exists", name)));
+            return Err(Status::already_exists(format!(
+                "View {} already exists",
+                name
+            )));
         }
         views.insert(name, view);
         Ok(())
@@ -107,7 +117,8 @@ impl TableManager {
 
     pub async fn get_aggregation_view(&self, name: &str) -> Result<AggregationView, Status> {
         let views = self.views.read().await;
-        views.get(name)
+        views
+            .get(name)
             .cloned()
             .ok_or_else(|| Status::not_found(format!("View {} not found", name)))
     }
@@ -137,4 +148,4 @@ impl TableManager {
         }
         Ok(())
     }
-} 
+}

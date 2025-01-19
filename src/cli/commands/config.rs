@@ -1,21 +1,21 @@
+use clap::Args;
 use serde::Deserialize;
 use std::path::PathBuf;
-use clap::Args;
 
 /// Trait for configuration options that can be set via CLI, env vars, or config file
 pub trait ConfigOption {
     /// Get the environment variable name for this option
     fn env_var(&self) -> Option<&'static str>;
-    
+
     /// Get the long CLI flag for this option
     fn cli_flag(&self) -> Option<&'static str>;
-    
+
     /// Get the short CLI flag for this option
     fn cli_short(&self) -> Option<char>;
-    
+
     /// Get the config file path for this option (e.g., "server.host")
     fn config_path(&self) -> &'static str;
-    
+
     /// Get the help text for this option
     fn help_text(&self) -> &'static str;
 }
@@ -91,7 +91,7 @@ impl<T> ConfigOption for ConfigOptionDef<T> {
 pub trait ConfigSection: Sized + Default {
     /// Get all configuration options for this section
     fn options() -> Vec<ConfigOptionDef<String>>;
-    
+
     /// Create a new instance from a config file section
     fn from_config<'de, D>(deserializer: D) -> Result<Self, D::Error>
     where

@@ -5,7 +5,7 @@
 
 use clap::Parser;
 use hyprstream_core::{
-    cli::{Cli, Commands, run_server},
+    cli::{run_server, Cli, Commands},
     config::Settings,
 };
 

@@ -10,10 +10,10 @@
 //! Configuration options are loaded in order of precedence, with later sources
 //! overriding earlier ones.
 
+use crate::cli::commands::server::{CacheConfig, EngineConfig, ServerConfig};
 use config::{Config, ConfigError};
 use serde::Deserialize;
 use std::path::PathBuf;
-use crate::cli::commands::server::{ServerConfig, EngineConfig, CacheConfig};
 
 const DEFAULT_CONFIG: &str = include_str!("../config/default.toml");
 const DEFAULT_CONFIG_PATH: &str = "/etc/hyprstream/config.toml";
@@ -38,7 +38,12 @@ pub struct Settings {
 
 impl Settings {
     /// Loads configuration from all available sources.
-    pub fn new(server: ServerConfig, engine: EngineConfig, cache: CacheConfig, config_path: Option<PathBuf>) -> Result<Self, ConfigError> {
+    pub fn new(
+        server: ServerConfig,
+        engine: EngineConfig,
+        cache: CacheConfig,
+        config_path: Option<PathBuf>,
+    ) -> Result<Self, ConfigError> {
         let mut builder = Config::builder();
 
         // Load default configuration
@@ -50,7 +55,8 @@ impl Settings {
         // Load system configuration if it exists
         if let Ok(metadata) = std::fs::metadata(DEFAULT_CONFIG_PATH) {
             if metadata.is_file() {
-                builder = builder.add_source(config::File::from(PathBuf::from(DEFAULT_CONFIG_PATH)));
+                builder =
+                    builder.add_source(config::File::from(PathBuf::from(DEFAULT_CONFIG_PATH)));
             }
         }
 

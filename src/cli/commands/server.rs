@@ -1,7 +1,7 @@
-use clap::Args;
-use std::path::PathBuf;
-use serde::Deserialize;
 use super::config::{ConfigOptionDef, ConfigSection};
+use clap::Args;
+use serde::Deserialize;
+use std::path::PathBuf;
 
 #[derive(Debug, Default, Deserialize, Args)]
 pub struct ServerConfig {
@@ -35,15 +35,24 @@ impl ConfigSection for ServerConfig {
             ConfigOptionDef::new("server.port", "Server port")
                 .with_env("HYPRSTREAM_SERVER_PORT")
                 .with_cli("port"),
-            ConfigOptionDef::new("server.log_level", "Log level (trace, debug, info, warn, error)")
-                .with_env("HYPRSTREAM_LOG_LEVEL")
-                .with_cli("log-level"),
-            ConfigOptionDef::new("server.working_dir", "Working directory for the server when running in detached mode")
-                .with_env("HYPRSTREAM_WORKING_DIR")
-                .with_cli("working-dir"),
-            ConfigOptionDef::new("server.pid_file", "PID file location when running in detached mode")
-                .with_env("HYPRSTREAM_PID_FILE")
-                .with_cli("pid-file"),
+            ConfigOptionDef::new(
+                "server.log_level",
+                "Log level (trace, debug, info, warn, error)",
+            )
+            .with_env("HYPRSTREAM_LOG_LEVEL")
+            .with_cli("log-level"),
+            ConfigOptionDef::new(
+                "server.working_dir",
+                "Working directory for the server when running in detached mode",
+            )
+            .with_env("HYPRSTREAM_WORKING_DIR")
+            .with_cli("working-dir"),
+            ConfigOptionDef::new(
+                "server.pid_file",
+                "PID file location when running in detached mode",
+            )
+            .with_env("HYPRSTREAM_PID_FILE")
+            .with_cli("pid-file"),
         ]
     }
 
@@ -100,12 +109,18 @@ impl ConfigSection for EngineConfig {
             ConfigOptionDef::new("engine.type", "Primary storage engine type")
                 .with_env("HYPRSTREAM_ENGINE")
                 .with_cli("engine-type"),
-            ConfigOptionDef::new("engine.connection", "Primary storage engine connection string")
-                .with_env("HYPRSTREAM_ENGINE_CONNECTION")
-                .with_cli("engine-connection"),
-            ConfigOptionDef::new("engine.options", "Primary storage engine options (key=value pairs)")
-                .with_env("HYPRSTREAM_ENGINE_OPTIONS")
-                .with_cli("engine-options"),
+            ConfigOptionDef::new(
+                "engine.connection",
+                "Primary storage engine connection string",
+            )
+            .with_env("HYPRSTREAM_ENGINE_CONNECTION")
+            .with_cli("engine-connection"),
+            ConfigOptionDef::new(
+                "engine.options",
+                "Primary storage engine options (key=value pairs)",
+            )
+            .with_env("HYPRSTREAM_ENGINE_OPTIONS")
+            .with_cli("engine-options"),
             ConfigOptionDef::new("engine.username", "Primary storage engine username")
                 .with_env("HYPRSTREAM_ENGINE_USERNAME")
                 .with_cli("engine-username"),
