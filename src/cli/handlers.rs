@@ -494,7 +494,7 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
 
     let mut shutdown_rx = shutdown_tx.subscribe();
     let server_future = server
-        .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(service))
+        .add_service(service.into_server())
         .serve_with_shutdown(addr, async move {
             let _ = shutdown_rx.recv().await;
             tracing::info!("Initiating graceful shutdown");
