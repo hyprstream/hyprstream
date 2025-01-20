@@ -11,6 +11,7 @@
 //! the metric-specific aggregation in `crate::metrics::aggregation`.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::time::Duration;
 
@@ -62,8 +63,12 @@ pub struct GroupBy {
 /// Result of an aggregation operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggregateResult {
+    /// The aggregated value
     pub value: f64,
-    pub timestamp: i64,
+    /// Group values for each grouping column
+    pub group_values: HashMap<String, String>,
+    /// Optional timestamp for time-based grouping
+    pub timestamp: Option<i64>,
 }
 
 impl TimeWindow {

@@ -2224,6 +2224,7 @@ dependencies = [
  "num_cpus",
  "parking_lot",
  "polars",
+ "prost",
  "rlimit",
  "rustls",
  "rustls-pemfile",

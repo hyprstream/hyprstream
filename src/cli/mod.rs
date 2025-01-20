@@ -1,14 +1,11 @@
-use clap::Parser;
+//! Command-line interface module.
+//!
+//! This module provides the CLI functionality for:
+//! - Server management
+//! - Configuration handling
+//! - SQL query execution
 
 pub mod commands;
-mod handlers;
-pub use commands::config;
-pub use commands::Commands;
-pub use handlers::{execute_sql, run_server};
+pub mod handlers;
 
-#[derive(Parser)]
-#[command(author, version, about, long_about = None)]
-pub struct Cli {
-    #[command(subcommand)]
-    pub command: Commands,
-}
+pub use handlers::{handle_config, handle_server};

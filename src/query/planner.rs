@@ -1,3 +1,5 @@
+use crate::query::rules::view::ViewOptimizationRule;
+use crate::storage::StorageBackend;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::error::Result;
 use datafusion::execution::context::SessionContext;
@@ -28,6 +30,8 @@ pub enum OptimizationHint {
     OptimizeForStreaming,
     /// Optimize for vector operations
     OptimizeForVectorOps,
+    /// Use views when possible
+    PreferViews,
 }
 
 /// Core trait for query planning and optimization
@@ -52,21 +56,36 @@ pub struct DataFusionPlanner {
     ctx: SessionContext,
     /// Custom optimization rules
     optimizations: Vec<Box<dyn OptimizerRule + Send + Sync>>,
+    /// Storage backend for view lookups
+    storage: Arc<dyn StorageBackend>,
 }
 
 impl DataFusionPlanner {
-    pub fn new() -> Self {
+    pub fn new(storage: Arc<dyn StorageBackend>) -> Self {
         let ctx = SessionContext::new();
-        Self {
+        let mut planner = Self {
             ctx,
             optimizations: Vec::new(),
-        }
+            storage,
+        };
+
+        // Add default optimization rules
+        planner.add_default_rules();
+        planner
     }
 
     /// Add a custom optimization rule
     pub fn with_optimization(mut self, rule: Box<dyn OptimizerRule + Send + Sync>) -> Self {
         self.optimizations.push(rule);
         self
+    }
+
+    /// Add default optimization rules
+    fn add_default_rules(&mut self) {
+        // Add view optimization rule
+        self.optimizations.push(Box::new(ViewOptimizationRule::new(
+            self.storage.clone(),
+        )));
     }
 }
 
@@ -146,3 +165,32 @@ pub struct ColumnStatistics {
 // Add missing imports
 use datafusion::scalar::ScalarValue;
 use std::collections::HashMap;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::DuckDbBackend;
+
+    #[tokio::test]
+    async fn test_query_planning_with_views() -> Result<()> {
+        // Create test backend
+        let backend = Arc::new(DuckDbBackend::new_in_memory().unwrap());
+        backend.init().await.unwrap();
+
+        // Create planner with backend
+        let planner = DataFusionPlanner::new(backend);
+
+        // Create test query
+        let query = Query {
+            sql: "SELECT * FROM test_table".to_string(),
+            schema_hint: None,
+            hints: vec![OptimizationHint::PreferViews],
+        };
+
+        // Plan should succeed
+        let plan = planner.create_logical_plan(&query).await?;
+        assert!(plan.schema().fields().len() > 0);
+
+        Ok(())
+    }
+}

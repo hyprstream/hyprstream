@@ -12,11 +12,12 @@ pub mod adbc;
 pub mod cache;
 pub mod duckdb;
 pub mod table_manager;
+pub mod view;
 
 use crate::aggregation::{AggregateFunction, AggregateResult, GroupBy, TimeWindow};
 use crate::cli::commands::config::Credentials;
 use crate::metrics::MetricRecord;
-use crate::storage::table_manager::{AggregationView, TableManager};
+use crate::storage::view::{ViewDefinition, ViewMetadata};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
@@ -105,9 +106,7 @@ impl BatchAggregation {
             window: Some(window),
         }
     }
-}
 
-impl BatchAggregation {
     pub fn new(
         schema: Arc<Schema>,
         value_column: String,
@@ -115,9 +114,9 @@ impl BatchAggregation {
         window: Option<TimeWindow>,
     ) -> Self {
         Self {
-            metric_id: String::new(), // Will be set during processing
-            window_start: 0,          // Will be set during processing
-            window_end: 0,            // Will be set during processing
+            metric_id: String::new(),
+            window_start: 0,
+            window_end: 0,
             running_sum: 0.0,
             running_count: 0,
             min_value: f64::INFINITY,
@@ -142,15 +141,6 @@ impl BatchAggregation {
 }
 
 /// Storage backend trait for metric data persistence.
-///
-/// This trait defines the interface that all storage backends must implement.
-/// It provides methods for:
-/// - Initialization and configuration
-/// - Metric data insertion
-/// - Metric data querying
-/// - SQL query preparation and execution
-/// - Aggregation of metrics
-/// - Table and view management
 #[async_trait]
 pub trait StorageBackend: Send + Sync + 'static {
     /// Initialize the storage backend.
@@ -163,11 +153,9 @@ pub trait StorageBackend: Send + Sync + 'static {
     async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<MetricRecord>, Status>;
 
     /// Prepare a SQL query and return a handle.
-    /// The handle is backend-specific and opaque to the caller.
     async fn prepare_sql(&self, query: &str) -> Result<Vec<u8>, Status>;
 
     /// Execute a prepared SQL query using its handle.
-    /// The handle must have been obtained from prepare_sql.
     async fn query_sql(&self, statement_handle: &[u8]) -> Result<Vec<MetricRecord>, Status>;
 
     /// Aggregate metrics using the specified function and grouping.
@@ -180,7 +168,6 @@ pub trait StorageBackend: Send + Sync + 'static {
     ) -> Result<Vec<AggregateResult>, Status>;
 
     /// Create a new instance with the given options.
-    /// The connection string and options are backend-specific.
     fn new_with_options(
         connection_string: &str,
         options: &HashMap<String, String>,
@@ -202,29 +189,27 @@ pub trait StorageBackend: Send + Sync + 'static {
         projection: Option<Vec<String>>,
     ) -> Result<RecordBatch, Status>;
 
-    /// Create an aggregation view
-    async fn create_aggregation_view(&self, view_name: &str, view: &AggregationView) -> Result<(), Status>;
+    /// Create a view with the given definition
+    async fn create_view(&self, name: &str, definition: ViewDefinition) -> Result<(), Status>;
 
-    /// Query data from an aggregation view
-    async fn query_aggregation_view(&self, view_name: &str) -> Result<RecordBatch, Status>;
+    /// Get view metadata
+    async fn get_view(&self, name: &str) -> Result<ViewMetadata, Status>;
+
+    /// List all views
+    async fn list_views(&self) -> Result<Vec<String>, Status>;
+
+    /// Drop a view
+    async fn drop_view(&self, name: &str) -> Result<(), Status>;
 
     /// Drop a table
     async fn drop_table(&self, table_name: &str) -> Result<(), Status>;
 
-    /// Drop an aggregation view
-    async fn drop_aggregation_view(&self, view_name: &str) -> Result<(), Status>;
-
-    /// Get the table manager instance
-    fn table_manager(&self) -> &TableManager;
-
     /// Update batch-level aggregations.
-    /// This is called during batch writes to maintain running aggregations.
     async fn update_batch_aggregations(
         &self,
         batch: &[MetricRecord],
         window: TimeWindow,
     ) -> Result<Vec<BatchAggregation>, Status> {
-        // Default implementation that processes the batch and updates aggregations
         let mut aggregations = HashMap::new();
 
         for metric in batch {
@@ -240,7 +225,6 @@ pub trait StorageBackend: Send + Sync + 'static {
                 )
             });
 
-            // Update running aggregations
             agg.running_sum += metric.value_running_window_sum;
             agg.running_count += 1;
             agg.min_value = agg.min_value.min(metric.value_running_window_sum);
@@ -251,12 +235,10 @@ pub trait StorageBackend: Send + Sync + 'static {
     }
 
     /// Insert batch-level aggregations.
-    /// This is called after update_batch_aggregations to persist the aggregations.
     async fn insert_batch_aggregations(
         &self,
         aggregations: Vec<BatchAggregation>,
     ) -> Result<(), Status> {
-        // Default implementation that stores aggregations in a separate table
         let mut batch = Vec::new();
         for agg in aggregations {
             batch.push(MetricRecord {
@@ -377,9 +359,7 @@ impl StorageBackend for StorageBackendType {
     async fn insert_into_table(&self, table_name: &str, batch: RecordBatch) -> Result<(), Status> {
         match self {
             StorageBackendType::Adbc(backend) => backend.insert_into_table(table_name, batch).await,
-            StorageBackendType::DuckDb(backend) => {
-                backend.insert_into_table(table_name, batch).await
-            }
+            StorageBackendType::DuckDb(backend) => backend.insert_into_table(table_name, batch).await,
         }
     }
 
@@ -390,23 +370,35 @@ impl StorageBackend for StorageBackendType {
     ) -> Result<RecordBatch, Status> {
         match self {
             StorageBackendType::Adbc(backend) => backend.query_table(table_name, projection).await,
-            StorageBackendType::DuckDb(backend) => {
-                backend.query_table(table_name, projection).await
-            }
+            StorageBackendType::DuckDb(backend) => backend.query_table(table_name, projection).await,
         }
     }
 
-    async fn create_aggregation_view(&self, view_name: &str, view: &AggregationView) -> Result<(), Status> {
+    async fn create_view(&self, name: &str, definition: ViewDefinition) -> Result<(), Status> {
         match self {
-            StorageBackendType::Adbc(backend) => backend.create_aggregation_view(view_name, view).await,
-            StorageBackendType::DuckDb(backend) => backend.create_aggregation_view(view_name, view).await,
+            StorageBackendType::Adbc(backend) => backend.create_view(name, definition).await,
+            StorageBackendType::DuckDb(backend) => backend.create_view(name, definition).await,
         }
     }
 
-    async fn query_aggregation_view(&self, view_name: &str) -> Result<RecordBatch, Status> {
+    async fn get_view(&self, name: &str) -> Result<ViewMetadata, Status> {
         match self {
-            StorageBackendType::Adbc(backend) => backend.query_aggregation_view(view_name).await,
-            StorageBackendType::DuckDb(backend) => backend.query_aggregation_view(view_name).await,
+            StorageBackendType::Adbc(backend) => backend.get_view(name).await,
+            StorageBackendType::DuckDb(backend) => backend.get_view(name).await,
+        }
+    }
+
+    async fn list_views(&self) -> Result<Vec<String>, Status> {
+        match self {
+            StorageBackendType::Adbc(backend) => backend.list_views().await,
+            StorageBackendType::DuckDb(backend) => backend.list_views().await,
+        }
+    }
+
+    async fn drop_view(&self, name: &str) -> Result<(), Status> {
+        match self {
+            StorageBackendType::Adbc(backend) => backend.drop_view(name).await,
+            StorageBackendType::DuckDb(backend) => backend.drop_view(name).await,
         }
     }
 
@@ -417,32 +409,14 @@ impl StorageBackend for StorageBackendType {
         }
     }
 
-    async fn drop_aggregation_view(&self, view_name: &str) -> Result<(), Status> {
-        match self {
-            StorageBackendType::Adbc(backend) => backend.drop_aggregation_view(view_name).await,
-            StorageBackendType::DuckDb(backend) => backend.drop_aggregation_view(view_name).await,
-        }
-    }
-
-    fn table_manager(&self) -> &TableManager {
-        match self {
-            StorageBackendType::Adbc(backend) => backend.table_manager(),
-            StorageBackendType::DuckDb(backend) => backend.table_manager(),
-        }
-    }
-
     async fn update_batch_aggregations(
         &self,
         batch: &[MetricRecord],
         window: TimeWindow,
     ) -> Result<Vec<BatchAggregation>, Status> {
         match self {
-            StorageBackendType::Adbc(backend) => {
-                backend.update_batch_aggregations(batch, window).await
-            }
-            StorageBackendType::DuckDb(backend) => {
-                backend.update_batch_aggregations(batch, window).await
-            }
+            StorageBackendType::Adbc(backend) => backend.update_batch_aggregations(batch, window).await,
+            StorageBackendType::DuckDb(backend) => backend.update_batch_aggregations(batch, window).await,
         }
     }
 
@@ -451,12 +425,8 @@ impl StorageBackend for StorageBackendType {
         aggregations: Vec<BatchAggregation>,
     ) -> Result<(), Status> {
         match self {
-            StorageBackendType::Adbc(backend) => {
-                backend.insert_batch_aggregations(aggregations).await
-            }
-            StorageBackendType::DuckDb(backend) => {
-                backend.insert_batch_aggregations(aggregations).await
-            }
+            StorageBackendType::Adbc(backend) => backend.insert_batch_aggregations(aggregations).await,
+            StorageBackendType::DuckDb(backend) => backend.insert_batch_aggregations(aggregations).await,
         }
     }
 }

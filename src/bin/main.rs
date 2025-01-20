@@ -4,17 +4,23 @@
 //! for real-time data ingestion, windowed aggregation, caching, and serving.
 
 use clap::Parser;
+use config::Config;
 use hyprstream_core::{
-    cli::{execute_sql, run_server, Cli, Commands},
-    config::Settings,
+    cli::commands::Commands,
+    cli::handlers::{handle_server, handle_sql},
 };
 use tracing::{info, Level};
 use tracing_subscriber::EnvFilter;
 
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Commands,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
-
     // Initialize logging with debug level for hyprstream_core
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -30,38 +36,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Hyprstream starting up");
 
-    // Handle commands
-    match cli.command {
-        Commands::Server(server_cmd) => {
-            // Initialize settings
-            let settings = Settings::new(
-                server_cmd.server,
-                server_cmd.engine,
-                server_cmd.cache,
-                server_cmd.config,
-            )?;
+    let cli = Cli::parse();
 
-            run_server(server_cmd.detach, settings).await?;
+    match cli.command {
+        Commands::Server(_cmd) => {
+            let config = Config::builder()
+                .set_default("host", "127.0.0.1")?
+                .set_default("port", "50051")?
+                .set_default("storage.type", "duckdb")?
+                .set_default("storage.connection", ":memory:")?
+                .build()?;
+            handle_server(config).await?
         }
-        Commands::Sql(sql_cmd) => {
-            let addr = if let Some(host) = sql_cmd.host {
-                Some(host.parse().map_err(|e| {
-                    format!("Invalid host:port address '{}': {}", host, e)
-                })?)
-            } else {
-                None
-            };
-            
-            execute_sql(
-                addr,
-                sql_cmd.query,
-                sql_cmd.tls_cert.as_deref(),
-                sql_cmd.tls_key.as_deref(),
-                sql_cmd.tls_ca.as_deref(),
-                sql_cmd.tls_skip_verify,
-                sql_cmd.verbose,
-            )
-            .await?;
+        Commands::Sql(cmd) => {
+            handle_sql(
+                cmd.host,
+                &cmd.query,
+                cmd.tls_cert.as_deref(),
+                cmd.tls_key.as_deref(),
+                cmd.tls_ca.as_deref(),
+                cmd.tls_skip_verify,
+                cmd.verbose,
+            ).await?
         }
     }
 
