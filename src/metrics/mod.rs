@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tonic::Status;
 
 use serde::{Deserialize, Serialize};
+use std::default::Default;
 
 /// A single metric record with running window calculations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +60,18 @@ impl MetricRecord {
         }
 
         Ok(metrics)
+    }
+}
+
+impl Default for MetricRecord {
+    fn default() -> Self {
+        Self {
+            metric_id: String::new(),
+            timestamp: 0,
+            value_running_window_sum: 0.0,
+            value_running_window_avg: 0.0,
+            value_running_window_count: 0,
+        }
     }
 }
 

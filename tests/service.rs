@@ -184,3 +184,55 @@ async fn test_create_aggregation_view() {
     let result = client.query_sql(query_sql.into()).await;
     assert!(result.is_ok());
 }
+
+#[tokio::test]
+async fn test_query_planner_integration() {
+    let (service, endpoint) = create_test_service().await;
+
+    // Start service in background
+    tokio::spawn(async move {
+        service.serve().await.unwrap();
+    });
+
+    // Wait for service to start
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Connect client
+    let channel = Channel::from_shared(endpoint)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = FlightSqlServiceClient::new(channel);
+
+    // Create test table with data
+    let create_table_sql = "CREATE TABLE metrics (
+        name VARCHAR NOT NULL,
+        value DOUBLE PRECISION NOT NULL,
+        timestamp BIGINT NOT NULL
+    )";
+    client.execute(create_table_sql.into(), None).await.unwrap();
+
+    // Insert test data
+    let insert_sql = "INSERT INTO metrics VALUES
+        ('cpu', 80.0, 1000),
+        ('memory', 60.0, 1000),
+        ('cpu', 85.0, 2000),
+        ('memory', 65.0, 2000)";
+    client.execute(insert_sql.into(), None).await.unwrap();
+
+    // Test aggregation query that should use vector operations
+    let query_sql = "SELECT name, AVG(value) as avg_value
+                    FROM metrics
+                    GROUP BY name
+                    ORDER BY name";
+    let result = client.query_sql(query_sql.into()).await;
+    assert!(result.is_ok());
+
+    // Test time-based query that should use predicate pushdown
+    let query_sql = "SELECT * FROM metrics
+                    WHERE timestamp >= 1500
+                    ORDER BY timestamp";
+    let result = client.query_sql(query_sql.into()).await;
+    assert!(result.is_ok());
+}

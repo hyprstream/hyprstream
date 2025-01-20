@@ -9,9 +9,13 @@
 //! The service implementation is designed to work with multiple storage backends
 //! while maintaining consistent query semantics and high performance.
 
-use crate::metrics::MetricRecord;
+use crate::metrics::{encode_record_batch, MetricRecord};
 use crate::models::storage::TimeSeriesModelStorage;
 use crate::models::{Model, ModelStorage};
+use crate::query::{
+    DataFusionExecutor, DataFusionPlanner, ExecutorConfig, OptimizationHint, Query, QueryExecutor,
+    QueryPlanner,
+};
 use crate::storage::table_manager::AggregationView;
 use crate::storage::{StorageBackend, StorageBackendType};
 use arrow_array::{builder::Float32Builder, ArrayRef, Float32Array};
@@ -269,6 +273,8 @@ pub struct FlightSqlService {
     model_storage: Arc<Box<dyn ModelStorage>>,
     statement_counter: Arc<AtomicU64>,
     prepared_statements: Arc<Mutex<Vec<String>>>,
+    planner: Arc<DataFusionPlanner>,
+    executor: Arc<DataFusionExecutor>,
 }
 
 impl FlightSqlService {
@@ -276,11 +282,17 @@ impl FlightSqlService {
         let backend = Arc::new(backend);
         let model_storage = Box::new(TimeSeriesModelStorage::new(backend.clone()));
 
+        // Initialize query planner and executor
+        let planner = Arc::new(DataFusionPlanner::new());
+        let executor = Arc::new(DataFusionExecutor::new(ExecutorConfig::default()));
+
         Self {
             backend,
             model_storage: Arc::new(model_storage),
             statement_counter: Arc::new(AtomicU64::new(0)),
             prepared_statements: Arc::new(Mutex::new(Vec::new())),
+            planner,
+            executor,
         }
     }
 
@@ -511,20 +523,60 @@ impl FlightSqlService {
                     }
                 }
             }
-            Command::Sql(sql_cmd) => match sql_cmd {
-                SqlCommand::Execute(sql) => {
-                    let statement_handle = self.backend.prepare_sql(&sql).await?;
-                    self.backend.query_sql(&statement_handle).await?;
-                    Ok(vec![])
+            Command::Sql(sql_cmd) => {
+                match sql_cmd {
+                    SqlCommand::Execute(sql) => {
+                        // Create query with execution hints
+                        let query = Query {
+                            sql,
+                            schema_hint: None,
+                            hints: vec![OptimizationHint::PreferPredicatePushdown],
+                        };
+
+                        // Plan and execute the query
+                        let plan = self.planner.plan_query(&query).await.map_err(|e| {
+                            Status::internal(format!("Query planning failed: {}", e))
+                        })?;
+
+                        self.executor.execute_collect(plan).await.map_err(|e| {
+                            Status::internal(format!("Query execution failed: {}", e))
+                        })?;
+
+                        Ok(vec![])
+                    }
+                    SqlCommand::Query(sql) => {
+                        // Create query with optimization hints
+                        let query = Query {
+                            sql,
+                            schema_hint: None,
+                            hints: vec![
+                                OptimizationHint::PreferPredicatePushdown,
+                                OptimizationHint::OptimizeForVectorOps,
+                            ],
+                        };
+
+                        // Plan and execute the query
+                        let plan = self.planner.plan_query(&query).await.map_err(|e| {
+                            Status::internal(format!("Query planning failed: {}", e))
+                        })?;
+
+                        let results = self.executor.execute_collect(plan).await.map_err(|e| {
+                            Status::internal(format!("Query execution failed: {}", e))
+                        })?;
+
+                        // Convert results to MetricRecords using the existing conversion function
+                        let records: Vec<MetricRecord> = results
+                            .into_iter()
+                            .filter_map(|batch| encode_record_batch(&batch).ok())
+                            .flatten()
+                            .collect();
+
+                        serde_json::to_vec(&records).map_err(|e| {
+                            Status::internal(format!("Failed to serialize query results: {}", e))
+                        })
+                    }
                 }
-                SqlCommand::Query(sql) => {
-                    let statement_handle = self.backend.prepare_sql(&sql).await?;
-                    let records = self.backend.query_sql(&statement_handle).await?;
-                    serde_json::to_vec(&records).map_err(|e| {
-                        Status::internal(format!("Failed to serialize query results: {}", e))
-                    })
-                }
-            },
+            }
         }
     }
 
