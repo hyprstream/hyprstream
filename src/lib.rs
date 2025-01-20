@@ -7,6 +7,7 @@
 //! - Model management and versioning
 
 pub mod aggregation;
+pub mod error;
 pub mod cli;
 pub mod metrics;
 pub mod models;

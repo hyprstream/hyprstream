@@ -3,14 +3,15 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
-use futures::StreamExt;
 use hyprstream_core::{
-    aggregation::{AggregateFunction, GroupBy, TimeWindow},
     storage::{
-        duckdb::DuckDbBackend, table_manager::AggregationView, StorageBackend, StorageBackendType,
+        duckdb::DuckDbBackend, StorageBackend, StorageBackendType,
+        view::{ViewDefinition, AggregationSpec},
     },
+    aggregation::{AggregateFunction, GroupBy},
 };
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tempfile::tempdir;
 use tonic::Status;
 
@@ -52,24 +53,31 @@ async fn test_cache_operations() -> Result<(), Status> {
     let result = backend.query_table(table_name, None).await?;
     assert_eq!(result.num_columns(), 2);
 
-    // Create aggregation view
-    let view = AggregationView {
+    // Create view
+    let view_name = format!("view_{}", table_name);
+    let view_def = ViewDefinition {
         source_table: table_name.to_string(),
-        function: AggregateFunction::Avg,
-        group_by: GroupBy {
-            columns: vec![],
-            time_column: Some("timestamp".to_string()),
-        },
-        window: TimeWindow::Fixed(Duration::from_secs(3600)), // 1 hour
-        aggregate_columns: vec!["value".to_string()],
+        columns: vec!["value".to_string(), "timestamp".to_string()],
+        aggregations: vec![AggregationSpec {
+            function: AggregateFunction::Avg,
+            column: "value".to_string(),
+        }],
+        group_by: Some(GroupBy {
+            columns: vec!["timestamp".to_string()],
+            time_column: None,
+        }),
+        window: None,
+        dependencies: HashSet::new(),
+        schema: Arc::new(Schema::new(vec![
+            Field::new("avg_value", DataType::Float64, false),
+            Field::new("timestamp", DataType::Int64, false),
+        ])),
     };
+    backend.as_ref().create_view(&view_name, view_def).await?;
 
-    let view_name = format!("agg_view_{}", table_name);
-    backend.create_aggregation_view(&view_name, &view).await?;
-
-    // Query aggregation view
-    let result = backend.query_aggregation_view(&view_name).await?;
-    assert_eq!(result.num_columns(), 2);
+    // Query view
+    let result = backend.as_ref().get_view(&view_name).await?;
+    assert_eq!(result.definition.schema.fields().len(), 2);
 
     Ok(())
 }

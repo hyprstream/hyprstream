@@ -1,5 +1,5 @@
 use crate::aggregation::{AggregateFunction, GroupBy, TimeWindow};
-use arrow_schema::{DataType, Field, Fields, Schema};
+use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -47,6 +47,7 @@ impl From<SerializableSchema> for Schema {
                         "Int64" => DataType::Int64,
                         "Float64" => DataType::Float64,
                         "Utf8" => DataType::Utf8,
+                        "Timestamp(Nanosecond, None)" => DataType::Timestamp(TimeUnit::Nanosecond, None),
                         _ => DataType::Utf8, // Default to string for unknown types
                     },
                     f.nullable,

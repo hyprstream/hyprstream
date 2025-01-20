@@ -9,7 +9,7 @@ use adbc_core::{
 };
 use arrow_array::{
     Array, Float64Array, Int64Array, RecordBatch, StringArray,
-    builder::{Float64Builder, Int64Builder, StringBuilder},
+    builder::{Int64Builder, StringBuilder},
 };
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
@@ -137,43 +137,10 @@ impl StorageBackend for AdbcBackend {
             .new_statement()
             .map_err(|e| Status::internal(format!("Failed to create statement: {}", e)))?;
 
-        // Create batch from metrics
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("metric_id", DataType::Utf8, false),
-            Field::new("timestamp", DataType::Int64, false),
-            Field::new("value_running_window_sum", DataType::Float64, false),
-            Field::new("value_running_window_avg", DataType::Float64, false),
-            Field::new("value_running_window_count", DataType::Int64, false),
-        ]));
-
-        let mut metric_ids = StringBuilder::new();
-        let mut timestamps = Int64Builder::new();
-        let mut sums = Float64Builder::new();
-        let mut avgs = Float64Builder::new();
-        let mut counts = Int64Builder::new();
-
-        for metric in &metrics {
-            metric_ids.append_value(&metric.metric_id);
-            timestamps.append_value(metric.timestamp);
-            sums.append_value(metric.value_running_window_sum);
-            avgs.append_value(metric.value_running_window_avg);
-            counts.append_value(metric.value_running_window_count);
-        }
-
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(metric_ids.finish()),
-                Arc::new(timestamps.finish()),
-                Arc::new(sums.finish()),
-                Arc::new(avgs.finish()),
-                Arc::new(counts.finish()),
-            ],
-        )
-        .map_err(|e| Status::internal(format!("Failed to create batch: {}", e)))?;
+        let batch = crate::storage::StorageUtils::create_metric_batch(&metrics)?;
 
         stmt.set_sql_query(
-            "INSERT INTO metrics (metric_id, timestamp, value_running_window_sum, value_running_window_avg, value_running_window_count) VALUES (?, ?, ?, ?, ?)",
+            &crate::storage::StorageUtils::generate_metric_insert_sql(),
         )
         .map_err(|e| Status::internal(format!("Failed to set query: {}", e)))?;
 
@@ -193,7 +160,7 @@ impl StorageBackend for AdbcBackend {
             .map_err(|e| Status::internal(format!("Failed to create statement: {}", e)))?;
 
         stmt.set_sql_query(
-            "SELECT * FROM metrics WHERE timestamp >= ? ORDER BY timestamp ASC",
+            &crate::storage::StorageUtils::generate_metric_query_sql(from_timestamp),
         )
         .map_err(|e| Status::internal(format!("Failed to set query: {}", e)))?;
 
@@ -290,28 +257,7 @@ impl StorageBackend for AdbcBackend {
     }
 
     async fn create_table(&self, table_name: &str, schema: &Schema) -> Result<(), Status> {
-        let mut sql = format!("CREATE TABLE IF NOT EXISTS {} (", table_name);
-        let mut first = true;
-
-        for field in schema.fields() {
-            if !first {
-                sql.push_str(", ");
-            }
-            first = false;
-
-            sql.push_str(&format!(
-                "{} {}",
-                field.name(),
-                match field.data_type() {
-                    DataType::Int64 => "BIGINT",
-                    DataType::Float64 => "DOUBLE PRECISION",
-                    DataType::Utf8 => "VARCHAR",
-                    _ => return Err(Status::invalid_argument("Unsupported data type")),
-                }
-            ));
-        }
-
-        sql.push_str(")");
+        let sql = crate::storage::StorageUtils::generate_create_table_sql(table_name, schema)?;
         self.execute_statement(&sql).await
     }
 
@@ -321,16 +267,7 @@ impl StorageBackend for AdbcBackend {
             .new_statement()
             .map_err(|e| Status::internal(format!("Failed to create statement: {}", e)))?;
 
-        let mut placeholders = Vec::new();
-        for _ in 0..batch.num_columns() {
-            placeholders.push("?");
-        }
-
-        let sql = format!(
-            "INSERT INTO {} VALUES ({})",
-            table_name,
-            placeholders.join(", ")
-        );
+        let sql = crate::storage::StorageUtils::generate_insert_sql(table_name, batch.num_columns());
 
         stmt.set_sql_query(&sql)
             .map_err(|e| Status::internal(format!("Failed to set query: {}", e)))?;
@@ -349,8 +286,7 @@ impl StorageBackend for AdbcBackend {
         table_name: &str,
         projection: Option<Vec<String>>,
     ) -> Result<RecordBatch, Status> {
-        let columns = projection.map(|cols| cols.join(", ")).unwrap_or_else(|| "*".to_string());
-        let sql = format!("SELECT {} FROM {}", columns, table_name);
+        let sql = crate::storage::StorageUtils::generate_select_sql(table_name, projection);
 
         let mut conn = self.conn.lock().await;
         let mut stmt = conn
@@ -378,8 +314,7 @@ impl StorageBackend for AdbcBackend {
             .map_err(|e| Status::internal(format!("Failed to create statement: {}", e)))?;
 
         // Create SQL view
-        let view_sql = definition.to_sql();
-        let create_view_sql = format!("CREATE VIEW {} AS {}", name, view_sql);
+        let create_view_sql = crate::storage::StorageUtils::generate_view_sql(name, &definition);
         
         stmt.set_sql_query(&create_view_sql)
             .map_err(|e| Status::internal(format!("Failed to set query: {}", e)))?;
@@ -579,6 +514,90 @@ impl StorageBackend for AdbcBackend {
         self.execute_statement(&sql).await
     }
 
+    async fn list_tables(&self) -> Result<Vec<String>, Status> {
+        let mut conn = self.conn.lock().await;
+        let mut stmt = conn
+            .new_statement()
+            .map_err(|e| Status::internal(format!("Failed to create statement: {}", e)))?;
+
+        stmt.set_sql_query(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
+        )
+        .map_err(|e| Status::internal(format!("Failed to set query: {}", e)))?;
+
+        let mut reader = stmt
+            .execute()
+            .map_err(|e| Status::internal(format!("Failed to execute query: {}", e)))?;
+
+        let mut tables = Vec::new();
+        while let Some(batch) = reader.next() {
+            let batch = batch.map_err(|e| Status::internal(format!("Failed to read batch: {}", e)))?;
+            let table_names = batch
+                .column_by_name("table_name")
+                .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| Status::internal("Invalid table_name column"))?;
+
+            for i in 0..table_names.len() {
+                tables.push(table_names.value(i).to_string());
+            }
+        }
+
+        Ok(tables)
+    }
+
+    async fn get_table_schema(&self, table_name: &str) -> Result<Arc<Schema>, Status> {
+        let mut conn = self.conn.lock().await;
+        let mut stmt = conn
+            .new_statement()
+            .map_err(|e| Status::internal(format!("Failed to create statement: {}", e)))?;
+
+        stmt.set_sql_query(&format!(
+            "SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_name = '{}'",
+            table_name
+        ))
+        .map_err(|e| Status::internal(format!("Failed to set query: {}", e)))?;
+
+        let mut reader = stmt
+            .execute()
+            .map_err(|e| Status::internal(format!("Failed to execute query: {}", e)))?;
+
+        let mut fields = Vec::new();
+        while let Some(batch) = reader.next() {
+            let batch = batch.map_err(|e| Status::internal(format!("Failed to read batch: {}", e)))?;
+            
+            let names = batch
+                .column_by_name("column_name")
+                .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| Status::internal("Invalid column_name column"))?;
+
+            let types = batch
+                .column_by_name("data_type")
+                .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| Status::internal("Invalid data_type column"))?;
+
+            let nullables = batch
+                .column_by_name("is_nullable")
+                .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| Status::internal("Invalid is_nullable column"))?;
+
+            for i in 0..batch.num_rows() {
+                let name = names.value(i);
+                let type_str = types.value(i);
+                let nullable = nullables.value(i) == "YES";
+
+                let data_type = match type_str.to_uppercase().as_str() {
+                    "BIGINT" | "INTEGER" => DataType::Int64,
+                    "DOUBLE PRECISION" | "REAL" => DataType::Float64,
+                    _ => DataType::Utf8,
+                };
+
+                fields.push(Field::new(name, data_type, !nullable));
+            }
+        }
+
+        Ok(Arc::new(Schema::new(fields)))
+    }
+
     async fn aggregate_metrics(
         &self,
         function: AggregateFunction,
@@ -586,22 +605,12 @@ impl StorageBackend for AdbcBackend {
         from_timestamp: i64,
         to_timestamp: Option<i64>,
     ) -> Result<Vec<AggregateResult>, Status> {
-        // Build aggregation query
-        let mut sql = format!(
-            "SELECT {}, {}({}) as value",
-            group_by.columns.join(", "),
+        let sql = crate::storage::StorageUtils::generate_metric_aggregation_sql(
             function,
-            "value_running_window_avg" // Use avg for now
+            group_by,
+            from_timestamp,
+            to_timestamp
         );
-
-        sql.push_str(" FROM metrics");
-        sql.push_str(&format!(" WHERE timestamp >= {}", from_timestamp));
-
-        if let Some(to) = to_timestamp {
-            sql.push_str(&format!(" AND timestamp <= {}", to));
-        }
-
-        sql.push_str(&format!(" GROUP BY {}", group_by.columns.join(", ")));
 
         // Execute query
         let mut conn = self.conn.lock().await;

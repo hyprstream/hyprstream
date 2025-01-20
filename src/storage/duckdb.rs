@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::Mutex;
+use crate::error::DuckDbErrorWrapper;
 use tonic::Status;
 
 /// DuckDB-based storage backend
@@ -103,7 +104,7 @@ impl StorageBackend for DuckDbBackend {
 
         for metric in metrics {
             tx.execute(
-                "INSERT INTO metrics (metric_id, timestamp, value_running_window_sum, value_running_window_avg, value_running_window_count) VALUES (?, ?, ?, ?, ?)",
+                &crate::storage::StorageUtils::generate_metric_insert_sql(),
                 params![
                     metric.metric_id,
                     metric.timestamp,
@@ -125,7 +126,7 @@ impl StorageBackend for DuckDbBackend {
         let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare(
-                "SELECT * FROM metrics WHERE timestamp >= ? ORDER BY timestamp ASC",
+                &crate::storage::StorageUtils::generate_metric_query_sql(from_timestamp),
             )
             .map_err(|e| Status::internal(format!("Failed to prepare statement: {}", e)))?;
 
@@ -203,28 +204,7 @@ impl StorageBackend for DuckDbBackend {
     }
 
     async fn create_table(&self, table_name: &str, schema: &Schema) -> Result<(), Status> {
-        let mut sql = format!("CREATE TABLE IF NOT EXISTS {} (", table_name);
-        let mut first = true;
-
-        for field in schema.fields() {
-            if !first {
-                sql.push_str(", ");
-            }
-            first = false;
-
-            sql.push_str(&format!(
-                "{} {}",
-                field.name(),
-                match field.data_type() {
-                    DataType::Int64 => "BIGINT",
-                    DataType::Float64 => "DOUBLE",
-                    DataType::Utf8 => "VARCHAR",
-                    _ => return Err(Status::invalid_argument("Unsupported data type")),
-                }
-            ));
-        }
-
-        sql.push_str(")");
+        let sql = crate::storage::StorageUtils::generate_create_table_sql(table_name, schema)?;
         self.execute_statement(&sql).await
     }
 
@@ -233,16 +213,7 @@ impl StorageBackend for DuckDbBackend {
         let tx = conn.transaction()
             .map_err(|e| Status::internal(format!("Failed to start transaction: {}", e)))?;
 
-        let mut placeholders = Vec::new();
-        for _ in 0..batch.num_columns() {
-            placeholders.push("?");
-        }
-
-        let sql = format!(
-            "INSERT INTO {} VALUES ({})",
-            table_name,
-            placeholders.join(", ")
-        );
+        let sql = crate::storage::StorageUtils::generate_insert_sql(table_name, batch.num_columns());
 
         let mut stmt = tx
             .prepare(&sql)
@@ -285,8 +256,7 @@ impl StorageBackend for DuckDbBackend {
         table_name: &str,
         projection: Option<Vec<String>>,
     ) -> Result<RecordBatch, Status> {
-        let columns = projection.map(|cols| cols.join(", ")).unwrap_or_else(|| "*".to_string());
-        let sql = format!("SELECT {} FROM {}", columns, table_name);
+        let sql = crate::storage::StorageUtils::generate_select_sql(table_name, projection);
 
         let conn = self.conn.lock().await;
         let mut stmt = conn
@@ -355,8 +325,7 @@ impl StorageBackend for DuckDbBackend {
             .map_err(|e| Status::internal(format!("Failed to start transaction: {}", e)))?;
 
         // Create SQL view
-        let view_sql = definition.to_sql();
-        let create_view_sql = format!("CREATE VIEW {} AS {}", name, view_sql);
+        let create_view_sql = crate::storage::StorageUtils::generate_view_sql(name, &definition);
         tx.execute(&create_view_sql, params![])
             .map_err(|e| Status::internal(format!("Failed to create view: {}", e)))?;
 
@@ -461,6 +430,54 @@ impl StorageBackend for DuckDbBackend {
         self.execute_statement(&sql).await
     }
 
+    async fn list_tables(&self) -> Result<Vec<String>, Status> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .map_err(|e| Status::internal(format!("Failed to prepare statement: {}", e)))?;
+
+        let rows = stmt
+            .query_map(params![], |row| row.get::<_, String>(0))
+            .map_err(|e| Status::internal(format!("Failed to execute query: {}", e)))?;
+
+        let mut tables = Vec::new();
+        for row in rows {
+            tables.push(row.map_err(|e| Status::internal(format!("Failed to read row: {}", e)))?);
+        }
+
+        Ok(tables)
+    }
+
+    async fn get_table_schema(&self, table_name: &str) -> Result<Arc<Schema>, Status> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({})", table_name))
+            .map_err(|e| Into::<Status>::into(DuckDbErrorWrapper(e)))?;
+
+        let mut fields = Vec::new();
+        let rows = stmt.query_map(params![], |row| {
+            let name: String = row.get(1)?;
+            let type_str: String = row.get(2)?;
+            let nullable: bool = row.get(3)?;
+            
+            let data_type = match type_str.to_uppercase().as_str() {
+                "INTEGER" | "BIGINT" => DataType::Int64,
+                "DOUBLE" | "REAL" => DataType::Float64,
+                _ => DataType::Utf8,
+            };
+
+            Ok((name, data_type, !nullable))
+        })
+        .map_err(|e| Into::<Status>::into(DuckDbErrorWrapper(e)))?;
+
+        for row in rows {
+            let (name, data_type, required) = row.map_err(|e| Into::<Status>::into(DuckDbErrorWrapper(e)))?;
+            fields.push(Field::new(name, data_type, required));
+        }
+
+        Ok(Arc::new(Schema::new(fields)))
+    }
+
     async fn aggregate_metrics(
         &self,
         function: AggregateFunction,
@@ -468,22 +485,12 @@ impl StorageBackend for DuckDbBackend {
         from_timestamp: i64,
         to_timestamp: Option<i64>,
     ) -> Result<Vec<AggregateResult>, Status> {
-        // Build aggregation query
-        let mut sql = format!(
-            "SELECT {}, {}({}) as value",
-            group_by.columns.join(", "),
+        let sql = crate::storage::StorageUtils::generate_metric_aggregation_sql(
             function,
-            "value_running_window_avg" // Use avg for now
+            group_by,
+            from_timestamp,
+            to_timestamp
         );
-
-        sql.push_str(" FROM metrics");
-        sql.push_str(&format!(" WHERE timestamp >= {}", from_timestamp));
-
-        if let Some(to) = to_timestamp {
-            sql.push_str(&format!(" AND timestamp <= {}", to));
-        }
-
-        sql.push_str(&format!(" GROUP BY {}", group_by.columns.join(", ")));
 
         // Execute query
         let conn = self.conn.lock().await;

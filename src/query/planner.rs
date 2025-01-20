@@ -1,11 +1,13 @@
 use crate::query::rules::view::ViewOptimizationRule;
 use crate::storage::StorageBackend;
 use datafusion::arrow::datatypes::Schema;
-use datafusion::error::Result;
+use crate::error::StatusWrapper;
+use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::optimizer::optimizer::OptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::datasource::memory::MemTable;
 use std::sync::Arc;
 
 /// Represents a query that can be planned and executed
@@ -61,17 +63,28 @@ pub struct DataFusionPlanner {
 }
 
 impl DataFusionPlanner {
-    pub fn new(storage: Arc<dyn StorageBackend>) -> Self {
+    pub async fn new(storage: Arc<dyn StorageBackend>) -> Result<Self> {
         let ctx = SessionContext::new();
         let mut planner = Self {
             ctx,
             optimizations: Vec::new(),
-            storage,
+            storage: storage.clone(),
         };
 
         // Add default optimization rules
         planner.add_default_rules();
-        planner
+
+        // Register tables from storage
+        let tables = storage.list_tables().await.map_err(|e| Into::<DataFusionError>::into(StatusWrapper(e)))?;
+        for table_name in tables {
+            let schema = storage.get_table_schema(&table_name).await.map_err(|e| Into::<DataFusionError>::into(StatusWrapper(e)))?;
+            planner.ctx.register_table(
+                &table_name,
+                Arc::new(MemTable::try_new(schema, vec![])?),
+            )?;
+        }
+
+        Ok(planner)
     }
 
     /// Add a custom optimization rule
@@ -171,7 +184,7 @@ use std::collections::HashMap;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::DuckDbBackend;
+    use crate::storage::duckdb::DuckDbBackend;
 
     #[tokio::test]
     async fn test_query_planning_with_views() -> Result<()> {
@@ -180,7 +193,7 @@ mod tests {
         backend.init().await.unwrap();
 
         // Create planner with backend
-        let planner = DataFusionPlanner::new(backend);
+        let planner = DataFusionPlanner::new(backend).await?;
 
         // Create test query
         let query = Query {

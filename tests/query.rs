@@ -2,9 +2,12 @@ use arrow::array::{Float32Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::error::Result;
-use hyprstream_core::query::{
-    DataFusionExecutor, DataFusionPlanner, ExecutorConfig, OptimizationHint, PhysicalOperator,
-    Query, QueryEngine, QueryEngineBuilder, QueryExecutor, QueryPlanner, VectorizedOperator,
+use hyprstream_core::{
+    query::{
+        DataFusionExecutor, DataFusionPlanner, ExecutorConfig, OptimizationHint, PhysicalOperator,
+        Query, QueryExecutor, QueryPlanner, VectorizedOperator,
+    },
+    storage::{duckdb::DuckDbBackend, StorageBackend},
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,7 +30,9 @@ async fn test_simple_query_execution() -> Result<()> {
     )?;
 
     // Create query engine with default configuration
-    let engine = QueryEngine::new();
+    let backend = Arc::new(DuckDbBackend::new_in_memory().unwrap());
+    let planner = DataFusionPlanner::new(backend.clone()).await?;
+    let executor = DataFusionExecutor::new(ExecutorConfig::default());
 
     // Create a simple query
     let query = Query {
@@ -37,7 +42,7 @@ async fn test_simple_query_execution() -> Result<()> {
     };
 
     // Execute query
-    let results = engine.execute_query(&query).await?;
+    let results = executor.execute_collect(planner.plan_query(&query).await?).await?;
 
     // Verify results
     assert!(!results.is_empty());
@@ -79,12 +84,26 @@ async fn test_vector_operations() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_query_optimization() -> Result<()> {
+async fn test_query_optimization() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // Create test table
+    let backend = Arc::new(DuckDbBackend::new_in_memory().unwrap());
+    backend.init().await?;
+    
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Float32, false),
+    ]));
+    backend.create_table("test_table", &schema).await?;
+
+    // Insert test data
+    let id_array = Int64Array::from(vec![1, 2, 3]);
+    let value_array = Float32Array::from(vec![1.0, 2.0, 3.0]);
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(id_array), Arc::new(value_array)])?;
+    backend.insert_into_table("test_table", batch).await?;
+
     // Create query engine with optimization hints
-    let engine = QueryEngineBuilder::new()
-        .with_optimization_hint(OptimizationHint::PreferPredicatePushdown)
-        .with_optimization_hint(OptimizationHint::OptimizeForVectorOps)
-        .build();
+    let planner = DataFusionPlanner::new(backend.clone()).await?;
+    let executor = DataFusionExecutor::new(ExecutorConfig::default());
 
     // Create a query that should benefit from optimizations
     let query = Query {
@@ -93,8 +112,7 @@ async fn test_query_optimization() -> Result<()> {
         hints: vec![],
     };
 
-    // Plan should succeed
-    let planner = DataFusionPlanner::new();
+    // Plan and execute query
     let plan = planner.create_logical_plan(&query).await?;
     assert!(plan.schema().fields().len() > 0);
     Ok(())
@@ -135,7 +153,9 @@ async fn test_executor_configuration() -> Result<()> {
 
 #[tokio::test]
 async fn test_streaming_execution() -> Result<()> {
-    let engine = QueryEngine::new();
+    let backend = Arc::new(DuckDbBackend::new_in_memory().unwrap());
+    let planner = DataFusionPlanner::new(backend.clone()).await?;
+    let executor = DataFusionExecutor::new(ExecutorConfig::default());
 
     // Create a query that produces multiple batches
     let query = Query {
@@ -145,7 +165,7 @@ async fn test_streaming_execution() -> Result<()> {
     };
 
     // Execute as stream
-    let mut stream = engine.execute_query_stream(&query).await?;
+    let mut stream = executor.execute_stream(planner.plan_query(&query).await?).await?;
 
     // Should be able to consume stream
     use futures::StreamExt;

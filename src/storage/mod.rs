@@ -18,12 +18,186 @@ use crate::aggregation::{AggregateFunction, AggregateResult, GroupBy, TimeWindow
 use crate::cli::commands::config::Credentials;
 use crate::metrics::MetricRecord;
 use crate::storage::view::{ViewDefinition, ViewMetadata};
-use arrow_array::RecordBatch;
+use arrow_array::{
+    Array, Float64Array, Int64Array, RecordBatch, StringArray,
+    builder::{Float64Builder, Int64Builder, StringBuilder},
+};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::Status;
+
+/// Utility functions for storage operations
+pub struct StorageUtils;
+
+impl StorageUtils {
+    /// Generate SQL for creating a table with the given schema
+    pub fn generate_create_table_sql(table_name: &str, schema: &Schema) -> Result<String, Status> {
+        let mut sql = format!("CREATE TABLE IF NOT EXISTS {} (", table_name);
+        let mut first = true;
+
+        for field in schema.fields() {
+            if !first {
+                sql.push_str(", ");
+            }
+            first = false;
+
+            sql.push_str(&format!(
+                "{} {}",
+                field.name(),
+                match field.data_type() {
+                    DataType::Int64 => "BIGINT",
+                    DataType::Float64 => "DOUBLE PRECISION",
+                    DataType::Utf8 => "VARCHAR",
+                    _ => return Err(Status::invalid_argument(format!(
+                        "Unsupported data type: {:?}",
+                        field.data_type()
+                    ))),
+                }
+            ));
+        }
+
+        sql.push_str(")");
+        Ok(sql)
+    }
+
+    /// Generate SQL for inserting data into a table
+    pub fn generate_insert_sql(table_name: &str, column_count: usize) -> String {
+        let placeholders = vec!["?"; column_count].join(", ");
+        format!("INSERT INTO {} VALUES ({})", table_name, placeholders)
+    }
+
+    /// Generate SQL for inserting metric records
+    pub fn generate_metric_insert_sql() -> String {
+        "INSERT INTO metrics (metric_id, timestamp, value_running_window_sum, value_running_window_avg, value_running_window_count) VALUES (?, ?, ?, ?, ?)"
+            .to_string()
+    }
+
+    /// Generate SQL for querying metrics
+    pub fn generate_metric_query_sql(from_timestamp: i64) -> String {
+        format!(
+            "SELECT * FROM metrics WHERE timestamp >= {} ORDER BY timestamp ASC",
+            from_timestamp
+        )
+    }
+
+    /// Generate SQL for aggregating metrics
+    pub fn generate_metric_aggregation_sql(
+        function: AggregateFunction,
+        group_by: &GroupBy,
+        from_timestamp: i64,
+        to_timestamp: Option<i64>,
+    ) -> String {
+        let mut sql = format!(
+            "SELECT {}, {}({}) as value",
+            group_by.columns.join(", "),
+            function,
+            "value_running_window_avg" // Use avg for now
+        );
+
+        sql.push_str(" FROM metrics");
+        sql.push_str(&format!(" WHERE timestamp >= {}", from_timestamp));
+
+        if let Some(to) = to_timestamp {
+            sql.push_str(&format!(" AND timestamp <= {}", to));
+        }
+
+        sql.push_str(&format!(" GROUP BY {}", group_by.columns.join(", ")));
+        sql
+    }
+
+    /// Generate SQL for selecting data from a table
+    pub fn generate_select_sql(table_name: &str, projection: Option<Vec<String>>) -> String {
+        let columns = projection.map(|cols| cols.join(", ")).unwrap_or_else(|| "*".to_string());
+        format!("SELECT {} FROM {}", columns, table_name)
+    }
+
+    /// Get the standard schema for metric records
+    pub fn get_metric_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("metric_id", DataType::Utf8, false),
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("value_running_window_sum", DataType::Float64, false),
+            Field::new("value_running_window_avg", DataType::Float64, false),
+            Field::new("value_running_window_count", DataType::Int64, false),
+        ])
+    }
+
+    /// Create a RecordBatch from metrics
+    pub fn create_metric_batch(metrics: &[MetricRecord]) -> Result<RecordBatch, Status> {
+        let mut builders = (
+            StringBuilder::new(),
+            Int64Builder::new(),
+            Float64Builder::new(),
+            Float64Builder::new(),
+            Int64Builder::new(),
+        );
+
+        for metric in metrics {
+            builders.0.append_value(&metric.metric_id);
+            builders.1.append_value(metric.timestamp);
+            builders.2.append_value(metric.value_running_window_sum);
+            builders.3.append_value(metric.value_running_window_avg);
+            builders.4.append_value(metric.value_running_window_count);
+        }
+
+        RecordBatch::try_new(
+            Arc::new(Self::get_metric_schema()),
+            vec![
+                Arc::new(builders.0.finish()),
+                Arc::new(builders.1.finish()),
+                Arc::new(builders.2.finish()),
+                Arc::new(builders.3.finish()),
+                Arc::new(builders.4.finish()),
+            ],
+        )
+        .map_err(|e| Status::internal(format!("Failed to create batch: {}", e)))
+    }
+
+    /// Convert a RecordBatch to metrics
+    pub fn batch_to_metrics(batch: &RecordBatch) -> Result<Vec<MetricRecord>, Status> {
+        let mut metrics = Vec::new();
+
+        for row in 0..batch.num_rows() {
+            metrics.push(MetricRecord {
+                metric_id: batch
+                    .column_by_name("metric_id")
+                    .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+                    .ok_or_else(|| Status::internal("Invalid metric_id column"))?
+                    .value(row)
+                    .to_string(),
+                timestamp: batch
+                    .column_by_name("timestamp")
+                    .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
+                    .ok_or_else(|| Status::internal("Invalid timestamp column"))?
+                    .value(row),
+                value_running_window_sum: batch
+                    .column_by_name("value_running_window_sum")
+                    .and_then(|col| col.as_any().downcast_ref::<Float64Array>())
+                    .ok_or_else(|| Status::internal("Invalid value_running_window_sum column"))?
+                    .value(row),
+                value_running_window_avg: batch
+                    .column_by_name("value_running_window_avg")
+                    .and_then(|col| col.as_any().downcast_ref::<Float64Array>())
+                    .ok_or_else(|| Status::internal("Invalid value_running_window_avg column"))?
+                    .value(row),
+                value_running_window_count: batch
+                    .column_by_name("value_running_window_count")
+                    .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
+                    .ok_or_else(|| Status::internal("Invalid value_running_window_count column"))?
+                    .value(row),
+            });
+        }
+
+        Ok(metrics)
+    }
+
+    /// Generate SQL for creating a view
+    pub fn generate_view_sql(name: &str, definition: &ViewDefinition) -> String {
+        format!("CREATE VIEW {} AS {}", name, definition.to_sql())
+    }
+}
 
 /// Batch-level aggregation state for efficient updates
 #[derive(Debug, Clone)]
@@ -197,6 +371,12 @@ pub trait StorageBackend: Send + Sync + 'static {
 
     /// List all views
     async fn list_views(&self) -> Result<Vec<String>, Status>;
+
+    /// List all tables
+    async fn list_tables(&self) -> Result<Vec<String>, Status>;
+
+    /// Get schema for a table
+    async fn get_table_schema(&self, table_name: &str) -> Result<Arc<Schema>, Status>;
 
     /// Drop a view
     async fn drop_view(&self, name: &str) -> Result<(), Status>;
@@ -406,6 +586,20 @@ impl StorageBackend for StorageBackendType {
         match self {
             StorageBackendType::Adbc(backend) => backend.drop_table(table_name).await,
             StorageBackendType::DuckDb(backend) => backend.drop_table(table_name).await,
+        }
+    }
+
+    async fn list_tables(&self) -> Result<Vec<String>, Status> {
+        match self {
+            StorageBackendType::Adbc(backend) => backend.list_tables().await,
+            StorageBackendType::DuckDb(backend) => backend.list_tables().await,
+        }
+    }
+
+    async fn get_table_schema(&self, table_name: &str) -> Result<Arc<Schema>, Status> {
+        match self {
+            StorageBackendType::Adbc(backend) => backend.get_table_schema(table_name).await,
+            StorageBackendType::DuckDb(backend) => backend.get_table_schema(table_name).await,
         }
     }
 

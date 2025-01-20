@@ -1,7 +1,7 @@
 use hyprstream_core::{
-    cli::{commands::sql::SqlCommand, execute_sql},
-    service::FlightSqlService,
-    storage::{duckdb::DuckDbBackend, StorageBackend, StorageBackendType},
+    cli::{commands::sql::SqlCommand, handlers::execute_sql},
+    service::FlightSqlServer,
+    storage::{duckdb::DuckDbBackend, StorageBackendType},
 };
 use std::env;
 use std::{
@@ -124,7 +124,7 @@ async fn start_test_server() -> (tokio::task::JoinHandle<()>, std::net::SocketAd
 
     // Create a test database
     let backend = StorageBackendType::DuckDb(DuckDbBackend::new_in_memory().unwrap());
-    let service = FlightSqlService::new(backend);
+    let service = FlightSqlServer::new(backend);
 
     // Run the server in the background
     let server_handle = tokio::spawn(async move {
@@ -154,7 +154,7 @@ async fn start_tls_test_server(
 
     // Create a test database
     let backend = StorageBackendType::DuckDb(DuckDbBackend::new_in_memory().unwrap());
-    let service = FlightSqlService::new(backend);
+    let service = FlightSqlServer::new(backend);
 
     // Run the server in the background with TLS
     let server_cert = cert_path.to_path_buf();

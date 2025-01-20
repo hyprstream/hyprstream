@@ -1,12 +1,10 @@
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use tonic::Request;
 
-use futures::StreamExt;
-use tonic::Streaming;
 
 use arrow_schema::{DataType, Field, Schema};
 use hyprstream_core::aggregation::{GroupBy, TimeWindow};
-use hyprstream_core::service::FlightSqlService;
+use hyprstream_core::service::FlightSqlServer;
 use hyprstream_core::storage::duckdb::DuckDbBackend;
 use hyprstream_core::storage::{BatchAggregation, StorageBackendType};
 use std::collections::HashMap;
@@ -52,13 +50,13 @@ async fn create_test_service() -> String {
     let addr = listener.local_addr().unwrap();
     let endpoint = format!("http://127.0.0.1:{}", addr.port());
 
-    let service = FlightSqlService::new(StorageBackendType::DuckDb(backend));
+    let service = FlightSqlServer::new(StorageBackendType::DuckDb(backend));
     let incoming_stream = tokio_stream::wrappers::TcpListenerStream::new(listener);
     
     // Spawn the service
     tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(service.into_server())
+            .add_service(service.into_service())
             .serve_with_incoming(incoming_stream)
             .await
             .unwrap();

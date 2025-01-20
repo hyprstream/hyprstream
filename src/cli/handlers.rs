@@ -8,6 +8,51 @@ use prost::Message;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tonic::transport::{Certificate, ClientTlsConfig, Identity, Server};
+use std::net::SocketAddr;
+use arrow_flight::flight_service_client::FlightServiceClient as FlightSqlClient;
+use bytes::Bytes;
+
+pub async fn execute_sql(
+    addr: Option<SocketAddr>,
+    sql: String,
+    tls_cert: Option<&Path>,
+    tls_key: Option<&Path>,
+    tls_ca: Option<&Path>,
+    tls_skip_verify: bool,
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let addr = addr.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 50051)));
+    let endpoint = tonic::transport::Channel::from_shared(format!("http://{}:{}", addr.ip(), addr.port()))?;
+
+    let channel = if let (Some(cert_path), Some(key_path), Some(ca_path)) = (tls_cert, tls_key, tls_ca) {
+        let cert = std::fs::read(cert_path)?;
+        let key = std::fs::read(key_path)?;
+        let ca = std::fs::read(ca_path)?;
+
+        let tls = ClientTlsConfig::new()
+            .identity(Identity::from_pem(cert, key))
+            .ca_certificate(Certificate::from_pem(ca))
+            .domain_name(addr.ip().to_string());
+
+        endpoint.tls_config(tls)?.connect().await?
+    } else {
+        endpoint.connect().await?
+    };
+
+    let mut client = FlightSqlClient::new(channel);
+    let action = arrow_flight::Action {
+        r#type: "CommandStatementUpdate".to_string(),
+        body: Bytes::from(sql.into_bytes()),
+    };
+    let result = client.do_action(tonic::Request::new(action)).await;
+
+    if verbose {
+        println!("SQL execution result: {:?}", result);
+    }
+
+    result?;
+    Ok(())
+}
 
 pub async fn handle_server(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let addr = format!("{}:{}", 

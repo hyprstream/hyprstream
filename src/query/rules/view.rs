@@ -3,8 +3,54 @@ use crate::storage::StorageBackend;
 use datafusion::error::Result;
 use datafusion::logical_expr::{LogicalPlan, TableScan};
 use datafusion::optimizer::optimizer::{OptimizerConfig, OptimizerRule};
-use datafusion_common::tree_node::Transformed;
+use datafusion_common::{tree_node::Transformed, DFSchema};
 use datafusion::sql::TableReference;
+use datafusion::datasource::{TableProvider, TableType};
+use datafusion::logical_expr::TableSource;
+use datafusion::physical_plan::{empty::EmptyExec, ExecutionPlan};
+use datafusion::execution::context::SessionState;
+use datafusion::logical_expr::Expr;
+use datafusion::catalog::Session;
+use async_trait::async_trait;
+
+struct EmptyTableProvider {
+    schema: arrow_schema::SchemaRef,
+}
+
+impl TableSource for EmptyTableProvider {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema(&self) -> arrow_schema::SchemaRef {
+        self.schema.clone()
+    }
+}
+
+#[async_trait]
+impl TableProvider for EmptyTableProvider {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema(&self) -> arrow_schema::SchemaRef {
+        self.schema.clone()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(EmptyExec::new(TableProvider::schema(self))))
+    }
+}
 use std::sync::Arc;
 
 /// Optimization rule that rewrites queries to use views when beneficial
@@ -133,8 +179,8 @@ mod tests {
     use super::*;
     use crate::aggregation::{AggregateFunction, GroupBy};
     use crate::storage::view::{AggregationSpec, ViewDefinition};
-    use crate::storage::DuckDbBackend;
-    use arrow_schema::{DataType, Field, Schema};
+    use crate::storage::duckdb::DuckDbBackend;
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use datafusion::datasource::empty::EmptyTable;
     use std::sync::Arc;
 
@@ -182,11 +228,13 @@ mod tests {
         let rule = ViewOptimizationRule::new(backend);
 
         // Create test plan
-        let df_schema = datafusion::arrow::datatypes::Schema::try_from(source_schema.as_ref().clone())
-            .unwrap();
+        let arrow_schema = source_schema.as_ref().clone();
+        let df_schema = DFSchema::try_from(arrow_schema.clone()).unwrap();
         let plan = LogicalPlan::TableScan(TableScan {
             table_name: "test_source".into(),
-            source: Arc::new(EmptyTable::new(Arc::new(df_schema))),
+            source: Arc::new(EmptyTableProvider {
+                schema: Arc::new(df_schema.clone().into())
+            }),
             projection: None,
             projected_schema: Arc::new(df_schema),
             filters: vec![],
