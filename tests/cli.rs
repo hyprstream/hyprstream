@@ -5,8 +5,7 @@ use hyprstream_core::{
 };
 use std::env;
 use std::{
-    fs::File,
-    io::Write,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
 };
 use tempfile::TempDir;
@@ -189,7 +188,7 @@ async fn test_sql_command_basic() {
 
     // Test basic SQL query
     let result = execute_sql(
-        Some(format!("127.0.0.1:{}", addr.port())),
+        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), addr.port())),
         "CREATE TABLE test (id INTEGER);".to_string(),
         None,
         None,
@@ -215,7 +214,7 @@ async fn test_sql_command_tls() {
 
     // Test TLS connection
     let result = execute_sql(
-        Some(format!("127.0.0.1:{}", addr.port())),
+        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), addr.port())),
         "CREATE TABLE test (id INTEGER);".to_string(),
         Some(&cert_path),
         Some(&key_path),
@@ -230,7 +229,7 @@ async fn test_sql_command_tls() {
     let wrong_cert_dir = TempDir::new().unwrap();
     let (wrong_cert, wrong_key, _) = create_test_certs(&wrong_cert_dir).await;
     let result = execute_sql(
-        Some(format!("127.0.0.1:{}", addr.port())),
+        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), addr.port())),
         "SELECT * FROM test;".to_string(),
         Some(&wrong_cert),
         Some(&wrong_key),
@@ -259,7 +258,7 @@ async fn test_sql_command_timeout() {
 
     // Test connection timeout (wrong port)
     let result = execute_sql(
-        Some(format!("127.0.0.1:{}", addr.port() + 1)), // Wrong port
+        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), addr.port() + 1)), // Wrong port
         "SELECT 1;".to_string(),
         None,
         None,
@@ -278,7 +277,7 @@ async fn test_sql_command_timeout() {
 
     // Test query timeout
     let result = execute_sql(
-        Some(format!("127.0.0.1:{}", addr.port())),
+        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), addr.port())),
         "SELECT CASE WHEN TRUE THEN pg_sleep(10) END;".to_string(), // Query that will take too long
         None,
         None,

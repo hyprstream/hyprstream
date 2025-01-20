@@ -852,7 +852,7 @@ impl StorageBackend for AdbcBackend {
             .map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))
     }
 
-    async fn create_aggregation_view(&self, view: &AggregationView) -> Result<(), Status> {
+    async fn create_aggregation_view(&self, view_name: &str, view: &AggregationView) -> Result<(), Status> {
         let columns: Vec<&str> = view.aggregate_columns.iter().map(|s| s.as_str()).collect();
 
         let sql = build_aggregate_query(
@@ -869,7 +869,7 @@ impl StorageBackend for AdbcBackend {
             .new_statement()
             .map_err(|e| Status::internal(format!("Failed to create statement: {}", e)))?;
 
-        stmt.set_sql_query(&format!("CREATE VIEW {} AS {}", view.source_table, sql))
+        stmt.set_sql_query(&format!("CREATE VIEW {} AS {}", view_name, sql))
             .map_err(|e| Status::internal(format!("Failed to set SQL query: {}", e)))?;
 
         stmt.execute_update()

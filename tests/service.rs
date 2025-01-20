@@ -41,34 +41,38 @@ impl FlightSqlClientExt for FlightSqlServiceClient<Channel> {
     }
 }
 
-async fn create_test_service() -> (FlightSqlService, String) {
+async fn create_test_service() -> String {
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir.path().join("test.db");
     let backend =
         DuckDbBackend::new(db_path.to_str().unwrap().to_string(), HashMap::new(), None).unwrap();
 
-    // Find an available port
+    // Create and bind the listener
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    drop(listener);
-
-    let service = FlightSqlService::new(StorageBackendType::DuckDb(backend));
     let endpoint = format!("http://127.0.0.1:{}", addr.port());
 
-    (service, endpoint)
-}
-
-#[tokio::test]
-async fn test_service_start() {
-    let (service, endpoint) = create_test_service().await;
-
-    // Start service in background
+    let service = FlightSqlService::new(StorageBackendType::DuckDb(backend));
+    let incoming_stream = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    
+    // Spawn the service
     tokio::spawn(async move {
-        service.serve().await.unwrap();
+        tonic::transport::Server::builder()
+            .add_service(service.into_server())
+            .serve_with_incoming(incoming_stream)
+            .await
+            .unwrap();
     });
 
     // Wait for service to start
     tokio::time::sleep(Duration::from_secs(1)).await;
+
+    endpoint
+}
+
+#[tokio::test]
+async fn test_service_start() {
+    let endpoint = create_test_service().await;
 
     // Try to connect
     let channel = Channel::from_shared(endpoint).unwrap().connect().await;
@@ -77,15 +81,7 @@ async fn test_service_start() {
 
 #[tokio::test]
 async fn test_create_table_and_query() {
-    let (service, endpoint) = create_test_service().await;
-
-    // Start service in background
-    tokio::spawn(async move {
-        service.serve().await.unwrap();
-    });
-
-    // Wait for service to start
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    let endpoint = create_test_service().await;
 
     // Connect client
     let channel = Channel::from_shared(endpoint)
@@ -124,15 +120,7 @@ async fn test_create_table_and_query() {
 
 #[tokio::test]
 async fn test_create_aggregation_view() {
-    let (service, endpoint) = create_test_service().await;
-
-    // Start service in background
-    tokio::spawn(async move {
-        service.serve().await.unwrap();
-    });
-
-    // Wait for service to start
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    let endpoint = create_test_service().await;
 
     // Connect client
     let channel = Channel::from_shared(endpoint)
@@ -187,15 +175,7 @@ async fn test_create_aggregation_view() {
 
 #[tokio::test]
 async fn test_query_planner_integration() {
-    let (service, endpoint) = create_test_service().await;
-
-    // Start service in background
-    tokio::spawn(async move {
-        service.serve().await.unwrap();
-    });
-
-    // Wait for service to start
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    let endpoint = create_test_service().await;
 
     // Connect client
     let channel = Channel::from_shared(endpoint)

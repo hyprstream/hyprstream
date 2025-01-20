@@ -452,7 +452,8 @@ impl FlightSqlService {
                 Ok(vec![])
             }
             TableCommand::CreateAggregationView(view) => {
-                self.backend.create_aggregation_view(&view).await?;
+                let view_name = format!("agg_view_{}", view.source_table);
+                self.backend.create_aggregation_view(&view_name, &view).await?;
                 Ok(vec![])
             }
             TableCommand::DropTable(name) => {

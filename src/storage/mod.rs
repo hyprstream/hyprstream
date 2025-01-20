@@ -203,7 +203,7 @@ pub trait StorageBackend: Send + Sync + 'static {
     ) -> Result<RecordBatch, Status>;
 
     /// Create an aggregation view
-    async fn create_aggregation_view(&self, view: &AggregationView) -> Result<(), Status>;
+    async fn create_aggregation_view(&self, view_name: &str, view: &AggregationView) -> Result<(), Status>;
 
     /// Query data from an aggregation view
     async fn query_aggregation_view(&self, view_name: &str) -> Result<RecordBatch, Status>;
@@ -396,10 +396,10 @@ impl StorageBackend for StorageBackendType {
         }
     }
 
-    async fn create_aggregation_view(&self, view: &AggregationView) -> Result<(), Status> {
+    async fn create_aggregation_view(&self, view_name: &str, view: &AggregationView) -> Result<(), Status> {
         match self {
-            StorageBackendType::Adbc(backend) => backend.create_aggregation_view(view).await,
-            StorageBackendType::DuckDb(backend) => backend.create_aggregation_view(view).await,
+            StorageBackendType::Adbc(backend) => backend.create_aggregation_view(view_name, view).await,
+            StorageBackendType::DuckDb(backend) => backend.create_aggregation_view(view_name, view).await,
         }
     }
 

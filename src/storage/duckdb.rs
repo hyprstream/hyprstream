@@ -650,27 +650,33 @@ impl StorageBackend for DuckDbBackend {
             .map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))?)
     }
 
-    async fn create_aggregation_view(&self, view: &AggregationView) -> Result<(), Status> {
+    async fn create_aggregation_view(&self, view_name: &str, view: &AggregationView) -> Result<(), Status> {
         let columns: Vec<&str> = view.aggregate_columns.iter().map(|s| s.as_str()).collect();
+let sql = build_aggregate_query(
+    &view.source_table,
+    view.function,
+    &view.group_by,
+    &columns,
+    None,
+    None,
+);
 
-        let sql = build_aggregate_query(
-            &view.source_table,
-            view.function,
-            &view.group_by,
-            &columns,
-            None,
-            None,
-        );
+let conn = self.conn.lock().await;
 
-        let view_name = format!("agg_view_{}", view.source_table);
-        let conn = self.conn.lock().await;
-        conn.execute(&format!("CREATE VIEW {} AS {}", view_name, sql), params![])
-            .map_err(|e| Status::internal(format!("Failed to create view: {}", e)))?;
+// First drop the view if it exists
+conn.execute(&format!("DROP VIEW IF EXISTS {}", view_name), params![])
+    .map_err(|e| Status::internal(format!("Failed to drop view: {}", e)))?;
+// Then create the new view
+let create_view_sql = format!("CREATE VIEW {} AS {}", view_name, sql);
+println!("Creating view with SQL: {}", create_view_sql);
+conn.execute(&create_view_sql, params![])
+    .map_err(|e| Status::internal(format!("Failed to create view: {}", e)))?;
 
-        // Register view in manager
-        self.table_manager
-            .create_aggregation_view(
-                view_name,
+// Register view in manager
+self.table_manager
+    .create_aggregation_view(
+        view_name.to_string(),
+        view_name.to_string(),
                 view.source_table.clone(),
                 view.function.clone(),
                 view.group_by.clone(),
@@ -683,7 +689,35 @@ impl StorageBackend for DuckDbBackend {
     }
 
     async fn query_aggregation_view(&self, view_name: &str) -> Result<RecordBatch, Status> {
-        self.query_table(view_name, None).await
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(&format!("SELECT * FROM {}", view_name))
+            .map_err(|e| Status::internal(format!("Failed to prepare statement: {}", e)))?;
+
+        let mut rows = stmt
+            .query(params![])
+            .map_err(|e| Status::internal(format!("Failed to execute query: {}", e)))?;
+
+        let mut values = Vec::new();
+        let mut timestamps = Vec::new();
+
+        while let Some(row) = rows.next().map_err(|e| Status::internal(e.to_string()))? {
+            values.push(row.get::<_, f64>(1)?);
+            timestamps.push(row.get::<_, i64>(0)?);
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(timestamps)),
+            Arc::new(Float64Array::from(values)),
+        ];
+
+        RecordBatch::try_new(schema, arrays)
+            .map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))
     }
 
     async fn drop_table(&self, table_name: &str) -> Result<(), Status> {

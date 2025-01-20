@@ -2,10 +2,11 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::Result;
 use datafusion::execution::context::{SessionConfig, SessionContext, TaskContext};
 use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use futures::Stream;
 use std::pin::Pin;
 use std::sync::Arc;
+use tracing::{debug, info, instrument, warn};
 
 /// Trait for executing physical query plans
 #[async_trait::async_trait]
@@ -17,12 +18,29 @@ pub trait QueryExecutor: Send + Sync {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>>;
 
     /// Execute a physical plan and collect all results into a vector
+    #[instrument(skip(self, plan))]
     async fn execute_collect(&self, plan: Arc<dyn ExecutionPlan>) -> Result<Vec<RecordBatch>> {
+        debug!("Starting batch collection");
         let mut stream = self.execute_stream(plan).await?;
         let mut results = Vec::new();
+        let mut total_rows = 0;
+        
         while let Some(batch) = stream.next().await {
-            results.push(batch?);
+            let batch = batch?;
+            total_rows += batch.num_rows();
+            debug!(
+                batch_rows = batch.num_rows(),
+                total_rows = total_rows,
+                "Collected batch"
+            );
+            results.push(batch);
         }
+
+        info!(
+            total_batches = results.len(),
+            total_rows = total_rows,
+            "Query execution completed"
+        );
         Ok(results)
     }
 }
@@ -57,32 +75,68 @@ impl Default for ExecutorConfig {
 }
 
 impl DataFusionExecutor {
+    #[instrument(skip(config))]
     pub fn new(config: ExecutorConfig) -> Self {
+        debug!(
+            max_tasks = config.max_concurrent_tasks,
+            batch_size = config.batch_size,
+            memory_limit = config.memory_limit,
+            "Creating new DataFusionExecutor"
+        );
         let ctx = SessionContext::new();
+        info!("Created new DataFusionExecutor");
         Self { config, ctx }
     }
 
+    #[instrument(skip(self, config))]
     pub fn with_config(mut self, config: ExecutorConfig) -> Self {
+        debug!(
+            old_max_tasks = self.config.max_concurrent_tasks,
+            new_max_tasks = config.max_concurrent_tasks,
+            old_batch_size = self.config.batch_size,
+            new_batch_size = config.batch_size,
+            old_memory_limit = self.config.memory_limit,
+            new_memory_limit = config.memory_limit,
+            "Updating executor configuration"
+        );
         self.config = config;
+        info!("Updated executor configuration");
         self
     }
 
+    #[instrument(skip(self))]
     fn create_runtime_env(&self) -> Result<Arc<RuntimeEnv>> {
+        debug!("Creating runtime environment");
         let config = RuntimeConfig::new();
-        RuntimeEnv::new(config).map(Arc::new)
+        let env = RuntimeEnv::new(config).map(Arc::new)?;
+        debug!("Created runtime environment");
+        Ok(env)
     }
 }
 
 #[async_trait::async_trait]
 impl QueryExecutor for DataFusionExecutor {
+    #[instrument(skip(self, plan), fields(plan_type = ?plan.as_ref()))]
     async fn execute_stream(
         &self,
         plan: Arc<dyn ExecutionPlan>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
         use std::collections::HashMap;
 
+        debug!(
+            schema = ?plan.schema(),
+            partitions = ?plan.as_ref().output_partitioning(),
+            "Starting query execution"
+        );
+
         // Create runtime environment
         let runtime = self.create_runtime_env()?;
+        debug!(
+            max_tasks = self.config.max_concurrent_tasks,
+            batch_size = self.config.batch_size,
+            memory_limit = self.config.memory_limit,
+            "Created runtime environment"
+        );
 
         // Create session config
         let session_config = SessionConfig::new().with_batch_size(self.config.batch_size);
@@ -97,11 +151,23 @@ impl QueryExecutor for DataFusionExecutor {
             HashMap::new(), // window functions
             runtime,
         ));
+        debug!("Created task context");
 
         // Execute the plan
         let stream = plan.execute(0, task_ctx)?;
+        info!("Query execution started successfully");
 
-        Ok(Box::pin(stream))
+        // Wrap stream with logging
+        let logged_stream = Box::pin(stream.inspect(|result| match result {
+            Ok(batch) => debug!(
+                rows = batch.num_rows(),
+                columns = batch.num_columns(),
+                "Processed record batch"
+            ),
+            Err(e) => warn!(error = ?e, "Error processing record batch"),
+        }));
+
+        Ok(logged_stream)
     }
 }
 

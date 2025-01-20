@@ -8,10 +8,27 @@ use hyprstream_core::{
     cli::{execute_sql, run_server, Cli, Commands},
     config::Settings,
 };
+use tracing::{info, Level};
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+
+    // Initialize logging with debug level for hyprstream_core
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::builder()
+                .with_default_directive(Level::INFO.into())
+                .parse_lossy("hyprstream_core=debug"),
+        )
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_file(true)
+        .with_line_number(true)
+        .init();
+
+    info!("Hyprstream starting up");
 
     // Handle commands
     match cli.command {

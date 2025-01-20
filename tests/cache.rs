@@ -65,7 +65,7 @@ async fn test_cache_operations() -> Result<(), Status> {
     };
 
     let view_name = format!("agg_view_{}", table_name);
-    backend.create_aggregation_view(&view).await?;
+    backend.create_aggregation_view(&view_name, &view).await?;
 
     // Query aggregation view
     let result = backend.query_aggregation_view(&view_name).await?;

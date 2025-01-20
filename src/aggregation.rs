@@ -161,19 +161,21 @@ pub fn build_aggregate_query(
         query.push_str(", ");
     }
 
+    // Build the SELECT clause parts
+    let mut select_parts = Vec::new();
+
     // Add time column if present
     if let Some(time_col) = &group_by.time_column {
-        query.push_str(&format!("{}, ", time_col));
+        select_parts.push(time_col.clone());
     }
 
-    // Add aggregation function
-    match function {
-        AggregateFunction::Sum => query.push_str("SUM(value)"),
-        AggregateFunction::Avg => query.push_str("AVG(value)"),
-        AggregateFunction::Count => query.push_str("COUNT(*)"),
-        AggregateFunction::Min => query.push_str("MIN(value)"),
-        AggregateFunction::Max => query.push_str("MAX(value)"),
+    // Add aggregation function for each column
+    for col in _columns {
+        select_parts.push(function.to_sql(col));
     }
+
+    // Join all parts with commas
+    query.push_str(&select_parts.join(", "));
 
     // Add FROM clause
     query.push_str(&format!(" FROM {}", table_name));
