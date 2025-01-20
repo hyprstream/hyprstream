@@ -110,8 +110,10 @@ impl QueryPlanner for DataFusionPlanner {
         // Apply custom optimization rules
         let mut optimized_plan = plan;
         for rule in &self.optimizations {
-            if let Some(new_plan) = rule.try_optimize(&optimized_plan, &state)? {
-                optimized_plan = new_plan;
+            if rule.supports_rewrite() {
+                match rule.rewrite(optimized_plan, &state)? {
+                    transformed => optimized_plan = transformed.data
+                }
             }
         }
 

@@ -174,6 +174,16 @@ async fn test_create_aggregation_view() {
 }
 
 #[tokio::test]
+async fn test_simple_sql_execution() {
+    let endpoint = create_test_service().await;
+    let channel = Channel::from_shared(endpoint).unwrap().connect().await.unwrap();
+    let mut client = FlightSqlServiceClient::new(channel);
+    
+    let result = client.query_sql("SELECT 1;".into()).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
 async fn test_query_planner_integration() {
     let endpoint = create_test_service().await;
 

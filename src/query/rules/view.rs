@@ -3,6 +3,7 @@ use crate::storage::StorageBackend;
 use datafusion::error::Result;
 use datafusion::logical_expr::{LogicalPlan, TableScan};
 use datafusion::optimizer::optimizer::{OptimizerConfig, OptimizerRule};
+use datafusion_common::tree_node::Transformed;
 use datafusion::sql::TableReference;
 use std::sync::Arc;
 
@@ -109,21 +110,20 @@ impl OptimizerRule for ViewOptimizationRule {
         "view_optimization"
     }
 
-    fn try_optimize(
-        &self,
-        plan: &LogicalPlan,
-        _config: &dyn OptimizerConfig,
-    ) -> Result<Option<LogicalPlan>> {
+    fn supports_rewrite(&self) -> bool {
+        true
+    }
+
+    fn rewrite(&self, plan: LogicalPlan, _config: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
         // Use tokio runtime to run async code
         let rt = tokio::runtime::Runtime::new().unwrap();
         
-        // Check if we can use a view for this query
-        if let Some(view) = rt.block_on(self.find_matching_view(plan))? {
-            // Rewrite the plan to use the view
-            Ok(Some(self.rewrite_with_view(plan, &view)?))
+        // Get matching view and rewrite plan
+        if let Some(view) = rt.block_on(self.find_matching_view(&plan))? {
+            let new_plan = self.rewrite_with_view(&plan, &view)?;
+            Ok(Transformed::yes(new_plan))
         } else {
-            // No matching view found
-            Ok(None)
+            Ok(Transformed::no(plan))
         }
     }
 }

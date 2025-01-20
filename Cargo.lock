@@ -2216,6 +2216,7 @@ dependencies = [
  "criterion",
  "daemonize",
  "datafusion",
+ "datafusion-common",
  "duckdb",
  "futures",
  "hex",
