@@ -11,13 +11,15 @@ use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
     RootCertStore,
 };
-use std::{collections::HashMap, fs::File, io::BufReader, path::Path, time::Duration};
+use std::{collections::HashMap, fs::File, io::BufReader, path::{Path, PathBuf}, time::Duration};
+use tokio::sync::broadcast;
 use tonic::transport::{
     Certificate as TonicCertificate, ClientTlsConfig, Identity, Server, ServerTlsConfig,
 };
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_log::LogTracer;
 use tracing_subscriber::{fmt, EnvFilter};
+use warp::Filter;
 
 fn load_certificate(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     let file = File::open(path).context("Failed to open certificate file")?;
@@ -51,7 +53,6 @@ fn configure_server_tls(
                 std::fs::read(key_path)?,
             ));
 
-            // Configure client authentication if CA cert is provided
             if let Some(ca_path) = client_ca_path {
                 let mut root_store = RootCertStore::empty();
                 for cert in load_certificate(ca_path)? {
@@ -108,7 +109,6 @@ pub async fn execute_sql(
     tls_skip_verify: bool,
     verbose: bool,
 ) -> Result<()> {
-    // Set up logging
     let level = if verbose { "debug" } else { "info" };
     let subscriber = fmt::Subscriber::builder()
         .with_env_filter(EnvFilter::new(level))
@@ -121,19 +121,15 @@ pub async fn execute_sql(
         .compact()
         .finish();
 
-    // Try to set the subscriber, but don't panic if it fails (e.g., if already set)
     if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
         eprintln!("Warning: Could not set global tracing subscriber: {}", e);
     }
 
-    // Install the default crypto provider (ignore result as it may already be installed)
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // Use default host:port if not provided
     let addr = host.unwrap_or_else(|| "127.0.0.1:50051".to_string());
     tracing::info!("Connecting to {}...", addr);
 
-    // Ensure URL has correct scheme based on TLS configuration
     let use_tls = tls_cert.is_some() || tls_key.is_some() || tls_ca.is_some();
     let uri_str = if !addr.starts_with("http://") && !addr.starts_with("https://") {
         format!(
@@ -152,9 +148,6 @@ pub async fn execute_sql(
         tracing::debug!("Query timeout: 30s");
     }
 
-    tracing::info!("Connecting to {}...", addr);
-
-    // Configure TLS if enabled
     let mut endpoint =
         tonic::transport::Channel::from_shared(uri_str.clone())?.timeout(Duration::from_secs(5));
 
@@ -162,7 +155,6 @@ pub async fn execute_sql(
         endpoint = endpoint.tls_config(tls_config)?;
     }
 
-    // Connect to the server with timeout
     let channel = match tokio::time::timeout(Duration::from_secs(5), endpoint.connect()).await {
         Ok(Ok(channel)) => channel,
         Ok(Err(e)) => {
@@ -180,7 +172,6 @@ pub async fn execute_sql(
 
     let mut client = FlightServiceClient::new(channel);
 
-    // Create the SQL action
     let action = Action {
         r#type: "sql.query".to_string(),
         body: query.clone().into_bytes().into(),
@@ -191,7 +182,6 @@ pub async fn execute_sql(
     }
     tracing::info!("Executing query...");
 
-    // Execute the query with timeout
     let response = match tokio::time::timeout(
         Duration::from_secs(30),
         client.do_action(tonic::Request::new(action)),
@@ -212,16 +202,13 @@ pub async fn execute_sql(
         }
     };
 
-    // Stream and print results
     let mut stream = response.into_inner();
     let mut row_count = 0;
     while let Some(result) = stream.message().await? {
         if !result.body.is_empty() {
-            // Try to parse as JSON for better formatting
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&result.body) {
                 println!("{}", serde_json::to_string_pretty(&json)?);
             } else {
-                // Fallback to string output
                 println!("{}", String::from_utf8_lossy(&result.body));
             }
             row_count += 1;
@@ -238,124 +225,58 @@ pub async fn execute_sql(
 }
 
 pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
-    // Install the default crypto provider (ignore result as it may already be installed)
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // Set up signal handling
-    #[cfg(unix)]
-    fn setup_signals() -> Result<()> {
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        
-        tokio::spawn({
-            async move {
-                let sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                    Ok(signal) => signal,
-                    Err(e) => {
-                        tracing::error!("Failed to create SIGTERM handler: {}", e);
-                        if let Err(e) = shutdown_tx.send(()) {
-                            tracing::error!("Additionally failed to send shutdown signal: {:?}", e);
-                        }
-                        return;
-                    }
-                };
-
-                let sigint = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
-                    Ok(signal) => signal,
-                    Err(e) => {
-                        tracing::error!("Failed to create SIGINT handler: {}", e);
-                        if let Err(e) = shutdown_tx.send(()) {
-                            tracing::error!("Additionally failed to send shutdown signal: {:?}", e);
-                        }
-                        return;
-                    }
-                };
-
-                let (mut sigterm, mut sigint) = (sigterm, sigint);
-
-                tokio::select! {
-                    _ = sigterm.recv() => {
-                        tracing::info!("Received SIGTERM signal, initiating graceful shutdown");
-                    }
-                    _ = sigint.recv() => {
-                        tracing::info!("Received SIGINT signal, initiating graceful shutdown");
-                    }
-                }
-
-                if let Err(e) = shutdown_tx.send(()) {
-                    tracing::error!("Failed to send shutdown signal: {:?}", e);
-                    std::process::exit(1);
-                }
-            }
-        });
-
-        Ok(())
-    }
-
-    setup_signals()?;
-
-    // Set up logging before anything else
-    LogTracer::init().context("Failed to initialize log tracer")?;
-
-    // Set up file appender for logs
-    let file_appender = RollingFileAppender::new(
-        Rotation::NEVER,
-        settings.server.working_dir.as_deref().unwrap_or("/tmp"),
-        "hyprstream.log",
-    );
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-
-    // Initialize tracing subscriber with both console and file outputs
-    let subscriber = fmt::Subscriber::builder()
-        .with_env_filter(EnvFilter::new(
-            settings.server.log_level.as_deref().unwrap_or("info"),
-        ))
-        .with_writer(non_blocking)
-        .with_ansi(false)
-        .with_target(false)
-        .with_thread_ids(true)
-        .with_thread_names(true)
-        .with_file(true)
-        .with_line_number(true)
-        .with_level(true)
-        .with_target(true)
-        .compact()
-        .finish();
-
-    // Try to set the subscriber, but don't panic if it fails (e.g., if already set)
-    if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
-        eprintln!("Warning: Could not set global tracing subscriber: {}", e);
-    }
-
-    if detach {
-        // Configure daemon
-        let daemonize = Daemonize::new()
-            .pid_file(
-                settings
-                    .server
-                    .pid_file
-                    .as_deref()
-                    .unwrap_or("/tmp/hyprstream.pid"),
-            )
-            .chown_pid_file(true)
-            .working_directory(settings.server.working_dir.as_deref().unwrap_or("/tmp"));
-
-        // Start daemon
-        tracing::info!("Starting server in detached mode");
-        tracing::info!("PID file: {:?}", settings.server.pid_file);
-        tracing::info!("Working directory: {:?}", settings.server.working_dir);
-        
-        // Create log directory if it doesn't exist
-        let log_dir = settings
+    let work_dir = if detach {
+        settings
             .server
             .working_dir
             .as_deref()
-            .unwrap_or("/tmp")
-            .to_string();
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                #[cfg(unix)]
+                {
+                    PathBuf::from("/var/run/hyprstream")
+                }
+                #[cfg(not(unix))]
+                {
+                    let mut path = std::env::temp_dir();
+                    path.push("hyprstream");
+                    path
+                }
+            })
+    } else {
+        settings
+            .server
+            .working_dir
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let mut path = std::env::temp_dir();
+                path.push("hyprstream");
+                path
+            })
+    };
+
+    std::fs::create_dir_all(&work_dir)
+        .with_context(|| format!("Failed to create working directory: {}", work_dir.display()))?;
+
+    if detach {
+        let daemonize = Daemonize::new()
+            .pid_file(
+                settings.server.pid_file.as_deref().unwrap_or_else(|| {
+                    let default_pid = format!("{}/hyprstream.pid", work_dir.display());
+                    Box::leak(default_pid.into_boxed_str())
+                })
+            )
+            .chown_pid_file(true)
+            .working_directory(&work_dir);
+
+        let log_dir = work_dir.join("logs");
         std::fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
 
-        // Create file descriptors for stdout/stderr with proper paths
-        let stdout_path = std::path::Path::new(&log_dir).join("hyprstream.out");
-        let stderr_path = std::path::Path::new(&log_dir).join("hyprstream.err");
+        let stdout_path = log_dir.join("hyprstream.out");
+        let stderr_path = log_dir.join("hyprstream.err");
 
         let stdout = std::fs::OpenOptions::new()
             .create(true)
@@ -369,18 +290,73 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
             .open(&stderr_path)
             .with_context(|| format!("Failed to create stderr file at {:?}", stderr_path))?;
 
-        tracing::info!("Configured daemon output:");
-        tracing::info!("  stdout: {:?}", stdout_path);
-        tracing::info!("  stderr: {:?}", stderr_path);
-        
-        // Configure daemon with proper file descriptors
-        daemonize.stdout(stdout).stderr(stderr).start().context("Failed to start daemon")?;
-        
-        // Logging configuration persists after daemonization
-        tracing::info!("Successfully daemonized server process");
+        daemonize
+            .stdout(stdout)
+            .stderr(stderr)
+            .start()
+            .context("Failed to start daemon")?;
     }
 
-    // Convert engine options from Vec<String> to HashMap
+    LogTracer::init().context("Failed to initialize log tracer")?;
+
+    let file_appender = RollingFileAppender::new(
+        match settings.server.log_level.as_deref().unwrap_or("info") {
+            "debug" | "trace" => Rotation::HOURLY,
+            _ => Rotation::DAILY,
+        },
+        &work_dir,
+        "hyprstream.log",
+    );
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    let subscriber = fmt::Subscriber::builder()
+        .with_env_filter(EnvFilter::new(
+            settings.server.log_level.as_deref().unwrap_or("info"),
+        ))
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .with_target(false)
+        .with_thread_ids(true)
+        .with_thread_names(true)
+        .with_file(true)
+        .with_line_number(true)
+        .with_level(true)
+        .with_target(true)
+        .with_timer(tracing_subscriber::fmt::time::ChronoUtc::rfc_3339())
+        .compact()
+        .finish();
+
+    if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
+        eprintln!("Warning: Could not set global tracing subscriber: {}", e);
+    }
+
+    let (shutdown_tx, _) = broadcast::channel(1);
+
+    // Set up cross-platform signal handling
+    let shutdown_tx_ctrlc = shutdown_tx.clone();
+    tokio::spawn(async move {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!("Failed to install Ctrl+C handler: {}", e);
+            return;
+        }
+        tracing::info!("Received Ctrl+C signal");
+        let _ = shutdown_tx_ctrlc.send(());
+    });
+
+    #[cfg(unix)]
+    {
+        let shutdown_tx_unix = shutdown_tx.clone();
+        tokio::spawn(async move {
+            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+            
+            if sigterm.recv().await.is_some() {
+                tracing::info!("Received SIGTERM signal");
+                let _ = shutdown_tx_unix.send(());
+            }
+        });
+    }
+
     let engine_options: HashMap<String, String> = settings
         .engine
         .engine_options
@@ -398,7 +374,6 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
         })
         .unwrap_or_default();
 
-    // Create credentials if username and password are provided
     let engine_credentials = if let (Some(username), Some(password)) = (
         settings.engine.engine_username.as_ref(),
         settings.engine.engine_password.as_ref(),
@@ -411,7 +386,6 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
         None
     };
 
-    // Create storage backend
     let engine_backend = match settings.engine.engine_type.as_deref().unwrap_or("duckdb") {
         "adbc" => StorageBackendType::Adbc(
             AdbcBackend::new_with_options(
@@ -440,17 +414,14 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
         engine_type => anyhow::bail!("Unsupported engine type: {}", engine_type),
     };
 
-    // Initialize backend
     match &engine_backend {
         StorageBackendType::Adbc(backend) => backend.init().await,
         StorageBackendType::DuckDb(backend) => backend.init().await,
     }
     .context("Failed to initialize storage backend")?;
 
-    // Create the service
     let service = FlightSqlService::new(engine_backend);
 
-    // Start the server
     let addr = format!(
         "{}:{}",
         settings.server.host.as_deref().unwrap_or("127.0.0.1"),
@@ -462,7 +433,54 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
     tracing::warn!("This is a pre-release alpha for preview purposes only.");
     tracing::info!("Starting server on {}", addr);
 
-    // Configure server with TLS if certificates are provided
+    if let Some(health_port) = settings.server.health_check_port {
+        let health_addr = format!("127.0.0.1:{}", health_port)
+            .parse::<std::net::SocketAddr>()
+            .context("Invalid health check address")?;
+        let health_path = settings
+            .server
+            .health_check_path
+            .clone()
+            .unwrap_or_else(|| "/health".to_string());
+
+        let mut health_shutdown_rx = shutdown_tx.subscribe();
+
+        tokio::spawn(async move {
+            let start_time = std::time::SystemTime::now();
+            let health_route = warp::path::path(health_path.clone())
+                .and(warp::get())
+                .map(move || {
+                    let uptime = start_time
+                        .elapsed()
+                        .map(|d| d.as_secs())
+                        .unwrap_or_default();
+                    warp::reply::json(&serde_json::json!({
+                        "status": "healthy",
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "uptime_seconds": uptime
+                    }))
+                });
+
+            let (_, server) = warp::serve(health_route).bind_with_graceful_shutdown(
+                health_addr,
+                async move {
+                    let _ = health_shutdown_rx.recv().await;
+                    tracing::info!("Shutting down health check endpoint");
+                },
+            );
+
+            tokio::select! {
+                _ = server => {
+                    tracing::error!("Health check server exited unexpectedly");
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                    tracing::info!("Health check endpoint started on {} at path {}", health_addr, health_path);
+                }
+            }
+        });
+    }
+
     let mut server = Server::builder();
     if let Some(tls_config) = configure_server_tls(
         settings.server.tls_cert.as_deref(),
@@ -472,29 +490,17 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
         server = server.tls_config(tls_config)?;
     }
 
-    // Run the server with enhanced error handling and graceful shutdown
     tracing::info!("Binding server to {}", addr);
-    
+
+    let mut shutdown_rx = shutdown_tx.subscribe();
     let server_future = server
         .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(service))
-        .serve_with_shutdown(addr, async {
-            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("failed to install SIGTERM handler");
-            let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                .expect("failed to install SIGINT handler");
-
-            tokio::select! {
-                _ = sigterm.recv() => {
-                    tracing::info!("Received SIGTERM signal, initiating graceful shutdown");
-                }
-                _ = sigint.recv() => {
-                    tracing::info!("Received SIGINT signal, initiating graceful shutdown");
-                }
-            }
+        .serve_with_shutdown(addr, async move {
+            let _ = shutdown_rx.recv().await;
+            tracing::info!("Initiating graceful shutdown");
         });
 
-    // Add timeout for initial binding
-    match tokio::time::timeout(std::time::Duration::from_secs(5), server_future).await {
+    match tokio::time::timeout(Duration::from_secs(5), server_future).await {
         Ok(result) => match result {
             Ok(_) => {
                 tracing::info!("Server shutdown completed successfully");
@@ -508,7 +514,6 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
                 let host = settings.server.host.as_deref().unwrap_or("127.0.0.1");
                 let port = settings.server.port.unwrap_or(50051);
 
-                // Log detailed error information
                 tracing::error!("Server error details:");
                 tracing::error!("  Message: {}", err_msg);
                 tracing::error!("  Binding: {}:{}", host, port);

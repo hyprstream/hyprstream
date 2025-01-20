@@ -296,14 +296,18 @@ impl FlightSqlService {
         }
     }
 
-    pub async fn serve(self) -> Result<(), tonic::transport::Error> {
+    pub async fn serve(self, config: &crate::cli::commands::server::ServerConfig) -> Result<(), tonic::transport::Error> {
         use arrow_flight::flight_service_server::FlightServiceServer;
         use tonic::transport::Server;
 
-        // Bind to all interfaces on port 0 to let OS assign a port
-        let addr = "[::]:0".parse().unwrap();
+        // Use configured host and port, or fall back to defaults
+        let host = config.host.as_deref().unwrap_or("127.0.0.1");
+        let port = config.port.unwrap_or(50051);
+        let addr = format!("{}:{}", host, port).parse().unwrap();
+        
         let svc = FlightServiceServer::new(self);
-
+        println!("Starting server on {}", addr);
+        
         Server::builder().add_service(svc).serve(addr).await
     }
 
