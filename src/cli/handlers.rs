@@ -241,6 +241,58 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
     // Install the default crypto provider (ignore result as it may already be installed)
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    // Set up signal handling
+    #[cfg(unix)]
+    fn setup_signals() -> Result<()> {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        
+        tokio::spawn({
+            async move {
+                let sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(signal) => signal,
+                    Err(e) => {
+                        tracing::error!("Failed to create SIGTERM handler: {}", e);
+                        if let Err(e) = shutdown_tx.send(()) {
+                            tracing::error!("Additionally failed to send shutdown signal: {:?}", e);
+                        }
+                        return;
+                    }
+                };
+
+                let sigint = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+                    Ok(signal) => signal,
+                    Err(e) => {
+                        tracing::error!("Failed to create SIGINT handler: {}", e);
+                        if let Err(e) = shutdown_tx.send(()) {
+                            tracing::error!("Additionally failed to send shutdown signal: {:?}", e);
+                        }
+                        return;
+                    }
+                };
+
+                let (mut sigterm, mut sigint) = (sigterm, sigint);
+
+                tokio::select! {
+                    _ = sigterm.recv() => {
+                        tracing::info!("Received SIGTERM signal, initiating graceful shutdown");
+                    }
+                    _ = sigint.recv() => {
+                        tracing::info!("Received SIGINT signal, initiating graceful shutdown");
+                    }
+                }
+
+                if let Err(e) = shutdown_tx.send(()) {
+                    tracing::error!("Failed to send shutdown signal: {:?}", e);
+                    std::process::exit(1);
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    setup_signals()?;
+
     // Set up logging before anything else
     LogTracer::init().context("Failed to initialize log tracer")?;
 
@@ -291,14 +343,47 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
         tracing::info!("Starting server in detached mode");
         tracing::info!("PID file: {:?}", settings.server.pid_file);
         tracing::info!("Working directory: {:?}", settings.server.working_dir);
-        daemonize.start().context("Failed to start daemon")?;
+        
+        // Create log directory if it doesn't exist
+        let log_dir = settings
+            .server
+            .working_dir
+            .as_deref()
+            .unwrap_or("/tmp")
+            .to_string();
+        std::fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
+
+        // Create file descriptors for stdout/stderr with proper paths
+        let stdout_path = std::path::Path::new(&log_dir).join("hyprstream.out");
+        let stderr_path = std::path::Path::new(&log_dir).join("hyprstream.err");
+
+        let stdout = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&stdout_path)
+            .with_context(|| format!("Failed to create stdout file at {:?}", stdout_path))?;
+
+        let stderr = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&stderr_path)
+            .with_context(|| format!("Failed to create stderr file at {:?}", stderr_path))?;
+
+        tracing::info!("Configured daemon output:");
+        tracing::info!("  stdout: {:?}", stdout_path);
+        tracing::info!("  stderr: {:?}", stderr_path);
+        
+        // Configure daemon with proper file descriptors
+        daemonize.stdout(stdout).stderr(stderr).start().context("Failed to start daemon")?;
+        
+        // Logging configuration persists after daemonization
+        tracing::info!("Successfully daemonized server process");
     }
 
     // Convert engine options from Vec<String> to HashMap
     let engine_options: HashMap<String, String> = settings
         .engine
         .engine_options
-        .as_ref()
         .map(|opts| {
             opts.iter()
                 .filter_map(|opt| {
@@ -387,22 +472,81 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
         server = server.tls_config(tls_config)?;
     }
 
-    // Run the server (it's already detached if detach was true)
-    match server
+    // Run the server with enhanced error handling and graceful shutdown
+    tracing::info!("Binding server to {}", addr);
+    
+    let server_future = server
         .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(service))
-        .serve(addr)
-        .await
-    {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            if e.to_string().contains("Address already in use") {
-                anyhow::bail!(
-                    "Port {} is already in use. Try using a different port with --port",
-                    settings.server.port.unwrap_or(50051)
-                );
-            } else {
-                Err(e).context("Server error")?
+        .serve_with_shutdown(addr, async {
+            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+            let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .expect("failed to install SIGINT handler");
+
+            tokio::select! {
+                _ = sigterm.recv() => {
+                    tracing::info!("Received SIGTERM signal, initiating graceful shutdown");
+                }
+                _ = sigint.recv() => {
+                    tracing::info!("Received SIGINT signal, initiating graceful shutdown");
+                }
             }
+        });
+
+    // Add timeout for initial binding
+    match tokio::time::timeout(std::time::Duration::from_secs(5), server_future).await {
+        Ok(result) => match result {
+            Ok(_) => {
+                tracing::info!("Server shutdown completed successfully");
+                if detach {
+                    tracing::info!("Daemon process terminated cleanly");
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                let host = settings.server.host.as_deref().unwrap_or("127.0.0.1");
+                let port = settings.server.port.unwrap_or(50051);
+
+                // Log detailed error information
+                tracing::error!("Server error details:");
+                tracing::error!("  Message: {}", err_msg);
+                tracing::error!("  Binding: {}:{}", host, port);
+                if detach {
+                    tracing::error!("  Mode: Daemon process");
+                }
+
+                if err_msg.contains("Address already in use") {
+                    anyhow::bail!(
+                        "Port {} is already in use on {}. Check if another instance is running or try a different port",
+                        port,
+                        host
+                    )
+                }
+
+                Err(anyhow::anyhow!(e))
+                    .with_context(|| format!("Failed to start server on {}:{}", host, port))
+            }
+        },
+        Err(_) => {
+            let port = settings.server.port.unwrap_or(50051);
+            let host = settings.server.host.as_deref().unwrap_or("127.0.0.1");
+            
+            tracing::error!(
+                "Server failed to bind to {}:{} within timeout period",
+                host,
+                port
+            );
+            
+            anyhow::bail!(
+                "Server failed to bind within 5 seconds.\nPossible issues:\n\
+                 - Port {} is blocked or requires elevated permissions\n\
+                 - Network interface {} is not available\n\
+                 - System resources are constrained\n\
+                 Try using a different port/host or check system permissions",
+                port,
+                host
+            )
         }
     }
 }
