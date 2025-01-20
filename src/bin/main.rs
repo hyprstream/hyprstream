@@ -27,8 +27,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_server(server_cmd.detach, settings).await?;
         }
         Commands::Sql(sql_cmd) => {
+            let addr = if let Some(host) = sql_cmd.host {
+                Some(host.parse().map_err(|e| {
+                    format!("Invalid host:port address '{}': {}", host, e)
+                })?)
+            } else {
+                None
+            };
+            
             execute_sql(
-                sql_cmd.host,
+                addr,
                 sql_cmd.query,
                 sql_cmd.tls_cert.as_deref(),
                 sql_cmd.tls_key.as_deref(),

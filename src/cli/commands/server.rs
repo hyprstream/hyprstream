@@ -49,14 +49,6 @@ pub struct ServerConfig {
     #[arg(long, env = "HYPRSTREAM_LOG_COMPRESSION")]
     pub log_compression: Option<bool>,
 
-    /// Port for health check endpoint
-    #[arg(long, env = "HYPRSTREAM_HEALTH_CHECK_PORT")]
-    pub health_check_port: Option<u16>,
-
-    /// Path for health check endpoint
-    #[arg(long, env = "HYPRSTREAM_HEALTH_CHECK_PATH")]
-    pub health_check_path: Option<String>,
-
     /// Minimum TLS version (1.2|1.3)
     #[arg(long, env = "HYPRSTREAM_TLS_MIN_VERSION")]
     pub tls_min_version: Option<String>,
@@ -84,8 +76,6 @@ impl Default for ServerConfig {
             log_rotation: Some("daily".to_string()),
             log_retention: Some(30),
             log_compression: Some(true),
-            health_check_port: None,
-            health_check_path: Some("/health".to_string()),
             tls_min_version: Some("1.2".to_string()),
             tls_cipher_list: None,
             tls_prefer_server_ciphers: Some(true),
@@ -151,18 +141,6 @@ impl ConfigSection for ServerConfig {
             .with_env("HYPRSTREAM_LOG_COMPRESSION")
             .with_cli("log-compression"),
             ConfigOptionDef::new(
-                "server.health_check_port",
-                "Port for health check endpoint",
-            )
-            .with_env("HYPRSTREAM_HEALTH_CHECK_PORT")
-            .with_cli("health-check-port"),
-            ConfigOptionDef::new(
-                "server.health_check_path",
-                "Path for health check endpoint",
-            )
-            .with_env("HYPRSTREAM_HEALTH_CHECK_PATH")
-            .with_cli("health-check-path"),
-            ConfigOptionDef::new(
                 "server.tls_min_version",
                 "Minimum TLS version (1.2|1.3)",
             )
@@ -200,8 +178,6 @@ impl ConfigSection for ServerConfig {
             log_rotation: Option<String>,
             log_retention: Option<u32>,
             log_compression: Option<bool>,
-            health_check_port: Option<u16>,
-            health_check_path: Option<String>,
             tls_min_version: Option<String>,
             tls_cipher_list: Option<String>,
             tls_prefer_server_ciphers: Option<bool>,
@@ -220,8 +196,6 @@ impl ConfigSection for ServerConfig {
             log_rotation: config.log_rotation.or(Some("daily".to_string())),
             log_retention: config.log_retention.or(Some(30)),
             log_compression: config.log_compression.or(Some(true)),
-            health_check_port: config.health_check_port,
-            health_check_path: config.health_check_path.or(Some("/health".to_string())),
             tls_min_version: config.tls_min_version.or(Some("1.2".to_string())),
             tls_cipher_list: config.tls_cipher_list,
             tls_prefer_server_ciphers: config.tls_prefer_server_ciphers.or(Some(true)),

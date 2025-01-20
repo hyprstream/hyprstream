@@ -11,15 +11,42 @@ use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
     RootCertStore,
 };
-use std::{collections::HashMap, fs::File, io::BufReader, path::{Path, PathBuf}, time::Duration};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::BufReader,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::Path,
+    time::Duration,
+};
 use tokio::sync::broadcast;
 use tonic::transport::{
     Certificate as TonicCertificate, ClientTlsConfig, Identity, Server, ServerTlsConfig,
 };
-use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_log::LogTracer;
 use tracing_subscriber::{fmt, EnvFilter};
-use warp::Filter;
+fn parse_server_addr(settings: &Settings) -> Result<SocketAddr> {
+    let port = settings.server.port.unwrap_or(50051);
+    
+    match settings.server.host.as_deref() {
+        None | Some("0.0.0.0") => Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)),
+        Some("::") => Ok(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)),
+        Some(host) => {
+            host.parse::<SocketAddr>()
+                .or_else(|_| {
+                    // Try parsing as IPv6
+                    host.parse::<Ipv6Addr>()
+                        .map(|addr| SocketAddr::new(IpAddr::V6(addr), port))
+                        .or_else(|_| {
+                            // Try parsing as IPv4
+                            host.parse::<Ipv4Addr>()
+                                .map(|addr| SocketAddr::new(IpAddr::V4(addr), port))
+                                .context("Invalid address format")
+                        })
+                })
+        }
+    }
+}
 
 fn load_certificate(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     let file = File::open(path).context("Failed to open certificate file")?;
@@ -101,7 +128,7 @@ fn configure_client_tls(
 }
 
 pub async fn execute_sql(
-    host: Option<String>,
+    addr: Option<SocketAddr>,
     query: String,
     tls_cert: Option<&Path>,
     tls_key: Option<&Path>,
@@ -127,19 +154,17 @@ pub async fn execute_sql(
 
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let addr = host.unwrap_or_else(|| "127.0.0.1:50051".to_string());
+    let addr = addr.unwrap_or_else(|| {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 50051)
+    });
     tracing::info!("Connecting to {}...", addr);
 
     let use_tls = tls_cert.is_some() || tls_key.is_some() || tls_ca.is_some();
-    let uri_str = if !addr.starts_with("http://") && !addr.starts_with("https://") {
-        format!(
-            "{}://{}",
-            if use_tls { "https" } else { "http" },
-            addr.clone()
-        )
-    } else {
-        addr.clone()
-    };
+    let uri_str = format!(
+        "{}://{}",
+        if use_tls { "https" } else { "http" },
+        addr
+    );
 
     if verbose {
         tracing::debug!("Using URL {}", uri_str);
@@ -227,102 +252,32 @@ pub async fn execute_sql(
 pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let work_dir = if detach {
-        settings
-            .server
-            .working_dir
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                #[cfg(unix)]
-                {
-                    PathBuf::from("/var/run/hyprstream")
-                }
-                #[cfg(not(unix))]
-                {
-                    let mut path = std::env::temp_dir();
-                    path.push("hyprstream");
-                    path
-                }
-            })
-    } else {
-        settings
-            .server
-            .working_dir
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                let mut path = std::env::temp_dir();
-                path.push("hyprstream");
-                path
-            })
-    };
-
-    std::fs::create_dir_all(&work_dir)
-        .with_context(|| format!("Failed to create working directory: {}", work_dir.display()))?;
-
     if detach {
         let daemonize = Daemonize::new()
-            .pid_file(
-                settings.server.pid_file.as_deref().unwrap_or_else(|| {
-                    let default_pid = format!("{}/hyprstream.pid", work_dir.display());
-                    Box::leak(default_pid.into_boxed_str())
-                })
-            )
-            .chown_pid_file(true)
-            .working_directory(&work_dir);
+            .pid_file(settings.server.pid_file.as_deref().unwrap_or("/tmp/hyprstream.pid"))
+            .chown_pid_file(true);
 
-        let log_dir = work_dir.join("logs");
-        std::fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
-
-        let stdout_path = log_dir.join("hyprstream.out");
-        let stderr_path = log_dir.join("hyprstream.err");
-
-        let stdout = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&stdout_path)
-            .with_context(|| format!("Failed to create stdout file at {:?}", stdout_path))?;
-
-        let stderr = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&stderr_path)
-            .with_context(|| format!("Failed to create stderr file at {:?}", stderr_path))?;
-
-        daemonize
-            .stdout(stdout)
-            .stderr(stderr)
-            .start()
-            .context("Failed to start daemon")?;
+        daemonize.start().context("Failed to start daemon")?;
     }
 
     LogTracer::init().context("Failed to initialize log tracer")?;
 
-    let file_appender = RollingFileAppender::new(
-        match settings.server.log_level.as_deref().unwrap_or("info") {
-            "debug" | "trace" => Rotation::HOURLY,
-            _ => Rotation::DAILY,
-        },
-        &work_dir,
-        "hyprstream.log",
-    );
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    let log_level = settings.server.log_level.as_deref().unwrap_or("info");
+    let env_filter = EnvFilter::new(log_level);
+    
+    // Configure stdout/stderr handling
+    let (non_blocking_stdout, _guard_stdout) = tracing_appender::non_blocking(std::io::stdout());
 
     let subscriber = fmt::Subscriber::builder()
-        .with_env_filter(EnvFilter::new(
-            settings.server.log_level.as_deref().unwrap_or("info"),
-        ))
-        .with_writer(non_blocking)
-        .with_ansi(false)
+        .with_env_filter(env_filter)
+        .with_writer(non_blocking_stdout)
+        .with_ansi(true)
         .with_target(false)
-        .with_thread_ids(true)
-        .with_thread_names(true)
-        .with_file(true)
-        .with_line_number(true)
+        .with_thread_ids(false)
+        .with_thread_names(false)
+        .with_file(false)
+        .with_line_number(false)
         .with_level(true)
-        .with_target(true)
-        .with_timer(tracing_subscriber::fmt::time::ChronoUtc::rfc_3339())
         .compact()
         .finish();
 
@@ -360,6 +315,7 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
     let engine_options: HashMap<String, String> = settings
         .engine
         .engine_options
+        .clone()
         .map(|opts| {
             opts.iter()
                 .filter_map(|opt| {
@@ -421,65 +377,11 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
     .context("Failed to initialize storage backend")?;
 
     let service = FlightSqlService::new(engine_backend);
-
-    let addr = format!(
-        "{}:{}",
-        settings.server.host.as_deref().unwrap_or("127.0.0.1"),
-        settings.server.port.unwrap_or(50051)
-    )
-    .parse()
-    .context("Invalid listen address")?;
+    let addr = parse_server_addr(&settings)
+        .context("Failed to parse server address")?;
 
     tracing::warn!("This is a pre-release alpha for preview purposes only.");
     tracing::info!("Starting server on {}", addr);
-
-    if let Some(health_port) = settings.server.health_check_port {
-        let health_addr = format!("127.0.0.1:{}", health_port)
-            .parse::<std::net::SocketAddr>()
-            .context("Invalid health check address")?;
-        let health_path = settings
-            .server
-            .health_check_path
-            .clone()
-            .unwrap_or_else(|| "/health".to_string());
-
-        let mut health_shutdown_rx = shutdown_tx.subscribe();
-
-        tokio::spawn(async move {
-            let start_time = std::time::SystemTime::now();
-            let health_route = warp::path::path(health_path.clone())
-                .and(warp::get())
-                .map(move || {
-                    let uptime = start_time
-                        .elapsed()
-                        .map(|d| d.as_secs())
-                        .unwrap_or_default();
-                    warp::reply::json(&serde_json::json!({
-                        "status": "healthy",
-                        "timestamp": chrono::Utc::now().to_rfc3339(),
-                        "version": env!("CARGO_PKG_VERSION"),
-                        "uptime_seconds": uptime
-                    }))
-                });
-
-            let (_, server) = warp::serve(health_route).bind_with_graceful_shutdown(
-                health_addr,
-                async move {
-                    let _ = health_shutdown_rx.recv().await;
-                    tracing::info!("Shutting down health check endpoint");
-                },
-            );
-
-            tokio::select! {
-                _ = server => {
-                    tracing::error!("Health check server exited unexpectedly");
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                    tracing::info!("Health check endpoint started on {} at path {}", health_addr, health_path);
-                }
-            }
-        });
-    }
 
     let mut server = Server::builder();
     if let Some(tls_config) = configure_server_tls(
@@ -490,8 +392,6 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
         server = server.tls_config(tls_config)?;
     }
 
-    tracing::info!("Binding server to {}", addr);
-
     let mut shutdown_rx = shutdown_tx.subscribe();
     let server_future = server
         .add_service(service.into_server())
@@ -500,58 +400,27 @@ pub async fn run_server(detach: bool, settings: Settings) -> Result<()> {
             tracing::info!("Initiating graceful shutdown");
         });
 
-    match tokio::time::timeout(Duration::from_secs(5), server_future).await {
-        Ok(result) => match result {
-            Ok(_) => {
-                tracing::info!("Server shutdown completed successfully");
-                if detach {
-                    tracing::info!("Daemon process terminated cleanly");
-                }
-                Ok(())
+    match server_future.await {
+        Ok(_) => {
+            tracing::info!("Server shutdown completed successfully");
+            if detach {
+                tracing::info!("Daemon process terminated cleanly");
             }
-            Err(e) => {
-                let err_msg = e.to_string();
-                let host = settings.server.host.as_deref().unwrap_or("127.0.0.1");
-                let port = settings.server.port.unwrap_or(50051);
+            Ok(())
+        }
+        Err(e) => {
+            let err_msg = e.to_string();
+            tracing::error!("Server error: {}", err_msg);
 
-                tracing::error!("Server error details:");
-                tracing::error!("  Message: {}", err_msg);
-                tracing::error!("  Binding: {}:{}", host, port);
-                if detach {
-                    tracing::error!("  Mode: Daemon process");
-                }
-
-                if err_msg.contains("Address already in use") {
-                    anyhow::bail!(
-                        "Port {} is already in use on {}. Check if another instance is running or try a different port",
-                        port,
-                        host
-                    )
-                }
-
-                Err(anyhow::anyhow!(e))
-                    .with_context(|| format!("Failed to start server on {}:{}", host, port))
+            if err_msg.contains("Address already in use") {
+                anyhow::bail!(
+                    "Address {} is already in use. Check if another instance is running",
+                    addr
+                )
             }
-        },
-        Err(_) => {
-            let port = settings.server.port.unwrap_or(50051);
-            let host = settings.server.host.as_deref().unwrap_or("127.0.0.1");
-            
-            tracing::error!(
-                "Server failed to bind to {}:{} within timeout period",
-                host,
-                port
-            );
-            
-            anyhow::bail!(
-                "Server failed to bind within 5 seconds.\nPossible issues:\n\
-                 - Port {} is blocked or requires elevated permissions\n\
-                 - Network interface {} is not available\n\
-                 - System resources are constrained\n\
-                 Try using a different port/host or check system permissions",
-                port,
-                host
-            )
+
+            Err(anyhow::anyhow!(e))
+                .with_context(|| format!("Failed to start server on {}", addr))
         }
     }
 }
