@@ -12,8 +12,6 @@
 use crate::metrics::MetricRecord;
 use crate::models::storage::TimeSeriesModelStorage;
 use crate::models::{Model, ModelStorage};
-use crate::storage::adbc::AdbcBackend;
-use crate::storage::duckdb::DuckDbBackend;
 use crate::storage::table_manager::AggregationView;
 use crate::storage::{StorageBackend, StorageBackendType};
 use arrow_array::{builder::Float32Builder, ArrayRef, Float32Array};
@@ -29,7 +27,6 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json;
-use std::any::{Any, TypeId};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

@@ -20,7 +20,6 @@ use crate::storage::table_manager::{AggregationView, TableManager};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
-use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::Status;
