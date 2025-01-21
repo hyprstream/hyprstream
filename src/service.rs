@@ -1,5 +1,14 @@
-use crate::storage::view::ViewDefinition;
-use crate::storage::{StorageBackend, StorageBackendType};
+use crate::{
+    query::{
+        DataFusionExecutor, DataFusionPlanner, ExecutorConfig, Query,
+        planner::{OptimizationHint, QueryPlanner},
+        executor::QueryExecutor,
+    },
+    storage::{
+        view::ViewDefinition,
+        StorageBackend, StorageBackendType,
+    },
+};
 use arrow_flight::{
     flight_service_server::{FlightService, FlightServiceServer},
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo, HandshakeRequest,
@@ -149,8 +158,7 @@ pub struct FlightSqlServer {
     backend: Arc<StorageBackendType>,
     #[allow(dead_code)]
     statement_counter: Arc<AtomicU64>,
-    #[allow(dead_code)]
-    prepared_statements: Arc<Mutex<Vec<String>>>,
+    prepared_statements: Arc<Mutex<Vec<(u64, String)>>>,
 }
 
 impl FlightSqlServer {
@@ -313,9 +321,98 @@ impl FlightService for FlightSqlServer {
 
     async fn do_get(
         &self,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        Err(Status::unimplemented("do_get not implemented"))
+        let ticket = request.into_inner();
+        let statements = self.prepared_statements.lock();
+        
+        // Get SQL from prepared statement handle
+        let handle = u64::from_le_bytes(
+            ticket.ticket.to_vec()
+                .try_into()
+                .map_err(|_| Status::invalid_argument("Invalid statement handle"))?
+        );
+        
+        // Get SQL query from prepared statements
+        let sql = {
+            let guard = statements
+                .map_err(|e| Status::internal(format!("Lock error: {}", e)))?;
+                
+            let sql = guard.iter()
+                .find(|(h, _)| *h == handle)
+                .map(|(_, sql)| sql.to_string())
+                .ok_or_else(|| Status::invalid_argument("Statement handle not found"))?;
+                
+            // Drop guard before any async operations
+            drop(guard);
+            sql
+        };
+
+        // Create planner and executor
+        let planner = DataFusionPlanner::new(Arc::new((*self.backend).clone())).await
+            .map_err(|e| Status::internal(format!("Failed to create planner: {}", e)))?;
+            
+        let executor = DataFusionExecutor::new(ExecutorConfig::default());
+
+        // Create and plan query
+        let query = Query {
+            sql: sql.to_string(),
+            schema_hint: None,
+            hints: vec![
+                OptimizationHint::PreferPredicatePushdown,
+                OptimizationHint::OptimizeForVectorOps,
+            ],
+        };
+
+        // Create physical plan
+        let physical_plan = planner.plan_query(&query).await
+            .map_err(|e| Status::internal(format!("Failed to plan query: {}", e)))?;
+
+        // Execute plan as stream
+        let stream = executor.execute_stream(physical_plan).await
+            .map_err(|e| Status::internal(format!("Failed to execute query: {}", e)))?;
+
+        // Convert DataFusion stream to FlightData stream
+        let flight_stream = Box::pin(async_stream::try_stream! {
+            let mut schema_sent = false;
+            
+            for await result in stream {
+                let batch = result.map_err(|e| Status::internal(format!("Error reading batch: {}", e)))?;
+                
+                if !schema_sent {
+                    // Send schema as first message
+                    let options = arrow_ipc::writer::IpcWriteOptions::default();
+                    let mut dictionary_tracker = arrow_ipc::writer::DictionaryTracker::new(false);
+                    let schema_bytes = arrow_ipc::writer::IpcDataGenerator::default()
+                        .schema_to_bytes_with_dictionary_tracker(&batch.schema(), &mut dictionary_tracker, &options)
+                        .ipc_message;
+                        
+                    yield FlightData {
+                        flight_descriptor: None,
+                        data_header: schema_bytes.into(),
+                        data_body: vec![].into(),
+                        app_metadata: vec![].into(),
+                    };
+                    schema_sent = true;
+                }
+
+                // Send batch data
+                let mut dictionary_tracker = arrow_ipc::writer::DictionaryTracker::new(false);
+                let options = arrow_ipc::writer::IpcWriteOptions::default();
+                let (_, data) = arrow_ipc::writer::IpcDataGenerator::default()
+                    .encoded_batch(&batch, &mut dictionary_tracker, &options)
+                    .map_err(|e| Status::internal(format!("Failed to serialize batch: {}", e)))?;
+
+                yield FlightData {
+                    flight_descriptor: None,
+                    data_header: vec![].into(),
+                    data_body: data.ipc_message.into(),
+                    app_metadata: vec![].into(),
+                };
+            }
+        });
+
+        Ok(Response::new(flight_stream))
     }
 
     async fn do_put(

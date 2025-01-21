@@ -7,6 +7,17 @@ use std::error::Error as StdError;
 use std::fmt;
 use tracing::{debug, error, info};
 
+use arrow_flight::flight_service_client::FlightServiceClient as FlightSqlClient;
+use ::config::{Config, File};
+use tonic::transport::{Certificate, ClientTlsConfig, Identity, Server, ServerTlsConfig};
+use futures::StreamExt;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    net::SocketAddr,
+};
+use bytes::Bytes;
+
 #[derive(Debug)]
 enum ConnectionError {
     Timeout(String),
@@ -30,16 +41,6 @@ impl StdError for ConnectionError {
         }
     }
 }
-use arrow_flight::flight_service_client::{FlightServiceClient, FlightServiceClient as FlightSqlClient};
-use ::config::{Config, File};
-use tonic::transport::{Certificate, ClientTlsConfig, Identity, Server, ServerTlsConfig};
-use prost::Message;
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    net::SocketAddr,
-};
-use bytes::Bytes;
 
 pub async fn execute_sql(
     addr: Option<SocketAddr>,
@@ -151,12 +152,36 @@ pub async fn execute_sql(
         body: Bytes::from(serde_json::to_vec(&json)?),
     };
 
+    // Execute the action and get results
     let result = client.do_action(tonic::Request::new(action)).await;
-
     debug!(result = ?result, "SQL execution result");
 
     match result {
-        Ok(_) => {
+        Ok(mut response) => {
+            // For queries that return data, fetch results using do_get
+            if !sql.trim().to_uppercase().starts_with("CREATE ") &&
+               !sql.trim().to_uppercase().starts_with("DROP ") &&
+               !sql.trim().to_uppercase().starts_with("ALTER ") {
+                let result = response.get_mut().next().await
+                    .ok_or_else(|| std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "No ticket received for query"
+                    ))??;
+
+                let ticket = arrow_flight::Ticket {
+                    ticket: result.body,
+                };
+
+                let mut stream = client.do_get(tonic::Request::new(ticket)).await?.into_inner();
+                
+                // Process results
+                while let Some(data) = stream.message().await? {
+                    if verbose {
+                        debug!(data_size = data.data_body.len(), "Received flight data");
+                    }
+                }
+            }
+            
             debug!("SQL execution completed successfully");
             Ok(())
         }
@@ -306,64 +331,13 @@ pub async fn handle_sql(
         addr_parts[1].parse()?
     );
 
+    // Execute SQL and process results
     execute_sql(
         Some(socket_addr),
         query.to_string(),
         config.as_ref(),
         verbose,
     ).await?;
-
-    let channel = {
-        let addr_parts: Vec<&str> = addr.split(':').collect();
-        if addr_parts.len() != 2 {
-            return Err("Invalid address format. Expected host:port".into());
-        }
-
-        let scheme = if config.as_ref().map(|c| c.get_bool("tls.enabled").unwrap_or(false)).unwrap_or(false) {
-            "https"
-        } else {
-            "http"
-        };
-
-        let mut endpoint = tonic::transport::Channel::from_shared(format!("{}://{}:{}", scheme, addr_parts[0], addr_parts[1]))?
-            .timeout(std::time::Duration::from_secs(5));
-
-        if let Some(config) = config {
-            if let Some((identity, ca_cert)) = get_tls_config(&config) {
-                let mut tls = ClientTlsConfig::new()
-                    .domain_name("localhost")
-                    .identity(identity);
-                
-                if let Some(ca) = ca_cert {
-                    tls = tls.ca_certificate(ca);
-                }
-
-                endpoint = endpoint.tls_config(tls)?;
-            }
-        }
-
-        endpoint.connect().await?
-    };
-    let mut client = FlightServiceClient::new(channel);
-    
-    let command = arrow_flight::sql::CommandStatementQuery {
-        query: query.to_string(),
-        transaction_id: None,
-    };
-    
-    let mut buf = Vec::new();
-    command.encode(&mut buf)?;
-    let request = arrow_flight::Ticket {
-        ticket: buf.into(),
-    };
-    
-    let mut stream = client.do_get(request).await?.into_inner();
-    
-    while let Some(flight_data) = stream.message().await? {
-        if verbose {
-            println!("Received data: {:?}", flight_data);
-        }
-    }
 
     Ok(())
 }
