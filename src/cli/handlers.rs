@@ -3,6 +3,32 @@ use crate::{
     storage::{StorageBackendType, adbc::AdbcBackend, duckdb::DuckDbBackend},
     config::{get_tls_config, set_tls_data},
 };
+use std::error::Error as StdError;
+use std::fmt;
+
+#[derive(Debug)]
+enum ConnectionError {
+    Timeout(String),
+    Other(Box<dyn StdError>),
+}
+
+impl fmt::Display for ConnectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConnectionError::Timeout(msg) => write!(f, "Connection timeout: {}", msg),
+            ConnectionError::Other(e) => write!(f, "Connection error: {}", e),
+        }
+    }
+}
+
+impl StdError for ConnectionError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            ConnectionError::Timeout(_) => None,
+            ConnectionError::Other(e) => Some(e.as_ref()),
+        }
+    }
+}
 use arrow_flight::flight_service_client::{FlightServiceClient, FlightServiceClient as FlightSqlClient};
 use ::config::{Config, File};
 use tonic::transport::{Certificate, ClientTlsConfig, Identity, Server, ServerTlsConfig};
@@ -23,24 +49,86 @@ pub async fn execute_sql(
     let addr = addr.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 50051)));
     let scheme = if config.map(|c| c.get_bool("tls.enabled").unwrap_or(false)).unwrap_or(false) { "https" } else { "http" };
     let channel = {
+        if verbose {
+            println!("Connecting to {}://{}:{} with TLS={}", scheme, addr.ip(), addr.port(),
+                    config.map(|c| c.get_bool("tls.enabled").unwrap_or(false)).unwrap_or(false));
+        }
+        
         let mut endpoint = tonic::transport::Channel::from_shared(format!("{}://{}:{}", scheme, addr.ip(), addr.port()))?
-            .timeout(std::time::Duration::from_secs(5));
+            .timeout(std::time::Duration::from_secs(60))  // Increase timeout for TLS handshake
+            .tcp_keepalive(Some(std::time::Duration::from_secs(5)))
+            .connect_timeout(std::time::Duration::from_secs(30));  // Separate connect timeout
+
+        if verbose {
+            println!("Channel endpoint created with 60s timeout and TCP keepalive");
+        }
 
         if let Some(config) = config {
             if let Some((identity, ca_cert)) = get_tls_config(config) {
+                if verbose {
+                    println!("Configuring TLS client with identity and CA cert");
+                }
+                if verbose {
+                    println!("Creating client TLS config with identity");
+                }
+                
                 let mut tls = ClientTlsConfig::new()
                     .domain_name("localhost")
                     .identity(identity);
                 
                 if let Some(ca) = ca_cert {
+                    if verbose {
+                        println!("Adding CA certificate to TLS config");
+                    }
                     tls = tls.ca_certificate(ca);
                 }
 
+                if verbose {
+                    println!("Client TLS config created with SNI name 'localhost'");
+                    println!("Attempting TLS connection with server...");
+                }
+
+                if verbose {
+                    println!("Applying TLS configuration to endpoint");
+                }
                 endpoint = endpoint.tls_config(tls)?;
+            } else if verbose {
+                println!("No TLS configuration found in config");
             }
+        } else if verbose {
+            println!("No config provided for TLS");
         }
 
-        endpoint.connect().await
+        if verbose {
+            println!("Attempting to connect to endpoint...");
+        }
+        
+        match endpoint.connect().await {
+            Ok(chan) => {
+                if verbose {
+                    println!("Successfully connected to endpoint");
+                }
+                Ok(chan)
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                if verbose {
+                    println!("Connection error: {}", err_str);
+                    if let Some(source) = e.source() {
+                        println!("Error source: {}", source);
+                    }
+                }
+                
+                let conn_error = if err_str.contains("transport error") ||
+                   err_str.contains("deadline has elapsed") ||
+                   err_str.contains("connection refused") {
+                    ConnectionError::Timeout(err_str)
+                } else {
+                    ConnectionError::Other(Box::new(e))
+                };
+                Err(Box::new(conn_error))
+            }
+        }
     }.map_err(|e| {
         let err_str = e.to_string();
         if err_str.contains("transport error") ||
