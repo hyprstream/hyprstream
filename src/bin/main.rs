@@ -21,12 +21,20 @@ pub struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging with debug level for hyprstream_core
+    let cli = Cli::parse();
+
+    // Get logging config from command
+    let (level, filter) = match &cli.command {
+        Commands::Server(cmd) => (&cmd.logging.get_effective_level(), &cmd.logging.log_filter),
+        Commands::Sql(cmd) => (&cmd.logging.get_effective_level(), &cmd.logging.log_filter),
+    };
+
+    // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::builder()
-                .with_default_directive(Level::INFO.into())
-                .parse_lossy("hyprstream_core=debug"),
+                .with_default_directive(level.parse().unwrap_or(Level::INFO).into())
+                .parse_lossy(filter.as_deref().unwrap_or("hyprstream_core=debug"))
         )
         .with_target(true)
         .with_thread_ids(true)
@@ -72,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cmd.tls_key.as_deref(),
                 cmd.tls_ca.as_deref(),
                 cmd.tls_skip_verify,
-                cmd.verbose,
+                cmd.logging.verbose > 0,
             ).await?
         }
     }

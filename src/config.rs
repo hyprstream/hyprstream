@@ -10,7 +10,10 @@
 //! Configuration options are loaded in order of precedence, with later sources
 //! overriding earlier ones.
 
-use crate::cli::commands::server::{CacheConfig, EngineConfig, ServerConfig};
+use crate::cli::commands::{
+    config::LoggingConfig,
+    server::{CacheConfig, EngineConfig, ServerConfig},
+};
 use config::{Config, ConfigError};
 use config::builder::{ConfigBuilder, DefaultState};
 use config::File;
@@ -95,6 +98,9 @@ pub struct Settings {
     /// Cache configuration
     #[serde(default)]
     pub cache: CacheConfig,
+    /// Logging configuration
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
 
 impl Settings {
@@ -103,6 +109,7 @@ impl Settings {
         server: ServerConfig,
         engine: EngineConfig,
         cache: CacheConfig,
+        logging: LoggingConfig,
         config_path: Option<PathBuf>,
     ) -> Result<Self, ConfigError> {
         let mut builder = ::config::Config::builder();
@@ -136,6 +143,7 @@ impl Settings {
         settings.server = server;
         settings.engine = engine;
         settings.cache = cache;
+        settings.logging = logging;
 
         Ok(settings)
     }

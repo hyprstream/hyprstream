@@ -17,6 +17,11 @@ connection = ":memory:"
 max_duration_secs = 3600
 options = {}
 
+# Logging Configuration
+[logging]
+level = "info"
+# filter = "hyprstream=debug,tower_http=debug"
+
 # TLS Configuration
 [tls]
 enabled = false

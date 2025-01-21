@@ -1,5 +1,11 @@
 use hyprstream_core::{
-    cli::{commands::sql::SqlCommand, handlers::execute_sql},
+    cli::{
+        commands::{
+            sql::SqlCommand,
+            config::LoggingConfig,
+        },
+        handlers::execute_sql,
+    },
     config::{self, set_tls_data, get_tls_config},
     service::FlightSqlServer,
     storage::{duckdb::DuckDbBackend, StorageBackendType},
@@ -144,7 +150,7 @@ async fn test_sql_command_basic() {
         Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), addr.port())),
         "CREATE TABLE test (id INTEGER);".to_string(),
         None,
-        false,
+        false, // No verbose output
     )
     .await;
     assert!(result.is_ok(), "Basic SQL query failed: {:?}", result.err());
@@ -179,7 +185,7 @@ async fn test_sql_command_tls() {
         Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), addr.port())),
         "CREATE TABLE test (id INTEGER);".to_string(),
         Some(&config),
-        true, // Enable verbose mode for more debug output
+        true, // -v for debug level output
     )
     .await;
     assert!(result.is_ok(), "TLS connection failed: {:?}", result.err());
@@ -198,7 +204,7 @@ async fn test_sql_command_timeout() {
         Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), addr.port() + 1)), // Wrong port
         "SELECT 1;".to_string(),
         None,
-        false,
+        true, // verbose output
     )
     .await;
     assert!(result.is_err(), "Expected timeout error");
@@ -217,7 +223,7 @@ async fn test_sql_command_timeout() {
         Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), addr.port())),
         "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n < 1000000) SELECT COUNT(*) FROM t;".to_string(), // Query that will take too long
         None,
-        false,
+        true, // verbose output for debugging
     )
     .await;
     assert!(result.is_err(), "Expected query timeout");
@@ -245,8 +251,12 @@ async fn test_sql_command_args() {
         tls_key: Some(tls_paths.key_path.clone()),
         tls_ca: Some(tls_paths.ca_path.clone()),
         tls_skip_verify: false,
-        verbose: true,
         help: None,
+        logging: LoggingConfig {
+            verbose: 1,  // -v for debug level
+            log_level: None,
+            log_filter: None,
+        },
     };
 
     // Verify command line arguments
@@ -256,7 +266,11 @@ async fn test_sql_command_args() {
     assert!(cmd.tls_key.is_some());
     assert!(cmd.tls_ca.is_some());
     assert!(!cmd.tls_skip_verify);
-    assert!(cmd.verbose);
+    // Test logging configuration
+    assert_eq!(cmd.logging.verbose, 1);  // -v for debug level
+    assert_eq!(cmd.logging.get_effective_level(), "debug");
+    assert!(cmd.logging.log_level.is_none());
+    assert!(cmd.logging.log_filter.is_none());
 
     // Test that we can create a Config with TLS settings from command args
     let config = Config::builder()
@@ -276,7 +290,7 @@ async fn test_sql_command_args() {
         Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)),
         cmd.query.clone(),
         Some(&config),
-        cmd.verbose,
+        cmd.logging.verbose > 0,
     ).await;
 
     // The connection will fail (no server) but we just want to verify the Config works

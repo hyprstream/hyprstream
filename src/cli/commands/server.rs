@@ -1,4 +1,4 @@
-use super::config::{ConfigOptionDef, ConfigSection};
+use super::config::{ConfigOptionDef, ConfigSection, LoggingConfig};
 use clap::Args;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -12,10 +12,6 @@ pub struct ServerConfig {
     /// Server port
     #[arg(long, env = "HYPRSTREAM_SERVER_PORT")]
     pub port: Option<u16>,
-
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(long, env = "HYPRSTREAM_LOG_LEVEL")]
-    pub log_level: Option<String>,
 
     /// Working directory for the server when running in detached mode
     #[arg(long, env = "HYPRSTREAM_WORKING_DIR")]
@@ -37,18 +33,6 @@ pub struct ServerConfig {
     #[arg(long = "tls-client-ca", env = "HYPRSTREAM_TLS_CLIENT_CA")]
     pub tls_client_ca: Option<PathBuf>,
 
-    /// Log rotation policy (never|hourly|daily|weekly)
-    #[arg(long, env = "HYPRSTREAM_LOG_ROTATION")]
-    pub log_rotation: Option<String>,
-
-    /// Number of log files to retain
-    #[arg(long, env = "HYPRSTREAM_LOG_RETENTION")]
-    pub log_retention: Option<u32>,
-
-    /// Enable log compression
-    #[arg(long, env = "HYPRSTREAM_LOG_COMPRESSION")]
-    pub log_compression: Option<bool>,
-
     /// Minimum TLS version (1.2|1.3)
     #[arg(long, env = "HYPRSTREAM_TLS_MIN_VERSION")]
     pub tls_min_version: Option<String>,
@@ -67,15 +51,11 @@ impl Default for ServerConfig {
         Self {
             host: None,
             port: None,
-            log_level: None,
             working_dir: None,
             pid_file: None,
             tls_cert: None,
             tls_key: None,
             tls_client_ca: None,
-            log_rotation: Some("daily".to_string()),
-            log_retention: Some(30),
-            log_compression: Some(true),
             tls_min_version: Some("1.2".to_string()),
             tls_cipher_list: None,
             tls_prefer_server_ciphers: Some(true),
@@ -92,12 +72,6 @@ impl ConfigSection for ServerConfig {
             ConfigOptionDef::new("server.port", "Server port")
                 .with_env("HYPRSTREAM_SERVER_PORT")
                 .with_cli("port"),
-            ConfigOptionDef::new(
-                "server.log_level",
-                "Log level (trace, debug, info, warn, error)",
-            )
-            .with_env("HYPRSTREAM_LOG_LEVEL")
-            .with_cli("log-level"),
             ConfigOptionDef::new(
                 "server.working_dir",
                 "Working directory for the server when running in detached mode",
@@ -122,24 +96,6 @@ impl ConfigSection for ServerConfig {
             )
             .with_env("HYPRSTREAM_TLS_CLIENT_CA")
             .with_cli("tls-client-ca"),
-            ConfigOptionDef::new(
-                "server.log_rotation",
-                "Log rotation policy (never|hourly|daily|weekly)",
-            )
-            .with_env("HYPRSTREAM_LOG_ROTATION")
-            .with_cli("log-rotation"),
-            ConfigOptionDef::new(
-                "server.log_retention",
-                "Number of log files to retain",
-            )
-            .with_env("HYPRSTREAM_LOG_RETENTION")
-            .with_cli("log-retention"),
-            ConfigOptionDef::new(
-                "server.log_compression",
-                "Enable log compression",
-            )
-            .with_env("HYPRSTREAM_LOG_COMPRESSION")
-            .with_cli("log-compression"),
             ConfigOptionDef::new(
                 "server.tls_min_version",
                 "Minimum TLS version (1.2|1.3)",
@@ -169,15 +125,11 @@ impl ConfigSection for ServerConfig {
         struct ServerConfigFile {
             host: Option<String>,
             port: Option<u16>,
-            log_level: Option<String>,
             working_dir: Option<String>,
             pid_file: Option<String>,
             tls_cert: Option<PathBuf>,
             tls_key: Option<PathBuf>,
             tls_client_ca: Option<PathBuf>,
-            log_rotation: Option<String>,
-            log_retention: Option<u32>,
-            log_compression: Option<bool>,
             tls_min_version: Option<String>,
             tls_cipher_list: Option<String>,
             tls_prefer_server_ciphers: Option<bool>,
@@ -187,15 +139,11 @@ impl ConfigSection for ServerConfig {
         Ok(ServerConfig {
             host: config.host,
             port: config.port,
-            log_level: config.log_level,
             working_dir: config.working_dir,
             pid_file: config.pid_file,
             tls_cert: config.tls_cert,
             tls_key: config.tls_key,
             tls_client_ca: config.tls_client_ca,
-            log_rotation: config.log_rotation.or(Some("daily".to_string())),
-            log_retention: config.log_retention.or(Some(30)),
-            log_compression: config.log_compression.or(Some(true)),
             tls_min_version: config.tls_min_version.or(Some("1.2".to_string())),
             tls_cipher_list: config.tls_cipher_list,
             tls_prefer_server_ciphers: config.tls_prefer_server_ciphers.or(Some(true)),
@@ -381,4 +329,7 @@ pub struct ServerCommand {
 
     #[command(flatten)]
     pub cache: CacheConfig,
+
+    #[command(flatten)]
+    pub logging: LoggingConfig,
 }
