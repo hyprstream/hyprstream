@@ -1,5 +1,3 @@
-use crate::aggregation::{AggregateFunction, AggregateResult, GroupBy};
-use crate::metrics::MetricRecord;
 use crate::storage::cache::{CacheEviction, CacheManager};
 use crate::storage::view::{ViewDefinition, ViewMetadata};
 use crate::storage::{Credentials, StorageBackend};
@@ -39,17 +37,6 @@ impl DuckDbBackend {
         // Initialize tables synchronously
         conn.execute_batch(
             r#"
-            CREATE TABLE IF NOT EXISTS metrics (
-                metric_id VARCHAR NOT NULL,
-                timestamp BIGINT NOT NULL,
-                value_running_window_sum DOUBLE NOT NULL,
-                value_running_window_avg DOUBLE NOT NULL,
-                value_running_window_count BIGINT NOT NULL,
-                PRIMARY KEY (metric_id, timestamp)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics(timestamp);
-
             CREATE TABLE IF NOT EXISTS view_metadata (
                 view_name VARCHAR PRIMARY KEY,
                 source_table VARCHAR NOT NULL,
@@ -86,64 +73,12 @@ impl StorageBackend for DuckDbBackend {
         Ok(())
     }
 
-    async fn insert_metrics(&self, metrics: Vec<MetricRecord>) -> Result<(), Status> {
-        let mut conn = self.conn.lock().await;
-        let tx = conn.transaction()
-            .map_err(|e| Status::internal(format!("Failed to start transaction: {}", e)))?;
-
-        for metric in metrics {
-            tx.execute(
-                &crate::storage::StorageUtils::generate_metric_insert_sql(),
-                params![
-                    metric.metric_id,
-                    metric.timestamp,
-                    metric.value_running_window_sum,
-                    metric.value_running_window_avg,
-                    metric.value_running_window_count,
-                ],
-            )
-            .map_err(|e| Status::internal(format!("Failed to insert metric: {}", e)))?;
-        }
-
-        tx.commit()
-            .map_err(|e| Status::internal(format!("Failed to commit transaction: {}", e)))?;
-
-        Ok(())
-    }
-
-    async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<MetricRecord>, Status> {
-        let conn = self.conn.lock().await;
-        let mut stmt = conn
-            .prepare(
-                &crate::storage::StorageUtils::generate_metric_query_sql(from_timestamp),
-            )
-            .map_err(|e| Status::internal(format!("Failed to prepare statement: {}", e)))?;
-
-        let rows = stmt
-            .query_map(params![from_timestamp], |row| {
-                Ok(MetricRecord {
-                    metric_id: row.get(0)?,
-                    timestamp: row.get(1)?,
-                    value_running_window_sum: row.get(2)?,
-                    value_running_window_avg: row.get(3)?,
-                    value_running_window_count: row.get(4)?,
-                })
-            })
-            .map_err(|e| Status::internal(format!("Failed to execute query: {}", e)))?;
-
-        let mut metrics = Vec::new();
-        for row in rows {
-            metrics.push(row.map_err(|e| Status::internal(format!("Failed to read row: {}", e)))?);
-        }
-
-        Ok(metrics)
-    }
 
     async fn prepare_sql(&self, query: &str) -> Result<Vec<u8>, Status> {
         Ok(query.as_bytes().to_vec())
     }
 
-    async fn query_sql(&self, statement_handle: &[u8]) -> Result<Vec<MetricRecord>, Status> {
+    async fn query_sql(&self, statement_handle: &[u8]) -> Result<RecordBatch, Status> {
         let sql = std::str::from_utf8(statement_handle)
             .map_err(|e| Status::internal(format!("Invalid SQL statement: {}", e)))?;
         
@@ -152,24 +87,45 @@ impl StorageBackend for DuckDbBackend {
             .prepare(sql)
             .map_err(|e| Status::internal(format!("Failed to prepare statement: {}", e)))?;
 
-        let rows = stmt
-            .query_map(params![], |row| {
-                Ok(MetricRecord {
-                    metric_id: row.get(0)?,
-                    timestamp: row.get(1)?,
-                    value_running_window_sum: row.get(2)?,
-                    value_running_window_avg: row.get(3)?,
-                    value_running_window_count: row.get(4)?,
-                })
-            })
+        // Use query_arrow to get RecordBatch directly
+        let mut arrow_stream = stmt.query_arrow(params![])
             .map_err(|e| Status::internal(format!("Failed to execute query: {}", e)))?;
 
-        let mut metrics = Vec::new();
-        for row in rows {
-            metrics.push(row.map_err(|e| Status::internal(format!("Failed to read row: {}", e)))?);
+        // Get the first batch (or empty if no results)
+        match arrow_stream.next() {
+            Some(batch) => Ok(batch),
+            None => {
+                // Create empty batch with schema from statement
+                let schema = Arc::new(Schema::new(
+                    stmt.column_names()
+                        .iter()
+                        .map(|col| {
+                            Field::new(
+                                col,
+                                match col.to_uppercase().as_str() {
+                                    "INTEGER" | "BIGINT" => DataType::Int64,
+                                    "DOUBLE" | "REAL" | "FLOAT" => DataType::Float64,
+                                    "VARCHAR" | "TEXT" => DataType::Utf8,
+                                    _ => DataType::Utf8, // Fallback but log warning
+                                },
+                                true,
+                            )
+                        })
+                        .collect::<Vec<Field>>(),
+                ));
+                let empty_arrays: Vec<ArrayRef> = schema
+                    .fields()
+                    .iter()
+                    .map(|field| match field.data_type() {
+                        DataType::Int64 => Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
+                        DataType::Float64 => Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef,
+                        _ => Arc::new(StringArray::from(Vec::<String>::new())) as ArrayRef,
+                    })
+                    .collect();
+                RecordBatch::try_new(schema, empty_arrays)
+                    .map_err(|e| Status::internal(format!("Failed to create empty batch: {}", e)))
+            }
         }
-
-        Ok(metrics)
     }
 
     fn new_with_options(
@@ -238,86 +194,6 @@ impl StorageBackend for DuckDbBackend {
             .map_err(|e| Status::internal(format!("Failed to commit transaction: {}", e)))?;
 
         Ok(())
-    }
-
-    async fn query_table(
-        &self,
-        table_name: &str,
-        projection: Option<Vec<String>>,
-    ) -> Result<RecordBatch, Status> {
-        // Get schema first
-        let schema = self.get_table_schema(table_name).await?;
-
-        // Then execute query
-        let sql = crate::storage::StorageUtils::generate_select_sql(table_name, projection);
-        tracing::debug!("Executing query: {}", sql);
-
-        let conn = self.conn.lock().await;
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| Status::internal(format!("Failed to prepare statement: {}", e)))?;
-
-        // Execute query and collect results
-        let mut rows = stmt
-            .query(params![])
-            .map_err(|e| Status::internal(format!("Failed to execute query: {}", e)))?;
-
-        let mut values: Vec<Vec<String>> = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| Status::internal(e.to_string()))? {
-            let mut row_values = Vec::new();
-            for i in 0..schema.fields().len() {
-                row_values.push(row.get::<_, String>(i).unwrap_or_default());
-            }
-            values.push(row_values);
-        }
-
-        // If no rows, return empty batch
-        if values.is_empty() {
-            let empty_arrays: Vec<ArrayRef> = schema
-                .fields()
-                .iter()
-                .map(|field| match field.data_type() {
-                    DataType::Int64 => Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
-                    DataType::Float64 => Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef,
-                    _ => Arc::new(StringArray::from(Vec::<String>::new())) as ArrayRef,
-                })
-                .collect();
-            return Ok(RecordBatch::try_new(schema, empty_arrays)
-                .map_err(|e| Status::internal(format!("Failed to create empty batch: {}", e)))?);
-        }
-
-        // Convert string values to appropriate types
-        let arrays: Vec<ArrayRef> = schema
-            .fields()
-            .iter()
-            .enumerate()
-            .map(|(i, field)| {
-                let column_values: Vec<_> = values.iter().map(|row| &row[i]).collect();
-                match field.data_type() {
-                    DataType::Int64 => {
-                        let parsed: Vec<i64> = column_values
-                            .iter()
-                            .map(|s| s.parse().unwrap_or_default())
-                            .collect();
-                        Arc::new(Int64Array::from(parsed)) as ArrayRef
-                    }
-                    DataType::Float64 => {
-                        let parsed: Vec<f64> = column_values
-                            .iter()
-                            .map(|s| s.parse().unwrap_or_default())
-                            .collect();
-                        Arc::new(Float64Array::from(parsed)) as ArrayRef
-                    }
-                    _ => {
-                        let str_values: Vec<&str> = column_values.iter().map(|s| s.as_str()).collect();
-                        Arc::new(StringArray::from(str_values)) as ArrayRef
-                    }
-                }
-            })
-            .collect();
-
-        Ok(RecordBatch::try_new(schema, arrays)
-            .map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))?)
     }
 
     async fn create_view(&self, name: &str, definition: ViewDefinition) -> Result<(), Status> {
@@ -477,49 +353,6 @@ impl StorageBackend for DuckDbBackend {
         }
 
         Ok(Arc::new(Schema::new(fields)))
-    }
-
-    async fn aggregate_metrics(
-        &self,
-        function: AggregateFunction,
-        group_by: &GroupBy,
-        from_timestamp: i64,
-        to_timestamp: Option<i64>,
-    ) -> Result<Vec<AggregateResult>, Status> {
-        let sql = crate::storage::StorageUtils::generate_metric_aggregation_sql(
-            function,
-            group_by,
-            from_timestamp,
-            to_timestamp
-        );
-
-        // Execute query
-        let conn = self.conn.lock().await;
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| Status::internal(format!("Failed to prepare statement: {}", e)))?;
-
-        let rows = stmt
-            .query_map(params![], |row| {
-                let mut group_values = HashMap::new();
-                for (i, col) in group_by.columns.iter().enumerate() {
-                    group_values.insert(col.clone(), row.get::<_, String>(i)?);
-                }
-                let value = row.get::<_, f64>(group_by.columns.len())?;
-                Ok(AggregateResult {
-                    value,
-                    group_values,
-                    timestamp: None, // TODO: Add timestamp support
-                })
-            })
-            .map_err(|e| Status::internal(format!("Failed to execute query: {}", e)))?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.map_err(|e| Status::internal(format!("Failed to read row: {}", e)))?);
-        }
-
-        Ok(results)
     }
 }
 

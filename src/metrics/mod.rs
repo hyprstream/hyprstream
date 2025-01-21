@@ -1,10 +1,13 @@
+pub mod storage;
+
 use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use serde::{Deserialize, Serialize};
+use std::default::Default;
 use std::sync::Arc;
 use tonic::Status;
 
-use serde::{Deserialize, Serialize};
-use std::default::Default;
+pub use storage::{MetricsStorage, MetricsStorageImpl};
 
 /// A single metric record with running window calculations.
 #[derive(Debug, Clone, Serialize, Deserialize)]

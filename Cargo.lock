@@ -2205,6 +2205,7 @@ dependencies = [
  "arrow-array",
  "arrow-flight",
  "arrow-ipc",
+ "arrow-json",
  "arrow-schema",
  "async-stream",
  "async-trait",

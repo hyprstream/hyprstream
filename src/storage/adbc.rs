@@ -1,5 +1,3 @@
-use crate::aggregation::{AggregateFunction, AggregateResult, GroupBy};
-use crate::metrics::MetricRecord;
 use crate::storage::cache::{CacheEviction, CacheManager};
 use crate::storage::view::{ViewDefinition, ViewMetadata};
 use crate::storage::{Credentials, StorageBackend};
@@ -7,10 +5,8 @@ use adbc_core::{
     driver_manager::ManagedConnection,
     Connection, Database, Driver, Optionable, Statement,
 };
-use arrow_array::{
-    Array, Float64Array, Int64Array, RecordBatch, StringArray,
-    builder::{Int64Builder, StringBuilder},
-};
+use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::builder::{StringBuilder, Int64Builder};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -110,17 +106,6 @@ impl StorageBackend for AdbcBackend {
     async fn init(&self) -> Result<(), Status> {
         self.execute_statement(
             r#"
-            CREATE TABLE IF NOT EXISTS metrics (
-                metric_id VARCHAR NOT NULL,
-                timestamp BIGINT NOT NULL,
-                value_running_window_sum DOUBLE PRECISION NOT NULL,
-                value_running_window_avg DOUBLE PRECISION NOT NULL,
-                value_running_window_count BIGINT NOT NULL,
-                PRIMARY KEY (metric_id, timestamp)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics(timestamp);
-
             CREATE TABLE IF NOT EXISTS view_metadata (
                 view_name VARCHAR PRIMARY KEY,
                 source_table VARCHAR NOT NULL,
@@ -132,95 +117,6 @@ impl StorageBackend for AdbcBackend {
         .await
     }
 
-    async fn insert_metrics(&self, metrics: Vec<MetricRecord>) -> Result<(), Status> {
-        let mut conn = self.conn.lock().await;
-        let mut stmt = conn
-            .new_statement()
-            .map_err(|e| Status::internal(format!("Failed to create statement: {}", e)))?;
-
-        let batch = crate::storage::StorageUtils::create_metric_batch(&metrics)?;
-
-        stmt.set_sql_query(
-            &crate::storage::StorageUtils::generate_metric_insert_sql(),
-        )
-        .map_err(|e| Status::internal(format!("Failed to set query: {}", e)))?;
-
-        stmt.bind(batch)
-            .map_err(|e| Status::internal(format!("Failed to bind parameters: {}", e)))?;
-
-        stmt.execute_update()
-            .map_err(|e| Status::internal(format!("Failed to execute statement: {}", e)))?;
-
-        Ok(())
-    }
-
-    async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<MetricRecord>, Status> {
-        let mut conn = self.conn.lock().await;
-        let mut stmt = conn
-            .new_statement()
-            .map_err(|e| Status::internal(format!("Failed to create statement: {}", e)))?;
-
-        stmt.set_sql_query(
-            &crate::storage::StorageUtils::generate_metric_query_sql(from_timestamp),
-        )
-        .map_err(|e| Status::internal(format!("Failed to set query: {}", e)))?;
-
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "timestamp",
-            DataType::Int64,
-            false,
-        )]));
-        let mut builder = Int64Builder::new();
-        builder.append_value(from_timestamp);
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(builder.finish())])
-            .map_err(|e| Status::internal(format!("Failed to create batch: {}", e)))?;
-
-        stmt.bind(batch)
-            .map_err(|e| Status::internal(format!("Failed to bind parameters: {}", e)))?;
-
-        let mut reader = stmt
-            .execute()
-            .map_err(|e| Status::internal(format!("Failed to execute query: {}", e)))?;
-
-        let mut metrics = Vec::new();
-        while let Some(batch) = reader.next() {
-            let batch = batch.map_err(|e| Status::internal(format!("Failed to read batch: {}", e)))?;
-
-            for row in 0..batch.num_rows() {
-                metrics.push(MetricRecord {
-                    metric_id: batch
-                        .column_by_name("metric_id")
-                        .and_then(|col| col.as_any().downcast_ref::<StringArray>())
-                        .ok_or_else(|| Status::internal("Invalid metric_id column"))?
-                        .value(row)
-                        .to_string(),
-                    timestamp: batch
-                        .column_by_name("timestamp")
-                        .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
-                        .ok_or_else(|| Status::internal("Invalid timestamp column"))?
-                        .value(row),
-                    value_running_window_sum: batch
-                        .column_by_name("value_running_window_sum")
-                        .and_then(|col| col.as_any().downcast_ref::<Float64Array>())
-                        .ok_or_else(|| Status::internal("Invalid value_running_window_sum column"))?
-                        .value(row),
-                    value_running_window_avg: batch
-                        .column_by_name("value_running_window_avg")
-                        .and_then(|col| col.as_any().downcast_ref::<Float64Array>())
-                        .ok_or_else(|| Status::internal("Invalid value_running_window_avg column"))?
-                        .value(row),
-                    value_running_window_count: batch
-                        .column_by_name("value_running_window_count")
-                        .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
-                        .ok_or_else(|| Status::internal("Invalid value_running_window_count column"))?
-                        .value(row),
-                });
-            }
-        }
-
-        Ok(metrics)
-    }
-
     async fn prepare_sql(&self, query: &str) -> Result<Vec<u8>, Status> {
         let handle = self.statement_counter.fetch_add(1, Ordering::SeqCst);
         let mut statements = self.prepared_statements.lock().await;
@@ -228,7 +124,7 @@ impl StorageBackend for AdbcBackend {
         Ok(handle.to_le_bytes().to_vec())
     }
 
-    async fn query_sql(&self, statement_handle: &[u8]) -> Result<Vec<MetricRecord>, Status> {
+    async fn query_sql(&self, statement_handle: &[u8]) -> Result<RecordBatch, Status> {
         let handle = u64::from_le_bytes(
             statement_handle
                 .try_into()
@@ -236,13 +132,48 @@ impl StorageBackend for AdbcBackend {
         );
 
         let statements = self.prepared_statements.lock().await;
-        let _sql = statements
+        let sql = statements
             .iter()
             .find(|(h, _)| *h == handle)
             .map(|(_, sql)| sql.as_str())
             .ok_or_else(|| Status::invalid_argument("Statement handle not found"))?;
 
-        self.query_metrics(0).await // TODO: Parse timestamp from SQL
+        let mut conn = self.conn.lock().await;
+        let mut stmt = conn
+            .new_statement()
+            .map_err(|e| Status::internal(format!("Failed to create statement: {}", e)))?;
+
+        stmt.set_sql_query(sql)
+            .map_err(|e| Status::internal(format!("Failed to set query: {}", e)))?;
+
+        // Get schema before executing query
+        let schema = Arc::new(Schema::new(
+            stmt.get_parameter_schema()
+                .map_err(|e| Status::internal(format!("Failed to get schema: {}", e)))?
+                .fields()
+                .to_vec(),
+        ));
+
+        let mut reader = stmt
+            .execute()
+            .map_err(|e| Status::internal(format!("Failed to execute query: {}", e)))?;
+
+        if let Some(batch) = reader.next() {
+            batch.map_err(|e| Status::internal(format!("Failed to read batch: {}", e)))
+        } else {
+            // Use already obtained schema for empty batch
+            let empty_arrays: Vec<ArrayRef> = schema
+                .fields()
+                .iter()
+                .map(|field| match field.data_type() {
+                    DataType::Int64 => Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
+                    DataType::Float64 => Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef,
+                    _ => Arc::new(StringArray::from(Vec::<String>::new())) as ArrayRef,
+                })
+                .collect();
+            RecordBatch::try_new(schema, empty_arrays)
+                .map_err(|e| Status::internal(format!("Failed to create empty batch: {}", e)))
+        }
     }
 
     fn new_with_options(
@@ -280,32 +211,6 @@ impl StorageBackend for AdbcBackend {
             .map_err(|e| Status::internal(format!("Failed to execute statement: {}", e)))?;
 
         Ok(())
-    }
-
-    async fn query_table(
-        &self,
-        table_name: &str,
-        projection: Option<Vec<String>>,
-    ) -> Result<RecordBatch, Status> {
-        let sql = crate::storage::StorageUtils::generate_select_sql(table_name, projection);
-
-        let mut conn = self.conn.lock().await;
-        let mut stmt = conn
-            .new_statement()
-            .map_err(|e| Status::internal(format!("Failed to create statement: {}", e)))?;
-
-        stmt.set_sql_query(&sql)
-            .map_err(|e| Status::internal(format!("Failed to set query: {}", e)))?;
-
-        let mut reader = stmt
-            .execute()
-            .map_err(|e| Status::internal(format!("Failed to execute query: {}", e)))?;
-
-        if let Some(batch) = reader.next() {
-            batch.map_err(|e| Status::internal(format!("Failed to read batch: {}", e)))
-        } else {
-            Err(Status::not_found("No data found"))
-        }
     }
 
     async fn create_view(&self, name: &str, definition: ViewDefinition) -> Result<(), Status> {
@@ -597,65 +502,5 @@ impl StorageBackend for AdbcBackend {
         }
 
         Ok(Arc::new(Schema::new(fields)))
-    }
-
-    async fn aggregate_metrics(
-        &self,
-        function: AggregateFunction,
-        group_by: &GroupBy,
-        from_timestamp: i64,
-        to_timestamp: Option<i64>,
-    ) -> Result<Vec<AggregateResult>, Status> {
-        let sql = crate::storage::StorageUtils::generate_metric_aggregation_sql(
-            function,
-            group_by,
-            from_timestamp,
-            to_timestamp
-        );
-
-        // Execute query
-        let mut conn = self.conn.lock().await;
-        let mut stmt = conn
-            .new_statement()
-            .map_err(|e| Status::internal(format!("Failed to create statement: {}", e)))?;
-
-        stmt.set_sql_query(&sql)
-            .map_err(|e| Status::internal(format!("Failed to set query: {}", e)))?;
-
-        let mut reader = stmt
-            .execute()
-            .map_err(|e| Status::internal(format!("Failed to execute query: {}", e)))?;
-
-        let mut results = Vec::new();
-        while let Some(batch) = reader.next() {
-            let batch = batch.map_err(|e| Status::internal(format!("Failed to read batch: {}", e)))?;
-
-            for row in 0..batch.num_rows() {
-                let mut group_values = HashMap::new();
-                for (_i, col) in group_by.columns.iter().enumerate() {
-                    let value = batch
-                        .column_by_name(col)
-                        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-                        .ok_or_else(|| Status::internal(format!("Invalid column {}", col)))?
-                        .value(row)
-                        .to_string();
-                    group_values.insert(col.clone(), value);
-                }
-
-                let value = batch
-                    .column_by_name("value")
-                    .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
-                    .ok_or_else(|| Status::internal("Invalid value column"))?
-                    .value(row);
-
-                results.push(AggregateResult {
-                    value,
-                    group_values,
-                    timestamp: None, // TODO: Add timestamp support
-                });
-            }
-        }
-
-        Ok(results)
     }
 }

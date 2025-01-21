@@ -51,10 +51,12 @@
 //! data consistency between cache and backing store.
 
 use crate::config::Credentials;
-use crate::metrics::MetricRecord;
+use crate::storage::view::ViewDefinition;
 use crate::storage::{StorageBackend, adbc::AdbcBackend, duckdb::DuckDbBackend};
 use std::sync::Arc;
 use std::collections::HashMap;
+use arrow_array::RecordBatch;
+use arrow_schema::Schema;
 use tonic::Status;
 
 /// Two-tier storage backend with caching support.
@@ -116,59 +118,6 @@ impl StorageBackend for CachedStorageBackend {
         Ok(())
     }
 
-    /// Inserts metrics into both cache and backing store.
-    ///
-    /// This method implements write-through caching:
-    /// 1. Writes to cache for fast access
-    /// 2. Writes to backing store for persistence
-    ///
-    /// # Arguments
-    ///
-    /// * `metrics` - Vector of MetricRecord instances to insert
-    async fn insert_metrics(&self, metrics: Vec<MetricRecord>) -> Result<(), Status> {
-        // Insert into both cache and backing store
-        self.cache.insert_metrics(metrics.clone()).await?;
-        self.store.insert_metrics(metrics).await?;
-        Ok(())
-    }
-
-    /// Queries metrics with caching support.
-    ///
-    /// This method implements a cache-first query strategy:
-    /// 1. Attempts to read from cache
-    /// 2. On cache miss, reads from backing store
-    /// 3. Updates cache with results from backing store
-    ///
-    /// # Arguments
-    ///
-    /// * `from_timestamp` - Unix timestamp to query from
-    async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<MetricRecord>, Status> {
-        // Calculate cache cutoff time
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        let cache_cutoff = now - self.max_duration_secs as i64;
-
-        // Only use cache for data within cache window
-        if from_timestamp >= cache_cutoff {
-            match self.cache.query_metrics(from_timestamp).await {
-                Ok(metrics) if !metrics.is_empty() => return Ok(metrics),
-                _ => {}
-            }
-        }
-
-        // Cache miss or data too old, query backing store
-        let metrics = self.store.query_metrics(from_timestamp).await?;
-
-        // Update cache with results if within cache window
-        if !metrics.is_empty() && from_timestamp >= cache_cutoff {
-            self.cache.insert_metrics(metrics.clone()).await?;
-        }
-
-        Ok(metrics)
-    }
-
     /// Prepares a SQL statement on the backing store.
     ///
     /// This method bypasses the cache and prepares statements
@@ -192,7 +141,7 @@ impl StorageBackend for CachedStorageBackend {
     /// # Arguments
     ///
     /// * `statement_handle` - Handle of the prepared statement
-    async fn query_sql(&self, statement_handle: &[u8]) -> Result<Vec<MetricRecord>, Status> {
+    async fn query_sql(&self, statement_handle: &[u8]) -> Result<RecordBatch, Status> {
         // Execute on backing store only
         self.store.query_sql(statement_handle).await
     }
@@ -241,5 +190,68 @@ impl StorageBackend for CachedStorageBackend {
         )?);
 
         Ok(Self::new(cache, store, max_duration_secs))
+    }
+
+    async fn create_table(&self, table_name: &str, schema: &Schema) -> Result<(), Status> {
+        // Create table in both cache and store
+        self.cache.create_table(table_name, schema).await?;
+        self.store.create_table(table_name, schema).await?;
+        Ok(())
+    }
+
+    async fn insert_into_table(&self, table_name: &str, batch: RecordBatch) -> Result<(), Status> {
+        // Insert into both cache and store
+        self.cache.insert_into_table(table_name, batch.clone()).await?;
+        self.store.insert_into_table(table_name, batch).await?;
+        Ok(())
+    }
+
+    async fn create_view(&self, name: &str, definition: ViewDefinition) -> Result<(), Status> {
+        // Create view in both cache and store
+        self.cache.create_view(name, definition.clone()).await?;
+        self.store.create_view(name, definition).await?;
+        Ok(())
+    }
+
+    async fn get_view(&self, name: &str) -> Result<crate::storage::view::ViewMetadata, Status> {
+        // Try cache first
+        match self.cache.get_view(name).await {
+            Ok(view) => Ok(view),
+            Err(_) => {
+                // On cache miss, get from store and update cache
+                let view = self.store.get_view(name).await?;
+                self.cache.create_view(name, view.definition.clone()).await?;
+                Ok(view)
+            }
+        }
+    }
+
+    async fn list_views(&self) -> Result<Vec<String>, Status> {
+        // List views from store (source of truth)
+        self.store.list_views().await
+    }
+
+    async fn drop_view(&self, name: &str) -> Result<(), Status> {
+        // Drop from both cache and store
+        self.cache.drop_view(name).await?;
+        self.store.drop_view(name).await?;
+        Ok(())
+    }
+
+    async fn drop_table(&self, table_name: &str) -> Result<(), Status> {
+        // Drop from both cache and store
+        self.cache.drop_table(table_name).await?;
+        self.store.drop_table(table_name).await?;
+        Ok(())
+    }
+
+    async fn list_tables(&self) -> Result<Vec<String>, Status> {
+        // List tables from store (source of truth)
+        self.store.list_tables().await
+    }
+
+    async fn get_table_schema(&self, table_name: &str) -> Result<Arc<Schema>, Status> {
+        // Get schema from store (source of truth)
+        self.store.get_table_schema(table_name).await
     }
 }

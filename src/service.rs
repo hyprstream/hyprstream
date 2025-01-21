@@ -25,6 +25,8 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tonic::{Request, Response, Status, Streaming};
+use arrow_array::{Int64Array, Float64Array, StringArray};
+use arrow_schema::DataType;
 
 // Add conversion trait for Arrow errors
 #[allow(dead_code)]
@@ -206,9 +208,37 @@ impl FlightSqlServer {
             }
             Command::Sql(SqlCommand::Query(sql)) => {
                 let statement_handle = self.backend.prepare_sql(&sql).await?;
-                let results = self.backend.query_sql(&statement_handle).await?;
-                serde_json::to_vec(&results)
-                    .map_err(|e| Status::internal(format!("Failed to serialize results: {}", e)))
+                let batch = self.backend.query_sql(&statement_handle).await?;
+                
+                // Convert to JSON using Arrow's array display
+                let mut json_rows = Vec::new();
+                for row_idx in 0..batch.num_rows() {
+                    let mut row = serde_json::Map::new();
+                    for col_idx in 0..batch.num_columns() {
+                        let col = batch.column(col_idx);
+                        let schema = batch.schema();
+                        let field = schema.field(col_idx);
+                        let col_name = field.name();
+                        let value = match col.data_type() {
+                            DataType::Int64 => {
+                                let array = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                                serde_json::Value::Number(array.value(row_idx).into())
+                            }
+                            DataType::Float64 => {
+                                let array = col.as_any().downcast_ref::<Float64Array>().unwrap();
+                                serde_json::Value::Number(serde_json::Number::from_f64(array.value(row_idx)).unwrap())
+                            }
+                            _ => {
+                                let array = col.as_any().downcast_ref::<StringArray>().unwrap();
+                                serde_json::Value::String(array.value(row_idx).to_string())
+                            }
+                        };
+                        row.insert(col_name.to_string(), value);
+                    }
+                    json_rows.push(serde_json::Value::Object(row));
+                }
+                serde_json::to_vec(&json_rows)
+                    .map_err(|e| Status::internal(format!("Failed to serialize JSON: {}", e)))
             }
         }
     }
