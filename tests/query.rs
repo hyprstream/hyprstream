@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 #[tokio::test]
-async fn test_simple_query_execution() -> Result<()> {
+async fn test_simple_query_execution() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Create a simple schema
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -31,6 +31,12 @@ async fn test_simple_query_execution() -> Result<()> {
 
     // Create query engine with default configuration
     let backend = Arc::new(DuckDbBackend::new_in_memory().unwrap());
+    backend.init().await?;
+    
+    // Create and populate test table
+    backend.create_table("test_table", &schema).await?;
+    backend.insert_into_table("test_table", batch).await?;
+
     let planner = DataFusionPlanner::new(backend.clone()).await?;
     let executor = DataFusionExecutor::new(ExecutorConfig::default());
 
@@ -52,11 +58,12 @@ async fn test_simple_query_execution() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_vector_operations() -> Result<()> {
-    // Create schema for vector data
+async fn test_vector_operations() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // Create schema for vector data including output column
     let schema = Arc::new(Schema::new(vec![
         Field::new("vec1", DataType::Float32, false),
         Field::new("vec2", DataType::Float32, false),
+        Field::new("result", DataType::Float32, false),
     ]));
 
     // Create test vectors
@@ -119,7 +126,7 @@ async fn test_query_optimization() -> std::result::Result<(), Box<dyn std::error
 }
 
 #[tokio::test]
-async fn test_executor_configuration() -> Result<()> {
+async fn test_executor_configuration() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Create executor with custom configuration
     let config = ExecutorConfig {
         max_concurrent_tasks: 4,
@@ -152,8 +159,24 @@ async fn test_executor_configuration() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_streaming_execution() -> Result<()> {
+async fn test_streaming_execution() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // Create and set up backend
     let backend = Arc::new(DuckDbBackend::new_in_memory().unwrap());
+    backend.init().await?;
+
+    // Create test table
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Float32, false),
+    ]));
+    backend.create_table("test_table", &schema).await?;
+
+    // Insert test data
+    let id_array = Int64Array::from(vec![1, 2, 3, 4, 5]);
+    let value_array = Float32Array::from(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(id_array), Arc::new(value_array)])?;
+    backend.insert_into_table("test_table", batch).await?;
+
     let planner = DataFusionPlanner::new(backend.clone()).await?;
     let executor = DataFusionExecutor::new(ExecutorConfig::default());
 

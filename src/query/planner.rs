@@ -185,12 +185,20 @@ use std::collections::HashMap;
 mod tests {
     use super::*;
     use crate::storage::duckdb::DuckDbBackend;
+    use arrow::datatypes::{DataType, Field, Schema};
 
     #[tokio::test]
     async fn test_query_planning_with_views() -> Result<()> {
         // Create test backend
         let backend = Arc::new(DuckDbBackend::new_in_memory().unwrap());
         backend.init().await.unwrap();
+
+        // Create test table
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        backend.create_table("test_table", &schema).await.unwrap();
 
         // Create planner with backend
         let planner = DataFusionPlanner::new(backend).await?;

@@ -53,6 +53,8 @@ pub struct VectorizedOperator {
     /// Input column names
     input_columns: Vec<String>,
     /// Output column name
+    // TODO: Use this field when implementing column renaming in execute method
+    #[allow(dead_code)]
     output_column: String,
 }
 

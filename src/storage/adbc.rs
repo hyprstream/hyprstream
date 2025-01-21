@@ -25,6 +25,7 @@ pub struct AdbcBackend {
     conn: Arc<Mutex<ManagedConnection>>,
     statement_counter: Arc<AtomicU64>,
     prepared_statements: Arc<Mutex<Vec<(u64, String)>>>,
+    #[allow(dead_code)]
     cache_manager: CacheManager,
 }
 

@@ -18,7 +18,7 @@ pub async fn execute_sql(
     tls_cert: Option<&Path>,
     tls_key: Option<&Path>,
     tls_ca: Option<&Path>,
-    tls_skip_verify: bool,
+    _tls_skip_verify: bool,
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let addr = addr.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 50051)));

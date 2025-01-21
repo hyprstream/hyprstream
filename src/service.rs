@@ -18,6 +18,7 @@ use std::sync::Mutex;
 use tonic::{Request, Response, Status, Streaming};
 
 // Add conversion trait for Arrow errors
+#[allow(dead_code)]
 trait ArrowErrorExt {
     fn to_status(self) -> Status;
 }
@@ -146,7 +147,9 @@ impl TableCommand {
 #[derive(Clone)]
 pub struct FlightSqlServer {
     backend: Arc<StorageBackendType>,
+    #[allow(dead_code)]
     statement_counter: Arc<AtomicU64>,
+    #[allow(dead_code)]
     prepared_statements: Arc<Mutex<Vec<String>>>,
 }
 

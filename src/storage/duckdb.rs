@@ -21,8 +21,11 @@ use tonic::Status;
 #[derive(Clone)]
 pub struct DuckDbBackend {
     conn: Arc<Mutex<Connection>>,
+    #[allow(dead_code)]
     connection_string: String,
+    #[allow(dead_code)]
     options: HashMap<String, String>,
+    #[allow(dead_code)]
     cache_manager: CacheManager,
 }
 
@@ -88,7 +91,7 @@ impl StorageBackend for DuckDbBackend {
                 view_name VARCHAR PRIMARY KEY,
                 source_table VARCHAR NOT NULL,
                 view_definition JSON NOT NULL,
-                created_at TIMESTAMP NOT NULL
+                created_at BIGINT NOT NULL
             );
             "#,
         )

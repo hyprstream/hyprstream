@@ -49,7 +49,8 @@ pub trait QueryExecutor: Send + Sync {
 pub struct DataFusionExecutor {
     /// Runtime configuration
     config: ExecutorConfig,
-    /// Session context
+    /// Session context - used indirectly through task context in execute_stream
+    #[allow(dead_code)]
     ctx: SessionContext,
 }
 

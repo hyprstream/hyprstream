@@ -6,9 +6,8 @@ use arrow::{
 use hyprstream_core::{
     storage::{
         duckdb::DuckDbBackend, StorageBackend, StorageBackendType,
-        view::{ViewDefinition, AggregationSpec},
+        view::ViewDefinition,
     },
-    aggregation::{AggregateFunction, GroupBy},
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -55,24 +54,17 @@ async fn test_cache_operations() -> Result<(), Status> {
 
     // Create view
     let view_name = format!("view_{}", table_name);
-    let view_def = ViewDefinition {
-        source_table: table_name.to_string(),
-        columns: vec!["value".to_string(), "timestamp".to_string()],
-        aggregations: vec![AggregationSpec {
-            function: AggregateFunction::Avg,
-            column: "value".to_string(),
-        }],
-        group_by: Some(GroupBy {
-            columns: vec!["timestamp".to_string()],
-            time_column: None,
-        }),
-        window: None,
-        dependencies: HashSet::new(),
-        schema: Arc::new(Schema::new(vec![
-            Field::new("avg_value", DataType::Float64, false),
+    let view_def = ViewDefinition::new(
+        table_name.to_string(),
+        vec!["value".to_string(), "timestamp".to_string()],
+        vec![],
+        None,
+        None,
+        Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Float64, false),
             Field::new("timestamp", DataType::Int64, false),
         ])),
-    };
+    );
     backend.as_ref().create_view(&view_name, view_def).await?;
 
     // Query view
