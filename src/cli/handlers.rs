@@ -5,6 +5,7 @@ use crate::{
 };
 use std::error::Error as StdError;
 use std::fmt;
+use tracing::{debug, error, info};
 
 #[derive(Debug)]
 enum ConnectionError {
@@ -49,74 +50,59 @@ pub async fn execute_sql(
     let addr = addr.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 50051)));
     let scheme = if config.map(|c| c.get_bool("tls.enabled").unwrap_or(false)).unwrap_or(false) { "https" } else { "http" };
     let channel = {
-        if verbose {
-            println!("Connecting to {}://{}:{} with TLS={}", scheme, addr.ip(), addr.port(),
-                    config.map(|c| c.get_bool("tls.enabled").unwrap_or(false)).unwrap_or(false));
-        }
+        debug!(
+            scheme = scheme,
+            ip = %addr.ip(),
+            port = %addr.port(),
+            tls_enabled = config.map(|c| c.get_bool("tls.enabled").unwrap_or(false)).unwrap_or(false),
+            "Connecting to endpoint"
+        );
         
         let mut endpoint = tonic::transport::Channel::from_shared(format!("{}://{}:{}", scheme, addr.ip(), addr.port()))?
             .timeout(std::time::Duration::from_secs(60))  // Increase timeout for TLS handshake
             .tcp_keepalive(Some(std::time::Duration::from_secs(5)))
             .connect_timeout(std::time::Duration::from_secs(30));  // Separate connect timeout
 
-        if verbose {
-            println!("Channel endpoint created with 60s timeout and TCP keepalive");
-        }
+        debug!("Channel endpoint created with 60s timeout and TCP keepalive");
 
         if let Some(config) = config {
             if let Some((identity, ca_cert)) = get_tls_config(config) {
-                if verbose {
-                    println!("Configuring TLS client with identity and CA cert");
-                }
-                if verbose {
-                    println!("Creating client TLS config with identity");
-                }
+                debug!("Configuring TLS client with identity and CA cert");
+                debug!("Creating client TLS config with identity");
                 
                 let mut tls = ClientTlsConfig::new()
                     .domain_name("localhost")
                     .identity(identity);
                 
                 if let Some(ca) = ca_cert {
-                    if verbose {
-                        println!("Adding CA certificate to TLS config");
-                    }
+                    debug!("Adding CA certificate to TLS config");
                     tls = tls.ca_certificate(ca);
                 }
 
-                if verbose {
-                    println!("Client TLS config created with SNI name 'localhost'");
-                    println!("Attempting TLS connection with server...");
-                }
-
-                if verbose {
-                    println!("Applying TLS configuration to endpoint");
-                }
+                debug!("Client TLS config created with SNI name 'localhost'");
+                debug!("Attempting TLS connection with server...");
+                debug!("Applying TLS configuration to endpoint");
+                
                 endpoint = endpoint.tls_config(tls)?;
-            } else if verbose {
-                println!("No TLS configuration found in config");
+            } else {
+                debug!("No TLS configuration found in config");
             }
-        } else if verbose {
-            println!("No config provided for TLS");
+        } else {
+            debug!("No config provided for TLS");
         }
 
-        if verbose {
-            println!("Attempting to connect to endpoint...");
-        }
+        debug!("Attempting to connect to endpoint...");
         
         match endpoint.connect().await {
             Ok(chan) => {
-                if verbose {
-                    println!("Successfully connected to endpoint");
-                }
+                debug!("Successfully connected to endpoint");
                 Ok(chan)
             }
             Err(e) => {
                 let err_str = e.to_string();
-                if verbose {
-                    println!("Connection error: {}", err_str);
-                    if let Some(source) = e.source() {
-                        println!("Error source: {}", source);
-                    }
+                error!(error = %err_str, "Connection error occurred");
+                if let Some(source) = e.source() {
+                    error!(source = %source, "Error source");
                 }
                 
                 let conn_error = if err_str.contains("transport error") ||
@@ -167,22 +153,28 @@ pub async fn execute_sql(
 
     let result = client.do_action(tonic::Request::new(action)).await;
 
-    if verbose {
-        println!("SQL execution result: {:?}", result);
-    }
+    debug!(result = ?result, "SQL execution result");
 
     match result {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            debug!("SQL execution completed successfully");
+            Ok(())
+        }
         Err(status) => {
             let err_str = status.to_string();
+            error!(error = %err_str, "SQL execution failed");
+            
             if err_str.contains("transport error") ||
                err_str.contains("deadline has elapsed") ||
                err_str.contains("connection refused") {
-                Err(Box::new(std::io::Error::new(
+                let timeout_err = std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "Connection timed out"
-                )))
+                );
+                error!(error = %timeout_err, "Connection timeout occurred");
+                Err(Box::new(timeout_err))
             } else {
+                error!(status = %status, "SQL execution error");
                 Err(Box::new(status))
             }
         }
@@ -249,11 +241,21 @@ pub async fn handle_server(
         server = server.tls_config(tls_config)?;
     }
 
-    println!("Starting server on {}", addr);
+    info!(address = %addr, "Starting Flight SQL server");
+    debug!(
+        tls_enabled = config.get_bool("tls.enabled").unwrap_or(false),
+        storage_type = config.get_string("storage.type").unwrap_or_default(),
+        "Server configuration"
+    );
+    
     server
         .add_service(service)
         .serve(addr)
-        .await?;
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Server failed to start");
+            e
+        })?;
 
     Ok(())
 }
@@ -379,6 +381,7 @@ pub fn handle_config(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::er
     }
 
     let settings = builder.build()?;
-    println!("{:#?}", settings);
+    info!("Configuration loaded successfully");
+    debug!(settings = ?settings, "Current configuration settings");
     Ok(())
 }
