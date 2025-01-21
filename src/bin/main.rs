@@ -39,13 +39,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Server(_cmd) => {
-            let config = Config::builder()
+        Commands::Server(cmd) => {
+            let mut config = Config::builder()
                 .set_default("host", "127.0.0.1")?
                 .set_default("port", "50051")?
                 .set_default("storage.type", "duckdb")?
-                .set_default("storage.connection", ":memory:")?
-                .build()?;
+                .set_default("storage.connection", ":memory:")?;
+
+            // Set TLS configuration from command line args
+            if cmd.server.tls_cert.is_some() {
+                config = config
+                    .set_default("tls.enabled", "true")?
+                    .set_default("tls.cert_path", cmd.server.tls_cert.unwrap().to_str().unwrap())?;
+            }
+            if cmd.server.tls_key.is_some() {
+                config = config
+                    .set_default("tls.key_path", cmd.server.tls_key.unwrap().to_str().unwrap())?;
+            }
+            if cmd.server.tls_client_ca.is_some() {
+                config = config
+                    .set_default("tls.ca_path", cmd.server.tls_client_ca.unwrap().to_str().unwrap())?;
+            }
+
+            let config = config.build()?;
             handle_server(config).await?
         }
         Commands::Sql(cmd) => {

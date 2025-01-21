@@ -9,7 +9,7 @@ use hyprstream_core::{
         view::ViewDefinition,
     },
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::tempdir;
 use tonic::Status;
@@ -20,7 +20,7 @@ async fn test_cache_operations() -> Result<(), Status> {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
 
-    // Create backend
+    // Create backend (initialization happens synchronously in new())
     let backend = Arc::new(StorageBackendType::DuckDb(DuckDbBackend::new_with_options(
         db_path.to_str().unwrap(),
         &HashMap::new(),
@@ -32,10 +32,10 @@ async fn test_cache_operations() -> Result<(), Status> {
 
     // Create test table
     let table_name = "test_metrics";
-    let schema = Schema::new(vec![
+    let schema = Arc::new(Schema::new(vec![
         Field::new("value", DataType::Float64, false),
         Field::new("timestamp", DataType::Int64, false),
-    ]);
+    ]));
 
     backend.create_table(table_name, &schema).await?;
 
@@ -43,7 +43,7 @@ async fn test_cache_operations() -> Result<(), Status> {
     let values: Arc<dyn Array> = Arc::new(Float64Array::from(vec![1.0]));
     let timestamps: Arc<dyn Array> = Arc::new(Int64Array::from(vec![1000]));
 
-    let batch = RecordBatch::try_new(Arc::new(schema), vec![values, timestamps]).unwrap();
+    let batch = RecordBatch::try_new(schema.clone(), vec![values, timestamps]).unwrap();
 
     // Insert test data
     backend.insert_into_table(table_name, batch).await?;

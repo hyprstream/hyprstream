@@ -14,6 +14,7 @@ pub mod models;
 pub mod query;
 pub mod service;
 pub mod storage;
+pub mod config;
 
 pub use query::{
     DataFusionExecutor, DataFusionPlanner, ExecutorConfig, OptimizationHint, Query, QueryExecutor,

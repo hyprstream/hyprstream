@@ -3,10 +3,7 @@ use crate::metrics::MetricRecord;
 use crate::storage::cache::{CacheEviction, CacheManager};
 use crate::storage::view::{ViewDefinition, ViewMetadata};
 use crate::storage::{Credentials, StorageBackend};
-use arrow_array::{
-    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray,
-    builder::{ArrayBuilder, Float64Builder, Int64Builder, StringBuilder},
-};
+use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use duckdb::{params, Config, Connection};
@@ -39,41 +36,7 @@ impl DuckDbBackend {
         let conn = Connection::open_with_flags(&connection_string, config)
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let backend = Self {
-            conn: Arc::new(Mutex::new(conn)),
-            connection_string,
-            options,
-            cache_manager: CacheManager::new(ttl),
-        };
-
-        // Initialize tables
-        let backend_clone = backend.clone();
-        tokio::spawn(async move {
-            if let Err(e) = backend_clone.init().await {
-                tracing::error!("Failed to initialize tables: {}", e);
-            }
-        });
-
-        Ok(backend)
-    }
-
-    pub fn new_in_memory() -> Result<Self, Status> {
-        Self::new(":memory:".to_string(), HashMap::new(), Some(0))
-    }
-
-    async fn execute_statement(&self, sql: &str) -> Result<(), Status> {
-        let conn = self.conn.lock().await;
-        conn.execute_batch(sql)
-            .map_err(|e| Status::internal(format!("Failed to execute statement: {}", e)))
-    }
-}
-
-#[async_trait]
-impl StorageBackend for DuckDbBackend {
-    async fn init(&self) -> Result<(), Status> {
-        let conn = self.conn.lock().await;
-
-        // Create metrics table
+        // Initialize tables synchronously
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS metrics (
@@ -97,6 +60,29 @@ impl StorageBackend for DuckDbBackend {
         )
         .map_err(|e| Status::internal(format!("Failed to create tables: {}", e)))?;
 
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            connection_string,
+            options,
+            cache_manager: CacheManager::new(ttl),
+        })
+    }
+
+    pub fn new_in_memory() -> Result<Self, Status> {
+        Self::new(":memory:".to_string(), HashMap::new(), Some(0))
+    }
+
+    async fn execute_statement(&self, sql: &str) -> Result<(), Status> {
+        let conn = self.conn.lock().await;
+        conn.execute_batch(sql)
+            .map_err(|e| Status::internal(format!("Failed to execute statement: {}", e)))
+    }
+}
+
+#[async_trait]
+impl StorageBackend for DuckDbBackend {
+    async fn init(&self) -> Result<(), Status> {
+        // Tables are already created in new()
         Ok(())
     }
 
@@ -259,66 +245,78 @@ impl StorageBackend for DuckDbBackend {
         table_name: &str,
         projection: Option<Vec<String>>,
     ) -> Result<RecordBatch, Status> {
+        // Get schema first
+        let schema = self.get_table_schema(table_name).await?;
+
+        // Then execute query
         let sql = crate::storage::StorageUtils::generate_select_sql(table_name, projection);
+        tracing::debug!("Executing query: {}", sql);
 
         let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| Status::internal(format!("Failed to prepare statement: {}", e)))?;
 
-        // Get column info first
-        let column_count = stmt.column_count();
-        let mut builders: Vec<Box<dyn ArrayBuilder>> = Vec::new();
-        let mut fields = Vec::new();
-
-        for i in 0..column_count {
-            let name = stmt.column_name(i).map_or(String::new(), |s| s.to_string());
-            let col_type = stmt.column_type(i).to_string();
-            let data_type = match col_type.as_str() {
-                "INTEGER" | "BIGINT" => DataType::Int64,
-                "DOUBLE" | "REAL" => DataType::Float64,
-                _ => DataType::Utf8,
-            };
-            fields.push(Field::new(name, data_type.clone(), true));
-            match &data_type {
-                DataType::Int64 => builders.push(Box::new(Int64Builder::new())),
-                DataType::Float64 => builders.push(Box::new(Float64Builder::new())),
-                _ => builders.push(Box::new(StringBuilder::new())),
-            }
-        }
-
-        // Now process all rows
+        // Execute query and collect results
         let mut rows = stmt
             .query(params![])
             .map_err(|e| Status::internal(format!("Failed to execute query: {}", e)))?;
 
+        let mut values: Vec<Vec<String>> = Vec::new();
         while let Some(row) = rows.next().map_err(|e| Status::internal(e.to_string()))? {
-            for (i, builder) in builders.iter_mut().enumerate() {
-                match builder {
-                    builder if builder.as_any().is::<Int64Builder>() => {
-                        builder.as_any_mut().downcast_mut::<Int64Builder>().unwrap()
-                            .append_value(row.get::<_, i64>(i).unwrap_or_default());
-                    }
-                    builder if builder.as_any().is::<Float64Builder>() => {
-                        builder.as_any_mut().downcast_mut::<Float64Builder>().unwrap()
-                            .append_value(row.get::<_, f64>(i).unwrap_or_default());
-                    }
-                    builder if builder.as_any().is::<StringBuilder>() => {
-                        builder.as_any_mut().downcast_mut::<StringBuilder>().unwrap()
-                            .append_value(row.get::<_, String>(i).unwrap_or_default());
-                    }
-                    _ => unreachable!(),
-                }
+            let mut row_values = Vec::new();
+            for i in 0..schema.fields().len() {
+                row_values.push(row.get::<_, String>(i).unwrap_or_default());
             }
+            values.push(row_values);
         }
 
-        // Convert builders to arrays
-        let arrays: Vec<ArrayRef> = builders
-            .into_iter()
-            .map(|mut builder| Arc::new(builder.finish()) as ArrayRef)
+        // If no rows, return empty batch
+        if values.is_empty() {
+            let empty_arrays: Vec<ArrayRef> = schema
+                .fields()
+                .iter()
+                .map(|field| match field.data_type() {
+                    DataType::Int64 => Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
+                    DataType::Float64 => Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef,
+                    _ => Arc::new(StringArray::from(Vec::<String>::new())) as ArrayRef,
+                })
+                .collect();
+            return Ok(RecordBatch::try_new(schema, empty_arrays)
+                .map_err(|e| Status::internal(format!("Failed to create empty batch: {}", e)))?);
+        }
+
+        // Convert string values to appropriate types
+        let arrays: Vec<ArrayRef> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, field)| {
+                let column_values: Vec<_> = values.iter().map(|row| &row[i]).collect();
+                match field.data_type() {
+                    DataType::Int64 => {
+                        let parsed: Vec<i64> = column_values
+                            .iter()
+                            .map(|s| s.parse().unwrap_or_default())
+                            .collect();
+                        Arc::new(Int64Array::from(parsed)) as ArrayRef
+                    }
+                    DataType::Float64 => {
+                        let parsed: Vec<f64> = column_values
+                            .iter()
+                            .map(|s| s.parse().unwrap_or_default())
+                            .collect();
+                        Arc::new(Float64Array::from(parsed)) as ArrayRef
+                    }
+                    _ => {
+                        let str_values: Vec<&str> = column_values.iter().map(|s| s.as_str()).collect();
+                        Arc::new(StringArray::from(str_values)) as ArrayRef
+                    }
+                }
+            })
             .collect();
 
-        Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+        Ok(RecordBatch::try_new(schema, arrays)
             .map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))?)
     }
 
