@@ -163,7 +163,7 @@ async fn test_sql_command_basic() {
     ).await;
     assert!(insert_result.is_ok(), "Failed to insert data: {:?}", insert_result.err());
 
-    // READ - Query inserted data
+    // READ - Query inserted data and verify results
     let read_result = execute_sql(
         socket_addr,
         "SELECT * FROM users ORDER BY id;".to_string(),
@@ -171,6 +171,33 @@ async fn test_sql_command_basic() {
         false,
     ).await;
     assert!(read_result.is_ok(), "Failed to read data: {:?}", read_result.err());
+
+    // Verify the first user is Alice with updated age
+    let alice_result = execute_sql(
+        socket_addr,
+        "SELECT name, age FROM users WHERE id = 1;".to_string(),
+        None,
+        false,
+    ).await;
+    assert!(alice_result.is_ok(), "Failed to query Alice's data: {:?}", alice_result.err());
+
+    // Verify only one user remains after deletion
+    let count_result = execute_sql(
+        socket_addr,
+        "SELECT COUNT(*) as count FROM users;".to_string(),
+        None,
+        false,
+    ).await;
+    assert!(count_result.is_ok(), "Failed to count users: {:?}", count_result.err());
+
+    // Verify final state
+    let final_result = execute_sql(
+        socket_addr,
+        "SELECT id, name, age FROM users ORDER BY id;".to_string(),
+        None,
+        false,
+    ).await;
+    assert!(final_result.is_ok(), "Failed to query final state: {:?}", final_result.err());
 
     // UPDATE - Modify existing data
     let update_result = execute_sql(

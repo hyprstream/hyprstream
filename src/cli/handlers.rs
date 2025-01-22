@@ -174,10 +174,64 @@ pub async fn execute_sql(
 
                 let mut stream = client.do_get(tonic::Request::new(ticket)).await?.into_inner();
                 
-                // Process results
-                while let Some(data) = stream.message().await? {
-                    if verbose {
-                        debug!(data_size = data.data_body.len(), "Received flight data");
+                // For non-SELECT queries, just process the response
+                if sql.trim().to_uppercase().starts_with("SELECT") {
+                    // Get statement handle from response
+                    let mut response_data = Vec::new();
+                    while let Some(data) = stream.message().await? {
+                        response_data.extend_from_slice(&data.data_body);
+                    }
+                    
+                    // Use handle to get results
+                    let ticket = arrow_flight::Ticket {
+                        ticket: Bytes::from(response_data),
+                    };
+                    
+                    let mut stream = client.do_get(tonic::Request::new(ticket)).await?.into_inner();
+                    
+                    // Process results
+                    let mut schema = None;
+                    let mut batches = Vec::new();
+                    
+                    while let Some(data) = stream.message().await? {
+                        if verbose {
+                            debug!(data_size = data.data_body.len(), "Received flight data");
+                        }
+                        
+                        // First message contains schema
+                        if schema.is_none() && !data.data_header.is_empty() {
+                            let reader = arrow_ipc::reader::StreamReader::try_new(
+                                std::io::Cursor::new(&data.data_header),
+                                None,
+                            )?;
+                            schema = Some(reader.schema());
+                            continue;
+                        }
+                        
+                        // Subsequent messages contain record batches
+                        if !data.data_body.is_empty() {
+                            let reader = arrow_ipc::reader::StreamReader::try_new(
+                                std::io::Cursor::new(&data.data_body),
+                                None,
+                            )?;
+                            
+                            for batch in reader {
+                                batches.push(batch?);
+                            }
+                        }
+                    }
+                    
+                    // Convert batches to JSON and print
+                    for batch in &batches {
+                        let json_rows = crate::utils::record_batch_to_json(batch)?;
+                        println!("{}", serde_json::to_string_pretty(&json_rows)?);
+                    }
+                } else {
+                    // For non-SELECT queries, just consume the response
+                    while let Some(data) = stream.message().await? {
+                        if verbose {
+                            debug!(data_size = data.data_body.len(), "Received flight data");
+                        }
                     }
                 }
             }

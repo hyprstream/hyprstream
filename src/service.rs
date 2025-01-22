@@ -201,42 +201,29 @@ impl FlightSqlServer {
         let action = request.into_inner();
         match Command::from_json(&action.body)? {
             Command::Table(cmd) => self.handle_table_command(cmd).await,
-            Command::Sql(SqlCommand::Execute(sql)) => {
+            Command::Sql(SqlCommand::Execute(sql)) | Command::Sql(SqlCommand::Query(sql)) => {
+                // Prepare statement
                 let statement_handle = self.backend.prepare_sql(&sql).await?;
-                self.backend.query_sql(&statement_handle).await?;
-                Ok(vec![])
-            }
-            Command::Sql(SqlCommand::Query(sql)) => {
-                let statement_handle = self.backend.prepare_sql(&sql).await?;
+                let handle = self.statement_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                
+                // Store SQL with handle (in a separate scope to ensure MutexGuard is dropped)
+                {
+                    let mut statements = self.prepared_statements.lock()
+                        .map_err(|e| Status::internal(format!("Lock error: {}", e)))?;
+                    statements.push((handle, sql.clone()));
+                }
+                
+                // Execute statement
                 let batch = self.backend.query_sql(&statement_handle).await?;
                 
-                // Convert to JSON using Arrow's array display
-                let mut json_rows = Vec::new();
-                for row_idx in 0..batch.num_rows() {
-                    let mut row = serde_json::Map::new();
-                    for col_idx in 0..batch.num_columns() {
-                        let col = batch.column(col_idx);
-                        let schema = batch.schema();
-                        let field = schema.field(col_idx);
-                        let col_name = field.name();
-                        let value = match col.data_type() {
-                            DataType::Int64 => {
-                                let array = col.as_any().downcast_ref::<Int64Array>().unwrap();
-                                serde_json::Value::Number(array.value(row_idx).into())
-                            }
-                            DataType::Float64 => {
-                                let array = col.as_any().downcast_ref::<Float64Array>().unwrap();
-                                serde_json::Value::Number(serde_json::Number::from_f64(array.value(row_idx)).unwrap())
-                            }
-                            _ => {
-                                let array = col.as_any().downcast_ref::<StringArray>().unwrap();
-                                serde_json::Value::String(array.value(row_idx).to_string())
-                            }
-                        };
-                        row.insert(col_name.to_string(), value);
-                    }
-                    json_rows.push(serde_json::Value::Object(row));
+                // For execute statements, just return handle
+                if matches!(Command::from_json(&action.body)?, Command::Sql(SqlCommand::Execute(_))) {
+                    return Ok(handle.to_le_bytes().to_vec());
                 }
+                
+                // Convert batch to JSON using shared utility
+                let json_rows = crate::utils::record_batch_to_json(&batch)
+                    .map_err(|e| Status::internal(format!("Failed to convert batch to JSON: {}", e)))?;
                 serde_json::to_vec(&json_rows)
                     .map_err(|e| Status::internal(format!("Failed to serialize JSON: {}", e)))
             }
