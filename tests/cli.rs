@@ -199,9 +199,6 @@ async fn test_sql_command_basic() {
     ).await;
     assert!(final_result.is_ok(), "Failed to query final state: {:?}", final_result.err());
 
-    // Clean up
-    server_handle.abort();
-
     // UPDATE - Modify existing data
     let update_result = execute_sql(
         socket_addr,

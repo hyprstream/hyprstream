@@ -56,8 +56,8 @@ pub async fn execute_sql(
     let addr = addr.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 50051)));
     
     // Create ADBC driver and database
-    let mut driver = ManagedDriver::load_dynamic_from_name(
-        "adbc-driver-flightsql",
+    let mut driver = ManagedDriver::load_dynamic_from_filename(
+        "/home/birdetta/.local/share/mamba/lib/libadbc_driver_flightsql.so", //adbc-driver-flightsql",
         None,
         adbc_core::options::AdbcVersion::V100,
     )?;

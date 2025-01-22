@@ -82,3 +82,6 @@ replace-with = "vendored-sources"
 
 [source.vendored-sources]
 directory = "vendor"
+
+[build]
+rustflags = ["-L", "/home/birdetta/.local/share/mamba/lib"] # Add linker search path
