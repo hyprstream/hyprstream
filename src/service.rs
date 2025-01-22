@@ -201,8 +201,14 @@ impl FlightSqlServer {
         let action = request.into_inner();
         match Command::from_json(&action.body)? {
             Command::Table(cmd) => self.handle_table_command(cmd).await,
-            Command::Sql(SqlCommand::Execute(sql)) | Command::Sql(SqlCommand::Query(sql)) => {
-                // Prepare statement
+            Command::Sql(SqlCommand::Execute(sql)) => {
+                // Prepare and execute statement
+                let statement_handle = self.backend.prepare_sql(&sql).await?;
+                self.backend.query_sql(&statement_handle).await?;
+                Ok(vec![])
+            }
+            Command::Sql(SqlCommand::Query(sql)) => {
+                // Prepare statement and store handle
                 let statement_handle = self.backend.prepare_sql(&sql).await?;
                 let handle = self.statement_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 
@@ -213,19 +219,8 @@ impl FlightSqlServer {
                     statements.push((handle, sql.clone()));
                 }
                 
-                // Execute statement
-                let batch = self.backend.query_sql(&statement_handle).await?;
-                
-                // For execute statements, just return handle
-                if matches!(Command::from_json(&action.body)?, Command::Sql(SqlCommand::Execute(_))) {
-                    return Ok(handle.to_le_bytes().to_vec());
-                }
-                
-                // Convert batch to JSON using shared utility
-                let json_rows = crate::utils::record_batch_to_json(&batch)
-                    .map_err(|e| Status::internal(format!("Failed to convert batch to JSON: {}", e)))?;
-                serde_json::to_vec(&json_rows)
-                    .map_err(|e| Status::internal(format!("Failed to serialize JSON: {}", e)))
+                // Return handle as ticket for DoGet
+                Ok(handle.to_le_bytes().to_vec())
             }
         }
     }

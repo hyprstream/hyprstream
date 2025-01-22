@@ -1,22 +1,27 @@
 use crate::{
-    service::FlightSqlServer,
-    storage::{StorageBackendType, adbc::AdbcBackend, duckdb::DuckDbBackend},
     config::{get_tls_config, set_tls_data},
+    storage::{StorageBackendType, adbc::AdbcBackend, duckdb::DuckDbBackend},
+    service::FlightSqlServer,
 };
-use std::error::Error as StdError;
-use std::fmt;
-use tracing::{debug, error, info};
-
-use arrow_flight::flight_service_client::FlightServiceClient as FlightSqlClient;
+use adbc_core::{
+    driver_manager::ManagedDriver,
+    options::{OptionDatabase, OptionValue},
+    Connection, Driver, Database, Statement,
+};
+use arrow::{
+    record_batch::RecordBatchReader,
+    util::pretty,
+};
 use ::config::{Config, File};
-use tonic::transport::{Certificate, ClientTlsConfig, Identity, Server, ServerTlsConfig};
-use futures::StreamExt;
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    error::Error as StdError,
+    fmt,
     net::SocketAddr,
+    path::{Path, PathBuf},
 };
-use bytes::Bytes;
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+use tracing::{debug, error, info};
 
 #[derive(Debug)]
 enum ConnectionError {
@@ -49,215 +54,75 @@ pub async fn execute_sql(
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let addr = addr.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 50051)));
-    let scheme = if config.map(|c| c.get_bool("tls.enabled").unwrap_or(false)).unwrap_or(false) { "https" } else { "http" };
-    let channel = {
-        debug!(
-            scheme = scheme,
-            ip = %addr.ip(),
-            port = %addr.port(),
-            tls_enabled = config.map(|c| c.get_bool("tls.enabled").unwrap_or(false)).unwrap_or(false),
-            "Connecting to endpoint"
-        );
-        
-        let mut endpoint = tonic::transport::Channel::from_shared(format!("{}://{}:{}", scheme, addr.ip(), addr.port()))?
-            .timeout(std::time::Duration::from_secs(60))  // Increase timeout for TLS handshake
-            .tcp_keepalive(Some(std::time::Duration::from_secs(5)))
-            .connect_timeout(std::time::Duration::from_secs(30));  // Separate connect timeout
+    
+    // Create ADBC driver and database
+    let mut driver = ManagedDriver::load_dynamic_from_name(
+        "adbc-driver-flightsql",
+        None,
+        adbc_core::options::AdbcVersion::V100,
+    )?;
 
-        debug!("Channel endpoint created with 60s timeout and TCP keepalive");
-
-        if let Some(config) = config {
-            if let Some((identity, ca_cert)) = get_tls_config(config) {
-                debug!("Configuring TLS client with identity and CA cert");
-                debug!("Creating client TLS config with identity");
-                
-                let mut tls = ClientTlsConfig::new()
-                    .domain_name("localhost")
-                    .identity(identity);
-                
-                if let Some(ca) = ca_cert {
-                    debug!("Adding CA certificate to TLS config");
-                    tls = tls.ca_certificate(ca);
-                }
-
-                debug!("Client TLS config created with SNI name 'localhost'");
-                debug!("Attempting TLS connection with server...");
-                debug!("Applying TLS configuration to endpoint");
-                
-                endpoint = endpoint.tls_config(tls)?;
-            } else {
-                debug!("No TLS configuration found in config");
-            }
+    // Create database with options
+    // Build URI with TLS if enabled
+    let uri = if let Some(config) = config {
+        if config.get_bool("tls.enabled").unwrap_or(false) {
+            format!("grpc+tls://{}:{}", addr.ip(), addr.port())
         } else {
-            debug!("No config provided for TLS");
+            format!("grpc://{}:{}", addr.ip(), addr.port())
         }
+    } else {
+        format!("grpc://{}:{}", addr.ip(), addr.port())
+    };
 
-        debug!("Attempting to connect to endpoint...");
-        
-        match endpoint.connect().await {
-            Ok(chan) => {
-                debug!("Successfully connected to endpoint");
-                Ok(chan)
+    let mut options = vec![(
+        OptionDatabase::Uri,
+        OptionValue::String(uri),
+    )];
+
+    let mut database = driver.new_database_with_opts(options)?;
+    
+    if verbose {
+        debug!(uri = ?format!("flight-sql://{}:{}", addr.ip(), addr.port()), "Connecting to database");
+    }
+    
+    // Create connection with options
+    let conn_options = vec![];  // Add connection-specific options if needed
+    let mut conn = database.new_connection_with_opts(conn_options)?;
+    
+    // Create and prepare statement
+    let mut stmt = conn.new_statement()?;
+    stmt.set_sql_query(&sql)?;
+    
+    // Execute statement and get results
+    let mut reader = stmt.execute()?;
+    
+    if verbose {
+        debug!(schema = ?reader.schema().as_ref(), "Query schema");
+    }
+    
+    // Process results in streaming fashion
+    let mut batches = Vec::new();
+    while let Some(result) = reader.next() {
+        match result {
+            Ok(batch) => {
+                if verbose {
+                    debug!(rows = batch.num_rows(), "Received batch");
+                }
+                batches.push(batch);
             }
             Err(e) => {
-                let err_str = e.to_string();
-                error!(error = %err_str, "Connection error occurred");
-                if let Some(source) = e.source() {
-                    error!(source = %source, "Error source");
-                }
-                
-                let conn_error = if err_str.contains("transport error") ||
-                   err_str.contains("deadline has elapsed") ||
-                   err_str.contains("connection refused") {
-                    ConnectionError::Timeout(err_str)
-                } else {
-                    ConnectionError::Other(Box::new(e))
-                };
-                Err(Box::new(conn_error))
-            }
-        }
-    }.map_err(|e| {
-        let err_str = e.to_string();
-        if err_str.contains("transport error") ||
-           err_str.contains("deadline has elapsed") ||
-           err_str.contains("connection refused") {
-            Box::new(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "Connection timed out"
-            )) as Box<dyn std::error::Error>
-        } else {
-            Box::new(e) as Box<dyn std::error::Error>
-        }
-    })?;
-
-    let mut client = FlightSqlClient::new(channel);
-    
-    // Create JSON command structure
-    let json = if sql.trim().to_uppercase().starts_with("CREATE ") ||
-                 sql.trim().to_uppercase().starts_with("DROP ") ||
-                 sql.trim().to_uppercase().starts_with("ALTER ") {
-        serde_json::json!({
-            "type": "sql.execute",
-            "data": sql
-        })
-    } else {
-        serde_json::json!({
-            "type": "sql.query",
-            "data": sql
-        })
-    };
-
-    let action = arrow_flight::Action {
-        r#type: "CommandStatementQuery".to_string(),
-        body: Bytes::from(serde_json::to_vec(&json)?),
-    };
-
-    // Execute the action and get results
-    let result = client.do_action(tonic::Request::new(action)).await;
-    debug!(result = ?result, "SQL execution result");
-
-    match result {
-        Ok(mut response) => {
-            // For queries that return data, fetch results using do_get
-            if !sql.trim().to_uppercase().starts_with("CREATE ") &&
-               !sql.trim().to_uppercase().starts_with("DROP ") &&
-               !sql.trim().to_uppercase().starts_with("ALTER ") {
-                let result = response.get_mut().next().await
-                    .ok_or_else(|| std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "No ticket received for query"
-                    ))??;
-
-                let ticket = arrow_flight::Ticket {
-                    ticket: result.body,
-                };
-
-                let mut stream = client.do_get(tonic::Request::new(ticket)).await?.into_inner();
-                
-                // For non-SELECT queries, just process the response
-                if sql.trim().to_uppercase().starts_with("SELECT") {
-                    // Get statement handle from response
-                    let mut response_data = Vec::new();
-                    while let Some(data) = stream.message().await? {
-                        response_data.extend_from_slice(&data.data_body);
-                    }
-                    
-                    // Use handle to get results
-                    let ticket = arrow_flight::Ticket {
-                        ticket: Bytes::from(response_data),
-                    };
-                    
-                    let mut stream = client.do_get(tonic::Request::new(ticket)).await?.into_inner();
-                    
-                    // Process results
-                    let mut schema = None;
-                    let mut batches = Vec::new();
-                    
-                    while let Some(data) = stream.message().await? {
-                        if verbose {
-                            debug!(data_size = data.data_body.len(), "Received flight data");
-                        }
-                        
-                        // First message contains schema
-                        if schema.is_none() && !data.data_header.is_empty() {
-                            let reader = arrow_ipc::reader::StreamReader::try_new(
-                                std::io::Cursor::new(&data.data_header),
-                                None,
-                            )?;
-                            schema = Some(reader.schema());
-                            continue;
-                        }
-                        
-                        // Subsequent messages contain record batches
-                        if !data.data_body.is_empty() {
-                            let reader = arrow_ipc::reader::StreamReader::try_new(
-                                std::io::Cursor::new(&data.data_body),
-                                None,
-                            )?;
-                            
-                            for batch in reader {
-                                batches.push(batch?);
-                            }
-                        }
-                    }
-                    
-                    // Convert batches to JSON and print
-                    for batch in &batches {
-                        let json_rows = crate::utils::record_batch_to_json(batch)?;
-                        println!("{}", serde_json::to_string_pretty(&json_rows)?);
-                    }
-                } else {
-                    // For non-SELECT queries, just consume the response
-                    while let Some(data) = stream.message().await? {
-                        if verbose {
-                            debug!(data_size = data.data_body.len(), "Received flight data");
-                        }
-                    }
-                }
-            }
-            
-            debug!("SQL execution completed successfully");
-            Ok(())
-        }
-        Err(status) => {
-            let err_str = status.to_string();
-            error!(error = %err_str, "SQL execution failed");
-            
-            if err_str.contains("transport error") ||
-               err_str.contains("deadline has elapsed") ||
-               err_str.contains("connection refused") {
-                let timeout_err = std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "Connection timed out"
-                );
-                error!(error = %timeout_err, "Connection timeout occurred");
-                Err(Box::new(timeout_err))
-            } else {
-                error!(status = %status, "SQL execution error");
-                Err(Box::new(status))
+                error!("Error reading batch: {}", e);
+                return Err(Box::new(e));
             }
         }
     }
+    
+    if !batches.is_empty() {
+        let table = pretty::pretty_format_batches(&batches)?;
+        info!("\n{}", table);
+    }
+    
+    Ok(())
 }
 
 pub async fn handle_server(
