@@ -11,22 +11,25 @@ use crate::{
 };
 use arrow_flight::{
     flight_service_server::{FlightService, FlightServiceServer},
-    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo, HandshakeRequest,
-    HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
+    sql::{
+        server::FlightSqlService,
+        CommandStatementQuery, TicketStatementQuery,
+        ActionCreatePreparedStatementRequest, ActionCreatePreparedStatementResult,
+        ActionClosePreparedStatementRequest, CommandPreparedStatementQuery,
+        SqlInfo, ProstMessageExt,
+    },
+    Action, FlightDescriptor, FlightInfo, Ticket, HandshakeRequest, HandshakeResponse, FlightEndpoint,
+    encode::FlightDataEncoderBuilder, error::FlightError,
 };
 use arrow_ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
+use futures::{Stream, StreamExt, TryStreamExt};
+use prost::Message;
+use std::pin::Pin;
 use arrow_schema::Schema;
-use bytes::Bytes;
-use futures::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json;
-use std::pin::Pin;
-use std::sync::atomic::AtomicU64;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{atomic::AtomicU64, Arc, Mutex};
 use tonic::{Request, Response, Status, Streaming};
-use arrow_array::{Int64Array, Float64Array, StringArray};
-use arrow_schema::DataType;
 
 // Add conversion trait for Arrow errors
 #[allow(dead_code)]
@@ -163,6 +166,195 @@ pub struct FlightSqlServer {
     prepared_statements: Arc<Mutex<Vec<(u64, String)>>>,
 }
 
+#[tonic::async_trait]
+impl FlightSqlService for FlightSqlServer {
+    type FlightService = Self;
+
+    async fn register_sql_info(&self, _id: i32, _info: &SqlInfo) {}
+
+    async fn do_handshake(
+        &self,
+        request: Request<Streaming<HandshakeRequest>>,
+    ) -> Result<Response<Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send>>>, Status> {
+        let mut stream = request.into_inner();
+        let response_stream = async_stream::try_stream! {
+            while let Some(request) = stream.next().await {
+                let request = request?;
+                yield HandshakeResponse {
+                    protocol_version: request.protocol_version,
+                    payload: request.payload,
+                };
+            }
+        };
+        Ok(Response::new(Box::pin(response_stream)))
+    }
+
+    async fn get_flight_info_statement(
+        &self,
+        query: CommandStatementQuery,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        // Create planner
+        let planner = DataFusionPlanner::new(Arc::new((*self.backend).clone())).await
+            .map_err(|e| Status::internal(format!("Failed to create planner: {}", e)))?;
+
+        // Create and plan query to get schema
+        let query_plan = Query {
+            sql: query.query.clone(),
+            schema_hint: None,
+            hints: vec![
+                OptimizationHint::PreferPredicatePushdown,
+                OptimizationHint::OptimizeForVectorOps,
+            ],
+        };
+
+        // Get physical plan to extract schema
+        let physical_plan = planner.plan_query(&query_plan).await
+            .map_err(|e| Status::internal(format!("Failed to plan query: {}", e)))?;
+        
+        let schema = physical_plan.schema();
+
+        // Generate schema bytes
+        let generator = IpcDataGenerator::default();
+        let options = IpcWriteOptions::default();
+        let mut dictionary_tracker = DictionaryTracker::new(false);
+        let schema_data = generator.schema_to_bytes_with_dictionary_tracker(
+            schema.as_ref(),
+            &mut dictionary_tracker,
+            &options,
+        );
+
+        // Generate ticket for do_get
+        let handle = self.statement_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        
+        // Store SQL with handle
+        {
+            let mut statements = self.prepared_statements.lock()
+                .map_err(|e| Status::internal(format!("Lock error: {}", e)))?;
+            statements.push((handle, query.query));
+        }
+
+        // Create ticket with statement handle
+        let ticket = TicketStatementQuery {
+            statement_handle: handle.to_le_bytes().to_vec().into(),
+        };
+
+        let flight_descriptor = request.into_inner();
+        
+        // Create FlightInfo with schema and endpoint
+        let info = FlightInfo::new()
+            .try_with_schema(schema.as_ref())
+            .map_err(|e| Status::internal(format!("Unable to serialize schema: {}", e)))?
+            .with_descriptor(flight_descriptor)
+            .with_endpoint(FlightEndpoint::new()
+                .with_ticket(Ticket {
+                    ticket: ticket.as_any().encode_to_vec().into(),
+                }))
+            .with_total_records(-1)
+            .with_total_bytes(-1)
+            .with_ordered(false);
+
+        Ok(Response::new(info))
+    }
+
+    async fn do_get_statement(
+        &self,
+        ticket: TicketStatementQuery,
+        request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        // Get SQL from prepared statement handle
+        let handle = u64::from_le_bytes(
+            ticket.statement_handle.to_vec()
+                .try_into()
+                .map_err(|_| Status::invalid_argument("Invalid statement handle"))?
+        );
+        
+        // Get SQL query from prepared statements
+        let sql = {
+            let guard = self.prepared_statements.lock()
+                .map_err(|e| Status::internal(format!("Lock error: {}", e)))?;
+                
+            let sql = guard.iter()
+                .find(|(h, _)| *h == handle)
+                .map(|(_, sql)| sql.to_string())
+                .ok_or_else(|| Status::invalid_argument("Statement handle not found"))?;
+                
+            // Drop guard before any async operations
+            drop(guard);
+            sql
+        };
+
+        // Create planner and executor
+        let planner = DataFusionPlanner::new(Arc::new((*self.backend).clone())).await
+            .map_err(|e| Status::internal(format!("Failed to create planner: {}", e)))?;
+            
+        let executor = DataFusionExecutor::new(ExecutorConfig::default());
+
+        // Create and plan query
+        let query = Query {
+            sql: sql.to_string(),
+            schema_hint: None,
+            hints: vec![
+                OptimizationHint::PreferPredicatePushdown,
+                OptimizationHint::OptimizeForVectorOps,
+            ],
+        };
+
+        // Create physical plan
+        let physical_plan = planner.plan_query(&query).await
+            .map_err(|e| Status::internal(format!("Failed to plan query: {}", e)))?;
+
+        // Get schema before moving physical_plan
+        let schema = physical_plan.schema();
+
+        // Execute plan as stream
+        let stream = executor.execute_stream(physical_plan).await
+            .map_err(|e| Status::internal(format!("Failed to execute query: {}", e)))?;
+
+        // Convert DataFusion stream to FlightData stream using FlightDataEncoderBuilder
+        let stream = stream.map_err(|e| FlightError::ExternalError(Box::new(e)));
+
+        let stream = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(stream)
+            .map_err(Status::from);
+
+Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn get_flight_info_prepared_statement(
+        &self,
+        _cmd: CommandPreparedStatementQuery,
+        _request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        Err(Status::unimplemented("get_flight_info_prepared_statement not implemented"))
+    }
+
+    async fn do_get_prepared_statement(
+        &self,
+        _query: CommandPreparedStatementQuery,
+        _request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        Err(Status::unimplemented("do_get_prepared_statement not implemented"))
+    }
+
+    async fn do_action_create_prepared_statement(
+        &self,
+        _query: ActionCreatePreparedStatementRequest,
+        _request: Request<Action>,
+    ) -> Result<ActionCreatePreparedStatementResult, Status> {
+        Err(Status::unimplemented("do_action_create_prepared_statement not implemented"))
+    }
+
+    async fn do_action_close_prepared_statement(
+        &self,
+        _query: ActionClosePreparedStatementRequest,
+        _request: Request<Action>,
+    ) -> Result<(), Status> {
+        Err(Status::unimplemented("do_action_close_prepared_statement not implemented"))
+    }
+}
+
 impl FlightSqlServer {
     pub fn new(backend: StorageBackendType) -> Self {
         Self {
@@ -226,260 +418,3 @@ impl FlightSqlServer {
     }
 }
 
-#[tonic::async_trait]
-impl FlightService for FlightSqlServer {
-    type HandshakeStream =
-        Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send + 'static>>;
-    type ListFlightsStream =
-        Pin<Box<dyn Stream<Item = Result<FlightInfo, Status>> + Send + 'static>>;
-    type DoGetStream = Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + 'static>>;
-    type DoPutStream = Pin<Box<dyn Stream<Item = Result<PutResult, Status>> + Send + 'static>>;
-    type DoActionStream =
-        Pin<Box<dyn Stream<Item = Result<arrow_flight::Result, Status>> + Send + 'static>>;
-    type ListActionsStream =
-        Pin<Box<dyn Stream<Item = Result<ActionType, Status>> + Send + 'static>>;
-    type DoExchangeStream =
-        Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + 'static>>;
-
-    async fn handshake(
-        &self,
-        request: Request<Streaming<HandshakeRequest>>,
-    ) -> Result<Response<Self::HandshakeStream>, Status> {
-        let mut stream = request.into_inner();
-
-        let response_stream = async_stream::try_stream! {
-            while let Some(request) = stream.next().await {
-                let request = request?;
-                yield HandshakeResponse {
-                    protocol_version: request.protocol_version,
-                    payload: request.payload,
-                };
-            }
-        };
-
-        Ok(Response::new(Box::pin(response_stream)))
-    }
-
-    async fn list_flights(
-        &self,
-        _request: Request<Criteria>,
-    ) -> Result<Response<Self::ListFlightsStream>, Status> {
-        let views = self.backend.list_views().await?;
-
-        let stream = futures::stream::iter(views.into_iter().map(|name| {
-            Ok(FlightInfo {
-                schema: Bytes::new(),
-                flight_descriptor: Some(FlightDescriptor {
-                    r#type: 0,
-                    cmd: Bytes::new(),
-                    path: vec![name],
-                }),
-                endpoint: vec![],
-                total_records: -1,
-                total_bytes: -1,
-                ordered: false,
-                app_metadata: Bytes::new(),
-            })
-        }));
-
-        Ok(Response::new(Box::pin(stream)))
-    }
-
-    async fn get_schema(
-        &self,
-        request: Request<FlightDescriptor>,
-    ) -> Result<Response<SchemaResult>, Status> {
-        let descriptor = request.into_inner();
-
-        let cmd = match descriptor.cmd.to_vec().as_slice() {
-            [] => return Err(Status::invalid_argument("Empty command")),
-            cmd => TableCommand::from_json(cmd)
-                .map_err(|e| Status::invalid_argument(format!("Invalid command: {}", e)))?,
-        };
-
-        let schema = match cmd {
-            TableCommand::CreateTable { schema, .. } => schema,
-            TableCommand::CreateView { definition, .. } => definition.schema,
-            _ => return Err(Status::invalid_argument("Command does not return schema")),
-        };
-
-        let generator = IpcDataGenerator::default();
-        let options = IpcWriteOptions::default();
-        let mut dictionary_tracker = DictionaryTracker::new(false);
-        let schema_data = generator.schema_to_bytes_with_dictionary_tracker(
-            &schema,
-            &mut dictionary_tracker,
-            &options,
-        );
-
-        Ok(Response::new(SchemaResult {
-            schema: Bytes::from(schema_data.ipc_message),
-        }))
-    }
-
-    async fn get_flight_info(
-        &self,
-        _request: Request<FlightDescriptor>,
-    ) -> Result<Response<FlightInfo>, Status> {
-        Err(Status::unimplemented("get_flight_info not implemented"))
-    }
-
-    async fn poll_flight_info(
-        &self,
-        _request: Request<FlightDescriptor>,
-    ) -> Result<Response<PollInfo>, Status> {
-        Err(Status::unimplemented("poll_flight_info not implemented"))
-    }
-
-    async fn do_get(
-        &self,
-        request: Request<Ticket>,
-    ) -> Result<Response<Self::DoGetStream>, Status> {
-        let ticket = request.into_inner();
-        let statements = self.prepared_statements.lock();
-        
-        // Get SQL from prepared statement handle
-        let handle = u64::from_le_bytes(
-            ticket.ticket.to_vec()
-                .try_into()
-                .map_err(|_| Status::invalid_argument("Invalid statement handle"))?
-        );
-        
-        // Get SQL query from prepared statements
-        let sql = {
-            let guard = statements
-                .map_err(|e| Status::internal(format!("Lock error: {}", e)))?;
-                
-            let sql = guard.iter()
-                .find(|(h, _)| *h == handle)
-                .map(|(_, sql)| sql.to_string())
-                .ok_or_else(|| Status::invalid_argument("Statement handle not found"))?;
-                
-            // Drop guard before any async operations
-            drop(guard);
-            sql
-        };
-
-        // Create planner and executor
-        let planner = DataFusionPlanner::new(Arc::new((*self.backend).clone())).await
-            .map_err(|e| Status::internal(format!("Failed to create planner: {}", e)))?;
-            
-        let executor = DataFusionExecutor::new(ExecutorConfig::default());
-
-        // Create and plan query
-        let query = Query {
-            sql: sql.to_string(),
-            schema_hint: None,
-            hints: vec![
-                OptimizationHint::PreferPredicatePushdown,
-                OptimizationHint::OptimizeForVectorOps,
-            ],
-        };
-
-        // Create physical plan
-        let physical_plan = planner.plan_query(&query).await
-            .map_err(|e| Status::internal(format!("Failed to plan query: {}", e)))?;
-
-        // Execute plan as stream
-        let stream = executor.execute_stream(physical_plan).await
-            .map_err(|e| Status::internal(format!("Failed to execute query: {}", e)))?;
-
-        // Convert DataFusion stream to FlightData stream
-        let flight_stream = Box::pin(async_stream::try_stream! {
-            let mut schema_sent = false;
-            
-            for await result in stream {
-                let batch = result.map_err(|e| Status::internal(format!("Error reading batch: {}", e)))?;
-                
-                if !schema_sent {
-                    // Send schema as first message
-                    let options = arrow_ipc::writer::IpcWriteOptions::default();
-                    let mut dictionary_tracker = arrow_ipc::writer::DictionaryTracker::new(false);
-                    let schema_bytes = arrow_ipc::writer::IpcDataGenerator::default()
-                        .schema_to_bytes_with_dictionary_tracker(&batch.schema(), &mut dictionary_tracker, &options)
-                        .ipc_message;
-                        
-                    yield FlightData {
-                        flight_descriptor: None,
-                        data_header: schema_bytes.into(),
-                        data_body: vec![].into(),
-                        app_metadata: vec![].into(),
-                    };
-                    schema_sent = true;
-                }
-
-                // Send batch data
-                let mut dictionary_tracker = arrow_ipc::writer::DictionaryTracker::new(false);
-                let options = arrow_ipc::writer::IpcWriteOptions::default();
-                let (_, data) = arrow_ipc::writer::IpcDataGenerator::default()
-                    .encoded_batch(&batch, &mut dictionary_tracker, &options)
-                    .map_err(|e| Status::internal(format!("Failed to serialize batch: {}", e)))?;
-
-                yield FlightData {
-                    flight_descriptor: None,
-                    data_header: vec![].into(),
-                    data_body: data.ipc_message.into(),
-                    app_metadata: vec![].into(),
-                };
-            }
-        });
-
-        Ok(Response::new(flight_stream))
-    }
-
-    async fn do_put(
-        &self,
-        _request: Request<Streaming<FlightData>>,
-    ) -> Result<Response<Self::DoPutStream>, Status> {
-        Err(Status::unimplemented("do_put not implemented"))
-    }
-
-    async fn do_action(
-        &self,
-        request: Request<Action>,
-    ) -> Result<Response<Self::DoActionStream>, Status> {
-        let result = self.handle_action(request).await?;
-
-        let stream = futures::stream::once(async move {
-            Ok(arrow_flight::Result {
-                body: Bytes::from(result),
-            })
-        });
-
-        Ok(Response::new(Box::pin(stream)))
-    }
-
-    async fn list_actions(
-        &self,
-        _request: Request<Empty>,
-    ) -> Result<Response<Self::ListActionsStream>, Status> {
-        let actions = vec![
-            ActionType {
-                r#type: "CreateTable".to_string(),
-                description: "Create a new table".to_string(),
-            },
-            ActionType {
-                r#type: "CreateView".to_string(),
-                description: "Create a new view".to_string(),
-            },
-            ActionType {
-                r#type: "DropTable".to_string(),
-                description: "Drop an existing table".to_string(),
-            },
-            ActionType {
-                r#type: "DropView".to_string(),
-                description: "Drop an existing view".to_string(),
-            },
-        ];
-
-        let stream = futures::stream::iter(actions.into_iter().map(Ok));
-        Ok(Response::new(Box::pin(stream)))
-    }
-
-    async fn do_exchange(
-        &self,
-        _request: Request<Streaming<FlightData>>,
-    ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        Err(Status::unimplemented("do_exchange not implemented"))
-    }
-}
