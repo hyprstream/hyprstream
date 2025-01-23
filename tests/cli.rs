@@ -6,7 +6,7 @@ use hyprstream_core::{
         },
         handlers::execute_sql,
     },
-    config::{self, set_tls_data, get_tls_config},
+    config::get_tls_config,
     service::FlightSqlServer,
     storage::{duckdb::DuckDbBackend, StorageBackendType},
 };
@@ -38,40 +38,65 @@ async fn start_test_server() -> (tokio::task::JoinHandle<()>, std::net::SocketAd
     // Install the default crypto provider
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // Start a test server
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
     // Create a test database
     let backend = StorageBackendType::DuckDb(DuckDbBackend::new_in_memory().unwrap());
     let service = FlightSqlServer::new(backend);
 
-    // Run the server in the background
+    // Create and bind to a TCP listener
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
+    let listener = TcpListener::bind(addr).await.unwrap();
+    let bound_addr = listener.local_addr().unwrap();
+
+    // Create channels for server readiness and bound port
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    
+    println!("Starting test server on {}", bound_addr);
+
+    // Spawn the server task
     let server_handle = tokio::spawn(async move {
-        Server::builder()
+        // Run the server in the background
+        let server = Server::builder()
             .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(service))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-            .await
-            .unwrap();
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener));
+
+        // Signal that we're ready to accept connections
+        // This happens after the server is bound and listening
+        let _ = tx.send(());
+
+        match server.await {
+            Ok(_) => println!("Server finished successfully"),
+            Err(e) => {
+                println!("Server error: {}", e);
+                if let Some(source) = e.source() {
+                    println!("Error source: {:?}", source);
+                }
+            }
+        }
     });
 
-    // Give the server a moment to start
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    // Wait for the server to be ready
+    rx.await.expect("Server startup signal not received");
+    println!("Server ready signal received");
+    
+    // Give the server a moment to fully initialize
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    (server_handle, addr)
+    (server_handle, bound_addr)
 }
 
 async fn start_tls_test_server() -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
     // Install the default crypto provider
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // Start a test server with TLS
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
     // Create a test database
     let backend = StorageBackendType::DuckDb(DuckDbBackend::new_in_memory().unwrap());
     let service = FlightSqlServer::new(backend);
+
+    // Find an available port
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
+    let listener = TcpListener::bind(addr).await.unwrap();
+    let bound_addr = listener.local_addr().unwrap();
+    drop(listener); // Release the port
 
     // Create config with TLS settings
     let tls_paths = get_test_tls_paths();
@@ -86,33 +111,33 @@ async fn start_tls_test_server() -> (tokio::task::JoinHandle<()>, std::net::Sock
     // Get TLS config from Config
     let (identity, ca_cert) = get_tls_config(&config).unwrap();
 
-    // Run the server in the background with TLS
+    println!("Starting TLS server...");
+    println!("Setting up server TLS config...");
+    
+    // Create server TLS config with more permissive settings
+    let mut tls_config = tonic::transport::ServerTlsConfig::new()
+        .identity(identity)
+        .client_auth_optional(true);  // Allow both TLS auth and non-auth clients
+
+    // Add CA cert if present
+    if let Some(ca) = ca_cert {
+        println!("Adding CA certificate to server TLS config");
+        tls_config = tls_config.client_ca_root(ca);
+    }
+
+    println!("Created server TLS config with client auth optional");
+
+    // Build and configure the server
+    let server = Server::builder()
+        .tls_config(tls_config)
+        .unwrap()
+        .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(service))
+        .serve(bound_addr);
+
+    println!("TLS test server starting on {}", bound_addr);
+
+    // Spawn the server task
     let server_handle = tokio::spawn(async move {
-        println!("Starting TLS server...");
-        println!("Setting up server TLS config...");
-        
-        // Create server TLS config with more permissive settings
-        let mut tls_config = tonic::transport::ServerTlsConfig::new()
-            .identity(identity)
-            .client_auth_optional(true);  // Allow both TLS auth and non-auth clients
-
-        // Add CA cert if present
-        if let Some(ca) = ca_cert {
-            println!("Adding CA certificate to server TLS config");
-            tls_config = tls_config.client_ca_root(ca);
-        }
-
-        println!("Created server TLS config with client auth optional");
-        println!("Waiting for TLS connections...");
-
-        let server = Server::builder()
-            .tls_config(tls_config)
-            .unwrap()
-            .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(service))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener));
-
-        println!("Server built with TLS config, starting to serve...");
-        
         match server.await {
             Ok(_) => println!("Server finished successfully"),
             Err(e) => {
@@ -124,27 +149,16 @@ async fn start_tls_test_server() -> (tokio::task::JoinHandle<()>, std::net::Sock
         }
     });
 
-    // Give the server more time to start and initialize TLS
-    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-
-    // Print server address and status for debugging
-    println!("TLS test server started on {}", addr);
-    println!("Waiting for server to be ready...");
-
-    // Try to connect to verify server is listening
-    let socket = tokio::net::TcpStream::connect(addr).await;
-    match socket {
-        Ok(_) => println!("Server is accepting connections"),
-        Err(e) => println!("Server connection test failed: {}", e),
-    }
-
-    (server_handle, addr)
+    (server_handle, bound_addr)
 }
 
 #[tokio::test]
 async fn test_sql_command_basic() {
     let (server_handle, addr) = start_test_server().await;
     let socket_addr = Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), addr.port()));
+
+    // Give the server a moment to start up
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // CREATE - Create table and insert data
     let create_result = execute_sql(
@@ -243,6 +257,9 @@ async fn test_sql_command_basic() {
 async fn test_sql_command_tls() {
     // Start TLS server
     let (server_handle, addr) = start_tls_test_server().await;
+
+    // Give the server a moment to start up
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Create config with TLS settings using paths
     let tls_paths = get_test_tls_paths();
