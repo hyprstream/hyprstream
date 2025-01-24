@@ -147,49 +147,11 @@ impl StorageBackend for CachedStorageBackend {
     }
 
     fn new_with_options(
-        connection_string: &str,
-        options: &HashMap<String, String>,
-        credentials: Option<&Credentials>,
+        _connection_string: &str,
+        _options: &HashMap<String, String>,
+        _credentials: Option<&Credentials>,
     ) -> Result<Self, Status> {
-        // Parse cache duration from options
-        let max_duration_secs = options
-            .get("max_duration_secs")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(3600);
-
-        // Create cache backend
-        let default_engine = "duckdb".to_string();
-        let default_connection = ":memory:".to_string();
-        let cache_engine = options.get("cache_engine").unwrap_or(&default_engine);
-        let cache_connection = options.get("cache_connection").unwrap_or(&default_connection);
-        let cache_options: HashMap<String, String> = options
-            .iter()
-            .filter(|(k, _)| k.starts_with("cache_"))
-            .map(|(k, v)| (k[6..].to_string(), v.clone()))
-            .collect();
-
-        let cache: Arc<dyn StorageBackend> = match cache_engine.as_str() {
-            "duckdb" => Arc::new(DuckDbBackend::new_with_options(
-                cache_connection,
-                &cache_options,
-                None,
-            )?),
-            "adbc" => Arc::new(AdbcBackend::new_with_options(
-                cache_connection,
-                &cache_options,
-                None,
-            )?),
-            _ => return Err(Status::invalid_argument("Invalid cache engine type")),
-        };
-
-        // Create store backend
-        let store = Arc::new(AdbcBackend::new_with_options(
-            connection_string,
-            options,
-            credentials,
-        )?);
-
-        Ok(Self::new(cache, store, max_duration_secs))
+        Err(Status::invalid_argument("Use CachedStorageBackend::new() instead"))
     }
 
     async fn create_table(&self, table_name: &str, schema: &Schema) -> Result<(), Status> {

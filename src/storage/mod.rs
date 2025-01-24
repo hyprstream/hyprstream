@@ -15,13 +15,25 @@ pub mod table_manager;
 pub mod view;
 
 use crate::cli::commands::config::Credentials;
-use crate::storage::view::{ViewDefinition, ViewMetadata};
+use crate::storage::{
+    adbc::AdbcBackend,
+    cached::CachedStorageBackend,
+    duckdb::DuckDbBackend,
+    view::{ViewDefinition, ViewMetadata},
+};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::Status;
+
+#[derive(Clone)]
+pub enum StorageBackendType {
+    DuckDb(DuckDbBackend),
+    Adbc(AdbcBackend),
+    Cached(CachedStorageBackend),
+}
 
 /// Utility functions for SQL operations
 pub struct StorageUtils;
@@ -101,9 +113,6 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// Create a new table with the given schema
     async fn create_table(&self, table_name: &str, schema: &Schema) -> Result<(), Status>;
 
-    /// Insert data into a table
-    async fn insert_into_table(&self, table_name: &str, batch: RecordBatch) -> Result<(), Status>;
-
     /// Create a view with the given definition
     async fn create_view(&self, name: &str, definition: ViewDefinition) -> Result<(), Status>;
 
@@ -126,17 +135,12 @@ pub trait StorageBackend: Send + Sync + 'static {
     async fn drop_table(&self, table_name: &str) -> Result<(), Status>;
 }
 
-#[derive(Clone)]
-pub enum StorageBackendType {
-    Adbc(adbc::AdbcBackend),
-    DuckDb(duckdb::DuckDbBackend),
-}
-
 impl AsRef<dyn StorageBackend> for StorageBackendType {
     fn as_ref(&self) -> &(dyn StorageBackend + 'static) {
         match self {
             StorageBackendType::Adbc(backend) => backend,
             StorageBackendType::DuckDb(backend) => backend,
+            StorageBackendType::Cached(backend) => backend,
         }
     }
 }
@@ -144,24 +148,15 @@ impl AsRef<dyn StorageBackend> for StorageBackendType {
 #[async_trait::async_trait]
 impl StorageBackend for StorageBackendType {
     async fn init(&self) -> Result<(), Status> {
-        match self {
-            StorageBackendType::Adbc(backend) => backend.init().await,
-            StorageBackendType::DuckDb(backend) => backend.init().await,
-        }
+        self.as_ref().init().await
     }
 
     async fn prepare_sql(&self, query: &str) -> Result<Vec<u8>, Status> {
-        match self {
-            StorageBackendType::Adbc(backend) => backend.prepare_sql(query).await,
-            StorageBackendType::DuckDb(backend) => backend.prepare_sql(query).await,
-        }
+        self.as_ref().prepare_sql(query).await
     }
 
     async fn query_sql(&self, statement_handle: &[u8]) -> Result<RecordBatch, Status> {
-        match self {
-            StorageBackendType::Adbc(backend) => backend.query_sql(statement_handle).await,
-            StorageBackendType::DuckDb(backend) => backend.query_sql(statement_handle).await,
-        }
+        self.as_ref().query_sql(statement_handle).await
     }
 
     fn new_with_options(
@@ -183,70 +178,61 @@ impl StorageBackend for StorageBackendType {
             "duckdb" => Ok(StorageBackendType::DuckDb(
                 duckdb::DuckDbBackend::new_with_options(connection_string, options, credentials)?,
             )),
+            "cached" => {
+                // Create cache backend (in-memory DuckDB)
+                let cache = Arc::new(DuckDbBackend::new_in_memory()?);
+                
+                // Create store backend based on store_engine option
+                let store_engine = options.get("store_engine")
+                    .ok_or_else(|| Status::invalid_argument("Missing store_engine for cached backend"))?;
+                
+                let store = match store_engine.as_str() {
+                    "adbc" => Arc::new(AdbcBackend::new_with_options(connection_string, options, credentials)?),
+                    "duckdb" => Arc::new(DuckDbBackend::new_with_options(connection_string, options, credentials)?),
+                    _ => return Err(Status::invalid_argument("Invalid store_engine type")),
+                };
+
+                Ok(StorageBackendType::Cached(CachedStorageBackend::new(
+                    cache,
+                    store,
+                    options.get("max_duration_secs")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(3600),
+                )))
+            }
             _ => Err(Status::invalid_argument("Invalid engine type")),
         }
     }
 
     async fn create_table(&self, table_name: &str, schema: &Schema) -> Result<(), Status> {
-        match self {
-            StorageBackendType::Adbc(backend) => backend.create_table(table_name, schema).await,
-            StorageBackendType::DuckDb(backend) => backend.create_table(table_name, schema).await,
-        }
-    }
-
-    async fn insert_into_table(&self, table_name: &str, batch: RecordBatch) -> Result<(), Status> {
-        match self {
-            StorageBackendType::Adbc(backend) => backend.insert_into_table(table_name, batch).await,
-            StorageBackendType::DuckDb(backend) => backend.insert_into_table(table_name, batch).await,
-        }
+        self.as_ref().create_table(table_name, schema).await
     }
 
     async fn create_view(&self, name: &str, definition: ViewDefinition) -> Result<(), Status> {
-        match self {
-            StorageBackendType::Adbc(backend) => backend.create_view(name, definition).await,
-            StorageBackendType::DuckDb(backend) => backend.create_view(name, definition).await,
-        }
+        self.as_ref().create_view(name, definition).await
     }
 
     async fn get_view(&self, name: &str) -> Result<ViewMetadata, Status> {
-        match self {
-            StorageBackendType::Adbc(backend) => backend.get_view(name).await,
-            StorageBackendType::DuckDb(backend) => backend.get_view(name).await,
-        }
+        self.as_ref().get_view(name).await
     }
 
     async fn list_views(&self) -> Result<Vec<String>, Status> {
-        match self {
-            StorageBackendType::Adbc(backend) => backend.list_views().await,
-            StorageBackendType::DuckDb(backend) => backend.list_views().await,
-        }
+        self.as_ref().list_views().await
     }
 
     async fn drop_view(&self, name: &str) -> Result<(), Status> {
-        match self {
-            StorageBackendType::Adbc(backend) => backend.drop_view(name).await,
-            StorageBackendType::DuckDb(backend) => backend.drop_view(name).await,
-        }
+        self.as_ref().drop_view(name).await
     }
 
     async fn drop_table(&self, table_name: &str) -> Result<(), Status> {
-        match self {
-            StorageBackendType::Adbc(backend) => backend.drop_table(table_name).await,
-            StorageBackendType::DuckDb(backend) => backend.drop_table(table_name).await,
-        }
+        self.as_ref().drop_table(table_name).await
     }
 
     async fn list_tables(&self) -> Result<Vec<String>, Status> {
-        match self {
-            StorageBackendType::Adbc(backend) => backend.list_tables().await,
-            StorageBackendType::DuckDb(backend) => backend.list_tables().await,
-        }
+        self.as_ref().list_tables().await
     }
 
     async fn get_table_schema(&self, table_name: &str) -> Result<Arc<Schema>, Status> {
-        match self {
-            StorageBackendType::Adbc(backend) => backend.get_table_schema(table_name).await,
-            StorageBackendType::DuckDb(backend) => backend.get_table_schema(table_name).await,
-        }
+        self.as_ref().get_table_schema(table_name).await
     }
 }

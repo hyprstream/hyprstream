@@ -1,75 +1,77 @@
-use arrow::{
-    array::{Array, Float64Array, Int64Array},
-    datatypes::{DataType, Field, Schema},
-    record_batch::RecordBatch,
+mod common;
+
+use arrow_adbc::{
+    connection::Connection,
+    database::Database,
+    driver::FlightSqlDriver,
 };
-use hyprstream_core::{
-    storage::{
-        duckdb::DuckDbBackend, StorageBackend, StorageBackendType,
-        view::ViewDefinition,
-    },
-};
-use std::collections::HashMap;
+use arrow_array::RecordBatch;
 use std::sync::Arc;
-use tempfile::tempdir;
 use tonic::Status;
 
 #[tokio::test]
 async fn test_cache_operations() -> Result<(), Status> {
-    // Create a temporary directory for the database
-    let dir = tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
+    // Start test server with cached storage
+    let TestServer { handle, addr, cache, store } = common::start_test_server(true).await;
+    let endpoint = common::get_test_endpoint(addr);
 
-    // Create backend (initialization happens synchronously in new())
-    let backend = Arc::new(StorageBackendType::DuckDb(DuckDbBackend::new_with_options(
-        db_path.to_str().unwrap(),
-        &HashMap::new(),
-        None,
-    )?));
+    // Get cache and store backends
+    let cache = cache.unwrap();
+    let store = store.unwrap();
 
-    // Initialize backend
-    backend.init().await?;
-
-    // Create test table
+    // Create test table directly in store
     let table_name = "test_metrics";
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("value", DataType::Float64, false),
-        Field::new("timestamp", DataType::Int64, false),
-    ]));
-
-    backend.create_table(table_name, &schema).await?;
-
-    // Create test data
-    let values: Arc<dyn Array> = Arc::new(Float64Array::from(vec![1.0]));
-    let timestamps: Arc<dyn Array> = Arc::new(Int64Array::from(vec![1000]));
-
-    let batch = RecordBatch::try_new(schema.clone(), vec![values, timestamps]).unwrap();
-
-    // Insert test data
-    backend.insert_into_table(table_name, batch).await?;
-
-    // Query data
-    let result = backend.query_table(table_name, None).await?;
-    assert_eq!(result.num_columns(), 2);
-
-    // Create view
-    let view_name = format!("view_{}", table_name);
-    let view_def = ViewDefinition::new(
-        table_name.to_string(),
-        vec!["value".to_string(), "timestamp".to_string()],
-        vec![],
-        None,
-        None,
-        Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Float64, false),
-            Field::new("timestamp", DataType::Int64, false),
-        ])),
+    let create_sql = format!(
+        "CREATE TABLE {} (
+            value DOUBLE PRECISION NOT NULL,
+            timestamp BIGINT NOT NULL
+        )", table_name
     );
-    backend.as_ref().create_view(&view_name, view_def).await?;
+    let stmt_handle = store.prepare_sql(&create_sql).await?;
+    store.query_sql(&stmt_handle).await?;
 
-    // Query view
-    let result = backend.as_ref().get_view(&view_name).await?;
-    assert_eq!(result.definition.schema.fields().len(), 2);
+    // Insert test data directly into store
+    let insert_sql = format!(
+        "INSERT INTO {} VALUES (1.0, 1000)",
+        table_name
+    );
+    let stmt_handle = store.prepare_sql(&insert_sql).await?;
+    store.query_sql(&stmt_handle).await?;
+
+    // Connect using ADBC to query through cache
+    let driver = FlightSqlDriver::new();
+    let database = Database::connect(&driver, &endpoint).unwrap();
+    let mut connection = database.connect().unwrap();
+
+    // First query - should be a cache miss and fetch from store
+    let query_sql = format!("SELECT * FROM {}", table_name);
+    let mut stmt = connection.prepare(&query_sql, None).unwrap();
+    let result = stmt.query(None).unwrap();
+    let batches: Vec<RecordBatch> = result.collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(batches[0].num_columns(), 2);
+
+    // Verify data is now in cache
+    let cache_query = format!("SELECT * FROM {}", table_name);
+    let stmt_handle = cache.prepare_sql(&cache_query).await?;
+    let cache_result = cache.query_sql(&stmt_handle).await?;
+    assert_eq!(cache_result.num_columns(), 2);
+
+    // Insert more data directly into store
+    let insert_sql = format!(
+        "INSERT INTO {} VALUES (2.0, 2000)",
+        table_name
+    );
+    let stmt_handle = store.prepare_sql(&insert_sql).await?;
+    store.query_sql(&stmt_handle).await?;
+
+    // Query again - should get updated data through cache
+    let mut stmt = connection.prepare(&query_sql, None).unwrap();
+    let result = stmt.query(None).unwrap();
+    let batches: Vec<RecordBatch> = result.collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(batches[0].num_rows(), 2); // Should see both rows
+
+    // Clean up
+    handle.abort();
 
     Ok(())
 }
