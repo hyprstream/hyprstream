@@ -71,6 +71,7 @@ anyhow = "1.0.95"
 daemonize = "0.5.0"
 prost = "0.13"
 arrow-json = "53.1.0"
+datafusion-table-providers = { version = "0.2.4", features = ["duckdb", "federation", "duckdb-federation", "postgres", "postgres-federation", "odbc", "odbc-federation"] }
 
 [dev-dependencies]
 criterion = "0.5.1"
