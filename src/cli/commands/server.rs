@@ -1,4 +1,4 @@
-use super::config::{ConfigOptionDef, ConfigSection};
+use super::config::{ConfigOptionDef, ConfigSection, LoggingConfig};
 use clap::Args;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -12,10 +12,6 @@ pub struct ServerConfig {
     /// Server port
     #[arg(long, env = "HYPRSTREAM_SERVER_PORT")]
     pub port: Option<u16>,
-
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(long, env = "HYPRSTREAM_LOG_LEVEL")]
-    pub log_level: Option<String>,
 
     /// Working directory for the server when running in detached mode
     #[arg(long, env = "HYPRSTREAM_WORKING_DIR")]
@@ -36,6 +32,18 @@ pub struct ServerConfig {
     /// Path to CA certificate for client authentication (enables mTLS)
     #[arg(long = "tls-client-ca", env = "HYPRSTREAM_TLS_CLIENT_CA")]
     pub tls_client_ca: Option<PathBuf>,
+
+    /// Minimum TLS version (1.2|1.3)
+    #[arg(long, env = "HYPRSTREAM_TLS_MIN_VERSION")]
+    pub tls_min_version: Option<String>,
+
+    /// Allowed TLS cipher suites
+    #[arg(long, env = "HYPRSTREAM_TLS_CIPHER_LIST")]
+    pub tls_cipher_list: Option<String>,
+
+    /// Prefer server cipher order
+    #[arg(long, env = "HYPRSTREAM_TLS_PREFER_SERVER_CIPHERS")]
+    pub tls_prefer_server_ciphers: Option<bool>,
 }
 
 impl Default for ServerConfig {
@@ -43,12 +51,14 @@ impl Default for ServerConfig {
         Self {
             host: None,
             port: None,
-            log_level: None,
             working_dir: None,
             pid_file: None,
             tls_cert: None,
             tls_key: None,
             tls_client_ca: None,
+            tls_min_version: Some("1.2".to_string()),
+            tls_cipher_list: None,
+            tls_prefer_server_ciphers: Some(true),
         }
     }
 }
@@ -62,12 +72,6 @@ impl ConfigSection for ServerConfig {
             ConfigOptionDef::new("server.port", "Server port")
                 .with_env("HYPRSTREAM_SERVER_PORT")
                 .with_cli("port"),
-            ConfigOptionDef::new(
-                "server.log_level",
-                "Log level (trace, debug, info, warn, error)",
-            )
-            .with_env("HYPRSTREAM_LOG_LEVEL")
-            .with_cli("log-level"),
             ConfigOptionDef::new(
                 "server.working_dir",
                 "Working directory for the server when running in detached mode",
@@ -92,6 +96,24 @@ impl ConfigSection for ServerConfig {
             )
             .with_env("HYPRSTREAM_TLS_CLIENT_CA")
             .with_cli("tls-client-ca"),
+            ConfigOptionDef::new(
+                "server.tls_min_version",
+                "Minimum TLS version (1.2|1.3)",
+            )
+            .with_env("HYPRSTREAM_TLS_MIN_VERSION")
+            .with_cli("tls-min-version"),
+            ConfigOptionDef::new(
+                "server.tls_cipher_list",
+                "Allowed TLS cipher suites",
+            )
+            .with_env("HYPRSTREAM_TLS_CIPHER_LIST")
+            .with_cli("tls-cipher-list"),
+            ConfigOptionDef::new(
+                "server.tls_prefer_server_ciphers",
+                "Prefer server cipher order",
+            )
+            .with_env("HYPRSTREAM_TLS_PREFER_SERVER_CIPHERS")
+            .with_cli("tls-prefer-server-ciphers"),
         ]
     }
 
@@ -103,24 +125,28 @@ impl ConfigSection for ServerConfig {
         struct ServerConfigFile {
             host: Option<String>,
             port: Option<u16>,
-            log_level: Option<String>,
             working_dir: Option<String>,
             pid_file: Option<String>,
             tls_cert: Option<PathBuf>,
             tls_key: Option<PathBuf>,
             tls_client_ca: Option<PathBuf>,
+            tls_min_version: Option<String>,
+            tls_cipher_list: Option<String>,
+            tls_prefer_server_ciphers: Option<bool>,
         }
 
         let config = ServerConfigFile::deserialize(deserializer)?;
         Ok(ServerConfig {
             host: config.host,
             port: config.port,
-            log_level: config.log_level,
             working_dir: config.working_dir,
             pid_file: config.pid_file,
             tls_cert: config.tls_cert,
             tls_key: config.tls_key,
             tls_client_ca: config.tls_client_ca,
+            tls_min_version: config.tls_min_version.or(Some("1.2".to_string())),
+            tls_cipher_list: config.tls_cipher_list,
+            tls_prefer_server_ciphers: config.tls_prefer_server_ciphers.or(Some(true)),
         })
     }
 }
@@ -303,4 +329,7 @@ pub struct ServerCommand {
 
     #[command(flatten)]
     pub cache: CacheConfig,
+
+    #[command(flatten)]
+    pub logging: LoggingConfig,
 }

@@ -120,28 +120,20 @@ impl ModelStorage for TimeSeriesModelStorage {
             version.map_or(String::new(), |v| format!(" AND version = '{}'", v));
 
         // Query metadata
-        let metadata_batch = self
-            .backend
-            .query_table(
-                "model_metadata",
-                Some(vec![format!(
-                    "* WHERE model_id = '{}'{}",
-                    model_id, version_condition
-                )]),
-            )
-            .await?;
+        let metadata_sql = format!(
+            "SELECT * FROM model_metadata WHERE model_id = '{}'{}",
+            model_id, version_condition
+        );
+        let metadata_handle = self.backend.prepare_sql(&metadata_sql).await?;
+        let metadata_batch = self.backend.query_sql(&metadata_handle).await?;
 
         // Query layers
-        let layers_batch = self
-            .backend
-            .query_table(
-                "model_layers",
-                Some(vec![format!(
-                    "* WHERE model_id = '{}'{}",
-                    model_id, version_condition
-                )]),
-            )
-            .await?;
+        let layers_sql = format!(
+            "SELECT * FROM model_layers WHERE model_id = '{}'{}",
+            model_id, version_condition
+        );
+        let layers_handle = self.backend.prepare_sql(&layers_sql).await?;
+        let layers_batch = self.backend.query_sql(&layers_handle).await?;
 
         // Convert record batches back to Model
         Self::record_batches_to_model(metadata_batch, layers_batch)
@@ -170,16 +162,12 @@ impl ModelStorage for TimeSeriesModelStorage {
         };
 
         // Query specific layers
-        let layers_batch = self
-            .backend
-            .query_table(
-                "model_layers",
-                Some(vec![format!(
-                    "* WHERE model_id = '{}'{}{}",
-                    model_id, version_condition, names_condition
-                )]),
-            )
-            .await?;
+        let sql = format!(
+            "SELECT * FROM model_layers WHERE model_id = '{}'{}{}",
+            model_id, version_condition, names_condition
+        );
+        let handle = self.backend.prepare_sql(&sql).await?;
+        let layers_batch = self.backend.query_sql(&handle).await?;
 
         // Convert record batch to ModelLayer instances
         Self::record_batch_to_layers(layers_batch)
@@ -187,10 +175,9 @@ impl ModelStorage for TimeSeriesModelStorage {
 
     async fn list_models(&self) -> Result<Vec<ModelMetadata>, Status> {
         // Query distinct models from metadata
-        let metadata_batch = self.backend.query_table(
-            "model_metadata",
-            Some(vec!["DISTINCT model_id, name, architecture, version, created_at, description, parent_version, parameters".to_string()]),
-        ).await?;
+        let sql = "SELECT DISTINCT model_id, name, architecture, version, created_at, description, parent_version, parameters FROM model_metadata";
+        let handle = self.backend.prepare_sql(sql).await?;
+        let metadata_batch = self.backend.query_sql(&handle).await?;
 
         // Convert record batch to ModelMetadata instances
         Self::record_batch_to_metadata_list(metadata_batch)
@@ -198,16 +185,12 @@ impl ModelStorage for TimeSeriesModelStorage {
 
     async fn list_versions(&self, model_id: &str) -> Result<Vec<ModelVersion>, Status> {
         // Query versions for specific model
-        let versions_batch = self
-            .backend
-            .query_table(
-                "model_metadata",
-                Some(vec![format!(
-                    "version, created_at, description, parent_version WHERE model_id = '{}'",
-                    model_id
-                )]),
-            )
-            .await?;
+        let sql = format!(
+            "SELECT version, created_at, description, parent_version FROM model_metadata WHERE model_id = '{}'",
+            model_id
+        );
+        let handle = self.backend.prepare_sql(&sql).await?;
+        let versions_batch = self.backend.query_sql(&handle).await?;
 
         // Convert record batch to ModelVersion instances
         Self::record_batch_to_versions(versions_batch)
@@ -215,26 +198,20 @@ impl ModelStorage for TimeSeriesModelStorage {
 
     async fn delete_version(&self, model_id: &str, version: &str) -> Result<(), Status> {
         // Delete metadata
-        self.backend
-            .query_table(
-                "model_metadata",
-                Some(vec![format!(
-                    "DELETE WHERE model_id = '{}' AND version = '{}'",
-                    model_id, version
-                )]),
-            )
-            .await?;
+        let metadata_sql = format!(
+            "DELETE FROM model_metadata WHERE model_id = '{}' AND version = '{}'",
+            model_id, version
+        );
+        let metadata_handle = self.backend.prepare_sql(&metadata_sql).await?;
+        self.backend.query_sql(&metadata_handle).await?;
 
         // Delete layers
-        self.backend
-            .query_table(
-                "model_layers",
-                Some(vec![format!(
-                    "DELETE WHERE model_id = '{}' AND version = '{}'",
-                    model_id, version
-                )]),
-            )
-            .await?;
+        let layers_sql = format!(
+            "DELETE FROM model_layers WHERE model_id = '{}' AND version = '{}'",
+            model_id, version
+        );
+        let layers_handle = self.backend.prepare_sql(&layers_sql).await?;
+        self.backend.query_sql(&layers_handle).await?;
 
         Ok(())
     }

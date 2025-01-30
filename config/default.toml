@@ -15,4 +15,16 @@ enabled = true
 engine = "duckdb"
 connection = ":memory:"
 max_duration_secs = 3600
-options = {} 
+options = {}
+
+# Logging Configuration
+[logging]
+level = "info"
+# filter = "hyprstream=debug,tower_http=debug"
+
+# TLS Configuration
+[tls]
+enabled = false
+cert_path = ""
+key_path = ""
+ca_path = ""

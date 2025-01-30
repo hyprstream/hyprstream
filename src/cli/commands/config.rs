@@ -1,3 +1,4 @@
+use clap::Args;
 use serde::Deserialize;
 
 /// Trait for configuration options that can be set via CLI, env vars, or config file
@@ -94,6 +95,69 @@ pub trait ConfigSection: Sized + Default {
     fn from_config<'de, D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>;
+}
+
+/// Logging configuration that can be set via CLI, env vars, or config file
+#[derive(Debug, Clone, Default, Args, Deserialize)]
+pub struct LoggingConfig {
+    /// Enable verbose logging (-v for debug, -vv for trace)
+    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
+    #[serde(skip)]
+    pub verbose: u8,
+
+    /// Log level (trace, debug, info, warn, error)
+    #[arg(long = "log-level", env = "HYPRSTREAM_LOG_LEVEL")]
+    pub log_level: Option<String>,
+
+    /// Log filter directives
+    #[arg(long = "log-filter", env = "HYPRSTREAM_LOG_FILTER")]
+    pub log_filter: Option<String>,
+}
+
+impl LoggingConfig {
+    pub fn get_effective_level(&self) -> &str {
+        match (self.verbose, self.log_level.as_deref()) {
+            (2, _) => "trace",     // -vv flag
+            (1, _) => "debug",     // -v flag
+            (0, Some(level)) => level, // Configured level
+            _ => "info",           // Default
+        }
+    }
+
+    fn is_valid_level(level: &str) -> bool {
+        matches!(level, "trace" | "debug" | "info" | "warn" | "error")
+    }
+}
+
+impl ConfigSection for LoggingConfig {
+    fn options() -> Vec<ConfigOptionDef<String>> {
+        vec![
+            ConfigOptionDef::new("logging.level", "Log level (trace, debug, info, warn, error)")
+                .with_env("HYPRSTREAM_LOG_LEVEL")
+                .with_cli("log-level"),
+            ConfigOptionDef::new("logging.filter", "Log filter directives")
+                .with_env("HYPRSTREAM_LOG_FILTER")
+                .with_cli("log-filter"),
+        ]
+    }
+
+    fn from_config<'de, D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct LoggingConfigFile {
+            level: Option<String>,
+            filter: Option<String>,
+        }
+
+        let config = LoggingConfigFile::deserialize(deserializer)?;
+        Ok(LoggingConfig {
+            verbose: 0,
+            log_level: config.level,
+            log_filter: config.filter,
+        })
+    }
 }
 
 /// Credentials for authentication

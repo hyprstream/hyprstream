@@ -1,4 +1,5 @@
 use clap::Args;
+use super::config::LoggingConfig;
 
 #[derive(Args)]
 #[command(disable_help_flag = true)]
@@ -31,7 +32,6 @@ pub struct SqlCommand {
     #[arg(long = "help", action = clap::ArgAction::Help)]
     pub help: Option<bool>,
 
-    /// Enable verbose output
-    #[arg(short = 'v', long = "verbose")]
-    pub verbose: bool,
+    #[command(flatten)]
+    pub logging: LoggingConfig,
 }

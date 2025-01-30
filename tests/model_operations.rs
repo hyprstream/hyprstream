@@ -7,7 +7,7 @@ use hyprstream_core::{
         storage::TimeSeriesModelStorage, Model, ModelLayer, ModelMetadata, ModelStorage,
         ModelVersion,
     },
-    service::FlightSqlService,
+    service::FlightSqlServer,
     storage::{duckdb::DuckDbBackend, StorageBackend, StorageBackendType},
 };
 use std::{collections::HashMap, sync::Arc, time::SystemTime};
@@ -39,7 +39,7 @@ async fn test_model_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
         StorageBackendType::DuckDb(backend) => backend.clone(),
         _ => panic!("Expected DuckDB backend"),
     };
-    let service = FlightSqlService::new(StorageBackendType::DuckDb(backend));
+    let service = FlightSqlServer::new(StorageBackendType::DuckDb(backend));
     let server = tonic::transport::Server::builder()
         .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(service))
         .serve(addr.parse()?);

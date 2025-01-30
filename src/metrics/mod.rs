@@ -1,9 +1,13 @@
+pub mod storage;
+
 use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use serde::{Deserialize, Serialize};
+use std::default::Default;
 use std::sync::Arc;
 use tonic::Status;
 
-use serde::{Deserialize, Serialize};
+pub use storage::{MetricsStorage, MetricsStorageImpl};
 
 /// A single metric record with running window calculations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +63,18 @@ impl MetricRecord {
         }
 
         Ok(metrics)
+    }
+}
+
+impl Default for MetricRecord {
+    fn default() -> Self {
+        Self {
+            metric_id: String::new(),
+            timestamp: 0,
+            value_running_window_sum: 0.0,
+            value_running_window_avg: 0.0,
+            value_running_window_count: 0,
+        }
     }
 }
 
