@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.71"
 name = "rustls"
-version = "0.23.20"
+version = "0.23.21"
 build = "build.rs"
 exclude = [
     "src/testdata",
@@ -65,7 +65,7 @@ harness = false
 required-features = ["ring"]
 
 [dependencies.aws-lc-rs]
-version = "1.10"
+version = "1.12"
 features = [
     "aws-lc-sys",
     "prebuilt-nasm",
@@ -172,6 +172,9 @@ default-features = false
 
 [dev-dependencies.webpki-roots]
 version = "0.26"
+
+[dev-dependencies.x509-parser]
+version = "0.16"
 
 [build-dependencies.rustversion]
 version = "1.0.6"

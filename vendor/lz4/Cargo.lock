@@ -36,7 +36,7 @@ checksum = "97b3888a4aecf77e811145cadf6eef5901f4782c53886191b2f693f24761847c"
 
 [[package]]
 name = "lz4"
-version = "1.28.0"
+version = "1.28.1"
 dependencies = [
  "lz4-sys",
  "rand",

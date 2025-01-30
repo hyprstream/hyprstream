@@ -330,6 +330,15 @@ impl Command {
         &mut self.std
     }
 
+    /// Cheaply convert into a `std::process::Command`.
+    ///
+    /// Note that Tokio specific options will be lost. Currently, this only applies to [`kill_on_drop`].
+    ///
+    /// [`kill_on_drop`]: Command::kill_on_drop
+    pub fn into_std(self) -> StdCommand {
+        self.std
+    }
+
     /// Adds an argument to pass to the program.
     ///
     /// Only one argument can be passed per use. So instead of:
@@ -801,6 +810,7 @@ impl Command {
     /// Basic usage:
     ///
     /// ```no_run
+    /// # if cfg!(miri) { return } // No `pidfd_spawnp` in miri.
     /// use tokio::process::Command;
     ///
     /// async fn run_ls() -> std::process::ExitStatus {
@@ -1183,6 +1193,7 @@ impl Child {
     /// This function is cancel safe.
     ///
     /// ```
+    /// # if cfg!(miri) { return } // No `pidfd_spawnp` in miri.
     /// # #[cfg(not(unix))]fn main(){}
     /// # #[cfg(unix)]
     /// use tokio::io::AsyncWriteExt;

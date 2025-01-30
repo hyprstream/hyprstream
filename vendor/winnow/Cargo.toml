@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.65.0"
 name = "winnow"
-version = "0.6.20"
+version = "0.6.24"
 build = false
 include = [
     "build.rs",
@@ -25,6 +25,7 @@ include = [
     "benches/**/*",
     "examples/**/*",
 ]
+autolib = false
 autobins = false
 autoexamples = false
 autotests = false
@@ -43,14 +44,11 @@ license = "MIT"
 repository = "https://github.com/winnow-rs/winnow"
 
 [package.metadata.docs.rs]
-cargo-args = [
-    "-Zunstable-options",
-    "-Zrustdoc-scrape-examples",
-]
 features = ["unstable-doc"]
 rustdoc-args = [
     "--cfg",
     "docsrs",
+    "--generate-link-to-definition",
 ]
 
 [[package.metadata.release.pre-release-replacements]]
@@ -94,10 +92,28 @@ file = "src/lib.rs"
 replace = "blob/v{{version}}/CHANGELOG.md"
 search = 'blob/v.+\..+\..+/CHANGELOG.md'
 
-[profile.bench]
-lto = true
-codegen-units = 1
-debug = 2
+[features]
+alloc = []
+debug = [
+    "std",
+    "dep:anstream",
+    "dep:anstyle",
+    "dep:is-terminal",
+    "dep:terminal_size",
+]
+default = ["std"]
+simd = ["dep:memchr"]
+std = [
+    "alloc",
+    "memchr?/std",
+]
+unstable-doc = [
+    "alloc",
+    "std",
+    "simd",
+    "unstable-recover",
+]
+unstable-recover = []
 
 [lib]
 name = "winnow"
@@ -267,29 +283,6 @@ features = ["examples"]
 [dev-dependencies.term-transcript]
 version = "0.2.0"
 
-[features]
-alloc = []
-debug = [
-    "std",
-    "dep:anstream",
-    "dep:anstyle",
-    "dep:is-terminal",
-    "dep:terminal_size",
-]
-default = ["std"]
-simd = ["dep:memchr"]
-std = [
-    "alloc",
-    "memchr?/std",
-]
-unstable-doc = [
-    "alloc",
-    "std",
-    "simd",
-    "unstable-recover",
-]
-unstable-recover = []
-
 [lints.clippy]
 bool_assert_comparison = "allow"
 branches_sharing_code = "allow"
@@ -335,6 +328,7 @@ rc_mutex = "warn"
 redundant_feature_names = "warn"
 ref_option_ref = "warn"
 rest_pat_in_fully_bound_structs = "warn"
+result_large_err = "allow"
 same_functions_in_if_condition = "warn"
 semicolon_if_nothing_returned = "warn"
 str_to_string = "warn"
@@ -358,3 +352,8 @@ unused_macro_rules = "warn"
 [lints.rust.rust_2018_idioms]
 level = "warn"
 priority = -1
+
+[profile.bench]
+lto = true
+codegen-units = 1
+debug = 2

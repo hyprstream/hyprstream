@@ -535,10 +535,8 @@ fn prepare_field_for_flight(
                 )
                 .with_metadata(field.metadata().clone())
             } else {
-                #[allow(deprecated)]
                 let dict_id = dictionary_tracker.set_dict_id(field.as_ref());
 
-                #[allow(deprecated)]
                 Field::new_dict(
                     field.name(),
                     field.data_type().clone(),
@@ -585,9 +583,7 @@ fn prepare_schema_for_flight(
                     )
                     .with_metadata(field.metadata().clone())
                 } else {
-                    #[allow(deprecated)]
                     let dict_id = dictionary_tracker.set_dict_id(field.as_ref());
-                    #[allow(deprecated)]
                     Field::new_dict(
                         field.name(),
                         field.data_type().clone(),
@@ -654,12 +650,10 @@ struct FlightIpcEncoder {
 
 impl FlightIpcEncoder {
     fn new(options: IpcWriteOptions, error_on_replacement: bool) -> Self {
-        #[allow(deprecated)]
         let preserve_dict_id = options.preserve_dict_id();
         Self {
             options,
             data_gen: IpcDataGenerator::default(),
-            #[allow(deprecated)]
             dictionary_tracker: DictionaryTracker::new_with_preserve_dict_id(
                 error_on_replacement,
                 preserve_dict_id,
@@ -940,7 +934,7 @@ mod tests {
         let mut decoder = FlightDataDecoder::new(encoder);
         let expected_schema = Schema::new(vec![Field::new_list(
             "dict_list",
-            Field::new_list_field(DataType::Utf8, true),
+            Field::new("item", DataType::Utf8, true),
             true,
         )]);
 
@@ -1044,7 +1038,7 @@ mod tests {
             "struct",
             vec![Field::new_list(
                 "dict_list",
-                Field::new_list_field(DataType::Utf8, true),
+                Field::new("item", DataType::Utf8, true),
                 true,
             )],
             true,
@@ -1224,16 +1218,12 @@ mod tests {
 
         let hydrated_struct_fields = vec![Field::new_list(
             "dict_list",
-            Field::new_list_field(DataType::Utf8, true),
+            Field::new("item", DataType::Utf8, true),
             true,
         )];
 
         let hydrated_union_fields = vec![
-            Field::new_list(
-                "dict_list",
-                Field::new_list_field(DataType::Utf8, true),
-                true,
-            ),
+            Field::new_list("dict_list", Field::new("item", DataType::Utf8, true), true),
             Field::new_struct("struct", hydrated_struct_fields.clone(), true),
             Field::new("string", DataType::Utf8, true),
         ];
@@ -1547,7 +1537,6 @@ mod tests {
     async fn verify_flight_round_trip(mut batches: Vec<RecordBatch>) {
         let expected_schema = batches.first().unwrap().schema();
 
-        #[allow(deprecated)]
         let encoder = FlightDataEncoderBuilder::default()
             .with_options(IpcWriteOptions::default().with_preserve_dict_id(false))
             .with_dictionary_handling(DictionaryHandling::Resend)
@@ -1575,7 +1564,6 @@ mod tests {
             HashMap::from([("some_key".to_owned(), "some_value".to_owned())]),
         );
 
-        #[allow(deprecated)]
         let mut dictionary_tracker = DictionaryTracker::new_with_preserve_dict_id(false, true);
 
         let got = prepare_schema_for_flight(&schema, &mut dictionary_tracker, false);
@@ -1594,30 +1582,12 @@ mod tests {
         hydrate_dictionaries(&batch, batch.schema()).expect("failed to optimize");
     }
 
-    fn make_flight_data(
+    pub fn make_flight_data(
         batch: &RecordBatch,
         options: &IpcWriteOptions,
     ) -> (Vec<FlightData>, FlightData) {
-        flight_data_from_arrow_batch(batch, options)
-    }
-
-    fn flight_data_from_arrow_batch(
-        batch: &RecordBatch,
-        options: &IpcWriteOptions,
-    ) -> (Vec<FlightData>, FlightData) {
-        let data_gen = IpcDataGenerator::default();
         #[allow(deprecated)]
-        let mut dictionary_tracker =
-            DictionaryTracker::new_with_preserve_dict_id(false, options.preserve_dict_id());
-
-        let (encoded_dictionaries, encoded_batch) = data_gen
-            .encoded_batch(batch, &mut dictionary_tracker, options)
-            .expect("DictionaryTracker configured above to not error on replacement");
-
-        let flight_dictionaries = encoded_dictionaries.into_iter().map(Into::into).collect();
-        let flight_batch = encoded_batch.into();
-
-        (flight_dictionaries, flight_batch)
+        crate::utils::flight_data_from_arrow_batch(batch, options)
     }
 
     #[test]
@@ -1771,7 +1741,7 @@ mod tests {
 
         let batch = RecordBatch::try_from_iter(vec![("a1", Arc::new(array) as _)]).unwrap();
 
-        verify_encoded_split(batch, 48).await;
+        verify_encoded_split(batch, 160).await;
     }
 
     #[tokio::test]
@@ -1828,6 +1798,7 @@ mod tests {
     }
 
     /// Return size, in memory of flight data
+    #[allow(clippy::needless_as_bytes)]
     fn flight_data_size(d: &FlightData) -> usize {
         let flight_descriptor_size = d
             .flight_descriptor

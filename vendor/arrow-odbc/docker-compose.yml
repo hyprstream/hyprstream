@@ -1,0 +1,12 @@
+# Docker compose file used for local development
+
+services:
+  # Microsoft SQL database used for testing
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2019-CU5-ubuntu-18.04
+    ports:
+      - 1433:1433
+
+    environment:
+      - MSSQL_SA_PASSWORD=My@Test@Password1
+    command: ["/opt/mssql/bin/sqlservr", "--accept-eula", "--reset-sa-password"]

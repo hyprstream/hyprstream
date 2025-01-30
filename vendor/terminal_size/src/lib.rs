@@ -1,8 +1,8 @@
 //! A simple utility for getting the size of a terminal.
 //!
-//! Supports both Linux, MacOS, and Windows.
+//! Works on Linux, macOS, Windows, and illumos.
 //!
-//!  This crate requires a minimum rust version of 1.48.0 (2020-11-19)
+//! This crate requires a minimum Rust version of 1.63.0 (2022-08-11).
 //!
 //! # Example
 //!
@@ -26,12 +26,14 @@ pub struct Height(pub u16);
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
-pub use crate::unix::{terminal_size, terminal_size_using_fd};
+#[allow(deprecated)]
+pub use crate::unix::{terminal_size, terminal_size_of, terminal_size_using_fd};
 
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use crate::windows::{terminal_size, terminal_size_using_handle};
+#[allow(deprecated)]
+pub use crate::windows::{terminal_size, terminal_size_of, terminal_size_using_handle};
 
 #[cfg(not(any(unix, windows)))]
 pub fn terminal_size() -> Option<(Width, Height)> {

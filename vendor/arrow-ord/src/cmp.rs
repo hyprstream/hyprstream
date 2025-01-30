@@ -656,10 +656,7 @@ pub fn compare_byte_view<T: ByteViewType>(
 ///
 /// # Safety
 /// The left/right_idx must within range of each array
-#[deprecated(
-    since = "52.2.0",
-    note = "Use `GenericByteViewArray::compare_unchecked` instead"
-)]
+#[deprecated(note = "Use `GenericByteViewArray::compare_unchecked` instead")]
 pub unsafe fn compare_byte_view_unchecked<T: ByteViewType>(
     left: &GenericByteViewArray<T>,
     left_idx: usize,

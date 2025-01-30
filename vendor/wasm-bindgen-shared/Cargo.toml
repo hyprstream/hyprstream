@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.57"
 name = "wasm-bindgen-shared"
-version = "0.2.99"
+version = "0.2.100"
 authors = ["The wasm-bindgen Developers"]
 build = "build.rs"
 links = "wasm_bindgen"
@@ -40,6 +40,9 @@ repository = "https://github.com/rustwasm/wasm-bindgen/tree/master/crates/shared
 [lib]
 name = "wasm_bindgen_shared"
 path = "src/lib.rs"
+
+[dependencies.unicode-ident]
+version = "1.0.5"
 
 [lints.clippy]
 large_enum_variant = "allow"

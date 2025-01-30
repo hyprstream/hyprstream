@@ -1,8 +1,7 @@
 use crate::target::TargetInfo;
-use crate::{Build, Error, ErrorKind, ToolFamily};
+use crate::{Build, Error, ErrorKind, Tool, ToolFamily};
 use std::borrow::Cow;
 use std::ffi::OsString;
-use std::path::Path;
 
 #[derive(Debug, PartialEq, Default)]
 pub(crate) struct RustcCodegenFlags<'a> {
@@ -158,21 +157,15 @@ impl<'this> RustcCodegenFlags<'this> {
     }
 
     // Rust and clang/cc don't agree on what equivalent flags should look like.
-    pub(crate) fn cc_flags(
-        &self,
-        build: &Build,
-        path: &Path,
-        family: ToolFamily,
-        target: &TargetInfo,
-        flags: &mut Vec<OsString>,
-    ) {
+    pub(crate) fn cc_flags(&self, build: &Build, tool: &mut Tool, target: &TargetInfo<'_>) {
+        let family = tool.family;
         // Push `flag` to `flags` if it is supported by the currently used CC
         let mut push_if_supported = |flag: OsString| {
             if build
-                .is_flag_supported_inner(&flag, path, target)
+                .is_flag_supported_inner(&flag, tool, target)
                 .unwrap_or(false)
             {
-                flags.push(flag);
+                tool.args.push(flag);
             } else {
                 build.cargo_output.print_warning(&format!(
                     "Inherited flag {:?} is not supported by the currently used CC",
@@ -181,26 +174,109 @@ impl<'this> RustcCodegenFlags<'this> {
             }
         };
 
+        let clang_or_gnu =
+            matches!(family, ToolFamily::Clang { .. }) || matches!(family, ToolFamily::Gnu { .. });
+
+        // Flags shared between clang and gnu
+        if clang_or_gnu {
+            // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-mbranch-protection
+            if let Some(value) = self.branch_protection {
+                push_if_supported(
+                    format!("-mbranch-protection={}", value.replace(",", "+")).into(),
+                );
+            }
+            // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-mcmodel
+            if let Some(value) = self.code_model {
+                push_if_supported(format!("-mcmodel={value}").into());
+            }
+            // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-fno-vectorize
+            if self.no_vectorize_loops {
+                push_if_supported("-fno-vectorize".into());
+            }
+            // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-fno-slp-vectorize
+            if self.no_vectorize_slp {
+                push_if_supported("-fno-slp-vectorize".into());
+            }
+            // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-mguard
+            if let Some(value) = self.control_flow_guard {
+                let cc_val = match value {
+                    "y" | "yes" | "on" | "true" | "checks" => Some("cf"),
+                    "nochecks" => Some("cf-nochecks"),
+                    "n" | "no" | "off" | "false" => Some("none"),
+                    _ => None,
+                };
+                if let Some(cc_val) = cc_val {
+                    push_if_supported(format!("-mguard={cc_val}").into());
+                }
+            }
+            // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-flto
+            if let Some(value) = self.lto {
+                let cc_val = match value {
+                    "y" | "yes" | "on" | "true" | "fat" => Some("full"),
+                    "thin" => Some("thin"),
+                    _ => None,
+                };
+                if let Some(cc_val) = cc_val {
+                    push_if_supported(format!("-flto={cc_val}").into());
+                }
+            }
+            // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-fPIC
+            // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-fPIE
+            // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-mdynamic-no-pic
+            if let Some(value) = self.relocation_model {
+                let cc_flag = match value {
+                    "pic" => Some("-fPIC"),
+                    "pie" => Some("-fPIE"),
+                    "dynamic-no-pic" => Some("-mdynamic-no-pic"),
+                    _ => None,
+                };
+                if let Some(cc_flag) = cc_flag {
+                    push_if_supported(cc_flag.into());
+                }
+            }
+            // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-fembed-bitcode
+            if let Some(value) = self.embed_bitcode {
+                let cc_val = if value { "all" } else { "off" };
+                push_if_supported(format!("-fembed-bitcode={cc_val}").into());
+            }
+            // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-fno-omit-frame-pointer
+            // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-fomit-frame-pointer
+            if let Some(value) = self.force_frame_pointers {
+                let cc_flag = if value {
+                    "-fno-omit-frame-pointer"
+                } else {
+                    "-fomit-frame-pointer"
+                };
+                push_if_supported(cc_flag.into());
+            }
+            // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-dead_strip
+            if let Some(false) = self.link_dead_code {
+                push_if_supported("-dead_strip".into());
+            }
+            // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-mno-red-zone
+            // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-mred-zone
+            if let Some(value) = self.no_redzone {
+                let cc_flag = if value { "-mno-red-zone" } else { "-mred-zone" };
+                push_if_supported(cc_flag.into());
+            }
+            // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-msoft-float
+            // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-mno-soft-float
+            if let Some(value) = self.soft_float {
+                let cc_flag = if value {
+                    "-msoft-float"
+                } else {
+                    "-mno-soft-float"
+                };
+                push_if_supported(cc_flag.into());
+            }
+        }
+
+        // Compiler-exclusive flags
         match family {
-            ToolFamily::Clang { .. } | ToolFamily::Gnu => {
-                // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-mbranch-protection
-                if let Some(value) = self.branch_protection {
-                    push_if_supported(
-                        format!("-mbranch-protection={}", value.replace(",", "+")).into(),
-                    );
-                }
-                // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-mcmodel
-                if let Some(value) = self.code_model {
-                    push_if_supported(format!("-mcmodel={value}").into());
-                }
-                // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-fno-vectorize
-                if self.no_vectorize_loops {
-                    push_if_supported("-fno-vectorize".into());
-                }
-                // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-fno-slp-vectorize
-                if self.no_vectorize_slp {
-                    push_if_supported("-fno-slp-vectorize".into());
-                }
+            ToolFamily::Clang { .. } => {
+                // GNU and Clang compilers both support the same PGO flags, but they use different libraries and
+                // different formats for the profile files which are not compatible.
+                // clang and rustc both internally use llvm, so we want to inherit the PGO flags only for clang.
                 // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-fprofile-generate
                 if let Some(value) = self.profile_generate {
                     push_if_supported(format!("-fprofile-generate={value}").into());
@@ -209,79 +285,8 @@ impl<'this> RustcCodegenFlags<'this> {
                 if let Some(value) = self.profile_use {
                     push_if_supported(format!("-fprofile-use={value}").into());
                 }
-                // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-mguard
-                if let Some(value) = self.control_flow_guard {
-                    let cc_val = match value {
-                        "y" | "yes" | "on" | "true" | "checks" => Some("cf"),
-                        "nochecks" => Some("cf-nochecks"),
-                        "n" | "no" | "off" | "false" => Some("none"),
-                        _ => None,
-                    };
-                    if let Some(cc_val) = cc_val {
-                        push_if_supported(format!("-mguard={cc_val}").into());
-                    }
-                }
-                // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-flto
-                if let Some(value) = self.lto {
-                    let cc_val = match value {
-                        "y" | "yes" | "on" | "true" | "fat" => Some("full"),
-                        "thin" => Some("thin"),
-                        _ => None,
-                    };
-                    if let Some(cc_val) = cc_val {
-                        push_if_supported(format!("-flto={cc_val}").into());
-                    }
-                }
-                // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-fPIC
-                // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-fPIE
-                // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-mdynamic-no-pic
-                if let Some(value) = self.relocation_model {
-                    let cc_flag = match value {
-                        "pic" => Some("-fPIC"),
-                        "pie" => Some("-fPIE"),
-                        "dynamic-no-pic" => Some("-mdynamic-no-pic"),
-                        _ => None,
-                    };
-                    if let Some(cc_flag) = cc_flag {
-                        push_if_supported(cc_flag.into());
-                    }
-                }
-                // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-fembed-bitcode
-                if let Some(value) = self.embed_bitcode {
-                    let cc_val = if value { "all" } else { "off" };
-                    push_if_supported(format!("-fembed-bitcode={cc_val}").into());
-                }
-                // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-fno-omit-frame-pointer
-                // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-fomit-frame-pointer
-                if let Some(value) = self.force_frame_pointers {
-                    let cc_flag = if value {
-                        "-fno-omit-frame-pointer"
-                    } else {
-                        "-fomit-frame-pointer"
-                    };
-                    push_if_supported(cc_flag.into());
-                }
-                // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-dead_strip
-                if let Some(false) = self.link_dead_code {
-                    push_if_supported("-dead_strip".into());
-                }
-                // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-mno-red-zone
-                // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-mred-zone
-                if let Some(value) = self.no_redzone {
-                    let cc_flag = if value { "-mno-red-zone" } else { "-mred-zone" };
-                    push_if_supported(cc_flag.into());
-                }
-                // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-msoft-float
-                // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-mno-soft-float
-                if let Some(value) = self.soft_float {
-                    let cc_flag = if value {
-                        "-msoft-float"
-                    } else {
-                        "-mno-soft-float"
-                    };
-                    push_if_supported(cc_flag.into());
-                }
             }
+            ToolFamily::Gnu { .. } => {}
             ToolFamily::Msvc { .. } => {
                 // https://learn.microsoft.com/en-us/cpp/build/reference/guard-enable-control-flow-guard
                 if let Some(value) = self.control_flow_guard {
@@ -320,7 +325,7 @@ mod tests {
     #[test]
     fn codegen_type() {
         let expected = RustcCodegenFlags {
-            code_model: Some("tiny".into()),
+            code_model: Some("tiny"),
             ..RustcCodegenFlags::default()
         };
         check("-Ccode-model=tiny", &expected);
@@ -334,7 +339,7 @@ mod tests {
         check(
             "-ccode-model=tiny\u{1f}-Ccode-model=small",
             &RustcCodegenFlags {
-                code_model: Some("small".into()),
+                code_model: Some("small"),
                 ..RustcCodegenFlags::default()
             },
         );
@@ -349,7 +354,7 @@ mod tests {
     #[test]
     fn three_valid_prefixes() {
         let expected = RustcCodegenFlags {
-            lto: Some("true".into()),
+            lto: Some("true"),
             ..RustcCodegenFlags::default()
         };
         check("-L\u{1f}-L\u{1f}-Clto", &expected);
@@ -467,20 +472,20 @@ mod tests {
         check(
             &flags.join("\u{1f}"),
             &RustcCodegenFlags {
-                code_model: Some("tiny".into()),
-                control_flow_guard: Some("yes".into()),
+                code_model: Some("tiny"),
+                control_flow_guard: Some("yes"),
                 embed_bitcode: Some(false),
                 force_frame_pointers: Some(true),
                 link_dead_code: Some(true),
-                lto: Some("false".into()),
+                lto: Some("false"),
                 no_redzone: Some(true),
                 no_vectorize_loops: true,
                 no_vectorize_slp: true,
-                profile_generate: Some("fooprofile".into()),
-                profile_use: Some("fooprofile".into()),
-                relocation_model: Some("pic".into()),
+                profile_generate: Some("fooprofile"),
+                profile_use: Some("fooprofile"),
+                relocation_model: Some("pic"),
                 soft_float: Some(true),
-                branch_protection: Some("bti,pac-ret,leaf".into()),
+                branch_protection: Some("bti,pac-ret,leaf"),
             },
         );
     }

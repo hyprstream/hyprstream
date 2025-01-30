@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.62"
 name = "arrow-csv"
-version = "54.0.0"
+version = "53.4.0"
 authors = ["Apache Arrow <dev@arrow.apache.org>"]
 build = false
 include = [
@@ -39,13 +39,19 @@ path = "src/lib.rs"
 bench = false
 
 [dependencies.arrow-array]
-version = "54.0.0"
+version = "53.4.0"
+
+[dependencies.arrow-buffer]
+version = "53.4.0"
 
 [dependencies.arrow-cast]
-version = "54.0.0"
+version = "53.4.0"
+
+[dependencies.arrow-data]
+version = "53.4.0"
 
 [dependencies.arrow-schema]
-version = "54.0.0"
+version = "53.4.0"
 
 [dependencies.chrono]
 version = "0.4.34"
@@ -63,6 +69,10 @@ version = "0.1"
 version = "1.4"
 default-features = false
 
+[dependencies.lexical-core]
+version = "1.0"
+default-features = false
+
 [dependencies.regex]
 version = "1.7.0"
 features = [
@@ -71,9 +81,6 @@ features = [
     "perf",
 ]
 default-features = false
-
-[dev-dependencies.arrow-buffer]
-version = "54.0.0"
 
 [dev-dependencies.bytes]
 version = "1.4"

@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.60"
 name = "chrono-tz"
-version = "0.10.0"
+version = "0.10.1"
 build = "build.rs"
 include = [
     "src/*.rs",
@@ -31,6 +31,7 @@ include = [
     "tz/southamerica",
     "tz/NEWS",
 ]
+autolib = false
 autobins = false
 autoexamples = false
 autotests = false

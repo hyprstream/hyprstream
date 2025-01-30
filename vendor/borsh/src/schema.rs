@@ -41,7 +41,7 @@ pub type DiscriminantValue = i64;
 /// The name of the field in the struct (can be used to convert JSON to Borsh using the schema).
 pub type FieldName = String;
 /// The type that we use to represent the definition of the Borsh type.
-
+///
 /// Description of data encoding on the wire.
 #[derive(Clone, PartialEq, Eq, Debug, BorshSerialize, BorshDeserialize, BorshSchemaMacro)]
 pub enum Definition {
@@ -846,7 +846,7 @@ impl_tuple!(
 );
 
 #[cfg(feature = "std")]
-mod id_addr_std_derive_impl {
+mod ip_addr_std_derive_impl {
     use crate::BorshSchema as BorshSchemaMacro;
 
     #[derive(BorshSchemaMacro)]
@@ -874,32 +874,32 @@ mod id_addr_std_derive_impl {
 #[cfg(feature = "std")]
 impl BorshSchema for std::net::Ipv4Addr {
     fn add_definitions_recursively(definitions: &mut BTreeMap<Declaration, Definition>) {
-        <id_addr_std_derive_impl::Ipv4Addr>::add_definitions_recursively(definitions);
+        <ip_addr_std_derive_impl::Ipv4Addr>::add_definitions_recursively(definitions);
     }
 
     fn declaration() -> Declaration {
-        id_addr_std_derive_impl::Ipv4Addr::declaration()
+        ip_addr_std_derive_impl::Ipv4Addr::declaration()
     }
 }
 
 #[cfg(feature = "std")]
 impl BorshSchema for std::net::Ipv6Addr {
     fn add_definitions_recursively(definitions: &mut BTreeMap<Declaration, Definition>) {
-        <id_addr_std_derive_impl::Ipv6Addr>::add_definitions_recursively(definitions);
+        <ip_addr_std_derive_impl::Ipv6Addr>::add_definitions_recursively(definitions);
     }
 
     fn declaration() -> Declaration {
-        id_addr_std_derive_impl::Ipv6Addr::declaration()
+        ip_addr_std_derive_impl::Ipv6Addr::declaration()
     }
 }
 
 #[cfg(feature = "std")]
 impl BorshSchema for std::net::IpAddr {
     fn add_definitions_recursively(definitions: &mut BTreeMap<Declaration, Definition>) {
-        <id_addr_std_derive_impl::IpAddr>::add_definitions_recursively(definitions);
+        <ip_addr_std_derive_impl::IpAddr>::add_definitions_recursively(definitions);
     }
 
     fn declaration() -> Declaration {
-        id_addr_std_derive_impl::IpAddr::declaration()
+        ip_addr_std_derive_impl::IpAddr::declaration()
     }
 }

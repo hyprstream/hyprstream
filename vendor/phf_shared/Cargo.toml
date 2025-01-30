@@ -11,10 +11,16 @@
 
 [package]
 edition = "2021"
-rust-version = "1.60"
+rust-version = "1.61"
 name = "phf_shared"
-version = "0.11.2"
+version = "0.11.3"
 authors = ["Steven Fackler <sfackler@gmail.com>"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
 description = "Support code shared by PHF libraries"
 readme = "README.md"
 categories = ["data-structures"]
@@ -28,10 +34,10 @@ path = "src/lib.rs"
 test = false
 
 [dependencies.siphasher]
-version = "0.3"
+version = "1.0"
 
 [dependencies.uncased]
-version = "0.9.6"
+version = "0.9.9"
 optional = true
 default-features = false
 

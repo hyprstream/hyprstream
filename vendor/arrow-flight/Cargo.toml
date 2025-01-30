@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.71.1"
 name = "arrow-flight"
-version = "54.0.0"
+version = "53.4.0"
 authors = ["Apache Arrow <dev@arrow.apache.org>"]
 build = false
 autolib = false
@@ -85,42 +85,42 @@ version = "1.0"
 optional = true
 
 [dependencies.arrow-arith]
-version = "54.0.0"
+version = "53.4.0"
 optional = true
 
 [dependencies.arrow-array]
-version = "54.0.0"
+version = "53.4.0"
 
 [dependencies.arrow-buffer]
-version = "54.0.0"
+version = "53.4.0"
 
 [dependencies.arrow-cast]
-version = "54.0.0"
+version = "53.4.0"
 
 [dependencies.arrow-data]
-version = "54.0.0"
+version = "53.4.0"
 optional = true
 
 [dependencies.arrow-ipc]
-version = "54.0.0"
+version = "53.4.0"
 
 [dependencies.arrow-ord]
-version = "54.0.0"
+version = "53.4.0"
 optional = true
 
 [dependencies.arrow-row]
-version = "54.0.0"
+version = "53.4.0"
 optional = true
 
 [dependencies.arrow-schema]
-version = "54.0.0"
+version = "53.4.0"
 
 [dependencies.arrow-select]
-version = "54.0.0"
+version = "53.4.0"
 optional = true
 
 [dependencies.arrow-string]
-version = "54.0.0"
+version = "53.4.0"
 optional = true
 
 [dependencies.base64]
@@ -159,7 +159,6 @@ optional = true
 
 [dependencies.paste]
 version = "1.0"
-optional = true
 
 [dependencies.prost]
 version = "0.13.1"
@@ -177,7 +176,6 @@ features = [
     "rt",
     "rt-multi-thread",
 ]
-optional = true
 default-features = false
 
 [dependencies.tonic]
@@ -204,7 +202,7 @@ optional = true
 default-features = false
 
 [dev-dependencies.arrow-cast]
-version = "54.0.0"
+version = "53.4.0"
 features = ["prettyprint"]
 
 [dev-dependencies.assert_cmd]
@@ -225,15 +223,6 @@ version = "0.2"
 [dev-dependencies.tempfile]
 version = "3.3"
 
-[dev-dependencies.tokio]
-version = "1.0"
-features = [
-    "macros",
-    "rt",
-    "rt-multi-thread",
-]
-default-features = false
-
 [dev-dependencies.tokio-stream]
 version = "0.1"
 features = ["net"]
@@ -242,41 +231,28 @@ features = ["net"]
 version = "0.5.0"
 features = ["util"]
 
-[dev-dependencies.tracing-log]
-version = "0.2"
-
-[dev-dependencies.tracing-subscriber]
-version = "0.3.1"
-features = [
-    "ansi",
-    "env-filter",
-    "fmt",
-]
-default-features = false
-
 [dev-dependencies.uuid]
 version = "1.10.0"
 features = ["v4"]
 
 [features]
 cli = [
+    "anyhow",
     "arrow-array/chrono-tz",
     "arrow-cast/prettyprint",
+    "clap",
+    "tracing-log",
+    "tracing-subscriber",
     "tonic/tls-webpki-roots",
-    "dep:anyhow",
-    "dep:clap",
-    "dep:tracing-log",
-    "dep:tracing-subscriber",
 ]
 default = []
 flight-sql-experimental = [
-    "dep:arrow-arith",
-    "dep:arrow-data",
-    "dep:arrow-ord",
-    "dep:arrow-row",
-    "dep:arrow-select",
-    "dep:arrow-string",
-    "dep:once_cell",
-    "dep:paste",
+    "arrow-arith",
+    "arrow-data",
+    "arrow-ord",
+    "arrow-row",
+    "arrow-select",
+    "arrow-string",
+    "once_cell",
 ]
 tls = ["tonic/tls"]

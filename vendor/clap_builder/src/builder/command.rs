@@ -11,6 +11,7 @@ use std::path::Path;
 // Internal
 use crate::builder::app_settings::{AppFlags, AppSettings};
 use crate::builder::arg_settings::ArgSettings;
+use crate::builder::ext::Extension;
 use crate::builder::ext::Extensions;
 use crate::builder::ArgAction;
 use crate::builder::IntoResettable;
@@ -106,6 +107,8 @@ pub struct Command {
     external_value_parser: Option<super::ValueParser>,
     long_help_exists: bool,
     deferred: Option<fn(Command) -> Command>,
+    #[cfg(feature = "unstable-ext")]
+    ext: Extensions,
     app_ext: Extensions,
 }
 
@@ -447,7 +450,7 @@ impl Command {
     /// ```
     #[must_use]
     pub fn groups(mut self, groups: impl IntoIterator<Item = impl Into<ArgGroup>>) -> Self {
-        for g in groups.into_iter() {
+        for g in groups {
             self = self.group(g.into());
         }
         self
@@ -545,7 +548,7 @@ impl Command {
     /// that exhaustively test your CLI to ensure the asserts are evaluated, this will run those
     /// asserts in a way convenient for running as a test.
     ///
-    /// **Note::** This will not help with asserts in [`ArgMatches`], those will need exhaustive
+    /// **Note:** This will not help with asserts in [`ArgMatches`], those will need exhaustive
     /// testing of your CLI.
     ///
     /// # Examples
@@ -584,7 +587,7 @@ impl Command {
     /// let mut cmd = Command::new("myprog");
     /// let err = cmd.error(ErrorKind::InvalidValue, "Some failure case");
     /// ```
-    pub fn error(&mut self, kind: ErrorKind, message: impl std::fmt::Display) -> Error {
+    pub fn error(&mut self, kind: ErrorKind, message: impl fmt::Display) -> Error {
         Error::raw(kind, message).format(self)
     }
 
@@ -631,16 +634,20 @@ impl Command {
     /// [`env::args_os`]: std::env::args_os()
     /// [`Command::get_matches`]: Command::get_matches()
     pub fn get_matches_mut(&mut self) -> ArgMatches {
-        self.try_get_matches_from_mut(&mut env::args_os())
+        self.try_get_matches_from_mut(env::args_os())
             .unwrap_or_else(|e| e.exit())
     }
 
     /// Parse [`env::args_os`], returning a [`clap::Result`] on failure.
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** This method WILL NOT exit when `--help` or `--version` (or short versions) are
     /// used. It will return a [`clap::Error`], where the [`kind`] is a
     /// [`ErrorKind::DisplayHelp`] or [`ErrorKind::DisplayVersion`] respectively. You must call
     /// [`Error::exit`] or perform a [`std::process::exit`].
+    ///
+    /// </div>
     ///
     /// # Panics
     ///
@@ -672,8 +679,12 @@ impl Command {
 
     /// Parse the specified arguments, [exiting][Error::exit] on failure.
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** The first argument will be parsed as the binary name unless
     /// [`Command::no_binary_name`] is used.
+    ///
+    /// </div>
     ///
     /// # Panics
     ///
@@ -706,13 +717,21 @@ impl Command {
 
     /// Parse the specified arguments, returning a [`clap::Result`] on failure.
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** This method WILL NOT exit when `--help` or `--version` (or short versions) are
     /// used. It will return a [`clap::Error`], where the [`kind`] is a [`ErrorKind::DisplayHelp`]
     /// or [`ErrorKind::DisplayVersion`] respectively. You must call [`Error::exit`] or
     /// perform a [`std::process::exit`] yourself.
     ///
+    /// </div>
+    ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** The first argument will be parsed as the binary name unless
     /// [`Command::no_binary_name`] is used.
+    ///
+    /// </div>
     ///
     /// # Panics
     ///
@@ -752,13 +771,21 @@ impl Command {
     ///
     /// Like [`Command::try_get_matches_from`] but doesn't consume the `Command`.
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** This method WILL NOT exit when `--help` or `--version` (or short versions) are
     /// used. It will return a [`clap::Error`], where the [`kind`] is a [`ErrorKind::DisplayHelp`]
     /// or [`ErrorKind::DisplayVersion`] respectively. You must call [`Error::exit`] or
     /// perform a [`std::process::exit`] yourself.
     ///
+    /// </div>
+    ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** The first argument will be parsed as the binary name unless
     /// [`Command::no_binary_name`] is used.
+    ///
+    /// </div>
     ///
     /// # Panics
     ///
@@ -1039,6 +1066,14 @@ impl Command {
 
         Usage::new(self).create_usage_with_title(&[])
     }
+
+    /// Extend [`Command`] with [`CommandExt`] data
+    #[cfg(feature = "unstable-ext")]
+    #[allow(clippy::should_implement_trait)]
+    pub fn add<T: CommandExt + Extension>(mut self, tagged: T) -> Self {
+        self.ext.set(tagged);
+        self
+    }
 }
 
 /// # Application-wide Settings
@@ -1076,7 +1111,11 @@ impl Command {
 
     /// Try not to fail on parse errors, like missing option values.
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** This choice is propagated to all child subcommands.
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -1114,7 +1153,11 @@ impl Command {
     /// This is the equivalent to saying the `foo` arg using [`Arg::overrides_with("foo")`] for all
     /// defined arguments.
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** This choice is propagated to all child subcommands.
+    ///
+    /// </div>
     ///
     /// [`Arg::overrides_with("foo")`]: crate::Arg::overrides_with()
     #[inline]
@@ -1126,14 +1169,22 @@ impl Command {
         }
     }
 
-    /// Disables the automatic delimiting of values after `--` or when [`Command::trailing_var_arg`]
+    /// Disables the automatic delimiting of values after `--` or when [`Arg::trailing_var_arg`]
     /// was used.
+    ///
+    /// <div class="warning">
     ///
     /// **NOTE:** The same thing can be done manually by setting the final positional argument to
     /// [`Arg::value_delimiter(None)`]. Using this setting is safer, because it's easier to locate
     /// when making changes.
     ///
+    /// </div>
+    ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** This choice is propagated to all child subcommands.
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -1157,9 +1208,19 @@ impl Command {
 
     /// Sets when to color output.
     ///
+    /// To customize how the output is styled, see [`Command::styles`].
+    ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** This choice is propagated to all child subcommands.
     ///
+    /// </div>
+    ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** Default behaviour is [`ColorChoice::Auto`].
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -1188,22 +1249,30 @@ impl Command {
 
     /// Sets the [`Styles`] for terminal output
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** This choice is propagated to all child subcommands.
     ///
+    /// </div>
+    ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** Default behaviour is [`Styles::default`].
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
     /// ```no_run
     /// # use clap_builder as clap;
     /// # use clap::{Command, ColorChoice, builder::styling};
-    /// let styles = styling::Styles::styled()
-    ///     .header(styling::AnsiColor::Green.on_default() | styling::Effects::BOLD)
-    ///     .usage(styling::AnsiColor::Green.on_default() | styling::Effects::BOLD)
-    ///     .literal(styling::AnsiColor::Blue.on_default() | styling::Effects::BOLD)
+    /// const STYLES: styling::Styles = styling::Styles::styled()
+    ///     .header(styling::AnsiColor::Green.on_default().bold())
+    ///     .usage(styling::AnsiColor::Green.on_default().bold())
+    ///     .literal(styling::AnsiColor::Blue.on_default().bold())
     ///     .placeholder(styling::AnsiColor::Cyan.on_default());
     /// Command::new("myprog")
-    ///     .styles(styles)
+    ///     .styles(STYLES)
     ///     .get_matches();
     /// ```
     #[cfg(feature = "color")]
@@ -1224,9 +1293,17 @@ impl Command {
     /// **`unstable-v5` feature**: Defaults to unbound, being subject to
     /// [`Command::max_term_width`].
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** This setting applies globally and *not* on a per-command basis.
     ///
+    /// </div>
+    ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** This requires the `wrap_help` feature
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -1254,9 +1331,17 @@ impl Command {
     ///
     /// **`unstable-v5` feature**: Defaults to 100.
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** This setting applies globally and *not* on a per-command basis.
     ///
+    /// </div>
+    ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** This requires the `wrap_help` feature
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -1332,7 +1417,11 @@ impl Command {
     ///
     /// Defaults to `false`; subcommands have independent version strings from their parents.
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** This choice is propagated to all child subcommands.
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -1360,7 +1449,11 @@ impl Command {
 
     /// Places the help string for all arguments and subcommands on the line after them.
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** This choice is propagated to all child subcommands.
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -1382,7 +1475,11 @@ impl Command {
 
     /// Disables `-h` and `--help` flag.
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** This choice is propagated to all child subcommands.
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -1437,7 +1534,11 @@ impl Command {
 
     /// Disables the `help` [`subcommand`].
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** This choice is propagated to all child subcommands.
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -1468,7 +1569,11 @@ impl Command {
 
     /// Disables colorized help messages.
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** This choice is propagated to all child subcommands.
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -1490,10 +1595,18 @@ impl Command {
 
     /// Panic if help descriptions are omitted.
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** When deriving [`Parser`][crate::Parser], you could instead check this at
     /// compile-time with `#![deny(missing_docs)]`
     ///
+    /// </div>
+    ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** This choice is propagated to all child subcommands.
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -1550,7 +1663,11 @@ impl Command {
     /// To set this per argument, see
     /// [`Arg::hide_possible_values`][crate::Arg::hide_possible_values].
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** This choice is propagated to all child subcommands.
+    ///
+    /// </div>
     #[inline]
     pub fn hide_possible_values(self, yes: bool) -> Self {
         if yes {
@@ -1565,11 +1682,19 @@ impl Command {
     /// For example, to match an argument named `--test`, one could use `--t`, `--te`, `--tes`, and
     /// `--test`.
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** The match *must not* be ambiguous at all in order to succeed. i.e. to match
     /// `--te` to `--test` there could not also be another argument or alias `--temp` because both
     /// start with `--te`
     ///
+    /// </div>
+    ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** This choice is propagated to all child subcommands.
+    ///
+    /// </div>
     ///
     /// [aliases]: crate::Command::aliases()
     #[inline]
@@ -1586,16 +1711,28 @@ impl Command {
     /// For example, to match a subcommand named `test`, one could use `t`, `te`, `tes`, and
     /// `test`.
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** The match *must not* be ambiguous at all in order to succeed. i.e. to match `te`
     /// to `test` there could not also be a subcommand or alias `temp` because both start with `te`
     ///
-    /// **CAUTION:** This setting can interfere with [positional/free arguments], take care when
+    /// </div>
+    ///
+    /// <div class="warning">
+    ///
+    /// **WARNING:** This setting can interfere with [positional/free arguments], take care when
     /// designing CLIs which allow inferred subcommands and have potential positional/free
     /// arguments whose values could start with the same characters as subcommands. If this is the
     /// case, it's recommended to use settings such as [`Command::args_conflicts_with_subcommands`] in
     /// conjunction with this setting.
     ///
+    /// </div>
+    ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** This choice is propagated to all child subcommands.
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -1651,12 +1788,20 @@ impl Command {
     /// This should only be used when absolutely necessary, such as when the binary name for your
     /// application is misleading, or perhaps *not* how the user should invoke your program.
     ///
-    /// **Pro-tip:** When building things such as third party `cargo`
+    /// <div class="warning">
+    ///
+    /// **TIP:** When building things such as third party `cargo`
     /// subcommands, this setting **should** be used!
+    ///
+    /// </div>
+    ///
+    /// <div class="warning">
     ///
     /// **NOTE:** This *does not* change or set the name of the binary file on
     /// disk. It only changes what clap thinks the name is for the purposes of
     /// error or help messages.
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -1692,12 +1837,20 @@ impl Command {
 
     /// Sets the author(s) for the help message.
     ///
-    /// **Pro-tip:** Use `clap`s convenience macro [`crate_authors!`] to
+    /// <div class="warning">
+    ///
+    /// **TIP:** Use `clap`s convenience macro [`crate_authors!`] to
     /// automatically set your application's author(s) to the same thing as your
     /// crate at compile time.
     ///
+    /// </div>
+    ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** A custom [`help_template`][Command::help_template] is needed for author to show
     /// up.
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -1718,9 +1871,6 @@ impl Command {
     ///
     /// If [`Command::long_about`] is not specified, this message will be displayed for `--help`.
     ///
-    /// **NOTE:** Only `Command::about` (short format) is used in completion
-    /// script generation in order to be concise.
-    ///
     /// See also [`crate_description!`](crate::crate_description!).
     ///
     /// # Examples
@@ -1740,10 +1890,15 @@ impl Command {
 
     /// Sets the program's description for the long help (`--help`).
     ///
-    /// If [`Command::about`] is not specified, this message will be displayed for `-h`.
+    /// If not set, [`Command::about`] will be used for long help in addition to short help
+    /// (`-h`).
+    ///
+    /// <div class="warning">
     ///
     /// **NOTE:** Only [`Command::about`] (short format) is used in completion
     /// script generation in order to be concise.
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -1792,7 +1947,8 @@ impl Command {
     /// This is often used to describe how to use the arguments, caveats to be noted, or license
     /// and contact information.
     ///
-    /// If [`Command::after_help`] is not specified, this message will be displayed for `-h`.
+    /// If not set, [`Command::after_help`] will be used for long help in addition to short help
+    /// (`-h`).
     ///
     /// # Examples
     ///
@@ -1835,7 +1991,8 @@ impl Command {
     ///
     /// This is often used for header, copyright, or license information.
     ///
-    /// If [`Command::before_help`] is not specified, this message will be displayed for `-h`.
+    /// If not set, [`Command::before_help`] will be used for long help in addition to short help
+    /// (`-h`).
     ///
     /// # Examples
     ///
@@ -1856,9 +2013,13 @@ impl Command {
     ///
     /// If [`Command::long_version`] is not specified, this message will be displayed for `--version`.
     ///
-    /// **Pro-tip:** Use `clap`s convenience macro [`crate_version!`] to
+    /// <div class="warning">
+    ///
+    /// **TIP:** Use `clap`s convenience macro [`crate_version!`] to
     /// automatically set your application's version to the same thing as your
     /// crate at compile time.
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -1879,9 +2040,13 @@ impl Command {
     ///
     /// If [`Command::version`] is not specified, this message will be displayed for `-V`.
     ///
-    /// **Pro-tip:** Use `clap`s convenience macro [`crate_version!`] to
+    /// <div class="warning">
+    ///
+    /// **TIP:** Use `clap`s convenience macro [`crate_version!`] to
     /// automatically set your application's version to the same thing as your
     /// crate at compile time.
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -1905,9 +2070,15 @@ impl Command {
 
     /// Overrides the `clap` generated usage string for help and error messages.
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** Using this setting disables `clap`s "context-aware" usage
     /// strings. After this setting is set, this will be *the only* usage string
     /// displayed to the user!
+    ///
+    /// </div>
+    ///
+    /// <div class="warning">
     ///
     /// **NOTE:** Multiple usage lines may be present in the usage argument, but
     /// some rules need to be followed to ensure the usage lines are formatted
@@ -1916,6 +2087,8 @@ impl Command {
     /// - Do not indent the first usage line.
     /// - Indent all subsequent usage lines with seven spaces.
     /// - The last line must not end with a newline.
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -1952,10 +2125,14 @@ impl Command {
     ///
     /// This should only be used when the auto-generated message does not suffice.
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** This **only** replaces the help message for the current
     /// command, meaning if you are using subcommands, those help messages will
     /// still be auto-generated unless you specify a [`Command::override_help`] for
     /// them as well.
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -1987,9 +2164,6 @@ impl Command {
     }
 
     /// Sets the help template to be used, overriding the default format.
-    ///
-    /// **NOTE:** The template system is by design very simple. Therefore, the
-    /// tags have to be written in the lowercase and without spacing.
     ///
     /// Tags are given inside curly brackets.
     ///
@@ -2133,7 +2307,11 @@ impl Command {
 
     /// Exit gracefully if no arguments are present (e.g. `$ myprog`).
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** [`subcommands`] count as arguments
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -2217,7 +2395,7 @@ impl Command {
     /// For example, imagine a CLI which has three positional arguments `[foo] [bar] [baz]...` where
     /// `baz` accepts multiple values (similar to man `ARGS...` style training arguments).
     ///
-    /// With this setting the following invocations are posisble:
+    /// With this setting the following invocations are possible:
     ///
     /// * `$ prog foo bar baz1 baz2 baz3`
     /// * `$ prog foo -- baz1 baz2 baz3`
@@ -2353,7 +2531,11 @@ impl Command {
     ///
     /// Allows the subcommand to be used as if it were an [`Arg::long`].
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** Any leading `-` characters will be stripped.
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -2394,13 +2576,21 @@ impl Command {
     /// alias. This is more efficient and easier than creating multiple hidden subcommands as one
     /// only needs to check for the existence of this command, and not all aliased variants.
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** Aliases defined with this method are *hidden* from the help
     /// message. If you're looking for aliases that will be displayed in the help
     /// message, see [`Command::visible_alias`].
     ///
+    /// </div>
+    ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** When using aliases and checking for the existence of a
     /// particular subcommand within an [`ArgMatches`] struct, one only needs to
     /// search for the original name and not all aliases.
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -2485,13 +2675,21 @@ impl Command {
     /// given aliases. This is more efficient, and easier than creating multiple hidden subcommands
     /// as one only needs to check for the existence of this command and not all aliased variants.
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** Aliases defined with this method are *hidden* from the help
     /// message. If looking for aliases that will be displayed in the help
     /// message, see [`Command::visible_aliases`].
     ///
+    /// </div>
+    ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** When using aliases and checking for the existence of a
     /// particular subcommand within an [`ArgMatches`] struct, one only needs to
     /// search for the original name and not all aliases.
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -2567,7 +2765,7 @@ impl Command {
     #[must_use]
     pub fn long_flag_aliases(mut self, names: impl IntoIterator<Item = impl Into<Str>>) -> Self {
         for s in names {
-            self = self.long_flag_alias(s)
+            self = self.long_flag_alias(s);
         }
         self
     }
@@ -2579,14 +2777,22 @@ impl Command {
     /// than creating hidden subcommands as one only needs to check for
     /// the existence of this command and not all aliased variants.
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** The alias defined with this method is *visible* from the help
     /// message and displayed as if it were just another regular subcommand. If
     /// looking for an alias that will not be displayed in the help message, see
     /// [`Command::alias`].
     ///
+    /// </div>
+    ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** When using aliases and checking for the existence of a
     /// particular subcommand within an [`ArgMatches`] struct, one only needs to
     /// search for the original name and not all aliases.
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -2678,14 +2884,22 @@ impl Command {
     /// than creating multiple hidden subcommands as one only needs to check for
     /// the existence of this command and not all aliased variants.
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** The alias defined with this method is *visible* from the help
     /// message and displayed as if it were just another regular subcommand. If
     /// looking for an alias that will not be displayed in the help message, see
     /// [`Command::alias`].
     ///
+    /// </div>
+    ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** When using aliases, and checking for the existence of a
     /// particular subcommand within an [`ArgMatches`] struct, one only needs to
     /// search for the original name and not all aliases.
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -2865,13 +3079,21 @@ impl Command {
     ///
     /// Arguments will be stored in the `""` argument in the [`ArgMatches`]
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** Use this setting with caution,
     /// as a truly unexpected argument (i.e. one that is *NOT* an external subcommand)
     /// will **not** cause an error and instead be treated as a potential subcommand.
     /// One should check for such cases manually and inform the user appropriately.
     ///
+    /// </div>
+    ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** A built-in subcommand will be parsed as an external subcommand when escaped with
     /// `--`.
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -2914,7 +3136,11 @@ impl Command {
     /// The default parser is for `OsString`.  This can be used to switch it to `String` or another
     /// type.
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** Setting this requires [`Command::allow_external_subcommands`]
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -3074,7 +3300,11 @@ impl Command {
     /// using this setting would allow you to set those arguments to [`Arg::required(true)`]
     /// and yet receive no error so long as the user uses a valid subcommand instead.
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** This defaults to false (using subcommand does *not* negate requirements)
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -3155,14 +3385,26 @@ impl Command {
     /// [`allow_external_subcommands`][Command::allow_external_subcommands] if you want to specifically
     /// get the unrecognized binary name.
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** Multicall can't be used with [`no_binary_name`] since they interpret
     /// the command name in incompatible ways.
     ///
+    /// </div>
+    ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** The multicall command cannot have arguments.
+    ///
+    /// </div>
+    ///
+    /// <div class="warning">
     ///
     /// **NOTE:** Applets are slightly semantically different from subcommands,
     /// so it's recommended to use [`Command::subcommand_help_heading`] and
     /// [`Command::subcommand_value_name`] to change the descriptive text as above.
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -3438,6 +3680,13 @@ impl Command {
         &self.name
     }
 
+    /// Get all known names of the cmd (i.e. primary name and visible aliases).
+    pub fn get_name_and_visible_aliases(&self) -> Vec<&str> {
+        let mut names = vec![self.name.as_str()];
+        names.extend(self.get_visible_aliases());
+        names
+    }
+
     /// Get the version of the cmd.
     #[inline]
     pub fn get_version(&self) -> Option<&str> {
@@ -3448,6 +3697,12 @@ impl Command {
     #[inline]
     pub fn get_long_version(&self) -> Option<&str> {
         self.long_version.as_deref()
+    }
+
+    /// Get the placement within help
+    #[inline]
+    pub fn get_display_order(&self) -> usize {
+        self.disp_ord.unwrap_or(999)
     }
 
     /// Get the authors of the cmd.
@@ -3541,6 +3796,15 @@ impl Command {
     #[inline]
     pub fn get_all_long_flag_aliases(&self) -> impl Iterator<Item = &str> + '_ {
         self.long_flag_aliases.iter().map(|a| a.0.as_str())
+    }
+
+    /// Iterate through the *hidden* aliases for this subcommand.
+    #[inline]
+    pub fn get_aliases(&self) -> impl Iterator<Item = &str> + '_ {
+        self.aliases
+            .iter()
+            .filter(|(_, vis)| !*vis)
+            .map(|a| a.0.as_str())
     }
 
     #[inline]
@@ -3706,15 +3970,15 @@ impl Command {
         }
     }
 
-    // Get a unique list of all arguments of all commands and continuous subcommands the given argument conflicts with.
-    //
-    // This behavior follows the propagation rules of global arguments.
-    // It is useful for finding conflicts for arguments declared as global.
-    //
-    // ### Panics
-    //
-    // If the given arg contains a conflict with an argument that is unknown to
-    // this `Command`.
+    /// Get a unique list of all arguments of all commands and continuous subcommands the given argument conflicts with.
+    ///
+    /// This behavior follows the propagation rules of global arguments.
+    /// It is useful for finding conflicts for arguments declared as global.
+    ///
+    /// ### Panics
+    ///
+    /// If the given arg contains a conflict with an argument that is unknown to
+    /// this `Command`.
     fn get_global_arg_conflicts_with(&self, arg: &Arg) -> Vec<&Arg> // FIXME: This could probably have been an iterator
     {
         arg.blacklist
@@ -3736,21 +4000,26 @@ impl Command {
             .collect()
     }
 
-    // Get a list of subcommands which contain the provided Argument
-    //
-    // This command will only include subcommands in its list for which the subcommands
-    // parent also contains the Argument.
-    //
-    // This search follows the propagation rules of global arguments.
-    // It is useful to finding subcommands, that have inherited a global argument.
-    //
-    // **NOTE:** In this case only Sucommand_1 will be included
-    //   Subcommand_1 (contains Arg)
-    //     Subcommand_1.1 (doesn't contain Arg)
-    //       Subcommand_1.1.1 (contains Arg)
-    //
+    /// Get a list of subcommands which contain the provided Argument
+    ///
+    /// This command will only include subcommands in its list for which the subcommands
+    /// parent also contains the Argument.
+    ///
+    /// This search follows the propagation rules of global arguments.
+    /// It is useful to finding subcommands, that have inherited a global argument.
+    ///
+    /// <div class="warning">
+    ///
+    /// **NOTE:** In this case only `Sucommand_1` will be included
+    /// ```text
+    ///   Subcommand_1 (contains Arg)
+    ///     Subcommand_1.1 (doesn't contain Arg)
+    ///       Subcommand_1.1.1 (contains Arg)
+    /// ```
+    ///
+    /// </div>
     fn get_subcommands_containing(&self, arg: &Arg) -> Vec<&Self> {
-        let mut vec = std::vec::Vec::new();
+        let mut vec = Vec::new();
         for idx in 0..self.subcommands.len() {
             if self.subcommands[idx]
                 .args
@@ -3936,6 +4205,18 @@ impl Command {
     /// Report whether [`Command::multicall`] is set
     pub fn is_multicall_set(&self) -> bool {
         self.is_set(AppSettings::Multicall)
+    }
+
+    /// Access an [`CommandExt`]
+    #[cfg(feature = "unstable-ext")]
+    pub fn get<T: CommandExt + Extension>(&self) -> Option<&T> {
+        self.ext.get::<T>()
+    }
+
+    /// Remove an [`CommandExt`]
+    #[cfg(feature = "unstable-ext")]
+    pub fn remove<T: CommandExt + Extension>(mut self) -> Option<T> {
+        self.ext.remove::<T>()
     }
 }
 
@@ -4540,6 +4821,8 @@ impl Command {
     }
 
     pub(crate) fn format_group(&self, g: &Id) -> StyledStr {
+        use std::fmt::Write as _;
+
         let g_string = self
             .unroll_args_in_group(g)
             .iter()
@@ -4555,10 +4838,9 @@ impl Command {
             })
             .collect::<Vec<_>>()
             .join("|");
+        let placeholder = self.get_styles().get_placeholder();
         let mut styled = StyledStr::new();
-        styled.push_str("<");
-        styled.push_string(g_string);
-        styled.push_str(">");
+        write!(&mut styled, "{placeholder}<{g_string}>{placeholder:#}").unwrap();
         styled
     }
 }
@@ -4566,7 +4848,7 @@ impl Command {
 /// A workaround:
 /// <https://github.com/rust-lang/rust/issues/34511#issuecomment-373423999>
 pub(crate) trait Captures<'a> {}
-impl<'a, T> Captures<'a> for T {}
+impl<T> Captures<'_> for T {}
 
 // Internal Query Methods
 impl Command {
@@ -4592,7 +4874,7 @@ impl Command {
 
     #[inline]
     pub(crate) fn set(&mut self, s: AppSettings) {
-        self.settings.set(s)
+        self.settings.set(s);
     }
 
     #[inline]
@@ -4656,7 +4938,7 @@ impl Command {
 
     /// Iterate through all the names of all subcommands (not recursively), including aliases.
     /// Used for suggestions.
-    pub(crate) fn all_subcommand_names(&self) -> impl Iterator<Item = &str> + Captures {
+    pub(crate) fn all_subcommand_names(&self) -> impl Iterator<Item = &str> + Captures<'_> {
         self.get_subcommands().flat_map(|sc| {
             let name = sc.get_name();
             let aliases = sc.get_all_aliases();
@@ -4699,7 +4981,7 @@ impl Command {
                 if !args.contains(n) {
                     if self.find(n).is_some() {
                         debug!("Command::unroll_args_in_group:iter: this is an arg");
-                        args.push(n.clone())
+                        args.push(n.clone());
                     } else {
                         debug!("Command::unroll_args_in_group:iter: this is a group");
                         g_vec.push(n);
@@ -4730,7 +5012,7 @@ impl Command {
                 for r in arg.requires.iter().filter_map(&func) {
                     if let Some(req) = self.find(&r) {
                         if !req.requires.is_empty() {
-                            r_vec.push(req.get_id())
+                            r_vec.push(req.get_id());
                         }
                     }
                     args.push(r);
@@ -4753,11 +5035,6 @@ impl Command {
         self.get_subcommands()
             .find(|sc| sc.long_flag_aliases_to(long))
             .map(|sc| sc.get_name())
-    }
-
-    #[cfg(feature = "help")]
-    pub(crate) fn get_display_order(&self) -> usize {
-        self.disp_ord.unwrap_or(999)
     }
 
     pub(crate) fn write_help_err(&self, mut use_long: bool) -> StyledStr {
@@ -4860,6 +5137,8 @@ impl Default for Command {
             external_value_parser: Default::default(),
             long_help_exists: false,
             deferred: None,
+            #[cfg(feature = "unstable-ext")]
+            ext: Default::default(),
             app_ext: Default::default(),
         }
     }
@@ -4880,22 +5159,29 @@ impl From<&'_ Command> for Command {
 }
 
 impl fmt::Display for Command {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.name)
     }
 }
 
-pub(crate) trait AppTag: crate::builder::ext::Extension {}
+/// User-provided data that can be attached to an [`Arg`]
+#[cfg(feature = "unstable-ext")]
+pub trait CommandExt: Extension {}
 
+#[allow(dead_code)] // atm dependent on features enabled
+pub(crate) trait AppExt: Extension {}
+
+#[allow(dead_code)] // atm dependent on features enabled
 #[derive(Default, Copy, Clone, Debug)]
 struct TermWidth(usize);
 
-impl AppTag for TermWidth {}
+impl AppExt for TermWidth {}
 
+#[allow(dead_code)] // atm dependent on features enabled
 #[derive(Default, Copy, Clone, Debug)]
 struct MaxTermWidth(usize);
 
-impl AppTag for MaxTermWidth {}
+impl AppExt for MaxTermWidth {}
 
 fn two_elements_of<I, T>(mut iter: I) -> Option<(T, T)>
 where

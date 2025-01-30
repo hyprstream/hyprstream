@@ -320,8 +320,9 @@
 //! these situations with conditional punctuation tokens whose selection can be
 //! deferred and populated after it's known that the group is or is not broken.
 
-#![doc(html_root_url = "https://docs.rs/prettyplease/0.2.25")]
+#![doc(html_root_url = "https://docs.rs/prettyplease/0.2.29")]
 #![allow(
+    clippy::bool_to_int_with_if,
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
     clippy::derive_partial_eq_without_eq,
@@ -336,6 +337,7 @@
     clippy::needless_pass_by_value,
     clippy::ref_option,
     clippy::similar_names,
+    clippy::struct_excessive_bools,
     clippy::too_many_lines,
     clippy::unused_self,
     clippy::vec_init_then_push
@@ -344,10 +346,12 @@
 
 mod algorithm;
 mod attr;
+mod classify;
 mod convenience;
 mod data;
 mod expr;
 mod file;
+mod fixup;
 mod generics;
 mod item;
 mod iter;
@@ -356,6 +360,7 @@ mod lit;
 mod mac;
 mod pat;
 mod path;
+mod precedence;
 mod ring;
 mod stmt;
 mod token;

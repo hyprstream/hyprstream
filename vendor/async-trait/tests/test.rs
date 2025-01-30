@@ -9,6 +9,7 @@
     clippy::let_unit_value,
     clippy::missing_panics_doc,
     clippy::missing_safety_doc,
+    clippy::needless_lifetimes,
     clippy::needless_return,
     clippy::non_minimal_cfg,
     clippy::trivially_copy_pass_by_ref,
@@ -1659,4 +1660,46 @@ pub mod issue277 {
     }
 
     fn g(_: &mut &()) {}
+}
+
+// https://github.com/dtolnay/async-trait/issues/281
+#[rustversion::since(1.75)]
+pub mod issue281 {
+    use async_trait::async_trait;
+
+    #[async_trait]
+    pub trait Trait {
+        type Error;
+        async fn method(&self) -> Result<impl AsRef<str> + Send + Sync, Self::Error>;
+    }
+
+    pub struct T;
+
+    #[async_trait]
+    impl Trait for T {
+        type Error = ();
+        async fn method(&self) -> Result<impl AsRef<str> + Send + Sync, Self::Error> {
+            Ok("Hello World")
+        }
+    }
+}
+
+pub mod issue283 {
+    use async_trait::async_trait;
+
+    #[async_trait]
+    pub trait Trait {
+        async fn a();
+    }
+
+    pub trait Bound {
+        fn b();
+    }
+
+    #[async_trait]
+    impl<T: Bound> Trait for T {
+        async fn a() {
+            Self::b();
+        }
+    }
 }

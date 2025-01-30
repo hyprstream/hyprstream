@@ -13,13 +13,14 @@
 edition = "2021"
 rust-version = "1.56"
 name = "pin-project"
-version = "1.1.7"
+version = "1.1.8"
 build = false
 exclude = [
     "/.*",
     "/tools",
     "/DEVELOPMENT.md",
 ]
+autolib = false
 autobins = false
 autoexamples = false
 autotests = false
@@ -137,7 +138,7 @@ name = "unsafe_unpin"
 path = "tests/unsafe_unpin.rs"
 
 [dependencies.pin-project-internal]
-version = "=1.1.7"
+version = "=1.1.8"
 
 [dev-dependencies.rustversion]
 version = "1"

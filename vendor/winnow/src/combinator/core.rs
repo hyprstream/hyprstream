@@ -3,74 +3,26 @@ use crate::error::{ErrMode, ErrorKind, Needed, ParserError};
 use crate::stream::Stream;
 use crate::*;
 
-/// Return the remaining input.
-///
-/// # Effective Signature
-///
-/// Assuming you are parsing a `&str` [Stream]:
-/// ```rust
-/// # use winnow::prelude::*;;
-/// pub fn rest<'i>(input: &mut &'i str) -> PResult<&'i str>
-/// # {
-/// #     winnow::combinator::rest.parse_next(input)
-/// # }
-/// ```
-///
-/// # Example
-///
-/// ```rust
-/// # use winnow::prelude::*;
-/// # use winnow::error::ErrorKind;
-/// # use winnow::error::InputError;
-/// use winnow::combinator::rest;
-/// assert_eq!(rest::<_,InputError<_>>.parse_peek("abc"), Ok(("", "abc")));
-/// assert_eq!(rest::<_,InputError<_>>.parse_peek(""), Ok(("", "")));
-/// ```
+/// Deprecated, replaced with [`token::rest`]
+#[deprecated(since = "0.6.23", note = "replaced with `token::rest`")]
 #[inline]
 pub fn rest<Input, Error>(input: &mut Input) -> PResult<<Input as Stream>::Slice, Error>
 where
     Input: Stream,
     Error: ParserError<Input>,
 {
-    trace("rest", move |input: &mut Input| Ok(input.finish())).parse_next(input)
+    crate::token::rest(input)
 }
 
-/// Return the length of the remaining input.
-///
-/// Note: this does not advance the [`Stream`]
-///
-/// # Effective Signature
-///
-/// Assuming you are parsing a `&str` [Stream]:
-/// ```rust
-/// # use winnow::prelude::*;;
-/// pub fn rest_len(input: &mut &str) -> PResult<usize>
-/// # {
-/// #     winnow::combinator::rest_len.parse_next(input)
-/// # }
-/// ```
-///
-/// # Example
-///
-/// ```rust
-/// # use winnow::prelude::*;
-/// # use winnow::error::ErrorKind;
-/// # use winnow::error::InputError;
-/// use winnow::combinator::rest_len;
-/// assert_eq!(rest_len::<_,InputError<_>>.parse_peek("abc"), Ok(("abc", 3)));
-/// assert_eq!(rest_len::<_,InputError<_>>.parse_peek(""), Ok(("", 0)));
-/// ```
+/// Deprecated, replaced with [`token::rest_len`]
+#[deprecated(since = "0.6.23", note = "replaced with `token::rest_len`")]
 #[inline]
 pub fn rest_len<Input, Error>(input: &mut Input) -> PResult<usize, Error>
 where
     Input: Stream,
     Error: ParserError<Input>,
 {
-    trace("rest_len", move |input: &mut Input| {
-        let len = input.eof_offset();
-        Ok(len)
-    })
-    .parse_next(input)
+    crate::token::rest_len(input)
 }
 
 /// Apply a [`Parser`], producing `None` on [`ErrMode::Backtrack`].
@@ -153,7 +105,9 @@ where
     })
 }
 
-/// Tries to apply its parser without consuming the input.
+/// Apply the parser without advancing the input.
+///
+/// To lookahead and only advance on success, see [`opt`].
 ///
 /// # Example
 ///
@@ -234,7 +188,11 @@ where
 
 /// Succeeds if the child parser returns an error.
 ///
+/// <div class="warning">
+///
 /// **Note:** This does not advance the [`Stream`]
+///
+/// </div>
 ///
 /// # Example
 ///
@@ -282,8 +240,8 @@ where
 /// ```rust
 /// # use winnow::{error::ErrMode, error::ErrorKind, error::InputError};
 /// # use winnow::token::one_of;
+/// # use winnow::token::rest;
 /// # use winnow::ascii::digit1;
-/// # use winnow::combinator::rest;
 /// # use winnow::combinator::alt;
 /// # use winnow::combinator::preceded;
 /// # use winnow::prelude::*;
@@ -307,8 +265,8 @@ where
 /// # use winnow::{error::ErrMode, error::ErrorKind, error::InputError};
 /// # use winnow::prelude::*;
 /// # use winnow::token::one_of;
+/// # use winnow::token::rest;
 /// # use winnow::ascii::digit1;
-/// # use winnow::combinator::rest;
 /// # use winnow::combinator::alt;
 /// # use winnow::combinator::preceded;
 /// use winnow::combinator::cut_err;
@@ -452,7 +410,7 @@ where
     }
 }
 
-impl<'a, F, I, O, E> core::iter::Iterator for &'a mut ParserIterator<F, I, O, E>
+impl<F, I, O, E> core::iter::Iterator for &mut ParserIterator<F, I, O, E>
 where
     F: Parser<I, O, E>,
     I: Stream,
@@ -505,7 +463,11 @@ enum State<E> {
 /// - [`Parser::default_value`]
 /// - [`Parser::map`]
 ///
+/// <div class="warning">
+///
 /// **Note:** This never advances the [`Stream`]
+///
+/// </div>
 ///
 /// # Example
 ///
@@ -528,6 +490,7 @@ enum State<E> {
 /// ```
 #[doc(alias = "value")]
 #[doc(alias = "success")]
+#[inline]
 pub fn empty<Input, Error>(_input: &mut Input) -> PResult<(), Error>
 where
     Input: Stream,
@@ -552,6 +515,7 @@ where
 /// assert_eq!(fail::<_, &str, _>.parse_peek(s), Err(ErrMode::Backtrack(InputError::new(s, ErrorKind::Fail))));
 /// ```
 #[doc(alias = "unexpected")]
+#[inline]
 pub fn fail<Input, Output, Error>(i: &mut Input) -> PResult<Output, Error>
 where
     Input: Stream,

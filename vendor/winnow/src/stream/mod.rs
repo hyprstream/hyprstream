@@ -3,7 +3,7 @@
 //! Stream types include:
 //! - `&[u8]` and [`Bytes`] for binary data
 //! - `&str` (aliased as [`Str`]) and [`BStr`] for UTF-8 data
-//! - [`Located`] can track the location within the original buffer to report
+//! - [`LocatingSlice`] can track the location within the original buffer to report
 //!   [spans][crate::Parser::with_span]
 //! - [`Stateful`] to thread global state through your parsers
 //! - [`Partial`] can mark an input as partial buffer that is being streamed into
@@ -95,7 +95,11 @@ impl BStr {
     }
 }
 
-/// Allow collecting the span of a parsed token
+/// Deprecated, replaced with [`LocatingSlice`]
+#[deprecated(since = "0.6.23", note = "Replaced with `LocatingSlice`")]
+pub type Located<I> = LocatingSlice<I>;
+
+/// Allow collecting the span of a parsed token within a slice
 ///
 /// Spans are tracked as a [`Range<usize>`] of byte offsets.
 ///
@@ -108,13 +112,14 @@ impl BStr {
 ///
 /// See [`Parser::span`][crate::Parser::span] and [`Parser::with_span`][crate::Parser::with_span] for more details
 #[derive(Copy, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
-#[doc(alias = "LocatedSpan")]
-pub struct Located<I> {
+#[doc(alias = "LocatingSliceSpan")]
+#[doc(alias = "Located")]
+pub struct LocatingSlice<I> {
     initial: I,
     input: I,
 }
 
-impl<I> Located<I>
+impl<I> LocatingSlice<I>
 where
     I: Clone + Offset,
 {
@@ -124,12 +129,13 @@ where
         Self { initial, input }
     }
 
+    #[inline]
     fn location(&self) -> usize {
         self.input.offset_from(&self.initial)
     }
 }
 
-impl<I> Located<I>
+impl<I> LocatingSlice<I>
 where
     I: Clone + Stream + Offset,
 {
@@ -138,20 +144,21 @@ where
     /// This is useful for formats that encode a graph with addresses relative to the start of the
     /// input.
     #[doc(alias = "fseek")]
+    #[inline]
     pub fn reset_to_start(&mut self) {
         let start = self.initial.checkpoint();
         self.input.reset(&start);
     }
 }
 
-impl<I> AsRef<I> for Located<I> {
+impl<I> AsRef<I> for LocatingSlice<I> {
     #[inline(always)]
     fn as_ref(&self) -> &I {
         &self.input
     }
 }
 
-impl<I> crate::lib::std::ops::Deref for Located<I> {
+impl<I> crate::lib::std::ops::Deref for LocatingSlice<I> {
     type Target = I;
 
     #[inline(always)]
@@ -160,13 +167,13 @@ impl<I> crate::lib::std::ops::Deref for Located<I> {
     }
 }
 
-impl<I: crate::lib::std::fmt::Display> crate::lib::std::fmt::Display for Located<I> {
+impl<I: crate::lib::std::fmt::Display> crate::lib::std::fmt::Display for LocatingSlice<I> {
     fn fmt(&self, f: &mut crate::lib::std::fmt::Formatter<'_>) -> crate::lib::std::fmt::Result {
         self.input.fmt(f)
     }
 }
 
-impl<I: crate::lib::std::fmt::Debug> crate::lib::std::fmt::Debug for Located<I> {
+impl<I: crate::lib::std::fmt::Debug> crate::lib::std::fmt::Debug for LocatingSlice<I> {
     #[inline]
     fn fmt(&self, f: &mut crate::lib::std::fmt::Formatter<'_>) -> crate::lib::std::fmt::Result {
         self.input.fmt(f)
@@ -195,6 +202,7 @@ impl<I, E> Default for Recoverable<I, E>
 where
     I: Default + Stream,
 {
+    #[inline]
     fn default() -> Self {
         Self::new(I::default())
     }
@@ -207,6 +215,7 @@ where
     I: Stream,
 {
     /// Track recoverable errors with the stream
+    #[inline]
     pub fn new(input: I) -> Self {
         Self {
             input,
@@ -216,6 +225,7 @@ where
     }
 
     /// Act as a normal stream
+    #[inline]
     pub fn unrecoverable(input: I) -> Self {
         Self {
             input,
@@ -225,6 +235,7 @@ where
     }
 
     /// Access the current input and errors
+    #[inline]
     pub fn into_parts(self) -> (I, Vec<E>) {
         (self.input, self.errors)
     }
@@ -325,7 +336,7 @@ impl<I: Stream + crate::lib::std::fmt::Debug, E: crate::lib::std::fmt::Debug>
 /// assert_eq!(state, 1);
 /// ```
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
-#[doc(alias = "LocatedSpan")]
+#[doc(alias = "LocatingSliceSpan")]
 pub struct Stateful<I, S> {
     /// Inner input being wrapped in state
     pub input: I,
@@ -446,6 +457,7 @@ where
     I: StreamIsPartial,
 {
     /// Create a partial input
+    #[inline]
     pub fn new(input: I) -> Self {
         debug_assert!(
             !I::is_partial_supported(),
@@ -466,6 +478,7 @@ impl<I> Default for Partial<I>
 where
     I: Default + StreamIsPartial,
 {
+    #[inline]
     fn default() -> Self {
         Self::new(I::default())
     }
@@ -514,7 +527,7 @@ impl<S: SliceLen> SliceLen for AsciiCaseless<S> {
     }
 }
 
-impl<'a, T> SliceLen for &'a [T] {
+impl<T> SliceLen for &[T] {
     #[inline(always)]
     fn slice_len(&self) -> usize {
         self.len()
@@ -528,14 +541,14 @@ impl<T, const LEN: usize> SliceLen for [T; LEN] {
     }
 }
 
-impl<'a, T, const LEN: usize> SliceLen for &'a [T; LEN] {
+impl<T, const LEN: usize> SliceLen for &[T; LEN] {
     #[inline(always)]
     fn slice_len(&self) -> usize {
         self.len()
     }
 }
 
-impl<'a> SliceLen for &'a str {
+impl SliceLen for &str {
     #[inline(always)]
     fn slice_len(&self) -> usize {
         self.len()
@@ -556,14 +569,14 @@ impl SliceLen for char {
     }
 }
 
-impl<'a> SliceLen for &'a Bytes {
+impl SliceLen for &Bytes {
     #[inline(always)]
     fn slice_len(&self) -> usize {
         self.len()
     }
 }
 
-impl<'a> SliceLen for &'a BStr {
+impl SliceLen for &BStr {
     #[inline(always)]
     fn slice_len(&self) -> usize {
         self.len()
@@ -580,7 +593,7 @@ where
     }
 }
 
-impl<I> SliceLen for Located<I>
+impl<I> SliceLen for LocatingSlice<I>
 where
     I: SliceLen,
 {
@@ -631,7 +644,7 @@ pub trait Stream: Offset<<Self as Stream>::Checkpoint> + crate::lib::std::fmt::D
     type Token: crate::lib::std::fmt::Debug;
     /// Sequence of `Token`s
     ///
-    /// Example: `&[u8]` for `Located<&[u8]>` or `&str` for `Located<&str>`
+    /// Example: `&[u8]` for `LocatingSlice<&[u8]>` or `&str` for `LocatingSlice<&str>`
     type Slice: crate::lib::std::fmt::Debug;
 
     /// Iterate with the offset from the current location
@@ -669,12 +682,16 @@ pub trait Stream: Offset<<Self as Stream>::Checkpoint> + crate::lib::std::fmt::D
     fn offset_at(&self, tokens: usize) -> Result<usize, Needed>;
     /// Split off a slice of tokens from the input
     ///
-    /// **NOTE:** For inputs with variable width tokens, like `&str`'s `char`, `offset` might not correspond
+    /// <div class="warning">
+    ///
+    /// **Note:** For inputs with variable width tokens, like `&str`'s `char`, `offset` might not correspond
     /// with the number of tokens. To get a valid offset, use:
     /// - [`Stream::eof_offset`]
     /// - [`Stream::iter_offsets`]
     /// - [`Stream::offset_for`]
     /// - [`Stream::offset_at`]
+    ///
+    /// </div>
     ///
     /// # Panic
     ///
@@ -1117,7 +1134,7 @@ where
     }
 }
 
-impl<I: Stream> Stream for Located<I> {
+impl<I: Stream> Stream for LocatingSlice<I> {
     type Token = <I as Stream>::Token;
     type Slice = <I as Stream>::Slice;
 
@@ -1336,13 +1353,13 @@ impl<I: Stream> Stream for Partial<I> {
 
 /// Number of indices input has advanced since start of parsing
 ///
-/// See [`Located`] for adding location tracking to your [`Stream`]
+/// See [`LocatingSlice`] for adding location tracking to your [`Stream`]
 pub trait Location {
     /// Number of indices input has advanced since start of parsing
     fn location(&self) -> usize;
 }
 
-impl<I> Location for Located<I>
+impl<I> Location for LocatingSlice<I>
 where
     I: Clone + Offset,
 {
@@ -1431,7 +1448,7 @@ where
 
 #[cfg(feature = "unstable-recover")]
 #[cfg(feature = "std")]
-impl<'a, E> Recover<E> for &'a str {
+impl<E> Recover<E> for &str {
     #[inline(always)]
     fn record_err(
         &mut self,
@@ -1451,7 +1468,7 @@ impl<'a, E> Recover<E> for &'a str {
 
 #[cfg(feature = "unstable-recover")]
 #[cfg(feature = "std")]
-impl<'a, E> Recover<E> for &'a Bytes {
+impl<E> Recover<E> for &Bytes {
     #[inline(always)]
     fn record_err(
         &mut self,
@@ -1471,7 +1488,7 @@ impl<'a, E> Recover<E> for &'a Bytes {
 
 #[cfg(feature = "unstable-recover")]
 #[cfg(feature = "std")]
-impl<'a, E> Recover<E> for &'a BStr {
+impl<E> Recover<E> for &BStr {
     #[inline(always)]
     fn record_err(
         &mut self,
@@ -1515,7 +1532,7 @@ where
 
 #[cfg(feature = "unstable-recover")]
 #[cfg(feature = "std")]
-impl<I, E> Recover<E> for Located<I>
+impl<I, E> Recover<E> for LocatingSlice<I>
 where
     I: Recover<E>,
     I: Stream,
@@ -1645,11 +1662,13 @@ pub trait StreamIsPartial: Sized {
     }
 }
 
-impl<'a, T> StreamIsPartial for &'a [T] {
+impl<T> StreamIsPartial for &[T] {
     type PartialState = ();
 
+    #[inline]
     fn complete(&mut self) -> Self::PartialState {}
 
+    #[inline]
     fn restore_partial(&mut self, _state: Self::PartialState) {}
 
     #[inline(always)]
@@ -1658,13 +1677,15 @@ impl<'a, T> StreamIsPartial for &'a [T] {
     }
 }
 
-impl<'a> StreamIsPartial for &'a str {
+impl StreamIsPartial for &str {
     type PartialState = ();
 
+    #[inline]
     fn complete(&mut self) -> Self::PartialState {
         // Already complete
     }
 
+    #[inline]
     fn restore_partial(&mut self, _state: Self::PartialState) {}
 
     #[inline(always)]
@@ -1673,13 +1694,15 @@ impl<'a> StreamIsPartial for &'a str {
     }
 }
 
-impl<'a> StreamIsPartial for &'a Bytes {
+impl StreamIsPartial for &Bytes {
     type PartialState = ();
 
+    #[inline]
     fn complete(&mut self) -> Self::PartialState {
         // Already complete
     }
 
+    #[inline]
     fn restore_partial(&mut self, _state: Self::PartialState) {}
 
     #[inline(always)]
@@ -1688,13 +1711,15 @@ impl<'a> StreamIsPartial for &'a Bytes {
     }
 }
 
-impl<'a> StreamIsPartial for &'a BStr {
+impl StreamIsPartial for &BStr {
     type PartialState = ();
 
+    #[inline]
     fn complete(&mut self) -> Self::PartialState {
         // Already complete
     }
 
+    #[inline]
     fn restore_partial(&mut self, _state: Self::PartialState) {}
 
     #[inline(always)]
@@ -1709,10 +1734,12 @@ where
 {
     type PartialState = I::PartialState;
 
+    #[inline]
     fn complete(&mut self) -> Self::PartialState {
         self.0.complete()
     }
 
+    #[inline]
     fn restore_partial(&mut self, state: Self::PartialState) {
         self.0.restore_partial(state);
     }
@@ -1728,16 +1755,18 @@ where
     }
 }
 
-impl<I> StreamIsPartial for Located<I>
+impl<I> StreamIsPartial for LocatingSlice<I>
 where
     I: StreamIsPartial,
 {
     type PartialState = I::PartialState;
 
+    #[inline]
     fn complete(&mut self) -> Self::PartialState {
         self.input.complete()
     }
 
+    #[inline]
     fn restore_partial(&mut self, state: Self::PartialState) {
         self.input.restore_partial(state);
     }
@@ -1762,10 +1791,12 @@ where
 {
     type PartialState = I::PartialState;
 
+    #[inline]
     fn complete(&mut self) -> Self::PartialState {
         self.input.complete()
     }
 
+    #[inline]
     fn restore_partial(&mut self, state: Self::PartialState) {
         self.input.restore_partial(state);
     }
@@ -1787,10 +1818,12 @@ where
 {
     type PartialState = I::PartialState;
 
+    #[inline]
     fn complete(&mut self) -> Self::PartialState {
         self.input.complete()
     }
 
+    #[inline]
     fn restore_partial(&mut self, state: Self::PartialState) {
         self.input.restore_partial(state);
     }
@@ -1812,10 +1845,12 @@ where
 {
     type PartialState = bool;
 
+    #[inline]
     fn complete(&mut self) -> Self::PartialState {
         core::mem::replace(&mut self.partial, false)
     }
 
+    #[inline]
     fn restore_partial(&mut self, state: Self::PartialState) {
         self.partial = state;
     }
@@ -1835,12 +1870,16 @@ where
 pub trait Offset<Start = Self> {
     /// Offset between the first byte of `start` and the first byte of `self`a
     ///
+    /// <div class="warning">
+    ///
     /// **Note:** This is an offset, not an index, and may point to the end of input
     /// (`start.len()`) when `self` is exhausted.
+    ///
+    /// </div>
     fn offset_from(&self, start: &Start) -> usize;
 }
 
-impl<'a, T> Offset for &'a [T] {
+impl<T> Offset for &[T] {
     #[inline]
     fn offset_from(&self, start: &Self) -> usize {
         let fst = (*start).as_ptr();
@@ -1864,7 +1903,7 @@ where
     }
 }
 
-impl<'a> Offset for &'a str {
+impl Offset for &str {
     #[inline(always)]
     fn offset_from(&self, start: &Self) -> usize {
         self.as_bytes().offset_from(&start.as_bytes())
@@ -1878,7 +1917,7 @@ impl<'a> Offset<<&'a str as Stream>::Checkpoint> for &'a str {
     }
 }
 
-impl<'a> Offset for &'a Bytes {
+impl Offset for &Bytes {
     #[inline(always)]
     fn offset_from(&self, start: &Self) -> usize {
         self.as_bytes().offset_from(&start.as_bytes())
@@ -1892,7 +1931,7 @@ impl<'a> Offset<<&'a Bytes as Stream>::Checkpoint> for &'a Bytes {
     }
 }
 
-impl<'a> Offset for &'a BStr {
+impl Offset for &BStr {
     #[inline(always)]
     fn offset_from(&self, start: &Self) -> usize {
         self.as_bytes().offset_from(&start.as_bytes())
@@ -1926,7 +1965,7 @@ where
     }
 }
 
-impl<I> Offset for Located<I>
+impl<I> Offset for LocatingSlice<I>
 where
     I: Stream,
 {
@@ -1936,12 +1975,12 @@ where
     }
 }
 
-impl<I> Offset<<Located<I> as Stream>::Checkpoint> for Located<I>
+impl<I> Offset<<LocatingSlice<I> as Stream>::Checkpoint> for LocatingSlice<I>
 where
     I: Stream,
 {
     #[inline(always)]
-    fn offset_from(&self, other: &<Located<I> as Stream>::Checkpoint) -> usize {
+    fn offset_from(&self, other: &<LocatingSlice<I> as Stream>::Checkpoint) -> usize {
         self.checkpoint().offset_from(other)
     }
 }
@@ -2030,21 +2069,21 @@ pub trait AsBytes {
     fn as_bytes(&self) -> &[u8];
 }
 
-impl<'a> AsBytes for &'a [u8] {
+impl AsBytes for &[u8] {
     #[inline(always)]
     fn as_bytes(&self) -> &[u8] {
         self
     }
 }
 
-impl<'a> AsBytes for &'a Bytes {
+impl AsBytes for &Bytes {
     #[inline(always)]
     fn as_bytes(&self) -> &[u8] {
         (*self).as_bytes()
     }
 }
 
-impl<I> AsBytes for Located<I>
+impl<I> AsBytes for LocatingSlice<I>
 where
     I: AsBytes,
 {
@@ -2093,28 +2132,28 @@ pub trait AsBStr {
     fn as_bstr(&self) -> &[u8];
 }
 
-impl<'a> AsBStr for &'a [u8] {
+impl AsBStr for &[u8] {
     #[inline(always)]
     fn as_bstr(&self) -> &[u8] {
         self
     }
 }
 
-impl<'a> AsBStr for &'a BStr {
+impl AsBStr for &BStr {
     #[inline(always)]
     fn as_bstr(&self) -> &[u8] {
         (*self).as_bytes()
     }
 }
 
-impl<'a> AsBStr for &'a str {
+impl AsBStr for &str {
     #[inline(always)]
     fn as_bstr(&self) -> &[u8] {
         (*self).as_bytes()
     }
 }
 
-impl<I> AsBStr for Located<I>
+impl<I> AsBStr for LocatingSlice<I>
 where
     I: AsBStr,
 {
@@ -2178,7 +2217,7 @@ pub trait Compare<T> {
     fn compare(&self, t: T) -> CompareResult;
 }
 
-impl<'a, 'b> Compare<&'b [u8]> for &'a [u8] {
+impl<'b> Compare<&'b [u8]> for &[u8] {
     #[inline]
     fn compare(&self, t: &'b [u8]) -> CompareResult {
         if t.iter().zip(*self).any(|(a, b)| a != b) {
@@ -2191,7 +2230,7 @@ impl<'a, 'b> Compare<&'b [u8]> for &'a [u8] {
     }
 }
 
-impl<'a, 'b> Compare<AsciiCaseless<&'b [u8]>> for &'a [u8] {
+impl<'b> Compare<AsciiCaseless<&'b [u8]>> for &[u8] {
     #[inline]
     fn compare(&self, t: AsciiCaseless<&'b [u8]>) -> CompareResult {
         if t.0
@@ -2208,49 +2247,49 @@ impl<'a, 'b> Compare<AsciiCaseless<&'b [u8]>> for &'a [u8] {
     }
 }
 
-impl<'a, const LEN: usize> Compare<[u8; LEN]> for &'a [u8] {
+impl<const LEN: usize> Compare<[u8; LEN]> for &[u8] {
     #[inline(always)]
     fn compare(&self, t: [u8; LEN]) -> CompareResult {
         self.compare(&t[..])
     }
 }
 
-impl<'a, const LEN: usize> Compare<AsciiCaseless<[u8; LEN]>> for &'a [u8] {
+impl<const LEN: usize> Compare<AsciiCaseless<[u8; LEN]>> for &[u8] {
     #[inline(always)]
     fn compare(&self, t: AsciiCaseless<[u8; LEN]>) -> CompareResult {
         self.compare(AsciiCaseless(&t.0[..]))
     }
 }
 
-impl<'a, 'b, const LEN: usize> Compare<&'b [u8; LEN]> for &'a [u8] {
+impl<'b, const LEN: usize> Compare<&'b [u8; LEN]> for &[u8] {
     #[inline(always)]
     fn compare(&self, t: &'b [u8; LEN]) -> CompareResult {
         self.compare(&t[..])
     }
 }
 
-impl<'a, 'b, const LEN: usize> Compare<AsciiCaseless<&'b [u8; LEN]>> for &'a [u8] {
+impl<'b, const LEN: usize> Compare<AsciiCaseless<&'b [u8; LEN]>> for &[u8] {
     #[inline(always)]
     fn compare(&self, t: AsciiCaseless<&'b [u8; LEN]>) -> CompareResult {
         self.compare(AsciiCaseless(&t.0[..]))
     }
 }
 
-impl<'a, 'b> Compare<&'b str> for &'a [u8] {
+impl<'b> Compare<&'b str> for &[u8] {
     #[inline(always)]
     fn compare(&self, t: &'b str) -> CompareResult {
         self.compare(t.as_bytes())
     }
 }
 
-impl<'a, 'b> Compare<AsciiCaseless<&'b str>> for &'a [u8] {
+impl<'b> Compare<AsciiCaseless<&'b str>> for &[u8] {
     #[inline(always)]
     fn compare(&self, t: AsciiCaseless<&'b str>) -> CompareResult {
         self.compare(AsciiCaseless(t.0.as_bytes()))
     }
 }
 
-impl<'a> Compare<u8> for &'a [u8] {
+impl Compare<u8> for &[u8] {
     #[inline]
     fn compare(&self, t: u8) -> CompareResult {
         match self.first().copied() {
@@ -2261,7 +2300,7 @@ impl<'a> Compare<u8> for &'a [u8] {
     }
 }
 
-impl<'a> Compare<AsciiCaseless<u8>> for &'a [u8] {
+impl Compare<AsciiCaseless<u8>> for &[u8] {
     #[inline]
     fn compare(&self, t: AsciiCaseless<u8>) -> CompareResult {
         match self.first() {
@@ -2272,42 +2311,42 @@ impl<'a> Compare<AsciiCaseless<u8>> for &'a [u8] {
     }
 }
 
-impl<'a> Compare<char> for &'a [u8] {
+impl Compare<char> for &[u8] {
     #[inline(always)]
     fn compare(&self, t: char) -> CompareResult {
         self.compare(t.encode_utf8(&mut [0; 4]).as_bytes())
     }
 }
 
-impl<'a> Compare<AsciiCaseless<char>> for &'a [u8] {
+impl Compare<AsciiCaseless<char>> for &[u8] {
     #[inline(always)]
     fn compare(&self, t: AsciiCaseless<char>) -> CompareResult {
         self.compare(AsciiCaseless(t.0.encode_utf8(&mut [0; 4]).as_bytes()))
     }
 }
 
-impl<'a, 'b> Compare<&'b str> for &'a str {
+impl<'b> Compare<&'b str> for &str {
     #[inline(always)]
     fn compare(&self, t: &'b str) -> CompareResult {
         self.as_bytes().compare(t.as_bytes())
     }
 }
 
-impl<'a, 'b> Compare<AsciiCaseless<&'b str>> for &'a str {
+impl<'b> Compare<AsciiCaseless<&'b str>> for &str {
     #[inline(always)]
     fn compare(&self, t: AsciiCaseless<&'b str>) -> CompareResult {
         self.as_bytes().compare(t.as_bytes())
     }
 }
 
-impl<'a> Compare<char> for &'a str {
+impl Compare<char> for &str {
     #[inline(always)]
     fn compare(&self, t: char) -> CompareResult {
         self.as_bytes().compare(t)
     }
 }
 
-impl<'a> Compare<AsciiCaseless<char>> for &'a str {
+impl Compare<AsciiCaseless<char>> for &str {
     #[inline(always)]
     fn compare(&self, t: AsciiCaseless<char>) -> CompareResult {
         self.as_bytes().compare(t)
@@ -2336,7 +2375,7 @@ where
     }
 }
 
-impl<I, U> Compare<U> for Located<I>
+impl<I, U> Compare<U> for LocatingSlice<I>
 where
     I: Compare<U>,
 {
@@ -2385,21 +2424,21 @@ pub trait FindSlice<T> {
     fn find_slice(&self, substr: T) -> Option<crate::lib::std::ops::Range<usize>>;
 }
 
-impl<'i, 's> FindSlice<&'s [u8]> for &'i [u8] {
+impl<'s> FindSlice<&'s [u8]> for &[u8] {
     #[inline(always)]
     fn find_slice(&self, substr: &'s [u8]) -> Option<crate::lib::std::ops::Range<usize>> {
         memmem(self, substr)
     }
 }
 
-impl<'i, 's> FindSlice<(&'s [u8],)> for &'i [u8] {
+impl<'s> FindSlice<(&'s [u8],)> for &[u8] {
     #[inline(always)]
     fn find_slice(&self, substr: (&'s [u8],)) -> Option<crate::lib::std::ops::Range<usize>> {
         memmem(self, substr.0)
     }
 }
 
-impl<'i, 's> FindSlice<(&'s [u8], &'s [u8])> for &'i [u8] {
+impl<'s> FindSlice<(&'s [u8], &'s [u8])> for &[u8] {
     #[inline(always)]
     fn find_slice(
         &self,
@@ -2409,7 +2448,7 @@ impl<'i, 's> FindSlice<(&'s [u8], &'s [u8])> for &'i [u8] {
     }
 }
 
-impl<'i, 's> FindSlice<(&'s [u8], &'s [u8], &'s [u8])> for &'i [u8] {
+impl<'s> FindSlice<(&'s [u8], &'s [u8], &'s [u8])> for &[u8] {
     #[inline(always)]
     fn find_slice(
         &self,
@@ -2419,7 +2458,7 @@ impl<'i, 's> FindSlice<(&'s [u8], &'s [u8], &'s [u8])> for &'i [u8] {
     }
 }
 
-impl<'i> FindSlice<char> for &'i [u8] {
+impl FindSlice<char> for &[u8] {
     #[inline(always)]
     fn find_slice(&self, substr: char) -> Option<crate::lib::std::ops::Range<usize>> {
         let mut b = [0; 4];
@@ -2428,7 +2467,7 @@ impl<'i> FindSlice<char> for &'i [u8] {
     }
 }
 
-impl<'i> FindSlice<(char,)> for &'i [u8] {
+impl FindSlice<(char,)> for &[u8] {
     #[inline(always)]
     fn find_slice(&self, substr: (char,)) -> Option<crate::lib::std::ops::Range<usize>> {
         let mut b = [0; 4];
@@ -2437,7 +2476,7 @@ impl<'i> FindSlice<(char,)> for &'i [u8] {
     }
 }
 
-impl<'i> FindSlice<(char, char)> for &'i [u8] {
+impl FindSlice<(char, char)> for &[u8] {
     #[inline(always)]
     fn find_slice(&self, substr: (char, char)) -> Option<crate::lib::std::ops::Range<usize>> {
         let mut b = [0; 4];
@@ -2448,7 +2487,7 @@ impl<'i> FindSlice<(char, char)> for &'i [u8] {
     }
 }
 
-impl<'i> FindSlice<(char, char, char)> for &'i [u8] {
+impl FindSlice<(char, char, char)> for &[u8] {
     #[inline(always)]
     fn find_slice(&self, substr: (char, char, char)) -> Option<crate::lib::std::ops::Range<usize>> {
         let mut b = [0; 4];
@@ -2461,56 +2500,56 @@ impl<'i> FindSlice<(char, char, char)> for &'i [u8] {
     }
 }
 
-impl<'i> FindSlice<u8> for &'i [u8] {
+impl FindSlice<u8> for &[u8] {
     #[inline(always)]
     fn find_slice(&self, substr: u8) -> Option<crate::lib::std::ops::Range<usize>> {
         memchr(substr, self).map(|i| i..i + 1)
     }
 }
 
-impl<'i> FindSlice<(u8,)> for &'i [u8] {
+impl FindSlice<(u8,)> for &[u8] {
     #[inline(always)]
     fn find_slice(&self, substr: (u8,)) -> Option<crate::lib::std::ops::Range<usize>> {
         memchr(substr.0, self).map(|i| i..i + 1)
     }
 }
 
-impl<'i> FindSlice<(u8, u8)> for &'i [u8] {
+impl FindSlice<(u8, u8)> for &[u8] {
     #[inline(always)]
     fn find_slice(&self, substr: (u8, u8)) -> Option<crate::lib::std::ops::Range<usize>> {
         memchr2(substr, self).map(|i| i..i + 1)
     }
 }
 
-impl<'i> FindSlice<(u8, u8, u8)> for &'i [u8] {
+impl FindSlice<(u8, u8, u8)> for &[u8] {
     #[inline(always)]
     fn find_slice(&self, substr: (u8, u8, u8)) -> Option<crate::lib::std::ops::Range<usize>> {
         memchr3(substr, self).map(|i| i..i + 1)
     }
 }
 
-impl<'i, 's> FindSlice<&'s str> for &'i [u8] {
+impl<'s> FindSlice<&'s str> for &[u8] {
     #[inline(always)]
     fn find_slice(&self, substr: &'s str) -> Option<crate::lib::std::ops::Range<usize>> {
         self.find_slice(substr.as_bytes())
     }
 }
 
-impl<'i, 's> FindSlice<(&'s str,)> for &'i [u8] {
+impl<'s> FindSlice<(&'s str,)> for &[u8] {
     #[inline(always)]
     fn find_slice(&self, substr: (&'s str,)) -> Option<crate::lib::std::ops::Range<usize>> {
         memmem(self, substr.0.as_bytes())
     }
 }
 
-impl<'i, 's> FindSlice<(&'s str, &'s str)> for &'i [u8] {
+impl<'s> FindSlice<(&'s str, &'s str)> for &[u8] {
     #[inline(always)]
     fn find_slice(&self, substr: (&'s str, &'s str)) -> Option<crate::lib::std::ops::Range<usize>> {
         memmem2(self, (substr.0.as_bytes(), substr.1.as_bytes()))
     }
 }
 
-impl<'i, 's> FindSlice<(&'s str, &'s str, &'s str)> for &'i [u8] {
+impl<'s> FindSlice<(&'s str, &'s str, &'s str)> for &[u8] {
     #[inline(always)]
     fn find_slice(
         &self,
@@ -2527,28 +2566,28 @@ impl<'i, 's> FindSlice<(&'s str, &'s str, &'s str)> for &'i [u8] {
     }
 }
 
-impl<'i, 's> FindSlice<&'s str> for &'i str {
+impl<'s> FindSlice<&'s str> for &str {
     #[inline(always)]
     fn find_slice(&self, substr: &'s str) -> Option<crate::lib::std::ops::Range<usize>> {
         self.as_bytes().find_slice(substr)
     }
 }
 
-impl<'i, 's> FindSlice<(&'s str,)> for &'i str {
+impl<'s> FindSlice<(&'s str,)> for &str {
     #[inline(always)]
     fn find_slice(&self, substr: (&'s str,)) -> Option<crate::lib::std::ops::Range<usize>> {
         self.as_bytes().find_slice(substr)
     }
 }
 
-impl<'i, 's> FindSlice<(&'s str, &'s str)> for &'i str {
+impl<'s> FindSlice<(&'s str, &'s str)> for &str {
     #[inline(always)]
     fn find_slice(&self, substr: (&'s str, &'s str)) -> Option<crate::lib::std::ops::Range<usize>> {
         self.as_bytes().find_slice(substr)
     }
 }
 
-impl<'i, 's> FindSlice<(&'s str, &'s str, &'s str)> for &'i str {
+impl<'s> FindSlice<(&'s str, &'s str, &'s str)> for &str {
     #[inline(always)]
     fn find_slice(
         &self,
@@ -2558,28 +2597,28 @@ impl<'i, 's> FindSlice<(&'s str, &'s str, &'s str)> for &'i str {
     }
 }
 
-impl<'i> FindSlice<char> for &'i str {
+impl FindSlice<char> for &str {
     #[inline(always)]
     fn find_slice(&self, substr: char) -> Option<crate::lib::std::ops::Range<usize>> {
         self.as_bytes().find_slice(substr)
     }
 }
 
-impl<'i> FindSlice<(char,)> for &'i str {
+impl FindSlice<(char,)> for &str {
     #[inline(always)]
     fn find_slice(&self, substr: (char,)) -> Option<crate::lib::std::ops::Range<usize>> {
         self.as_bytes().find_slice(substr)
     }
 }
 
-impl<'i> FindSlice<(char, char)> for &'i str {
+impl FindSlice<(char, char)> for &str {
     #[inline(always)]
     fn find_slice(&self, substr: (char, char)) -> Option<crate::lib::std::ops::Range<usize>> {
         self.as_bytes().find_slice(substr)
     }
 }
 
-impl<'i> FindSlice<(char, char, char)> for &'i str {
+impl FindSlice<(char, char, char)> for &str {
     #[inline(always)]
     fn find_slice(&self, substr: (char, char, char)) -> Option<crate::lib::std::ops::Range<usize>> {
         self.as_bytes().find_slice(substr)
@@ -2610,7 +2649,7 @@ where
     }
 }
 
-impl<I, T> FindSlice<T> for Located<I>
+impl<I, T> FindSlice<T> for LocatingSlice<I>
 where
     I: FindSlice<T>,
 {
@@ -2662,14 +2701,14 @@ pub trait ParseSlice<R> {
     fn parse_slice(&self) -> Option<R>;
 }
 
-impl<'a, R: FromStr> ParseSlice<R> for &'a [u8] {
+impl<R: FromStr> ParseSlice<R> for &[u8] {
     #[inline(always)]
     fn parse_slice(&self) -> Option<R> {
         from_utf8(self).ok().and_then(|s| s.parse().ok())
     }
 }
 
-impl<'a, R: FromStr> ParseSlice<R> for &'a str {
+impl<R: FromStr> ParseSlice<R> for &str {
     #[inline(always)]
     fn parse_slice(&self) -> Option<R> {
         self.parse().ok()
@@ -2682,7 +2721,7 @@ pub trait UpdateSlice: Stream {
     fn update_slice(self, inner: Self::Slice) -> Self;
 }
 
-impl<'a, T> UpdateSlice for &'a [T]
+impl<T> UpdateSlice for &[T]
 where
     T: Clone + crate::lib::std::fmt::Debug,
 {
@@ -2692,28 +2731,28 @@ where
     }
 }
 
-impl<'a> UpdateSlice for &'a str {
+impl UpdateSlice for &str {
     #[inline(always)]
     fn update_slice(self, inner: Self::Slice) -> Self {
         inner
     }
 }
 
-impl<'a> UpdateSlice for &'a Bytes {
+impl UpdateSlice for &Bytes {
     #[inline(always)]
     fn update_slice(self, inner: Self::Slice) -> Self {
         Bytes::new(inner)
     }
 }
 
-impl<'a> UpdateSlice for &'a BStr {
+impl UpdateSlice for &BStr {
     #[inline(always)]
     fn update_slice(self, inner: Self::Slice) -> Self {
         BStr::new(inner)
     }
 }
 
-impl<I> UpdateSlice for Located<I>
+impl<I> UpdateSlice for LocatingSlice<I>
 where
     I: UpdateSlice,
 {
@@ -3208,8 +3247,12 @@ pub trait AsChar {
 
     /// Tests that self is an alphabetic character
     ///
+    /// <div class="warning">
+    ///
     /// **Warning:** for `&str` it matches alphabetic
     /// characters outside of the 52 ASCII letters
+    ///
+    /// </div>
     fn is_alpha(self) -> bool;
 
     /// Tests that self is an alphabetic character
@@ -3268,7 +3311,7 @@ impl AsChar for u8 {
     }
 }
 
-impl<'a> AsChar for &'a u8 {
+impl AsChar for &u8 {
     #[inline(always)]
     fn as_char(self) -> char {
         (*self).as_char()
@@ -3346,7 +3389,7 @@ impl AsChar for char {
     }
 }
 
-impl<'a> AsChar for &'a char {
+impl AsChar for &char {
     #[inline(always)]
     fn as_char(self) -> char {
         (*self).as_char()
@@ -3421,7 +3464,7 @@ impl ContainsToken<u8> for u8 {
     }
 }
 
-impl<'a> ContainsToken<&'a u8> for u8 {
+impl ContainsToken<&u8> for u8 {
     #[inline(always)]
     fn contains_token(&self, token: &u8) -> bool {
         self.contains_token(*token)
@@ -3435,7 +3478,7 @@ impl ContainsToken<char> for u8 {
     }
 }
 
-impl<'a> ContainsToken<&'a char> for u8 {
+impl ContainsToken<&char> for u8 {
     #[inline(always)]
     fn contains_token(&self, token: &char) -> bool {
         self.contains_token(*token)

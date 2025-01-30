@@ -38,6 +38,8 @@ use alloc::vec::Vec;
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec};
 
+use super::keywords::RESERVED_FOR_IDENTIFIER;
+
 /// A [`Dialect`] for [Snowflake](https://www.snowflake.com/)
 #[derive(Debug, Default)]
 pub struct SnowflakeDialect;
@@ -49,6 +51,14 @@ impl Dialect for SnowflakeDialect {
     }
 
     fn supports_projection_trailing_commas(&self) -> bool {
+        true
+    }
+
+    // Snowflake supports double-dot notation when the schema name is not specified
+    // In this case the default PUBLIC schema is used
+    //
+    // see https://docs.snowflake.com/en/sql-reference/name-resolution#resolution-when-schema-omitted-double-dot-notation
+    fn supports_object_name_double_dot_notation(&self) -> bool {
         true
     }
 
@@ -93,6 +103,11 @@ impl Dialect for SnowflakeDialect {
 
     /// See [doc](https://docs.snowflake.com/en/sql-reference/sql/set#syntax)
     fn supports_parenthesized_set_variables(&self) -> bool {
+        true
+    }
+
+    /// See [doc](https://docs.snowflake.com/en/sql-reference/sql/comment)
+    fn supports_comment_on(&self) -> bool {
         true
     }
 
@@ -202,6 +217,22 @@ impl Dialect for SnowflakeDialect {
 
     fn allow_extract_single_quotes(&self) -> bool {
         true
+    }
+
+    /// Snowflake expects the `LIKE` option before the `IN` option,
+    /// for example: <https://docs.snowflake.com/en/sql-reference/sql/show-views#syntax>
+    fn supports_show_like_before_in(&self) -> bool {
+        true
+    }
+
+    fn is_reserved_for_identifier(&self, kw: Keyword) -> bool {
+        // Unreserve some keywords that Snowflake accepts as identifiers
+        // See: https://docs.snowflake.com/en/sql-reference/reserved-keywords
+        if matches!(kw, Keyword::INTERVAL) {
+            false
+        } else {
+            RESERVED_FOR_IDENTIFIER.contains(&kw)
+        }
     }
 }
 

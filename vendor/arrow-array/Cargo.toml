@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.62"
 name = "arrow-array"
-version = "54.0.0"
+version = "53.4.0"
 authors = ["Apache Arrow <dev@arrow.apache.org>"]
 build = false
 include = [
@@ -64,13 +64,13 @@ path = "benches/union_array.rs"
 harness = false
 
 [dependencies.arrow-buffer]
-version = "54.0.0"
+version = "53.4.0"
 
 [dependencies.arrow-data]
-version = "54.0.0"
+version = "53.4.0"
 
 [dependencies.arrow-schema]
-version = "54.0.0"
+version = "53.4.0"
 
 [dependencies.chrono]
 version = "0.4.34"

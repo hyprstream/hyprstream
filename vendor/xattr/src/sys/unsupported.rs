@@ -8,17 +8,17 @@ use crate::UnsupportedPlatformError;
 pub const ENOATTR: i32 = 0;
 
 /// An iterator over a set of extended attributes names.
-#[derive(Clone, Debug)]
+#[derive(Clone, Default)]
 pub struct XAttrs;
 
 impl Iterator for XAttrs {
     type Item = OsString;
     fn next(&mut self) -> Option<OsString> {
-        unreachable!("this should never exist")
+        None
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        unreachable!("this should never exist")
+        (0, Some(0))
     }
 }
 

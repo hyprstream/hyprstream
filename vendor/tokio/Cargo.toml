@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.70"
 name = "tokio"
-version = "1.42.0"
+version = "1.43.0"
 authors = ["Tokio Contributors <team@tokio.rs>"]
 build = false
 autobins = false
@@ -422,6 +422,10 @@ name = "signal_drop_signal"
 path = "tests/signal_drop_signal.rs"
 
 [[test]]
+name = "signal_info"
+path = "tests/signal_info.rs"
+
+[[test]]
 name = "signal_multi_rt"
 path = "tests/signal_multi_rt.rs"
 
@@ -436,6 +440,10 @@ path = "tests/signal_notify_both.rs"
 [[test]]
 name = "signal_panic"
 path = "tests/signal_panic.rs"
+
+[[test]]
+name = "signal_realtime"
+path = "tests/signal_realtime.rs"
 
 [[test]]
 name = "signal_twice"
@@ -614,6 +622,18 @@ name = "time_timeout"
 path = "tests/time_timeout.rs"
 
 [[test]]
+name = "tracing_sync"
+path = "tests/tracing_sync.rs"
+
+[[test]]
+name = "tracing_task"
+path = "tests/tracing_task.rs"
+
+[[test]]
+name = "tracing_time"
+path = "tests/tracing_time.rs"
+
+[[test]]
 name = "udp"
 path = "tests/udp.rs"
 
@@ -642,7 +662,7 @@ name = "unwindsafe"
 path = "tests/unwindsafe.rs"
 
 [dependencies.bytes]
-version = "1.0.0"
+version = "1.1.0"
 optional = true
 
 [dependencies.mio]
@@ -658,7 +678,7 @@ optional = true
 version = "0.2.11"
 
 [dependencies.tokio-macros]
-version = "~2.4.0"
+version = "~2.5.0"
 optional = true
 
 [dev-dependencies.async-stream]
@@ -742,6 +762,9 @@ time = []
 [target.'cfg(all(target_family = "wasm", not(target_os = "wasi")))'.dev-dependencies.wasm-bindgen-test]
 version = "0.3.0"
 
+[target.'cfg(all(tokio_unstable, target_has_atomic = "64"))'.dev-dependencies.tracing-mock]
+version = "= 0.1.0-beta.1"
+
 [target."cfg(loom)".dev-dependencies.loom]
 version = "0.7"
 features = [
@@ -780,7 +803,7 @@ optional = true
 default-features = false
 
 [target."cfg(unix)".dependencies.libc]
-version = "0.2.149"
+version = "0.2.168"
 optional = true
 
 [target."cfg(unix)".dependencies.signal-hook-registry]
@@ -788,7 +811,7 @@ version = "1.1.1"
 optional = true
 
 [target."cfg(unix)".dev-dependencies.libc]
-version = "0.2.149"
+version = "0.2.168"
 
 [target."cfg(unix)".dev-dependencies.nix]
 version = "0.29.0"

@@ -14,9 +14,9 @@ mod x86_64_unknown_linux_gnu;
 mod x86_64_unknown_linux_musl;
 
 use crate::{
-    cargo_env, emit_warning, env_var_to_bool, execute_command, get_cflags, is_no_asm, option_env,
-    out_dir, requested_c_std, target, target_arch, target_env, target_os, target_vendor,
-    CStdRequested, OutputLibType,
+    cargo_env, emit_warning, env_var_to_bool, execute_command, get_crate_cflags, is_no_asm,
+    option_env, out_dir, requested_c_std, target, target_arch, target_env, target_os,
+    target_vendor, CStdRequested, OutputLibType,
 };
 use std::path::PathBuf;
 
@@ -180,8 +180,8 @@ impl CcBuilder {
             }
         }
 
-        if !get_cflags().is_empty() {
-            let cflags = get_cflags();
+        if !get_crate_cflags().is_empty() {
+            let cflags = get_crate_cflags();
             emit_warning(&format!(
                 "AWS_LC_SYS_CFLAGS found. Setting CFLAGS: '{cflags}'"
             ));
@@ -267,14 +267,25 @@ impl CcBuilder {
         let mut ret_val = false;
         let output_dir = self.out_dir.join(format!("out-{basename}"));
         let mut cc_build = self.create_builder();
+        let source_file = self
+            .manifest_dir
+            .join("aws-lc")
+            .join("tests")
+            .join("compiler_features_tests")
+            .join(format!("{basename}.c"));
+        if !source_file.exists() {
+            emit_warning("######");
+            emit_warning("###### WARNING: MISSING GIT SUBMODULE ######");
+            emit_warning(&format!(
+                "  -- Did you initialize the repo's git submodules? Unable to find source file: {:?}.",
+                &source_file
+            ));
+            emit_warning("  -- run 'git submodule update --init --recursive' to initialize.");
+            emit_warning("######");
+            emit_warning("######");
+        }
         cc_build
-            .file(
-                self.manifest_dir
-                    .join("aws-lc")
-                    .join("tests")
-                    .join("compiler_features_tests")
-                    .join(format!("{basename}.c")),
-            )
+            .file(source_file)
             .warnings_into_errors(true)
             .out_dir(&output_dir);
 

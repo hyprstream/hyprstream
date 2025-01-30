@@ -1,3 +1,5 @@
+#![allow(clippy::exhaustive_enums)]
+
 use core::mem;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -110,20 +112,20 @@ const ACTIONS: [Action; 16] = [
 ///
 /// Bad things will happen if those invariants are violated.
 #[inline(always)]
-pub const fn unpack(delta: u8) -> (State, Action) {
+pub(crate) const fn unpack(delta: u8) -> (State, Action) {
     unsafe {
         (
             // State is stored in bottom 4 bits
-            mem::transmute(delta & 0x0f),
+            mem::transmute::<u8, State>(delta & 0x0f),
             // Action is stored in top 4 bits
-            mem::transmute(delta >> 4),
+            mem::transmute::<u8, Action>(delta >> 4),
         )
     }
 }
 
 #[inline(always)]
 #[cfg(test)]
-pub const fn pack(state: State, action: Action) -> u8 {
+pub(crate) const fn pack(state: State, action: Action) -> u8 {
     (action as u8) << 4 | state as u8
 }
 

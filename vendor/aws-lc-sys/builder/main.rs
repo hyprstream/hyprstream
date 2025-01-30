@@ -279,7 +279,7 @@ fn generate_src_bindings(manifest_dir: &Path, prefix: &Option<String>, src_bindi
             ..Default::default()
         },
     )
-    .write_to_file(src_bindings_path.join(format!("{}.rs", target_platform_prefix("crypto"))))
+    .write_to_file(src_bindings_path)
     .expect("write bindings");
 }
 
@@ -430,6 +430,7 @@ fn initialize() {
         let target = target();
         let supported_platform = match target.as_str() {
             "aarch64-apple-darwin"
+            | "aarch64-linux-android"
             | "aarch64-pc-windows-msvc"
             | "aarch64-unknown-linux-gnu"
             | "aarch64-unknown-linux-musl"
@@ -485,7 +486,7 @@ fn is_no_asm() -> bool {
 
 #[allow(unknown_lints)]
 #[allow(static_mut_refs)]
-fn get_cflags() -> &'static str {
+fn get_crate_cflags() -> &'static str {
     unsafe { AWS_LC_SYS_CFLAGS.as_str() }
 }
 
@@ -521,6 +522,7 @@ fn test_nasm_command() -> bool {
 fn prepare_cargo_cfg() {
     if cfg!(clippy) {
         println!("cargo:rustc-check-cfg=cfg(use_bindgen_generated)");
+        println!("cargo:rustc-check-cfg=cfg(aarch64_linux_android)");
         println!("cargo:rustc-check-cfg=cfg(aarch64_apple_darwin)");
         println!("cargo:rustc-check-cfg=cfg(aarch64_pc_windows_msvc)");
         println!("cargo:rustc-check-cfg=cfg(aarch64_unknown_linux_gnu)");
@@ -588,25 +590,35 @@ fn main() {
     if is_pregenerating_bindings() {
         #[cfg(feature = "bindgen")]
         {
-            emit_warning(&format!(
-                "Generating src bindings. Platform: '{}' Prefix: '{prefix:?}'",
-                target()
-            ));
-            let src_bindings_path = Path::new(&manifest_dir).join("src");
-            generate_src_bindings(&manifest_dir, &prefix, &src_bindings_path);
+            let src_bindings_path = Path::new(&manifest_dir)
+                .join("src")
+                .join(format!("{}.rs", target_platform_prefix("crypto")));
+            if is_external_bindgen() {
+                invoke_external_bindgen(&manifest_dir, &prefix, &src_bindings_path).unwrap();
+            } else {
+                generate_src_bindings(&manifest_dir, &prefix, &src_bindings_path);
+            }
             bindings_available = true;
         }
     } else if is_bindgen_required() {
+        let aws_lc_crypto_dir = Path::new(&manifest_dir).join("aws-lc").join("crypto");
+        if !aws_lc_crypto_dir.exists() {
+            emit_warning("######");
+            emit_warning("###### WARNING: MISSING GIT SUBMODULE ######");
+            emit_warning(&format!(
+                "  -- Did you initialize the repo's git submodules? Unable to find crypto directory: {:?}.",
+                &aws_lc_crypto_dir
+            ));
+            emit_warning("  -- run 'git submodule update --init --recursive' to initialize.");
+            emit_warning("######");
+            emit_warning("######");
+        }
         bindings_available = handle_bindgen(&manifest_dir, &prefix);
     } else {
         bindings_available = true;
     }
 
     if !bindings_available && !cfg!(feature = "ssl") {
-        emit_warning(&format!(
-            "Generating bindings - external bindgen. Platform: {}",
-            target()
-        ));
         let gen_bindings_path = out_dir().join("bindings.rs");
         let result = invoke_external_bindgen(&manifest_dir, &prefix, &gen_bindings_path);
         match result {
@@ -748,6 +760,11 @@ fn invoke_external_bindgen(
     gen_bindings_path: &Path,
 ) -> Result<(), String> {
     verify_bindgen()?;
+
+    emit_warning(&format!(
+        "Generating bindings - external bindgen. Platform: {}",
+        target()
+    ));
 
     let options = BindingOptions {
         // We collect the symbols w/o the prefix added

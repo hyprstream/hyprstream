@@ -110,6 +110,11 @@
 //! println!("{args:?}");
 //! ```
 
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![warn(missing_docs)]
+#![warn(clippy::print_stderr)]
+#![warn(clippy::print_stdout)]
+
 mod ext;
 
 use std::ffi::OsStr;
@@ -128,7 +133,11 @@ pub struct RawArgs {
 impl RawArgs {
     //// Create an argument list to parse
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** The argument returned will be the current binary.
+    ///
+    /// </div>
     ///
     /// # Example
     ///
@@ -158,7 +167,7 @@ impl RawArgs {
     /// let mut paths = raw.remaining(&mut cursor).map(PathBuf::from).collect::<Vec<_>>();
     /// println!("{paths:?}");
     /// ```
-    pub fn new(iter: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Self {
+    pub fn new(iter: impl IntoIterator<Item = impl Into<OsString>>) -> Self {
         let iter = iter.into_iter();
         Self::from(iter)
     }
@@ -357,14 +366,22 @@ impl<'s> ParsedArg<'s> {
 
     /// Treat as a value
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** May return a flag or an escape.
+    ///
+    /// </div>
     pub fn to_value_os(&self) -> &OsStr {
         self.inner
     }
 
     /// Treat as a value
     ///
+    /// <div class="warning">
+    ///
     /// **NOTE:** May return a flag or an escape.
+    ///
+    /// </div>
     pub fn to_value(&self) -> Result<&str, &OsStr> {
         self.inner.to_str().ok_or(self.inner)
     }
@@ -463,7 +480,8 @@ fn split_nonutf8_once(b: &OsStr) -> (&str, Option<&OsStr>) {
     match b.try_str() {
         Ok(s) => (s, None),
         Err(err) => {
-            // SAFETY: `char_indices` ensures `index` is at a valid UTF-8 boundary
+            // SAFETY: `err.valid_up_to()`, which came from str::from_utf8(), is guaranteed
+            // to be a valid UTF8 boundary
             let (valid, after_valid) = unsafe { ext::split_at(b, err.valid_up_to()) };
             let valid = valid.try_str().unwrap();
             (valid, Some(after_valid))
@@ -487,9 +505,9 @@ fn is_number(arg: &str) -> bool {
             // optional exponent, and only if it's not the first character.
             b'.' if !seen_dot && position_of_e.is_none() && i > 0 => seen_dot = true,
 
-            // Allow an exponent `e` but only at most one after the first
+            // Allow an exponent `e`/`E` but only at most one after the first
             // character.
-            b'e' if position_of_e.is_none() && i > 0 => position_of_e = Some(i),
+            b'e' | b'E' if position_of_e.is_none() && i > 0 => position_of_e = Some(i),
 
             _ => return false,
         }

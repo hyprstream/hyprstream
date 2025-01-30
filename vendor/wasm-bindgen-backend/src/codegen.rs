@@ -225,6 +225,13 @@ impl ToTokens for ast::Struct {
         let wasm_bindgen = &self.wasm_bindgen;
         (quote! {
             #[automatically_derived]
+            impl #wasm_bindgen::__rt::marker::SupportsConstructor for #name {}
+            #[automatically_derived]
+            impl #wasm_bindgen::__rt::marker::SupportsInstanceProperty for #name {}
+            #[automatically_derived]
+            impl #wasm_bindgen::__rt::marker::SupportsStaticProperty for #name {}
+
+            #[automatically_derived]
             impl #wasm_bindgen::describe::WasmDescribe for #name {
                 fn describe() {
                     use #wasm_bindgen::describe::*;
@@ -630,7 +637,7 @@ impl TryToTokens for ast::Export {
 
         let mut argtys = Vec::new();
         for (i, arg) in self.function.arguments.iter().enumerate() {
-            argtys.push(&*arg.ty);
+            argtys.push(&*arg.pat_type.ty);
             let i = i + offset;
             let ident = Ident::new(&format!("arg{}", i), Span::call_site());
             fn unwrap_nested_types(ty: &syn::Type) -> &syn::Type {
@@ -640,7 +647,7 @@ impl TryToTokens for ast::Export {
                     _ => ty,
                 }
             }
-            let ty = unwrap_nested_types(&arg.ty);
+            let ty = unwrap_nested_types(&arg.pat_type.ty);
 
             match &ty {
                 syn::Type::Reference(syn::TypeReference {
@@ -713,7 +720,12 @@ impl TryToTokens for ast::Export {
             elems: Default::default(),
             paren_token: Default::default(),
         });
-        let syn_ret = self.function.ret.as_ref().unwrap_or(&syn_unit);
+        let syn_ret = self
+            .function
+            .ret
+            .as_ref()
+            .map(|ret| &ret.r#type)
+            .unwrap_or(&syn_unit);
         if let syn::Type::Reference(_) = syn_ret {
             bail_span!(syn_ret, "cannot return a borrowed ref with #[wasm_bindgen]",)
         }
@@ -782,11 +794,40 @@ impl TryToTokens for ast::Export {
         let nargs = self.function.arguments.len() as u32;
         let attrs = &self.function.rust_attrs;
 
-        let start_check = if self.start {
-            quote! { const _ASSERT: fn() = || -> #projection::Abi { loop {} }; }
-        } else {
-            quote! {}
+        let mut checks = Vec::new();
+        if self.start {
+            checks.push(quote! { const _ASSERT: fn() = || -> #projection::Abi { loop {} }; });
         };
+
+        if let Some(class) = self.rust_class.as_ref() {
+            // little helper function to make sure the check points to the
+            // location of the function causing the assert to fail
+            let mut add_check = |token_stream| {
+                checks.push(respan(token_stream, &self.rust_name));
+            };
+
+            match &self.method_kind {
+                ast::MethodKind::Constructor => {
+                    add_check(quote! {
+                        let _: #wasm_bindgen::__rt::marker::CheckSupportsConstructor<#class>;
+                    });
+                }
+                ast::MethodKind::Operation(operation) => match operation.kind {
+                    ast::OperationKind::Getter(_) | ast::OperationKind::Setter(_) => {
+                        if operation.is_static {
+                            add_check(quote! {
+                                let _: #wasm_bindgen::__rt::marker::CheckSupportsStaticProperty<#class>;
+                            });
+                        } else {
+                            add_check(quote! {
+                                let _: #wasm_bindgen::__rt::marker::CheckSupportsInstanceProperty<#class>;
+                            });
+                        }
+                    }
+                    _ => {}
+                },
+            }
+        }
 
         (quote! {
             #[automatically_derived]
@@ -798,7 +839,9 @@ impl TryToTokens for ast::Export {
                     export_name = #export_name,
                 )]
                 pub unsafe extern "C" fn #generated_name(#(#args),*) -> #wasm_bindgen::convert::WasmRet<#projection::Abi> {
-                    #start_check
+                    const _: () = {
+                        #(#checks)*
+                    };
 
                     let #ret = #call;
                     #convert_ret
@@ -1285,7 +1328,7 @@ impl TryToTokens for ast::ImportFunction {
             ast::ImportFunctionKind::Normal => {}
         }
         let vis = &self.function.rust_vis;
-        let ret = match &self.function.ret {
+        let ret = match self.function.ret.as_ref().map(|ret| &ret.r#type) {
             Some(ty) => quote! { -> #ty },
             None => quote!(),
         };
@@ -1299,8 +1342,8 @@ impl TryToTokens for ast::ImportFunction {
         let wasm_bindgen_futures = &self.wasm_bindgen_futures;
 
         for (i, arg) in self.function.arguments.iter().enumerate() {
-            let ty = &arg.ty;
-            let name = match &*arg.pat {
+            let ty = &arg.pat_type.ty;
+            let name = match &*arg.pat_type.pat {
                 syn::Pat::Ident(syn::PatIdent {
                     by_ref: None,
                     ident,
@@ -1309,7 +1352,7 @@ impl TryToTokens for ast::ImportFunction {
                 }) => ident.clone(),
                 syn::Pat::Wild(_) => syn::Ident::new(&format!("__genarg_{}", i), Span::call_site()),
                 _ => bail_span!(
-                    arg.pat,
+                    arg.pat_type.pat,
                     "unsupported pattern in #[wasm_bindgen] imported function",
                 ),
             };
@@ -1504,7 +1547,7 @@ impl ToTokens for DescribeImport<'_> {
             ast::ImportKind::Type(_) => return,
             ast::ImportKind::Enum(_) => return,
         };
-        let argtys = f.function.arguments.iter().map(|arg| &arg.ty);
+        let argtys = f.function.arguments.iter().map(|arg| &arg.pat_type.ty);
         let nargs = f.function.arguments.len() as u32;
         let inform_ret = match &f.js_ret {
             Some(ref t) => quote! { <#t as WasmDescribe>::describe(); },
@@ -1765,24 +1808,12 @@ fn thread_local_import(
             }
         },
         ast::ThreadLocal::V2 => {
-            #[cfg(feature = "std")]
-            let inner = quote! {
-                #wasm_bindgen::__rt::std::thread_local!(static _VAL: #actual_ty = init(););
-                #wasm_bindgen::JsThreadLocal {
-                    __inner: &_VAL,
-                }
-            };
-            #[cfg(not(feature = "std"))]
-            let inner = quote! {
-                #wasm_bindgen::__wbindgen_thread_local!(#wasm_bindgen, #actual_ty)
-            };
-
             quote! {
                 #vis static #name: #wasm_bindgen::JsThreadLocal<#actual_ty> = {
                     fn init() -> #actual_ty {
                         #init
                     }
-                    #inner
+                    #wasm_bindgen::__wbindgen_thread_local!(#wasm_bindgen, #actual_ty)
                 };
             }
         }

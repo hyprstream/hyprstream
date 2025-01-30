@@ -32,9 +32,9 @@ mod util;
 
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io;
 use std::os::unix::io::{AsRawFd, BorrowedFd};
 use std::path::Path;
+use std::{fmt, io};
 
 pub use error::UnsupportedPlatformError;
 pub use sys::{XAttrs, SUPPORTED_PLATFORM};
@@ -153,3 +153,16 @@ pub trait FileExt: AsRawFd {
 }
 
 impl FileExt for File {}
+
+impl fmt::Debug for XAttrs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Waiting on https://github.com/rust-lang/rust/issues/117729 to stabilize...
+        struct AsList<'a>(&'a XAttrs);
+        impl<'a> fmt::Debug for AsList<'a> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_list().entries(self.0.clone()).finish()
+            }
+        }
+        f.debug_tuple("XAttrs").field(&AsList(self)).finish()
+    }
+}

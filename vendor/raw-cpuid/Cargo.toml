@@ -12,9 +12,10 @@
 [package]
 edition = "2018"
 name = "raw-cpuid"
-version = "11.2.0"
+version = "11.3.0"
 authors = ["Gerd Zellweger <mail@gerdzellweger.com>"]
 build = false
+autolib = false
 autobins = false
 autoexamples = false
 autotests = false
@@ -57,7 +58,10 @@ path = "examples/cpu.rs"
 [[example]]
 name = "serialize_deserialize"
 path = "examples/serialize_deserialize.rs"
-required-features = ["serde_json"]
+required-features = [
+    "serde_json",
+    "serialize",
+]
 
 [[example]]
 name = "topology"

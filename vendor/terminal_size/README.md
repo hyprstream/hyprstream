@@ -2,12 +2,12 @@ terminal-size
 =============
 
 
-[Documention](https://docs.rs/crate/terminal_size)
+[Documentation](https://docs.rs/terminal_size)
 
 
-Rust library to getting the size of your terminal.
+Rust library for getting the size of your terminal.
 
-Works on Linux, MacOS, Windows, and illumos.
+Works on Linux, macOS, Windows, and illumos.
 
 ```rust
 use terminal_size::{Width, Height, terminal_size};
@@ -22,7 +22,7 @@ if let Some((Width(w), Height(h))) = size {
 
 ## Minimum Rust Version
 
-This crate requires a minimum rust version of 1.63.0 (2022-08-11)
+This crate requires a minimum Rust version of 1.63.0 (2022-08-11).
 
 ## License
 

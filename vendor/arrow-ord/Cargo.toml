@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.62"
 name = "arrow-ord"
-version = "54.0.0"
+version = "53.4.0"
 authors = ["Apache Arrow <dev@arrow.apache.org>"]
 build = false
 include = [
@@ -39,23 +39,28 @@ path = "src/lib.rs"
 bench = false
 
 [dependencies.arrow-array]
-version = "54.0.0"
+version = "53.4.0"
 
 [dependencies.arrow-buffer]
-version = "54.0.0"
+version = "53.4.0"
 
 [dependencies.arrow-data]
-version = "54.0.0"
+version = "53.4.0"
 
 [dependencies.arrow-schema]
-version = "54.0.0"
+version = "53.4.0"
 
 [dependencies.arrow-select]
-version = "54.0.0"
+version = "53.4.0"
 
-[dev-dependencies.half]
+[dependencies.half]
 version = "2.1"
 features = ["num-traits"]
+default-features = false
+
+[dependencies.num]
+version = "0.4"
+features = ["std"]
 default-features = false
 
 [dev-dependencies.rand]

@@ -1,3 +1,10 @@
+//! Low level terminal capability lookups
+
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![warn(missing_docs)]
+#![warn(clippy::print_stderr)]
+#![warn(clippy::print_stdout)]
+
 pub mod windows;
 
 /// Check [CLICOLOR] status
@@ -25,11 +32,7 @@ pub fn clicolor() -> Option<bool> {
 /// [CLICOLOR_FORCE]: https://bixense.com/clicolors/
 #[inline]
 pub fn clicolor_force() -> bool {
-    let value = std::env::var_os("CLICOLOR_FORCE");
-    value
-        .as_deref()
-        .unwrap_or_else(|| std::ffi::OsStr::new("0"))
-        != "0"
+    non_empty(std::env::var_os("CLICOLOR_FORCE").as_deref())
 }
 
 /// Check [NO_COLOR] status
@@ -44,67 +47,65 @@ pub fn clicolor_force() -> bool {
 /// [NO_COLOR]: https://no-color.org/
 #[inline]
 pub fn no_color() -> bool {
-    let value = std::env::var_os("NO_COLOR");
-    value.as_deref().unwrap_or_else(|| std::ffi::OsStr::new("")) != ""
+    non_empty(std::env::var_os("NO_COLOR").as_deref())
 }
 
 /// Check `TERM` for color support
 #[inline]
-#[cfg(not(windows))]
 pub fn term_supports_color() -> bool {
-    match std::env::var_os("TERM") {
-        // If TERM isn't set, then we are in a weird environment that
-        // probably doesn't support colors.
-        None => return false,
-        Some(k) => {
+    #[cfg(not(windows))]
+    {
+        match std::env::var_os("TERM") {
+            // If TERM isn't set, then we are in a weird environment that
+            // probably doesn't support colors.
+            None => return false,
+            Some(k) => {
+                if k == "dumb" {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+    #[cfg(windows)]
+    {
+        // On Windows, if TERM isn't set, then we shouldn't automatically
+        // assume that colors aren't allowed. This is unlike Unix environments
+        // where TERM is more rigorously set.
+        if let Some(k) = std::env::var_os("TERM") {
             if k == "dumb" {
                 return false;
             }
         }
+        true
     }
-    true
-}
-
-/// Check `TERM` for color support
-#[inline]
-#[cfg(windows)]
-pub fn term_supports_color() -> bool {
-    // On Windows, if TERM isn't set, then we shouldn't automatically
-    // assume that colors aren't allowed. This is unlike Unix environments
-    // where TERM is more rigorously set.
-    if let Some(k) = std::env::var_os("TERM") {
-        if k == "dumb" {
-            return false;
-        }
-    }
-    true
 }
 
 /// Check `TERM` for ANSI color support
+///
+/// On Windows, you might need to also check [`windows::enable_ansi_colors`] as ANSI color support
+/// is opt-in, rather than assumed.
 #[inline]
-#[cfg(not(windows))]
 pub fn term_supports_ansi_color() -> bool {
-    term_supports_color()
-}
-
-/// Check `TERM` for ANSI color support
-#[inline]
-#[cfg(windows)]
-pub fn term_supports_ansi_color() -> bool {
-    match std::env::var_os("TERM") {
-        // If TERM isn't set, then we are in a weird environment that
-        // probably doesn't support ansi.
-        None => return false,
-        Some(k) => {
-            // cygwin doesn't seem to support ANSI escape sequences
-            // and instead has its own variety. However, the Windows
-            // console API may be available.
-            if k == "dumb" || k == "cygwin" {
-                return false;
+    #[cfg(not(windows))]
+    {
+        term_supports_color()
+    }
+    #[cfg(windows)]
+    {
+        match std::env::var_os("TERM") {
+            None => return false,
+            Some(k) => {
+                // cygwin doesn't seem to support ANSI escape sequences
+                // and instead has its own variety. However, the Windows
+                // console API may be available.
+                if k == "dumb" || k == "cygwin" {
+                    return false;
+                }
             }
         }
+        true
     }
-    true
 }
 
 /// Check [COLORTERM] for truecolor support
@@ -131,4 +132,28 @@ pub fn is_ci() -> bool {
     // - Gitlab and Github set it to `true`
     // - Woodpecker sets it to `woodpecker`
     std::env::var_os("CI").is_some()
+}
+
+fn non_empty(var: Option<&std::ffi::OsStr>) -> bool {
+    !var.unwrap_or_default().is_empty()
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn non_empty_not_present() {
+        assert!(!non_empty(None));
+    }
+
+    #[test]
+    fn non_empty_empty() {
+        assert!(!non_empty(Some(std::ffi::OsStr::new(""))));
+    }
+
+    #[test]
+    fn non_empty_texty() {
+        assert!(non_empty(Some(std::ffi::OsStr::new("hello"))));
+    }
 }

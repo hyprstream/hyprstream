@@ -3,6 +3,8 @@
 #![cfg_attr(not(feature = "error-context"), allow(dead_code))]
 #![cfg_attr(not(feature = "error-context"), allow(unused_imports))]
 
+use std::borrow::Cow;
+
 use crate::builder::Command;
 use crate::builder::StyledStr;
 use crate::builder::Styles;
@@ -12,6 +14,7 @@ use crate::error::ContextKind;
 use crate::error::ContextValue;
 use crate::error::ErrorKind;
 use crate::output::TAB;
+use crate::ArgAction;
 
 /// Defines how to format an error for displaying to the user
 pub trait ErrorFormatter: Sized {
@@ -23,8 +26,12 @@ pub trait ErrorFormatter: Sized {
 ///
 /// No context is included.
 ///
+/// <div class="warning">
+///
 /// **NOTE:** Consider removing the `error-context` default feature if using this to remove all
 /// overhead for [`RichFormatter`].
+///
+/// </div>
 #[non_exhaustive]
 pub struct KindFormatter;
 
@@ -105,12 +112,7 @@ impl ErrorFormatter for RichFormatter {
                 styled.push_str("\n");
             }
             for suggestion in suggestions {
-                let _ = write!(
-                    styled,
-                    "\n{TAB}{}tip:{} ",
-                    valid.render(),
-                    valid.render_reset()
-                );
+                let _ = write!(styled, "\n{TAB}{valid}tip:{valid:#} ",);
                 styled.push_styled(suggestion);
             }
         }
@@ -120,7 +122,7 @@ impl ErrorFormatter for RichFormatter {
             put_usage(&mut styled, usage);
         }
 
-        try_help(&mut styled, styles, error.inner.help_flag);
+        try_help(&mut styled, styles, error.inner.help_flag.as_deref());
 
         styled
     }
@@ -129,7 +131,7 @@ impl ErrorFormatter for RichFormatter {
 fn start_error(styled: &mut StyledStr, styles: &Styles) {
     use std::fmt::Write as _;
     let error = &styles.get_error();
-    let _ = write!(styled, "{}error:{} ", error.render(), error.render_reset());
+    let _ = write!(styled, "{error}error:{error:#} ");
 }
 
 #[must_use]
@@ -152,16 +154,12 @@ fn write_dynamic_context(
                     prior_arg = None;
                     let _ = write!(
                         styled,
-                        "the argument '{}{invalid_arg}{}' cannot be used multiple times",
-                        invalid.render(),
-                        invalid.render_reset()
+                        "the argument '{invalid}{invalid_arg}{invalid:#}' cannot be used multiple times",
                     );
                 } else {
                     let _ = write!(
                         styled,
-                        "the argument '{}{invalid_arg}{}' cannot be used with",
-                        invalid.render(),
-                        invalid.render_reset()
+                        "the argument '{invalid}{invalid_arg}{invalid:#}' cannot be used with",
                     );
                 }
             } else if let Some(ContextValue::String(invalid_arg)) =
@@ -169,9 +167,7 @@ fn write_dynamic_context(
             {
                 let _ = write!(
                     styled,
-                    "the subcommand '{}{invalid_arg}{}' cannot be used with",
-                    invalid.render(),
-                    invalid.render_reset()
+                    "the subcommand '{invalid}{invalid_arg}{invalid:#}' cannot be used with",
                 );
             } else {
                 styled.push_str(error.kind().as_str().unwrap());
@@ -182,21 +178,11 @@ fn write_dynamic_context(
                     ContextValue::Strings(values) => {
                         styled.push_str(":");
                         for v in values {
-                            let _ = write!(
-                                styled,
-                                "\n{TAB}{}{v}{}",
-                                invalid.render(),
-                                invalid.render_reset()
-                            );
+                            let _ = write!(styled, "\n{TAB}{invalid}{v}{invalid:#}",);
                         }
                     }
                     ContextValue::String(value) => {
-                        let _ = write!(
-                            styled,
-                            " '{}{value}{}'",
-                            invalid.render(),
-                            invalid.render_reset()
-                        );
+                        let _ = write!(styled, " '{invalid}{value}{invalid:#}'",);
                     }
                     _ => {
                         styled.push_str(" one or more of the other specified arguments");
@@ -211,9 +197,7 @@ fn write_dynamic_context(
             if let Some(ContextValue::String(invalid_arg)) = invalid_arg {
                 let _ = write!(
                     styled,
-                    "equal sign is needed when assigning values to '{}{invalid_arg}{}'",
-                    invalid.render(),
-                    invalid.render_reset()
+                    "equal sign is needed when assigning values to '{invalid}{invalid_arg}{invalid:#}'",
                 );
                 true
             } else {
@@ -231,18 +215,12 @@ fn write_dynamic_context(
                 if invalid_value.is_empty() {
                     let _ = write!(
                         styled,
-                        "a value is required for '{}{invalid_arg}{}' but none was supplied",
-                        invalid.render(),
-                        invalid.render_reset()
+                        "a value is required for '{invalid}{invalid_arg}{invalid:#}' but none was supplied",
                     );
                 } else {
                     let _ = write!(
                         styled,
-                        "invalid value '{}{invalid_value}{}' for '{}{invalid_arg}{}'",
-                        invalid.render(),
-                        invalid.render_reset(),
-                        literal.render(),
-                        literal.render_reset()
+                        "invalid value '{invalid}{invalid_value}{invalid:#}' for '{literal}{invalid_arg}{literal:#}'",
                     );
                 }
 
@@ -259,9 +237,7 @@ fn write_dynamic_context(
             if let Some(ContextValue::String(invalid_sub)) = invalid_sub {
                 let _ = write!(
                     styled,
-                    "unrecognized subcommand '{}{invalid_sub}{}'",
-                    invalid.render(),
-                    invalid.render_reset()
+                    "unrecognized subcommand '{invalid}{invalid_sub}{invalid:#}'",
                 );
                 true
             } else {
@@ -273,12 +249,7 @@ fn write_dynamic_context(
             if let Some(ContextValue::Strings(invalid_arg)) = invalid_arg {
                 styled.push_str("the following required arguments were not provided:");
                 for v in invalid_arg {
-                    let _ = write!(
-                        styled,
-                        "\n{TAB}{}{v}{}",
-                        valid.render(),
-                        valid.render_reset()
-                    );
+                    let _ = write!(styled, "\n{TAB}{valid}{v}{valid:#}",);
                 }
                 true
             } else {
@@ -290,9 +261,7 @@ fn write_dynamic_context(
             if let Some(ContextValue::String(invalid_sub)) = invalid_sub {
                 let _ = write!(
                     styled,
-                    "'{}{invalid_sub}{}' requires a subcommand but one was not provided",
-                    invalid.render(),
-                    invalid.render_reset()
+                    "'{invalid}{invalid_sub}{invalid:#}' requires a subcommand but one was not provided",
                 );
                 let values = error.get(ContextKind::ValidSubcommand);
                 write_values_list("subcommands", styled, valid, values);
@@ -313,11 +282,7 @@ fn write_dynamic_context(
             {
                 let _ = write!(
                     styled,
-                    "unexpected value '{}{invalid_value}{}' for '{}{invalid_arg}{}' found; no more were expected",
-                    invalid.render(),
-                    invalid.render_reset(),
-                    literal.render(),
-                    literal.render_reset(),
+                    "unexpected value '{invalid}{invalid_value}{invalid:#}' for '{literal}{invalid_arg}{literal:#}' found; no more were expected",
                 );
                 true
             } else {
@@ -337,13 +302,7 @@ fn write_dynamic_context(
                 let were_provided = singular_or_plural(*actual_num_values as usize);
                 let _ = write!(
                     styled,
-                    "{}{min_values}{} more values required by '{}{invalid_arg}{}'; only {}{actual_num_values}{}{were_provided}",
-                    valid.render(),
-                    valid.render_reset(),
-                    literal.render(),
-                    literal.render_reset(),
-                    invalid.render(),
-                    invalid.render_reset(),
+                    "{valid}{min_values}{valid:#} values required by '{literal}{invalid_arg}{literal:#}'; only {invalid}{actual_num_values}{invalid:#}{were_provided}",
                 );
                 true
             } else {
@@ -360,11 +319,7 @@ fn write_dynamic_context(
             {
                 let _ = write!(
                     styled,
-                    "invalid value '{}{invalid_value}{}' for '{}{invalid_arg}{}'",
-                    invalid.render(),
-                    invalid.render_reset(),
-                    literal.render(),
-                    literal.render_reset(),
+                    "invalid value '{invalid}{invalid_value}{invalid:#}' for '{literal}{invalid_arg}{literal:#}'",
                 );
                 if let Some(source) = error.inner.source.as_deref() {
                     let _ = write!(styled, ": {source}");
@@ -387,13 +342,7 @@ fn write_dynamic_context(
                 let were_provided = singular_or_plural(*actual_num_values as usize);
                 let _ = write!(
                     styled,
-                    "{}{num_values}{} values required for '{}{invalid_arg}{}' but {}{actual_num_values}{}{were_provided}",
-                    valid.render(),
-                    valid.render_reset(),
-                    literal.render(),
-                    literal.render_reset(),
-                    invalid.render(),
-                    invalid.render_reset(),
+                    "{valid}{num_values}{valid:#} values required for '{literal}{invalid_arg}{literal:#}' but {invalid}{actual_num_values}{invalid:#}{were_provided}",
                 );
                 true
             } else {
@@ -405,9 +354,7 @@ fn write_dynamic_context(
             if let Some(ContextValue::String(invalid_arg)) = invalid_arg {
                 let _ = write!(
                     styled,
-                    "unexpected argument '{}{invalid_arg}{}' found",
-                    invalid.render(),
-                    invalid.render_reset(),
+                    "unexpected argument '{invalid}{invalid_arg}{invalid:#}' found",
                 );
                 true
             } else {
@@ -434,13 +381,11 @@ fn write_values_list(
         if !possible_values.is_empty() {
             let _ = write!(styled, "\n{TAB}[{list_name}: ");
 
-            let style = valid.render();
-            let reset = valid.render_reset();
             for (idx, val) in possible_values.iter().enumerate() {
                 if idx > 0 {
                     styled.push_str(", ");
                 }
-                let _ = write!(styled, "{style}{}{reset}", Escape(val));
+                let _ = write!(styled, "{valid}{}{valid:#}", Escape(val));
             }
 
             styled.push_str("]");
@@ -461,7 +406,7 @@ pub(crate) fn format_error_message(
         put_usage(&mut styled, usage);
     }
     if let Some(cmd) = cmd {
-        try_help(&mut styled, styles, get_help_flag(cmd));
+        try_help(&mut styled, styles, get_help_flag(cmd).as_deref());
     }
     styled
 }
@@ -480,14 +425,32 @@ fn put_usage(styled: &mut StyledStr, usage: &StyledStr) {
     styled.push_styled(usage);
 }
 
-pub(crate) fn get_help_flag(cmd: &Command) -> Option<&'static str> {
+pub(crate) fn get_help_flag(cmd: &Command) -> Option<Cow<'static, str>> {
     if !cmd.is_disable_help_flag_set() {
-        Some("--help")
+        Some(Cow::Borrowed("--help"))
+    } else if let Some(flag) = get_user_help_flag(cmd) {
+        Some(Cow::Owned(flag))
     } else if cmd.has_subcommands() && !cmd.is_disable_help_subcommand_set() {
-        Some("help")
+        Some(Cow::Borrowed("help"))
     } else {
         None
     }
+}
+
+fn get_user_help_flag(cmd: &Command) -> Option<String> {
+    let arg = cmd.get_arguments().find(|arg| match arg.get_action() {
+        ArgAction::Help | ArgAction::HelpShort | ArgAction::HelpLong => true,
+        ArgAction::Append
+        | ArgAction::Count
+        | ArgAction::SetTrue
+        | ArgAction::SetFalse
+        | ArgAction::Set
+        | ArgAction::Version => false,
+    })?;
+
+    arg.get_long()
+        .map(|long| format!("--{long}"))
+        .or_else(|| arg.get_short().map(|short| format!("-{short}")))
 }
 
 fn try_help(styled: &mut StyledStr, styles: &Styles, help: Option<&str>) {
@@ -496,9 +459,7 @@ fn try_help(styled: &mut StyledStr, styles: &Styles, help: Option<&str>) {
         let literal = &styles.get_literal();
         let _ = write!(
             styled,
-            "\n\nFor more information, try '{}{help}{}'.\n",
-            literal.render(),
-            literal.render_reset()
+            "\n\nFor more information, try '{literal}{help}{literal:#}'.\n",
         );
     } else {
         styled.push_str("\n");
@@ -506,46 +467,35 @@ fn try_help(styled: &mut StyledStr, styles: &Styles, help: Option<&str>) {
 }
 
 #[cfg(feature = "error-context")]
-fn did_you_mean(styled: &mut StyledStr, styles: &Styles, context: &str, valid: &ContextValue) {
+fn did_you_mean(styled: &mut StyledStr, styles: &Styles, context: &str, possibles: &ContextValue) {
     use std::fmt::Write as _;
 
-    let _ = write!(
-        styled,
-        "{TAB}{}tip:{}",
-        styles.get_valid().render(),
-        styles.get_valid().render_reset()
-    );
-    if let ContextValue::String(valid) = valid {
+    let valid = &styles.get_valid();
+    let _ = write!(styled, "{TAB}{valid}tip:{valid:#}",);
+    if let ContextValue::String(possible) = possibles {
         let _ = write!(
             styled,
-            " a similar {context} exists: '{}{valid}{}'",
-            styles.get_valid().render(),
-            styles.get_valid().render_reset()
+            " a similar {context} exists: '{valid}{possible}{valid:#}'",
         );
-    } else if let ContextValue::Strings(valid) = valid {
-        if valid.len() == 1 {
+    } else if let ContextValue::Strings(possibles) = possibles {
+        if possibles.len() == 1 {
             let _ = write!(styled, " a similar {context} exists: ",);
         } else {
             let _ = write!(styled, " some similar {context}s exist: ",);
         }
-        for (i, valid) in valid.iter().enumerate() {
+        for (i, possible) in possibles.iter().enumerate() {
             if i != 0 {
                 styled.push_str(", ");
             }
-            let _ = write!(
-                styled,
-                "'{}{valid}{}'",
-                styles.get_valid().render(),
-                styles.get_valid().render_reset()
-            );
+            let _ = write!(styled, "'{valid}{possible}{valid:#}'",);
         }
     }
 }
 
 struct Escape<'s>(&'s str);
 
-impl<'s> std::fmt::Display for Escape<'s> {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+impl std::fmt::Display for Escape<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.0.contains(char::is_whitespace) {
             std::fmt::Debug::fmt(self.0, f)
         } else {

@@ -13,13 +13,14 @@
 edition = "2018"
 rust-version = "1.37"
 name = "pin-project-lite"
-version = "0.2.15"
+version = "0.2.16"
 build = false
 exclude = [
     "/.*",
     "/tools",
     "/DEVELOPMENT.md",
 ]
+autolib = false
 autobins = false
 autoexamples = false
 autotests = false

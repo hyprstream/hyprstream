@@ -41,10 +41,7 @@ impl Printer {
         }
         self.word(close);
         if semicolon {
-            match mac.delimiter {
-                MacroDelimiter::Paren(_) | MacroDelimiter::Bracket(_) => self.word(";"),
-                MacroDelimiter::Brace(_) => {}
-            }
+            self.word(";");
         }
     }
 
@@ -179,6 +176,7 @@ impl Printer {
                 (_, Token::Ident(ident)) if !is_keyword(ident) => {
                     (state != Dot && state != Colon2, Ident)
                 }
+                (_, Token::Literal(lit)) if lit.to_string().ends_with('.') => (state != Dot, Other),
                 (_, Token::Literal(_)) => (state != Dot, Ident),
                 (_, Token::Punct(',' | ';', _)) => (false, Other),
                 (_, Token::Punct('.', _)) if !matcher => (state != Ident && state != Delim, Dot),
@@ -211,6 +209,13 @@ impl Printer {
     }
 }
 
+pub(crate) fn requires_semi(delimiter: &MacroDelimiter) -> bool {
+    match delimiter {
+        MacroDelimiter::Paren(_) | MacroDelimiter::Bracket(_) => true,
+        MacroDelimiter::Brace(_) => false,
+    }
+}
+
 fn is_keyword(ident: &Ident) -> bool {
     match ident.to_string().as_str() {
         "as" | "async" | "await" | "box" | "break" | "const" | "continue" | "crate" | "dyn"
@@ -224,6 +229,7 @@ fn is_keyword(ident: &Ident) -> bool {
 #[cfg(feature = "verbatim")]
 mod standard_library {
     use crate::algorithm::Printer;
+    use crate::fixup::FixupContext;
     use crate::iter::IterDelimited;
     use crate::path::PathKind;
     use crate::INDENT;
@@ -543,7 +549,7 @@ mod standard_library {
                     self.word("(");
                     self.cbox(INDENT);
                     self.zerobreak();
-                    self.expr(expr);
+                    self.expr(expr, FixupContext::NONE);
                     self.zerobreak();
                     self.offset(-INDENT);
                     self.end();
@@ -554,7 +560,7 @@ mod standard_library {
                     self.cbox(INDENT);
                     self.zerobreak();
                     for elem in exprs.iter().delimited() {
-                        self.expr(&elem);
+                        self.expr(&elem, FixupContext::NONE);
                         self.trailing_comma(elem.is_last);
                     }
                     self.offset(-INDENT);
@@ -570,14 +576,14 @@ mod standard_library {
                     self.word("(");
                     self.cbox(INDENT);
                     self.zerobreak();
-                    self.expr(&matches.expression);
+                    self.expr(&matches.expression, FixupContext::NONE);
                     self.word(",");
                     self.space();
                     self.pat(&matches.pattern);
                     if let Some(guard) = &matches.guard {
                         self.space();
                         self.word("if ");
-                        self.expr(guard);
+                        self.expr(guard, FixupContext::NONE);
                     }
                     self.zerobreak();
                     self.offset(-INDENT);
@@ -598,7 +604,7 @@ mod standard_library {
                         self.ty(&item.ty);
                         self.word(" = ");
                         self.neverbreak();
-                        self.expr(&item.init);
+                        self.expr(&item.init, FixupContext::NONE);
                         self.word(";");
                         self.end();
                         self.hardbreak();
@@ -613,7 +619,7 @@ mod standard_library {
                     self.cbox(INDENT);
                     self.zerobreak();
                     for elem in vec.iter().delimited() {
-                        self.expr(&elem);
+                        self.expr(&elem, FixupContext::NONE);
                         self.trailing_comma(elem.is_last);
                     }
                     self.offset(-INDENT);
@@ -624,10 +630,10 @@ mod standard_library {
                     self.word("[");
                     self.cbox(INDENT);
                     self.zerobreak();
-                    self.expr(elem);
+                    self.expr(elem, FixupContext::NONE);
                     self.word(";");
                     self.space();
-                    self.expr(n);
+                    self.expr(n, FixupContext::NONE);
                     self.zerobreak();
                     self.offset(-INDENT);
                     self.end();

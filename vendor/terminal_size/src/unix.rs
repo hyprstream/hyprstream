@@ -1,6 +1,5 @@
 use super::{Height, Width};
-use rustix::fd::{BorrowedFd, AsRawFd};
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsFd, BorrowedFd, RawFd};
 
 /// Returns the size of the terminal.
 ///
@@ -8,11 +7,11 @@ use std::os::unix::io::RawFd;
 /// The size of the first stream that is a TTY will be returned.  If nothing
 /// is a TTY, then `None` is returned.
 pub fn terminal_size() -> Option<(Width, Height)> {
-    if let Some(size) = terminal_size_using_fd(std::io::stdout().as_raw_fd()) {
+    if let Some(size) = terminal_size_of(std::io::stdout()) {
         Some(size)
-    } else if let Some(size) = terminal_size_using_fd(std::io::stderr().as_raw_fd()) {
+    } else if let Some(size) = terminal_size_of(std::io::stderr()) {
         Some(size)
-    } else if let Some(size) = terminal_size_using_fd(std::io::stdin().as_raw_fd()) {
+    } else if let Some(size) = terminal_size_of(std::io::stdin()) {
         Some(size)
     } else {
         None
@@ -22,19 +21,14 @@ pub fn terminal_size() -> Option<(Width, Height)> {
 /// Returns the size of the terminal using the given file descriptor, if available.
 ///
 /// If the given file descriptor is not a tty, returns `None`
-pub fn terminal_size_using_fd(fd: RawFd) -> Option<(Width, Height)> {
+pub fn terminal_size_of<Fd: AsFd>(fd: Fd) -> Option<(Width, Height)> {
     use rustix::termios::{isatty, tcgetwinsize};
 
-    // TODO: Once I/O safety is stabilized, the enlosing function here should
-    // be unsafe due to taking a `RawFd`. We should then move the main
-    // logic here into a new function which takes a `BorrowedFd` and is safe.
-    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
-
-    if !isatty(fd) {
+    if !isatty(&fd) {
         return None;
     }
 
-    let winsize = tcgetwinsize(fd).ok()?;
+    let winsize = tcgetwinsize(&fd).ok()?;
 
     let rows = winsize.ws_row;
     let cols = winsize.ws_col;
@@ -44,6 +38,21 @@ pub fn terminal_size_using_fd(fd: RawFd) -> Option<(Width, Height)> {
     } else {
         None
     }
+}
+
+/// Returns the size of the terminal using the given raw file descriptor, if available.
+///
+/// The given file descriptor must be an open file descriptor.
+///
+/// If the given file descriptor is not a tty, returns `None`
+///
+/// # Safety
+///
+/// `fd` must be a valid open file descriptor.
+#[deprecated(note = "Use `terminal_size_of` instead.
+     Use `BorrowedFd::borrow_raw` to convert a raw fd into a `BorrowedFd` if needed.")]
+pub unsafe fn terminal_size_using_fd(fd: RawFd) -> Option<(Width, Height)> {
+    terminal_size_of(BorrowedFd::borrow_raw(fd))
 }
 
 #[test]

@@ -10,27 +10,65 @@
 # See Cargo.toml.orig for the original contents.
 
 [package]
-edition = "2018"
-rust-version = "1.51.0"
+edition = "2021"
+rust-version = "1.56"
 name = "valuable"
-version = "0.1.0"
-description = "Object-safe value inspection, used to pass un-typed structured data across trait-object boundaries.\n"
-readme = "../README.md"
-keywords = ["valuable", "serialization", "debugging", "no_std"]
-categories = ["development-tools::debugging", "encoding"]
+version = "0.1.1"
+build = "build.rs"
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = """
+Object-safe value inspection, used to pass un-typed structured data across trait-object boundaries.
+"""
+readme = "README.md"
+keywords = [
+    "valuable",
+    "serialization",
+    "debugging",
+    "no_std",
+]
+categories = [
+    "development-tools::debugging",
+    "encoding",
+]
 license = "MIT"
 repository = "https://github.com/tokio-rs/valuable"
-resolver = "2"
+
 [package.metadata.docs.rs]
 all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
+rustdoc-args = [
+    "--cfg",
+    "docsrs",
+]
+
+[lib]
+name = "valuable"
+path = "src/lib.rs"
+
+[[example]]
+name = "derive"
+path = "examples/derive.rs"
+
+[[example]]
+name = "hello_world"
+path = "examples/hello_world.rs"
+
+[[example]]
+name = "print"
+path = "examples/print.rs"
 
 [[bench]]
 name = "structable"
+path = "benches/structable.rs"
 harness = false
+
 [dependencies.valuable-derive]
-version = "0.1.0"
+version = "=0.1.1"
 optional = true
+
 [dev-dependencies.criterion]
 version = "0.3"
 

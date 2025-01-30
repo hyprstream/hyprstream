@@ -20,7 +20,11 @@ use std::ffi::OsString;
 ///
 /// See also [`Subcommand`] and [`Args`].
 ///
+/// <div class="warning">
+///
 /// **NOTE:** Deriving requires the `derive` feature flag
+///
+/// </div>
 pub trait Parser: FromArgMatches + CommandFactory + Sized {
     /// Parse from `std::env::args_os()`, [exit][Error::exit] on error.
     fn parse() -> Self {
@@ -73,6 +77,10 @@ pub trait Parser: FromArgMatches + CommandFactory + Sized {
     }
 
     /// Update from iterator, [exit][Error::exit] on error.
+    ///
+    /// Unlike [`Parser::parse`], this works with an existing instance of `self`.
+    /// The assumption is that all required fields are already provided and any [`Args`] or
+    /// [`Subcommand`]s provided by the user will modify only what is specified.
     fn update_from<I, T>(&mut self, itr: I)
     where
         I: IntoIterator<Item = T>,
@@ -210,21 +218,29 @@ pub trait FromArgMatches: Sized {
 ///   `Args`.
 /// - `Variant(ChildArgs)`: No attribute is used with enum variants that impl `Args`.
 ///
+/// <div class="warning">
+///
 /// **NOTE:** Deriving requires the `derive` feature flag
+///
+/// </div>
 pub trait Args: FromArgMatches + Sized {
     /// Report the [`ArgGroup::id`][crate::ArgGroup::id] for this set of arguments
     fn group_id() -> Option<crate::Id> {
         None
     }
-    /// Append to [`Command`] so it can instantiate `Self`.
-    ///
-    /// See also [`CommandFactory`].
-    fn augment_args(cmd: Command) -> Command;
-    /// Append to [`Command`] so it can update `self`.
+    /// Append to [`Command`] so it can instantiate `Self` via
+    /// [`FromArgMatches::from_arg_matches_mut`]
     ///
     /// This is used to implement `#[command(flatten)]`
     ///
-    /// See also [`CommandFactory`].
+    /// See also [`CommandFactory::command`].
+    fn augment_args(cmd: Command) -> Command;
+    /// Append to [`Command`] so it can instantiate `self` via
+    /// [`FromArgMatches::update_from_arg_matches_mut`]
+    ///
+    /// This is used to implement `#[command(flatten)]`
+    ///
+    /// See also [`CommandFactory::command_for_update`].
     fn augment_args_for_update(cmd: Command) -> Command;
 }
 
@@ -237,17 +253,25 @@ pub trait Args: FromArgMatches + Sized {
 /// - `#[command(flatten)] Variant(SubCmd)`: Attribute can only be used with enum variants that impl
 ///   `Subcommand`.
 ///
+/// <div class="warning">
+///
 /// **NOTE:** Deriving requires the `derive` feature flag
+///
+/// </div>
 pub trait Subcommand: FromArgMatches + Sized {
-    /// Append to [`Command`] so it can instantiate `Self`.
-    ///
-    /// See also [`CommandFactory`].
-    fn augment_subcommands(cmd: Command) -> Command;
-    /// Append to [`Command`] so it can update `self`.
+    /// Append to [`Command`] so it can instantiate `Self` via
+    /// [`FromArgMatches::from_arg_matches_mut`]
     ///
     /// This is used to implement `#[command(flatten)]`
     ///
-    /// See also [`CommandFactory`].
+    /// See also [`CommandFactory::command`].
+    fn augment_subcommands(cmd: Command) -> Command;
+    /// Append to [`Command`] so it can instantiate `self` via
+    /// [`FromArgMatches::update_from_arg_matches_mut`]
+    ///
+    /// This is used to implement `#[command(flatten)]`
+    ///
+    /// See also [`CommandFactory::command_for_update`].
     fn augment_subcommands_for_update(cmd: Command) -> Command;
     /// Test whether `Self` can parse a specific subcommand
     fn has_subcommand(name: &str) -> bool;
@@ -260,7 +284,11 @@ pub trait Subcommand: FromArgMatches + Sized {
 /// - Call [`EnumValueParser`][crate::builder::EnumValueParser]
 /// - Allowing using the `#[arg(default_value_t)]` attribute without implementing `Display`.
 ///
+/// <div class="warning">
+///
 /// **NOTE:** Deriving requires the `derive` feature flag
+///
+/// </div>
 pub trait ValueEnum: Sized + Clone {
     /// All possible argument values, in display order.
     fn value_variants<'a>() -> &'a [Self];
@@ -311,10 +339,10 @@ impl<T: Parser> Parser for Box<T> {
 }
 
 impl<T: CommandFactory> CommandFactory for Box<T> {
-    fn command<'help>() -> Command {
+    fn command() -> Command {
         <T as CommandFactory>::command()
     }
-    fn command_for_update<'help>() -> Command {
+    fn command_for_update() -> Command {
         <T as CommandFactory>::command_for_update()
     }
 }
@@ -355,7 +383,7 @@ impl<T: Subcommand> Subcommand for Box<T> {
     }
 }
 
-fn format_error<I: CommandFactory>(err: crate::Error) -> crate::Error {
+fn format_error<I: CommandFactory>(err: Error) -> Error {
     let mut cmd = I::command();
     err.format(&mut cmd)
 }

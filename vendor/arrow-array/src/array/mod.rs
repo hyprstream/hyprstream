@@ -323,7 +323,8 @@ pub trait Array: std::fmt::Debug + Send + Sync {
     /// even if the nulls present in [`DictionaryArray::values`] are not referenced by any key,
     /// and therefore would not appear in [`Array::logical_nulls`].
     fn is_nullable(&self) -> bool {
-        self.logical_null_count() != 0
+        // TODO this is not necessarily perfect default implementation, since null_count() and logical_null_count() are not always equivalent
+        self.null_count() != 0
     }
 
     /// Returns the total number of bytes of memory pointed to by this array.
@@ -926,7 +927,7 @@ mod tests {
 
     #[test]
     fn test_empty_list_primitive() {
-        let data_type = DataType::List(Arc::new(Field::new_list_field(DataType::Int32, false)));
+        let data_type = DataType::List(Arc::new(Field::new("item", DataType::Int32, false)));
         let array = new_empty_array(&data_type);
         let a = array.as_any().downcast_ref::<ListArray>().unwrap();
         assert_eq!(a.len(), 0);
@@ -984,7 +985,7 @@ mod tests {
 
     #[test]
     fn test_null_list_primitive() {
-        let data_type = DataType::List(Arc::new(Field::new_list_field(DataType::Int32, true)));
+        let data_type = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
         let array = new_null_array(&data_type, 9);
         let a = array.as_any().downcast_ref::<ListArray>().unwrap();
         assert_eq!(a.len(), 9);

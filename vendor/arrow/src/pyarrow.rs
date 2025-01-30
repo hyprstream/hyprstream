@@ -15,6 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
+/*
+Workaround https://github.com/PyO3/pyo3/issues/4743
+
+Newer versions of Rust signal an error on older py03 versions. This is fixed in 0.23.0
+but we need to work around for 0.22.x in arrow's 53.x line
+
+warning: unexpected `cfg` condition value: `gil-refs`
+  --> arrow/src/pyarrow.rs:80:1
+   |
+80 | import_exception!(pyarrow, ArrowException);
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `arrow-csv`, `arrow-ipc`, `arrow-json`, `chrono-tz`, `csv`, `default`, `ffi`, `force_validate`, `ipc`, `ipc_compression`, `json`, `prettyprint`, `pyarrow`, `pyo3`, `rand`, and `test_utils`
+   = note: using a cfg inside a macro will use the cfgs from the destination crate and not the ones from the defining crate
+   = help: try referring to `$crate::impl_exception_boilerplate` crate for guidance on how handle this unexpected cfg
+   = help: the macro `$crate::impl_exception_boilerplate` may come from an old version of the `pyo3` crate, try updating your dependency with `cargo update -p pyo3`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+   = note: this warning originates in the macro `$crate::impl_exception_boilerplate` which comes from the expansion of the macro `import_exception` (in Nightly builds, run with -Z macro-backtrace for more info)
+ */
+#![allow(unexpected_cfgs)]
+
 //! Pass Arrow objects from and to PyArrow, using Arrow's
 //! [C Data Interface](https://arrow.apache.org/docs/format/CDataInterface.html)
 //! and [pyo3](https://docs.rs/pyo3/latest/pyo3/).
@@ -111,7 +132,7 @@ impl<T: ToPyArrow> IntoPyArrow for T {
 }
 
 fn validate_class(expected: &str, value: &Bound<PyAny>) -> PyResult<()> {
-    let pyarrow = PyModule::import(value.py(), "pyarrow")?;
+    let pyarrow = PyModule::import_bound(value.py(), "pyarrow")?;
     let class = pyarrow.getattr(expected)?;
     if !value.is_instance(&class)? {
         let expected_module = class.getattr("__module__")?.extract::<PyBackedStr>()?;
@@ -177,7 +198,7 @@ impl ToPyArrow for DataType {
     fn to_pyarrow(&self, py: Python) -> PyResult<PyObject> {
         let c_schema = FFI_ArrowSchema::try_from(self).map_err(to_py_err)?;
         let c_schema_ptr = &c_schema as *const FFI_ArrowSchema;
-        let module = py.import("pyarrow")?;
+        let module = py.import_bound("pyarrow")?;
         let class = module.getattr("DataType")?;
         let dtype = class.call_method1("_import_from_c", (c_schema_ptr as Py_uintptr_t,))?;
         Ok(dtype.into())
@@ -213,7 +234,7 @@ impl ToPyArrow for Field {
     fn to_pyarrow(&self, py: Python) -> PyResult<PyObject> {
         let c_schema = FFI_ArrowSchema::try_from(self).map_err(to_py_err)?;
         let c_schema_ptr = &c_schema as *const FFI_ArrowSchema;
-        let module = py.import("pyarrow")?;
+        let module = py.import_bound("pyarrow")?;
         let class = module.getattr("Field")?;
         let dtype = class.call_method1("_import_from_c", (c_schema_ptr as Py_uintptr_t,))?;
         Ok(dtype.into())
@@ -249,7 +270,7 @@ impl ToPyArrow for Schema {
     fn to_pyarrow(&self, py: Python) -> PyResult<PyObject> {
         let c_schema = FFI_ArrowSchema::try_from(self).map_err(to_py_err)?;
         let c_schema_ptr = &c_schema as *const FFI_ArrowSchema;
-        let module = py.import("pyarrow")?;
+        let module = py.import_bound("pyarrow")?;
         let class = module.getattr("Schema")?;
         let schema = class.call_method1("_import_from_c", (c_schema_ptr as Py_uintptr_t,))?;
         Ok(schema.into())
@@ -309,7 +330,7 @@ impl ToPyArrow for ArrayData {
         let array = FFI_ArrowArray::new(self);
         let schema = FFI_ArrowSchema::try_from(self.data_type()).map_err(to_py_err)?;
 
-        let module = py.import("pyarrow")?;
+        let module = py.import_bound("pyarrow")?;
         let class = module.getattr("Array")?;
         let array = class.call_method1(
             "_import_from_c",
@@ -318,7 +339,7 @@ impl ToPyArrow for ArrayData {
                 addr_of!(schema) as Py_uintptr_t,
             ),
         )?;
-        Ok(array.unbind())
+        Ok(array.to_object(py))
     }
 }
 
@@ -335,7 +356,7 @@ impl<T: ToPyArrow> ToPyArrow for Vec<T> {
             .iter()
             .map(|v| v.to_pyarrow(py))
             .collect::<PyResult<Vec<_>>>()?;
-        Ok(PyList::new(py, values)?.unbind().into())
+        Ok(values.to_object(py))
     }
 }
 
@@ -451,7 +472,7 @@ impl FromPyArrow for ArrowArrayStreamReader {
         // make the conversion through PyArrow's private API
         // this changes the pointer's memory and is thus unsafe.
         // In particular, `_export_to_c` can go out of bounds
-        let args = PyTuple::new(value.py(), [stream_ptr as Py_uintptr_t])?;
+        let args = PyTuple::new_bound(value.py(), [stream_ptr as Py_uintptr_t]);
         value.call_method1("_export_to_c", args)?;
 
         let stream_reader = ArrowArrayStreamReader::try_new(stream)
@@ -469,9 +490,9 @@ impl IntoPyArrow for Box<dyn RecordBatchReader + Send> {
         let mut stream = FFI_ArrowArrayStream::new(self);
 
         let stream_ptr = (&mut stream) as *mut FFI_ArrowArrayStream;
-        let module = py.import("pyarrow")?;
+        let module = py.import_bound("pyarrow")?;
         let class = module.getattr("RecordBatchReader")?;
-        let args = PyTuple::new(py, [stream_ptr as Py_uintptr_t])?;
+        let args = PyTuple::new_bound(py, [stream_ptr as Py_uintptr_t]);
         let reader = class.call_method1("_import_from_c", args)?;
 
         Ok(PyObject::from(reader))
@@ -500,17 +521,11 @@ impl<'source, T: FromPyArrow> FromPyObject<'source> for PyArrowType<T> {
     }
 }
 
-impl<'py, T: IntoPyArrow> IntoPyObject<'py> for PyArrowType<T> {
-    type Target = PyAny;
-
-    type Output = Bound<'py, Self::Target>;
-
-    type Error = PyErr;
-
-    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, PyErr> {
+impl<T: IntoPyArrow> IntoPy<PyObject> for PyArrowType<T> {
+    fn into_py(self, py: Python) -> PyObject {
         match self.0.into_pyarrow(py) {
-            Ok(obj) => Result::Ok(obj.into_bound(py)),
-            Err(err) => Result::Err(err),
+            Ok(obj) => obj,
+            Err(err) => err.to_object(py),
         }
     }
 }

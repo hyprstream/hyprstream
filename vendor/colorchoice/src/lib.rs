@@ -1,15 +1,27 @@
 //! Global override of color control
 
 #![cfg_attr(not(test), no_std)]
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![warn(missing_docs)]
+#![warn(clippy::print_stderr)]
+#![warn(clippy::print_stdout)]
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Selection for overriding color output
+#[allow(clippy::exhaustive_enums)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ColorChoice {
+    /// Use colors if the output device appears to support them
     Auto,
+    /// Like `Always`, except it never tries to use anything other than emitting ANSI
+    /// color codes.
     AlwaysAnsi,
+    /// Try very hard to emit colors.
+    ///
+    /// This includes emitting ANSI colors on Windows if the console API is unavailable.
     Always,
+    /// Never emit colors.
     Never,
 }
 
@@ -21,7 +33,7 @@ impl ColorChoice {
 
     /// Override the detected [`ColorChoice`]
     pub fn write_global(self) {
-        USER.set(self)
+        USER.set(self);
     }
 }
 
@@ -38,36 +50,34 @@ pub(crate) struct AtomicChoice(AtomicUsize);
 
 impl AtomicChoice {
     pub(crate) const fn new() -> Self {
-        Self(AtomicUsize::new(Self::from_choice(
-            crate::ColorChoice::Auto,
-        )))
+        Self(AtomicUsize::new(Self::from_choice(ColorChoice::Auto)))
     }
 
-    pub(crate) fn get(&self) -> crate::ColorChoice {
+    pub(crate) fn get(&self) -> ColorChoice {
         let choice = self.0.load(Ordering::SeqCst);
-        Self::to_choice(choice).unwrap()
+        Self::to_choice(choice).expect("Only `ColorChoice` values can be `set`")
     }
 
-    pub(crate) fn set(&self, choice: crate::ColorChoice) {
+    pub(crate) fn set(&self, choice: ColorChoice) {
         let choice = Self::from_choice(choice);
         self.0.store(choice, Ordering::SeqCst);
     }
 
-    const fn from_choice(choice: crate::ColorChoice) -> usize {
+    const fn from_choice(choice: ColorChoice) -> usize {
         match choice {
-            crate::ColorChoice::Auto => 0,
-            crate::ColorChoice::AlwaysAnsi => 1,
-            crate::ColorChoice::Always => 2,
-            crate::ColorChoice::Never => 3,
+            ColorChoice::Auto => 0,
+            ColorChoice::AlwaysAnsi => 1,
+            ColorChoice::Always => 2,
+            ColorChoice::Never => 3,
         }
     }
 
-    const fn to_choice(choice: usize) -> Option<crate::ColorChoice> {
+    const fn to_choice(choice: usize) -> Option<ColorChoice> {
         match choice {
-            0 => Some(crate::ColorChoice::Auto),
-            1 => Some(crate::ColorChoice::AlwaysAnsi),
-            2 => Some(crate::ColorChoice::Always),
-            3 => Some(crate::ColorChoice::Never),
+            0 => Some(ColorChoice::Auto),
+            1 => Some(ColorChoice::AlwaysAnsi),
+            2 => Some(ColorChoice::Always),
+            3 => Some(ColorChoice::Never),
             _ => None,
         }
     }

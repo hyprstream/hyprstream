@@ -7,7 +7,7 @@
 //! - [Tutorial][_tutorial::chapter_0]
 //! - [Special Topics][_topic]
 //! - [Discussions](https://github.com/winnow-rs/winnow/discussions)
-//! - [CHANGELOG](https://github.com/winnow-rs/winnow/blob/v0.6.20/CHANGELOG.md) (includes major version migration
+//! - [CHANGELOG](https://github.com/winnow-rs/winnow/blob/v0.6.24/CHANGELOG.md) (includes major version migration
 //!   guides)
 //!
 //! ## Aspirations
@@ -158,7 +158,9 @@ pub use error::PResult;
 pub use parser::*;
 pub use stream::BStr;
 pub use stream::Bytes;
+#[allow(deprecated)]
 pub use stream::Located;
+pub use stream::LocatingSlice;
 pub use stream::Partial;
 pub use stream::Stateful;
 pub use stream::Str;

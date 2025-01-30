@@ -22,12 +22,11 @@ pub const ENOATTR: i32 = rustix::io::Errno::NOATTR.raw_os_error();
 #[inline]
 fn as_listxattr_buffer(buf: &mut [u8]) -> &mut [c_char] {
     // SAFETY: u8 and i8 have the same size and alignment
-    unsafe {
-        &mut *(buf as *mut [u8] as *mut [c_char])
-    }
+    unsafe { &mut *(buf as *mut [u8] as *mut [c_char]) }
 }
 
 /// An iterator over a set of extended attributes names.
+#[derive(Default)]
 pub struct XAttrs {
     data: Box<[u8]>,
     offset: usize,
@@ -76,9 +75,7 @@ impl Iterator for XAttrs {
 }
 
 pub fn get_fd(fd: BorrowedFd<'_>, name: &OsStr) -> io::Result<Vec<u8>> {
-    allocate_loop(|buf| {
-        rfs::fgetxattr(fd, name, buf)
-    })
+    allocate_loop(|buf| rfs::fgetxattr(fd, name, buf))
 }
 
 pub fn set_fd(fd: BorrowedFd<'_>, name: &OsStr, value: &[u8]) -> io::Result<()> {
@@ -92,9 +89,7 @@ pub fn remove_fd(fd: BorrowedFd<'_>, name: &OsStr) -> io::Result<()> {
 }
 
 pub fn list_fd(fd: BorrowedFd<'_>) -> io::Result<XAttrs> {
-    let vec = allocate_loop(|buf| {
-        rfs::flistxattr(fd, as_listxattr_buffer(buf))
-    })?;
+    let vec = allocate_loop(|buf| rfs::flistxattr(fd, as_listxattr_buffer(buf)))?;
     Ok(XAttrs {
         data: vec.into_boxed_slice(),
         offset: 0,
@@ -119,17 +114,23 @@ pub fn set_path(path: &Path, name: &OsStr, value: &[u8], deref: bool) -> io::Res
 }
 
 pub fn remove_path(path: &Path, name: &OsStr, deref: bool) -> io::Result<()> {
-    let removexattr_func = if deref { rfs::removexattr } else { rfs::lremovexattr };
+    let removexattr_func = if deref {
+        rfs::removexattr
+    } else {
+        rfs::lremovexattr
+    };
     removexattr_func(path, name)?;
     Ok(())
 }
 
 pub fn list_path(path: &Path, deref: bool) -> io::Result<XAttrs> {
-    let listxattr_func = if deref { rfs::listxattr } else { rfs::llistxattr };
+    let listxattr_func = if deref {
+        rfs::listxattr
+    } else {
+        rfs::llistxattr
+    };
     let path = path.as_cow_c_str()?;
-    let vec = allocate_loop(|buf| {
-        listxattr_func(&*path, as_listxattr_buffer(buf))
-    })?;
+    let vec = allocate_loop(|buf| listxattr_func(&*path, as_listxattr_buffer(buf)))?;
     Ok(XAttrs {
         data: vec.into_boxed_slice(),
         offset: 0,

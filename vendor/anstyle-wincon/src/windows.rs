@@ -8,20 +8,16 @@ type StdioColorInnerResult = Result<(anstyle::AnsiColor, anstyle::AnsiColor), in
 
 /// Cached [`get_colors`] call for [`std::io::stdout`]
 pub fn stdout_initial_colors() -> StdioColorResult {
-    static INITIAL: std::sync::OnceLock<StdioColorInnerResult> = std::sync::OnceLock::new();
-    INITIAL
-        .get_or_init(|| get_colors_(&std::io::stdout()))
-        .clone()
-        .map_err(Into::into)
+    static INITIAL: once_cell::sync::OnceCell<StdioColorInnerResult> =
+        once_cell::sync::OnceCell::new();
+    (*INITIAL.get_or_init(|| get_colors_(&std::io::stdout()))).map_err(Into::into)
 }
 
 /// Cached [`get_colors`] call for [`std::io::stderr`]
 pub fn stderr_initial_colors() -> StdioColorResult {
-    static INITIAL: std::sync::OnceLock<StdioColorInnerResult> = std::sync::OnceLock::new();
-    INITIAL
-        .get_or_init(|| get_colors_(&std::io::stderr()))
-        .clone()
-        .map_err(Into::into)
+    static INITIAL: once_cell::sync::OnceCell<StdioColorInnerResult> =
+        once_cell::sync::OnceCell::new();
+    (*INITIAL.get_or_init(|| get_colors_(&std::io::stderr()))).map_err(Into::into)
 }
 
 /// Apply colors to future writes
@@ -86,14 +82,15 @@ pub(crate) fn write_colored<S: AsHandle + std::io::Write>(
 }
 
 mod inner {
+    use std::os::windows::io::RawHandle;
+
+    use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::Console::CONSOLE_CHARACTER_ATTRIBUTES;
     use windows_sys::Win32::System::Console::CONSOLE_SCREEN_BUFFER_INFO;
     use windows_sys::Win32::System::Console::FOREGROUND_BLUE;
     use windows_sys::Win32::System::Console::FOREGROUND_GREEN;
     use windows_sys::Win32::System::Console::FOREGROUND_INTENSITY;
     use windows_sys::Win32::System::Console::FOREGROUND_RED;
-
-    use std::os::windows::io::RawHandle;
 
     const FOREGROUND_CYAN: CONSOLE_CHARACTER_ATTRIBUTES = FOREGROUND_BLUE | FOREGROUND_GREEN;
     const FOREGROUND_MAGENTA: CONSOLE_CHARACTER_ATTRIBUTES = FOREGROUND_BLUE | FOREGROUND_RED;
@@ -128,8 +125,8 @@ mod inner {
         handle: RawHandle,
     ) -> Result<CONSOLE_SCREEN_BUFFER_INFO, IoError> {
         unsafe {
-            let handle = std::mem::transmute(handle);
-            if handle == 0 {
+            let handle: HANDLE = handle as HANDLE;
+            if handle.is_null() {
                 return Err(IoError::BrokenPipe);
             }
 
@@ -149,8 +146,8 @@ mod inner {
         attributes: CONSOLE_CHARACTER_ATTRIBUTES,
     ) -> Result<(), IoError> {
         unsafe {
-            let handle = std::mem::transmute(handle);
-            if handle == 0 {
+            let handle: HANDLE = handle as HANDLE;
+            if handle.is_null() {
                 return Err(IoError::BrokenPipe);
             }
 
@@ -257,7 +254,7 @@ mod inner {
         for expected in COLORS {
             let nibble = to_nibble(expected);
             let actual = from_nibble(nibble);
-            assert_eq!(expected, actual, "Intermediate: {}", nibble);
+            assert_eq!(expected, actual, "Intermediate: {nibble}");
         }
     }
 }

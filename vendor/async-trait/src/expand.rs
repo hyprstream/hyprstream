@@ -12,7 +12,7 @@ use syn::visit_mut::{self, VisitMut};
 use syn::{
     parse_quote, parse_quote_spanned, Attribute, Block, FnArg, GenericArgument, GenericParam,
     Generics, Ident, ImplItem, Lifetime, LifetimeParam, Pat, PatIdent, PathArguments, Receiver,
-    ReturnType, Signature, Token, TraitItem, Type, TypePath, WhereClause,
+    ReturnType, Signature, Token, TraitItem, Type, TypeInfer, TypePath, WhereClause,
 };
 
 impl ToTokens for Item {
@@ -99,7 +99,7 @@ pub fn expand(input: &mut Item, is_local: bool) {
                     ImplItem::Fn(method) if method.sig.asyncness.is_some() => {
                         let sig = &mut method.sig;
                         let block = &mut method.block;
-                        let has_self = has_self_in_sig(sig) || has_self_in_block(block);
+                        let has_self = has_self_in_sig(sig);
                         transform_block(context, sig, block);
                         transform_sig(context, sig, has_self, false, is_local);
                         method.attrs.push(lint_suppress_with_body());
@@ -410,6 +410,8 @@ fn transform_block(context: Context, sig: &mut Signature, block: &mut Block) {
                     quote!(#(#decls)* { #(#stmts)* })
                 }
             } else {
+                let mut ret = ret.clone();
+                replace_impl_trait_with_infer(&mut ret);
                 quote! {
                     if let ::core::option::Option::Some(__ret) = ::core::option::Option::None::<#ret> {
                         #[allow(unreachable_code)]
@@ -474,4 +476,21 @@ fn where_clause_or_default(clause: &mut Option<WhereClause>) -> &mut WhereClause
         where_token: Default::default(),
         predicates: Punctuated::new(),
     })
+}
+
+fn replace_impl_trait_with_infer(ty: &mut Type) {
+    struct ReplaceImplTraitWithInfer;
+
+    impl VisitMut for ReplaceImplTraitWithInfer {
+        fn visit_type_mut(&mut self, ty: &mut Type) {
+            if let Type::ImplTrait(impl_trait) = ty {
+                *ty = Type::Infer(TypeInfer {
+                    underscore_token: Token![_](impl_trait.impl_token.span),
+                });
+            }
+            visit_mut::visit_type_mut(self, ty);
+        }
+    }
+
+    ReplaceImplTraitWithInfer.visit_type_mut(ty);
 }

@@ -1,7 +1,7 @@
 //! Basic types to build the parsers
 
 use crate::ascii::Caseless as AsciiCaseless;
-use crate::combinator::*;
+use crate::combinator::impls;
 #[cfg(feature = "unstable-recover")]
 #[cfg(feature = "std")]
 use crate::error::FromRecoverableError;
@@ -82,7 +82,18 @@ pub trait Parser<I, O, E> {
 
     /// Take tokens from the [`Stream`], turning it into the output
     ///
-    /// This includes advancing the [`Stream`] to the next location.
+    /// This returns a copy of the [`Stream`] advanced to the next location.
+    ///
+    /// <div class="warning">
+    ///
+    /// Generally, prefer [`Parser::parse_next`].
+    /// This is primarily intended for:
+    /// - Migrating from older versions / `nom`
+    /// - Testing [`Parser`]s
+    ///
+    /// For look-ahead parsing, see instead [`peek`][crate::combinator::peek].
+    ///
+    /// </div>
     #[inline(always)]
     fn parse_peek(&mut self, mut input: I) -> IResult<I, O, E> {
         match self.parse_next(&mut input) {
@@ -135,11 +146,11 @@ pub trait Parser<I, O, E> {
     /// }
     /// ```
     #[inline(always)]
-    fn by_ref(&mut self) -> ByRef<'_, Self>
+    fn by_ref(&mut self) -> impls::ByRef<'_, Self>
     where
         Self: core::marker::Sized,
     {
-        ByRef::new(self)
+        impls::ByRef { p: self }
     }
 
     /// Produce the provided value
@@ -159,12 +170,18 @@ pub trait Parser<I, O, E> {
     /// ```
     #[doc(alias = "to")]
     #[inline(always)]
-    fn value<O2>(self, val: O2) -> Value<Self, I, O, O2, E>
+    fn value<O2>(self, val: O2) -> impls::Value<Self, I, O, O2, E>
     where
         Self: core::marker::Sized,
         O2: Clone,
     {
-        Value::new(self, val)
+        impls::Value {
+            parser: self,
+            val,
+            i: Default::default(),
+            o: Default::default(),
+            e: Default::default(),
+        }
     }
 
     /// Produce a type's default value
@@ -183,12 +200,18 @@ pub trait Parser<I, O, E> {
     /// # }
     /// ```
     #[inline(always)]
-    fn default_value<O2>(self) -> DefaultValue<Self, I, O, O2, E>
+    fn default_value<O2>(self) -> impls::DefaultValue<Self, I, O, O2, E>
     where
         Self: core::marker::Sized,
         O2: core::default::Default,
     {
-        DefaultValue::new(self)
+        impls::DefaultValue {
+            parser: self,
+            o2: Default::default(),
+            i: Default::default(),
+            o: Default::default(),
+            e: Default::default(),
+        }
     }
 
     /// Discards the output of the `Parser`
@@ -207,11 +230,16 @@ pub trait Parser<I, O, E> {
     /// # }
     /// ```
     #[inline(always)]
-    fn void(self) -> Void<Self, I, O, E>
+    fn void(self) -> impls::Void<Self, I, O, E>
     where
         Self: core::marker::Sized,
     {
-        Void::new(self)
+        impls::Void {
+            parser: self,
+            i: Default::default(),
+            o: Default::default(),
+            e: Default::default(),
+        }
     }
 
     /// Convert the parser's output to another type using [`std::convert::From`]
@@ -236,12 +264,18 @@ pub trait Parser<I, O, E> {
     /// # }
     /// ```
     #[inline(always)]
-    fn output_into<O2>(self) -> OutputInto<Self, I, O, O2, E>
+    fn output_into<O2>(self) -> impls::OutputInto<Self, I, O, O2, E>
     where
         Self: core::marker::Sized,
         O: Into<O2>,
     {
-        OutputInto::new(self)
+        impls::OutputInto {
+            parser: self,
+            i: Default::default(),
+            o: Default::default(),
+            o2: Default::default(),
+            e: Default::default(),
+        }
     }
 
     /// Produce the consumed input as produced value.
@@ -263,23 +297,33 @@ pub trait Parser<I, O, E> {
     #[doc(alias = "concat")]
     #[doc(alias = "recognize")]
     #[inline(always)]
-    fn take(self) -> Take<Self, I, O, E>
+    fn take(self) -> impls::Take<Self, I, O, E>
     where
         Self: core::marker::Sized,
         I: Stream,
     {
-        Take::new(self)
+        impls::Take {
+            parser: self,
+            i: Default::default(),
+            o: Default::default(),
+            e: Default::default(),
+        }
     }
 
     /// Replaced with [`Parser::take`]
     #[inline(always)]
     #[deprecated(since = "0.6.14", note = "Replaced with `Parser::take`")]
-    fn recognize(self) -> Take<Self, I, O, E>
+    fn recognize(self) -> impls::Take<Self, I, O, E>
     where
         Self: core::marker::Sized,
         I: Stream,
     {
-        Take::new(self)
+        impls::Take {
+            parser: self,
+            i: Default::default(),
+            o: Default::default(),
+            e: Default::default(),
+        }
     }
 
     /// Produce the consumed input with the output
@@ -321,23 +365,33 @@ pub trait Parser<I, O, E> {
     #[doc(alias = "consumed")]
     #[doc(alias = "with_recognized")]
     #[inline(always)]
-    fn with_taken(self) -> WithTaken<Self, I, O, E>
+    fn with_taken(self) -> impls::WithTaken<Self, I, O, E>
     where
         Self: core::marker::Sized,
         I: Stream,
     {
-        WithTaken::new(self)
+        impls::WithTaken {
+            parser: self,
+            i: Default::default(),
+            o: Default::default(),
+            e: Default::default(),
+        }
     }
 
     /// Replaced with [`Parser::with_taken`]
     #[inline(always)]
     #[deprecated(since = "0.6.14", note = "Replaced with `Parser::with_taken`")]
-    fn with_recognized(self) -> WithTaken<Self, I, O, E>
+    fn with_recognized(self) -> impls::WithTaken<Self, I, O, E>
     where
         Self: core::marker::Sized,
         I: Stream,
     {
-        WithTaken::new(self)
+        impls::WithTaken {
+            parser: self,
+            i: Default::default(),
+            o: Default::default(),
+            e: Default::default(),
+        }
     }
 
     /// Produce the location of the consumed input as produced value.
@@ -347,22 +401,27 @@ pub trait Parser<I, O, E> {
     /// ```rust
     /// # use winnow::prelude::*;
     /// # use winnow::{error::ErrMode,error::ErrorKind, error::InputError, stream::Stream};
-    /// use winnow::stream::Located;
+    /// use winnow::stream::LocatingSlice;
     /// use winnow::ascii::alpha1;
     /// use winnow::combinator::separated_pair;
     ///
     /// let mut parser = separated_pair(alpha1.span(), ',', alpha1.span());
     ///
-    /// assert_eq!(parser.parse(Located::new("abcd,efgh")), Ok((0..4, 5..9)));
-    /// assert_eq!(parser.parse_peek(Located::new("abcd;")),Err(ErrMode::Backtrack(InputError::new(Located::new("abcd;").peek_slice(4).0, ErrorKind::Tag))));
+    /// assert_eq!(parser.parse(LocatingSlice::new("abcd,efgh")), Ok((0..4, 5..9)));
+    /// assert_eq!(parser.parse_peek(LocatingSlice::new("abcd;")),Err(ErrMode::Backtrack(InputError::new(LocatingSlice::new("abcd;").peek_slice(4).0, ErrorKind::Tag))));
     /// ```
     #[inline(always)]
-    fn span(self) -> Span<Self, I, O, E>
+    fn span(self) -> impls::Span<Self, I, O, E>
     where
         Self: core::marker::Sized,
         I: Stream + Location,
     {
-        Span::new(self)
+        impls::Span {
+            parser: self,
+            i: Default::default(),
+            o: Default::default(),
+            e: Default::default(),
+        }
     }
 
     /// Produce the location of consumed input with the output
@@ -380,12 +439,12 @@ pub trait Parser<I, O, E> {
     /// ```rust
     /// # use winnow::prelude::*;
     /// # use winnow::{error::ErrMode,error::ErrorKind, error::InputError, stream::Stream};
-    /// use winnow::stream::Located;
+    /// use winnow::stream::LocatingSlice;
     /// use winnow::ascii::alpha1;
     /// use winnow::token::literal;
     /// use winnow::combinator::separated_pair;
     ///
-    /// fn inner_parser<'s>(input: &mut Located<&'s str>) -> PResult<bool, InputError<Located<&'s str>>> {
+    /// fn inner_parser<'s>(input: &mut LocatingSlice<&'s str>) -> PResult<bool, InputError<LocatingSlice<&'s str>>> {
     ///     "1234".value(true).parse_next(input)
     /// }
     ///
@@ -393,25 +452,30 @@ pub trait Parser<I, O, E> {
     ///
     /// let mut consumed_parser = separated_pair(alpha1.value(1).with_span(), ',', alpha1.value(2).with_span());
     ///
-    /// assert_eq!(consumed_parser.parse(Located::new("abcd,efgh")), Ok(((1, 0..4), (2, 5..9))));
-    /// assert_eq!(consumed_parser.parse_peek(Located::new("abcd;")),Err(ErrMode::Backtrack(InputError::new(Located::new("abcd;").peek_slice(4).0, ErrorKind::Tag))));
+    /// assert_eq!(consumed_parser.parse(LocatingSlice::new("abcd,efgh")), Ok(((1, 0..4), (2, 5..9))));
+    /// assert_eq!(consumed_parser.parse_peek(LocatingSlice::new("abcd;")),Err(ErrMode::Backtrack(InputError::new(LocatingSlice::new("abcd;").peek_slice(4).0, ErrorKind::Tag))));
     ///
     /// // the second output (representing the consumed input)
     /// // should be the same as that of the `span` parser.
     /// let mut span_parser = inner_parser.span();
     /// let mut consumed_parser = inner_parser.with_span().map(|(output, consumed)| consumed);
     ///
-    /// assert_eq!(span_parser.parse_peek(Located::new("1234")), consumed_parser.parse_peek(Located::new("1234")));
-    /// assert_eq!(span_parser.parse_peek(Located::new("abcd")), consumed_parser.parse_peek(Located::new("abcd")));
+    /// assert_eq!(span_parser.parse_peek(LocatingSlice::new("1234")), consumed_parser.parse_peek(LocatingSlice::new("1234")));
+    /// assert_eq!(span_parser.parse_peek(LocatingSlice::new("abcd")), consumed_parser.parse_peek(LocatingSlice::new("abcd")));
     /// # }
     /// ```
     #[inline(always)]
-    fn with_span(self) -> WithSpan<Self, I, O, E>
+    fn with_span(self) -> impls::WithSpan<Self, I, O, E>
     where
         Self: core::marker::Sized,
         I: Stream + Location,
     {
-        WithSpan::new(self)
+        impls::WithSpan {
+            parser: self,
+            i: Default::default(),
+            o: Default::default(),
+            e: Default::default(),
+        }
     }
 
     /// Maps a function over the output of a parser
@@ -433,12 +497,19 @@ pub trait Parser<I, O, E> {
     /// # }
     /// ```
     #[inline(always)]
-    fn map<G, O2>(self, map: G) -> Map<Self, G, I, O, O2, E>
+    fn map<G, O2>(self, map: G) -> impls::Map<Self, G, I, O, O2, E>
     where
         G: FnMut(O) -> O2,
         Self: core::marker::Sized,
     {
-        Map::new(self, map)
+        impls::Map {
+            parser: self,
+            map,
+            i: Default::default(),
+            o: Default::default(),
+            o2: Default::default(),
+            e: Default::default(),
+        }
     }
 
     /// Applies a function returning a `Result` over the output of a parser.
@@ -463,14 +534,22 @@ pub trait Parser<I, O, E> {
     /// # }
     /// ```
     #[inline(always)]
-    fn try_map<G, O2, E2>(self, map: G) -> TryMap<Self, G, I, O, O2, E, E2>
+    fn try_map<G, O2, E2>(self, map: G) -> impls::TryMap<Self, G, I, O, O2, E, E2>
     where
         Self: core::marker::Sized,
         G: FnMut(O) -> Result<O2, E2>,
         I: Stream,
         E: FromExternalError<I, E2>,
     {
-        TryMap::new(self, map)
+        impls::TryMap {
+            parser: self,
+            map,
+            i: Default::default(),
+            o: Default::default(),
+            o2: Default::default(),
+            e: Default::default(),
+            e2: Default::default(),
+        }
     }
 
     /// Apply both [`Parser::verify`] and [`Parser::map`].
@@ -498,14 +577,21 @@ pub trait Parser<I, O, E> {
     #[doc(alias = "filter_map")]
     #[doc(alias = "map_opt")]
     #[inline(always)]
-    fn verify_map<G, O2>(self, map: G) -> VerifyMap<Self, G, I, O, O2, E>
+    fn verify_map<G, O2>(self, map: G) -> impls::VerifyMap<Self, G, I, O, O2, E>
     where
         Self: core::marker::Sized,
         G: FnMut(O) -> Option<O2>,
         I: Stream,
         E: ParserError<I>,
     {
-        VerifyMap::new(self, map)
+        impls::VerifyMap {
+            parser: self,
+            map,
+            i: Default::default(),
+            o: Default::default(),
+            o2: Default::default(),
+            e: Default::default(),
+        }
     }
 
     /// Creates a parser from the output of this one
@@ -541,13 +627,21 @@ pub trait Parser<I, O, E> {
     /// assert_eq!(length_take.parse_peek(&[4, 0, 1, 2][..]), Err(ErrMode::Backtrack(InputError::new(&[0, 1, 2][..], ErrorKind::Slice))));
     /// ```
     #[inline(always)]
-    fn flat_map<G, H, O2>(self, map: G) -> FlatMap<Self, G, H, I, O, O2, E>
+    fn flat_map<G, H, O2>(self, map: G) -> impls::FlatMap<Self, G, H, I, O, O2, E>
     where
         Self: core::marker::Sized,
         G: FnMut(O) -> H,
         H: Parser<I, O2, E>,
     {
-        FlatMap::new(self, map)
+        impls::FlatMap {
+            f: self,
+            g: map,
+            h: Default::default(),
+            i: Default::default(),
+            o: Default::default(),
+            o2: Default::default(),
+            e: Default::default(),
+        }
     }
 
     /// Applies a second parser over the output of the first one
@@ -568,14 +662,21 @@ pub trait Parser<I, O, E> {
     /// # }
     /// ```
     #[inline(always)]
-    fn and_then<G, O2>(self, inner: G) -> AndThen<Self, G, I, O, O2, E>
+    fn and_then<G, O2>(self, inner: G) -> impls::AndThen<Self, G, I, O, O2, E>
     where
         Self: core::marker::Sized,
         G: Parser<O, O2, E>,
         O: StreamIsPartial,
         I: Stream,
     {
-        AndThen::new(self, inner)
+        impls::AndThen {
+            outer: self,
+            inner,
+            i: Default::default(),
+            o: Default::default(),
+            o2: Default::default(),
+            e: Default::default(),
+        }
     }
 
     /// Apply [`std::str::FromStr`] to the output of the parser
@@ -599,14 +700,20 @@ pub trait Parser<I, O, E> {
     /// ```
     #[doc(alias = "from_str")]
     #[inline(always)]
-    fn parse_to<O2>(self) -> ParseTo<Self, I, O, O2, E>
+    fn parse_to<O2>(self) -> impls::ParseTo<Self, I, O, O2, E>
     where
         Self: core::marker::Sized,
         I: Stream,
         O: ParseSlice<O2>,
         E: ParserError<I>,
     {
-        ParseTo::new(self)
+        impls::ParseTo {
+            p: self,
+            i: Default::default(),
+            o: Default::default(),
+            o2: Default::default(),
+            e: Default::default(),
+        }
     }
 
     /// Returns the output of the child parser if it satisfies a verification function.
@@ -631,7 +738,7 @@ pub trait Parser<I, O, E> {
     #[doc(alias = "satisfy")]
     #[doc(alias = "filter")]
     #[inline(always)]
-    fn verify<G, O2>(self, filter: G) -> Verify<Self, G, I, O, O2, E>
+    fn verify<G, O2>(self, filter: G) -> impls::Verify<Self, G, I, O, O2, E>
     where
         Self: core::marker::Sized,
         G: FnMut(&O2) -> bool,
@@ -640,7 +747,14 @@ pub trait Parser<I, O, E> {
         O2: ?Sized,
         E: ParserError<I>,
     {
-        Verify::new(self, filter)
+        impls::Verify {
+            parser: self,
+            filter,
+            i: Default::default(),
+            o: Default::default(),
+            o2: Default::default(),
+            e: Default::default(),
+        }
     }
 
     /// If parsing fails, add context to the error
@@ -649,14 +763,20 @@ pub trait Parser<I, O, E> {
     /// to errors when backtracking through a parse tree.
     #[doc(alias = "labelled")]
     #[inline(always)]
-    fn context<C>(self, context: C) -> Context<Self, I, O, E, C>
+    fn context<C>(self, context: C) -> impls::Context<Self, I, O, E, C>
     where
         Self: core::marker::Sized,
         I: Stream,
         E: AddContext<I, C>,
         C: Clone + crate::lib::std::fmt::Debug,
     {
-        Context::new(self, context)
+        impls::Context {
+            parser: self,
+            context,
+            i: Default::default(),
+            o: Default::default(),
+            e: Default::default(),
+        }
     }
 
     /// Transforms [`Incomplete`][crate::error::ErrMode::Incomplete] into [`Backtrack`][crate::error::ErrMode::Backtrack]
@@ -675,21 +795,27 @@ pub trait Parser<I, O, E> {
     /// # }
     /// ```
     #[inline(always)]
-    fn complete_err(self) -> CompleteErr<Self>
+    fn complete_err(self) -> impls::CompleteErr<Self>
     where
         Self: core::marker::Sized,
     {
-        CompleteErr::new(self)
+        impls::CompleteErr { f: self }
     }
 
     /// Convert the parser's error to another type using [`std::convert::From`]
     #[inline(always)]
-    fn err_into<E2>(self) -> ErrInto<Self, I, O, E, E2>
+    fn err_into<E2>(self) -> impls::ErrInto<Self, I, O, E, E2>
     where
         Self: core::marker::Sized,
         E: Into<E2>,
     {
-        ErrInto::new(self)
+        impls::ErrInto {
+            parser: self,
+            i: Default::default(),
+            o: Default::default(),
+            e: Default::default(),
+            e2: Default::default(),
+        }
     }
 
     /// Recover from an error by skipping everything `recover` consumes and trying again
@@ -702,7 +828,7 @@ pub trait Parser<I, O, E> {
     #[inline(always)]
     #[cfg(feature = "unstable-recover")]
     #[cfg(feature = "std")]
-    fn retry_after<R>(self, recover: R) -> RetryAfter<Self, R, I, O, E>
+    fn retry_after<R>(self, recover: R) -> impls::RetryAfter<Self, R, I, O, E>
     where
         Self: core::marker::Sized,
         R: Parser<I, (), E>,
@@ -710,7 +836,13 @@ pub trait Parser<I, O, E> {
         I: Recover<E>,
         E: FromRecoverableError<I, E>,
     {
-        RetryAfter::new(self, recover)
+        impls::RetryAfter {
+            parser: self,
+            recover,
+            i: Default::default(),
+            o: Default::default(),
+            e: Default::default(),
+        }
     }
 
     /// Recover from an error by skipping this parse and everything `recover` consumes
@@ -720,7 +852,7 @@ pub trait Parser<I, O, E> {
     #[inline(always)]
     #[cfg(feature = "unstable-recover")]
     #[cfg(feature = "std")]
-    fn resume_after<R>(self, recover: R) -> ResumeAfter<Self, R, I, O, E>
+    fn resume_after<R>(self, recover: R) -> impls::ResumeAfter<Self, R, I, O, E>
     where
         Self: core::marker::Sized,
         R: Parser<I, (), E>,
@@ -728,13 +860,19 @@ pub trait Parser<I, O, E> {
         I: Recover<E>,
         E: FromRecoverableError<I, E>,
     {
-        ResumeAfter::new(self, recover)
+        impls::ResumeAfter {
+            parser: self,
+            recover,
+            i: Default::default(),
+            o: Default::default(),
+            e: Default::default(),
+        }
     }
 }
 
-impl<'a, I, O, E, F> Parser<I, O, E> for F
+impl<I, O, E, F> Parser<I, O, E> for F
 where
-    F: FnMut(&mut I) -> PResult<O, E> + 'a,
+    F: FnMut(&mut I) -> PResult<O, E>,
     I: Stream,
 {
     #[inline(always)]
@@ -1051,7 +1189,6 @@ where
     E: ParserError<Recoverable<I, R>>,
     E: crate::lib::std::fmt::Debug,
 {
-    #[inline]
     fn recoverable_parse(&mut self, input: I) -> (I, Option<O>, Vec<R>) {
         debug_assert!(
             !I::is_partial_supported(),
@@ -1063,7 +1200,7 @@ where
         let start_token = input.checkpoint();
         let result = (
             self.by_ref(),
-            crate::combinator::eof.resume_after(rest.void()),
+            crate::combinator::eof.resume_after(crate::token::rest.void()),
         )
             .parse_next(&mut input);
 
@@ -1117,15 +1254,16 @@ impl_parser_for_tuples!(
 use crate::lib::std::boxed::Box;
 
 #[cfg(feature = "alloc")]
-impl<'a, I, O, E> Parser<I, O, E> for Box<dyn Parser<I, O, E> + 'a> {
+impl<I, O, E> Parser<I, O, E> for Box<dyn Parser<I, O, E> + '_> {
     #[inline(always)]
     fn parse_next(&mut self, i: &mut I) -> PResult<O, E> {
         (**self).parse_next(i)
     }
 }
 
-/// Convert a [`Parser::parse_peek`] style parse function to be a [`Parser`]
+/// Deprecated
 #[inline(always)]
+#[deprecated(since = "0.6.23")]
 pub fn unpeek<'a, I, O, E>(
     mut peek: impl FnMut(I) -> IResult<I, O, E> + 'a,
 ) -> impl FnMut(&mut I) -> PResult<O, E>

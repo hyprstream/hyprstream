@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.57"
 name = "js-sys"
-version = "0.3.76"
+version = "0.3.77"
 authors = ["The wasm-bindgen Developers"]
 build = false
 include = [
@@ -47,7 +47,7 @@ version = "1.12"
 default-features = false
 
 [dependencies.wasm-bindgen]
-version = "=0.2.99"
+version = "=0.2.100"
 default-features = false
 
 [features]

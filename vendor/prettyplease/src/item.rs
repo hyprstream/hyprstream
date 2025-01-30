@@ -1,5 +1,7 @@
 use crate::algorithm::Printer;
+use crate::fixup::FixupContext;
 use crate::iter::IterDelimited;
+use crate::mac;
 use crate::path::PathKind;
 use crate::INDENT;
 use proc_macro2::TokenStream;
@@ -47,7 +49,7 @@ impl Printer {
         self.ty(&item.ty);
         self.word(" = ");
         self.neverbreak();
-        self.expr(&item.expr);
+        self.expr(&item.expr, FixupContext::NONE);
         self.word(";");
         self.end();
         self.hardbreak();
@@ -100,8 +102,8 @@ impl Printer {
         self.word("{");
         self.hardbreak_if_nonempty();
         self.inner_attrs(&item.attrs);
-        for stmt in &item.block.stmts {
-            self.stmt(stmt);
+        for stmt in item.block.stmts.iter().delimited() {
+            self.stmt(&stmt, stmt.is_last);
         }
         self.offset(-INDENT);
         self.end();
@@ -168,7 +170,7 @@ impl Printer {
 
     fn item_macro(&mut self, item: &ItemMacro) {
         self.outer_attrs(&item.attrs);
-        let semicolon = true;
+        let semicolon = mac::requires_semi(&item.mac.delimiter);
         self.mac(&item.mac, item.ident.as_ref(), semicolon);
         self.hardbreak();
     }
@@ -210,7 +212,7 @@ impl Printer {
         self.ty(&item.ty);
         self.word(" = ");
         self.neverbreak();
-        self.expr(&item.expr);
+        self.expr(&item.expr, FixupContext::NONE);
         self.word(";");
         self.end();
         self.hardbreak();
@@ -836,7 +838,7 @@ impl Printer {
 
     fn foreign_item_macro(&mut self, foreign_item: &ForeignItemMacro) {
         self.outer_attrs(&foreign_item.attrs);
-        let semicolon = true;
+        let semicolon = mac::requires_semi(&foreign_item.mac.delimiter);
         self.mac(&foreign_item.mac, None, semicolon);
         self.hardbreak();
     }
@@ -961,7 +963,7 @@ impl Printer {
         if let Some((_eq_token, default)) = &trait_item.default {
             self.word(" = ");
             self.neverbreak();
-            self.expr(default);
+            self.expr(default, FixupContext::NONE);
         }
         self.word(";");
         self.end();
@@ -981,8 +983,8 @@ impl Printer {
             self.word("{");
             self.hardbreak_if_nonempty();
             self.inner_attrs(&trait_item.attrs);
-            for stmt in &block.stmts {
-                self.stmt(stmt);
+            for stmt in block.stmts.iter().delimited() {
+                self.stmt(&stmt, stmt.is_last);
             }
             self.offset(-INDENT);
             self.end();
@@ -1023,7 +1025,7 @@ impl Printer {
 
     fn trait_item_macro(&mut self, trait_item: &TraitItemMacro) {
         self.outer_attrs(&trait_item.attrs);
-        let semicolon = true;
+        let semicolon = mac::requires_semi(&trait_item.mac.delimiter);
         self.mac(&trait_item.mac, None, semicolon);
         self.hardbreak();
     }
@@ -1158,7 +1160,7 @@ impl Printer {
         self.ty(&impl_item.ty);
         self.word(" = ");
         self.neverbreak();
-        self.expr(&impl_item.expr);
+        self.expr(&impl_item.expr, FixupContext::NONE);
         self.word(";");
         self.end();
         self.hardbreak();
@@ -1180,8 +1182,8 @@ impl Printer {
         self.word("{");
         self.hardbreak_if_nonempty();
         self.inner_attrs(&impl_item.attrs);
-        for stmt in &impl_item.block.stmts {
-            self.stmt(stmt);
+        for stmt in impl_item.block.stmts.iter().delimited() {
+            self.stmt(&stmt, stmt.is_last);
         }
         self.offset(-INDENT);
         self.end();
@@ -1211,7 +1213,7 @@ impl Printer {
 
     fn impl_item_macro(&mut self, impl_item: &ImplItemMacro) {
         self.outer_attrs(&impl_item.attrs);
-        let semicolon = true;
+        let semicolon = mac::requires_semi(&impl_item.mac.delimiter);
         self.mac(&impl_item.mac, None, semicolon);
         self.hardbreak();
     }
@@ -1421,6 +1423,7 @@ impl Printer {
 #[cfg(feature = "verbatim")]
 mod verbatim {
     use crate::algorithm::Printer;
+    use crate::fixup::FixupContext;
     use crate::iter::IterDelimited;
     use crate::INDENT;
     use syn::ext::IdentExt;
@@ -1707,7 +1710,7 @@ mod verbatim {
                 self.word(" = ");
                 self.neverbreak();
                 self.ibox(-INDENT);
-                self.expr(value);
+                self.expr(value, FixupContext::NONE);
                 self.end();
             }
             self.where_clause_oneline_semi(&item.generics.where_clause);
@@ -1728,8 +1731,8 @@ mod verbatim {
                 self.word("{");
                 self.hardbreak_if_nonempty();
                 self.inner_attrs(&item.attrs);
-                for stmt in body {
-                    self.stmt(stmt);
+                for stmt in body.iter().delimited() {
+                    self.stmt(&stmt, stmt.is_last);
                 }
                 self.offset(-INDENT);
                 self.end();
@@ -1756,7 +1759,7 @@ mod verbatim {
             if let Some(expr) = &item.expr {
                 self.word(" = ");
                 self.neverbreak();
-                self.expr(expr);
+                self.expr(expr, FixupContext::NONE);
             }
             self.word(";");
             self.end();

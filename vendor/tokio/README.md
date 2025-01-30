@@ -56,7 +56,7 @@ Make sure you activated the full features of the tokio crate on Cargo.toml:
 
 ```toml
 [dependencies]
-tokio = { version = "1.42.0", features = ["full"] }
+tokio = { version = "1.43.0", features = ["full"] }
 ```
 Then, on your main.rs:
 
@@ -78,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 let n = match socket.read(&mut buf).await {
                     // socket closed
-                    Ok(n) if n == 0 => return,
+                    Ok(0) => return,
                     Ok(n) => n,
                     Err(e) => {
                         eprintln!("failed to read from socket; err = {:?}", e);

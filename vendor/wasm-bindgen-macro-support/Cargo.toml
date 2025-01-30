@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.57"
 name = "wasm-bindgen-macro-support"
-version = "0.2.99"
+version = "0.2.100"
 authors = ["The wasm-bindgen Developers"]
 build = false
 include = [
@@ -53,17 +53,13 @@ features = [
 ]
 
 [dependencies.wasm-bindgen-backend]
-version = "=0.2.99"
-default-features = false
+version = "=0.2.100"
 
 [dependencies.wasm-bindgen-shared]
-version = "=0.2.99"
+version = "=0.2.100"
 
 [features]
-default = ["std"]
 extra-traits = ["syn/extra-traits"]
-spans = ["wasm-bindgen-backend/spans"]
-std = ["wasm-bindgen-backend/std"]
 strict-macro = []
 
 [lints.clippy]

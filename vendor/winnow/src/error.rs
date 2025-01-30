@@ -30,6 +30,18 @@ use crate::stream::Stream;
 #[allow(unused_imports)] // Here for intra-doc links
 use crate::Parser;
 
+/// For use with [`Parser::parse_next`]
+///
+/// - `Ok(O)` is the parsed value
+/// - [`Err(ErrMode<E>)`][ErrMode] is the error along with how to respond to it
+///
+/// By default, the error type (`E`) is [`ContextError`].
+///
+/// When integrating into the result of the application, see
+/// - [`Parser::parse`]
+/// - [`ErrMode::into_inner`]
+pub type PResult<O, E = ContextError> = Result<O, ErrMode<E>>;
+
 /// For use with [`Parser::parse_peek`] which allows the input stream to be threaded through a
 /// parser.
 ///
@@ -43,22 +55,14 @@ use crate::Parser;
 /// - [`ErrMode::into_inner`]
 pub type IResult<I, O, E = InputError<I>> = PResult<(I, O), E>;
 
-/// For use with [`Parser::parse_next`]
-///
-/// - `Ok(O)` is the parsed value
-/// - [`Err(ErrMode<E>)`][ErrMode] is the error along with how to respond to it
-///
-/// By default, the error type (`E`) is [`ContextError`].
-///
-/// When integrating into the result of the application, see
-/// - [`Parser::parse`]
-/// - [`ErrMode::into_inner`]
-pub type PResult<O, E = ContextError> = Result<O, ErrMode<E>>;
-
 /// Contains information on needed data if a parser returned `Incomplete`
+///
+/// <div class="warning">
 ///
 /// **Note:** This is only possible for `Stream` that are [partial][`crate::stream::StreamIsPartial`],
 /// like [`Partial`][crate::Partial].
+///
+/// </div>
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Needed {
     /// Needs more data, but we do not know how much
@@ -168,7 +172,6 @@ impl<E> ErrMode<E> {
     /// Unwrap the mode, returning the underlying error
     ///
     /// Returns `None` for [`ErrMode::Incomplete`]
-    #[cfg_attr(debug_assertions, track_caller)]
     #[inline(always)]
     pub fn into_inner(self) -> Option<E> {
         match self {
@@ -273,6 +276,7 @@ pub trait ParserError<I: Stream>: Sized {
 
     /// Process a parser assertion
     #[cfg_attr(debug_assertions, track_caller)]
+    #[inline(always)]
     fn assert(input: &I, _message: &'static str) -> Self
     where
         I: crate::lib::std::fmt::Debug,
@@ -350,8 +354,12 @@ pub trait ErrorConvert<E> {
 /// This is useful for testing of generic parsers to ensure the error happens at the right
 /// location.
 ///
+/// <div class="warning">
+///
 /// **Note:** [context][Parser::context] and inner errors (like from [`Parser::try_map`]) will be
 /// dropped.
+///
+/// </div>
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct InputError<I: Clone> {
     /// The input stream, pointing to the location where the error occurred
@@ -378,7 +386,7 @@ impl<I: Clone> InputError<I> {
 }
 
 #[cfg(feature = "alloc")]
-impl<'i, I: ToOwned> InputError<&'i I>
+impl<I: ToOwned> InputError<&I>
 where
     <I as ToOwned>::Owned: Clone,
 {
@@ -1184,8 +1192,12 @@ impl<I, E> ParseError<I, E> {
 
     /// The location in [`ParseError::input`] where parsing failed
     ///
+    /// <div class="warning">
+    ///
     /// **Note:** This is an offset, not an index, and may point to the end of input
     /// (`input.len()`) on eof errors.
+    ///
+    /// </div>
     #[inline]
     pub fn offset(&self) -> usize {
         self.offset

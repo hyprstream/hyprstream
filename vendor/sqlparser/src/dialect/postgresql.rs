@@ -28,7 +28,7 @@
 // limitations under the License.
 use log::debug;
 
-use crate::ast::{CommentObject, ObjectName, Statement, UserDefinedTypeRepresentation};
+use crate::ast::{ObjectName, Statement, UserDefinedTypeRepresentation};
 use crate::dialect::{Dialect, Precedence};
 use crate::keywords::Keyword;
 use crate::parser::{Parser, ParserError};
@@ -136,9 +136,7 @@ impl Dialect for PostgreSqlDialect {
     }
 
     fn parse_statement(&self, parser: &mut Parser) -> Option<Result<Statement, ParserError>> {
-        if parser.parse_keyword(Keyword::COMMENT) {
-            Some(parse_comment(parser))
-        } else if parser.parse_keyword(Keyword::CREATE) {
+        if parser.parse_keyword(Keyword::CREATE) {
             parser.prev_token(); // unconsume the CREATE in case we don't end up parsing anything
             parse_create(parser)
         } else {
@@ -193,50 +191,46 @@ impl Dialect for PostgreSqlDialect {
     }
 
     /// see <https://www.postgresql.org/docs/current/sql-listen.html>
-    fn supports_listen(&self) -> bool {
-        true
-    }
-
+    /// see <https://www.postgresql.org/docs/current/sql-unlisten.html>
     /// see <https://www.postgresql.org/docs/current/sql-notify.html>
-    fn supports_notify(&self) -> bool {
+    fn supports_listen_notify(&self) -> bool {
         true
     }
-}
 
-pub fn parse_comment(parser: &mut Parser) -> Result<Statement, ParserError> {
-    let if_exists = parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
+    /// see <https://www.postgresql.org/docs/13/functions-math.html>
+    fn supports_factorial_operator(&self) -> bool {
+        true
+    }
 
-    parser.expect_keyword(Keyword::ON)?;
-    let token = parser.next_token();
+    /// see <https://www.postgresql.org/docs/current/sql-comment.html>
+    fn supports_comment_on(&self) -> bool {
+        true
+    }
 
-    let (object_type, object_name) = match token.token {
-        Token::Word(w) if w.keyword == Keyword::COLUMN => {
-            let object_name = parser.parse_object_name(false)?;
-            (CommentObject::Column, object_name)
-        }
-        Token::Word(w) if w.keyword == Keyword::TABLE => {
-            let object_name = parser.parse_object_name(false)?;
-            (CommentObject::Table, object_name)
-        }
-        Token::Word(w) if w.keyword == Keyword::EXTENSION => {
-            let object_name = parser.parse_object_name(false)?;
-            (CommentObject::Extension, object_name)
-        }
-        _ => parser.expected("comment object_type", token)?,
-    };
+    /// See <https://www.postgresql.org/docs/current/sql-load.html>
+    fn supports_load_extension(&self) -> bool {
+        true
+    }
 
-    parser.expect_keyword(Keyword::IS)?;
-    let comment = if parser.parse_keyword(Keyword::NULL) {
-        None
-    } else {
-        Some(parser.parse_literal_string()?)
-    };
-    Ok(Statement::Comment {
-        object_type,
-        object_name,
-        comment,
-        if_exists,
-    })
+    /// See <https://www.postgresql.org/docs/current/functions-json.html>
+    ///
+    /// Required to support the colon in:
+    /// ```sql
+    /// SELECT json_object('a': 'b')
+    /// ```
+    fn supports_named_fn_args_with_colon_operator(&self) -> bool {
+        true
+    }
+
+    /// See <https://www.postgresql.org/docs/current/functions-json.html>
+    ///
+    /// Required to support the label in:
+    /// ```sql
+    /// SELECT json_object('label': 'value')
+    /// ```
+    fn supports_named_fn_args_with_expr_name(&self) -> bool {
+        true
+    }
 }
 
 pub fn parse_create(parser: &mut Parser) -> Option<Result<Statement, ParserError>> {

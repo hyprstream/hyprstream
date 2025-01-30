@@ -12,13 +12,19 @@
 [package]
 edition = "2018"
 name = "utf8parse"
-version = "0.2.1"
+version = "0.2.2"
 authors = [
     "Joe Wilm <joe@jwilm.com>",
     "Christian Duerr <contact@christianduerr.com>",
 ]
+build = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
 description = "Table-driven UTF-8 parser"
 documentation = "https://docs.rs/utf8parse/"
+readme = false
 keywords = [
     "utf8",
     "parse",
@@ -31,6 +37,14 @@ categories = [
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/alacritty/vte"
 resolver = "2"
+
+[lib]
+name = "utf8parse"
+path = "src/lib.rs"
+
+[[test]]
+name = "utf-8-demo"
+path = "tests/utf-8-demo.rs"
 
 [features]
 default = []

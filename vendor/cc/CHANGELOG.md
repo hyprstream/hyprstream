@@ -6,6 +6,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.10](https://github.com/rust-lang/cc-rs/compare/cc-v1.2.9...cc-v1.2.10) - 2025-01-17
+
+### Other
+
+- Fix CC_FORCE_DISABLE=0 evaluating to true ([#1371](https://github.com/rust-lang/cc-rs/pull/1371))
+- Regenerate target info ([#1369](https://github.com/rust-lang/cc-rs/pull/1369))
+- Make hidden lifetimes explicit. ([#1366](https://github.com/rust-lang/cc-rs/pull/1366))
+
+## [1.2.9](https://github.com/rust-lang/cc-rs/compare/cc-v1.2.8...cc-v1.2.9) - 2025-01-12
+
+### Other
+
+- Don't pass inherited PGO flags to GNU compilers (#1363)
+- Adjusted zig cc judgment and avoided zigbuild errors([#1360](https://github.com/rust-lang/cc-rs/pull/1360)) ([#1361](https://github.com/rust-lang/cc-rs/pull/1361))
+- Fix compilation on macOS using clang and fix compilation using zig-cc ([#1364](https://github.com/rust-lang/cc-rs/pull/1364))
+
+## [1.2.8](https://github.com/rust-lang/cc-rs/compare/cc-v1.2.7...cc-v1.2.8) - 2025-01-11
+
+### Other
+
+- Add `is_like_clang_cl()` getter (#1357)
+- Fix clippy error in lib.rs ([#1356](https://github.com/rust-lang/cc-rs/pull/1356))
+- Regenerate target info ([#1352](https://github.com/rust-lang/cc-rs/pull/1352))
+- Fix compiler family detection issue with clang-cl on macOS ([#1328](https://github.com/rust-lang/cc-rs/pull/1328))
+- Update `windows-bindgen` dependency ([#1347](https://github.com/rust-lang/cc-rs/pull/1347))
+- Fix clippy warnings ([#1346](https://github.com/rust-lang/cc-rs/pull/1346))
+
+## [1.2.7](https://github.com/rust-lang/cc-rs/compare/cc-v1.2.6...cc-v1.2.7) - 2025-01-03
+
+### Other
+
+- Regenerate target info ([#1342](https://github.com/rust-lang/cc-rs/pull/1342))
+- Document new supported architecture names in windows::find
+- Make is_flag_supported_inner take an &Tool ([#1337](https://github.com/rust-lang/cc-rs/pull/1337))
+- Fix is_flag_supported on msvc ([#1336](https://github.com/rust-lang/cc-rs/pull/1336))
+- Allow using Visual Studio target names in `find_tool` ([#1335](https://github.com/rust-lang/cc-rs/pull/1335))
+
 ## [1.2.6](https://github.com/rust-lang/cc-rs/compare/cc-v1.2.5...cc-v1.2.6) - 2024-12-27
 
 ### Other

@@ -645,7 +645,7 @@ impl Build {
     pub fn is_flag_supported(&self, flag: impl AsRef<OsStr>) -> Result<bool, Error> {
         self.is_flag_supported_inner(
             flag.as_ref(),
-            self.get_base_compiler()?.path(),
+            &self.get_base_compiler()?,
             &self.get_target()?,
         )
     }
@@ -653,11 +653,11 @@ impl Build {
     fn is_flag_supported_inner(
         &self,
         flag: &OsStr,
-        compiler_path: &Path,
+        tool: &Tool,
         target: &TargetInfo<'_>,
     ) -> Result<bool, Error> {
         let compiler_flag = CompilerFlag {
-            compiler: compiler_path.into(),
+            compiler: tool.path().into(),
             flag: flag.into(),
         };
 
@@ -679,7 +679,7 @@ impl Build {
         let mut compiler = {
             let mut cfg = Build::new();
             cfg.flag(flag)
-                .compiler(compiler_path)
+                .compiler(tool.path())
                 .cargo_metadata(self.cargo_output.metadata)
                 .opt_level(0)
                 .debug(false)
@@ -725,7 +725,18 @@ impl Build {
             },
         );
 
+        if compiler.supports_path_delimiter() {
+            cmd.arg("--");
+        }
+
         cmd.arg(&src);
+
+        // On MSVC skip the CRT by setting the entry point to `main`.
+        // This way we don't need to add the default library paths.
+        if compiler.is_like_msvc() {
+            // Flags from _LINK_ are appended to the linker arguments.
+            cmd.env("_LINK_", "-entry:main");
+        }
 
         let output = cmd.output()?;
         let is_supported = output.status.success() && output.stderr.is_empty();
@@ -1788,7 +1799,8 @@ impl Build {
         if is_asm {
             cmd.args(self.asm_flags.iter().map(std::ops::Deref::deref));
         }
-        if compiler.family == (ToolFamily::Msvc { clang_cl: true }) && !is_assembler_msvc {
+
+        if compiler.supports_path_delimiter() && !is_assembler_msvc {
             // #513: For `clang-cl`, separate flags/options from the input file.
             // When cross-compiling macOS -> Windows, this avoids interpreting
             // common `/Users/...` paths as the `/U` flag and triggering
@@ -1796,6 +1808,7 @@ impl Build {
             cmd.arg("--");
         }
         cmd.arg(&obj.src);
+
         if cfg!(target_os = "macos") {
             self.fix_env_for_apple_os(&mut cmd)?;
         }
@@ -1950,7 +1963,7 @@ impl Build {
 
         for flag in self.flags_supported.iter() {
             if self
-                .is_flag_supported_inner(flag, &cmd.path, &target)
+                .is_flag_supported_inner(flag, &cmd, &target)
                 .unwrap_or(false)
             {
                 cmd.push_cc_arg((**flag).into());
@@ -2424,20 +2437,20 @@ impl Build {
         Ok(())
     }
 
-    fn add_inherited_rustflags(&self, cmd: &mut Tool, target: &TargetInfo) -> Result<(), Error> {
+    fn add_inherited_rustflags(
+        &self,
+        cmd: &mut Tool,
+        target: &TargetInfo<'_>,
+    ) -> Result<(), Error> {
         let env_os = match self.getenv("CARGO_ENCODED_RUSTFLAGS") {
             Some(env) => env,
             // No encoded RUSTFLAGS -> nothing to do
             None => return Ok(()),
         };
 
-        let Tool {
-            family, path, args, ..
-        } = cmd;
-
         let env = env_os.to_string_lossy();
         let codegen_flags = RustcCodegenFlags::parse(&env)?;
-        codegen_flags.cc_flags(self, path, *family, target, args);
+        codegen_flags.cc_flags(self, cmd, target);
         Ok(())
     }
 
@@ -3028,10 +3041,7 @@ impl Build {
         }
 
         let mut parts = tool.split_whitespace();
-        let maybe_wrapper = match parts.next() {
-            Some(s) => s,
-            None => return None,
-        };
+        let maybe_wrapper = parts.next()?;
 
         let file_stem = Path::new(maybe_wrapper).file_stem()?.to_str()?;
         if known_wrappers.contains(&file_stem) {
@@ -3754,7 +3764,7 @@ impl Build {
         Ok(Arc::from(OsStr::new(sdk_path.trim())))
     }
 
-    fn apple_sdk_root(&self, target: &TargetInfo) -> Result<Arc<OsStr>, Error> {
+    fn apple_sdk_root(&self, target: &TargetInfo<'_>) -> Result<Arc<OsStr>, Error> {
         let sdk = target.apple_sdk_name();
 
         if let Some(ret) = self
@@ -4147,10 +4157,9 @@ fn is_disabled() -> bool {
         match std::env::var_os("CC_FORCE_DISABLE") {
             // Not set? Not disabled.
             None => false,
-            // Respect `CC_FORCE_DISABLE=0` and some simple synonyms.
-            Some(v) if &*v != "0" && &*v != "false" && &*v != "no" => false,
-            // Otherwise, we're disabled. This intentionally includes `CC_FORCE_DISABLE=""`
-            Some(_) => true,
+            // Respect `CC_FORCE_DISABLE=0` and some simple synonyms, otherwise
+            // we're disabled. This intentionally includes `CC_FORCE_DISABLE=""`
+            Some(v) => &*v != "0" && &*v != "false" && &*v != "no",
         }
     }
     match val {

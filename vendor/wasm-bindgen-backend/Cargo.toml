@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.57"
 name = "wasm-bindgen-backend"
-version = "0.2.99"
+version = "0.2.100"
 authors = ["The wasm-bindgen Developers"]
 build = false
 include = [
@@ -55,13 +55,10 @@ version = "2.0"
 features = ["full"]
 
 [dependencies.wasm-bindgen-shared]
-version = "=0.2.99"
+version = "=0.2.100"
 
 [features]
-default = ["std"]
 extra-traits = ["syn/extra-traits"]
-spans = []
-std = []
 
 [lints.clippy]
 large_enum_variant = "allow"

@@ -530,6 +530,7 @@ where
 ///     let old_expr = std::mem::replace(expr, Expr::Value(Value::Null));
 ///     *expr = Expr::Function(Function {
 ///           name: ObjectName(vec![Ident::new("f")]),
+///           uses_odbc_syntax: false,
 ///           args: FunctionArguments::List(FunctionArgumentList {
 ///               duplicate_treatment: None,
 ///               args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(old_expr))],
@@ -876,7 +877,16 @@ mod tests {
                     "POST: QUERY: SELECT * FROM monthly_sales PIVOT(SUM(a.amount) FOR a.MONTH IN ('JAN', 'FEB', 'MAR', 'APR')) AS p (c, d) ORDER BY EMPID",
                     "POST: STATEMENT: SELECT * FROM monthly_sales PIVOT(SUM(a.amount) FOR a.MONTH IN ('JAN', 'FEB', 'MAR', 'APR')) AS p (c, d) ORDER BY EMPID",
                 ]
-            )
+            ),
+            (
+                "SHOW COLUMNS FROM t1",
+                vec![
+                    "PRE: STATEMENT: SHOW COLUMNS FROM t1",
+                    "PRE: RELATION: t1",
+                    "POST: RELATION: t1",
+                    "POST: STATEMENT: SHOW COLUMNS FROM t1",
+                ],
+            ),
         ];
         for (sql, expected) in tests {
             let actual = do_visit(sql);
