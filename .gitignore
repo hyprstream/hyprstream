@@ -5,6 +5,9 @@ Cargo.lock
 **/*.rs.bk
 *.pdb
 
+# WebUI
+.webui*
+
 # Claude Flow
 # Swarm and hive mind data
 .swarm/

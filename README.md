@@ -71,7 +71,10 @@ This server provides TCL script execution through MCP with a Unix-like namespace
 - **Version Support**: Tools can have specific versions or use "latest"
 - **Protected System Tools**: System tools in `/bin` and `/sbin` cannot be removed
 - **User Tool Management**: Users can create tools in their own namespaces
-- **Built-in Documentation**: Access Molt TCL interpreter docs and examples via `docs___molt_book`
+- **Built-in Documentation**: Access Molt TCL interpreter docs and examples via `docs__molt_book`
+- **MCP Server Integration**: Bridge external MCP servers as TCL tools with persistent configuration
+- **Cross-Platform Persistence**: Platform-appropriate storage directories (XDG, macOS, Windows)
+- **Auto-Start Servers**: Automatically reconnect to configured MCP servers on startup
 - **MCP-Compatible Naming**: Internal namespace paths are converted to MCP-compatible names
 - **Thread-Safe Architecture**: Handles TCL's non-thread-safe interpreter safely
 
@@ -89,11 +92,40 @@ Tools are organized using a path-like structure:
 
 ### MCP Name Mapping
 Since MCP doesn't support forward slashes in tool names, paths are converted:
-- `/bin/tcl_execute` → `bin___tcl_execute`
-- `/docs/molt_book` → `docs___molt_book`
-- `/sbin/tcl_tool_add` → `sbin___tcl_tool_add`
-- `/alice/utils/reverse_string:1.0` → `user_alice__utils___reverse_string__v1_0`
-- `/bob/math/calculate:latest` → `user_bob__math___calculate`
+- `/bin/tcl_execute` → `bin__tcl_execute`
+- `/docs/molt_book` → `docs__molt_book`
+- `/sbin/tcl_tool_add` → `sbin__tcl_tool_add`
+- `/alice/utils/reverse_string:1.0` → `user__alice__utils__reverse_string__v1_0`
+- `/bob/math/calculate:latest` → `user__bob__math__calculate`
+
+## MCP Server Integration
+
+External MCP servers can be integrated as TCL tools:
+
+```bash
+# Add an MCP server (requires privileged mode)
+tcl-mcp-server run sbin__mcp_add '{
+  "id": "context7",
+  "name": "Context7 Server", 
+  "command": "npx",
+  "args": ["-y", "@modelcontextprotocol/server-everything"],
+  "auto_start": true
+}'
+
+# List tools (includes MCP server tools)
+tcl-mcp-server list
+# Output: bin__tcl_execute, mcp__context7__get_library_docs, ...
+
+# Execute MCP server tool
+tcl-mcp-server run mcp__context7__get_library_docs '{"query": "rust async"}'
+```
+
+**Persistence**: Server configurations are saved to platform-appropriate directories:
+- **Linux**: `~/.local/share/tcl-mcp-server/mcp-index.json`  
+- **macOS**: `~/Library/Application Support/tcl-mcp-server/mcp-index.json`
+- **Windows**: `%APPDATA%\tcl-mcp-server\mcp-index.json`
+
+See [MCP Server Integration Guide](docs/MCP_SERVER_INTEGRATION.md) for details.
 
 ## Installation
 
@@ -446,14 +478,15 @@ claude mcp add tcl-admin /path/to/tcl-mcp/target/release/tcl-mcp-server-admin
 
 ## Testing
 
-Two test scripts are provided:
+Test scripts are available in the tests directory:
 
 ```bash
-# Basic functionality test
-python3 test_mcp.py
+# Run the comprehensive test suite
+./scripts/run_mcp_tests.sh
 
-# Namespace functionality test
-python3 test_namespace.py
+# Or run specific Python tests
+python3 tests/test_bin_exec_tool_mcp.py
+python3 tests/test_capabilities.py
 ```
 
 ## Building a Container Image

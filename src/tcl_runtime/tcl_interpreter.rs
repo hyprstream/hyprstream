@@ -1,12 +1,11 @@
-use anyhow::{Result, anyhow};
 use super::TclRuntime;
+use anyhow::{anyhow, Result};
 
 /// Official TCL interpreter implementation using the tcl crate
 #[cfg(feature = "tcl")]
 pub struct TclInterpreter {
     interp: tcl::Interpreter,
 }
-
 
 #[cfg(feature = "tcl")]
 impl TclRuntime for TclInterpreter {
@@ -15,43 +14,44 @@ impl TclRuntime for TclInterpreter {
             interp: tcl::Interpreter::new().expect("Failed to create TCL interpreter"),
         }
     }
-    
+
     fn eval(&mut self, script: &str) -> Result<String> {
         match self.interp.eval(script) {
             Ok(result) => Ok(result.to_string()),
             Err(err) => Err(anyhow!("TCL execution error: {}", err)),
         }
     }
-    
+
     fn set_var(&mut self, name: &str, value: &str) -> Result<()> {
         let _result = self.interp.set(name, value);
         // TCL set always succeeds unless there's a serious error
         Ok(())
     }
-    
+
     fn get_var(&self, name: &str) -> Result<String> {
         match self.interp.get(name) {
             Ok(value) => Ok(value.to_string()),
             Err(err) => Err(anyhow!("Failed to get variable '{}': {}", name, err)),
         }
     }
-    
+
     fn has_command(&self, command: &str) -> bool {
         // Check if command exists by trying to get its info
         let check_cmd = format!("info commands {}", command);
-        self.interp.eval(check_cmd)
+        self.interp
+            .eval(check_cmd)
             .map(|result| !result.to_string().is_empty())
             .unwrap_or(false)
     }
-    
+
     fn name(&self) -> &'static str {
         "TCL (Official)"
     }
-    
+
     fn version(&self) -> &'static str {
         "8.6"
     }
-    
+
     fn features(&self) -> Vec<String> {
         vec![
             "full_tcl_8_6".to_string(),
@@ -64,7 +64,7 @@ impl TclRuntime for TclInterpreter {
             "native_performance".to_string(),
         ]
     }
-    
+
     fn is_safe(&self) -> bool {
         false // Full TCL has access to file system, exec, etc.
     }
@@ -106,7 +106,7 @@ mod tests {
         assert!(runtime.has_command("set"));
         assert!(!runtime.has_command("nonexistent_command"));
     }
-    
+
     #[test]
     fn test_tcl_runtime_string_ops() {
         let mut runtime = TclInterpreter::new();

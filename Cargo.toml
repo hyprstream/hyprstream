@@ -41,6 +41,7 @@ anyhow = "1.0"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 
 # For dynamic tool management
 dashmap = "5.5"
@@ -56,6 +57,13 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # UUID generation
 uuid = { version = "1.0", features = ["serde", "v4"] }
+
+# MCP client support
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures = "0.3"
+
+# Filesystem notification for tool auto-reload
+notify = "6.0"
 
 [dev-dependencies]
 # For testing with temporary directories

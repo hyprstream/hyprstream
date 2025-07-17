@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::env;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -9,12 +9,15 @@ pub enum RuntimeType {
 
 impl std::str::FromStr for RuntimeType {
     type Err = anyhow::Error;
-    
+
     fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
             "molt" => Ok(RuntimeType::Molt),
             "tcl" => Ok(RuntimeType::Tcl),
-            _ => Err(anyhow!("Invalid runtime type '{}'. Valid options: molt, tcl", s)),
+            _ => Err(anyhow!(
+                "Invalid runtime type '{}'. Valid options: molt, tcl",
+                s
+            )),
         }
     }
 }
@@ -26,7 +29,7 @@ impl RuntimeType {
             RuntimeType::Tcl => "tcl",
         }
     }
-    
+
     /// Check if this runtime type is available based on compiled features
     pub fn is_available(&self) -> bool {
         match self {
@@ -51,32 +54,61 @@ impl Default for RuntimeConfig {
     }
 }
 
+impl RuntimeConfig {
+    /// Get list of available runtimes  
+    pub fn available_runtimes() -> Vec<RuntimeType> {
+        available_runtimes()
+    }
+
+    /// Create runtime config from CLI args and environment variables
+    pub fn from_args_and_env(
+        cli_runtime: Option<&str>,
+        env_runtime: Option<&str>, // Environment variable value
+    ) -> Result<Self> {
+        let mut config = RuntimeConfig::default();
+
+        // Check environment variable first
+        if let Some(env_runtime) = env_runtime {
+            config.runtime_type = Some(env_runtime.parse()?);
+        }
+
+        // CLI argument overrides environment
+        if let Some(cli_runtime) = cli_runtime {
+            config.runtime_type = Some(cli_runtime.parse()?);
+        }
+
+        Ok(config)
+    }
+}
+
 /// Trait defining the interface for TCL runtime implementations
 pub trait TclRuntime {
     /// Create a new instance of the TCL runtime
-    fn new() -> Self where Self: Sized;
-    
+    fn new() -> Self
+    where
+        Self: Sized;
+
     /// Evaluate a TCL script and return the result
     fn eval(&mut self, script: &str) -> Result<String>;
-    
+
     /// Set a variable in the TCL runtime
     fn set_var(&mut self, name: &str, value: &str) -> Result<()>;
-    
+
     /// Get a variable from the TCL runtime
     fn get_var(&self, name: &str) -> Result<String>;
-    
+
     /// Check if the runtime supports a specific command
     fn has_command(&self, command: &str) -> bool;
-    
+
     /// Get runtime name for logging/debugging
     fn name(&self) -> &'static str;
-    
+
     /// Get runtime version
     fn version(&self) -> &'static str;
-    
+
     /// Get runtime features/capabilities
     fn features(&self) -> Vec<String>;
-    
+
     /// Check if runtime is safe/sandboxed
     fn is_safe(&self) -> bool;
 }
@@ -90,7 +122,6 @@ pub use molt_runtime::MoltRuntime;
 mod tcl_interpreter;
 #[cfg(feature = "tcl")]
 pub use tcl_interpreter::TclInterpreter;
-
 
 /// Check if a runtime type is available at compile time
 pub fn is_runtime_available(runtime_type: RuntimeType) -> bool {
@@ -119,30 +150,35 @@ pub fn create_runtime_with_config(config: RuntimeConfig) -> Result<Box<dyn TclRu
                 return Ok(runtime);
             }
             Err(e) if config.fallback_enabled => {
-                tracing::warn!("Failed to create requested runtime {:?}: {}. Trying fallback.", requested_type, e);
+                tracing::warn!(
+                    "Failed to create requested runtime {:?}: {}. Trying fallback.",
+                    requested_type,
+                    e
+                );
                 // Fall through to auto-selection
             }
             Err(e) => return Err(e),
         }
     }
-    
-    // Auto-select based on available features (prefer Molt for safety)
-    #[cfg(feature = "molt")]
+
+    // Auto-select based on available features (prefer C TCL for full compatibility)
+    #[cfg(feature = "tcl")]
+    {
+        tracing::info!("Auto-selecting official C TCL runtime");
+        return Ok(Box::new(TclInterpreter::new()));
+    }
+
+    #[cfg(all(feature = "molt", not(feature = "tcl")))]
     {
         tracing::info!("Auto-selecting Molt TCL runtime");
         return Ok(Box::new(MoltRuntime::new()));
     }
-    
-    
-    #[cfg(all(feature = "tcl", not(feature = "molt")))]
-    {
-        tracing::info!("Auto-selecting official TCL runtime");
-        return Ok(Box::new(TclInterpreter::new()));
-    }
-    
+
     #[cfg(all(not(feature = "molt"), not(feature = "tcl")))]
     {
-        return Err(anyhow!("No TCL runtime features enabled. Please build with --features molt or --features tcl"));
+        return Err(anyhow!(
+            "No TCL runtime features enabled. Please build with --features molt or --features tcl"
+        ));
     }
 }
 
@@ -156,7 +192,9 @@ fn create_specific_runtime(runtime_type: RuntimeType) -> Result<Box<dyn TclRunti
             }
             #[cfg(not(feature = "molt"))]
             {
-                Err(anyhow!("Molt runtime not available. Build with --features molt"))
+                Err(anyhow!(
+                    "Molt runtime not available. Build with --features molt"
+                ))
             }
         }
         RuntimeType::Tcl => {
@@ -166,7 +204,9 @@ fn create_specific_runtime(runtime_type: RuntimeType) -> Result<Box<dyn TclRunti
             }
             #[cfg(not(feature = "tcl"))]
             {
-                Err(anyhow!("TCL runtime not available. Build with --features tcl"))
+                Err(anyhow!(
+                    "TCL runtime not available. Build with --features tcl"
+                ))
             }
         }
     }
@@ -175,63 +215,34 @@ fn create_specific_runtime(runtime_type: RuntimeType) -> Result<Box<dyn TclRunti
 /// Get list of available runtime types based on compiled features
 pub fn get_available_runtimes() -> Vec<RuntimeType> {
     let mut runtimes = Vec::new();
-    
+
     #[cfg(feature = "molt")]
     runtimes.push(RuntimeType::Molt);
-    
+
     #[cfg(feature = "tcl")]
     runtimes.push(RuntimeType::Tcl);
-    
-    
-    runtimes
-}
 
-impl RuntimeConfig {
-    /// Create runtime config from CLI args and environment variables
-    pub fn from_args_and_env(
-        cli_runtime: Option<&str>,
-        env_runtime: Option<&str>, // Environment variable value
-    ) -> Result<Self> {
-        let mut config = RuntimeConfig::default();
-        
-        // Check environment variable first
-        if let Some(env_runtime) = env_runtime {
-            config.runtime_type = Some(env_runtime.parse()?);
-        }
-        
-        // CLI argument overrides environment  
-        if let Some(cli_runtime) = cli_runtime {
-            config.runtime_type = Some(cli_runtime.parse()?);
-        }
-        
-        Ok(config)
-    }
-    
-    /// Get available runtimes (convenience method)
-    pub fn available_runtimes() -> Vec<RuntimeType> {
-        get_available_runtimes()
-    }
+    runtimes
 }
 
 /// Create runtime from environment and CLI arguments
 pub fn create_runtime_from_env(cli_runtime: Option<&str>) -> Result<Box<dyn TclRuntime>> {
     let mut config = RuntimeConfig::default();
-    
+
     // Check environment variable first
     if let Ok(env_runtime) = env::var("TCL_MCP_RUNTIME") {
         config.runtime_type = Some(env_runtime.parse()?);
     }
-    
+
     // CLI argument overrides environment
     if let Some(cli_runtime) = cli_runtime {
         config.runtime_type = Some(cli_runtime.parse()?);
     }
-    
+
     create_runtime_with_config(config)
 }
 
 /// Factory function to create the appropriate runtime based on features (backward compatibility)
 pub fn create_runtime() -> Box<dyn TclRuntime> {
-    create_runtime_with_config(RuntimeConfig::default())
-        .expect("Failed to create default runtime")
+    create_runtime_with_config(RuntimeConfig::default()).expect("Failed to create default runtime")
 }
