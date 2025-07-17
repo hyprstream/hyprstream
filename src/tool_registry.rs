@@ -213,7 +213,7 @@ impl ToolRegistry {
         // Apply search filter
         if let Some(search) = &query.search {
             tools.retain(|tool| {
-                tool.path.to_string().contains(search) || tool.description.contains(search)
+                tool.path.to_mcp_name().contains(search) || tool.description.contains(search)
             });
         }
 
@@ -409,36 +409,36 @@ impl ToolRegistry {
 
     /// Get description for system tools
     fn get_system_tool_description(&self, path: &ToolPath) -> String {
-        match path.to_string().as_str() {
-            "/bin/tcl_execute" => "Execute a TCL script and return the result".to_string(),
-            "/bin/exec_tool" => "Execute a tool by its path with parameters".to_string(),
-            "/bin/discover_tools" => "Discover and index tools from the filesystem".to_string(),
-            "/bin/list_tools" => {
+        match path.to_mcp_name().as_str() {
+            "bin__tcl_execute" => "Execute a TCL script and return the result".to_string(),
+            "bin__exec_tool" => "Execute a tool by its path with parameters".to_string(),
+            "bin__discover_tools" => "Discover and index tools from the filesystem".to_string(),
+            "bin__list_tools" => {
                 "List tools with flexible output formats and advanced filtering".to_string()
             }
-            "/bin/inspect_tool" => {
+            "bin__inspect_tool" => {
                 "Get detailed information about a specific tool including schema".to_string()
             }
-            "/bin/list_namespaces" => "List available namespaces and their tool counts".to_string(),
-            "/bin/search_tools" => "Search tools by description or name".to_string(),
-            "/bin/list_xmcp_tools" => {
+            "bin__list_namespaces" => "List available namespaces and their tool counts".to_string(),
+            "bin__search_tools" => "Search tools by description or name".to_string(),
+            "bin__list_xmcp_tools" => {
                 "List tools in xmcp namespace with server grouping".to_string()
             }
-            "/sbin/tcl_tool_add" => {
+            "sbin__tcl_tool_add" => {
                 "Add a new TCL tool to the available tools (PRIVILEGED)".to_string()
             }
-            "/sbin/tcl_tool_remove" => {
+            "sbin__tcl_tool_remove" => {
                 "Remove a TCL tool from the available tools (PRIVILEGED)".to_string()
             }
-            "/sbin/mcp_add" => "Add an MCP server configuration (PRIVILEGED)".to_string(),
-            "/sbin/mcp_remove" => "Remove an MCP server configuration (PRIVILEGED)".to_string(),
-            "/sbin/mcp_list" => "List all registered MCP servers (PRIVILEGED)".to_string(),
-            "/sbin/mcp_connect" => "Manually connect to an MCP server (PRIVILEGED)".to_string(),
-            "/sbin/mcp_info" => {
+            "sbin__mcp_add" => "Add an MCP server configuration (PRIVILEGED)".to_string(),
+            "sbin__mcp_remove" => "Remove an MCP server configuration (PRIVILEGED)".to_string(),
+            "sbin__mcp_list" => "List all registered MCP servers (PRIVILEGED)".to_string(),
+            "sbin__mcp_connect" => "Manually connect to an MCP server (PRIVILEGED)".to_string(),
+            "sbin__mcp_info" => {
                 "Get detailed information about an MCP server (PRIVILEGED)".to_string()
             }
-            "/sbin/mcp_ping" => "Test connectivity to an MCP server (PRIVILEGED)".to_string(),
-            "/docs/molt_book" => {
+            "sbin__mcp_ping" => "Test connectivity to an MCP server (PRIVILEGED)".to_string(),
+            "docs__molt_book" => {
                 "Access Molt TCL interpreter documentation and examples".to_string()
             }
             _ => "System tool".to_string(),
@@ -447,14 +447,14 @@ impl ToolRegistry {
 
     /// Get parameters for system tools
     fn get_system_tool_parameters(&self, path: &ToolPath) -> Vec<ParameterDefinition> {
-        match path.to_string().as_str() {
-            "/bin/tcl_execute" => vec![ParameterDefinition {
+        match path.to_mcp_name().as_str() {
+            "bin__tcl_execute" => vec![ParameterDefinition {
                 name: "script".to_string(),
                 description: "TCL script to execute".to_string(),
                 required: true,
                 type_name: "string".to_string(),
             }],
-            "/bin/tcl_tool_list" => vec![
+            "bin__tcl_tool_list" => vec![
                 ParameterDefinition {
                     name: "namespace".to_string(),
                     description: "Filter tools by namespace (optional)".to_string(),
@@ -468,10 +468,10 @@ impl ToolRegistry {
                     type_name: "string".to_string(),
                 },
             ],
-            "/bin/exec_tool" => vec![
+            "bin__exec_tool" => vec![
                 ParameterDefinition {
                     name: "tool_path".to_string(),
-                    description: "Full path to the tool (e.g., '/bin/list_dir')".to_string(),
+                    description: "Full path to the tool (e.g., 'bin__list_dir')".to_string(),
                     required: true,
                     type_name: "string".to_string(),
                 },
@@ -482,7 +482,7 @@ impl ToolRegistry {
                     type_name: "object".to_string(),
                 },
             ],
-            "/bin/list_tools" => vec![
+            "bin__list_tools" => vec![
                 ParameterDefinition {
                     name: "namespace".to_string(),
                     description: "Filter by namespace (bin, sbin, docs, user, xmcp)".to_string(),
@@ -522,14 +522,14 @@ impl ToolRegistry {
                     type_name: "string".to_string(),
                 },
             ],
-            "/bin/inspect_tool" => vec![ParameterDefinition {
+            "bin__inspect_tool" => vec![ParameterDefinition {
                 name: "tool_path".to_string(),
-                description: "Tool path to inspect (e.g., '/bin/tcl_execute')".to_string(),
+                description: "Tool path to inspect (e.g., 'bin__tcl_execute')".to_string(),
                 required: true,
                 type_name: "string".to_string(),
             }],
-            "/bin/list_namespaces" => vec![],
-            "/bin/search_tools" => vec![
+            "bin__list_namespaces" => vec![],
+            "bin__search_tools" => vec![
                 ParameterDefinition {
                     name: "query".to_string(),
                     description: "Search query string".to_string(),
@@ -543,7 +543,7 @@ impl ToolRegistry {
                     type_name: "integer".to_string(),
                 },
             ],
-            "/bin/list_xmcp_tools" => vec![ParameterDefinition {
+            "bin__list_xmcp_tools" => vec![ParameterDefinition {
                 name: "server".to_string(),
                 description: "Filter by server ID".to_string(),
                 required: false,

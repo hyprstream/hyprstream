@@ -176,7 +176,7 @@ async fn test_privileged_tool_management() -> Result<()> {
     assert!(add_result.contains("Tool added successfully") || add_result.contains(&tool_name));
 
     // Execute the custom tool
-    let tool_path = format!("/test/math/{}", tool_name);
+    let tool_path = format!("user__test__math__{}", tool_name);
     let exec_result = client
         .exec_tool(
             &tool_path,

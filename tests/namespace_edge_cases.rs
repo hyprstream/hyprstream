@@ -9,11 +9,11 @@ mod namespace_edge_cases {
     fn test_parsing_edge_cases() {
         // Valid paths
         let valid_cases = vec![
-            ("/bin/tool", "bin", "tool", "latest"),
-            ("/sbin/admin_tool", "sbin", "admin_tool", "latest"),
-            ("/docs/help", "docs", "help", "latest"),
-            ("/alice/utils/tool:1.0", "user:alice", "tool", "1.0"),
-            ("/mcp/server/tool:2.0", "mcp:server", "tool", "2.0"),
+            ("bin__tool", "bin", "tool", "latest"),
+            ("sbin__admin_tool", "sbin", "admin_tool", "latest"),
+            ("docs__help", "docs", "help", "latest"),
+            ("user__alice__utils__tool__v1_0", "user:alice", "tool", "1.0"),
+            ("mcp__server__tool__v2_0", "mcp:server", "tool", "2.0"),
         ];
 
         for (path, expected_ns, expected_name, expected_version) in valid_cases {
@@ -37,12 +37,12 @@ mod namespace_edge_cases {
 
         // Invalid paths
         let invalid_cases = vec![
-            "bin/tool",        // Missing leading slash
-            "/",               // Just slash
-            "//bin/tool",      // Double slash
-            "/bin/",           // Trailing slash
-            "/bin",            // Missing tool name
-            "/unknown/tool",   // Unknown namespace
+            "bin_tool",        // Wrong separator
+            "_",               // Just underscore
+            "__bin__tool",     // Leading separators
+            "bin__",           // Trailing separator
+            "bin",             // Missing tool name
+            "unknown__tool",   // Unknown namespace
             "",                // Empty string
         ];
 
@@ -138,24 +138,24 @@ mod namespace_edge_cases {
     #[test]
     fn test_display_formatting() {
         let test_cases = vec![
-            (ToolPath::bin("tool"), "/bin/tool"),
-            (ToolPath::sbin("admin"), "/sbin/admin"),
-            (ToolPath::docs("help"), "/docs/help"),
+            (ToolPath::bin("tool"), "bin__tool"),
+            (ToolPath::sbin("admin"), "sbin__admin"),
+            (ToolPath::docs("help"), "docs__help"),
             (
                 ToolPath::user("alice", "utils", "tool", "latest"),
-                "/alice/utils/tool",
+                "user__alice__utils__tool",
             ),
             (
                 ToolPath::user("alice", "utils", "tool", "1.0"),
-                "/alice/utils/tool:1.0",
+                "user__alice__utils__tool__v1_0",
             ),
             (
                 ToolPath::mcp("server", "tool", "latest"),
-                "/mcp/server/tool",
+                "mcp__server__tool",
             ),
             (
                 ToolPath::mcp("server", "tool", "2.0"),
-                "/mcp/server/tool:2.0",
+                "mcp__server__tool__v2_0",
             ),
         ];
 
@@ -183,12 +183,12 @@ mod namespace_edge_cases {
     fn test_version_edge_cases() {
         // Parse various version formats
         let version_tests = vec![
-            ("/alice/pkg/tool", "latest"),
-            ("/alice/pkg/tool:1.0", "1.0"),
-            ("/alice/pkg/tool:1.0.0", "1.0.0"),
-            ("/alice/pkg/tool:v1.0", "v1.0"),
-            ("/alice/pkg/tool:1.0-beta", "1.0-beta"),
-            ("/alice/pkg/tool:latest", "latest"),
+            ("user__alice__pkg__tool", "latest"),
+            ("user__alice__pkg__tool__v1_0", "1.0"),
+            ("user__alice__pkg__tool__v1_0_0", "1.0.0"),
+            ("user__alice__pkg__tool__vv1_0", "v1.0"),
+            ("user__alice__pkg__tool__v1_0-beta", "1.0-beta"),
+            ("user__alice__pkg__tool__vlatest", "latest"),
         ];
 
         for (path, expected_version) in version_tests {
@@ -249,10 +249,11 @@ mod namespace_edge_cases {
         // With package
         let with_pkg = ToolPath::user("alice", "utils", "tool", "1.0");
         assert_eq!(with_pkg.package, Some("utils".to_string()));
-        assert_eq!(with_pkg.to_string(), "/alice/utils/tool:1.0");
+        assert_eq!(with_pkg.to_string(), "user__alice__utils__tool__v1_0");
 
-        // Without package - currently not supported in parse
-        // This is a design decision - user tools always need a package
-        assert!(ToolPath::parse("/alice/tool").is_err());
+        // Without package - now supported in parse
+        let without_pkg = ToolPath::parse("user__alice__tool").unwrap();
+        assert_eq!(without_pkg.package, None);
+        assert_eq!(without_pkg.to_string(), "user__alice__tool");
     }
 }

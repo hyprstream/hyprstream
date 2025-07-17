@@ -33,7 +33,6 @@ pub async fn list_tools(
 
     for tool in &tools {
         let mut tool_info = json!({
-            "path": tool.path.to_string(),
             "mcp_name": tool.path.to_mcp_name(),
             "description": tool.description,
             "source": format!("{:?}", tool.source),
@@ -50,8 +49,8 @@ pub async fn list_tools(
     // Handle output format
     match format.as_deref().unwrap_or("detailed") {
         "simple" => {
-            // Simple format: just array of paths for backward compatibility
-            let paths: Vec<String> = tools.iter().map(|t| t.path.to_string()).collect();
+            // Simple format: just array of MCP names for backward compatibility
+            let paths: Vec<String> = tools.iter().map(|t| t.path.to_mcp_name()).collect();
             Ok(serde_json::to_string_pretty(&paths)?)
         }
         _ => {
@@ -70,7 +69,6 @@ pub async fn inspect_tool(registry: &ToolRegistry, tool_path: &str) -> Result<St
 
     if let Some(tool) = registry.get_tool(&path).await {
         let mut info = json!({
-            "path": tool.path.to_string(),
             "mcp_name": tool.path.to_mcp_name(),
             "description": tool.description,
             "source": describe_source(&tool.source),
@@ -84,7 +82,7 @@ pub async fn inspect_tool(registry: &ToolRegistry, tool_path: &str) -> Result<St
             ToolSource::System => {
                 info["system_info"] = json!({
                     "type": "built-in",
-                    "privileged": tool.path.to_string().starts_with("/sbin/")
+                    "privileged": tool.path.to_mcp_name().starts_with("sbin__")
                 });
             }
             ToolSource::UserTcl { script } => {
@@ -189,7 +187,6 @@ pub async fn search_tools(
         .into_iter()
         .map(|tool| {
             json!({
-                "path": tool.path.to_string(),
                 "mcp_name": tool.path.to_mcp_name(),
                 "description": tool.description,
                 "source_type": match tool.source {

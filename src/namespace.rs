@@ -1,7 +1,32 @@
-use crate::path_format::{ParsedPath, PathPattern};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+
+/// MCP path separator
+const SEPARATOR: &str = "__";
+
+/// Parse an MCP-formatted path into components
+fn parse_path(path: &str) -> Vec<&str> {
+    path.split(SEPARATOR).collect()
+}
+
+/// Join components into an MCP-formatted path
+fn join_path(components: &[&str]) -> String {
+    components.join(SEPARATOR)
+}
+
+/// Format a version string for use in paths (dots to underscores)
+fn format_version(version: &str) -> String {
+    format!("v{}", version.replace('.', "_"))
+}
+
+/// Parse a version string from path format (underscores to dots)
+fn parse_version(version: &str) -> String {
+    version
+        .strip_prefix('v')
+        .unwrap_or(version)
+        .replace('_', ".")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Namespace {
@@ -80,99 +105,39 @@ impl ToolPath {
         }
     }
 
-    /// Parse a tool path from a string representation
+    /// Parse a tool path from MCP name format
     /// Examples:
-    /// - "/bin/tcl_execute"
-    /// - "/sbin/tcl_tool_add"
-    /// - "/mcp/filesystem/read_file:1.0"
-    /// - "/alice/utils/reverse_string:1.0"
-    /// - "/bob/math/calculate:latest"
+    /// - "bin__tcl_execute"
+    /// - "sbin__tcl_tool_add"
+    /// - "mcp__filesystem__read_file__v1_0"
+    /// - "user__alice__utils__reverse_string__v1_0"
+    /// - "user__bob__math__calculate"
     pub fn parse(path: &str) -> Result<Self> {
-        if !path.starts_with('/') {
-            return Err(anyhow!("Tool path must start with '/'"));
-        }
-
-        let parts: Vec<&str> = path[1..].split('/').collect();
-
-        match parts.as_slice() {
-            ["bin", name] => {
-                let (name, _version) = Self::parse_name_version(name)?;
-                if name.is_empty() {
-                    return Err(anyhow!("Tool name cannot be empty"));
-                }
-                Ok(Self::bin(name))
-            }
-            ["sbin", name] => {
-                let (name, _version) = Self::parse_name_version(name)?;
-                if name.is_empty() {
-                    return Err(anyhow!("Tool name cannot be empty"));
-                }
-                Ok(Self::sbin(name))
-            }
-            ["docs", name] => {
-                let (name, _version) = Self::parse_name_version(name)?;
-                if name.is_empty() {
-                    return Err(anyhow!("Tool name cannot be empty"));
-                }
-                Ok(Self::docs(name))
-            }
-            ["mcp", server, name_version] => {
-                let (name, version) = Self::parse_name_version(name_version)?;
-                if name.is_empty() || server.is_empty() {
-                    return Err(anyhow!("MCP server and tool name cannot be empty"));
-                }
-                Ok(Self::mcp(server.to_string(), name, version))
-            }
-            [user, package, name_version] => {
-                if user.is_empty() {
-                    return Err(anyhow!("User namespace cannot have empty user name"));
-                }
-                let (name, version) = Self::parse_name_version(name_version)?;
-                if name.is_empty() || package.is_empty() {
-                    return Err(anyhow!("User package and tool name cannot be empty"));
-                }
-                Ok(Self::user(
-                    user.to_string(),
-                    package.to_string(),
-                    name,
-                    version,
-                ))
-            }
-            _ => Err(anyhow!("Invalid tool path format: {}", path)),
-        }
-    }
-
-    /// Parse name:version format
-    fn parse_name_version(s: &str) -> Result<(String, String)> {
-        if let Some((name, version)) = s.split_once(':') {
-            Ok((name.to_string(), version.to_string()))
-        } else {
-            Ok((s.to_string(), "latest".to_string()))
-        }
+        Self::from_mcp_name(path)
     }
 
     /// Convert to MCP-compatible tool name using standardized path format
     pub fn to_mcp_name(&self) -> String {
         match &self.namespace {
-            Namespace::Bin => PathPattern::bin(&self.name),
-            Namespace::Sbin => PathPattern::sbin(&self.name),
-            Namespace::Docs => PathPattern::docs(&self.name),
+            Namespace::Bin => join_path(&["bin", &self.name]),
+            Namespace::Sbin => join_path(&["sbin", &self.name]),
+            Namespace::Docs => join_path(&["docs", &self.name]),
             Namespace::Mcp(server) => {
                 if self.version == "latest" {
-                    PathPattern::mcp(server, &self.name)
+                    join_path(&["mcp", server, &self.name])
                 } else {
-                    PathPattern::mcp_versioned(server, &self.name, &self.version)
+                    join_path(&["mcp", server, &self.name, &format_version(&self.version)])
                 }
             }
             Namespace::User(user) => {
                 if let Some(package) = &self.package {
                     if self.version == "latest" {
-                        PathPattern::user(user, Some(package), &self.name)
+                        join_path(&["user", user, package, &self.name])
                     } else {
-                        PathPattern::user_versioned(user, package, &self.name, &self.version)
+                        join_path(&["user", user, package, &self.name, &format_version(&self.version)])
                     }
                 } else {
-                    PathPattern::user(user, None, &self.name)
+                    join_path(&["user", user, &self.name])
                 }
             }
         }
@@ -180,32 +145,73 @@ impl ToolPath {
 
     /// Convert from MCP tool name back to ToolPath using standardized parsing
     pub fn from_mcp_name(mcp_name: &str) -> Result<Self> {
-        let parsed = ParsedPath::parse(mcp_name)?;
+        let parts = parse_path(mcp_name);
 
-        match parsed.namespace.as_str() {
-            "bin" => Ok(Self::bin(parsed.name)),
-            "sbin" => Ok(Self::sbin(parsed.name)),
-            "docs" => Ok(Self::docs(parsed.name)),
-            "mcp" => {
-                let server = parsed
-                    .server
-                    .ok_or_else(|| anyhow!("MCP namespace requires server"))?;
-                let version = parsed.version.unwrap_or_else(|| "latest".to_string());
-                Ok(Self::mcp(server, parsed.name, version))
+        match parts.as_slice() {
+            ["bin", name] => {
+                if name.is_empty() || *name == "_" {
+                    return Err(anyhow!("Tool name cannot be empty or just underscore"));
+                }
+                Ok(Self::bin(name.to_string()))
             }
-            "user" => {
-                let user = parsed
-                    .user
-                    .ok_or_else(|| anyhow!("User namespace requires user"))?;
-                let version = parsed.version.unwrap_or_else(|| "latest".to_string());
+            ["sbin", name] => {
+                if name.is_empty() || *name == "_" {
+                    return Err(anyhow!("Tool name cannot be empty or just underscore"));
+                }
+                Ok(Self::sbin(name.to_string()))
+            }
+            ["docs", name] => {
+                if name.is_empty() || *name == "_" {
+                    return Err(anyhow!("Tool name cannot be empty or just underscore"));
+                }
+                Ok(Self::docs(name.to_string()))
+            }
+            ["mcp", server, name] => {
+                if name.is_empty() || server.is_empty() || *name == "_" || *server == "_" {
+                    return Err(anyhow!("MCP tool name and server cannot be empty or just underscore"));
+                }
+                Ok(Self::mcp(server.to_string(), name.to_string(), "latest".to_string()))
+            }
+            ["mcp", server, name, version] if version.starts_with('v') => {
+                if name.is_empty() || server.is_empty() || *name == "_" || *server == "_" {
+                    return Err(anyhow!("MCP tool name and server cannot be empty or just underscore"));
+                }
+                Ok(Self::mcp(server.to_string(), name.to_string(), parse_version(version)))
+            }
+            ["user", user, name] => {
+                if name.is_empty() || user.is_empty() || *name == "_" || *user == "_" {
+                    return Err(anyhow!("User tool name and user cannot be empty or just underscore"));
+                }
                 Ok(Self {
-                    namespace: Namespace::User(user),
-                    package: parsed.package,
-                    name: parsed.name,
-                    version,
+                    namespace: Namespace::User(user.to_string()),
+                    package: None,
+                    name: name.to_string(),
+                    version: "latest".to_string(),
                 })
             }
-            _ => Err(anyhow!("Unknown namespace: {}", parsed.namespace)),
+            ["user", user, package, name] => {
+                if name.is_empty() || user.is_empty() || package.is_empty() || *name == "_" || *user == "_" || *package == "_" {
+                    return Err(anyhow!("User tool name, user, and package cannot be empty or just underscore"));
+                }
+                Ok(Self {
+                    namespace: Namespace::User(user.to_string()),
+                    package: Some(package.to_string()),
+                    name: name.to_string(),
+                    version: "latest".to_string(),
+                })
+            }
+            ["user", user, package, name, version] if version.starts_with('v') => {
+                if name.is_empty() || user.is_empty() || package.is_empty() || *name == "_" || *user == "_" || *package == "_" {
+                    return Err(anyhow!("User tool name, user, and package cannot be empty or just underscore"));
+                }
+                Ok(Self {
+                    namespace: Namespace::User(user.to_string()),
+                    package: Some(package.to_string()),
+                    name: name.to_string(),
+                    version: parse_version(version),
+                })
+            }
+            _ => Err(anyhow!("Invalid MCP path format: {}", mcp_name)),
         }
     }
 
@@ -225,29 +231,7 @@ impl ToolPath {
 
 impl fmt::Display for ToolPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.namespace {
-            Namespace::Bin => write!(f, "/bin/{}", self.name),
-            Namespace::Sbin => write!(f, "/sbin/{}", self.name),
-            Namespace::Docs => write!(f, "/docs/{}", self.name),
-            Namespace::Mcp(server) => {
-                if self.version == "latest" {
-                    write!(f, "/mcp/{}/{}", server, self.name)
-                } else {
-                    write!(f, "/mcp/{}/{}:{}", server, self.name, self.version)
-                }
-            }
-            Namespace::User(user) => {
-                if let Some(package) = &self.package {
-                    if self.version == "latest" {
-                        write!(f, "/{}/{}/{}", user, package, self.name)
-                    } else {
-                        write!(f, "/{}/{}/{}:{}", user, package, self.name, self.version)
-                    }
-                } else {
-                    write!(f, "/{}/{}", user, self.name)
-                }
-            }
-        }
+        write!(f, "{}", self.to_mcp_name())
     }
 }
 
@@ -258,22 +242,22 @@ mod tests {
     #[test]
     fn test_parse_paths() {
         assert_eq!(
-            ToolPath::parse("/bin/tcl_execute").unwrap(),
+            ToolPath::parse("bin__tcl_execute").unwrap(),
             ToolPath::bin("tcl_execute")
         );
 
         assert_eq!(
-            ToolPath::parse("/sbin/tcl_tool_add").unwrap(),
+            ToolPath::parse("sbin__tcl_tool_add").unwrap(),
             ToolPath::sbin("tcl_tool_add")
         );
 
         assert_eq!(
-            ToolPath::parse("/alice/utils/reverse_string:1.0").unwrap(),
+            ToolPath::parse("user__alice__utils__reverse_string__v1_0").unwrap(),
             ToolPath::user("alice", "utils", "reverse_string", "1.0")
         );
 
         assert_eq!(
-            ToolPath::parse("/bob/math/calculate").unwrap(),
+            ToolPath::parse("user__bob__math__calculate").unwrap(),
             ToolPath::user("bob", "math", "calculate", "latest")
         );
     }

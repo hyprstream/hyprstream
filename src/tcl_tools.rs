@@ -61,7 +61,7 @@ fn default_version() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TclToolRemoveRequest {
-    /// Full tool path (e.g., "/alice/utils/reverse_string:1.0")
+    /// Full tool path (e.g., "user__alice__utils__reverse_string__v1_0")
     pub path: String,
 }
 
@@ -77,7 +77,7 @@ pub struct TclToolListRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TclExecToolRequest {
-    /// Tool path to execute (e.g., "/bin/list_dir")
+    /// Tool path to execute (e.g., "bin__list_dir")
     pub tool_path: String,
     /// Parameters to pass to the tool
     #[serde(default)]

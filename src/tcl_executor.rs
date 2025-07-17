@@ -742,14 +742,14 @@ impl TclExecutor {
 
         // Check if it's a built-in system tool
         match tool_path {
-            "/bin/tcl_execute" => {
+            "bin__tcl_execute" => {
                 if let Some(script) = params.get("script").and_then(|s| s.as_str()) {
                     self.execute_script(script)
                 } else {
                     Err(anyhow!("Missing required parameter: script"))
                 }
             }
-            "/bin/tcl_tool_list" => {
+            "bin__tcl_tool_list" => {
                 let namespace = params
                     .get("namespace")
                     .and_then(|s| s.as_str())
@@ -761,7 +761,7 @@ impl TclExecutor {
                 let tools = self.list_tools(namespace, filter);
                 Ok(tools.join("\n"))
             }
-            "/bin/list_tools" => {
+            "bin__list_tools" => {
                 let namespace = params
                     .get("namespace")
                     .and_then(|s| s.as_str())
@@ -802,7 +802,7 @@ impl TclExecutor {
                     Err(e) => Err(anyhow!("Failed to list tools: {}", e)),
                 }
             }
-            "/bin/inspect_tool" => {
+            "bin__inspect_tool" => {
                 if let Some(tool_path) = params.get("tool_path").and_then(|s| s.as_str()) {
                     match advanced_tools::inspect_tool(&self.tool_registry, tool_path).await {
                         Ok(result) => Ok(result),
@@ -812,13 +812,13 @@ impl TclExecutor {
                     Err(anyhow!("Missing required parameter: tool_path"))
                 }
             }
-            "/bin/list_namespaces" => {
+            "bin__list_namespaces" => {
                 match advanced_tools::list_namespaces(&self.tool_registry).await {
                     Ok(result) => Ok(result),
                     Err(e) => Err(anyhow!("Failed to list namespaces: {}", e)),
                 }
             }
-            "/bin/search_tools" => {
+            "bin__search_tools" => {
                 if let Some(query) = params.get("query").and_then(|s| s.as_str()) {
                     let limit = params
                         .get("limit")
@@ -832,7 +832,7 @@ impl TclExecutor {
                     Err(anyhow!("Missing required parameter: query"))
                 }
             }
-            "/bin/list_xmcp_tools" => {
+            "bin__list_xmcp_tools" => {
                 let server_filter = params
                     .get("server")
                     .and_then(|s| s.as_str())

@@ -440,7 +440,7 @@ impl TclMcpServer {
                 for (path, description, schema) in system_tools {
                     tools.push(McpToolInfo {
                         name: path.to_mcp_name(),
-                        description: Some(format!("{} [{}]", description, path)),
+                        description: Some(description.to_string()),
                         input_schema: schema,
                     });
                 }
@@ -851,35 +851,35 @@ For Molt-specific capabilities and limitations, refer to the Molt Book."#)),
                     }
                     "bin__list_tools" => {
                         let request: crate::tcl_tools::TclExecToolRequest = serde_json::from_value(json!({
-                            "tool_path": "/bin/list_tools",
+                            "tool_path": "bin__list_tools",
                             "params": params.arguments
                         }))?;
                         tb.exec_tool(request).await
                     }
                     "bin__inspect_tool" => {
                         let request: crate::tcl_tools::TclExecToolRequest = serde_json::from_value(json!({
-                            "tool_path": "/bin/inspect_tool", 
+                            "tool_path": "bin__inspect_tool", 
                             "params": params.arguments
                         }))?;
                         tb.exec_tool(request).await
                     }
                     "bin__list_namespaces" => {
                         let request: crate::tcl_tools::TclExecToolRequest = serde_json::from_value(json!({
-                            "tool_path": "/bin/list_namespaces",
+                            "tool_path": "bin__list_namespaces",
                             "params": params.arguments
                         }))?;
                         tb.exec_tool(request).await
                     }
                     "bin__search_tools" => {
                         let request: crate::tcl_tools::TclExecToolRequest = serde_json::from_value(json!({
-                            "tool_path": "/bin/search_tools",
+                            "tool_path": "bin__search_tools",
                             "params": params.arguments
                         }))?;
                         tb.exec_tool(request).await
                     }
                     "bin__list_xmcp_tools" => {
                         let request: crate::tcl_tools::TclExecToolRequest = serde_json::from_value(json!({
-                            "tool_path": "/bin/list_xmcp_tools",
+                            "tool_path": "bin__list_xmcp_tools",
                             "params": params.arguments
                         }))?;
                         tb.exec_tool(request).await

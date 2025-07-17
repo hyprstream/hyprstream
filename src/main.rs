@@ -203,16 +203,16 @@ async fn run_tool(
     }
 
     // Convert tool name to MCP format if needed
-    let mcp_tool_name = if tool_name.contains(path_format::SEPARATOR) {
+    let mcp_tool_name = if tool_name.contains("__") {
         // Already in MCP format
         tool_name.to_string()
     } else {
         // Try to find the tool by searching for it
         // First, try with common namespace prefixes
         let candidates = vec![
-            path_format::PathPattern::bin(tool_name),
-            path_format::PathPattern::sbin(tool_name),
-            path_format::PathPattern::docs(tool_name),
+            format!("bin__{}", tool_name),
+            format!("sbin__{}", tool_name),
+            format!("docs__{}", tool_name),
             format!("user__{}", tool_name),
             format!("debug__{}", tool_name),
             format!("test__{}", tool_name),
