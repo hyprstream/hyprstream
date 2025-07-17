@@ -1,6 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing::info;
+use chrono::Utc;
+use std::collections::HashMap;
 
 mod advanced_tools;
 mod mcp_client;
@@ -17,6 +19,8 @@ mod tool_discovery;
 mod tool_registry;
 
 use server::TclMcpServer;
+use mcp_client::{McpClient, McpServerConfig};
+use mcp_persistence::McpPersistence;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -67,6 +71,74 @@ enum Commands {
     },
     /// Start the MCP server (default behavior)
     Server,
+    /// Manage downstream MCP clients
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpCommands {
+    /// Add a new MCP server
+    Add {
+        /// Unique identifier for the server
+        id: String,
+        /// Human-readable name for the server
+        name: String,
+        /// Optional description of the server
+        #[arg(long)]
+        description: Option<String>,
+        /// Environment variables in KEY=VALUE format
+        #[arg(long, help = "Environment variables in KEY=VALUE format (can be specified multiple times)")]
+        env: Vec<String>,
+        /// Whether to auto-start the server
+        #[arg(long, default_value = "true")]
+        auto_start: bool,
+        /// Connection timeout in milliseconds
+        #[arg(long, default_value = "30000")]
+        timeout_ms: u64,
+        /// Maximum retry attempts
+        #[arg(long, default_value = "3")]
+        max_retries: u32,
+        /// Command and arguments (everything after options)
+        #[arg(last = true, help = "Command and arguments to start the server (use -- to separate if needed)")]
+        command_args: Vec<String>,
+    },
+    /// Remove an MCP server
+    Remove {
+        /// Server ID to remove
+        id: String,
+        /// Whether to force removal (kill process)
+        #[arg(long)]
+        force: bool,
+    },
+    /// List all registered MCP servers
+    List {
+        /// Show detailed information
+        #[arg(long)]
+        detailed: bool,
+    },
+    /// Get information about a specific MCP server
+    Info {
+        /// Server ID to get information about
+        id: String,
+    },
+    /// Connect to an MCP server
+    Connect {
+        /// Server ID to connect to
+        id: String,
+    },
+    /// Disconnect from an MCP server
+    Disconnect {
+        /// Server ID to disconnect from
+        id: String,
+    },
+    /// Test connectivity to an MCP server
+    Ping {
+        /// Server ID to ping
+        id: String,
+    },
 }
 
 fn parse_json_args(s: &str) -> Result<serde_json::Value, String> {
@@ -157,6 +229,7 @@ async fn main() -> Result<()> {
             list_tools(namespace, filter, args.privileged, runtime_config).await
         }
         Some(Commands::Info { tool }) => tool_info(&tool, args.privileged, runtime_config).await,
+        Some(Commands::Mcp { command }) => handle_mcp_command(command).await,
         Some(Commands::Server) | None => {
             // Default behavior - run as MCP server
             if args.privileged {
@@ -416,4 +489,262 @@ async fn tool_info(
             std::process::exit(1);
         }
     }
+}
+
+async fn handle_mcp_command(command: McpCommands) -> Result<()> {
+    match command {
+        McpCommands::Add {
+            id,
+            name,
+            description,
+            env,
+            auto_start,
+            timeout_ms,
+            max_retries,
+            command_args,
+        } => add_mcp_server(id, name, command_args, description, env, auto_start, timeout_ms, max_retries).await,
+        McpCommands::Remove { id, force } => remove_mcp_server(id, force).await,
+        McpCommands::List { detailed } => list_mcp_servers(detailed).await,
+        McpCommands::Info { id } => mcp_server_info(id).await,
+        McpCommands::Connect { id } => connect_mcp_server(id).await,
+        McpCommands::Disconnect { id } => disconnect_mcp_server(id).await,
+        McpCommands::Ping { id } => ping_mcp_server(id).await,
+    }
+}
+
+async fn add_mcp_server(
+    id: String,
+    name: String,
+    command_args: Vec<String>,
+    description: Option<String>,
+    env: Vec<String>,
+    auto_start: bool,
+    timeout_ms: u64,
+    max_retries: u32,
+) -> Result<()> {
+    // Parse command and arguments
+    if command_args.is_empty() {
+        eprintln!("Error: No command provided");
+        std::process::exit(1);
+    }
+    
+    let command = command_args[0].clone();
+    let args = command_args[1..].to_vec();
+
+    // Parse environment variables
+    let mut env_map = HashMap::new();
+    for env_var in env {
+        if let Some((key, value)) = env_var.split_once('=') {
+            env_map.insert(key.to_string(), value.to_string());
+        } else {
+            eprintln!("Warning: Invalid environment variable format: {}", env_var);
+        }
+    }
+
+    // Create server configuration
+    let config = McpServerConfig {
+        id: id.clone(),
+        name,
+        description,
+        command,
+        args,
+        env: env_map,
+        auto_start,
+        timeout_ms,
+        max_retries,
+        created_at: Utc::now(),
+    };
+
+    // Save to persistence
+    let mut persistence = McpPersistence::new().await?;
+    persistence.save_server(id.clone(), config.clone(), auto_start).await?;
+
+    // Create MCP client and register server
+    let client = McpClient::new();
+    if let Err(e) = client.register_server(config).await {
+        eprintln!("Warning: Failed to register server with MCP client: {}", e);
+        eprintln!("The server configuration has been saved, but auto-start may not work until the server is available.");
+    }
+
+    println!("✓ MCP server '{}' added successfully", id);
+    if auto_start {
+        println!("  Auto-start is enabled - the server will start automatically");
+    }
+    Ok(())
+}
+
+async fn remove_mcp_server(id: String, force: bool) -> Result<()> {
+    // Remove from persistence
+    let mut persistence = McpPersistence::new().await?;
+    let removed = persistence.remove_server(&id).await?;
+
+    if !removed {
+        eprintln!("Server '{}' not found in configuration", id);
+        std::process::exit(1);
+    }
+
+    // Remove from client (if running)
+    let client = McpClient::new();
+    if let Err(e) = client.remove_server(&id, force).await {
+        eprintln!("Warning: Error removing server from client: {}", e);
+    }
+
+    println!("✓ MCP server '{}' removed successfully", id);
+    Ok(())
+}
+
+async fn list_mcp_servers(detailed: bool) -> Result<()> {
+    let persistence = McpPersistence::new().await?;
+    let servers = persistence.list_servers();
+
+    if servers.is_empty() {
+        println!("No MCP servers configured");
+        return Ok(());
+    }
+
+    if detailed {
+        println!("Registered MCP servers:");
+        println!();
+        for (id, entry) in servers {
+            println!("Server: {}", id);
+            println!("  Name: {}", entry.config.name);
+            println!("  Command: {}", entry.config.command);
+            if !entry.config.args.is_empty() {
+                println!("  Args: {:?}", entry.config.args);
+            }
+            if let Some(desc) = &entry.config.description {
+                println!("  Description: {}", desc);
+            }
+            println!("  Auto-start: {}", entry.auto_start);
+            println!("  Timeout: {}ms", entry.config.timeout_ms);
+            println!("  Max retries: {}", entry.config.max_retries);
+            println!("  Added: {}", entry.added_at.format("%Y-%m-%d %H:%M:%S UTC"));
+            println!("  Updated: {}", entry.updated_at.format("%Y-%m-%d %H:%M:%S UTC"));
+            if !entry.config.env.is_empty() {
+                println!("  Environment:");
+                for (key, value) in &entry.config.env {
+                    println!("    {}={}", key, value);
+                }
+            }
+            println!();
+        }
+    } else {
+        println!("Registered MCP servers:");
+        for (id, entry) in servers {
+            let status_indicator = if entry.auto_start { "🟢" } else { "⚪" };
+            println!("  {} {} - {}", status_indicator, id, entry.config.name);
+        }
+        println!();
+        println!("Legend: 🟢 = auto-start enabled, ⚪ = manual start");
+    }
+
+    Ok(())
+}
+
+async fn mcp_server_info(id: String) -> Result<()> {
+    let persistence = McpPersistence::new().await?;
+    
+    if let Some(entry) = persistence.get_server(&id) {
+        println!("MCP Server Information");
+        println!("=====================");
+        println!("ID: {}", id);
+        println!("Name: {}", entry.config.name);
+        println!("Command: {}", entry.config.command);
+        
+        if !entry.config.args.is_empty() {
+            println!("Arguments: {:?}", entry.config.args);
+        }
+        
+        if let Some(desc) = &entry.config.description {
+            println!("Description: {}", desc);
+        }
+        
+        println!("Auto-start: {}", entry.auto_start);
+        println!("Timeout: {}ms", entry.config.timeout_ms);
+        println!("Max retries: {}", entry.config.max_retries);
+        println!("Added: {}", entry.added_at.format("%Y-%m-%d %H:%M:%S UTC"));
+        println!("Updated: {}", entry.updated_at.format("%Y-%m-%d %H:%M:%S UTC"));
+        
+        if !entry.config.env.is_empty() {
+            println!("Environment variables:");
+            for (key, value) in &entry.config.env {
+                println!("  {}={}", key, value);
+            }
+        }
+        
+        // Try to get runtime status
+        let client = McpClient::new();
+        if let Ok(status) = client.get_server_status(&id).await {
+            println!("Runtime status: {:?}", status);
+        }
+    } else {
+        eprintln!("Server '{}' not found", id);
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+async fn connect_mcp_server(id: String) -> Result<()> {
+    let persistence = McpPersistence::new().await?;
+    
+    if let Some(entry) = persistence.get_server(&id) {
+        let client = McpClient::new();
+        client.register_server(entry.config.clone()).await?;
+        
+        match client.debug_connect_server(&id).await {
+            Ok(result) => {
+                println!("{}", result);
+            }
+            Err(e) => {
+                eprintln!("Failed to connect to server '{}': {}", id, e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        eprintln!("Server '{}' not found", id);
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+async fn disconnect_mcp_server(id: String) -> Result<()> {
+    let client = McpClient::new();
+    
+    match client.debug_disconnect_server(&id).await {
+        Ok(result) => {
+            println!("{}", result);
+        }
+        Err(e) => {
+            eprintln!("Failed to disconnect from server '{}': {}", id, e);
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
+}
+
+async fn ping_mcp_server(id: String) -> Result<()> {
+    let persistence = McpPersistence::new().await?;
+    
+    if let Some(entry) = persistence.get_server(&id) {
+        let client = McpClient::new();
+        client.register_server(entry.config.clone()).await?;
+        
+        match client.debug_ping_server(&id).await {
+            Ok(result) => {
+                println!("{}", result);
+            }
+            Err(e) => {
+                eprintln!("Failed to ping server '{}': {}", id, e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        eprintln!("Server '{}' not found", id);
+        std::process::exit(1);
+    }
+
+    Ok(())
 }
