@@ -1,7 +1,6 @@
 //! VDB-first service module for adaptive ML inference
 
 pub mod embedding_flight;
-pub mod flight;
 pub mod flight_metric;
 
 // Re-export main services

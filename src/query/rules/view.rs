@@ -1,7 +1,7 @@
 use crate::storage::view::ViewMetadata;
 use crate::storage::VDBSparseStorage;
 use datafusion::error::Result;
-use datafusion::logical_expr::{LogicalPlan, TableScan, Expr};
+use datafusion::logical_expr::{LogicalPlan, TableScan};
 use datafusion::optimizer::optimizer::{OptimizerConfig, OptimizerRule};
 use datafusion_common::tree_node::Transformed;
 use datafusion::sql::TableReference;
@@ -77,6 +77,7 @@ impl ViewOptimizationRule {
     }
 
     /// Check if a view can be used to answer this query
+    #[allow(dead_code)]
     fn can_use_view(&self, plan: &LogicalPlan, view: &ViewMetadata) -> Result<bool> {
         match plan {
             LogicalPlan::TableScan(scan) => {
@@ -98,6 +99,7 @@ impl ViewOptimizationRule {
     }
 
     /// Rewrite the plan to use the view
+    #[allow(dead_code)]
     fn rewrite_with_view(&self, plan: &LogicalPlan, view: &ViewMetadata) -> Result<LogicalPlan> {
         match plan {
             LogicalPlan::TableScan(scan) => {

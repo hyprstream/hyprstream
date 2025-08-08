@@ -1,7 +1,7 @@
-//! NanoVDB-backed sparse storage for adaptive layers
+//! OpenVDB-backed sparse storage for adaptive layers
 //! 
-//! This module provides 100x compression for 99% sparse adapter weights
-//! using NanoVDB's hierarchical grid structure.
+//! This module provides efficient storage and dynamic updates for 99% sparse 
+//! adapter weights using OpenVDB's hierarchical grid structure.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,18 +15,35 @@ use serde::{Serialize, Deserialize};
 pub mod grid;
 pub mod compression;
 pub mod adapter_store;
-pub mod nanovdb_bindings;
-pub mod hardware_accelerated;
 pub mod neuralvdb_codec;
 pub mod sparse_storage; // New VDB-first storage interface
+
+// OpenVDB integration (only VDB backend)
+#[cfg(feature = "vdb")]
+pub mod openvdb_bindings;
+
+// Hardware accelerated module requires VDB support
+#[cfg(feature = "vdb")]
+pub mod hardware_accelerated;
 
 pub use grid::*;
 pub use compression::*;
 pub use adapter_store::*;
-pub use nanovdb_bindings::*;
-pub use hardware_accelerated::*;
-pub use neuralvdb_codec::*;
 pub use sparse_storage::*; // Export new VDB-first interface
+
+// Export OpenVDB bindings when VDB feature enabled
+#[cfg(feature = "vdb")]
+pub use openvdb_bindings::{
+    OpenVDBLoRAAdapter, 
+    OpenVDBActiveIterator, 
+    OpenVDBBatchOps
+};
+
+// Export hardware accelerated features when VDB is available
+#[cfg(feature = "vdb")]
+pub use hardware_accelerated::*;
+
+pub use neuralvdb_codec::*;
 
 /// Configuration for VDB storage
 #[derive(Debug, Clone, Serialize, Deserialize)]

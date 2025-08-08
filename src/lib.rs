@@ -9,11 +9,14 @@
 
 pub mod aggregation;
 pub mod adapters;
+pub mod api;
 pub mod error;
 pub mod cli;
+pub mod inference;
 pub mod metrics;
 pub mod models;
 pub mod query;
+pub mod runtime;
 pub mod service;
 pub mod storage;
 pub mod config;
@@ -27,4 +30,8 @@ pub use service::{EmbeddingFlightService, MetricFlightSqlService};
 pub use storage::{
     VDBSparseStorage, SparseStorageConfig, SparseStorage,
     SparseWeightUpdate, EmbeddingMatch, SparseStorageError
+};
+pub use runtime::{
+    RuntimeEngine, LlamaCppEngine, LoRAEngineWrapper, SparseLoRAAdapter, LoRAConfig,
+    ModelInfo, GenerationRequest, GenerationResult, FinishReason, RuntimeConfig
 };

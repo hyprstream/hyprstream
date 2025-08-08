@@ -20,7 +20,7 @@ use arrow_ipc;
 use std::pin::Pin;
 use std::sync::Arc;
 use tonic::{Request, Response, Status, Streaming};
-use futures::stream::{self, Stream, StreamExt};
+use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 
 /// Embedding query types for FlightSQL interface
@@ -371,7 +371,8 @@ impl FlightService for EmbeddingFlightService {
         // Convert schema to IPC bytes using arrow format
         let schema_message = arrow_ipc::writer::IpcWriteOptions::default();
         let encoded_data = arrow_ipc::writer::IpcDataGenerator::default();
-        let encoded_schema = encoded_data.schema_to_bytes(&schema, &schema_message);
+        let mut dictionary_tracker = arrow_ipc::writer::DictionaryTracker::new(false);
+        let encoded_schema = encoded_data.schema_to_bytes_with_dictionary_tracker(&schema, &mut dictionary_tracker, &schema_message);
         let schema_bytes = encoded_schema.ipc_message.into();
         let schema_result = SchemaResult { schema: schema_bytes };
         Ok(Response::new(schema_result))

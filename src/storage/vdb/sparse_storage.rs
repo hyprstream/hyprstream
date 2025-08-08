@@ -7,8 +7,11 @@
 //! - Hardware-accelerated sparse operations
 
 use crate::storage::vdb::{
-    Coordinate3D, HardwareVDBStorage, NeuralVDBCodec,
+    Coordinate3D, NeuralVDBCodec,
 };
+
+#[cfg(feature = "vdb")]
+use crate::storage::vdb::HardwareVDBStorage;
 use crate::storage::vdb::compression::CompressionStats;
 use crate::storage::vdb::adapter_store::{AdapterInfo, AdapterMetadata};
 use crate::adapters::sparse_lora::{SparseLoRAAdapter, SparseLoRAConfig};

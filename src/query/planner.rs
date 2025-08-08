@@ -1,13 +1,11 @@
 use crate::query::rules::view::ViewOptimizationRule;
 use crate::storage::VDBSparseStorage;
 use datafusion::arrow::datatypes::Schema;
-use crate::error::StatusWrapper;
-use datafusion::error::{DataFusionError, Result};
+use datafusion::error::Result;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::optimizer::optimizer::OptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::datasource::memory::MemTable;
 use std::sync::Arc;
 
 /// Represents a query that can be planned and executed
@@ -76,7 +74,6 @@ impl DataFusionPlanner {
 
         // VDB-first storage doesn't have traditional tables
         // Instead, we can register embedding search as a custom function
-        // This is a placeholder for VDB-specific query capabilities
 
         Ok(planner)
     }

@@ -7,7 +7,7 @@ use clap::Parser;
 use config::Config;
 use hyprstream_core::{
     cli::commands::Commands,
-    cli::handlers::{handle_server, handle_embedding_query},
+    cli::handlers::{handle_server, handle_embedding_query, handle_model_command, handle_lora_command, handle_auth_command},
 };
 use tracing::{info, Level};
 use tracing_subscriber::EnvFilter;
@@ -27,6 +27,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (level, filter) = match &cli.command {
         Commands::Server(cmd) => (&cmd.logging.get_effective_level(), &cmd.logging.log_filter),
         Commands::Sql(cmd) => (&cmd.logging.get_effective_level(), &cmd.logging.log_filter),
+        Commands::Model(_) => (&"info", &None),
+        Commands::Lora(_) => (&"info", &None),
+        Commands::QuickStart(_) => (&"info", &None),
+        Commands::Auth(_) => (&"info", &None),
     };
 
     // Initialize logging
@@ -84,6 +88,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cmd.tls_skip_verify,
                 cmd.logging.verbose > 0,
             ).await?
+        }
+        Commands::Model(cmd) => {
+            let server_url = "http://localhost:50051".to_string(); // Default server URL
+            handle_model_command(cmd, server_url).await?
+        }
+        Commands::Lora(cmd) => {
+            let server_url = "http://localhost:50051".to_string(); // Default server URL
+            handle_lora_command(cmd, server_url).await?
+        }
+        Commands::QuickStart(cmd) => {
+            hyprstream_core::cli::commands::quick_start::handle_quick_start(cmd).await?
+        }
+        Commands::Auth(cmd) => {
+            handle_auth_command(cmd).await?
         }
     }
 

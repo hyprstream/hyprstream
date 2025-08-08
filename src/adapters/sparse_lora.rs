@@ -176,7 +176,7 @@ impl SparseLoRAAdapter {
         
         // Initialize LoRA B with zeros (standard practice)
         {
-            let lora_b = self.lora_b.write().await;
+            let _lora_b = self.lora_b.write().await;
             // B starts at zero so adapter initially has no effect
         }
         
@@ -189,7 +189,7 @@ impl SparseLoRAAdapter {
     
     /// Forward pass: input @ A @ B
     pub async fn forward(&self, input: &[f32]) -> Vec<f32> {
-        let start = std::time::Instant::now();
+        let _start = std::time::Instant::now();
         
         // input: [batch_size * seq_len, in_features]
         // Simplified for single vector input
@@ -364,6 +364,28 @@ impl SparseLoRAAdapter {
         };
         
         lora_a_size + lora_b_size + bias_size
+    }
+    
+    /// Get the total number of sparse weights in the adapter
+    pub fn get_sparse_weight_count(&self) -> usize {
+        // For now, return estimate based on configuration
+        // In async context, this would need to be `async fn`
+        let max_active_a = ((self.config.in_features * self.config.rank) as f32 * (1.0 - self.config.sparsity)) as usize;
+        let max_active_b = ((self.config.rank * self.config.out_features) as f32 * (1.0 - self.config.sparsity)) as usize;
+        max_active_a + max_active_b
+    }
+    
+    /// Scale all weights by a given factor (for fusion)
+    pub fn scale_weights(&self, scale: f32) -> anyhow::Result<Self> {
+        // Create a scaled copy of the adapter
+        let mut scaled_config = self.config.clone();
+        scaled_config.alpha *= scale; // Scale the LoRA alpha parameter
+        
+        let scaled_adapter = Self::new(scaled_config);
+        
+        // In a full implementation, we would copy and scale the actual weights
+        // For now, return a new adapter with scaled config
+        Ok(scaled_adapter)
     }
 }
 

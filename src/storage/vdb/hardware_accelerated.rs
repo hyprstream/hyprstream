@@ -1,9 +1,24 @@
-//! Hardware-accelerated VDB storage using official NanoVDB
+//! Hardware-accelerated VDB storage using OpenVDB
 
-use crate::storage::vdb::nanovdb_bindings::{
-    NanoGrid, GridBuilder, Coord3D, NanoVDBError,
-    utils::cuda_available
+#[cfg(feature = "vdb")]
+use crate::storage::vdb::openvdb_bindings::{
+    OpenVDBLoRAAdapter, OpenVDBBatchOps
 };
+
+use std::fmt;
+
+/// VDB operation errors
+#[derive(Debug, thiserror::Error)]
+pub enum VDBError {
+    #[error("OpenVDB not available - install OpenVDB to use VDB features")]
+    OpenVDBNotAvailable,
+    #[error("VDB operation failed: {0}")]
+    OperationFailed(String),
+    #[error("Invalid coordinates: ({0}, {1})")]
+    InvalidCoordinates(i32, i32),
+    #[error("I/O error: {0}")]
+    IoError(#[from] std::io::Error),
+}
 use crate::storage::vdb::grid::{SparseWeights, Coordinate3D};
 use crate::storage::vdb::neuralvdb_codec::{NeuralVDBCodec, CompressedAdapter, CompressionStats};
 use crate::adapters::sparse_lora::{SparseLoRAAdapter, SparseLoRAConfig};
@@ -13,17 +28,15 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use std::time::Instant;
 
-#[cfg(feature = "cuda")]
-use crate::storage::vdb::nanovdb_bindings::CudaGrid;
-
-/// Hardware-accelerated VDB storage with NanoVDB backend
+/// Hardware-accelerated VDB storage with OpenVDB backend
 pub struct HardwareVDBStorage {
-    /// CPU grids for fallback and initialization
-    cpu_grids: Arc<RwLock<HashMap<String, NanoGrid>>>,
+    /// OpenVDB-based LoRA adapters
+    #[cfg(feature = "vdb")]
+    adapters: Arc<RwLock<HashMap<String, OpenVDBLoRAAdapter>>>,
     
-    /// GPU grids for hardware acceleration
-    #[cfg(feature = "cuda")]
-    gpu_grids: Arc<RwLock<HashMap<String, CudaGrid>>>,
+    /// Fallback HashMap storage when OpenVDB not available
+    #[cfg(not(feature = "vdb"))]
+    fallback_storage: Arc<RwLock<HashMap<String, HashMap<Coordinate3D, f32>>>>,
     
     /// NeuralVDB codec for extreme compression (10-100x)
     neural_codec: Arc<NeuralVDBCodec>,
@@ -33,12 +46,6 @@ pub struct HardwareVDBStorage {
     
     /// Performance and usage statistics
     stats: Arc<RwLock<HardwareStats>>,
-    
-    /// Whether CUDA is available and enabled
-    cuda_enabled: bool,
-    
-    /// Background value for new grids
-    background_value: f32,
     
     /// Enable neural compression (default: true for 10-100x compression)
     neural_compression_enabled: bool,
@@ -78,45 +85,38 @@ pub struct HardwareStats {
 
 impl HardwareVDBStorage {
     /// Create new hardware-accelerated VDB storage
-    pub async fn new() -> Result<Self, NanoVDBError> {
+    pub async fn new() -> Result<Self, VDBError> {
         Self::new_with_config(true).await
     }
 
     /// Create new storage with configurable neural compression
-    pub async fn new_with_config(neural_compression: bool) -> Result<Self, NanoVDBError> {
-        let cuda_enabled = cuda_available();
-        
+    pub async fn new_with_config(neural_compression: bool) -> Result<Self, VDBError> {
         // Initialize NeuralVDB codec
-        let device = if cuda_enabled {
-            crate::storage::vdb::neuralvdb_codec::Device::Cuda(0)
-        } else {
-            crate::storage::vdb::neuralvdb_codec::Device::Cpu
-        };
+        let device = crate::storage::vdb::neuralvdb_codec::Device::Cpu;
         
         let neural_codec = Arc::new(
             NeuralVDBCodec::new(device)
-                .map_err(|e| NanoVDBError::InitializationFailed(e.to_string()))?
+                .map_err(|e| VDBError::OperationFailed(e.to_string()))?
         );
         
-        if cuda_enabled {
-            println!("✅ NanoVDB initialized with CUDA acceleration + NeuralVDB codec");
-        } else {
-            println!("⚠️ NanoVDB initialized CPU-only with NeuralVDB codec");
-        }
+        #[cfg(feature = "vdb")]
+        println!("✅ OpenVDB initialized with NeuralVDB codec");
+        
+        #[cfg(not(feature = "vdb"))]
+        println!("⚠️ Fallback storage initialized with NeuralVDB codec");
 
         if neural_compression {
             println!("🧠 Neural compression enabled (10-100x compression ratios)");
         }
 
         Ok(Self {
-            cpu_grids: Arc::new(RwLock::new(HashMap::new())),
-            #[cfg(feature = "cuda")]
-            gpu_grids: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(feature = "vdb")]
+            adapters: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(not(feature = "vdb"))]
+            fallback_storage: Arc::new(RwLock::new(HashMap::new())),
             neural_codec,
             compressed_adapters: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(RwLock::new(HardwareStats::default())),
-            cuda_enabled,
-            background_value: 0.0,
             neural_compression_enabled: neural_compression,
         })
     }
@@ -126,47 +126,32 @@ impl HardwareVDBStorage {
         &self,
         adapter_id: &str,
         adapter: &SparseLoRAAdapter,
-    ) -> Result<(), NanoVDBError> {
+    ) -> Result<(), VDBError> {
         let start = Instant::now();
         
-        // Convert adapter to VDB weights
-        let vdb_weights = adapter.to_vdb_weights().await;
-        
-        // Build NanoVDB grid
-        let mut builder = GridBuilder::new(self.background_value)?;
-        
-        // Add sparse weights to grid
-        self.populate_grid_from_weights(&mut builder, &vdb_weights).await;
-        
-        // Build final grid
-        let cpu_grid = builder.build()?;
-        
-        // Store CPU grid
+        #[cfg(feature = "vdb")]
         {
-            let mut cpu_grids = self.cpu_grids.write().await;
-            cpu_grids.insert(adapter_id.to_string(), cpu_grid);
-        }
-
-        // Convert to GPU if CUDA is available
-        #[cfg(feature = "cuda")]
-        if self.cuda_enabled {
-            let cpu_grid = {
-                let cpu_grids = self.cpu_grids.read().await;
-                cpu_grids.get(adapter_id).unwrap().clone()
-            };
+            // Create OpenVDB LoRA grid
+            let openvdb_adapter = crate::storage::vdb::openvdb_bindings::OpenVDBLoRAAdapter::new()
+                .map_err(|e| VDBError::OperationFailed(e.to_string()))?;
             
-            match cpu_grid.to_cuda() {
-                Ok(gpu_grid) => {
-                    let mut gpu_grids = self.gpu_grids.write().await;
-                    gpu_grids.insert(adapter_id.to_string(), gpu_grid);
-                    
-                    let mut stats = self.stats.write().await;
-                    stats.gpu_memory_usage += vdb_weights.active_count() * 16; // Estimate
-                }
-                Err(e) => {
-                    eprintln!("Failed to convert grid to CUDA: {}", e);
-                }
+            // Convert sparse adapter to OpenVDB format
+            let weights = adapter.get_sparse_weights().await;
+            for (coord, weight) in weights {
+                openvdb_adapter.set_weight(coord.x(), coord.y(), coord.z(), weight);
             }
+            
+            // Store in adapters map
+            let mut adapters = self.adapters.write().await;
+            adapters.insert(adapter_id.to_string(), openvdb_adapter);
+        }
+        
+        #[cfg(not(feature = "vdb"))]
+        {
+            // Fallback storage implementation
+            let weights = adapter.get_sparse_weights().await;
+            let mut storage = self.fallback_storage.write().await;
+            storage.insert(adapter_id.to_string(), weights);
         }
 
         // Update statistics
@@ -178,15 +163,10 @@ impl HardwareVDBStorage {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
-            
-            // Calculate compression ratio
-            let dense_size = vdb_weights.shape().iter().product::<usize>() * std::mem::size_of::<f32>();
-            let sparse_size = vdb_weights.active_count() * (std::mem::size_of::<Coordinate3D>() + std::mem::size_of::<f32>());
-            stats.avg_compression_ratio = dense_size as f64 / sparse_size as f64;
         }
 
-        println!("Stored adapter '{}' in {:.2}ms (CUDA: {})", 
-                adapter_id, start.elapsed().as_millis(), self.cuda_enabled);
+        println!("Stored adapter '{}' in {:.2}ms", 
+                adapter_id, start.elapsed().as_millis());
 
         Ok(())
     }
@@ -196,7 +176,7 @@ impl HardwareVDBStorage {
         &self,
         adapter_id: &str,
         adapter: &SparseLoRAAdapter,
-    ) -> Result<(), NanoVDBError> {
+    ) -> Result<(), VDBError> {
         if !self.neural_compression_enabled {
             return self.store_adapter_accelerated(adapter_id, adapter).await;
         }
@@ -206,7 +186,7 @@ impl HardwareVDBStorage {
         // Use NeuralVDB codec for extreme compression (10-100x)
         let compressed = self.neural_codec.encode_adapter(adapter_id, adapter)
             .await
-            .map_err(|e| NanoVDBError::CompressionFailed(e.to_string()))?;
+            .map_err(|e| VDBError::OperationFailed(e.to_string()))?;
 
         // Store compressed representation
         {
@@ -237,7 +217,7 @@ impl HardwareVDBStorage {
         &self,
         adapter_id: &str,
         config: SparseLoRAConfig,
-    ) -> Result<SparseLoRAAdapter, NanoVDBError> {
+    ) -> Result<SparseLoRAAdapter, VDBError> {
         if !self.neural_compression_enabled {
             return self.load_adapter_accelerated(adapter_id, config).await;
         }
@@ -248,10 +228,10 @@ impl HardwareVDBStorage {
         let adapter = {
             let compressed_adapters = self.compressed_adapters.read().await;
             let compressed = compressed_adapters.get(adapter_id)
-                .ok_or(NanoVDBError::GridCreationFailed)?;
+                .ok_or(VDBError::OperationFailed("Grid not found".to_string()))?;
             self.neural_codec.decode_adapter(compressed, config)
                 .await
-                .map_err(|e| NanoVDBError::DecompressionFailed(e.to_string()))?
+                .map_err(|e| VDBError::OperationFailed(e.to_string()))?;
         };
 
         // Update cache statistics
@@ -271,7 +251,7 @@ impl HardwareVDBStorage {
         &self,
         adapter_id: &str,
         adapter: &SparseLoRAAdapter,
-    ) -> Result<(), NanoVDBError> {
+    ) -> Result<(), VDBError> {
         // Store regular version for fast access
         self.store_adapter_accelerated(adapter_id, adapter).await?;
 
@@ -289,20 +269,32 @@ impl HardwareVDBStorage {
         &self,
         adapter_id: &str,
         config: SparseLoRAConfig,
-    ) -> Result<SparseLoRAAdapter, NanoVDBError> {
+    ) -> Result<SparseLoRAAdapter, VDBError> {
         let start = Instant::now();
         
-        // Convert grid back to VDB weights directly to avoid borrowing issues
-        let vdb_weights = {
-            let cpu_grids = self.cpu_grids.read().await;
-            let cpu_grid = cpu_grids.get(adapter_id)
-                .ok_or(NanoVDBError::GridCreationFailed)?;
-            self.grid_to_vdb_weights(cpu_grid).await
+        #[cfg(feature = "vdb")]
+        let weights = {
+            let adapters = self.adapters.read().await;
+            let openvdb_adapter = adapters.get(adapter_id)
+                .ok_or(VDBError::OperationFailed("Adapter not found".to_string()))?;
+            
+            // Extract weights from OpenVDB adapter
+            openvdb_adapter.get_all_weights()
+                .map_err(|e| VDBError::OperationFailed(e.to_string()))?
+        };
+        
+        #[cfg(not(feature = "vdb"))]
+        let weights = {
+            let storage = self.fallback_storage.read().await;
+            storage.get(adapter_id)
+                .ok_or(VDBError::OperationFailed("Adapter not found".to_string()))?
+                .clone()
         };
         
         // Create adapter and load weights
         let adapter = SparseLoRAAdapter::new(config);
-        adapter.from_vdb_weights(&vdb_weights).await;
+        adapter.load_sparse_weights(&weights).await
+            .map_err(|e| VDBError::OperationFailed(e.to_string()))?;
 
         // Update cache statistics
         {
@@ -321,30 +313,19 @@ impl HardwareVDBStorage {
         &self,
         adapter_id: &str,
         sparse_updates: &HashMap<Coordinate3D, f32>,
-    ) -> Result<(), NanoVDBError> {
-        #[cfg(feature = "cuda")]
+    ) -> Result<(), VDBError> {
+        let start = Instant::now();
+        
+        #[cfg(feature = "vdb")]
         {
-            if !self.cuda_enabled {
-                return Err(NanoVDBError::CudaNotAvailable);
+            let mut adapters = self.adapters.write().await;
+            let adapter = adapters.get_mut(adapter_id)
+                .ok_or(VDBError::OperationFailed("Adapter not found".to_string()))?;
+
+            // Apply sparse updates to OpenVDB adapter
+            for (&coord, &value) in sparse_updates {
+                adapter.set_weight(coord.x(), coord.y(), coord.z(), value);
             }
-
-            let start = Instant::now();
-            
-            let mut gpu_grids = self.gpu_grids.write().await;
-            let gpu_grid = gpu_grids.get_mut(adapter_id)
-                .ok_or(NanoVDBError::GridCreationFailed)?;
-
-            // Convert sparse updates to GPU format
-            let (coords, values): (Vec<Coord3D>, Vec<f32>) = sparse_updates
-                .iter()
-                .map(|(&coord, &value)| {
-                    let gpu_coord = Coord3D::new(coord.x() as i32, coord.y() as i32, coord.z() as i32);
-                    (gpu_coord, value)
-                })
-                .unzip();
-
-            // Perform batch update on GPU
-            gpu_grid.batch_update(&coords, &values)?;
 
             // Update statistics
             {
@@ -353,50 +334,60 @@ impl HardwareVDBStorage {
                 stats.avg_kernel_time_us = start.elapsed().as_micros() as f64;
             }
 
-            println!("GPU sparse update completed in {:.2}μs", start.elapsed().as_micros());
-
+            println!("Sparse update completed in {:.2}μs", start.elapsed().as_micros());
             Ok(())
         }
         
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "vdb"))]
         {
-            // Fallback to CPU implementation when CUDA is not available
-            println!("GPU sparse update requested but CUDA not available, using CPU fallback");
-            Err(NanoVDBError::CudaNotAvailable)
+            let mut storage = self.fallback_storage.write().await;
+            if let Some(weights) = storage.get_mut(adapter_id) {
+                for (&coord, &value) in sparse_updates {
+                    weights.insert(coord, value);
+                }
+                println!("Sparse update completed in {:.2}μs", start.elapsed().as_micros());
+                Ok(())
+            } else {
+                Err(VDBError::OperationFailed("Adapter not found".to_string()))
+            }
         }
     }
 
     /// Perform sparse matrix multiplication using GPU acceleration
-    #[cfg(feature = "cuda")]
     pub async fn gpu_sparse_multiply(
         &self,
         adapter_id: &str,
         input: &[f32],
         output: &mut [f32],
-    ) -> Result<(), NanoVDBError> {
-        if !self.cuda_enabled {
-            return Err(NanoVDBError::CudaNotAvailable);
-        }
-
+    ) -> Result<(), VDBError> {
         let start = Instant::now();
         
-        let gpu_grids = self.gpu_grids.read().await;
-        let gpu_grid = gpu_grids.get(adapter_id)
-            .ok_or(NanoVDBError::GridCreationFailed)?;
-
-        // Perform GPU sparse matrix multiplication
-        gpu_grid.sparse_multiply(input, output)?;
-
-        // Update statistics
+        #[cfg(feature = "vdb")]
         {
-            let mut stats = self.stats.write().await;
-            stats.cuda_kernel_calls += 1;
-            stats.avg_kernel_time_us = start.elapsed().as_micros() as f64;
+            let adapters = self.adapters.read().await;
+            let adapter = adapters.get(adapter_id)
+                .ok_or(VDBError::OperationFailed("Adapter not found".to_string()))?;
+
+            // Perform sparse matrix multiplication using OpenVDB adapter
+            adapter.sparse_multiply(input, output)
+                .map_err(|e| VDBError::OperationFailed(e.to_string()))?;
+
+            // Update statistics
+            {
+                let mut stats = self.stats.write().await;
+                stats.cuda_kernel_calls += 1;
+                stats.avg_kernel_time_us = start.elapsed().as_micros() as f64;
+            }
+
+            println!("Sparse multiply completed in {:.2}μs", start.elapsed().as_micros());
+            Ok(())
         }
-
-        println!("GPU sparse multiply completed in {:.2}μs", start.elapsed().as_micros());
-
-        Ok(())
+        
+        #[cfg(not(feature = "vdb"))]
+        {
+            // Fallback implementation
+            Err(VDBError::OperationFailed("Sparse multiply not supported without VDB".to_string()))
+        }
     }
 
     /// Get comprehensive storage statistics
@@ -409,131 +400,84 @@ impl HardwareVDBStorage {
     pub async fn memory_usage(&self) -> HashMap<String, usize> {
         let mut usage = HashMap::new();
         
-        // CPU grid memory
-        let cpu_grids = self.cpu_grids.read().await;
-        let cpu_memory: usize = cpu_grids.values()
-            .map(|grid| grid.memory_usage() as usize)
-            .sum();
-        usage.insert("cpu_grids".to_string(), cpu_memory);
-
-        // GPU grid memory
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "vdb")]
         {
-            let gpu_grids = self.gpu_grids.read().await;
-            let gpu_memory: usize = gpu_grids.values()
-                .map(|grid| grid.buffer_size())
+            let adapters = self.adapters.read().await;
+            let total_memory: usize = adapters.values()
+                .map(|adapter| adapter.memory_usage() as usize)
                 .sum();
-            usage.insert("gpu_grids".to_string(), gpu_memory);
+            usage.insert("vdb_adapters".to_string(), total_memory);
+            usage.insert("total_adapters".to_string(), adapters.len());
         }
         
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "vdb"))]
         {
-            usage.insert("gpu_grids".to_string(), 0);
+            let storage = self.fallback_storage.read().await;
+            let total_memory: usize = storage.values()
+                .map(|weights| weights.len() * std::mem::size_of::<(Coordinate3D, f32)>())
+                .sum();
+            usage.insert("fallback_storage".to_string(), total_memory);
+            usage.insert("total_adapters".to_string(), storage.len());
         }
-
-        usage.insert("total_adapters".to_string(), cpu_grids.len());
 
         usage
     }
 
     /// List all stored adapters with statistics
     pub async fn list_adapters(&self) -> Vec<AdapterInfo> {
-        let cpu_grids = self.cpu_grids.read().await;
-        let mut adapters = Vec::new();
+        let mut adapter_infos = Vec::new();
 
-        for (adapter_id, grid) in cpu_grids.iter() {
-            let stats = grid.stats();
-            
-            adapters.push(AdapterInfo {
-                id: adapter_id.clone(),
-                active_voxels: stats.active_voxels,
-                memory_usage_bytes: stats.memory_usage,
-                sparsity: stats.sparsity,
-                tree_depth: stats.tree_depth,
-                cuda_enabled: self.cuda_enabled,
-            });
+        #[cfg(feature = "vdb")]
+        {
+            let adapters = self.adapters.read().await;
+            for (adapter_id, adapter) in adapters.iter() {
+                adapter_infos.push(AdapterInfo {
+                    id: adapter_id.clone(),
+                    active_voxels: adapter.active_voxel_count(),
+                    memory_usage_bytes: adapter.memory_usage(),
+                    sparsity: adapter.sparsity_ratio(),
+                    tree_depth: 0, // OpenVDB doesn't expose tree depth directly
+                    cuda_enabled: false, // Will be set based on OpenVDB capabilities
+                });
+            }
+        }
+        
+        #[cfg(not(feature = "vdb"))]
+        {
+            let storage = self.fallback_storage.read().await;
+            for (adapter_id, weights) in storage.iter() {
+                adapter_infos.push(AdapterInfo {
+                    id: adapter_id.clone(),
+                    active_voxels: weights.len() as u64,
+                    memory_usage_bytes: (weights.len() * std::mem::size_of::<(Coordinate3D, f32)>()) as u64,
+                    sparsity: 0.99, // Estimate
+                    tree_depth: 0,
+                    cuda_enabled: false,
+                });
+            }
         }
 
-        adapters
+        adapter_infos
     }
 
     /// Remove adapter from storage
-    pub async fn remove_adapter(&self, adapter_id: &str) -> Result<(), NanoVDBError> {
+    pub async fn remove_adapter(&self, adapter_id: &str) -> Result<(), VDBError> {
+        #[cfg(feature = "vdb")]
         {
-            let mut cpu_grids = self.cpu_grids.write().await;
-            cpu_grids.remove(adapter_id);
+            let mut adapters = self.adapters.write().await;
+            adapters.remove(adapter_id);
         }
-
-        #[cfg(feature = "cuda")]
+        
+        #[cfg(not(feature = "vdb"))]
         {
-            let mut gpu_grids = self.gpu_grids.write().await;
-            if let Some(removed) = gpu_grids.remove(adapter_id) {
-                let mut stats = self.stats.write().await;
-                stats.gpu_memory_usage = stats.gpu_memory_usage.saturating_sub(removed.buffer_size());
-            }
+            let mut storage = self.fallback_storage.write().await;
+            storage.remove(adapter_id);
         }
 
         println!("Removed adapter '{}'", adapter_id);
         Ok(())
     }
 
-    /// Internal: Populate grid builder from VDB weights
-    async fn populate_grid_from_weights(
-        &self,
-        builder: &mut GridBuilder,
-        weights: &SparseWeights,
-    ) {
-        for (linear_idx, value) in weights.active_iter() {
-            let coord = self.linear_to_coord_3d(linear_idx, &weights.shape());
-            builder.set_value_on(coord, value);
-        }
-    }
-
-    /// Internal: Convert grid back to VDB weights
-    async fn grid_to_vdb_weights(&self, grid: &NanoGrid) -> SparseWeights {
-        // Estimate shape based on active voxels (simplified)
-        let mut weights = SparseWeights::new(vec![1536, 1536]); // Default Qwen3 shape
-        
-        for (coord, value) in grid.iter() {
-            let linear_idx = self.coord_3d_to_linear(coord, &[1536, 1536]);
-            weights.set(linear_idx, value);
-        }
-        
-        weights
-    }
-
-    /// Convert linear index to 3D coordinate
-    fn linear_to_coord_3d(&self, index: usize, shape: &[usize]) -> Coord3D {
-        match shape.len() {
-            2 => {
-                let (h, w) = (shape[0], shape[1]);
-                let y = (index / w) as i32;
-                let x = (index % w) as i32;
-                Coord3D::new(x, y, 0)
-            }
-            3 => {
-                let (d, h, w) = (shape[0], shape[1], shape[2]);
-                let z = (index / (h * w)) as i32;
-                let y = ((index % (h * w)) / w) as i32;
-                let x = (index % w) as i32;
-                Coord3D::new(x, y, z)
-            }
-            _ => Coord3D::new(index as i32, 0, 0)
-        }
-    }
-
-    /// Convert 3D coordinate to linear index
-    fn coord_3d_to_linear(&self, coord: Coord3D, shape: &[usize]) -> usize {
-        match shape.len() {
-            2 => (coord.y as usize) * shape[1] + (coord.x as usize),
-            3 => {
-                (coord.z as usize) * (shape[1] * shape[2]) +
-                (coord.y as usize) * shape[2] +
-                (coord.x as usize)
-            }
-            _ => coord.x as usize
-        }
-    }
 
 }
 

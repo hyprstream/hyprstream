@@ -13,6 +13,7 @@
 // VDB-first storage for sparse adaptive layers
 pub mod vdb;
 pub mod view;
+pub mod paths;
 
 // Re-export main VDB interfaces
 pub use vdb::{
@@ -24,3 +25,6 @@ pub use vdb::{
 
 // Legacy view support (retained for compatibility)
 pub use view::{ViewDefinition, ViewMetadata};
+
+// XDG-compliant path management and HF authentication
+pub use paths::{StoragePaths, HfAuth};

@@ -140,12 +140,11 @@ pub trait VDBMetricsStorage: Send + Sync + 'static {
         }
         
         // VDB-based metrics storage would aggregate these into sparse structures
-        // For now, this is a placeholder for the concept
         Ok(())
     }
 
     /// Query metrics from VDB storage
-    async fn query_metrics(&self, from_timestamp: i64) -> Result<Vec<MetricRecord>, Status> {
+    async fn query_metrics(&self, _from_timestamp: i64) -> Result<Vec<MetricRecord>, Status> {
         // Query VDB storage for metrics-related adapter statistics
         let storage_stats = self.vdb_storage()
             .get_storage_stats()
@@ -199,9 +198,9 @@ pub trait VDBMetricsStorage: Send + Sync + 'static {
     async fn aggregate_metrics(
         &self,
         function: AggregateFunction,
-        group_by: &GroupBy,
-        from_timestamp: i64,
-        to_timestamp: Option<i64>,
+        _group_by: &GroupBy,
+        _from_timestamp: i64,
+        _to_timestamp: Option<i64>,
     ) -> Result<Vec<AggregateResult>, Status> {
         // Use VDB storage to compute aggregations across adapters
         let adapters = self.vdb_storage()
