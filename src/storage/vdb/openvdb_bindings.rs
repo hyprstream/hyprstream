@@ -227,6 +227,11 @@ impl OpenVDBLoRAAdapter {
         Ok(adapter)
     }
     
+    /// Get all active weights (placeholder implementation)
+    pub fn get_all_weights(&self) -> HashMap<Coordinate3D, f32> {
+        self.to_hashmap()
+    }
+    
     fn is_valid_coord(&self, row: i32, col: i32) -> bool {
         row >= 0 && col >= 0 && 
         (row as usize) < self.shape.0 && 

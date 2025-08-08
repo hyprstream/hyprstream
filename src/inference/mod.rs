@@ -240,7 +240,7 @@ impl InferenceAPI {
         }
         
         // Fuse adapters with specified weights
-        let fusion = LoRAFusion::new(FusionStrategy::WeightedAverage);
+        let mut fusion = LoRAFusion::new(FusionStrategy::WeightedAverage);
         let fused = fusion.fuse_adapters(adapters, &session.adapter_weights)?;
         
         Ok(fused)

@@ -218,7 +218,8 @@ pub struct VDBSparseStorage {
     config: SparseStorageConfig,
     
     /// Hardware-accelerated VDB storage backend
-    hardware_storage: Arc<HardwareVDBStorage>,
+    #[cfg(feature = "vdb")]
+    hardware_storage: Arc<crate::storage::vdb::hardware_accelerated::HardwareVDBStorage>,
     
     /// Neural compression codec
     neural_codec: Arc<NeuralVDBCodec>,

@@ -36,6 +36,42 @@ pub struct ModelManagementState {
     config: ModelManagementConfig,
 }
 
+/// Type alias for backwards compatibility
+pub type ModelManager = ModelManagementState;
+
+impl ModelManagementState {
+    /// Create new model management state
+    pub async fn new() -> Result<Self> {
+        let config = ModelManagementConfig::default();
+        let storage = Arc::new(ModelStorage::new(config.models_dir.clone()).await?);
+        let registries = Arc::new(RwLock::new(HashMap::new()));
+        
+        #[cfg(feature = "vdb")]
+        let vdb_storage = Arc::new(
+            crate::storage::vdb::hardware_accelerated::HardwareVDBStorage::new().await
+                .map_err(|e| anyhow::anyhow!("Failed to initialize VDB storage: {}", e))?
+        );
+        
+        Ok(Self {
+            storage,
+            registries,
+            #[cfg(feature = "vdb")]
+            vdb_storage,
+            config,
+        })
+    }
+    
+    /// List cached models (compatibility method)
+    pub async fn list_cached_models(&self) -> Result<Vec<(ModelUri, ModelMetadata)>> {
+        self.storage.list_local_models().await
+    }
+    
+    /// Get cache statistics (compatibility method)  
+    pub async fn get_cache_stats(&self) -> Result<crate::api::model_storage::CacheStats> {
+        self.storage.get_cache_stats().await
+    }
+}
+
 /// Configuration for model management
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelManagementConfig {
@@ -340,8 +376,8 @@ async fn list_models(
             uri: uri.uri.clone(),
             local_path: Some(local_path.to_string_lossy().to_string()),
             size_bytes: Some(metadata.size_bytes),
-            files: metadata.files,
-            metadata,
+            files: metadata.files.clone(),
+            metadata: metadata.clone(),
             is_cached: true,
             last_accessed: Some(chrono::Utc::now().timestamp()),
         });
@@ -401,8 +437,8 @@ async fn get_model_info(
             uri: model_uri.uri,
             local_path: Some(local_path.to_string_lossy().to_string()),
             size_bytes: Some(metadata.size_bytes),
-            files: metadata.files,
-            metadata,
+            files: metadata.files.clone(),
+            metadata: metadata.clone(),
             is_cached: true,
             last_accessed: Some(chrono::Utc::now().timestamp()),
         }));

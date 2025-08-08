@@ -2,6 +2,7 @@
 
 use crate::inference::{InferenceInput, InferenceOutput, InferenceToken, FusedAdapterWeights};
 use crate::inference::model_loader::{ModelLoader, BaseModelHandle};
+use crate::runtime::RuntimeEngine;
 #[cfg(feature = "vdb")]
 use crate::storage::vdb::hardware_accelerated::HardwareVDBStorage;
 
@@ -192,7 +193,7 @@ impl InferenceEngine {
                 println!("⚠️ LlamaCpp not available, using fallback inference");
                 
                 let response = if prompt.to_lowercase().contains("hello") {
-                    "Hello! I'm a language model powered by Hyprstream with adaptive LoRA capabilities."
+                    "Hello! I'm a language model powered by Hyprstream with adaptive LoRA capabilities.".to_string()
                 } else if prompt.to_lowercase().contains("code") {
                     format!("I can help with coding tasks. Your request: '{}'. I would analyze this and provide code assistance using my fine-tuned adapters.", prompt)
                 } else if prompt.to_lowercase().contains("explain") {
@@ -209,30 +210,34 @@ impl InferenceEngine {
     /// Try LlamaCpp inference
     async fn try_llamacpp_inference(&self, prompt: &str, input: &InferenceInput) -> Result<String> {
         // Try to initialize LlamaCpp engine
-        let engine = crate::runtime::llamacpp_engine::LlamaCppEngine::new(
-            crate::runtime::llamacpp_engine::LlamaCppConfig {
-                model_path: "./models/default.gguf".into(),
-                n_ctx: Some(2048),
-                n_batch: Some(512),
-                n_threads: Some(self.config.cpu_threads),
-                use_mmap: true,
-                use_mlock: false,
-                verbose_llama: false,
+        let mut engine = crate::runtime::LlamaCppEngine::new(
+            crate::runtime::RuntimeConfig {
+                context_length: 2048,
+                batch_size: 512,
+                num_threads: Some(self.config.cpu_threads),
+                use_gpu: self.config.use_gpu,
+                gpu_layers: if self.config.use_gpu { Some(20) } else { None },
+                mmap: true,
             }
-        ).await?;
+        )?;
+        
+        // Try to find an available model file
+        let model_path = self.find_available_model().await?;
+        engine.load_model(&model_path).await?;
         
         // Prepare generation request
         let generation_request = crate::runtime::GenerationRequest {
             prompt: prompt.to_string(),
-            max_tokens: Some(input.max_tokens),
-            temperature: Some(input.temperature),
-            top_p: Some(input.top_p),
+            max_tokens: input.max_tokens,
+            temperature: input.temperature,
+            top_p: input.top_p,
             stop_tokens: vec!["</s>".to_string(), "\n\n".to_string()],
-            stream: Some(input.stream),
+            top_k: None,
+            seed: None,
         };
         
         // Generate response
-        let result = engine.generate(generation_request).await?;
+        let result = engine.generate_with_params(generation_request).await?;
         
         Ok(result.text)
     }
@@ -316,6 +321,43 @@ impl InferenceEngine {
         let mut stats = self.stats.write().await;
         *stats = InferenceEngineStats::default();
         println!("📊 Reset inference engine statistics");
+    }
+    
+    /// Find an available model file in common locations
+    async fn find_available_model(&self) -> Result<std::path::PathBuf> {
+        let candidate_paths = vec![
+            "./models/default.gguf",
+            "./models/qwen2-1_5b-instruct-q4_0.gguf", 
+            "~/.local/share/hyprstream/models/qwen2-1_5b-instruct-q4_0.gguf",
+            "/tmp/models/default.gguf",
+        ];
+        
+        for path_str in candidate_paths {
+            let path = std::path::Path::new(path_str);
+            if path.exists() {
+                println!("✅ Found model at: {}", path.display());
+                return Ok(path.to_path_buf());
+            }
+        }
+        
+        // Try to use storage paths to find downloaded models
+        if let Ok(storage) = crate::storage::StoragePaths::new() {
+            if let Ok(models_dir) = storage.models_dir() {
+                let mut entries = tokio::fs::read_dir(&models_dir).await?;
+                while let Some(entry) = entries.next_entry().await? {
+                    let path = entry.path();
+                    if path.extension().map_or(false, |ext| ext == "gguf") {
+                        println!("✅ Found model in storage: {}", path.display());
+                        return Ok(path);
+                    }
+                }
+            }
+        }
+        
+        Err(anyhow::anyhow!(
+            "No GGUF model files found. Please download a model first:\n\
+             hyprstream model download qwen2-1.5b-instruct"
+        ))
     }
     
     /// Get memory usage

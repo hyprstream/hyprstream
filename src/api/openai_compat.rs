@@ -2,6 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 
+// Type aliases for API compatibility
+pub use ChatCompletionRequest as OpenAIRequest;
+pub use ChatCompletionResponse as OpenAIResponse;
+
+/// Chat completion streaming response 
+pub type ChatCompletionStreamResponse = OpenAIStreamResponse;
+
 /// OpenAI Chat Completion Request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionRequest {

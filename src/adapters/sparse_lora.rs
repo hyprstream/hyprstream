@@ -7,6 +7,19 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use serde::{Serialize, Deserialize};
 
+/// Initialization methods for sparse LoRA adapters
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum InitMethod {
+    /// Random Gaussian initialization
+    Random,
+    /// Xavier/Glorot uniform initialization
+    Xavier,
+    /// Kaiming/He initialization
+    Kaiming,
+    /// Zero initialization
+    Zeros,
+}
+
 /// Configuration for sparse LoRA adapters
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SparseLoRAConfig {
@@ -33,6 +46,21 @@ pub struct SparseLoRAConfig {
     
     /// Enable bias parameters
     pub bias: bool,
+    
+    /// Target modules for LoRA application
+    pub target_modules: Vec<String>,
+    
+    /// Initialization method
+    pub init_method: InitMethod,
+    
+    /// Sparsity threshold for weight pruning
+    pub sparsity_threshold: f32,
+    
+    /// Enable gradient checkpointing
+    pub enable_gradient_checkpointing: bool,
+    
+    /// Use mixed precision training
+    pub mixed_precision: bool,
 }
 
 impl Default for SparseLoRAConfig {
@@ -46,6 +74,14 @@ impl Default for SparseLoRAConfig {
             dropout: 0.0,         // No dropout for inference
             alpha: 16.0,          // LoRA scaling
             bias: false,          // No bias typically
+            target_modules: vec![
+                "self_attn.q_proj".to_string(),
+                "self_attn.v_proj".to_string(),
+            ],
+            init_method: InitMethod::Random,
+            sparsity_threshold: 1e-6,
+            enable_gradient_checkpointing: false,
+            mixed_precision: false,
         }
     }
 }
@@ -386,6 +422,18 @@ impl SparseLoRAAdapter {
         // In a full implementation, we would copy and scale the actual weights
         // For now, return a new adapter with scaled config
         Ok(scaled_adapter)
+    }
+    
+    /// Load sparse weights from a collection (placeholder implementation)
+    pub async fn load_sparse_weights(&self, _weights: &std::collections::HashMap<crate::storage::vdb::grid::Coordinate3D, f32>) {
+        // TODO: Implement loading weights from coordinate-based structure
+        // This would involve mapping coordinates to matrix positions and updating the sparse matrices
+        println!("⚠️ load_sparse_weights not yet implemented");
+    }
+    
+    /// Get adapter configuration (placeholder implementation)
+    pub fn get_config(&self) -> &SparseLoRAConfig {
+        &self.config
     }
 }
 

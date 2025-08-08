@@ -65,6 +65,8 @@ impl LoRAFusion {
             return Err(anyhow::anyhow!("No adapters provided for fusion"));
         }
         
+        let adapters_len = adapters.len();
+        
         let fused_weights = match &self.strategy {
             FusionStrategy::WeightedAverage => {
                 self.fuse_weighted_average(adapters, weights)?
@@ -88,7 +90,7 @@ impl LoRAFusion {
         self.stats.total_fusions += 1;
         self.stats.avg_fusion_time_ms = (self.stats.avg_fusion_time_ms * (self.stats.total_fusions - 1) as f64 + fusion_time) 
             / self.stats.total_fusions as f64;
-        self.stats.avg_adapters_per_fusion = (self.stats.avg_adapters_per_fusion * (self.stats.total_fusions - 1) as f64 + adapters.len() as f64)
+        self.stats.avg_adapters_per_fusion = (self.stats.avg_adapters_per_fusion * (self.stats.total_fusions - 1) as f64 + adapters_len as f64)
             / self.stats.total_fusions as f64;
         
         Ok(fused_weights)

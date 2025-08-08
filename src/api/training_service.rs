@@ -245,7 +245,7 @@ impl TrainingService {
     
     /// Train a batch of samples
     async fn train_batch(
-        vdb_storage: &Arc<HardwareVDBStorage>,
+        #[cfg(feature = "vdb")] vdb_storage: &Arc<HardwareVDBStorage>,
         lora_id: &str,
         samples: &[TrainingSample],
         config: &TrainingConfig,

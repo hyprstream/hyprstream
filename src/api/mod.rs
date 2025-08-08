@@ -171,9 +171,14 @@ async fn create_lora_layer(
     
     // Create sparse adapter in VDB storage
     let adapter_config = crate::adapters::sparse_lora::SparseLoRAConfig {
+        in_features: 1536, // TODO: get from model config
+        out_features: 1536, // TODO: get from model config
         rank: request.config.rank,
-        alpha: request.config.alpha,
+        sparsity: request.config.sparsity_ratio,
+        learning_rate: 1e-4, // TODO: get from request
         dropout: request.config.dropout,
+        alpha: request.config.alpha,
+        bias: false,
         target_modules: request.config.target_modules.clone(),
         init_method: crate::adapters::sparse_lora::InitMethod::Random,
         sparsity_threshold: 1.0 - request.config.sparsity_ratio,
@@ -186,10 +191,16 @@ async fn create_lora_layer(
     
     // Store in VDB with neural compression if enabled
     if request.config.use_neural_compression {
-        state.vdb_storage.store_adapter_neural_compressed(&lora_id, &adapter).await
+        #[cfg(feature = "vdb")]
+        { state.vdb_storage.store_adapter_neural_compressed(&lora_id, &adapter).await }
+        #[cfg(not(feature = "vdb"))]
+        { Ok(()) }
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     } else {
-        state.vdb_storage.store_adapter_accelerated(&lora_id, &adapter).await
+        #[cfg(feature = "vdb")]
+        { state.vdb_storage.store_adapter_accelerated(&lora_id, &adapter).await }
+        #[cfg(not(feature = "vdb"))]
+        { Ok(()) }
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     }
     
@@ -256,8 +267,10 @@ async fn delete_lora_layer(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     
     // Remove from VDB storage
-    state.vdb_storage.remove_adapter(&lora_id).await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    #[cfg(feature = "vdb")]
+    { state.vdb_storage.remove_adapter(&lora_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? }
+    #[cfg(not(feature = "vdb"))]
+    { /* VDB feature not enabled, nothing to remove */ }
     
     // Remove endpoint
     let mut endpoints = state.endpoints.write().await;
@@ -276,10 +289,14 @@ async fn openai_chat_completions(
     Json(request): Json<openai_compat::ChatCompletionRequest>,
 ) -> Result<JsonResponse<openai_compat::ChatCompletionResponse>, StatusCode> {
     // Load the LoRA adapter
+    #[cfg(feature = "vdb")]
     let adapter = state.vdb_storage.load_adapter_neural_compressed(
         &lora_id,
         Default::default(),
     ).await.map_err(|_| StatusCode::NOT_FOUND)?;
+    
+    #[cfg(not(feature = "vdb"))]
+    return Err(StatusCode::SERVICE_UNAVAILABLE);
     
     // Create inference session
     let session_id = state.training_service.create_inference_session(
@@ -353,10 +370,14 @@ async fn openai_completions(
     Json(request): Json<openai_compat::CompletionRequest>,
 ) -> Result<JsonResponse<openai_compat::CompletionResponse>, StatusCode> {
     // Similar to chat completions but for raw completions
+    #[cfg(feature = "vdb")]
     let adapter = state.vdb_storage.load_adapter_neural_compressed(
         &lora_id,
         Default::default(),
     ).await.map_err(|_| StatusCode::NOT_FOUND)?;
+    
+    #[cfg(not(feature = "vdb"))]
+    return Err(StatusCode::SERVICE_UNAVAILABLE);
     
     let session_id = state.training_service.create_inference_session(
         &lora_id,
@@ -421,10 +442,14 @@ async fn openai_embeddings(
     Json(request): Json<openai_compat::EmbeddingRequest>,
 ) -> Result<JsonResponse<openai_compat::EmbeddingResponse>, StatusCode> {
     // Generate embeddings using the LoRA-adapted model
+    #[cfg(feature = "vdb")]
     let adapter = state.vdb_storage.load_adapter_neural_compressed(
         &lora_id,
         Default::default(),
     ).await.map_err(|_| StatusCode::NOT_FOUND)?;
+    
+    #[cfg(not(feature = "vdb"))]
+    return Err(StatusCode::SERVICE_UNAVAILABLE);
     
     let mut embeddings = Vec::new();
     

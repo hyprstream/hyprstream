@@ -98,6 +98,9 @@ pub struct RuntimeConfig {
     pub mmap: bool,
 }
 
+/// LlamaCpp specific configuration (compatibility alias)
+pub type LlamaCppConfig = RuntimeConfig;
+
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {

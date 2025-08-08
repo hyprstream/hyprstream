@@ -28,12 +28,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     for layer_idx in 0..28 {  // Qwen3 has 28 layers
         let config = SparseLoRAConfig {
+            in_features: 1536,
+            out_features: 1536,
             rank: 64,
-            alpha: 16.0,
+            sparsity: 0.99, // 99% sparse
+            learning_rate: 1e-4,
             dropout: 0.1,
+            alpha: 16.0,
+            bias: false,
             target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
-            sparsity_ratio: 0.99, // 99% sparse
-            block_size: 16,
+            init_method: crate::adapters::sparse_lora::InitMethod::Random,
+            sparsity_threshold: 1e-6,
+            enable_gradient_checkpointing: false,
+            mixed_precision: false,
         };
         
         let adapter = SparseLoRAAdapter::new(config);

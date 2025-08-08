@@ -424,7 +424,7 @@ impl AutoregressivePredictor {
             
             // Temporal trend (recent vs older patterns)
             let recent_avg = neighborhood.iter().rev().take(3)
-                .map(|p| p.weight_delta).sum::<f32>() / 3.0.min(neighborhood.len() as f32);
+                .map(|p| p.weight_delta).sum::<f32>() / (3.0_f32).min(neighborhood.len() as f32);
             features.push(recent_avg);
             
             // Level consistency (how often the same hierarchical level is used)
@@ -506,8 +506,10 @@ impl HardwareVDBStorage {
         let start = Instant::now();
         
         // Create OpenVDB LoRA grid with hierarchical structure
-        let openvdb_adapter = crate::storage::vdb::openvdb_bindings::OpenVDBLoRAAdapter::new()
-            .map_err(|e| VDBError::OperationFailed(e.to_string()))?;
+        let openvdb_adapter = crate::storage::vdb::openvdb_bindings::OpenVDBLoRAAdapter::new(
+            1536, // TODO: get from adapter
+            1536  // TODO: get from adapter  
+        ).map_err(|e| VDBError::OperationFailed(e.to_string()))?;
         
         // Phase 1: Generate Z-order pattern for spatial locality
         let z_pattern = self.generate_z_order_pattern(adapter).await?;
@@ -620,7 +622,7 @@ impl HardwareVDBStorage {
                 .ok_or(VDBError::OperationFailed("Grid not found".to_string()))?;
             self.neural_codec.decode_adapter(compressed, config)
                 .await
-                .map_err(|e| VDBError::OperationFailed(e.to_string()))?;
+                .map_err(|e| VDBError::OperationFailed(e.to_string()))?
         };
 
         // Update cache statistics

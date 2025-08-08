@@ -227,23 +227,30 @@ impl ModelStorage {
     
     /// Get total size of a model directory
     pub async fn calculate_model_size(&self, model_path: &Path) -> Result<u64> {
-        let mut total_size = 0u64;
-        
-        if !model_path.exists() {
-            return Ok(0);
-        }
-        
-        let mut entries = fs::read_dir(model_path).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let metadata = entry.metadata().await?;
-            if metadata.is_file() {
-                total_size += metadata.len();
-            } else if metadata.is_dir() {
-                total_size += self.calculate_model_size(&entry.path()).await?;
+        self.calculate_model_size_recursive(model_path).await
+    }
+    
+    /// Recursive helper method for calculate_model_size
+    fn calculate_model_size_recursive<'a>(&'a self, model_path: &'a Path) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>> {
+        Box::pin(async move {
+            let mut total_size = 0u64;
+            
+            if !model_path.exists() {
+                return Ok(0);
             }
-        }
-        
-        Ok(total_size)
+            
+            let mut entries = tokio::fs::read_dir(model_path).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let metadata = entry.metadata().await?;
+                if metadata.is_file() {
+                    total_size += metadata.len();
+                } else if metadata.is_dir() {
+                    total_size += self.calculate_model_size_recursive(&entry.path()).await?;
+                }
+            }
+            
+            Ok(total_size)
+        })
     }
     
     /// Verify model integrity

@@ -312,8 +312,8 @@ impl FlightService for InferenceFlightService {
                     let encoded_dictionaries = data_gen.encoded_batch(&batch, &mut dictionary_tracker, &options)
                         .map_err(|e| Status::internal(format!("Failed to encode batch: {}", e)))?;
                     
-                    let schema_message = arrow_ipc::writer::encode_schema(batch.schema().as_ref());
-                    let encoded_schema = data_gen.schema_to_bytes(&batch.schema(), &schema_message);
+                    let schema_message = data_gen.schema_to_fb(&batch.schema());
+                    let encoded_schema = schema_message.finished_data().to_vec();
                     
                     (encoded_dictionaries, encoded_schema)
                 };
