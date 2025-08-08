@@ -1,11 +1,10 @@
 use crate::storage::view::ViewMetadata;
-use crate::storage::StorageBackend;
+use crate::storage::VDBSparseStorage;
 use datafusion::error::Result;
-use datafusion::logical_expr::{LogicalPlan, TableScan};
+use datafusion::logical_expr::{LogicalPlan, TableScan, Expr};
 use datafusion::optimizer::optimizer::{OptimizerConfig, OptimizerRule};
-use datafusion_common::{tree_node::Transformed, DFSchema};
+use datafusion_common::tree_node::Transformed;
 use datafusion::sql::TableReference;
-use datafusion::logical_expr::Expr;
 #[cfg(test)]
 use {
     datafusion::datasource::{TableProvider, TableType},
@@ -58,38 +57,22 @@ impl TableProvider for EmptyTableProvider {
 }
 use std::sync::Arc;
 
-/// Optimization rule that rewrites queries to use views when beneficial
+/// Optimization rule that rewrites queries to use views when beneficial  
+/// Adapted for VDB-first architecture (mostly disabled for embeddings-only queries)
 pub struct ViewOptimizationRule {
-    storage: Arc<dyn StorageBackend>,
+    vdb_storage: Arc<VDBSparseStorage>,
 }
 
 impl ViewOptimizationRule {
-    pub fn new(storage: Arc<dyn StorageBackend>) -> Self {
-        Self { storage }
+    pub fn new(vdb_storage: Arc<VDBSparseStorage>) -> Self {
+        Self { vdb_storage }
     }
 
-    /// Check if a view can be used for this query
+    /// Check if a view can be used for this query (disabled for VDB-first)
     #[allow(dead_code)]
-    async fn find_matching_view(&self, plan: &LogicalPlan) -> Result<Option<ViewMetadata>> {
-        // Get list of available views
-        let views = self.storage.list_views().await.map_err(|e| {
-            datafusion::error::DataFusionError::Internal(format!("Failed to list views: {}", e))
-        })?;
-
-        // For each view, check if it can be used for this query
-        for view_name in views {
-            let view = self.storage.get_view(&view_name).await.map_err(|e| {
-                datafusion::error::DataFusionError::Internal(format!(
-                    "Failed to get view metadata: {}",
-                    e
-                ))
-            })?;
-
-            if self.can_use_view(plan, &view)? {
-                return Ok(Some(view));
-            }
-        }
-
+    async fn find_matching_view(&self, _plan: &LogicalPlan) -> Result<Option<ViewMetadata>> {
+        // VDB-first architecture focuses on embeddings, not traditional views
+        // Return None to disable view optimization
         Ok(None)
     }
 
@@ -167,21 +150,8 @@ impl OptimizerRule for ViewOptimizationRule {
     }
 
     fn rewrite(&self, plan: LogicalPlan, _config: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
-        // Get matching view and rewrite plan
-        // Note: This is a blocking operation, but it's acceptable for testing
-        let views = futures::executor::block_on(self.storage.list_views())
-            .map_err(|e| datafusion::error::DataFusionError::Internal(format!("Failed to list views: {}", e)))?;
-        
-        // For each view, check if it can be used for this query
-        for view_name in views {
-            let view = futures::executor::block_on(self.storage.get_view(&view_name))
-                .map_err(|e| datafusion::error::DataFusionError::Internal(format!("Failed to get view metadata: {}", e)))?;
-            
-            if self.can_use_view(&plan, &view)? {
-                let new_plan = self.rewrite_with_view(&plan, &view)?;
-                return Ok(Transformed::yes(new_plan));
-            }
-        }
+        // VDB-first architecture doesn't use traditional views - it's embeddings-focused
+        // Return the plan unchanged for now
         Ok(Transformed::no(plan))
     }
 }

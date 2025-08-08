@@ -1,12 +1,14 @@
-//! Core library for high-performance metric storage and analysis.
+//! VDB-first adaptive ML inference server with dynamic sparse weight adjustments.
 //!
 //! This crate provides the core functionality for:
-//! - Efficient metric storage and retrieval
-//! - Real-time aggregation and analysis
-//! - Flexible query execution
-//! - Model management and versioning
+//! - Real-time sparse weight updates for 99% sparse neural networks
+//! - Dynamic adaptive ML inference with streaming weight adjustments
+//! - Hardware-accelerated VDB storage with neural compression
+//! - Memory-mapped disk persistence with zero-copy operations
+//! - FlightSQL interface for embeddings and similarity search
 
 pub mod aggregation;
+pub mod adapters;
 pub mod error;
 pub mod cli;
 pub mod metrics;
@@ -21,5 +23,8 @@ pub use query::{
     DataFusionExecutor, DataFusionPlanner, ExecutorConfig, OptimizationHint, Query, QueryExecutor,
     QueryPlanner,
 };
-pub use service::FlightSqlServer;
-pub use storage::{StorageBackend, StorageBackendType};
+pub use service::{EmbeddingFlightService, MetricFlightSqlService};
+pub use storage::{
+    VDBSparseStorage, SparseStorageConfig, SparseStorage,
+    SparseWeightUpdate, EmbeddingMatch, SparseStorageError
+};

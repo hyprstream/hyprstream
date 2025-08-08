@@ -7,7 +7,7 @@ use clap::Parser;
 use config::Config;
 use hyprstream_core::{
     cli::commands::Commands,
-    cli::handlers::{handle_server, handle_sql},
+    cli::handlers::{handle_server, handle_embedding_query},
 };
 use tracing::{info, Level};
 use tracing_subscriber::EnvFilter;
@@ -51,8 +51,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut config = Config::builder()
                 .set_default("host", "127.0.0.1")?
                 .set_default("port", "50051")?
-                .set_default("storage.type", "duckdb")?
-                .set_default("storage.connection", ":memory:")?;
+                .set_default("storage.path", "./vdb_storage")?
+                .set_default("storage.neural_compression", true)?
+                .set_default("storage.hardware_acceleration", true)?
+                .set_default("storage.cache_size_mb", 2048)?;
 
             // Set TLS configuration from command line args
             if cmd.server.tls_cert.is_some() {
@@ -73,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             handle_server(config).await?
         }
         Commands::Sql(cmd) => {
-            handle_sql(
+            handle_embedding_query(
                 cmd.host,
                 &cmd.query,
                 cmd.tls_cert.as_deref(),

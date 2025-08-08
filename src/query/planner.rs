@@ -1,5 +1,5 @@
 use crate::query::rules::view::ViewOptimizationRule;
-use crate::storage::StorageBackend;
+use crate::storage::VDBSparseStorage;
 use datafusion::arrow::datatypes::Schema;
 use crate::error::StatusWrapper;
 use datafusion::error::{DataFusionError, Result};
@@ -52,37 +52,31 @@ pub trait QueryPlanner: Send + Sync {
     }
 }
 
-/// Default query planner implementation using DataFusion
+/// VDB-first query planner implementation using DataFusion
 pub struct DataFusionPlanner {
     /// DataFusion context for planning and optimization
     ctx: SessionContext,
     /// Custom optimization rules
     optimizations: Vec<Box<dyn OptimizerRule + Send + Sync>>,
-    /// Storage backend for view lookups
-    storage: Arc<dyn StorageBackend>,
+    /// VDB sparse storage for embeddings and vector operations
+    vdb_storage: Arc<VDBSparseStorage>,
 }
 
 impl DataFusionPlanner {
-    pub async fn new(storage: Arc<dyn StorageBackend>) -> Result<Self> {
+    pub async fn new(vdb_storage: Arc<VDBSparseStorage>) -> Result<Self> {
         let ctx = SessionContext::new();
         let mut planner = Self {
             ctx,
             optimizations: Vec::new(),
-            storage: storage.clone(),
+            vdb_storage,
         };
 
         // Add default optimization rules
         planner.add_default_rules();
 
-        // Register tables from storage
-        let tables = storage.list_tables().await.map_err(|e| Into::<DataFusionError>::into(StatusWrapper(e)))?;
-        for table_name in tables {
-            let schema = storage.get_table_schema(&table_name).await.map_err(|e| Into::<DataFusionError>::into(StatusWrapper(e)))?;
-            planner.ctx.register_table(
-                &table_name,
-                Arc::new(MemTable::try_new(schema, vec![])?),
-            )?;
-        }
+        // VDB-first storage doesn't have traditional tables
+        // Instead, we can register embedding search as a custom function
+        // This is a placeholder for VDB-specific query capabilities
 
         Ok(planner)
     }
@@ -95,9 +89,9 @@ impl DataFusionPlanner {
 
     /// Add default optimization rules
     fn add_default_rules(&mut self) {
-        // Add view optimization rule
+        // Add view optimization rule for VDB-first architecture
         self.optimizations.push(Box::new(ViewOptimizationRule::new(
-            self.storage.clone(),
+            self.vdb_storage.clone(),
         )));
     }
 }

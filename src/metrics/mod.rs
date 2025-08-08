@@ -7,7 +7,7 @@ use std::default::Default;
 use std::sync::Arc;
 use tonic::Status;
 
-pub use storage::{MetricsStorage, MetricsStorageImpl};
+pub use storage::{VDBMetricsStorage, VDBMetricsStorageImpl};
 
 /// A single metric record with running window calculations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,12 +16,25 @@ pub struct MetricRecord {
     pub metric_id: String,
     /// Unix timestamp in seconds
     pub timestamp: i64,
+    /// Metric value
+    pub value: f64,
     /// Running sum within the window
     pub value_running_window_sum: f64,
     /// Running average within the window
     pub value_running_window_avg: f64,
     /// Running count within the window
     pub value_running_window_count: i64,
+}
+
+/// Simplified metric record for VDB-first architecture
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimpleMetricRecord {
+    /// Unique identifier for the metric
+    pub metric_id: String,
+    /// Unix timestamp in seconds
+    pub timestamp: i64,
+    /// Metric value
+    pub value: f64,
 }
 
 impl MetricRecord {
@@ -35,6 +48,11 @@ impl MetricRecord {
             .column_by_name("timestamp")
             .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
             .ok_or_else(|| Status::internal("Invalid timestamp column"))?;
+
+        let values = batch
+            .column_by_name("value")
+            .and_then(|col| col.as_any().downcast_ref::<Float64Array>())
+            .ok_or_else(|| Status::internal("Invalid value column"))?;
 
         let sums = batch
             .column_by_name("value_running_window_sum")
@@ -56,6 +74,7 @@ impl MetricRecord {
             metrics.push(MetricRecord {
                 metric_id: metric_ids.value(i).to_string(),
                 timestamp: timestamps.value(i),
+                value: values.value(i),
                 value_running_window_sum: sums.value(i),
                 value_running_window_avg: avgs.value(i),
                 value_running_window_count: counts.value(i),
@@ -71,9 +90,23 @@ impl Default for MetricRecord {
         Self {
             metric_id: String::new(),
             timestamp: 0,
+            value: 0.0,
             value_running_window_sum: 0.0,
             value_running_window_avg: 0.0,
             value_running_window_count: 0,
+        }
+    }
+}
+
+impl From<SimpleMetricRecord> for MetricRecord {
+    fn from(simple: SimpleMetricRecord) -> Self {
+        Self {
+            metric_id: simple.metric_id,
+            timestamp: simple.timestamp,
+            value: simple.value,
+            value_running_window_sum: simple.value,
+            value_running_window_avg: simple.value,
+            value_running_window_count: 1,
         }
     }
 }
@@ -123,6 +156,11 @@ pub fn encode_record_batch(batch: &RecordBatch) -> Result<Vec<MetricRecord>, Sta
         .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
         .ok_or_else(|| Status::internal("Invalid timestamp column"))?;
 
+    let values = batch
+        .column_by_name("value")
+        .and_then(|col| col.as_any().downcast_ref::<Float64Array>())
+        .ok_or_else(|| Status::internal("Invalid value column"))?;
+
     let sums = batch
         .column_by_name("value_running_window_sum")
         .and_then(|col| col.as_any().downcast_ref::<Float64Array>())
@@ -143,6 +181,7 @@ pub fn encode_record_batch(batch: &RecordBatch) -> Result<Vec<MetricRecord>, Sta
         metrics.push(MetricRecord {
             metric_id: metric_ids.value(i).to_string(),
             timestamp: timestamps.value(i),
+            value: values.value(i),
             value_running_window_sum: sums.value(i),
             value_running_window_avg: avgs.value(i),
             value_running_window_count: counts.value(i),

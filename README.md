@@ -177,7 +177,7 @@ We welcome contributions! Please feel free to submit a Pull Request.
 
 ## 📄 License
 
-This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the AGPL v3 - see the [LICENSE](LICENSE) file for details.
 
 ---
 For inquiries or support, contact us at [📧 support@hyprstream.com](mailto:support@hyprstream.com) or visit our GitHub repository to contribute! 🌐
