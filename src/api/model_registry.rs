@@ -63,6 +63,23 @@ pub struct RegistryModelInfo {
     pub metadata: ModelMetadata,
 }
 
+/// Model info for search results and API responses
+#[derive(Debug, Clone)]
+pub struct ModelInfo {
+    pub name: String,
+    pub id: String,
+    pub description: String,
+    pub size_bytes: Option<u64>,
+    pub downloads: Option<u64>,
+    pub likes: Option<u64>,
+    pub tags: Vec<String>,
+    pub architecture: Option<String>,
+    pub task: Option<String>,
+    pub library_name: Option<String>,
+    pub created_at: i64,
+    pub last_modified: Option<String>,
+}
+
 /// Abstract model registry trait
 #[async_trait]
 pub trait ModelRegistry {

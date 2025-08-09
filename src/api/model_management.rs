@@ -3,7 +3,7 @@
 use axum::{
     Router,
     routing::{get, post, delete},
-    extract::{Path, State, Json, Query},
+    extract::{State, Json, Query},
     response::Json as JsonResponse,
     http::StatusCode,
 };
@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 use anyhow::Result;
 use url::Url;
 
-use crate::api::huggingface::HuggingFaceClient;
 use crate::api::model_registry::{ModelRegistry, ModelRegistryType};
 use crate::api::model_storage::{ModelStorage, ModelMetadata};
 

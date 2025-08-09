@@ -23,7 +23,6 @@ pub mod openai_compat;
 pub mod training_service;
 
 use lora_registry::{LoRARegistry, LoRALayer};
-use openai_compat::{OpenAIRequest, OpenAIResponse, OpenAIStreamResponse};
 use training_service::{TrainingService, TrainingConfig};
 
 /// Main API server state
@@ -192,16 +191,24 @@ async fn create_lora_layer(
     // Store in VDB with neural compression if enabled
     if request.config.use_neural_compression {
         #[cfg(feature = "vdb")]
-        { state.vdb_storage.store_adapter_neural_compressed(&lora_id, &adapter).await }
+        { 
+            state.vdb_storage.store_adapter_neural_compressed(&lora_id, &adapter).await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        }
         #[cfg(not(feature = "vdb"))]
-        { Ok(()) }
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        { 
+            // VDB feature not enabled, skip storage
+        }
     } else {
         #[cfg(feature = "vdb")]
-        { state.vdb_storage.store_adapter_accelerated(&lora_id, &adapter).await }
+        { 
+            state.vdb_storage.store_adapter_accelerated(&lora_id, &adapter).await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        }
         #[cfg(not(feature = "vdb"))]
-        { Ok(()) }
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        { 
+            // VDB feature not enabled, skip storage
+        }
     }
     
     // Register endpoint
@@ -268,9 +275,14 @@ async fn delete_lora_layer(
     
     // Remove from VDB storage
     #[cfg(feature = "vdb")]
-    { state.vdb_storage.remove_adapter(&lora_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? }
+    { 
+        state.vdb_storage.remove_adapter(&lora_id).await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
     #[cfg(not(feature = "vdb"))]
-    { /* VDB feature not enabled, nothing to remove */ }
+    { 
+        // VDB feature not enabled, nothing to remove
+    }
     
     // Remove endpoint
     let mut endpoints = state.endpoints.write().await;
@@ -290,7 +302,7 @@ async fn openai_chat_completions(
 ) -> Result<JsonResponse<openai_compat::ChatCompletionResponse>, StatusCode> {
     // Load the LoRA adapter
     #[cfg(feature = "vdb")]
-    let adapter = state.vdb_storage.load_adapter_neural_compressed(
+    let _adapter = state.vdb_storage.load_adapter_neural_compressed(
         &lora_id,
         Default::default(),
     ).await.map_err(|_| StatusCode::NOT_FOUND)?;
@@ -371,7 +383,7 @@ async fn openai_completions(
 ) -> Result<JsonResponse<openai_compat::CompletionResponse>, StatusCode> {
     // Similar to chat completions but for raw completions
     #[cfg(feature = "vdb")]
-    let adapter = state.vdb_storage.load_adapter_neural_compressed(
+    let _adapter = state.vdb_storage.load_adapter_neural_compressed(
         &lora_id,
         Default::default(),
     ).await.map_err(|_| StatusCode::NOT_FOUND)?;
@@ -443,7 +455,7 @@ async fn openai_embeddings(
 ) -> Result<JsonResponse<openai_compat::EmbeddingResponse>, StatusCode> {
     // Generate embeddings using the LoRA-adapted model
     #[cfg(feature = "vdb")]
-    let adapter = state.vdb_storage.load_adapter_neural_compressed(
+    let _adapter = state.vdb_storage.load_adapter_neural_compressed(
         &lora_id,
         Default::default(),
     ).await.map_err(|_| StatusCode::NOT_FOUND)?;

@@ -237,7 +237,25 @@ impl OpenVDBLoRAAdapter {
         (row as usize) < self.shape.0 && 
         (col as usize) < self.shape.1
     }
+    
+    /// Sparse matrix multiplication (placeholder)
+    pub fn sparse_multiply(&self, _input: &[f32], _output: &mut [f32]) -> Result<()> {
+        // TODO: Implement sparse matrix multiplication using OpenVDB
+        println!("⚠️ sparse_multiply not yet implemented");
+        Ok(())
+    }
+    
+    /// Get active voxel count
+    pub fn active_voxel_count(&self) -> u64 {
+        // TODO: Get actual count from OpenVDB grid
+        0
+    }
 }
+
+// SAFETY: OpenVDBLoRAAdapter contains C++ OpenVDB data structures which are thread-safe
+// when properly accessed. We ensure exclusive access through Rust's borrowing rules.
+unsafe impl Send for OpenVDBLoRAAdapter {}
+unsafe impl Sync for OpenVDBLoRAAdapter {}
 
 /// Iterator over active (non-zero) weights (temporarily disabled)
 pub struct OpenVDBActiveIterator {

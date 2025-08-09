@@ -3,26 +3,24 @@
 use crate::adapters::sparse_lora::SparseLoRAAdapter;
 #[cfg(feature = "vdb")]
 use crate::storage::vdb::hardware_accelerated::HardwareVDBStorage;
-use crate::storage::vdb::sparse_storage::SparseStorage;
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use arrow_array::{Float32Array, RecordBatch, StringArray, Int64Array};
-use arrow_schema::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
 use anyhow::Result;
 
 pub mod model_loader;
 pub mod inference_engine;
 pub mod lora_fusion;
-pub mod inference_service;
+
+// Re-export unified config system
+pub use crate::config::{HyprConfig, GenerationRequest, GenerationResult, ModelInfo};
 
 pub use model_loader::{ModelLoader, BaseModelHandle};
-pub use inference_engine::{InferenceEngine, InferenceConfig};
+pub use inference_engine::{InferenceEngine, InferenceEngineStats};
 pub use lora_fusion::{LoRAFusion, FusionStrategy};
-pub use inference_service::{InferenceFlightService, InferenceRequest, InferenceResponse};
 
 /// Inference session with active LoRA adapters
 #[derive(Debug, Clone)]
@@ -72,7 +70,7 @@ impl InferenceAPI {
     pub async fn new(
         model_path: &Path,
         #[cfg(feature = "vdb")] vdb_storage: Arc<HardwareVDBStorage>,
-        config: InferenceConfig,
+        config: HyprConfig,
     ) -> Result<Self> {
         // Load base model with mmap
         let model_loader = Arc::new(ModelLoader::new(model_path).await?);
@@ -194,9 +192,18 @@ impl InferenceAPI {
         };
         
         // Create streaming inference
+        #[cfg(feature = "vdb")]
         let stream = self.engine.stream_infer_with_updates(
             &self.model_loader,
             &self.vdb_storage,
+            session,
+            input,
+            update_channel,
+        ).await?;
+        
+        #[cfg(not(feature = "vdb"))]
+        let stream = self.engine.stream_infer_with_updates(
+            &self.model_loader,
             session,
             input,
             update_channel,
@@ -256,7 +263,15 @@ impl InferenceAPI {
         let sparse_updates = self.convert_to_sparse_updates(updates)?;
         
         // Apply updates through VDB storage
-        self.vdb_storage.gpu_sparse_update(adapter_id, &sparse_updates).await?;
+        #[cfg(feature = "vdb")]
+        {
+            self.vdb_storage.gpu_sparse_update(adapter_id, &sparse_updates).await?;
+        }
+        #[cfg(not(feature = "vdb"))]
+        {
+            // Placeholder - VDB not available, skip sparse updates
+            tracing::warn!("VDB storage not available - skipping sparse updates for adapter: {}", adapter_id);
+        }
         
         Ok(())
     }
@@ -368,7 +383,7 @@ pub struct SparseWeightUpdate {
     pub timestamp: i64,
 }
 
-fn parse_weight_key(key: &str) -> Option<(usize, (i32, i32))> {
+fn parse_weight_key(_key: &str) -> Option<(usize, (i32, i32))> {
     // Parse keys like "layer.0.weight[100,200]"
     // This is a simplified parser - implement based on actual key format
     None

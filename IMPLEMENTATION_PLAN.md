@@ -1,8 +1,16 @@
-# Hyprstream Implementation Plan
+# Hyprstream Implementation Plan - CRITICAL ARCHITECTURE FIX
 
-## Executive Summary
+## ⚠️ URGENT: Architecture Issue Identified
 
-This plan addresses the critical gaps identified in the Hyprstream codebase audit, transforming it from an architectural framework into a fully functional VDB-first adaptive ML inference server. The plan is structured in 4 phases over approximately 12-16 weeks.
+**PROBLEM:** The `src/inference/` module contains FlightSQL transport code instead of LLaMA.cpp inference logic. This architectural confusion prevents proper model inference despite having functional LLaMA.cpp integration in `src/runtime/`.
+
+**ROOT CAUSE:** Mixed concerns between transport protocols and ML inference logic.
+
+**IMPACT:** Cannot perform actual model inference with LLaMA.cpp.
+
+## IMMEDIATE PRIORITY: Fix Architecture (Next 48 Hours)
+
+### Critical Path to Working LLaMA.cpp Inference
 
 ## Phase 1: Foundation & Core Dependencies (Weeks 1-4)
 

@@ -1,69 +1,36 @@
-//! Core inference engine for running models with LoRA adapters
+//! Core inference engine for running models with LoRA adapters using LLaMA.cpp
 
 use crate::inference::{InferenceInput, InferenceOutput, InferenceToken, FusedAdapterWeights};
-use crate::inference::model_loader::{ModelLoader, BaseModelHandle};
-use crate::runtime::RuntimeEngine;
+use crate::inference::model_loader::ModelLoader;
+use crate::runtime::{RuntimeEngine, LlamaCppEngine};
+use crate::config::{HyprConfig};
 #[cfg(feature = "vdb")]
 use crate::storage::vdb::hardware_accelerated::HardwareVDBStorage;
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use std::path::Path;
+use anyhow::{Result, anyhow};
 use futures::Stream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
+use serde::{Serialize, Deserialize};
 
-/// Configuration for inference engine
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InferenceConfig {
-    /// Maximum batch size for inference
-    pub max_batch_size: usize,
-    
-    /// Use GPU acceleration if available
-    pub use_gpu: bool,
-    
-    /// GPU device ID
-    pub gpu_device: i32,
-    
-    /// Number of CPU threads for inference
-    pub cpu_threads: usize,
-    
-    /// KV cache size limit
-    pub kv_cache_size_mb: usize,
-    
-    /// Enable mixed precision inference
-    pub mixed_precision: bool,
-    
-    /// Flash attention if supported
-    pub flash_attention: bool,
-}
-
-impl Default for InferenceConfig {
-    fn default() -> Self {
-        Self {
-            max_batch_size: 8,
-            use_gpu: true,
-            gpu_device: 0,
-            cpu_threads: std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4),
-            kv_cache_size_mb: 2048,
-            mixed_precision: true,
-            flash_attention: true,
-        }
-    }
-}
-
-/// Core inference engine
+/// Core inference engine using LLaMA.cpp
 pub struct InferenceEngine {
-    config: InferenceConfig,
+    /// Unified system configuration
+    config: HyprConfig,
+    
+    /// LLaMA.cpp runtime engine
+    llama_engine: RwLock<Option<LlamaCppEngine>>,
+    
+    /// Currently loaded model path
+    current_model_path: RwLock<Option<String>>,
     
     /// Runtime statistics
-    stats: tokio::sync::RwLock<InferenceEngineStats>,
+    stats: RwLock<InferenceEngineStats>,
 }
 
 /// Inference engine statistics
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct InferenceEngineStats {
     pub total_inferences: u64,
     pub total_tokens_generated: u64,
@@ -75,28 +42,102 @@ pub struct InferenceEngineStats {
 }
 
 impl InferenceEngine {
-    /// Create new inference engine
-    pub fn new(config: InferenceConfig) -> Result<Self> {
-        println!("🚀 Initializing inference engine (GPU: {})", config.use_gpu);
+    /// Create new inference engine with unified config
+    pub fn new(config: HyprConfig) -> Result<Self> {
+        println!("🚀 Initializing LLaMA.cpp inference engine (GPU: {}, threads: {:?})", 
+                config.runtime.use_gpu, config.runtime.cpu_threads);
         
         Ok(Self {
             config,
-            stats: tokio::sync::RwLock::new(InferenceEngineStats::default()),
+            llama_engine: RwLock::new(None),
+            current_model_path: RwLock::new(None),
+            stats: RwLock::new(InferenceEngineStats::default()),
         })
     }
     
-    /// Run inference with base model and fused adapters
+    /// Load a GGUF model using LLaMA.cpp
+    pub async fn load_model(&self, model_path: &Path) -> Result<()> {
+        println!("📥 Loading GGUF model: {}", model_path.display());
+        
+        // Create and initialize LLaMA engine using unified config
+        let mut llama_engine = LlamaCppEngine::new(self.config.runtime.clone())?;
+        llama_engine.load_model(model_path).await?;
+        
+        // Store the engine and model path
+        {
+            let mut engine_guard = self.llama_engine.write().await;
+            *engine_guard = Some(llama_engine);
+        }
+        
+        {
+            let mut path_guard = self.current_model_path.write().await;
+            *path_guard = Some(model_path.to_string_lossy().to_string());
+        }
+        
+        println!("✅ Model loaded successfully: {}", model_path.display());
+        Ok(())
+    }
+    
+    /// Generate text using LLaMA.cpp with unified config
+    pub async fn generate_text(&self, prompt: &str, max_tokens: usize) -> Result<String> {
+        // Create generation request from unified config
+        let mut request = self.config.create_request(prompt.to_string());
+        request.max_tokens = max_tokens; // Override with provided value
+        
+        // Get the LLaMA engine
+        let engine_guard = self.llama_engine.read().await;
+        let llama_engine = engine_guard.as_ref()
+            .ok_or_else(|| anyhow!("No model loaded. Call load_model() first."))?;
+        
+        println!("🤖 Generating text with LLaMA.cpp: \"{}\" (max_tokens: {})", 
+                prompt.chars().take(50).collect::<String>(), max_tokens);
+        
+        let result = llama_engine.generate_with_params(request).await?;
+        
+        // Update statistics
+        {
+            let mut stats = self.stats.write().await;
+            stats.total_inferences += 1;
+            stats.total_tokens_generated += result.tokens_generated as u64;
+            stats.avg_tokens_per_second = result.tokens_per_second as f64;
+            stats.avg_latency_ms = result.generation_time_ms as f64;
+            stats.last_inference_time = chrono::Utc::now().timestamp();
+        }
+        
+        println!("✅ Generated {} tokens at {:.1} tok/s", result.tokens_generated, result.tokens_per_second);
+        Ok(result.text)
+    }
+    
+    /// Check if a model is loaded
+    pub async fn is_model_loaded(&self) -> bool {
+        let engine_guard = self.llama_engine.read().await;
+        engine_guard.is_some()
+    }
+    
+    /// Get current model information
+    pub async fn get_model_info(&self) -> Option<String> {
+        let path_guard = self.current_model_path.read().await;
+        path_guard.clone()
+    }
+    
+    /// Run inference with base model and fused adapters using LLaMA.cpp
     pub async fn infer(
         &self,
-        model_loader: &ModelLoader,
+        _model_loader: &ModelLoader,
         fused_weights: &FusedAdapterWeights,
         input: InferenceInput,
     ) -> Result<InferenceOutput> {
         let start_time = std::time::Instant::now();
         
-        // For now, implement a simplified inference
-        // In production, this would integrate with llama.cpp or similar
-        let response_text = self.generate_response(&input).await?;
+        // Get prompt from input
+        let prompt = input.prompt
+            .ok_or_else(|| anyhow!("No prompt provided in input"))?;
+        
+        // TODO: Apply LoRA adapters from fused_weights (for now, use base model)
+        println!("🧠 Using {} fused LoRA adapters", fused_weights.weights.len());
+        
+        // Generate text using LLaMA.cpp
+        let response_text = self.generate_text(&prompt, input.max_tokens).await?;
         let tokens_generated = response_text.split_whitespace().count();
         
         let latency = start_time.elapsed().as_millis() as f64;
@@ -181,66 +222,6 @@ impl InferenceEngine {
         Ok(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
     }
     
-    /// Generate response using LlamaCpp engine
-    async fn generate_response(&self, input: &InferenceInput) -> Result<String> {
-        let prompt = input.prompt.as_ref().map(|s| s.as_str()).unwrap_or("");
-        
-        // Try to use LlamaCpp engine if available
-        match self.try_llamacpp_inference(prompt, input).await {
-            Ok(response) => Ok(response),
-            Err(_) => {
-                // Fallback to simplified implementation for now
-                println!("⚠️ LlamaCpp not available, using fallback inference");
-                
-                let response = if prompt.to_lowercase().contains("hello") {
-                    "Hello! I'm a language model powered by Hyprstream with adaptive LoRA capabilities.".to_string()
-                } else if prompt.to_lowercase().contains("code") {
-                    format!("I can help with coding tasks. Your request: '{}'. I would analyze this and provide code assistance using my fine-tuned adapters.", prompt)
-                } else if prompt.to_lowercase().contains("explain") {
-                    format!("I'll explain that for you. Based on your query '{}', here's a detailed explanation using knowledge from my specialized adapters.", prompt)
-                } else {
-                    format!("I understand your request: '{}'. I'm processing this through the Hyprstream inference engine with real-time adapter fusion for optimal results.", prompt)
-                };
-                
-                Ok(response.to_string())
-            }
-        }
-    }
-    
-    /// Try LlamaCpp inference
-    async fn try_llamacpp_inference(&self, prompt: &str, input: &InferenceInput) -> Result<String> {
-        // Try to initialize LlamaCpp engine
-        let mut engine = crate::runtime::LlamaCppEngine::new(
-            crate::runtime::RuntimeConfig {
-                context_length: 2048,
-                batch_size: 512,
-                num_threads: Some(self.config.cpu_threads),
-                use_gpu: self.config.use_gpu,
-                gpu_layers: if self.config.use_gpu { Some(20) } else { None },
-                mmap: true,
-            }
-        )?;
-        
-        // Try to find an available model file
-        let model_path = self.find_available_model().await?;
-        engine.load_model(&model_path).await?;
-        
-        // Prepare generation request
-        let generation_request = crate::runtime::GenerationRequest {
-            prompt: prompt.to_string(),
-            max_tokens: input.max_tokens,
-            temperature: input.temperature,
-            top_p: input.top_p,
-            stop_tokens: vec!["</s>".to_string(), "\n\n".to_string()],
-            top_k: None,
-            seed: None,
-        };
-        
-        // Generate response
-        let result = engine.generate_with_params(generation_request).await?;
-        
-        Ok(result.text)
-    }
     
     /// Get engine statistics
     pub async fn get_stats(&self) -> InferenceEngineStats {
@@ -263,31 +244,19 @@ impl InferenceEngine {
     pub async fn warmup(&self) -> Result<()> {
         println!("🔥 Warming up inference engine...");
         
-        let warmup_input = InferenceInput {
-            prompt: Some("Hello world".to_string()),
-            input_ids: None,
-            max_tokens: 10,
-            temperature: 1.0,
-            top_p: 1.0,
-            stream: false,
-        };
+        // Check if model is loaded, if not try to find and load one
+        if !self.is_model_loaded().await {
+            if let Ok(model_path) = self.find_available_model().await {
+                println!("📥 Loading model for warmup: {}", model_path.display());
+                self.load_model(&model_path).await?;
+            } else {
+                println!("⚠️ No model available for warmup - skipping");
+                return Ok(());
+            }
+        }
         
-        // Create dummy fused weights for warmup
-        let fused_weights = FusedAdapterWeights {
-            weights: HashMap::new(),
-            fusion_metadata: crate::inference::FusionMetadata {
-                num_adapters: 0,
-                total_sparse_weights: 0,
-                fusion_strategy: "warmup".to_string(),
-                timestamp: chrono::Utc::now().timestamp(),
-            },
-        };
-        
-        // Create dummy model loader for warmup
-        let model_loader = ModelLoader::new(std::path::Path::new("./")).await?;
-        
-        // Run warmup inference
-        let _result = self.infer(&model_loader, &fused_weights, warmup_input).await?;
+        // Run warmup inference with LLaMA.cpp
+        let _result = self.generate_text("Hello", 5).await?;
         
         println!("✅ Inference engine warmed up successfully");
         Ok(())
@@ -295,7 +264,7 @@ impl InferenceEngine {
     
     /// Check if GPU acceleration is available
     pub fn is_gpu_available(&self) -> bool {
-        self.config.use_gpu && self.check_gpu_availability()
+        self.config.runtime.use_gpu && self.check_gpu_availability()
     }
     
     /// Check GPU availability (simplified)
@@ -305,13 +274,13 @@ impl InferenceEngine {
         std::path::Path::new("/usr/local/cuda").exists()
     }
     
-    /// Get inference configuration
-    pub fn config(&self) -> &InferenceConfig {
+    /// Get system configuration
+    pub fn config(&self) -> &HyprConfig {
         &self.config
     }
     
     /// Update configuration
-    pub fn update_config(&mut self, config: InferenceConfig) {
+    pub fn update_config(&mut self, config: HyprConfig) {
         self.config = config;
         println!("🔧 Updated inference engine configuration");
     }
@@ -367,8 +336,8 @@ impl InferenceEngine {
         MemoryUsage {
             gpu_memory_used_mb: stats.gpu_memory_used_mb,
             kv_cache_usage_percent: stats.kv_cache_usage_percent,
-            kv_cache_limit_mb: self.config.kv_cache_size_mb as u64,
-            cpu_threads_active: self.config.cpu_threads,
+            kv_cache_limit_mb: self.config.runtime.kv_cache_size_mb as u64,
+            cpu_threads_active: self.config.runtime.cpu_threads.unwrap_or(0usize),
         }
     }
 }

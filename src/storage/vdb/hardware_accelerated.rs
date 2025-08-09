@@ -111,6 +111,7 @@ pub struct WeightUpdatePattern {
 
 /// Statistics for autoregressive prediction accuracy
 #[derive(Debug, Default)]
+#[derive(Clone)]
 pub struct PredictionStats {
     /// Total predictions made
     pub total_predictions: u64,
@@ -506,7 +507,7 @@ impl HardwareVDBStorage {
         let start = Instant::now();
         
         // Create OpenVDB LoRA grid with hierarchical structure
-        let openvdb_adapter = crate::storage::vdb::openvdb_bindings::OpenVDBLoRAAdapter::new(
+        let mut openvdb_adapter = crate::storage::vdb::openvdb_bindings::OpenVDBLoRAAdapter::new(
             1536, // TODO: get from adapter
             1536  // TODO: get from adapter  
         ).map_err(|e| VDBError::OperationFailed(e.to_string()))?;
@@ -519,13 +520,13 @@ impl HardwareVDBStorage {
         
         // Phase 3: Store with hierarchical encoding
         // Level 0: Rank structure (coarse)
-        self.store_rank_structure(&openvdb_adapter, &quantized.rank_data).await?;
+        self.store_rank_structure(&mut openvdb_adapter, &quantized.rank_data).await?;
         
         // Level 1: Active weight clusters (medium) 
-        self.store_weight_clusters(&openvdb_adapter, &quantized.cluster_data).await?;
+        self.store_weight_clusters(&mut openvdb_adapter, &quantized.cluster_data).await?;
         
         // Level 2: Individual sparse weights (fine)
-        self.store_sparse_weights_zorder(&openvdb_adapter, &quantized.sparse_data, &z_pattern).await?;
+        self.store_sparse_weights_zorder(&mut openvdb_adapter, &quantized.sparse_data, &z_pattern).await?;
         
         // Store in adapters map and cache Z-order pattern
         {
@@ -670,13 +671,11 @@ impl HardwareVDBStorage {
             
             // Extract weights from OpenVDB adapter with hierarchical reconstruction
             openvdb_adapter.get_all_weights()
-                .map_err(|e| VDBError::OperationFailed(e.to_string()))?
         };
         
         // Create adapter and load weights
         let adapter = SparseLoRAAdapter::new(config);
-        adapter.load_sparse_weights(&weights).await
-            .map_err(|e| VDBError::OperationFailed(e.to_string()))?;
+        adapter.load_sparse_weights(&weights).await;
 
         // Update cache statistics
         {
@@ -888,7 +887,7 @@ impl HardwareVDBStorage {
                 adapter_infos.push(AdapterInfo {
                     id: adapter_id.clone(),
                     active_voxels: adapter.active_voxel_count(),
-                    memory_usage_bytes: adapter.memory_usage(),
+                    memory_usage_bytes: adapter.memory_usage() as u64,
                     sparsity: adapter.sparsity_ratio(),
                     tree_depth: hierarchical_depth as u32, // Use hierarchical depth
                     cuda_enabled: true, // OpenVDB with hardware acceleration
@@ -917,7 +916,7 @@ impl HardwareVDBStorage {
     /// Generate Z-order pattern for spatial locality (OctGPT-inspired)
     async fn generate_z_order_pattern(&self, adapter: &SparseLoRAAdapter) -> Result<ZOrderPattern, VDBError> {
         // For LoRA matrices, create Z-order curve through weight space
-        let config = adapter.get_config().await;
+        let config = adapter.get_config();
         let total_weights = config.in_features * config.rank + config.rank * config.out_features;
         
         let mut indices = Vec::new();
@@ -946,7 +945,7 @@ impl HardwareVDBStorage {
     /// Store rank structure at coarse level
     async fn store_rank_structure(
         &self, 
-        adapter: &crate::storage::vdb::openvdb_bindings::OpenVDBLoRAAdapter,
+        adapter: &mut crate::storage::vdb::openvdb_bindings::OpenVDBLoRAAdapter,
         rank_data: &[u8]
     ) -> Result<(), VDBError> {
         // Store quantized rank matrices in VDB tree structure
@@ -954,7 +953,7 @@ impl HardwareVDBStorage {
         for (i, &value) in rank_data.iter().enumerate() {
             let x = (i % 32) as i32; // Max rank 32
             let y = (i / 32) as i32;
-            adapter.set_weight(x, y, 0, value as f32 / 255.0); // Normalize from u8
+            adapter.set_weight(x, y, value as f32 / 255.0); // Normalize from u8
         }
         Ok(())
     }
@@ -962,12 +961,12 @@ impl HardwareVDBStorage {
     /// Store weight clusters at medium level
     async fn store_weight_clusters(
         &self,
-        adapter: &crate::storage::vdb::openvdb_bindings::OpenVDBLoRAAdapter,
+        adapter: &mut crate::storage::vdb::openvdb_bindings::OpenVDBLoRAAdapter,
         cluster_data: &[(u16, u16, f32)]
     ) -> Result<(), VDBError> {
         // Level 1: Store clustered weights with spatial locality
         for (i, &(x, y, weight)) in cluster_data.iter().enumerate() {
-            adapter.set_weight(x as i32, y as i32, 1, weight); // Level 1 in Z
+            adapter.set_weight(x as i32, y as i32, weight); // Level 1
         }
         Ok(())
     }
@@ -975,14 +974,14 @@ impl HardwareVDBStorage {
     /// Store individual sparse weights with Z-order traversal
     async fn store_sparse_weights_zorder(
         &self,
-        adapter: &crate::storage::vdb::openvdb_bindings::OpenVDBLoRAAdapter,
+        adapter: &mut crate::storage::vdb::openvdb_bindings::OpenVDBLoRAAdapter,
         sparse_data: &[(u32, f32)],
         z_pattern: &ZOrderPattern
     ) -> Result<(), VDBError> {
         // Level 2: Store fine-grained sparse weights following Z-order
-        for (morton_idx, &weight) in sparse_data.iter().enumerate() {
-            let (x, y) = self.deinterleave_2d_coords(z_pattern.indices[morton_idx]);
-            adapter.set_weight(x, y, 2, weight); // Level 2 in Z
+        for &(idx, weight) in sparse_data.iter() {
+            let (x, y) = self.deinterleave_2d_coords(idx);
+            adapter.set_weight(x, y, weight); // Level 2
         }
         Ok(())
     }
@@ -1133,11 +1132,12 @@ mod tests {
     async fn test_coordinate_conversion() {
         let storage = HardwareVDBStorage::new().await.unwrap();
         
-        let shape = vec![100, 200];
-        let coord = storage.linear_to_coord_3d(10205, &shape); // Row 51, Col 5
-        assert_eq!(coord, Coord3D::new(5, 51, 0));
-        
-        let linear = storage.coord_3d_to_linear(coord, &shape);
-        assert_eq!(linear, 10205);
+        // Test Morton code encoding/decoding
+        let x = 10u32;
+        let y = 20u32;
+        let morton = storage.morton_encode(x, y);
+        let (decoded_x, decoded_y) = storage.deinterleave_2d_coords(morton);
+        assert_eq!(decoded_x, 10);
+        assert_eq!(decoded_y, 20);
     }
 }

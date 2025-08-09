@@ -74,6 +74,25 @@ pub struct WeightMap {
     pub file_path: PathBuf,
 }
 
+impl Clone for WeightMap {
+    fn clone(&self) -> Self {
+        use std::fs::File;
+        use memmap2::MmapOptions;
+        
+        // Re-open the file and create a new memory map
+        let file = File::open(&self.file_path)
+            .expect("Failed to reopen file for cloning WeightMap");
+        let mmap = unsafe { MmapOptions::new().map(&file) }
+            .expect("Failed to create memory map for cloning WeightMap");
+        
+        WeightMap {
+            mmap,
+            tensors: self.tensors.clone(),
+            file_path: self.file_path.clone(),
+        }
+    }
+}
+
 /// Information about a tensor in a weight file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TensorInfo {

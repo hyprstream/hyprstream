@@ -89,10 +89,11 @@ pub async fn handle_quick_start(cmd: QuickStartCommand) -> Result<()> {
     let config = RuntimeConfig {
         context_length: cmd.context_length,
         batch_size: 512,
-        num_threads: None,
+        cpu_threads: None,
         use_gpu: cmd.use_gpu,
         gpu_layers: cmd.gpu_layers,
         mmap: true,
+        kv_cache_size_mb: 2048,
     };
 
     println!("🔧 Initializing runtime engine...");

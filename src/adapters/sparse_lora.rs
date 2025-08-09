@@ -431,6 +431,18 @@ impl SparseLoRAAdapter {
         println!("⚠️ load_sparse_weights not yet implemented");
     }
     
+    /// Get LoRA A matrix data (async accessor)
+    pub async fn get_lora_a(&self) -> Vec<f32> {
+        let lora_a = self.lora_a.read().await;
+        lora_a.to_dense()
+    }
+    
+    /// Get LoRA B matrix data (async accessor)
+    pub async fn get_lora_b(&self) -> Vec<f32> {
+        let lora_b = self.lora_b.read().await;
+        lora_b.to_dense()
+    }
+    
     /// Get adapter configuration (placeholder implementation)
     pub fn get_config(&self) -> &SparseLoRAConfig {
         &self.config
@@ -496,6 +508,21 @@ impl SparseMatrix {
         }
         
         result
+    }
+    
+    /// Convert sparse matrix to dense format
+    fn to_dense(&self) -> Vec<f32> {
+        let total_elements = self.shape[0] * self.shape[1];
+        let mut dense = vec![0.0; total_elements];
+        
+        for ((row, col), &value) in &self.data {
+            let idx = row * self.shape[1] + col;
+            if idx < dense.len() {
+                dense[idx] = value;
+            }
+        }
+        
+        dense
     }
     
     fn apply_sparse_gradient(&mut self, gradients: &HashMap<(usize, usize), f32>, lr: f32) {

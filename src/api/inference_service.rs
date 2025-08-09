@@ -1,8 +1,6 @@
 //! FlightSQL service for inference with LoRA adapters
 
-use crate::api::{ApiState, LoRAEndpoint};
-use crate::service::embedding_flight::EmbeddingFlightService;
-use crate::storage::vdb::sparse_storage::SparseStorage;
+use crate::api::ApiState;
 
 use arrow_flight::{
     flight_service_server::{FlightService, FlightServiceServer},
@@ -11,9 +9,8 @@ use arrow_flight::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use std::pin::Pin;
-use std::sync::Arc;
 use tonic::{Request, Response, Status, Streaming};
-use futures::stream::{self, Stream, StreamExt};
+use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 
 /// Inference request for FlightSQL
@@ -84,21 +81,13 @@ pub struct InferenceFlightService {
     /// API state with LoRA registry and training service
     api_state: ApiState,
     
-    /// Base embedding service for non-inference operations
-    embedding_service: EmbeddingFlightService,
 }
 
 impl InferenceFlightService {
     /// Create new inference FlightSQL service
     pub fn new(api_state: ApiState) -> Self {
-        // Create embedding service as fallback
-        let embedding_service = EmbeddingFlightService::new(
-            api_state.vdb_storage.clone() as Arc<dyn SparseStorage>
-        );
-        
         Self {
             api_state,
-            embedding_service,
         }
     }
     
@@ -214,9 +203,11 @@ impl FlightService for InferenceFlightService {
     /// Handshake for inference service
     async fn handshake(
         &self,
-        request: Request<Streaming<HandshakeRequest>>,
+        _request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
-        self.embedding_service.handshake(request).await
+        let response = HandshakeResponse::default();
+        let stream = stream::iter(vec![Ok(response)]);
+        Ok(Response::new(Box::pin(stream)))
     }
 
     /// List available inference operations
@@ -263,8 +254,7 @@ impl FlightService for InferenceFlightService {
                 Ok(Response::new(Box::pin(stream)))
             }
             Err(_) => {
-                // Fallback to embedding service
-                self.embedding_service.do_get(Request::new(ticket)).await
+                Err(Status::invalid_argument("Invalid ticket format"))
             }
         }
     }
@@ -286,17 +276,16 @@ impl FlightService for InferenceFlightService {
             let schema_result = SchemaResult { schema: schema_bytes };
             Ok(Response::new(schema_result))
         } else {
-            // Fallback to embedding service
-            self.embedding_service.get_schema(Request::new(descriptor)).await
+            Err(Status::not_found("Schema not found"))
         }
     }
 
     /// Not implemented for inference service
     async fn do_put(
         &self,
-        request: Request<Streaming<FlightData>>,
+        _request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        self.embedding_service.do_put(request).await
+        Err(Status::unimplemented("Do put not implemented"))
     }
 
     /// List available inference actions
@@ -335,10 +324,11 @@ impl FlightService for InferenceFlightService {
                 let layers = self.api_state.lora_registry.list_all().await
                     .map_err(|e| Status::internal(format!("Failed to list LoRAs: {}", e)))?;
                 
+                let stats_json = serde_json::to_vec(&layers)
+                    .map_err(|e| Status::internal(format!("Serialization error: {}", e)))?;
+                
                 let result = arrow_flight::Result {
-                    body: serde_json::to_vec(&layers)
-                        .map_err(|e| Status::internal(format!("Serialization error: {}", e)))?
-                        .into(),
+                    body: stats_json.into(),
                 };
                 
                 let stream = stream::iter(vec![Ok(result)]);
@@ -348,10 +338,11 @@ impl FlightService for InferenceFlightService {
             "get_training_stats" => {
                 let stats = self.api_state.training_service.get_stats().await;
                 
+                let stats_json = serde_json::to_vec(&stats)
+                    .map_err(|e| Status::internal(format!("Serialization error: {}", e)))?;
+                
                 let result = arrow_flight::Result {
-                    body: serde_json::to_vec(&stats)
-                        .map_err(|e| Status::internal(format!("Serialization error: {}", e)))?
-                        .into(),
+                    body: stats_json.into(),
                 };
                 
                 let stream = stream::iter(vec![Ok(result)]);
@@ -359,8 +350,7 @@ impl FlightService for InferenceFlightService {
             }
             
             _ => {
-                // Fallback to embedding service
-                self.embedding_service.do_action(Request::new(action)).await
+                Err(Status::unimplemented(format!("Action {} not implemented", action.r#type)))
             }
         }
     }
@@ -368,9 +358,9 @@ impl FlightService for InferenceFlightService {
     /// Not implemented for inference service
     async fn do_exchange(
         &self,
-        request: Request<Streaming<FlightData>>,
+        _request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        self.embedding_service.do_exchange(request).await
+        Err(Status::unimplemented("Do exchange not implemented"))
     }
 
     /// Get flight info for inference operations
@@ -391,16 +381,16 @@ impl FlightService for InferenceFlightService {
 
             Ok(Response::new(flight_info))
         } else {
-            self.embedding_service.get_flight_info(Request::new(descriptor)).await
+            Err(Status::not_found("Flight info not found"))
         }
     }
 
     /// Poll flight info (not implemented)
     async fn poll_flight_info(
         &self,
-        request: Request<FlightDescriptor>,
+        _request: Request<FlightDescriptor>,
     ) -> Result<Response<arrow_flight::PollInfo>, Status> {
-        self.embedding_service.poll_flight_info(request).await
+        Err(Status::unimplemented("Poll flight info not implemented"))
     }
 }
 

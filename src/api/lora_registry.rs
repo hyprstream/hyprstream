@@ -144,6 +144,12 @@ impl LoRARegistry {
         
         Ok(())
     }
+    
+    /// List all registered adapters
+    pub async fn list_adapters(&self) -> Result<Vec<String>> {
+        let layers = self.layers.read().await;
+        Ok(layers.keys().cloned().collect())
+    }
 }
 
 fn estimate_memory_usage(layer: &LoRALayer) -> u64 {

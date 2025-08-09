@@ -1,150 +1,203 @@
-//! Configuration management for Hyprstream service.
-//!
-//! This module provides configuration handling through multiple sources:
-//! 1. Default configuration (embedded in binary)
-//! 2. System-wide configuration file (`/etc/hyprstream/config.toml`)
-//! 3. User-specified configuration file
-//! 4. Environment variables (prefixed with `HYPRSTREAM_`)
-//! 5. Command-line arguments
-//!
-//! Configuration options are loaded in order of precedence, with later sources
-//! overriding earlier ones.
+//! Unified configuration system for LLaMA.cpp-based inference
 
-use crate::cli::commands::{
-    config::LoggingConfig,
-    server::{CacheConfig, EngineConfig, ServerConfig},
-};
-use config::{Config, ConfigError};
-use config::builder::{ConfigBuilder, DefaultState};
-use config::File;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use tonic::transport::{Identity, Certificate};
 
-const DEFAULT_CONFIG: &str = include_str!("../config/default.toml");
-const DEFAULT_CONFIG_PATH: &str = "/etc/hyprstream/config.toml";
-
-/// Set TLS configuration using certificate data directly
-pub fn set_tls_data(
-    builder: ConfigBuilder<DefaultState>,
-    cert: &[u8],
-    key: &[u8],
-    ca: Option<&[u8]>,
-) -> Result<ConfigBuilder<DefaultState>, ConfigError> {
-    // Store the TLS configuration
-    let mut builder = builder
-        .set_default("tls.enabled", true)?
-        .set_default("tls.cert_data", cert.to_vec())?
-        .set_default("tls.key_data", key.to_vec())?;
-
-    if let Some(ca_data) = ca {
-        builder = builder.set_default("tls.ca_data", ca_data.to_vec())?;
-    }
-
-    Ok(builder)
+/// Single unified configuration for the entire system
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HyprConfig {
+    /// Model configuration
+    pub model: ModelConfig,
+    /// Runtime execution settings
+    pub runtime: RuntimeConfig,
+    /// Text generation parameters
+    pub generation: GenerationConfig,
+    /// LoRA adapter settings
+    pub lora: LoRAConfig,
 }
 
-/// Get TLS configuration from Config
-pub fn get_tls_config(config: &Config) -> Option<(Identity, Option<Certificate>)> {
-    if !config.get_bool("tls.enabled").unwrap_or(false) {
-        return None;
-    }
-
-    // Try to get certificate data first
-    let cert_result = config.get::<Vec<u8>>("tls.cert_data");
-    let key_result = config.get::<Vec<u8>>("tls.key_data");
-    let ca_result = config.get::<Vec<u8>>("tls.ca_data");
-
-    if let (Ok(cert), Ok(key)) = (cert_result, key_result) {
-        let identity = Identity::from_pem(&cert, &key);
-        let ca_cert = ca_result.ok().map(|ca| Certificate::from_pem(&ca));
-        return Some((identity, ca_cert));
-    }
-
-    // Fall back to loading from files
-    let cert_path = config.get_string("tls.cert_path").ok()?;
-    let key_path = config.get_string("tls.key_path").ok()?;
-    if cert_path.is_empty() || key_path.is_empty() {
-        return None;
-    }
-
-    let cert = std::fs::read(cert_path).ok()?;
-    let key = std::fs::read(key_path).ok()?;
-    let identity = Identity::from_pem(&cert, &key);
-
-    let ca_cert = config
-        .get_string("tls.ca_path")
-        .ok()
-        .filter(|p| !p.is_empty())
-        .and_then(|p| std::fs::read(p).ok())
-        .map(|ca| Certificate::from_pem(&ca));
-
-    Some((identity, ca_cert))
+/// Model loading and identification
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelConfig {
+    /// Path to GGUF model file
+    pub path: PathBuf,
+    /// Model identifier (e.g., "qwen2-1.5b")
+    pub name: String,
+    /// Architecture type ("llama", "qwen", etc.)
+    pub architecture: String,
+    /// Expected parameter count
+    pub parameters: Option<u64>,
 }
 
-/// Complete service configuration.
-///
-/// This structure holds all configuration options for the service,
-/// including server settings, storage backend configuration, and
-/// cache settings.
-#[derive(Debug, Deserialize)]
-pub struct Settings {
-    /// Server configuration
-    #[serde(default)]
-    pub server: ServerConfig,
-    /// Engine configuration
-    #[serde(default)]
-    pub engine: EngineConfig,
-    /// Cache configuration
-    #[serde(default)]
-    pub cache: CacheConfig,
-    /// Logging configuration
-    #[serde(default)]
-    pub logging: LoggingConfig,
+/// LLaMA.cpp runtime configuration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RuntimeConfig {
+    /// Context window size
+    pub context_length: usize,
+    /// Batch processing size
+    pub batch_size: usize,
+    /// CPU threads (None = auto-detect)
+    pub cpu_threads: Option<usize>,
+    /// Use GPU acceleration
+    pub use_gpu: bool,
+    /// GPU layers to offload (None = auto)
+    pub gpu_layers: Option<usize>,
+    /// Use memory mapping for model files
+    pub mmap: bool,
+    /// KV cache size in MB
+    pub kv_cache_size_mb: usize,
 }
 
-impl Settings {
-    /// Loads configuration from all available sources.
-    pub fn new(
-        server: ServerConfig,
-        engine: EngineConfig,
-        cache: CacheConfig,
-        logging: LoggingConfig,
-        config_path: Option<PathBuf>,
-    ) -> Result<Self, ConfigError> {
-        let mut builder = ::config::Config::builder();
+/// Text generation parameters
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerationConfig {
+    /// Maximum tokens to generate
+    pub max_tokens: usize,
+    /// Sampling temperature (0.0-2.0)
+    pub temperature: f32,
+    /// Nucleus sampling threshold
+    pub top_p: f32,
+    /// Top-k sampling limit
+    pub top_k: Option<usize>,
+    /// Repetition penalty
+    pub repeat_penalty: f32,
+    /// Stop sequences
+    pub stop_tokens: Vec<String>,
+    /// Random seed for reproducible generation
+    pub seed: Option<u32>,
+    /// Enable streaming output
+    pub stream: bool,
+}
 
-        // Load default configuration
-        builder = builder.add_source(File::from_str(
-            DEFAULT_CONFIG,
-            config::FileFormat::Toml,
-        ));
+/// LoRA adapter configuration  
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoRAConfig {
+    /// Enable LoRA adapters
+    pub enabled: bool,
+    /// Maximum number of active adapters
+    pub max_adapters: usize,
+    /// LoRA scaling factor (alpha)
+    pub alpha: f32,
+    /// Target sparsity ratio (0.0-1.0)
+    pub sparsity: f32,
+}
 
-        // Load system configuration if it exists
-        if let Ok(metadata) = std::fs::metadata(DEFAULT_CONFIG_PATH) {
-            if metadata.is_file() {
-                builder =
-                    builder.add_source(File::from(PathBuf::from(DEFAULT_CONFIG_PATH)));
-            }
+impl Default for HyprConfig {
+    fn default() -> Self {
+        Self {
+            model: ModelConfig {
+                path: PathBuf::from("./models/default.gguf"),
+                name: "default".to_string(),
+                architecture: "llama".to_string(),
+                parameters: None,
+            },
+            runtime: RuntimeConfig {
+                context_length: 4096,
+                batch_size: 512,
+                cpu_threads: None,
+                use_gpu: true,
+                gpu_layers: None,
+                mmap: true,
+                kv_cache_size_mb: 2048,
+            },
+            generation: GenerationConfig {
+                max_tokens: 100,
+                temperature: 0.7,
+                top_p: 0.9,
+                top_k: Some(40),
+                repeat_penalty: 1.1,
+                stop_tokens: vec!["</s>".to_string(), "<|endoftext|>".to_string()],
+                seed: None,
+                stream: false,
+            },
+            lora: LoRAConfig {
+                enabled: true,
+                max_adapters: 4,
+                alpha: 32.0,
+                sparsity: 0.99,
+            },
         }
+    }
+}
 
-        // Load user configuration if specified
-        if let Some(ref config_path) = config_path {
-            builder = builder.add_source(File::from(config_path.clone()));
+/// Model information returned after loading
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub name: String,
+    pub parameters: u64,
+    pub context_length: usize,
+    pub vocab_size: usize,
+    pub architecture: String,
+    pub quantization: Option<String>,
+}
+
+/// Generation request with all parameters
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GenerationRequest {
+    pub prompt: String,
+    pub max_tokens: usize,
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: Option<usize>,
+    pub repeat_penalty: f32,
+    pub stop_tokens: Vec<String>,
+    pub seed: Option<u32>,
+    pub stream: bool,
+}
+
+impl From<&GenerationConfig> for GenerationRequest {
+    fn from(config: &GenerationConfig) -> Self {
+        Self {
+            prompt: String::new(), // Will be set by caller
+            max_tokens: config.max_tokens,
+            temperature: config.temperature,
+            top_p: config.top_p,
+            top_k: config.top_k,
+            repeat_penalty: config.repeat_penalty,
+            stop_tokens: config.stop_tokens.clone(),
+            seed: config.seed,
+            stream: config.stream,
         }
+    }
+}
 
-        // Add environment variables (prefixed with HYPRSTREAM_)
-        builder = builder.add_source(config::Environment::with_prefix("HYPRSTREAM"));
+/// Generation result with metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerationResult {
+    pub text: String,
+    pub tokens_generated: usize,
+    pub finish_reason: FinishReason,
+    pub generation_time_ms: u64,
+    pub tokens_per_second: f32,
+}
 
-        // Build initial settings
-        let mut settings: Settings = builder.build()?.try_deserialize()?;
+/// Why generation stopped
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FinishReason {
+    MaxTokens,
+    StopToken(String),
+    EndOfSequence,
+    Error(String),
+}
 
-        // Override with command line arguments
-        settings.server = server;
-        settings.engine = engine;
-        settings.cache = cache;
-        settings.logging = logging;
-
-        Ok(settings)
+impl HyprConfig {
+    /// Load configuration from JSON file
+    pub fn from_file(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let contents = std::fs::read_to_string(path)?;
+        Ok(serde_json::from_str(&contents)?)
+    }
+    
+    /// Save configuration to JSON file
+    pub fn to_file(&self, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+        let contents = serde_json::to_string_pretty(self)?;
+        std::fs::write(path, contents)?;
+        Ok(())
+    }
+    
+    /// Create generation request from config + prompt
+    pub fn create_request(&self, prompt: String) -> GenerationRequest {
+        let mut request = GenerationRequest::from(&self.generation);
+        request.prompt = prompt;
+        request
     }
 }

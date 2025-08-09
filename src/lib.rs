@@ -10,8 +10,9 @@
 pub mod aggregation;
 pub mod adapters;
 pub mod api;
-pub mod error;
 pub mod cli;
+pub mod config;
+pub mod error;
 pub mod inference;
 pub mod metrics;
 pub mod models;
@@ -19,7 +20,6 @@ pub mod query;
 pub mod runtime;
 pub mod service;
 pub mod storage;
-pub mod config;
 pub mod utils;
 
 pub use query::{
