@@ -1,7 +1,9 @@
 //! Unified configuration system for LLaMA.cpp-based inference
 
+use config::{Config, ConfigError, Environment, File};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use crate::storage::paths::StoragePaths;
 
 /// Single unified configuration for the entire system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,6 +16,23 @@ pub struct HyprConfig {
     pub generation: GenerationConfig,
     /// LoRA adapter settings
     pub lora: LoRAConfig,
+    /// Storage paths configuration
+    pub storage: StorageConfig,
+}
+
+/// Storage paths and directories configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageConfig {
+    /// Models directory path
+    pub models_dir: PathBuf,
+    /// LoRAs directory path
+    pub loras_dir: PathBuf,
+    /// Cache directory path
+    pub cache_dir: PathBuf,
+    /// Config directory path
+    pub config_dir: PathBuf,
+    /// VDB storage directory path
+    pub vdb_storage_dir: PathBuf,
 }
 
 /// Model loading and identification
@@ -82,13 +101,30 @@ pub struct LoRAConfig {
     pub sparsity: f32,
 }
 
+impl Default for StorageConfig {
+    fn default() -> Self {
+        let storage_paths = StoragePaths::new().expect("Failed to initialize storage paths");
+        
+        Self {
+            models_dir: storage_paths.models_dir().unwrap_or_else(|_| PathBuf::from("./models")),
+            loras_dir: storage_paths.loras_dir().unwrap_or_else(|_| PathBuf::from("./loras")),
+            cache_dir: storage_paths.cache_dir().unwrap_or_else(|_| PathBuf::from("./cache")),
+            config_dir: storage_paths.config_dir().unwrap_or_else(|_| PathBuf::from("./config")),
+            vdb_storage_dir: storage_paths.cache_dir()
+                .unwrap_or_else(|_| PathBuf::from("./cache"))
+                .join("vdb_storage"),
+        }
+    }
+}
+
 impl Default for HyprConfig {
     fn default() -> Self {
         Self {
+            // No default model - users must explicitly download and configure
             model: ModelConfig {
-                path: PathBuf::from("./models/default.gguf"),
-                name: "default".to_string(),
-                architecture: "llama".to_string(),
+                path: PathBuf::new(), // Empty path - no default model
+                name: String::new(),   // No default name
+                architecture: String::new(), // No default architecture
                 parameters: None,
             },
             runtime: RuntimeConfig {
@@ -116,6 +152,7 @@ impl Default for HyprConfig {
                 alpha: 32.0,
                 sparsity: 0.99,
             },
+            storage: StorageConfig::default(),
         }
     }
 }
@@ -181,15 +218,60 @@ pub enum FinishReason {
 }
 
 impl HyprConfig {
-    /// Load configuration from JSON file
-    pub fn from_file(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let contents = std::fs::read_to_string(path)?;
-        Ok(serde_json::from_str(&contents)?)
+    /// Load configuration using the config crate with XDG directories and environment variables
+    pub fn load() -> Result<Self, ConfigError> {
+        let storage = StoragePaths::new()
+            .map_err(|e| ConfigError::Message(format!("Failed to initialize storage paths: {}", e)))?;
+        
+        let config_dir = storage.config_dir()
+            .map_err(|e| ConfigError::Message(format!("Failed to get config directory: {}", e)))?;
+        
+        let settings = Config::builder()
+            // Load from default configuration structure
+            .add_source(Config::try_from(&HyprConfig::default())?)
+            // Load from config file if it exists
+            .add_source(File::from(config_dir.join("config")).required(false))
+            .add_source(File::from(config_dir.join("config.toml")).required(false))
+            .add_source(File::from(config_dir.join("config.json")).required(false))
+            .add_source(File::from(config_dir.join("config.yaml")).required(false))
+            // Load from environment variables with HYPRSTREAM_ prefix
+            .add_source(Environment::with_prefix("HYPRSTREAM").separator("__"));
+            
+        // Build and deserialize configuration
+        settings.build()?.try_deserialize()
     }
     
-    /// Save configuration to JSON file
-    pub fn to_file(&self, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-        let contents = serde_json::to_string_pretty(self)?;
+    /// Save configuration to TOML file in XDG config directory
+    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let storage = StoragePaths::new()?;
+        let config_dir = storage.config_dir()?;
+        let config_path = config_dir.join("config.toml");
+        
+        let contents = toml::to_string_pretty(self)?;
+        std::fs::write(&config_path, contents)?;
+        
+        println!("✅ Configuration saved to: {}", config_path.display());
+        Ok(())
+    }
+    
+    /// Load configuration from a specific file path  
+    pub fn from_file(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let settings = Config::builder()
+            .add_source(Config::try_from(&HyprConfig::default())?)
+            .add_source(File::from(path))
+            .build()?;
+            
+        Ok(settings.try_deserialize()?)
+    }
+    
+    /// Save configuration to a specific file path
+    pub fn to_file(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("toml");
+        let contents = match extension {
+            "json" => serde_json::to_string_pretty(self)?,
+            "yaml" | "yml" => serde_yaml::to_string(self)?,
+            _ => toml::to_string_pretty(self)?,
+        };
         std::fs::write(path, contents)?;
         Ok(())
     }
@@ -199,5 +281,81 @@ impl HyprConfig {
         let mut request = GenerationRequest::from(&self.generation);
         request.prompt = prompt;
         request
+    }
+    
+    /// Validate that the configuration has a model specified
+    pub fn validate(&self) -> Result<(), String> {
+        if self.model.path.as_os_str().is_empty() {
+            return Err("No model configured. Use 'hyprstream model download <model>' to download a model first.".to_string());
+        }
+        
+        if !self.model.path.exists() {
+            return Err(format!(
+                "Configured model path does not exist: {}. Use 'hyprstream model list' to see available models.",
+                self.model.path.display()
+            ));
+        }
+        
+        if self.model.name.is_empty() {
+            return Err("Model name is empty. Please configure a proper model.".to_string());
+        }
+        
+        Ok(())
+    }
+    
+    /// Update model configuration after downloading
+    pub fn set_model(&mut self, model_path: PathBuf, model_name: String, architecture: String) {
+        self.model.path = model_path;
+        self.model.name = model_name;
+        self.model.architecture = architecture;
+    }
+    
+    /// Get the models directory path
+    pub fn models_dir(&self) -> &PathBuf {
+        &self.storage.models_dir
+    }
+    
+    /// Get the LoRAs directory path
+    pub fn loras_dir(&self) -> &PathBuf {
+        &self.storage.loras_dir
+    }
+    
+    /// Get the cache directory path
+    pub fn cache_dir(&self) -> &PathBuf {
+        &self.storage.cache_dir
+    }
+    
+    /// Get the config directory path
+    pub fn config_dir(&self) -> &PathBuf {
+        &self.storage.config_dir
+    }
+    
+    /// Get the VDB storage directory path
+    pub fn vdb_storage_dir(&self) -> &PathBuf {
+        &self.storage.vdb_storage_dir
+    }
+    
+    /// Get a specific model path by name
+    pub fn model_path(&self, model_name: &str) -> PathBuf {
+        use crate::utils::sanitize_filename;
+        let sanitized_name = sanitize_filename(model_name);
+        self.storage.models_dir.join(sanitized_name)
+    }
+    
+    /// Get a specific LoRA path by name
+    pub fn lora_path(&self, lora_name: &str) -> PathBuf {
+        use crate::utils::sanitize_filename;
+        let sanitized_name = sanitize_filename(lora_name);
+        self.storage.loras_dir.join(sanitized_name)
+    }
+    
+    /// Ensure all configured directories exist
+    pub fn ensure_directories(&self) -> Result<(), std::io::Error> {
+        std::fs::create_dir_all(&self.storage.models_dir)?;
+        std::fs::create_dir_all(&self.storage.loras_dir)?;
+        std::fs::create_dir_all(&self.storage.cache_dir)?;
+        std::fs::create_dir_all(&self.storage.config_dir)?;
+        std::fs::create_dir_all(&self.storage.vdb_storage_dir)?;
+        Ok(())
     }
 }

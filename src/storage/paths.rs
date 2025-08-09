@@ -59,12 +59,14 @@ impl StoragePaths {
 
     /// Get a specific model path by name
     pub fn model_path(&self, model_name: &str) -> Result<PathBuf> {
+        use crate::utils::sanitize_filename;
         let sanitized_name = sanitize_filename(model_name);
         Ok(self.models_dir()?.join(sanitized_name))
     }
 
     /// Get a specific LoRA path by name
     pub fn lora_path(&self, lora_name: &str) -> Result<PathBuf> {
+        use crate::utils::sanitize_filename;
         let sanitized_name = sanitize_filename(lora_name);
         Ok(self.loras_dir()?.join(sanitized_name))
     }
@@ -132,84 +134,8 @@ impl Default for StoragePaths {
     }
 }
 
-/// Sanitize a filename to be safe for filesystem storage
-fn sanitize_filename(name: &str) -> String {
-    name.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_")
-        .replace(' ', "_")
-}
-
-/// HuggingFace authentication management
-pub struct HfAuth {
-    storage: StoragePaths,
-}
-
-impl HfAuth {
-    /// Create a new HuggingFace authentication manager
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            storage: StoragePaths::new()?,
-        })
-    }
-
-    /// Set the HuggingFace authentication token
-    pub async fn set_token(&self, token: &str) -> Result<()> {
-        let token_path = self.storage.hf_token_path()?;
-        tokio::fs::write(&token_path, token.trim()).await
-            .map_err(|e| anyhow!("Failed to write HF token to {}: {}", token_path.display(), e))?;
-        
-        // Set restrictive permissions (readable only by owner)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = tokio::fs::metadata(&token_path).await?.permissions();
-            perms.set_mode(0o600); // rw-------
-            tokio::fs::set_permissions(&token_path, perms).await?;
-        }
-
-        println!("✅ HuggingFace token saved to: {}", token_path.display());
-        Ok(())
-    }
-
-    /// Get the HuggingFace authentication token
-    pub async fn get_token(&self) -> Result<Option<String>> {
-        let token_path = self.storage.hf_token_path()?;
-        
-        if !token_path.exists() {
-            return Ok(None);
-        }
-
-        let token = tokio::fs::read_to_string(&token_path).await
-            .map_err(|e| anyhow!("Failed to read HF token from {}: {}", token_path.display(), e))?;
-        
-        Ok(Some(token.trim().to_string()))
-    }
-
-    /// Check if authentication token is configured
-    pub async fn is_authenticated(&self) -> bool {
-        self.get_token().await.map_or(false, |token| token.is_some())
-    }
-
-    /// Remove the authentication token
-    pub async fn logout(&self) -> Result<()> {
-        let token_path = self.storage.hf_token_path()?;
-        
-        if token_path.exists() {
-            tokio::fs::remove_file(&token_path).await
-                .map_err(|e| anyhow!("Failed to remove HF token: {}", e))?;
-            println!("✅ Logged out from HuggingFace");
-        } else {
-            println!("ℹ️  No HuggingFace token found");
-        }
-        
-        Ok(())
-    }
-}
-
-impl Default for HfAuth {
-    fn default() -> Self {
-        Self::new().expect("Failed to initialize HF auth")
-    }
-}
+// NOTE: sanitize_filename has been moved to crate::utils
+// NOTE: HfAuth has been moved to crate::auth
 
 #[cfg(test)]
 mod tests {
@@ -229,10 +155,5 @@ mod tests {
         assert!(models_dir != loras_dir);
     }
 
-    #[test]
-    fn test_sanitize_filename() {
-        assert_eq!(sanitize_filename("hello/world"), "hello_world");
-        assert_eq!(sanitize_filename("model:v1.0"), "model_v1.0");
-        assert_eq!(sanitize_filename("test file.gguf"), "test_file.gguf");
-    }
+    // NOTE: test_sanitize_filename moved to crate::utils
 }

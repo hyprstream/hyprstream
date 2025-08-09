@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use crate::config::HyprConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use memmap2::MmapOptions;
@@ -19,11 +20,11 @@ pub mod neuralvdb_codec;
 pub mod sparse_storage; // New VDB-first storage interface
 
 // OpenVDB integration (only VDB backend)
-#[cfg(feature = "vdb")]
+
 pub mod openvdb_bindings;
 
 // Hardware accelerated module requires VDB support
-#[cfg(feature = "vdb")]
+
 pub mod hardware_accelerated;
 
 pub use grid::*;
@@ -32,7 +33,7 @@ pub use adapter_store::*;
 pub use sparse_storage::*; // Export new VDB-first interface
 
 // Export OpenVDB bindings when VDB feature enabled
-#[cfg(feature = "vdb")]
+
 pub use openvdb_bindings::{
     OpenVDBLoRAAdapter, 
     OpenVDBActiveIterator, 
@@ -40,7 +41,7 @@ pub use openvdb_bindings::{
 };
 
 // Export hardware accelerated features when VDB is available
-#[cfg(feature = "vdb")]
+
 pub use hardware_accelerated::*;
 
 pub use neuralvdb_codec::*;
@@ -60,8 +61,10 @@ pub struct VDBConfig {
 
 impl Default for VDBConfig {
     fn default() -> Self {
+        let config = HyprConfig::load().unwrap_or_default();
+        
         Self {
-            storage_path: PathBuf::from("./vdb_storage"),
+            storage_path: config.vdb_storage_dir().clone(),
             compression: "lz4".to_string(),
             cache_size_mb: 1000,
             background_value: 0.0,

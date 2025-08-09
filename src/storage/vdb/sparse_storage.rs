@@ -10,7 +10,7 @@ use crate::storage::vdb::{
     Coordinate3D, NeuralVDBCodec,
 };
 
-#[cfg(feature = "vdb")]
+
 use crate::storage::vdb::HardwareVDBStorage;
 use crate::storage::vdb::compression::CompressionStats;
 use crate::storage::vdb::adapter_store::{AdapterInfo, AdapterMetadata};
@@ -19,6 +19,7 @@ use crate::adapters::sparse_lora::{SparseLoRAAdapter, SparseLoRAConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::path::PathBuf;
+use crate::config::HyprConfig;
 use tokio::sync::RwLock;
 use serde::{Serialize, Deserialize};
 use thiserror::Error;
@@ -72,8 +73,10 @@ pub struct SparseStorageConfig {
 
 impl Default for SparseStorageConfig {
     fn default() -> Self {
+        let config = HyprConfig::load().unwrap_or_default();
+        
         Self {
-            storage_path: PathBuf::from("./vdb_storage"),
+            storage_path: config.vdb_storage_dir().clone(),
             neural_compression: true,
             hardware_acceleration: true,
             cache_size_mb: 2048, // 2GB cache for active adapters
@@ -218,7 +221,7 @@ pub struct VDBSparseStorage {
     config: SparseStorageConfig,
     
     /// Hardware-accelerated VDB storage backend
-    #[cfg(feature = "vdb")]
+    
     hardware_storage: Arc<crate::storage::vdb::hardware_accelerated::HardwareVDBStorage>,
     
     /// Neural compression codec
@@ -244,7 +247,7 @@ impl VDBSparseStorage {
         tokio::fs::create_dir_all(&config.storage_path).await?;
         
         // Initialize hardware-accelerated VDB storage
-        #[cfg(feature = "vdb")]
+        
         let hardware_storage = Arc::new(
             HardwareVDBStorage::new_with_config(config.neural_compression).await
                 .map_err(|e| SparseStorageError::HardwareError(e.to_string()))?
@@ -269,7 +272,7 @@ impl VDBSparseStorage {
         
         Ok(Self {
             config,
-            #[cfg(feature = "vdb")]
+            
             hardware_storage,
             neural_codec,
             adapter_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -341,7 +344,7 @@ impl VDBSparseStorage {
         
         // Apply updates to each adapter
         for (adapter_id, coords_updates) in adapter_updates {
-            #[cfg(feature = "vdb")]
+            
             {
                 if let Err(e) = self.hardware_storage
                     .gpu_sparse_update(&adapter_id, &coords_updates).await 
@@ -351,7 +354,7 @@ impl VDBSparseStorage {
                     self.apply_cpu_sparse_update(&adapter_id, &coords_updates).await?;
                 }
             }
-            #[cfg(not(feature = "vdb"))]
+            
             {
                 // VDB feature not enabled, use CPU fallback
                 self.apply_cpu_sparse_update(&adapter_id, &coords_updates).await?;
@@ -423,7 +426,7 @@ impl Clone for VDBSparseStorage {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
-            #[cfg(feature = "vdb")]
+            
             hardware_storage: Arc::clone(&self.hardware_storage),
             neural_codec: Arc::clone(&self.neural_codec),
             adapter_cache: Arc::clone(&self.adapter_cache),
@@ -458,22 +461,14 @@ impl SparseStorage for VDBSparseStorage {
         adapter: &SparseLoRAAdapter
     ) -> Result<(), SparseStorageError> {
         // Store using hardware-accelerated VDB storage
-        #[cfg(feature = "vdb")]
-        {
-            if self.config.neural_compression {
-                self.hardware_storage
-                    .store_adapter_neural_compressed(id, adapter).await
-                    .map_err(|e| SparseStorageError::HardwareError(e.to_string()))?;
-            } else {
-                self.hardware_storage
-                    .store_adapter_accelerated(id, adapter).await
-                    .map_err(|e| SparseStorageError::HardwareError(e.to_string()))?;
-            }
-        }
-        #[cfg(not(feature = "vdb"))]
-        {
-            // VDB feature not enabled, store in cache only
-            println!("Warning: VDB feature disabled, adapter '{}' stored in memory cache only", id);
+        if self.config.neural_compression {
+            self.hardware_storage
+                .store_adapter_neural_compressed(id, adapter).await
+                .map_err(|e| SparseStorageError::HardwareError(e.to_string()))?;
+        } else {
+            self.hardware_storage
+                .store_adapter_accelerated(id, adapter).await
+                .map_err(|e| SparseStorageError::HardwareError(e.to_string()))?;
         }
         
         // Cache the adapter for fast access
@@ -513,33 +508,23 @@ impl SparseStorage for VDBSparseStorage {
         }
         
         // Load from VDB storage
-        #[cfg(feature = "vdb")]
+        let adapter = if self.config.neural_compression {
+            self.hardware_storage
+                .load_adapter_neural_compressed(id, config).await
+                .map_err(|e| SparseStorageError::HardwareError(e.to_string()))?
+        } else {
+            self.hardware_storage
+                .load_adapter_accelerated(id, config).await
+                .map_err(|e| SparseStorageError::HardwareError(e.to_string()))?
+        };
+        
+        // Cache for future access
         {
-            let adapter = if self.config.neural_compression {
-                self.hardware_storage
-                    .load_adapter_neural_compressed(id, config).await
-                    .map_err(|e| SparseStorageError::HardwareError(e.to_string()))?
-            } else {
-                self.hardware_storage
-                    .load_adapter_accelerated(id, config).await
-                    .map_err(|e| SparseStorageError::HardwareError(e.to_string()))?
-            };
-            
-            // Cache for future access
-            {
-                let mut cache = self.adapter_cache.write().await;
-                cache.insert(id.to_string(), Arc::new(adapter.clone()));
-            }
-            
-            Ok(adapter)
+            let mut cache = self.adapter_cache.write().await;
+            cache.insert(id.to_string(), Arc::new(adapter.clone()));
         }
         
-        #[cfg(not(feature = "vdb"))]
-        {
-            Err(SparseStorageError::HardwareError(
-                "VDB feature disabled - cannot load adapter from storage".to_string()
-            ))
-        }
+        Ok(adapter)
     }
     
     /// Apply dynamic sparse weight updates in real-time
@@ -611,7 +596,7 @@ impl SparseStorage for VDBSparseStorage {
         updates: &HashMap<Coordinate3D, f32>
     ) -> Result<usize, SparseStorageError> {
         // Try GPU-accelerated batch update first
-        #[cfg(feature = "vdb")]
+        
         if self.config.hardware_acceleration {
             match self.hardware_storage.gpu_sparse_update(adapter_id, updates).await {
                 Ok(_) => return Ok(updates.len()),
@@ -704,62 +689,35 @@ impl SparseStorage for VDBSparseStorage {
     /// List all available adapters with metadata
     async fn list_adapters(&self) -> Result<Vec<AdapterInfo>, SparseStorageError> {
         // Convert from hardware_accelerated::AdapterInfo to adapter_store::AdapterInfo
-        #[cfg(feature = "vdb")]
-        {
-            let hw_adapter_infos = self.hardware_storage.list_adapters().await;
-            let mut adapter_infos = Vec::new();
-            
-            for hw_info in hw_adapter_infos {
-                adapter_infos.push(AdapterInfo {
-                    domain: hw_info.id.clone(),
-                    adapter_id: hw_info.id,
-                    metadata: AdapterMetadata {
-                        domain: "default".to_string(),
-                        created_at: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
-                        last_updated: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
-                        version: 1,
-                        sparsity: hw_info.sparsity,
-                        active_parameters: hw_info.active_voxels as usize,
-                        total_parameters: (hw_info.active_voxels as f64 / hw_info.sparsity as f64) as usize,
-                        training_steps: 0,
-                        learning_rate: 1e-4,
-                        adapter_type: "sparse_lora".to_string(),
-                    },
-                });
-            }
-            
-            Ok(adapter_infos)
-        }
-        #[cfg(not(feature = "vdb"))]
-        {
-            // Return cached adapter info only when VDB feature is disabled
-            let cache = self.adapter_cache.read().await;
-            let adapter_infos: Vec<AdapterInfo> = cache.keys().map(|id| {
-                AdapterInfo {
+        let hw_adapter_infos = self.hardware_storage.list_adapters().await;
+        let mut adapter_infos = Vec::new();
+        
+        for hw_info in hw_adapter_infos {
+            adapter_infos.push(AdapterInfo {
+                domain: hw_info.id.clone(),
+                adapter_id: hw_info.id,
+                metadata: AdapterMetadata {
                     domain: "default".to_string(),
-                    adapter_id: id.clone(),
-                    metadata: AdapterMetadata {
-                        domain: "default".to_string(),
-                        created_at: 0,
-                        last_updated: 0,
-                        version: 1,
-                        sparsity: 0.99,
-                        active_parameters: 1000,
-                        total_parameters: 100000,
-                        training_steps: 0,
-                        learning_rate: 1e-4,
-                        adapter_type: "sparse_lora".to_string(),
-                    },
-                }
-            }).collect();
-            Ok(adapter_infos)
+                    created_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    last_updated: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    version: 1,
+                    sparsity: hw_info.sparsity,
+                    active_parameters: hw_info.active_voxels as usize,
+                    total_parameters: (hw_info.active_voxels as f64 / hw_info.sparsity as f64) as usize,
+                    training_steps: 0,
+                    learning_rate: 1e-4,
+                    adapter_type: "sparse_lora".to_string(),
+                },
+            });
         }
+        
+        Ok(adapter_infos)
     }
     
     /// Get adapter statistics and health metrics

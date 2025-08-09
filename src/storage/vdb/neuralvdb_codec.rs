@@ -154,8 +154,6 @@ pub struct NeuralVDBCodec {
     /// Hierarchical processing levels (matching NeuralVDB's tree structure)
     hierarchy_levels: Vec<HierarchyLevel>,
     
-    /// Device for neural computation (CPU/CUDA)
-    device: Device,
     
     /// Temporal coherency cache for animation/streaming
     temporal_cache: Arc<RwLock<TemporalCache>>,
@@ -169,14 +167,6 @@ pub struct TopologyClassifier {
     /// Multi-scale topology prediction network
     network: Sequential,
     
-    /// Context window for temporal prediction
-    context_window: usize,
-    
-    /// Input feature dimension
-    input_dim: i64,
-    
-    /// Output dimension (probability of activation)
-    output_dim: i64,
 }
 
 /// Lossy value regressor - compresses weight values
@@ -184,11 +174,6 @@ pub struct ValueRegressor {
     /// Encoder network (weights -> compressed representation)
     encoder: Sequential,
     
-    /// Decoder network (compressed -> reconstructed weights)
-    decoder: Sequential,
-    
-    /// Latent dimension for compressed representation
-    latent_dim: i64,
     
     /// Quantization levels for lossy compression
     quantization_levels: i32,
@@ -203,12 +188,6 @@ pub struct HierarchyLevel {
     /// Compression ratio target
     compression_ratio: f32,
     
-    /// Quality threshold (PSNR)
-    quality_threshold: f32,
-    
-    /// Processing statistics
-    active_nodes: u64,
-    total_nodes: u64,
 }
 
 /// Temporal coherency cache for warm-starting
@@ -223,9 +202,6 @@ pub struct TemporalCache {
     /// Frame-to-frame correlation statistics
     correlation_stats: HashMap<String, f32>,
     
-    /// Cache hit/miss counters
-    cache_hits: u64,
-    cache_misses: u64,
 }
 
 /// Compression performance statistics
@@ -234,19 +210,6 @@ pub struct CompressionStats {
     /// Total compression ratio achieved
     avg_compression_ratio: f64,
     
-    /// Quality metrics (PSNR, SSIM)
-    avg_psnr: f64,
-    avg_ssim: f64,
-    
-    /// Encoding/decoding times (milliseconds)
-    avg_encode_time_ms: f64,
-    avg_decode_time_ms: f64,
-    
-    /// Memory usage reduction
-    memory_reduction_percent: f64,
-    
-    /// Temporal coherency improvement
-    temporal_coherency_gain: f64,
     
     /// Total frames processed
     frames_processed: u64,
@@ -268,23 +231,14 @@ impl NeuralVDBCodec {
             HierarchyLevel {
                 resolution: [512, 512, 1],   // Leaf level
                 compression_ratio: 100.0,
-                quality_threshold: 40.0,     // 40 dB PSNR
-                active_nodes: 0,
-                total_nodes: 0,
             },
             HierarchyLevel {
                 resolution: [64, 64, 1],     // Internal level 1
                 compression_ratio: 50.0,
-                quality_threshold: 35.0,
-                active_nodes: 0,
-                total_nodes: 0,
             },
             HierarchyLevel {
                 resolution: [8, 8, 1],       // Internal level 2
                 compression_ratio: 20.0,
-                quality_threshold: 30.0,
-                active_nodes: 0,
-                total_nodes: 0,
             },
         ];
 
@@ -292,7 +246,6 @@ impl NeuralVDBCodec {
             topology_classifier,
             value_regressor,
             hierarchy_levels,
-            device,
             temporal_cache: Arc::new(RwLock::new(TemporalCache::default())),
             stats: Arc::new(RwLock::new(CompressionStats::default())),
         })
@@ -644,12 +597,10 @@ impl NeuralVDBCodec {
         let mut stats = self.stats.write().await;
         
         stats.frames_processed += 1;
-        stats.avg_encode_time_ms = compressed.compression_metadata.encoding_time_ms;
         stats.avg_compression_ratio = compressed.compression_metadata.compression_ratio as f64;
         
         // Update running averages
         let frames = stats.frames_processed as f64;
-        stats.avg_psnr = (stats.avg_psnr * (frames - 1.0) + compressed.compression_metadata.quality_metrics.psnr as f64) / frames;
     }
 
     /// Reconstruct sparse weights from decoded topology and values
@@ -688,9 +639,6 @@ impl TopologyClassifier {
         
         Ok(Self {
             network,
-            context_window: 8,
-            input_dim,
-            output_dim: input_dim,
         })
     }
 
@@ -738,8 +686,6 @@ impl ValueRegressor {
 
         Ok(Self {
             encoder,
-            decoder,
-            latent_dim,
             quantization_levels: 256, // 8-bit quantization
         })
     }

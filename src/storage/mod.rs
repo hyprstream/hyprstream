@@ -26,5 +26,7 @@ pub use vdb::{
 // Legacy view support (retained for compatibility)
 pub use view::{ViewDefinition, ViewMetadata};
 
-// XDG-compliant path management and HF authentication
-pub use paths::{StoragePaths, HfAuth};
+// XDG-compliant path management (internal use only)
+// Note: StoragePaths should only be used by config module
+// HfAuth has been moved to crate::auth module
+pub use paths::StoragePaths;

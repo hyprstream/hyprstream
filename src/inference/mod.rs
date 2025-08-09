@@ -1,7 +1,6 @@
 //! Inference API for applying LoRA adapters to base models
 
 use crate::adapters::sparse_lora::SparseLoRAAdapter;
-#[cfg(feature = "vdb")]
 use crate::storage::vdb::hardware_accelerated::HardwareVDBStorage;
 
 use std::collections::HashMap;
@@ -51,8 +50,7 @@ pub struct InferenceAPI {
     /// Base model storage (mmap'd weights)
     model_loader: Arc<ModelLoader>,
     
-    /// VDB storage for LoRA adapters (only available with VDB feature)
-    #[cfg(feature = "vdb")]
+    /// VDB storage for LoRA adapters
     vdb_storage: Arc<HardwareVDBStorage>,
     
     /// Inference engine
@@ -69,7 +67,7 @@ impl InferenceAPI {
     /// Create new inference API
     pub async fn new(
         model_path: &Path,
-        #[cfg(feature = "vdb")] vdb_storage: Arc<HardwareVDBStorage>,
+        vdb_storage: Arc<HardwareVDBStorage>,
         config: HyprConfig,
     ) -> Result<Self> {
         // Load base model with mmap
@@ -80,7 +78,6 @@ impl InferenceAPI {
         
         Ok(Self {
             model_loader,
-            #[cfg(feature = "vdb")]
             vdb_storage,
             engine,
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -192,18 +189,9 @@ impl InferenceAPI {
         };
         
         // Create streaming inference
-        #[cfg(feature = "vdb")]
         let stream = self.engine.stream_infer_with_updates(
             &self.model_loader,
             &self.vdb_storage,
-            session,
-            input,
-            update_channel,
-        ).await?;
-        
-        #[cfg(not(feature = "vdb"))]
-        let stream = self.engine.stream_infer_with_updates(
-            &self.model_loader,
             session,
             input,
             update_channel,
@@ -220,30 +208,21 @@ impl InferenceAPI {
         let mut adapters = Vec::new();
         let mut stats = self.stats.write().await;
         
-        #[cfg(feature = "vdb")]
-        {
-            for adapter_id in &session.active_adapters {
-                // Load from VDB storage
-                match self.vdb_storage.load_adapter_neural_compressed(
-                    adapter_id,
-                    Default::default(),
-                ).await {
-                    Ok(adapter) => {
-                        stats.adapter_cache_hits += 1;
-                        adapters.push((adapter_id.clone(), adapter));
-                    }
-                    Err(_) => {
-                        stats.adapter_cache_misses += 1;
-                        return Err(anyhow::anyhow!("Failed to load adapter: {}", adapter_id));
-                    }
+        for adapter_id in &session.active_adapters {
+            // Load from VDB storage
+            match self.vdb_storage.load_adapter_neural_compressed(
+                adapter_id,
+                Default::default(),
+            ).await {
+                Ok(adapter) => {
+                    stats.adapter_cache_hits += 1;
+                    adapters.push((adapter_id.clone(), adapter));
+                }
+                Err(_) => {
+                    stats.adapter_cache_misses += 1;
+                    return Err(anyhow::anyhow!("Failed to load adapter: {}", adapter_id));
                 }
             }
-        }
-        
-        #[cfg(not(feature = "vdb"))]
-        {
-            // Without VDB feature, cannot load adapters
-            return Err(anyhow::anyhow!("VDB feature not enabled - cannot load adapters"));
         }
         
         // Fuse adapters with specified weights
@@ -263,15 +242,7 @@ impl InferenceAPI {
         let sparse_updates = self.convert_to_sparse_updates(updates)?;
         
         // Apply updates through VDB storage
-        #[cfg(feature = "vdb")]
-        {
-            self.vdb_storage.gpu_sparse_update(adapter_id, &sparse_updates).await?;
-        }
-        #[cfg(not(feature = "vdb"))]
-        {
-            // Placeholder - VDB not available, skip sparse updates
-            tracing::warn!("VDB storage not available - skipping sparse updates for adapter: {}", adapter_id);
-        }
+        self.vdb_storage.gpu_sparse_update(adapter_id, &sparse_updates).await?;
         
         Ok(())
     }

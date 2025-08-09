@@ -34,3 +34,23 @@ pub fn record_batch_to_json(batch: &RecordBatch) -> Result<Vec<JsonValue>, Box<d
     }
     Ok(json_rows)
 }
+
+/// Sanitize a filename to be safe for filesystem storage
+pub fn sanitize_filename(name: &str) -> String {
+    name.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_")
+        .replace(' ', "_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_filename() {
+        assert_eq!(sanitize_filename("hello/world"), "hello_world");
+        assert_eq!(sanitize_filename("model:v1.0"), "model_v1.0");
+        assert_eq!(sanitize_filename("test file.gguf"), "test_file.gguf");
+        assert_eq!(sanitize_filename("normal_name"), "normal_name");
+        assert_eq!(sanitize_filename(""), "");
+    }
+}

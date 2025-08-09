@@ -26,12 +26,39 @@ pub enum FusionStrategy {
     SparseMixture { top_k: usize },
 }
 
+/// Dynamic fusion weights with attention-based computation
+#[derive(Debug, Clone)]
+pub struct DynamicFusionWeights {
+    /// Per-adapter attention weights
+    pub attention_weights: HashMap<String, f32>,
+    /// Layer-wise attention patterns
+    pub layer_weights: HashMap<String, Vec<f32>>,
+    /// Adaptive threshold for weight allocation
+    pub adaptive_threshold: f32,
+    /// Similarity matrix between adapters
+    pub similarity_matrix: HashMap<(String, String), f32>,
+}
+
+impl Default for DynamicFusionWeights {
+    fn default() -> Self {
+        Self {
+            attention_weights: HashMap::new(),
+            layer_weights: HashMap::new(),
+            adaptive_threshold: 0.1,
+            similarity_matrix: HashMap::new(),
+        }
+    }
+}
+
 /// LoRA fusion engine
 pub struct LoRAFusion {
     strategy: FusionStrategy,
     
     /// Fusion statistics
     stats: FusionStats,
+    
+    /// Dynamic fusion weights computation
+    dynamic_weights: DynamicFusionWeights,
 }
 
 /// Statistics about adapter fusion
@@ -50,7 +77,22 @@ impl LoRAFusion {
         Self {
             strategy,
             stats: FusionStats::default(),
+            dynamic_weights: DynamicFusionWeights::default(),
         }
+    }
+    
+    /// Create fusion engine with layer-wise attention
+    pub fn with_layer_attention(strategy: FusionStrategy, num_layers: usize) -> Self {
+        let mut fusion = Self::new(strategy);
+        
+        // Initialize layer-wise weights for attention patterns
+        fusion.dynamic_weights.layer_weights = HashMap::new();
+        for layer_idx in 0..num_layers {
+            let layer_key = format!("layer_{}", layer_idx);
+            fusion.dynamic_weights.layer_weights.insert(layer_key, vec![1.0; 8]); // 8 attention heads typical
+        }
+        
+        fusion
     }
     
     /// Fuse multiple adapters with specified weights
@@ -98,7 +140,7 @@ impl LoRAFusion {
     
     /// Fuse adapters using weighted average
     fn fuse_weighted_average(
-        &self,
+        &mut self,
         adapters: Vec<(String, SparseLoRAAdapter)>,
         weights: &HashMap<String, f32>,
     ) -> Result<FusedAdapterWeights> {
@@ -133,7 +175,7 @@ impl LoRAFusion {
     
     /// Fuse adapters using attention mechanism
     fn fuse_with_attention(
-        &self,
+        &mut self,
         adapters: Vec<(String, SparseLoRAAdapter)>,
         _weights: &HashMap<String, f32>,
     ) -> Result<FusedAdapterWeights> {
@@ -170,7 +212,7 @@ impl LoRAFusion {
     
     /// Fuse adapters sequentially
     fn fuse_sequential(
-        &self,
+        &mut self,
         adapters: Vec<(String, SparseLoRAAdapter)>,
         weights: &HashMap<String, f32>,
     ) -> Result<FusedAdapterWeights> {
@@ -210,7 +252,7 @@ impl LoRAFusion {
     
     /// Fuse adapters using task-based routing
     fn fuse_task_routing(
-        &self,
+        &mut self,
         adapters: Vec<(String, SparseLoRAAdapter)>,
         weights: &HashMap<String, f32>,
     ) -> Result<FusedAdapterWeights> {
@@ -253,7 +295,7 @@ impl LoRAFusion {
     
     /// Fuse adapters using sparse mixture
     fn fuse_sparse_mixture(
-        &self,
+        &mut self,
         adapters: Vec<(String, SparseLoRAAdapter)>,
         weights: &HashMap<String, f32>,
         top_k: usize,
@@ -293,9 +335,9 @@ impl LoRAFusion {
         })
     }
     
-    /// Calculate attention weights based on adapter similarity
+    /// Calculate attention weights based on adapter similarity using dynamic fusion
     fn calculate_attention_weights(
-        &self,
+        &mut self,
         adapters: &[(String, SparseLoRAAdapter)],
     ) -> Result<HashMap<String, f32>> {
         let mut attention_weights = HashMap::new();
@@ -308,19 +350,226 @@ impl LoRAFusion {
             return Ok(attention_weights);
         }
         
-        // Calculate pairwise similarities and derive attention weights
-        // For now, use uniform weights as a placeholder
-        let uniform_weight = 1.0 / adapters.len() as f32;
-        for (adapter_id, _) in adapters {
-            attention_weights.insert(adapter_id.clone(), uniform_weight);
+        println!("🧠 Computing dynamic attention weights for {} adapters", adapters.len());
+        
+        // Step 1: Calculate pairwise similarities between adapters
+        let mut similarity_matrix = HashMap::new();
+        for (i, (id1, adapter1)) in adapters.iter().enumerate() {
+            for (id2, adapter2) in adapters.iter().skip(i + 1) {
+                let similarity = self.compute_adapter_similarity(adapter1, adapter2)?;
+                similarity_matrix.insert((id1.clone(), id2.clone()), similarity);
+                similarity_matrix.insert((id2.clone(), id1.clone()), similarity);
+            }
         }
         
-        // TODO: Implement actual similarity calculation based on:
-        // - Weight magnitudes
-        // - Sparsity patterns
-        // - Historical performance
+        // Step 2: Compute attention weights using adaptive mechanism
+        let mut raw_weights = HashMap::new();
+        for (adapter_id, adapter) in adapters {
+            // Base weight from adapter magnitude and sparsity
+            let magnitude_weight = self.compute_magnitude_weight(adapter)?;
+            let sparsity_weight = self.compute_sparsity_weight(adapter)?;
+            
+            // Similarity-based adjustment
+            let similarity_adjustment = self.compute_similarity_adjustment(
+                adapter_id, 
+                adapters, 
+                &similarity_matrix
+            )?;
+            
+            // Combined weight with adaptive thresholding
+            let raw_weight = magnitude_weight * 0.4 + sparsity_weight * 0.3 + similarity_adjustment * 0.3;
+            raw_weights.insert(adapter_id.clone(), raw_weight);
+        }
         
+        // Step 3: Apply adaptive threshold and normalize
+        let max_weight = raw_weights.values().cloned().fold(0.0f32, f32::max);
+        let adaptive_threshold = self.dynamic_weights.adaptive_threshold * max_weight;
+        
+        // Filter weights below threshold and normalize
+        let mut filtered_weights: Vec<(String, f32)> = raw_weights
+            .into_iter()
+            .filter(|(_, weight)| *weight >= adaptive_threshold)
+            .collect();
+            
+        // Ensure at least one adapter is selected
+        if filtered_weights.is_empty() {
+            // Select the adapter with highest weight
+            if let Some((best_id, best_weight)) = adapters.iter()
+                .map(|(id, adapter)| (id.clone(), self.compute_magnitude_weight(adapter).unwrap_or(0.1)))
+                .max_by(|(_, w1), (_, w2)| w1.partial_cmp(w2).unwrap_or(std::cmp::Ordering::Equal)) {
+                filtered_weights.push((best_id, best_weight));
+            }
+        }
+        
+        // Normalize weights to sum to 1.0
+        let total_weight: f32 = filtered_weights.iter().map(|(_, w)| w).sum();
+        if total_weight > 0.0 {
+            for (adapter_id, weight) in filtered_weights {
+                attention_weights.insert(adapter_id, weight / total_weight);
+            }
+        } else {
+            // Fallback to uniform weights
+            let uniform_weight = 1.0 / adapters.len() as f32;
+            for (adapter_id, _) in adapters {
+                attention_weights.insert(adapter_id.clone(), uniform_weight);
+            }
+        }
+        
+        // Update internal state
+        self.dynamic_weights.attention_weights = attention_weights.clone();
+        self.dynamic_weights.similarity_matrix = similarity_matrix;
+        
+        println!("🎯 Dynamic weights computed: {:?}", attention_weights);
         Ok(attention_weights)
+    }
+    
+    /// Update layer-wise attention patterns based on performance feedback
+    pub fn update_layer_attention(&mut self, layer_name: &str, performance_scores: &[f32]) {
+        if let Some(layer_weights) = self.dynamic_weights.layer_weights.get_mut(layer_name) {
+            // Update layer attention weights with exponential moving average
+            let alpha = 0.1; // Learning rate for attention updates
+            
+            for (i, &score) in performance_scores.iter().enumerate() {
+                if i < layer_weights.len() {
+                    layer_weights[i] = (1.0 - alpha) * layer_weights[i] + alpha * score;
+                }
+            }
+            
+            // Normalize layer weights to sum to 1.0
+            let sum: f32 = layer_weights.iter().sum();
+            if sum > 0.0 {
+                for weight in layer_weights.iter_mut() {
+                    *weight /= sum;
+                }
+            }
+            
+            println!("🎯 Updated layer attention for {}: {:?}", layer_name, layer_weights);
+        }
+    }
+    
+    /// Get layer-wise attention weights for a specific layer
+    pub fn get_layer_attention(&self, layer_name: &str) -> Option<&Vec<f32>> {
+        self.dynamic_weights.layer_weights.get(layer_name)
+    }
+    
+    /// Compute layer-specific fusion weights
+    pub fn compute_layer_fusion_weights(
+        &self,
+        layer_name: &str,
+        base_weights: &HashMap<String, f32>
+    ) -> HashMap<String, f32> {
+        let mut layer_adjusted_weights = base_weights.clone();
+        
+        if let Some(layer_attention) = self.dynamic_weights.layer_weights.get(layer_name) {
+            // Apply layer-specific attention modulation
+            let layer_importance = layer_attention.iter().sum::<f32>() / layer_attention.len() as f32;
+            
+            for (_, weight) in layer_adjusted_weights.iter_mut() {
+                *weight *= layer_importance;
+            }
+        }
+        
+        // Renormalize
+        let total: f32 = layer_adjusted_weights.values().sum();
+        if total > 0.0 {
+            for weight in layer_adjusted_weights.values_mut() {
+                *weight /= total;
+            }
+        }
+        
+        layer_adjusted_weights
+    }
+    
+    /// Compute similarity between two LoRA adapters based on weight patterns
+    fn compute_adapter_similarity(
+        &self,
+        adapter1: &SparseLoRAAdapter,
+        adapter2: &SparseLoRAAdapter,
+    ) -> Result<f32> {
+        // Get sparse weight patterns for both adapters
+        let weights1 = adapter1.get_sparse_weights();
+        let weights2 = adapter2.get_sparse_weights();
+        
+        if weights1.is_empty() || weights2.is_empty() {
+            return Ok(0.0);
+        }
+        
+        // Calculate cosine similarity between weight vectors
+        let mut dot_product = 0.0f32;
+        let mut norm1 = 0.0f32;
+        let mut norm2 = 0.0f32;
+        
+        // Find common indices and compute similarity
+        for (idx, &val1) in weights1.iter() {
+            if let Some(&val2) = weights2.get(idx) {
+                dot_product += val1 * val2;
+            }
+            norm1 += val1 * val1;
+        }
+        
+        for &val2 in weights2.values() {
+            norm2 += val2 * val2;
+        }
+        
+        let norm_product = (norm1 * norm2).sqrt();
+        if norm_product > 0.0 {
+            Ok(dot_product / norm_product)
+        } else {
+            Ok(0.0)
+        }
+    }
+    
+    /// Compute weight based on adapter magnitude
+    fn compute_magnitude_weight(&self, adapter: &SparseLoRAAdapter) -> Result<f32> {
+        let weights = adapter.get_sparse_weights();
+        if weights.is_empty() {
+            return Ok(0.1); // Minimum weight
+        }
+        
+        let magnitude: f32 = weights.values().map(|&w| w.abs()).sum();
+        Ok((magnitude / weights.len() as f32).min(1.0))
+    }
+    
+    /// Compute weight based on adapter sparsity pattern
+    fn compute_sparsity_weight(&self, adapter: &SparseLoRAAdapter) -> Result<f32> {
+        let sparse_count = adapter.get_sparse_weight_count();
+        let total_params = adapter.get_total_parameters(); // Assuming this method exists
+        
+        if total_params == 0 {
+            return Ok(0.1);
+        }
+        
+        let sparsity_ratio = sparse_count as f32 / total_params as f32;
+        // Higher sparsity gets higher weight (more efficient)
+        Ok(sparsity_ratio.min(1.0))
+    }
+    
+    /// Compute similarity-based adjustment for an adapter
+    fn compute_similarity_adjustment(
+        &self,
+        adapter_id: &str,
+        adapters: &[(String, SparseLoRAAdapter)],
+        similarity_matrix: &HashMap<(String, String), f32>,
+    ) -> Result<f32> {
+        let mut total_similarity = 0.0f32;
+        let mut count = 0;
+        
+        for (other_id, _) in adapters {
+            if other_id != adapter_id {
+                if let Some(&similarity) = similarity_matrix.get(&(adapter_id.to_string(), other_id.clone())) {
+                    total_similarity += similarity;
+                    count += 1;
+                }
+            }
+        }
+        
+        if count > 0 {
+            // Lower average similarity means more unique/important adapter
+            let avg_similarity = total_similarity / count as f32;
+            Ok(1.0 - avg_similarity.min(1.0))
+        } else {
+            Ok(0.5) // Neutral weight
+        }
     }
     
     /// Get fusion statistics

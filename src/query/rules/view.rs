@@ -60,12 +60,11 @@ use std::sync::Arc;
 /// Optimization rule that rewrites queries to use views when beneficial  
 /// Adapted for VDB-first architecture (mostly disabled for embeddings-only queries)
 pub struct ViewOptimizationRule {
-    vdb_storage: Arc<VDBSparseStorage>,
 }
 
 impl ViewOptimizationRule {
-    pub fn new(vdb_storage: Arc<VDBSparseStorage>) -> Self {
-        Self { vdb_storage }
+    pub fn new(_vdb_storage: Arc<VDBSparseStorage>) -> Self {
+        Self { }
     }
 
     /// Check if a view can be used for this query (disabled for VDB-first)

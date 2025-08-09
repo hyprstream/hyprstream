@@ -1,11 +1,10 @@
 //! Hardware-accelerated VDB storage using OpenVDB
 
-#[cfg(feature = "vdb")]
+
 use crate::storage::vdb::openvdb_bindings::{
-    OpenVDBLoRAAdapter, OpenVDBBatchOps
+    OpenVDBLoRAAdapter
 };
 
-use std::fmt;
 
 /// VDB operation errors
 #[derive(Debug, thiserror::Error)]
@@ -19,7 +18,7 @@ pub enum VDBError {
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
 }
-use crate::storage::vdb::grid::{SparseWeights, Coordinate3D};
+use crate::storage::vdb::grid::{Coordinate3D};
 use crate::storage::vdb::neuralvdb_codec::{NeuralVDBCodec, CompressedAdapter, CompressionStats};
 use crate::adapters::sparse_lora::{SparseLoRAAdapter, SparseLoRAConfig};
 
@@ -35,28 +34,18 @@ pub struct ZOrderPattern {
     indices: Vec<u32>,
     /// Hierarchical levels for multi-scale access
     levels: Vec<u8>,
-    /// Last access timestamp for caching
-    last_accessed: u64,
 }
 
 /// Multi-scale quantizer inspired by OctGPT
 #[derive(Debug)]
 pub struct MultiScaleQuantizer {
-    /// Coarse quantizer for rank structure
-    rank_quantizer: RankQuantizer,
     /// Fine quantizer for sparse weights (binary)
     sparse_quantizer: SparseQuantizer,
-    /// Compression statistics
-    stats: QuantizationStats,
 }
 
 /// Rank-level quantizer for LoRA A/B matrices
 #[derive(Debug)]
 pub struct RankQuantizer {
-    /// Quantization levels for rank dimensions
-    levels: u8,
-    /// Scale factors for dequantization
-    scales: Vec<f32>,
 }
 
 /// Sparse weight quantizer with binary compression
@@ -64,8 +53,6 @@ pub struct RankQuantizer {
 pub struct SparseQuantizer {
     /// Threshold for binary quantization
     threshold: f32,
-    /// Residual compression for fine details
-    residual_bits: u8,
 }
 
 /// Statistics for quantization performance
@@ -101,12 +88,8 @@ pub struct WeightUpdatePattern {
     morton_index: u32,
     /// Weight delta (change from previous value)
     weight_delta: f32,
-    /// Update timestamp
-    timestamp: u64,
     /// Hierarchical level (0=coarse, 1=medium, 2=fine)
     level: u8,
-    /// Context features (neighboring weight changes)
-    context_features: Vec<f32>,
 }
 
 /// Statistics for autoregressive prediction accuracy
@@ -139,7 +122,7 @@ pub struct HierarchicalQuantizedData {
 impl MultiScaleQuantizer {
     /// Encode LoRA adapter with hierarchical quantization (OctGPT-inspired)
     pub async fn encode_hierarchical(&self, adapter: &SparseLoRAAdapter) -> Result<HierarchicalQuantizedData, VDBError> {
-        let start = std::time::Instant::now();
+        let _start = std::time::Instant::now();
         
         // Get LoRA matrices
         let lora_a = adapter.get_lora_a().await;
@@ -159,7 +142,7 @@ impl MultiScaleQuantizer {
         let compression_ratio = total_original as f32 / total_compressed as f32;
         
         println!("🎯 Hierarchical quantization: {:.1}x compression in {:.2}ms", 
-                compression_ratio, start.elapsed().as_millis());
+                compression_ratio, _start.elapsed().as_millis());
         
         Ok(HierarchicalQuantizedData {
             rank_data,
@@ -188,7 +171,7 @@ impl MultiScaleQuantizer {
     }
     
     /// Quantize weight clusters for medium-level representation
-    async fn quantize_weight_clusters(&self, lora_a: &[f32], lora_b: &[f32]) -> Result<Vec<(u16, u16, f32)>, VDBError> {
+    async fn quantize_weight_clusters(&self, lora_a: &[f32], _lora_b: &[f32]) -> Result<Vec<(u16, u16, f32)>, VDBError> {
         let mut clusters = Vec::new();
         
         // Simple clustering: group weights by spatial proximity
@@ -326,7 +309,7 @@ impl AutoregressivePredictor {
         adapter_id: &str, 
         current_morton: u32
     ) -> Option<WeightUpdatePattern> {
-        let start = std::time::Instant::now();
+        let _start = std::time::Instant::now();
         
         let history = self.update_history.get(adapter_id)?;
         if history.len() < 3 {
@@ -367,12 +350,7 @@ impl AutoregressivePredictor {
         Some(WeightUpdatePattern {
             morton_index: current_morton,
             weight_delta: predicted_delta,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
             level: predicted_level,
-            context_features,
         })
     }
     
@@ -465,15 +443,9 @@ impl HardwareVDBStorage {
         
         // Initialize multi-scale quantizer (OctGPT-inspired)
         let quantizer = Arc::new(MultiScaleQuantizer {
-            rank_quantizer: RankQuantizer {
-                levels: 8, // 8-bit quantization for rank matrices
-                scales: vec![1.0; 32], // Support up to rank 32
-            },
             sparse_quantizer: SparseQuantizer {
                 threshold: 1e-6, // Binary threshold for sparsity
-                residual_bits: 4, // 4-bit residuals for fine details
             },
-            stats: QuantizationStats::default(),
         });
         
         // Initialize autoregressive predictor (OctGPT-inspired)
@@ -716,12 +688,7 @@ impl HardwareVDBStorage {
                     let pattern = WeightUpdatePattern {
                         morton_index,
                         weight_delta: new_value, // Simplified: using absolute value as delta
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
                         level: coord.z() as u8, // Use Z coordinate as hierarchical level
-                        context_features: vec![coord.x() as f32, coord.y() as f32, coord.z() as f32, new_value],
                     };
                     predictor.record_update(adapter_id, pattern).await;
                 }
@@ -935,10 +902,6 @@ impl HardwareVDBStorage {
         Ok(ZOrderPattern {
             indices,
             levels,
-            last_accessed: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
         })
     }
     
@@ -965,7 +928,7 @@ impl HardwareVDBStorage {
         cluster_data: &[(u16, u16, f32)]
     ) -> Result<(), VDBError> {
         // Level 1: Store clustered weights with spatial locality
-        for (i, &(x, y, weight)) in cluster_data.iter().enumerate() {
+        for (_i, &(x, y, weight)) in cluster_data.iter().enumerate() {
             adapter.set_weight(x as i32, y as i32, weight); // Level 1
         }
         Ok(())

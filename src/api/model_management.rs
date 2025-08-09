@@ -17,6 +17,7 @@ use url::Url;
 
 use crate::api::model_registry::{ModelRegistry, ModelRegistryType};
 use crate::api::model_storage::{ModelStorage, ModelMetadata};
+use crate::config::HyprConfig;
 
 /// Model management service state
 #[derive(Clone)]
@@ -27,9 +28,6 @@ pub struct ModelManagementState {
     /// Registry clients (HuggingFace, etc.)
     registries: Arc<RwLock<HashMap<ModelRegistryType, Box<dyn ModelRegistry + Send + Sync>>>>,
     
-    /// VDB storage for integration (only available with VDB feature)
-    #[cfg(feature = "vdb")]
-    vdb_storage: Arc<crate::storage::vdb::hardware_accelerated::HardwareVDBStorage>,
     
     /// Configuration
     config: ModelManagementConfig,
@@ -45,7 +43,7 @@ impl ModelManagementState {
         let storage = Arc::new(ModelStorage::new(config.models_dir.clone()).await?);
         let registries = Arc::new(RwLock::new(HashMap::new()));
         
-        #[cfg(feature = "vdb")]
+        
         let vdb_storage = Arc::new(
             crate::storage::vdb::hardware_accelerated::HardwareVDBStorage::new().await
                 .map_err(|e| anyhow::anyhow!("Failed to initialize VDB storage: {}", e))?
@@ -54,8 +52,6 @@ impl ModelManagementState {
         Ok(Self {
             storage,
             registries,
-            #[cfg(feature = "vdb")]
-            vdb_storage,
             config,
         })
     }
@@ -92,8 +88,10 @@ pub struct ModelManagementConfig {
 
 impl Default for ModelManagementConfig {
     fn default() -> Self {
+        let config = HyprConfig::load().unwrap_or_default();
+        
         Self {
-            models_dir: PathBuf::from("./models"),
+            models_dir: config.models_dir().clone(),
             max_concurrent_downloads: 3,
             cache_size_gb: 100,
             auto_cleanup: true,

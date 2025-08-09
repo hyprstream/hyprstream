@@ -4,15 +4,15 @@ use anyhow::{anyhow, Result};
 use hf_hub::api::tokio::ApiBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
-use crate::storage::{StoragePaths, HfAuth};
+use crate::{auth::HfAuth, config::HyprConfig};
 
 /// Download a model from HuggingFace Hub
-pub async fn download_qwen3_model(model_dir: Option<PathBuf>) -> Result<PathBuf> {
-    let storage = StoragePaths::new()?;
-    let base_dir = model_dir.unwrap_or_else(|| storage.models_dir().unwrap_or_else(|_| PathBuf::from("./models")));
+pub async fn download_qwen3_model(config: Option<&HyprConfig>) -> Result<PathBuf> {
+    let config = config.map(|c| c.clone()).unwrap_or_else(|| HyprConfig::load().unwrap_or_default());
+    let base_dir = config.models_dir();
     
     // Ensure models directory exists
-    tokio::fs::create_dir_all(&base_dir).await
+    tokio::fs::create_dir_all(base_dir).await
         .map_err(|e| anyhow!("Failed to create models directory: {}", e))?;
 
     println!("📥 Downloading Qwen3-1.7B model from HuggingFace Hub...");
@@ -117,10 +117,10 @@ async fn download_with_progress(
 pub async fn download_model_by_uri(
     model_uri: &str,
     filename: Option<&str>,
-    model_dir: Option<PathBuf>,
+    config: Option<&HyprConfig>,
 ) -> Result<PathBuf> {
-    let storage = StoragePaths::new()?;
-    let base_dir = model_dir.unwrap_or_else(|| storage.models_dir().unwrap_or_else(|_| PathBuf::from("./models")));
+    let config = config.map(|c| c.clone()).unwrap_or_else(|| HyprConfig::load().unwrap_or_default());
+    let base_dir = config.models_dir();
     
     // Parse the URI with optional revision/tag support
     // Format: author/model-name[:revision]
@@ -289,15 +289,15 @@ pub async fn list_repo_files(model_uri: &str) -> Result<Vec<String>> {
 /// Download a model by path/URI with optional filename and progress
 pub async fn download_model(
     model_path: &str,
-    model_dir: Option<PathBuf>,
+    config: Option<&HyprConfig>,
     filename: Option<String>,
     show_progress: bool,
 ) -> Result<PathBuf> {
     if show_progress {
-        download_model_by_uri(model_path, filename.as_deref(), model_dir).await
+        download_model_by_uri(model_path, filename.as_deref(), config).await
     } else {
         // Still show progress for now, but could disable progress bars in future
-        download_model_by_uri(model_path, filename.as_deref(), model_dir).await
+        download_model_by_uri(model_path, filename.as_deref(), config).await
     }
 }
 
@@ -307,9 +307,9 @@ pub async fn quick_start_download() -> Result<PathBuf> {
     println!("📥 This will download a small quantized model suitable for testing");
     println!();
     
-    // Use XDG-compliant storage paths
-    let storage = StoragePaths::new()?;
-    download_qwen3_model(Some(storage.models_dir()?)).await
+    // Use configuration-managed storage paths
+    let config = HyprConfig::load().unwrap_or_default();
+    download_qwen3_model(Some(&config)).await
 }
 
 /// Resolve a tag/revision to the corresponding GGUF filename

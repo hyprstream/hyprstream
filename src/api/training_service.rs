@@ -1,7 +1,6 @@
 //! Auto-regressive training service for LoRA adapters
 
 use crate::api::{TrainingSample, TrainingStatus};
-#[cfg(feature = "vdb")]
 use crate::storage::vdb::hardware_accelerated::HardwareVDBStorage;
 use crate::adapters::sparse_lora::{SparseLoRAAdapter, SparseLoRAConfig};
 use crate::inference::{InferenceAPI, InferenceInput, InferenceOutput};
@@ -73,8 +72,7 @@ pub struct TrainingSession {
 
 /// Training service for auto-regressive LoRA learning
 pub struct TrainingService {
-    /// VDB storage for adapters (only available with VDB feature)
-    #[cfg(feature = "vdb")]
+    /// VDB storage for adapters
     vdb_storage: Arc<HardwareVDBStorage>,
     
     /// Inference API for generating training targets
@@ -106,11 +104,11 @@ pub struct TrainingStats {
 impl TrainingService {
     /// Create new training service
     pub fn new(
-        #[cfg(feature = "vdb")] vdb_storage: Arc<HardwareVDBStorage>,
+         vdb_storage: Arc<HardwareVDBStorage>,
         inference_api: Arc<InferenceAPI>,
     ) -> Self {
         Self {
-            #[cfg(feature = "vdb")]
+            
             vdb_storage,
             inference_api,
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -154,7 +152,7 @@ impl TrainingService {
         
         // Start background training task
         let lora_id_clone = lora_id.to_string();
-        #[cfg(feature = "vdb")]
+        
         let vdb_storage = self.vdb_storage.clone();
         let sessions = self.sessions.clone();
         let stats = self.stats.clone();
@@ -168,7 +166,7 @@ impl TrainingService {
                 // Train when we have enough samples
                 if sample_batch.len() >= config.batch_size {
                     if let Err(e) = Self::train_batch(
-                        #[cfg(feature = "vdb")] &vdb_storage,
+                         &vdb_storage,
                         &lora_id_clone,
                         &sample_batch,
                         &config,
@@ -185,7 +183,7 @@ impl TrainingService {
             // Process remaining samples
             if !sample_batch.is_empty() {
                 let _ = Self::train_batch(
-                    #[cfg(feature = "vdb")] &vdb_storage,
+                     &vdb_storage,
                     &lora_id_clone,
                     &sample_batch,
                     &config,
@@ -246,7 +244,7 @@ impl TrainingService {
     
     /// Train a batch of samples
     async fn train_batch(
-        #[cfg(feature = "vdb")] vdb_storage: &Arc<HardwareVDBStorage>,
+         vdb_storage: &Arc<HardwareVDBStorage>,
         lora_id: &str,
         samples: &[TrainingSample],
         config: &TrainingConfig,
@@ -257,21 +255,11 @@ impl TrainingService {
         
         println!("🎯 Training LoRA {} with {} samples", lora_id, samples.len());
         
-        // Load current adapter
-        #[cfg(feature = "vdb")]
+        // Load current adapter from VDB storage
         let adapter = vdb_storage.load_adapter_neural_compressed(
             lora_id,
             SparseLoRAConfig::default(),
         ).await?;
-        
-        #[cfg(not(feature = "vdb"))]
-        let adapter = {
-            // Create a basic adapter when VDB is not available
-            let config = SparseLoRAConfig::default();
-            let adapter = crate::adapters::sparse_lora::SparseLoRAAdapter::new(config);
-            adapter.initialize_random().await;
-            adapter
-        };
         
         // Simulate gradient computation and sparse weight updates
         let mut weight_updates = HashMap::new();
@@ -294,14 +282,8 @@ impl TrainingService {
         
         // Apply weight updates to VDB storage
         if !weight_updates.is_empty() {
-            #[cfg(feature = "vdb")]
-            {
-                vdb_storage.gpu_sparse_update(lora_id, &weight_updates).await?;
-            }
-            #[cfg(not(feature = "vdb"))]
-            {
-                println!("📝 Applied {} weight updates (VDB not available)", weight_updates.len());
-            }
+            vdb_storage.gpu_sparse_update(lora_id, &weight_updates).await?;
+            println!("📝 Applied {} weight updates to VDB storage", weight_updates.len());
         }
         
         // Update session statistics

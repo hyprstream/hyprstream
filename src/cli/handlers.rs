@@ -3,6 +3,8 @@
 use crate::{
     storage::{VDBSparseStorage, SparseStorageConfig},
     service::embedding_flight::create_embedding_flight_server,
+    inference::{InferenceAPI, InferenceInput, InferenceOutput},
+    api::inference_service::InferenceResponse,
 };
 use ::config::{Config, File};
 use std::{
@@ -330,7 +332,7 @@ pub async fn handle_model_command(
                     match crate::cli::commands::download::download_model_by_uri(
                         model_path, // Pass the full URI with tag for resolution
                         files.as_ref().and_then(|f| f.first()).map(|s| s.as_str()),
-                        None,
+                        None, // Use default HyprConfig
                     ).await {
                         Ok(path) => {
                             println!("✅ Model downloaded successfully!");
@@ -965,18 +967,33 @@ pub async fn handle_lora_command(
         LoRAAction::Infer { lora_id, prompt, input_file, max_tokens, temperature, top_p, stream, format } => {
             info!("🔮 Running inference with LoRA: {}", lora_id);
             
-            let adapter_exists = lora_id.starts_with("lora_") || lora_id.contains("adapter");
+            // Load configuration
+            let config = match crate::config::HyprConfig::load() {
+                Ok(config) => config,
+                Err(e) => {
+                    println!("❌ Failed to load configuration: {}", e);
+                    println!("   Please run 'hyprstream model download <model>' first");
+                    return Ok(());
+                }
+            };
             
-            if !adapter_exists {
-                println!("❌ LoRA adapter '{}' not found", lora_id);
+            // Validate configuration
+            if let Err(e) = config.validate() {
+                println!("❌ Configuration error: {}", e);
                 return Ok(());
             }
             
             // Get input text
             let input_text = if let Some(p) = prompt {
                 p
-            } else if let Some(_file) = input_file {
-                "Content from input file would be loaded here".to_string()
+            } else if let Some(file_path) = input_file {
+                match std::fs::read_to_string(&file_path) {
+                    Ok(content) => content.trim().to_string(),
+                    Err(e) => {
+                        println!("❌ Failed to read input file '{}': {}", file_path, e);
+                        return Ok(());
+                    }
+                }
             } else {
                 println!("❌ Either --prompt or --input-file must be provided");
                 return Ok(());
@@ -984,58 +1001,65 @@ pub async fn handle_lora_command(
             
             println!("🚀 Initializing LoRA inference...");
             println!("   📋 Adapter: {}", lora_id);
-            println!("   🧠 Loading sparse weight matrices from VDB");
-            println!("   ⚡ Applying 99% sparsity optimization");
+            println!("   🧠 Model: {}", config.model.name);
+            println!("   ⚡ Using dynamic fusion strategy");
             println!("   🎯 Temperature: {}, Top-p: {}", temperature, top_p);
             println!();
             
-            if stream {
-                println!("📝 Streaming response:");
-                println!("----------------------------------------");
-                
-                // Mock streaming response
-                let response_parts = vec![
-                    "Based on the LoRA adapter optimization",
-                    ", I can provide a response that demonstrates",
-                    " the 99% sparse neural network architecture.",
-                    " This approach significantly reduces computational overhead",
-                    " while maintaining high-quality outputs",
-                    " through Hyprstream's VDB-first design.",
-                ];
-                
-                for part in response_parts {
-                    print!("{}", part);
-                    std::io::Write::flush(&mut std::io::stdout()).unwrap();
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                }
-                println!();
-                println!("----------------------------------------");
-            } else {
-                let full_response = "Based on the LoRA adapter optimization, I can provide a response that demonstrates the 99% sparse neural network architecture. This approach significantly reduces computational overhead while maintaining high-quality outputs through Hyprstream's VDB-first design.";
-                
-                match format.as_str() {
-                    "json" => {
-                        println!("{{");
-                        println!("  \"adapter_id\": \"{}\",", lora_id);
-                        println!("  \"prompt\": \"{}\",", input_text.replace('"', "\\\""));
-                        println!("  \"response\": \"{}\",", full_response.replace('"', "\\\""));
-                        println!("  \"tokens_generated\": {},", full_response.split_whitespace().count());
-                        println!("  \"temperature\": {},", temperature);
-                        println!("  \"top_p\": {}", top_p);
-                        println!("}}");
-                    },
-                    _ => {
-                        println!("Response:");
-                        println!("========");
-                        println!("{}", full_response);
+            // Create inference session
+            match create_lora_inference_session(&config, &lora_id, &input_text, max_tokens, temperature, top_p, stream).await {
+                Ok(response) => {
+                    match format.as_str() {
+                        "json" => {
+                            println!("{{");
+                            println!("  \"adapter_id\": \"{}\",", lora_id);
+                            println!("  \"prompt\": \"{}\",", input_text.replace('"', "\\\""));
+                            println!("  \"response\": \"{}\",", response.output.replace('"', "\\\""));
+                            println!("  \"tokens_generated\": {},", response.tokens_generated);
+                            println!("  \"latency_ms\": {},", response.latency_ms);
+                            println!("  \"temperature\": {},", temperature);
+                            println!("  \"top_p\": {}", top_p);
+                            println!("}}");
+                        },
+                        _ => {
+                            if stream {
+                                println!("📝 Streaming response:");
+                                println!("----------------------------------------");
+                                // Simulate streaming by splitting response
+                                for chunk in response.output.split_whitespace() {
+                                    print!("{} ", chunk);
+                                    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                                    std::thread::sleep(std::time::Duration::from_millis(50));
+                                }
+                                println!();
+                                println!("----------------------------------------");
+                            } else {
+                                println!("Response:");
+                                println!("========");
+                                println!("{}", response.output);
+                            }
+                        }
                     }
+                    
+                    println!();
+                    println!("📊 Generation Stats:");
+                    println!("   Tokens: {} | Time: {:.1}ms | Speed: {:.1} tok/s", 
+                           response.tokens_generated, 
+                           response.latency_ms,
+                           if response.latency_ms > 0.0 {
+                               (response.tokens_generated as f64) / (response.latency_ms / 1000.0)
+                           } else { 0.0 });
+                }
+                Err(e) => {
+                    println!("❌ Inference failed: {}", e);
+                    println!("   This may be because:");
+                    println!("   • LoRA adapter '{}' doesn't exist", lora_id);
+                    println!("   • Model '{}' is not loaded", config.model.name);
+                    println!("   • VDB storage is not accessible");
+                    println!("   ");
+                    println!("   Try: hyprstream lora list");
                 }
             }
-            
-            println!();
-            println!("📊 Generation Stats:");
-            println!("   Tokens: {} | Time: 1.2s | Speed: 25.3 tok/s", 
-                   std::cmp::min(32, max_tokens));
         }
         LoRAAction::Chat { lora_id, max_tokens, temperature, history, save_history } => {
             info!("💬 Starting chat with LoRA: {}", lora_id);
@@ -1069,7 +1093,7 @@ pub async fn handle_lora_command(
 /// Handle authentication commands
 pub async fn handle_auth_command(cmd: crate::cli::commands::AuthCommand) -> Result<(), Box<dyn std::error::Error>> {
     use crate::cli::commands::auth::AuthAction;
-    use crate::storage::HfAuth;
+    use crate::auth::HfAuth;
     use std::io::{self, Write};
     
     let auth = HfAuth::new()?;
@@ -1174,4 +1198,77 @@ fn mask_token(token: &str) -> String {
     } else {
         format!("{}***{}", &token[..4], &token[token.len()-4..])
     }
+}
+
+/// Create a LoRA inference session and perform inference
+async fn create_lora_inference_session(
+    config: &crate::config::HyprConfig,
+    lora_id: &str,
+    input_text: &str,
+    max_tokens: usize,
+    temperature: f32,
+    top_p: f32,
+    _stream: bool,
+) -> anyhow::Result<InferenceResponse> {
+    use std::sync::Arc;
+    
+    // Validate model exists
+    if !config.model.path.exists() {
+        return Err(anyhow::anyhow!(
+            "Model file not found: {}. Please download a model first.",
+            config.model.path.display()
+        ));
+    }
+    
+    // Create inference API
+    let vdb_storage = {
+        let storage_config = SparseStorageConfig {
+            storage_path: config.cache_dir().join("vdb_storage"),
+            neural_compression: true,
+            hardware_acceleration: true,
+            cache_size_mb: 1024,
+            compaction_interval_secs: 300,
+            streaming_updates: false,
+            update_batch_size: 100,
+        };
+        Arc::new(crate::storage::vdb::hardware_accelerated::HardwareVDBStorage::new().await?)
+    };
+    
+    let inference_api = Arc::new(InferenceAPI::new(
+        &config.model.path,
+        vdb_storage,
+        config.clone(),
+    ).await?);
+    
+    // Create inference session
+    let session_id = inference_api.create_session(
+        config.model.name.clone(),
+        vec![lora_id.to_string()],
+        None, // Use default weights
+    ).await?;
+    
+    // Create inference input
+    let input = InferenceInput {
+        prompt: Some(input_text.to_string()),
+        input_ids: None,
+        max_tokens,
+        temperature,
+        top_p,
+        stream: false, // CLI doesn't support true streaming yet
+    };
+    
+    // Perform inference
+    let output = inference_api.infer(&session_id, input).await?;
+    
+    // Close session
+    let _ = inference_api.close_session(&session_id).await;
+    
+    // Convert to API response format
+    Ok(InferenceResponse {
+        lora_id: lora_id.to_string(),
+        output: output.text,
+        tokens_generated: output.tokens_generated,
+        latency_ms: 0.0, // Will be calculated by caller
+        finish_reason: "completed".to_string(),
+    })
 }

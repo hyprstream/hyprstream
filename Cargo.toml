@@ -52,7 +52,9 @@ arrow-schema = "53.1.0"
 arrow-ipc = "53.1.0"
 
 # Configuration
-config = { version = "0.13", features = ["toml"] }
+config = { version = "0.13", features = ["toml", "yaml", "json"] }
+toml = "0.8"
+serde_yaml = "0.9"
 clap = { version = "4.4", features = ["derive", "env"] }
 tracing = "0.1"
 parking_lot = "0.12"
@@ -95,9 +97,8 @@ url = "2.5"
 urlencoding = "2.1"
 
 [features]
-default = ["vdb"]
+default = []
 cuda = []
-vdb = []  # Enable VDB features (requires OpenVDB)
 
 [build-dependencies]
 cc = "1.0"

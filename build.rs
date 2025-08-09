@@ -44,29 +44,20 @@ fn check_cuda_availability() -> bool {
 // Removed CUDA/NanoVDB build functions - OpenVDB only
 
 fn build_cpu_only() {
-    // Check if user wants VDB features
-    let vdb_requested = cfg!(feature = "vdb") || env::var("CARGO_FEATURE_VDB").is_ok();
-    
-    if vdb_requested {
-        // User wants VDB features - try to build with OpenVDB
-        match build_openvdb() {
-            Ok(_) => {
-                println!("cargo:warning=✅ Built with OpenVDB support - VDB features enabled");
-                println!("cargo:rustc-cfg=feature=\"vdb\"");
-            }
-            Err(e) => {
-                println!("cargo:warning=❌ OpenVDB not found but VDB features requested");
-                println!("cargo:warning=Error: {}", e);
-                println!("cargo:warning=Install OpenVDB to enable sparse LoRA storage");
-                println!("cargo:warning=See OPENVDB_SETUP.md for installation instructions");
-                
-                // Fail build if VDB explicitly requested but not available
-                panic!("VDB feature requested but OpenVDB not found. Install OpenVDB or build without --features vdb");
-            }
+    // VDB is always required - try to build with OpenVDB
+    match build_openvdb() {
+        Ok(_) => {
+            println!("cargo:warning=✅ Built with OpenVDB support - VDB features enabled");
         }
-    } else {
-        println!("cargo:warning=🔧 Building without VDB features (use --features vdb to enable)");
-        build_without_vdb();
+        Err(e) => {
+            println!("cargo:warning=❌ OpenVDB not found - VDB is required for Hyprstream");
+            println!("cargo:warning=Error: {}", e);
+            println!("cargo:warning=Install OpenVDB to enable sparse LoRA storage");
+            println!("cargo:warning=See OPENVDB_SETUP.md for installation instructions");
+            
+            // VDB is always required, so fail build if not available
+            panic!("VDB is required for Hyprstream but OpenVDB not found. Install OpenVDB to continue.");
+        }
     }
 }
 
@@ -163,11 +154,6 @@ fn build_openvdb() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn build_without_vdb() {
-    // Build without VDB features - only core functionality  
-    println!("cargo:warning=Building without VDB support - sparse storage features disabled");
-    println!("cargo:warning=To enable VDB: install OpenVDB and build with --features vdb");
-}
 
 // Removed NanoVDB binding generation - OpenVDB only
 
