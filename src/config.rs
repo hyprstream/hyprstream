@@ -358,4 +358,28 @@ impl HyprConfig {
         std::fs::create_dir_all(&self.storage.vdb_storage_dir)?;
         Ok(())
     }
+    
+    /// Create a default configuration for a specific model path
+    pub fn default_for_model(model_path: &Path) -> anyhow::Result<Self> {
+        let storage_paths = StoragePaths::new()?;
+        let mut config = Self::default();
+        
+        config.model.path = model_path.to_path_buf();
+        config.model.name = model_path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        config.model.architecture = "auto".to_string(); // Auto-detect from model
+        
+        // Update storage paths to use XDG directories
+        config.storage = StorageConfig {
+            models_dir: storage_paths.models_dir()?,
+            loras_dir: storage_paths.loras_dir()?,
+            cache_dir: storage_paths.cache_dir()?,
+            config_dir: storage_paths.config_dir()?,
+            vdb_storage_dir: storage_paths.cache_dir()?.join("vdb_storage"),
+        };
+        
+        Ok(config)
+    }
 }

@@ -5,6 +5,8 @@ use hf_hub::api::tokio::ApiBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
 use crate::{auth::HfAuth, config::HyprConfig};
+use crate::api::model_storage::{ModelStorage, ModelMetadata, ModelId, ExternalSource, SourceType, ModelFile, FileType};
+use crate::api::model_management::ModelUri;
 
 /// Download a model from HuggingFace Hub
 pub async fn download_qwen3_model(config: Option<&HyprConfig>) -> Result<PathBuf> {
@@ -21,14 +23,14 @@ pub async fn download_qwen3_model(config: Option<&HyprConfig>) -> Result<PathBuf
     // Initialize HuggingFace API with authentication
     let auth = HfAuth::new()?;
     let api = if let Some(token) = auth.get_token().await? {
-        ApiBuilder::new()
+        ApiBuilder::from_env()
             .with_token(Some(token))
             .build()
             .map_err(|e| anyhow!("Failed to initialize HuggingFace API: {}", e))?
     } else {
         println!("ℹ️  No HuggingFace token found. Some models may not be accessible.");
         println!("   Use 'hyprstream auth login' to authenticate for gated models.");
-        ApiBuilder::new()
+        ApiBuilder::from_env()
             .build()
             .map_err(|e| anyhow!("Failed to initialize HuggingFace API: {}", e))?
     };
@@ -97,11 +99,20 @@ async fn download_with_progress(
     local_path: &Path,
     pb: &ProgressBar,
 ) -> Result<()> {
-    pb.set_message(format!("Downloading {} to {}", filename, local_path.display()));
+    pb.set_message(format!("Downloading {}", filename));
     
-    // Get the file from the repository
+    // Get the file from the repository with better error handling
     let file_path = repo.get(filename).await
-        .map_err(|e| anyhow!("Failed to download file '{}': {}", filename, e))?;
+        .map_err(|e| {
+            let error_msg = format!("{}", e);
+            if error_msg.contains("etag") {
+                anyhow!("Download failed - server missing required headers. Try again or check if the file exists in the repository")
+            } else if error_msg.contains("404") {
+                anyhow!("File '{}' not found in repository. Use --files with the exact filename from the repository", filename)
+            } else {
+                anyhow!("Failed to download file '{}': {}", filename, e)
+            }
+        })?;
     
     // Copy the downloaded file to the target location
     tokio::fs::copy(&file_path, local_path).await
@@ -137,7 +148,7 @@ pub async fn download_model_by_uri(
         return Err(anyhow!("Invalid model URI format. Expected: author/model-name[:revision]"));
     }
     
-    let author = parts[0];
+    let _author = parts[0];
     let model_name = parts[1];
     
     // Ensure models directory exists
@@ -150,36 +161,47 @@ pub async fn download_model_by_uri(
     // Initialize HuggingFace API with authentication
     let auth = HfAuth::new()?;
     let api = if let Some(token) = auth.get_token().await? {
-        ApiBuilder::new()
+        ApiBuilder::from_env()
             .with_token(Some(token))
             .build()
             .map_err(|e| anyhow!("Failed to initialize HuggingFace API: {}", e))?
     } else {
         println!("ℹ️  No HuggingFace token found. Some models may not be accessible.");
-        ApiBuilder::new()
+        ApiBuilder::from_env()
             .build()
             .map_err(|e| anyhow!("Failed to initialize HuggingFace API: {}", e))?
     };
     
-    // Create the repository reference 
+    // Create the repository reference with revision if specified
     let repo = api.model(repo_path.to_string());
+    if let Some(rev) = revision {
+        println!("📌 Using revision: {}", rev);
+        println!("⚠️  Revision support limited in current hf-hub version");
+    }
     
-    // Handle revision/tag to filename mapping (like llamacpp)
-    let resolved_filename = if let Some(rev) = revision {
-        println!("📌 Resolving tag/revision: {}", rev);
-        resolve_tag_to_filename(rev, &repo).await?
-    } else {
-        filename.unwrap_or("model.gguf").to_string()
-    };
-    
-    // Use resolved filename or provided filename
-    let target_filename = &resolved_filename;
+    // Use the provided filename directly, or default
+    let target_filename = filename.unwrap_or("model.gguf");
     let filename_prefix = format!("{}_{}", model_name.replace('/', "_"), target_filename);
     let local_path = base_dir.join(filename_prefix);
     
     // Check if model already exists
     if local_path.exists() {
         println!("✅ Model already exists at: {}", local_path.display());
+        
+        // Still register the existing model with storage system to ensure it appears in model list
+        println!("📝 Registering existing model with storage system...");
+        if let Err(e) = register_downloaded_model(
+            model_uri, 
+            &local_path, 
+            target_filename,
+            &config
+        ).await {
+            eprintln!("⚠️  Warning: Failed to register existing model with storage system: {}", e);
+            eprintln!("   Model exists but may not appear in 'model list'");
+        } else {
+            println!("✅ Model registered with storage system");
+        }
+        
         return Ok(local_path);
     }
     
@@ -193,10 +215,22 @@ pub async fn download_model_by_uri(
     );
     
     // Download the model
-    match download_with_progress(&repo, &resolved_filename, &local_path, &pb).await {
+    match download_with_progress(&repo, target_filename, &local_path, &pb).await {
         Ok(()) => {
             pb.finish_with_message("✅ Download completed");
             println!("💾 Model saved to: {}", local_path.display());
+            
+            // Register model with storage system for proper indexing
+            if let Err(e) = register_downloaded_model(
+                model_uri, 
+                &local_path, 
+                target_filename,
+                &config
+            ).await {
+                eprintln!("⚠️  Warning: Failed to register model with storage system: {}", e);
+                eprintln!("   Model downloaded successfully but may not appear in 'model list'");
+            }
+            
             Ok(local_path)
         }
         Err(e) => {
@@ -228,60 +262,61 @@ pub async fn list_repo_files(model_uri: &str) -> Result<Vec<String>> {
     // Initialize HuggingFace API with authentication
     let auth = HfAuth::new()?;
     let api = if let Some(token) = auth.get_token().await? {
-        ApiBuilder::new()
+        ApiBuilder::from_env()
             .with_token(Some(token))
             .build()
             .map_err(|e| anyhow!("Failed to initialize HuggingFace API: {}", e))?
     } else {
-        ApiBuilder::new()
+        ApiBuilder::from_env()
             .build()
             .map_err(|e| anyhow!("Failed to initialize HuggingFace API: {}", e))?
     };
     
-    // Create the repository reference 
-    let repo = api.model(repo_path.to_string());
-    
-    // Note: Revision handling may need to be implemented differently
+    // Create the repository reference with revision if specified
+    let _repo = api.model(repo_path.to_string());
     if let Some(rev) = revision {
-        println!("📌 Attempting to use revision/tag: {} (may not be fully supported yet)", rev);
+        println!("📌 Using revision: {}", rev);
+        println!("⚠️  Revision support limited in current hf-hub version");
     }
     
-    // Try to get the actual file list from the repository
-    match repo.info().await {
-        Ok(repo_info) => {
-            let files: Vec<String> = repo_info.siblings
-                .iter()
-                .map(|sibling| sibling.rfilename.clone())
-                .collect();
-            
-            println!("📂 Available files ({} found):", files.len());
-            for file in &files {
-                println!("   {}", file);
+    // Use HuggingFace REST API to list repository files
+    let url = format!("https://huggingface.co/api/models/{}", repo_path);
+    let client = reqwest::Client::new();
+
+    match client.get(&url).send().await {
+        Ok(response) => {
+            if response.status().is_success() {
+                match response.json::<serde_json::Value>().await {
+                    Ok(repo_data) => {
+                        let files: Vec<String> = repo_data
+                            .get("siblings")
+                            .and_then(|s| s.as_array())
+                            .map(|siblings| {
+                                siblings.iter()
+                                    .filter_map(|sibling| {
+                                        sibling.get("rfilename")
+                                            .and_then(|name| name.as_str())
+                                            .map(|s| s.to_string())
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                        println!("📂 Available files ({} found):", files.len());
+                        for file in &files {
+                            println!("   {}", file);
+                        }
+
+                        Ok(files)
+                    }
+                    Err(e) => Err(anyhow!("Failed to parse repository data: {}", e))
+                }
+            } else {
+                Err(anyhow!("Failed to fetch repository info: HTTP {}", response.status()))
             }
-            
-            Ok(files)
         }
         Err(e) => {
-            println!("⚠️  Could not fetch repository info: {}", e);
-            println!("📂 Falling back to common GGUF filenames:");
-            
-            // Fallback to common GGUF filenames
-            let common_files = vec![
-                "model.gguf".to_string(),
-                "model.q4_0.gguf".to_string(),
-                "model.q4_1.gguf".to_string(),
-                "model.q5_0.gguf".to_string(),
-                "model.q5_1.gguf".to_string(),
-                "model.q8_0.gguf".to_string(),
-                "tokenizer.json".to_string(),
-                "config.json".to_string(),
-            ];
-            
-            for file in &common_files {
-                println!("   {}", file);
-            }
-            
-            Ok(common_files)
+            Err(anyhow!("Failed to connect to HuggingFace API: {}", e))
         }
     }
 }
@@ -312,78 +347,195 @@ pub async fn quick_start_download() -> Result<PathBuf> {
     download_qwen3_model(Some(&config)).await
 }
 
-/// Resolve a tag/revision to the corresponding GGUF filename
-/// This mimics llamacpp's behavior for resolving tags to quantization formats
-async fn resolve_tag_to_filename(tag: &str, repo: &hf_hub::api::tokio::ApiRepo) -> Result<String> {
-    // First, try to get the repository info to see available files
-    match repo.info().await {
-        Ok(repo_info) => {
-            let files: Vec<String> = repo_info.siblings
-                .iter()
-                .map(|sibling| sibling.rfilename.clone())
-                .filter(|name| name.ends_with(".gguf"))
-                .collect();
-            
-            // Try different common patterns for tag-to-filename mapping
-            let possible_patterns = vec![
-                // Direct format: Model-TAG.gguf (most common)
-                format!("-{}.gguf", tag),
-                format!("_{}.gguf", tag),
-                // With model name patterns
-                format!("-{}.gguf", tag.to_uppercase()),
-                format!("_{}.gguf", tag.to_uppercase()),
-                // Quantization format patterns
-                format!("-Q{}.gguf", tag),
-                format!("_Q{}.gguf", tag),
-            ];
-            
-            // Find files that match the tag pattern
-            for pattern in &possible_patterns {
-                for file in &files {
-                    if file.contains(pattern) {
-                        println!("✅ Resolved tag '{}' to file: {}", tag, file);
-                        return Ok(file.clone());
-                    }
-                }
+/// Register a downloaded model with the storage system
+async fn register_downloaded_model(
+    model_uri: &str,
+    local_path: &Path,
+    filename: &str,
+    config: &HyprConfig,
+) -> Result<()> {
+    // Create ModelUri from the URI string
+    let uri_with_scheme = if model_uri.starts_with("hf://") {
+        model_uri.to_string()
+    } else {
+        format!("hf://{}", model_uri)
+    };
+    
+    let model_uri_obj = ModelUri::parse(&uri_with_scheme)?;
+    
+    // Get file size
+    let file_metadata = tokio::fs::metadata(local_path).await
+        .map_err(|e| anyhow!("Failed to get file metadata: {}", e))?;
+    let file_size = file_metadata.len();
+    
+    // Determine model type and architecture from filename/URI
+    let model_type = if filename.ends_with(".gguf") {
+        "gguf".to_string()
+    } else {
+        "unknown".to_string()
+    };
+    
+    // Extract architecture info from model name if possible
+    let architecture = if model_uri_obj.name.to_lowercase().contains("qwen") {
+        Some("qwen".to_string())
+    } else if model_uri_obj.name.to_lowercase().contains("llama") {
+        Some("llama".to_string())
+    } else if model_uri_obj.name.to_lowercase().contains("mistral") {
+        Some("mistral".to_string())
+    } else {
+        None
+    };
+    
+    // Extract parameter count from model name if possible
+    let parameters = if model_uri_obj.name.contains("1.5B") {
+        Some(1_500_000_000u64)
+    } else if model_uri_obj.name.contains("7B") {
+        Some(7_000_000_000u64)
+    } else if model_uri_obj.name.contains("13B") {
+        Some(13_000_000_000u64)
+    } else if model_uri_obj.name.contains("70B") {
+        Some(70_000_000_000u64)
+    } else {
+        None
+    };
+    
+    // Generate UUID based on model content
+    let model_id = ModelId::from_content_hash(
+        &model_uri_obj.name,
+        &architecture.clone().unwrap_or_else(|| "unknown".to_string()),
+        parameters,
+    );
+    
+    // Create external source reference
+    let external_source = ExternalSource {
+        source_type: SourceType::HuggingFace,
+        identifier: format!("{}/{}", model_uri_obj.org, model_uri_obj.name), // Store full org/name
+        revision: model_uri_obj.revision.clone(),
+        download_url: None,
+        last_verified: chrono::Utc::now().timestamp(),
+    };
+    
+    // Create model file info
+    let model_file = ModelFile {
+        filename: filename.to_string(),
+        size_bytes: file_size,
+        checksum: None, // TODO: Calculate checksum
+        file_type: FileType::Model,
+    };
+    
+    // Create metadata with UUID system
+    let metadata = ModelMetadata {
+        model_id,
+        name: model_uri_obj.name.clone(),
+        display_name: None,
+        architecture: architecture.unwrap_or_else(|| "unknown".to_string()),
+        parameters,
+        model_type,
+        tokenizer_type: Some("tiktoken".to_string()), // Common for modern models
+        size_bytes: file_size,
+        files: vec![model_file],
+        external_sources: vec![external_source],
+        local_path: Some(local_path.to_path_buf()),
+        is_cached: true,
+        tags: vec![
+            if model_uri_obj.name.to_lowercase().contains("instruct") {
+                "instruct".to_string()
+            } else if model_uri_obj.name.to_lowercase().contains("chat") {
+                "chat".to_string()
+            } else {
+                "base".to_string()
             }
-            
-            // If no exact pattern match, try case-insensitive partial matching
-            let tag_lower = tag.to_lowercase();
-            for file in &files {
-                let file_lower = file.to_lowercase();
-                if file_lower.contains(&tag_lower) && file_lower.contains(".gguf") {
-                    println!("✅ Resolved tag '{}' to file (partial match): {}", tag, file);
-                    return Ok(file.clone());
-                }
+        ],
+        description: None,
+        license: None,
+        created_at: chrono::Utc::now().timestamp(),
+        last_accessed: chrono::Utc::now().timestamp(),
+        last_updated: chrono::Utc::now().timestamp(),
+    };
+    
+    // Validate GGUF format for llamacpp compatibility
+    if !validate_gguf_format(local_path).await? {
+        return Err(anyhow!("Downloaded file is not a valid GGUF format for llamacpp inference"));
+    }
+    
+    // Initialize model storage and register the metadata
+    let models_dir = config.models_dir();
+    let storage = ModelStorage::new(models_dir.clone()).await?;
+    
+    // Register model with UUID-based storage system
+    storage.store_metadata(&model_uri_obj, metadata).await?;
+    
+    println!("📝 Model registered with storage system");
+    println!("🦙 Model validated for llamacpp compatibility");
+    Ok(())
+}
+
+/// Validate that a file is in GGUF format for llamacpp compatibility
+async fn validate_gguf_format(file_path: &Path) -> Result<bool> {
+    // Check file extension first
+    if !file_path.extension().map_or(false, |ext| ext == "gguf") {
+        return Ok(false);
+    }
+    
+    // Check file exists and has reasonable size (GGUF files should be substantial)
+    let metadata = tokio::fs::metadata(file_path).await?;
+    if metadata.len() < 1_000_000 { // Less than 1MB is suspicious for a model
+        return Ok(false);
+    }
+    
+    // Read GGUF magic number (first 4 bytes should be "GGUF")
+    let mut file = tokio::fs::File::open(file_path).await?;
+    let mut magic_bytes = [0u8; 4];
+    
+    use tokio::io::AsyncReadExt;
+    if let Err(_) = file.read_exact(&mut magic_bytes).await {
+        return Ok(false);
+    }
+    
+    // GGUF files start with "GGUF" magic bytes
+    let is_gguf = magic_bytes == [b'G', b'G', b'U', b'F'];
+    
+    if is_gguf {
+        // Additional validation: try to read version (next 4 bytes after magic)
+        let mut version_bytes = [0u8; 4];
+        if file.read_exact(&mut version_bytes).await.is_ok() {
+            let version = u32::from_le_bytes(version_bytes);
+            // GGUF versions should be reasonable (currently 1-3)
+            if version >= 1 && version <= 10 { // Allow some future versions
+                return Ok(true);
             }
-            
-            // If no matches found, show available options
-            println!("❌ Could not resolve tag '{}' to a specific file", tag);
-            println!("💡 Available GGUF files:");
-            for file in &files[..std::cmp::min(10, files.len())] {
-                println!("   {}", file);
-            }
-            if files.len() > 10 {
-                println!("   ... and {} more files", files.len() - 10);
-            }
-            
-            Err(anyhow!("Could not resolve tag '{}' to a specific filename. Please specify the exact filename using --files flag.", tag))
-        }
-        Err(e) => {
-            println!("⚠️ Could not fetch repository info: {}", e);
-            
-            // Fallback: try common quantization format patterns
-            let fallback_patterns = vec![
-                format!("model-{}.gguf", tag),
-                format!("model_{}.gguf", tag),
-                format!("{}.gguf", tag),
-            ];
-            
-            println!("🔄 Trying fallback filename: model-{}.gguf", tag);
-            Ok(format!("model-{}.gguf", tag))
         }
     }
+    
+    Ok(false)
 }
+
+/// Register an already-downloaded model with the storage system
+pub async fn register_existing_model(
+    model_path: &Path, 
+    model_uri: &str,
+    config: Option<&HyprConfig>
+) -> Result<()> {
+    let config = config.map(|c| c.clone()).unwrap_or_else(|| HyprConfig::load().unwrap_or_default());
+    
+    if !model_path.exists() {
+        return Err(anyhow!("Model file does not exist: {}", model_path.display()));
+    }
+    
+    // Extract filename from path
+    let filename = model_path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown.gguf");
+    
+    println!("📝 Registering existing model: {}", filename);
+    
+    // Register with the system  
+    register_downloaded_model(model_uri, model_path, filename, &config).await?;
+    
+    println!("✅ Existing model registered successfully!");
+    Ok(())
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -396,7 +548,7 @@ mod tests {
         let result = download_model_by_uri(
             "microsoft/DialoGPT-medium",
             Some("model.gguf"),
-            Some(tempdir().unwrap().path().to_path_buf()),
+            None,
         ).await;
         
         // This will fail in test environment without network, but should parse correctly

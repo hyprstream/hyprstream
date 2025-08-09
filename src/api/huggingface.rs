@@ -5,7 +5,7 @@ use crate::api::model_registry::{
     ModelRegistry, DownloadResult, SearchResult, RegistryModelInfo, ModelInfo,
     ModelFileInfo, RegistryConfig
 };
-use crate::api::model_storage::ModelMetadata;
+use crate::api::model_storage::{ModelMetadata, ModelId, ExternalSource, SourceType, ModelFile, FileType};
 
 use std::path::Path;
 use std::collections::HashMap;
@@ -329,17 +329,41 @@ impl ModelRegistry for HuggingFaceClient {
             .and_then(|t| t.as_str())
             .map(|s| s.to_string());
         
+        // Generate UUID for the model
+        let model_id = ModelId::from_content_hash(
+            &model_uri.name,
+            &architecture.clone().unwrap_or_else(|| "unknown".to_string()),
+            parameters,
+        );
+        
+        // Create external source
+        let external_source = ExternalSource {
+            source_type: SourceType::HuggingFace,
+            identifier: format!("{}/{}", model_uri.org, model_uri.name),
+            revision: model_uri.revision.clone(),
+            download_url: None,
+            last_verified: chrono::Utc::now().timestamp(),
+        };
+        
         let metadata = ModelMetadata {
-            uri: model_uri.clone(),
+            model_id,
+            name: model_uri.name.clone(),
+            display_name: None,
+            architecture: architecture.unwrap_or_else(|| "unknown".to_string()),
+            parameters,
+            model_type: model_data.pipeline_tag.unwrap_or_else(|| "text-generation".to_string()),
+            tokenizer_type: None, // Could be extracted from tokenizer_config.json
             size_bytes: 0, // Will be calculated during download
             files: Vec::new(), // Will be populated during download
-            model_type: model_data.pipeline_tag.unwrap_or_else(|| "text-generation".to_string()),
-            architecture,
+            external_sources: vec![external_source],
+            local_path: None, // Will be set during download
+            is_cached: false,
+            tags: model_data.tags.unwrap_or_default(),
+            description: None,
+            license: None,
             created_at: chrono::Utc::now().timestamp(),
             last_accessed: chrono::Utc::now().timestamp(),
-            parameters,
-            tokenizer_type: None, // Could be extracted from tokenizer_config.json
-            tags: model_data.tags.unwrap_or_default(),
+            last_updated: chrono::Utc::now().timestamp(),
         };
         
         Ok(RegistryModelInfo {
@@ -390,22 +414,51 @@ impl ModelRegistry for HuggingFaceClient {
                 uri: format!("hf://{}", model_data.model_id),
             };
             
+            // Generate UUID for the model
+            let architecture = model_data.config.as_ref()
+                .and_then(|c| c.get("model_type"))
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+                
+            let parameters = model_data.config.as_ref()
+                .and_then(|c| c.get("num_parameters"))
+                .and_then(|p| p.as_u64());
+                
+            let model_id = ModelId::from_content_hash(
+                &model_uri.name,
+                &architecture,
+                parameters,
+            );
+            
+            // Create external source
+            let external_source = ExternalSource {
+                source_type: SourceType::HuggingFace,
+                identifier: model_data.model_id.clone(),
+                revision: None,
+                download_url: None,
+                last_verified: chrono::Utc::now().timestamp(),
+            };
+            
             let metadata = ModelMetadata {
-                uri: model_uri,
+                model_id,
+                name: model_uri.name.clone(),
+                display_name: None,
+                architecture,
+                parameters,
+                model_type: model_data.pipeline_tag.unwrap_or_else(|| "text-generation".to_string()),
+                tokenizer_type: None,
                 size_bytes: 0,
                 files: Vec::new(),
-                model_type: model_data.pipeline_tag.unwrap_or_else(|| "text-generation".to_string()),
-                architecture: model_data.config.as_ref()
-                    .and_then(|c| c.get("model_type"))
-                    .and_then(|t| t.as_str())
-                    .map(|s| s.to_string()),
+                external_sources: vec![external_source],
+                local_path: None,
+                is_cached: false,
+                tags: model_data.tags.unwrap_or_default(),
+                description: None,
+                license: None,
                 created_at: chrono::Utc::now().timestamp(),
                 last_accessed: chrono::Utc::now().timestamp(),
-                parameters: model_data.config.as_ref()
-                    .and_then(|c| c.get("num_parameters"))
-                    .and_then(|p| p.as_u64()),
-                tokenizer_type: None,
-                tags: model_data.tags.unwrap_or_default(),
+                last_updated: chrono::Utc::now().timestamp(),
             };
             
             results.push(SearchResult {

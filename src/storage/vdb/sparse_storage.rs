@@ -150,7 +150,7 @@ pub trait SparseStorage: Send + Sync + 'static {
         updates: &HashMap<Coordinate3D, f32>
     ) -> Result<usize, SparseStorageError>; // Returns number of updates applied
     
-    /// Query embeddings by similarity (for FlightSQL interface)
+    /// Query embeddings by similarity (for REST API interface)
     async fn similarity_search(
         &self,
         query_vector: &[f32],
@@ -612,7 +612,7 @@ impl SparseStorage for VDBSparseStorage {
         Ok(updates.len())
     }
     
-    /// Query embeddings by similarity (for FlightSQL interface)
+    /// Query embeddings by similarity (for REST API interface)
     async fn similarity_search(
         &self,
         query_vector: &[f32],

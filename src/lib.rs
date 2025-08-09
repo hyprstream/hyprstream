@@ -27,7 +27,7 @@ pub use query::{
     DataFusionExecutor, DataFusionPlanner, ExecutorConfig, OptimizationHint, Query, QueryExecutor,
     QueryPlanner,
 };
-pub use service::{EmbeddingFlightService, MetricFlightSqlService};
+// FlightSQL services removed - using REST API only
 pub use storage::{
     VDBSparseStorage, SparseStorageConfig, SparseStorage,
     SparseWeightUpdate, EmbeddingMatch, SparseStorageError

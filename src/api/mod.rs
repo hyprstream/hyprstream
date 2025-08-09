@@ -18,11 +18,10 @@ pub mod model_management;
 pub mod model_registry;
 pub mod model_storage;
 pub mod huggingface;
-pub mod inference_service;
 pub mod openai_compat;
 pub mod training_service;
 
-use lora_registry::{LoRARegistry, LoRALayer};
+use lora_registry::{LoRARegistry, LoRALayer, LoRAId};
 use training_service::{TrainingService, TrainingConfig};
 
 /// Main API server state
@@ -46,7 +45,7 @@ pub struct ApiState {
 /// LoRA endpoint configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoRAEndpoint {
-    pub lora_id: String,
+    pub lora_id: LoRAId,
     pub base_path: String,
     pub created_at: i64,
     pub config: LoRAConfig,
@@ -147,12 +146,12 @@ async fn create_lora_layer(
     State(state): State<ApiState>,
     Json(request): Json<CreateLoRARequest>,
 ) -> Result<JsonResponse<CreateLoRAResponse>, StatusCode> {
-    let lora_id = Uuid::new_v4().to_string();
+    let lora_id = LoRAId::new();
     
     // Create the LoRA layer in the registry
     let layer = LoRALayer {
         id: lora_id.clone(),
-        name: request.name.unwrap_or_else(|| format!("lora_{}", &lora_id[..8])),
+        name: request.name.unwrap_or_else(|| format!("lora_{}", lora_id.to_string()[..8].to_string())),
         base_model: request.base_model,
         config: request.config.clone(),
         created_at: chrono::Utc::now().timestamp(),
@@ -190,7 +189,7 @@ async fn create_lora_layer(
     if request.config.use_neural_compression {
         
         { 
-            state.vdb_storage.store_adapter_neural_compressed(&lora_id, &adapter).await
+            state.vdb_storage.store_adapter_neural_compressed(&lora_id.to_string(), &adapter).await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         }
         
@@ -200,7 +199,7 @@ async fn create_lora_layer(
     } else {
         
         { 
-            state.vdb_storage.store_adapter_accelerated(&lora_id, &adapter).await
+            state.vdb_storage.store_adapter_accelerated(&lora_id.to_string(), &adapter).await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         }
         
@@ -220,20 +219,20 @@ async fn create_lora_layer(
     };
     
     let mut endpoints = state.endpoints.write().await;
-    endpoints.insert(lora_id.clone(), endpoint);
+    endpoints.insert(lora_id.to_string(), endpoint);
     
     // Start auto-regressive training if enabled
     if request.auto_regressive {
         if let Some(training_config) = request.training_config {
             state.training_service.start_auto_training(
-                &lora_id,
+                &lora_id.to_string(),
                 training_config,
             ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         }
     }
     
     Ok(JsonResponse(CreateLoRAResponse {
-        lora_id: lora_id.clone(),
+        lora_id: lora_id.to_string(),
         endpoint: format!("/v1/inference/{}", lora_id),
         openai_base_url: format!("/v1/inference/{}", lora_id),
         status: "created".to_string(),
@@ -254,7 +253,7 @@ async fn get_lora_info(
     State(state): State<ApiState>,
     Path(lora_id): Path<String>,
 ) -> Result<JsonResponse<LoRALayer>, StatusCode> {
-    let layer = state.lora_registry.get(&lora_id).await
+    let layer = state.lora_registry.get_by_id_or_name(&lora_id).await
         .map_err(|_| StatusCode::NOT_FOUND)?;
     Ok(JsonResponse(layer))
 }
@@ -268,7 +267,7 @@ async fn delete_lora_layer(
     let _ = state.training_service.stop_auto_training(&lora_id).await;
     
     // Remove from registry
-    state.lora_registry.unregister(&lora_id).await
+    state.lora_registry.unregister_by_name(&lora_id).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     
     // Remove from VDB storage
@@ -496,6 +495,7 @@ async fn openai_list_models(
     State(state): State<ApiState>,
     Path(lora_id): Path<String>,
 ) -> Result<JsonResponse<openai_compat::ListModelsResponse>, StatusCode> {
+    let lora_id = lora_id.parse::<LoRAId>().map_err(|_| StatusCode::BAD_REQUEST)?;
     let layer = state.lora_registry.get(&lora_id).await
         .map_err(|_| StatusCode::NOT_FOUND)?;
     
@@ -573,6 +573,7 @@ async fn get_lora_stats(
     State(state): State<ApiState>,
     Path(lora_id): Path<String>,
 ) -> Result<JsonResponse<LoRAStats>, StatusCode> {
+    let lora_id = lora_id.parse::<LoRAId>().map_err(|_| StatusCode::BAD_REQUEST)?;
     let stats = state.lora_registry.get_stats(&lora_id).await
         .map_err(|_| StatusCode::NOT_FOUND)?;
     Ok(JsonResponse(stats))

@@ -84,7 +84,7 @@ rand = "0.8"
 llama-cpp-2 = "0.1.67"          # Rust bindings for llama.cpp
 candle-core = "0.6"             # Tensor operations for LoRA
 candle-nn = "0.6"               # Neural network layers
-hf-hub = { version = "0.3", features = ["tokio"] }  # HuggingFace model downloads
+hf-hub = { version = "0.4.3", features = ["tokio"] }  # HuggingFace model downloads
 uuid = { version = "1.0", features = ["v4", "serde"] }
 reqwest = { version = "0.11", features = ["json", "stream"] }
 indicatif = "0.17"              # Progress bars
@@ -110,4 +110,5 @@ pkg-config = "0.3"
 criterion = "0.5.1"
 tempfile = "3.9.0"
 tokio-stream = "0.1.14"
+
 

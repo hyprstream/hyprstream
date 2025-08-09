@@ -1,0 +1,283 @@
+   Compiling hyprstream v0.1.0-alpha-7 (/mnt/hyprstream/hyprstream)
+warning: hyprstream@0.1.0-alpha-7: Found CUDA at /usr/local/cuda, enabling GPU acceleration
+warning: hyprstream@0.1.0-alpha-7: Building CPU-only version (CUDA integration in progress)
+warning: hyprstream@0.1.0-alpha-7: pkg-config failed, trying system OpenVDB installation...
+warning: hyprstream@0.1.0-alpha-7: Found system OpenVDB installation
+warning: hyprstream@0.1.0-alpha-7: ✅ Built with OpenVDB support - VDB features enabled
+warning: elided lifetime has a name
+   --> src/api/model_storage.rs:234:151
+    |
+234 | ...ursive<'a>(&'a self, model_path: &'a Path) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>> {
+    |           -- lifetime `'a` declared here                                                                                  ^^ this elided lifetime gets resolved as `'a`
+    |
+    = note: `#[warn(elided_named_lifetimes)]` on by default
+
+warning: private item shadows public glob re-export
+  --> src/storage/vdb/mod.rs:7:17
+   |
+7  | use std::path::{Path, PathBuf};
+   |                 ^^^^
+   |
+note: the name `Path` in the type namespace is supposed to be publicly re-exported here
+  --> src/storage/vdb/mod.rs:47:9
+   |
+47 | pub use neuralvdb_codec::*;
+   |         ^^^^^^^^^^^^^^^^^^
+note: but the private item here shadows it
+  --> src/storage/vdb/mod.rs:7:17
+   |
+7  | use std::path::{Path, PathBuf};
+   |                 ^^^^
+   = note: `#[warn(hidden_glob_reexports)]` on by default
+
+warning: ambiguous glob re-exports
+  --> src/storage/vdb/mod.rs:31:9
+   |
+31 | pub use compression::*;
+   |         ^^^^^^^^^^^^^^ the name `CompressionStats` in the type namespace is first re-exported here
+...
+47 | pub use neuralvdb_codec::*;
+   |         ------------------ but the name `CompressionStats` in the type namespace is also re-exported here
+   |
+   = note: `#[warn(ambiguous_glob_reexports)]` on by default
+
+warning: ambiguous glob re-exports
+  --> src/storage/vdb/mod.rs:32:9
+   |
+32 | pub use adapter_store::*;
+   |         ^^^^^^^^^^^^^^^^ the name `AdapterInfo` in the type namespace is first re-exported here
+...
+45 | pub use hardware_accelerated::*;
+   |         ----------------------- but the name `AdapterInfo` in the type namespace is also re-exported here
+
+warning: unused variable: `z_pattern`
+   --> src/storage/vdb/hardware_accelerated.rs:942:9
+    |
+942 |         z_pattern: &ZOrderPattern
+    |         ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_z_pattern`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `values`
+   --> src/storage/vdb/neuralvdb_codec.rs:509:9
+    |
+509 |         values: &ValueEncoding,
+    |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_values`
+
+warning: unused variable: `frames`
+   --> src/storage/vdb/neuralvdb_codec.rs:603:13
+    |
+603 |         let frames = stats.frames_processed as f64;
+    |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_frames`
+
+warning: unused variable: `z_pattern`
+   --> src/storage/vdb/hardware_accelerated.rs:998:9
+    |
+998 |         z_pattern: &ZOrderPattern
+    |         ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_z_pattern`
+
+warning: unreachable statement
+   --> src/api/mod.rs:311:5
+    |
+308 |       return Err(StatusCode::SERVICE_UNAVAILABLE);
+    |       ------------------------------------------- any code following this expression is unreachable
+...
+311 | /     let session_id = state.training_service.create_inference_session(
+312 | |         &lora_id,
+313 | |         vec![lora_id.clone()],
+314 | |     ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    | |____________________________________________________________^ unreachable statement
+    |
+    = note: `#[warn(unreachable_code)]` on by default
+
+warning: unused variable: `request`
+   --> src/api/mod.rs:298:10
+    |
+298 |     Json(request): Json<openai_compat::ChatCompletionRequest>,
+    |          ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_request`
+
+warning: unreachable statement
+   --> src/api/mod.rs:391:5
+    |
+389 |       return Err(StatusCode::SERVICE_UNAVAILABLE);
+    |       ------------------------------------------- any code following this expression is unreachable
+390 |       
+391 | /     let session_id = state.training_service.create_inference_session(
+392 | |         &lora_id,
+393 | |         vec![lora_id.clone()],
+394 | |     ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    | |____________________________________________________________^ unreachable statement
+
+warning: unused variable: `request`
+   --> src/api/mod.rs:379:10
+    |
+379 |     Json(request): Json<openai_compat::CompletionRequest>,
+    |          ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_request`
+
+warning: unreachable statement
+   --> src/api/mod.rs:463:5
+    |
+461 |     return Err(StatusCode::SERVICE_UNAVAILABLE);
+    |     ------------------------------------------- any code following this expression is unreachable
+462 |     
+463 |     let mut embeddings = Vec::new();
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unreachable statement
+
+warning: unused variable: `request`
+   --> src/api/mod.rs:451:10
+    |
+451 |     Json(request): Json<openai_compat::EmbeddingRequest>,
+    |          ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_request`
+
+warning: unused variable: `api`
+  --> src/api/huggingface.rs:54:13
+   |
+54 |         let api = hf_hub::api::tokio::ApiBuilder::new()
+   |             ^^^ help: if this is intentional, prefix it with an underscore: `_api`
+
+warning: unused variable: `input`
+   --> src/api/training_service.rs:361:9
+    |
+361 |         input: &str,
+    |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_input`
+
+error[E0277]: the trait bound `(): FromStr` is not satisfied
+    --> src/cli/handlers.rs:98:7
+     |
+98   |     ).parse()?;
+     |       ^^^^^ the trait `FromStr` is not implemented for `()`
+     |
+     = help: the following other types implement trait `FromStr`:
+               Authority
+               CString
+               ColorChoice
+               Compression
+               CompressionTypeVariant
+               DType
+               DateTime<FixedOffset>
+               DateTime<Utc>
+             and 184 others
+note: required by a bound in `core::str::<impl str>::parse`
+    --> /private/birdetta/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/str/mod.rs:2430:21
+     |
+2430 |     pub fn parse<F: FromStr>(&self) -> Result<F, F::Err> {
+     |                     ^^^^^^^ required by this bound in `core::str::<impl str>::parse`
+
+error[E0277]: `()` doesn't implement `std::fmt::Display`
+   --> src/cli/handlers.rs:158:70
+    |
+158 |     info!("🚀 Starting VDB-first adaptive ML inference server at {}", addr);
+    |                                                                       ^^^^ `()` cannot be formatted with the default formatter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `()`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+    = note: this error originates in the macro `$crate::__macro_support::format_args` which comes from the expansion of the macro `info` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `()` doesn't implement `std::fmt::Display`
+   --> src/cli/handlers.rs:166:50
+    |
+166 |     println!("🚀 Starting REST API server at {}", addr);
+    |                                                   ^^^^ `()` cannot be formatted with the default formatter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `()`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+    = note: this error originates in the macro `$crate::format_args_nl` which comes from the expansion of the macro `println` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `cert`
+   --> src/cli/handlers.rs:189:17
+    |
+189 |             let cert = tokio::fs::read(cert_path).await?;
+    |                 ^^^^ help: if this is intentional, prefix it with an underscore: `_cert`
+
+warning: unused variable: `key`
+   --> src/cli/handlers.rs:190:17
+    |
+190 |             let key = tokio::fs::read(key_path).await?;
+    |                 ^^^ help: if this is intentional, prefix it with an underscore: `_key`
+
+warning: unused variable: `ca`
+   --> src/cli/handlers.rs:191:17
+    |
+191 |             let ca = if let Some(ca_path) = tls_ca {
+    |                 ^^ help: if this is intentional, prefix it with an underscore: `_ca`
+
+warning: unused variable: `model_path`
+   --> src/cli/handlers.rs:479:17
+    |
+479 |             let model_path = if uri.starts_with("hf://") {
+    |                 ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_model_path`
+
+warning: unused variable: `storage_config`
+    --> src/cli/handlers.rs:1270:13
+     |
+1270 |         let storage_config = SparseStorageConfig {
+     |             ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_storage_config`
+
+warning: unused variable: `model_id`
+  --> src/models/model_registry.rs:58:35
+   |
+58 |     pub async fn get_model(&self, model_id: &str) -> Option<Arc<dyn RuntimeEngine + '_>> {
+   |                                   ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_model_id`
+
+warning: unused variable: `models`
+  --> src/models/model_registry.rs:59:13
+   |
+59 |         let models = self.models.read().await;
+   |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_models`
+
+warning: unused variable: `adapter`
+   --> src/storage/vdb/sparse_storage.rs:382:21
+    |
+382 |         if let Some(adapter) = adapter_cache.get_mut(adapter_id) {
+    |                     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_adapter`
+
+warning: unused variable: `context_features`
+   --> src/storage/vdb/hardware_accelerated.rs:348:13
+    |
+348 |         let context_features = self.generate_context_features(history, current_morton);
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_context_features`
+
+warning: unused variable: `metadata`
+   --> src/adapters/sparse_lora.rs:180:13
+    |
+180 |         let metadata = AdapterMetadata {
+    |             ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_metadata`
+
+warning: unused variable: `path`
+   --> src/runtime/lora_wrapper.rs:315:36
+    |
+315 |     async fn load_model(&mut self, path: &Path) -> Result<()> {
+    |                                    ^^^^ help: if this is intentional, prefix it with an underscore: `_path`
+
+warning: unused variable: `vs`
+   --> src/storage/vdb/neuralvdb_codec.rs:631:16
+    |
+631 |     pub fn new(vs: &Path, input_dim: i64) -> Result<Self, Box<dyn std::error::Error>> {
+    |                ^^ help: if this is intentional, prefix it with an underscore: `_vs`
+
+warning: unused variable: `vs`
+   --> src/storage/vdb/neuralvdb_codec.rs:670:16
+    |
+670 |     pub fn new(vs: &Path, input_dim: i64, latent_dim: i64) -> Result<Self, Box<dyn std::error::Error>> {
+    |                ^^ help: if this is intentional, prefix it with an underscore: `_vs`
+
+warning: unused variable: `compressed`
+   --> src/storage/vdb/neuralvdb_codec.rs:711:26
+    |
+711 |     pub fn decode(&self, compressed: &Tensor) -> Result<Tensor, Box<dyn std::error::Error>> {
+    |                          ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_compressed`
+
+warning: unused variable: `h`
+   --> src/storage/vdb/mod.rs:259:22
+    |
+259 |                 let (h, w) = (shape[0], shape[1]);
+    |                      ^ help: if this is intentional, prefix it with an underscore: `_h`
+
+For more information about this error, try `rustc --explain E0277`.
+warning: `hyprstream` (lib) generated 31 warnings
+warning: hyprstream@0.1.0-alpha-7: Found CUDA at /usr/local/cuda, enabling GPU acceleration
+warning: hyprstream@0.1.0-alpha-7: Building CPU-only version (CUDA integration in progress)
+warning: hyprstream@0.1.0-alpha-7: pkg-config failed, trying system OpenVDB installation...
+warning: hyprstream@0.1.0-alpha-7: Found system OpenVDB installation
+warning: hyprstream@0.1.0-alpha-7: ✅ Built with OpenVDB support - VDB features enabled
+error: could not compile `hyprstream` (lib) due to 4 previous errors; 31 warnings emitted

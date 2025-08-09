@@ -16,7 +16,7 @@ use anyhow::Result;
 use url::Url;
 
 use crate::api::model_registry::{ModelRegistry, ModelRegistryType};
-use crate::api::model_storage::{ModelStorage, ModelMetadata};
+use crate::api::model_storage::{ModelStorage, ModelMetadata, ModelId, ExternalSource, SourceType, ModelFile, FileType};
 use crate::config::HyprConfig;
 
 /// Model management service state
@@ -42,12 +42,6 @@ impl ModelManagementState {
         let config = ModelManagementConfig::default();
         let storage = Arc::new(ModelStorage::new(config.models_dir.clone()).await?);
         let registries = Arc::new(RwLock::new(HashMap::new()));
-        
-        
-        let vdb_storage = Arc::new(
-            crate::storage::vdb::hardware_accelerated::HardwareVDBStorage::new().await
-                .map_err(|e| anyhow::anyhow!("Failed to initialize VDB storage: {}", e))?
-        );
         
         Ok(Self {
             storage,
@@ -134,22 +128,42 @@ impl ModelUri {
         let host = url.host_str().unwrap_or("");
         let path = url.path().trim_start_matches('/');
         
+        // Debug logging to understand parsing
+        eprintln!("DEBUG: Parsing URI: {}", uri);
+        eprintln!("DEBUG: scheme={}, host={:?}, path={:?}", registry, host, path);
+        
         let (org, name, revision) = match registry.as_str() {
             "hf" => {
                 // hf://microsoft/DialoGPT-medium@main
-                let parts: Vec<&str> = path.split('/').collect();
-                if parts.len() < 2 {
-                    return Err(anyhow::anyhow!("HuggingFace URI must have org/name format"));
-                }
+                let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+                eprintln!("DEBUG: parts={:?}, len={}", parts, parts.len());
                 
-                let org = parts[0].to_string();
-                let name_part = parts[1];
+                let (org, name_part) = if parts.len() >= 2 {
+                    // Standard case: hf://org/name
+                    (parts[0], parts[1])
+                } else if !host.is_empty() && parts.len() >= 1 {
+                    // Host-as-org case: hf://org/name where org becomes host
+                    eprintln!("DEBUG: Using host-as-org parsing");
+                    (host, parts[0])
+                } else if !host.is_empty() && parts.is_empty() {
+                    // Case where everything after hf:// is treated as host
+                    eprintln!("DEBUG: Host contains full path, trying to split");
+                    let host_parts: Vec<&str> = host.split('/').collect();
+                    if host_parts.len() >= 2 {
+                        (host_parts[0], host_parts[1])
+                    } else {
+                        return Err(anyhow::anyhow!("HuggingFace URI must have org/name format. Got host={:?}, path={:?}", host, path));
+                    }
+                } else {
+                    return Err(anyhow::anyhow!("HuggingFace URI must have org/name format. Got host={:?}, path={:?}, parts={:?}", host, path, parts));
+                };
                 
+                // Handle revision parsing
                 if let Some(at_pos) = name_part.find('@') {
                     let (name, rev) = name_part.split_at(at_pos);
-                    (org, name.to_string(), Some(rev[1..].to_string()))
+                    (org.to_string(), name.to_string(), Some(rev[1..].to_string()))
                 } else {
-                    (org, name_part.to_string(), None)
+                    (org.to_string(), name_part.to_string(), None)
                 }
             }
             "ollama" => {
@@ -292,7 +306,7 @@ async fn pull_model(
             status: "cached".to_string(),
             local_path: local_path.to_string_lossy().to_string(),
             size_bytes: metadata.size_bytes,
-            files_downloaded: metadata.files,
+            files_downloaded: metadata.files.iter().map(|f| f.filename.clone()).collect(),
             download_time_ms: 0,
         }));
     }
@@ -313,18 +327,64 @@ async fn pull_model(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     
-    // Store metadata
+    // Generate UUID for the model
+    let model_id = ModelId::from_content_hash(
+        &model_uri.name,
+        &download_result.architecture.clone().unwrap_or_else(|| "unknown".to_string()),
+        download_result.parameters,
+    );
+    
+    // Create external source
+    let external_source = ExternalSource {
+        source_type: match model_uri.registry.as_str() {
+            "hf" | "huggingface" => SourceType::HuggingFace,
+            "ollama" => SourceType::Ollama,
+            _ => SourceType::Custom(model_uri.registry.clone()),
+        },
+        identifier: format!("{}/{}", model_uri.org, model_uri.name),
+        revision: model_uri.revision.clone(),
+        download_url: None,
+        last_verified: chrono::Utc::now().timestamp(),
+    };
+    
+    // Convert files to ModelFile structs
+    let model_files: Vec<ModelFile> = download_result.files.iter().map(|filename| ModelFile {
+        filename: filename.clone(),
+        size_bytes: 0, // TODO: Get individual file sizes
+        checksum: None,
+        file_type: if filename.ends_with(".gguf") {
+            FileType::Model
+        } else if filename.contains("tokenizer") {
+            FileType::Tokenizer
+        } else if filename.contains("config") {
+            FileType::Config
+        } else if filename.contains("README") {
+            FileType::Readme
+        } else {
+            FileType::Other
+        },
+    }).collect();
+    
+    // Store metadata with UUID system
     let metadata = ModelMetadata {
-        uri: model_uri.clone(),
-        size_bytes: download_result.size_bytes,
-        files: download_result.files.clone(),
+        model_id,
+        name: model_uri.name.clone(),
+        display_name: None,
+        architecture: download_result.architecture.unwrap_or_else(|| "unknown".to_string()),
+        parameters: download_result.parameters,
         model_type: download_result.model_type,
-        architecture: download_result.architecture,
+        tokenizer_type: download_result.tokenizer_type,
+        size_bytes: download_result.size_bytes,
+        files: model_files,
+        external_sources: vec![external_source],
+        local_path: Some(local_path.to_path_buf()),
+        is_cached: true,
+        tags: download_result.tags,
+        description: None,
+        license: None,
         created_at: chrono::Utc::now().timestamp(),
         last_accessed: chrono::Utc::now().timestamp(),
-        parameters: download_result.parameters,
-        tokenizer_type: download_result.tokenizer_type,
-        tags: download_result.tags,
+        last_updated: chrono::Utc::now().timestamp(),
     };
     
     state.storage.store_metadata(&model_uri, metadata).await
@@ -373,7 +433,7 @@ async fn list_models(
             uri: uri.uri.clone(),
             local_path: Some(local_path.to_string_lossy().to_string()),
             size_bytes: Some(metadata.size_bytes),
-            files: metadata.files.clone(),
+            files: metadata.files.iter().map(|f| f.filename.clone()).collect(),
             metadata: metadata.clone(),
             is_cached: true,
             last_accessed: Some(chrono::Utc::now().timestamp()),
@@ -434,7 +494,7 @@ async fn get_model_info(
             uri: model_uri.uri,
             local_path: Some(local_path.to_string_lossy().to_string()),
             size_bytes: Some(metadata.size_bytes),
-            files: metadata.files.clone(),
+            files: metadata.files.iter().map(|f| f.filename.clone()).collect(),
             metadata: metadata.clone(),
             is_cached: true,
             last_accessed: Some(chrono::Utc::now().timestamp()),

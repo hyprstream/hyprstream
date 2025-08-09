@@ -1,0 +1,14 @@
+# Use LLVM lld linker for improved linking performance
+# This solves debug build linking issues with large native dependency sets
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+# Also apply to other common Linux targets if needed
+[target.aarch64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+# Alternative: Use lld for all builds (uncomment if desired)
+# [build]
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]

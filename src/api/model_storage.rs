@@ -7,10 +7,90 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use serde::{Deserialize, Serialize};
 use anyhow::Result;
+use uuid::Uuid;
 
-/// Model metadata stored locally
+/// UUID-based model identifier
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ModelId(pub Uuid);
+
+impl ModelId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+    
+    pub fn from_content_hash(name: &str, architecture: &str, parameters: Option<u64>) -> Self {
+        let content = format!("{}:{}:{}", name, architecture, parameters.unwrap_or(0));
+        // Use a simple hash of the content to create a reproducible UUID
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        
+        let mut hasher = DefaultHasher::new();
+        content.hash(&mut hasher);
+        let hash = hasher.finish();
+        
+        // Create UUID from hash
+        let bytes = hash.to_le_bytes();
+        let mut uuid_bytes = [0u8; 16];
+        uuid_bytes[..8].copy_from_slice(&bytes);
+        uuid_bytes[8..].copy_from_slice(&bytes);
+        
+        Self(Uuid::from_bytes(uuid_bytes))
+    }
+}
+
+impl std::fmt::Display for ModelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for ModelId {
+    type Err = uuid::Error;
+    
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(s)?))
+    }
+}
+
+/// External source reference
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelMetadata {
+pub struct ExternalSource {
+    pub source_type: SourceType,
+    pub identifier: String,
+    pub revision: Option<String>,
+    pub download_url: Option<String>,
+    pub last_verified: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SourceType {
+    HuggingFace,
+    Ollama,
+    LocalPath,
+    HttpUrl,
+    Custom(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelFile {
+    pub filename: String,
+    pub size_bytes: u64,
+    pub checksum: Option<String>,
+    pub file_type: FileType,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FileType {
+    Model,
+    Tokenizer,
+    Config,
+    Readme,
+    Other,
+}
+
+/// Legacy model metadata (for backwards compatibility)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegacyModelMetadata {
     pub uri: ModelUri,
     pub size_bytes: u64,
     pub files: Vec<String>,
@@ -23,6 +103,39 @@ pub struct ModelMetadata {
     pub tags: Vec<String>,
 }
 
+/// UUID-based model metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelMetadata {
+    pub model_id: ModelId,
+    pub name: String,
+    pub display_name: Option<String>,
+    pub architecture: String,
+    pub parameters: Option<u64>,
+    pub model_type: String,
+    pub tokenizer_type: Option<String>,
+    
+    // File information
+    pub size_bytes: u64,
+    pub files: Vec<ModelFile>,
+    
+    // Multiple external sources for same model
+    pub external_sources: Vec<ExternalSource>,
+    
+    // Storage information
+    pub local_path: Option<PathBuf>,
+    pub is_cached: bool,
+    
+    // Metadata
+    pub tags: Vec<String>,
+    pub description: Option<String>,
+    pub license: Option<String>,
+    
+    // Timestamps
+    pub created_at: i64,
+    pub last_accessed: i64,
+    pub last_updated: i64,
+}
+
 /// Local model storage manager
 pub struct ModelStorage {
     /// Base directory for model storage
@@ -31,8 +144,11 @@ pub struct ModelStorage {
     /// Metadata cache file
     metadata_file: PathBuf,
     
-    /// In-memory metadata cache
-    metadata_cache: tokio::sync::RwLock<HashMap<String, ModelMetadata>>,
+    /// In-memory metadata cache (keyed by ModelId UUID)
+    metadata_cache: tokio::sync::RwLock<HashMap<ModelId, ModelMetadata>>,
+    
+    /// URI to UUID mapping cache (for backward compatibility)
+    uri_to_uuid: tokio::sync::RwLock<HashMap<String, ModelId>>,
 }
 
 /// Cache statistics
@@ -62,6 +178,7 @@ impl ModelStorage {
             base_dir,
             metadata_file,
             metadata_cache: tokio::sync::RwLock::new(HashMap::new()),
+            uri_to_uuid: tokio::sync::RwLock::new(HashMap::new()),
         };
         
         // Load existing metadata
@@ -77,10 +194,61 @@ impl ModelStorage {
         }
         
         let content = fs::read_to_string(&self.metadata_file).await?;
-        let metadata_map: HashMap<String, ModelMetadata> = serde_json::from_str(&content)?;
         
-        let mut cache = self.metadata_cache.write().await;
-        *cache = metadata_map;
+        // Try to load new UUID-based format first
+        if let Ok(uuid_metadata_map) = serde_json::from_str::<HashMap<ModelId, ModelMetadata>>(&content) {
+            let mut cache = self.metadata_cache.write().await;
+            let mut uri_map = self.uri_to_uuid.write().await;
+            
+            // Build URI to UUID mapping
+            for (model_id, metadata) in &uuid_metadata_map {
+                // Generate a URI key from external sources for backward compatibility
+                if let Some(external_source) = metadata.external_sources.first() {
+                    let uri_key = match external_source.source_type {
+                        SourceType::HuggingFace => format!(
+                            "hf://{}", 
+                            external_source.identifier
+                        ),
+                        SourceType::Ollama => format!(
+                            "ollama://{}", 
+                            external_source.identifier
+                        ),
+                        SourceType::LocalPath => format!(
+                            "local://{}", 
+                            external_source.identifier
+                        ),
+                        SourceType::HttpUrl => external_source.identifier.clone(),
+                        SourceType::Custom(ref name) => format!(
+                            "{}://{}", 
+                            name, 
+                            external_source.identifier
+                        ),
+                    };
+                    uri_map.insert(uri_key, model_id.clone());
+                }
+            }
+            
+            *cache = uuid_metadata_map;
+            return Ok(());
+        }
+        
+        // Fall back to legacy URI-based format and migrate
+        if let Ok(legacy_metadata_map) = serde_json::from_str::<HashMap<String, ModelMetadata>>(&content) {
+            let mut cache = self.metadata_cache.write().await;
+            let mut uri_map = self.uri_to_uuid.write().await;
+            
+            // Migrate legacy format to UUID-based format
+            for (uri, metadata) in legacy_metadata_map {
+                cache.insert(metadata.model_id.clone(), metadata.clone());
+                uri_map.insert(uri, metadata.model_id.clone());
+            }
+            
+            drop(cache);
+            drop(uri_map);
+            
+            // Save migrated data in new format
+            self.save_metadata().await?;
+        }
         
         Ok(())
     }
@@ -96,26 +264,68 @@ impl ModelStorage {
     /// Store metadata for a model
     pub async fn store_metadata(&self, model_uri: &ModelUri, metadata: ModelMetadata) -> Result<()> {
         let mut cache = self.metadata_cache.write().await;
-        cache.insert(model_uri.uri.clone(), metadata);
+        let mut uri_map = self.uri_to_uuid.write().await;
+        
+        // Get the model ID before moving metadata
+        let model_id = metadata.model_id.clone();
+        
+        // Store with UUID as primary key
+        cache.insert(model_id.clone(), metadata);
+        // Maintain URI mapping for backward compatibility
+        uri_map.insert(model_uri.uri.clone(), model_id);
+        
         drop(cache);
+        drop(uri_map);
         
         self.save_metadata().await?;
         Ok(())
     }
     
-    /// Get metadata for a model
+    /// Get metadata for a model by URI
     pub async fn get_metadata(&self, model_uri: &ModelUri) -> Result<ModelMetadata> {
+        let uri_map = self.uri_to_uuid.read().await;
+        let model_id = uri_map.get(&model_uri.uri)
+            .ok_or_else(|| anyhow::anyhow!("Model URI not found: {}", model_uri.uri))?;
+        
         let cache = self.metadata_cache.read().await;
-        cache.get(&model_uri.uri)
+        cache.get(model_id)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Model metadata not found: {}", model_uri.uri))
+            .ok_or_else(|| anyhow::anyhow!("Model metadata not found for UUID: {}", model_id))
     }
     
-    /// Remove metadata for a model
+    /// Get metadata for a model by UUID
+    pub async fn get_metadata_by_id(&self, model_id: &ModelId) -> Result<ModelMetadata> {
+        let cache = self.metadata_cache.read().await;
+        cache.get(model_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Model metadata not found for UUID: {}", model_id))
+    }
+    
+    /// Remove metadata for a model by URI
     pub async fn remove_metadata(&self, model_uri: &ModelUri) -> Result<()> {
+        let mut uri_map = self.uri_to_uuid.write().await;
+        if let Some(model_id) = uri_map.remove(&model_uri.uri) {
+            drop(uri_map);
+            
+            let mut cache = self.metadata_cache.write().await;
+            cache.remove(&model_id);
+            drop(cache);
+            
+            self.save_metadata().await?;
+        }
+        Ok(())
+    }
+    
+    /// Remove metadata for a model by UUID
+    pub async fn remove_metadata_by_id(&self, model_id: &ModelId) -> Result<()> {
         let mut cache = self.metadata_cache.write().await;
-        cache.remove(&model_uri.uri);
+        cache.remove(model_id);
         drop(cache);
+        
+        // Also remove from URI mapping
+        let mut uri_map = self.uri_to_uuid.write().await;
+        uri_map.retain(|_, id| id != model_id);
+        drop(uri_map);
         
         self.save_metadata().await?;
         Ok(())
@@ -126,13 +336,72 @@ impl ModelStorage {
         let cache = self.metadata_cache.read().await;
         let mut models = Vec::new();
         
-        for (uri_str, metadata) in cache.iter() {
-            if let Ok(uri) = ModelUri::parse(uri_str) {
-                // Check if model files still exist
-                let model_path = uri.local_path(&self.base_dir);
-                if model_path.exists() {
-                    models.push((uri, metadata.clone()));
+        for (model_id, metadata) in cache.iter() {
+            // Generate ModelUri from external sources for backward compatibility
+            if let Some(external_source) = metadata.external_sources.first() {
+                let uri_str = match &external_source.source_type {
+                    SourceType::HuggingFace => format!(
+                        "hf://{}", 
+                        external_source.identifier
+                    ),
+                    SourceType::Ollama => format!(
+                        "ollama://{}", 
+                        external_source.identifier
+                    ),
+                    SourceType::LocalPath => format!(
+                        "local://{}", 
+                        external_source.identifier
+                    ),
+                    SourceType::HttpUrl => external_source.identifier.clone(),
+                    SourceType::Custom(name) => format!(
+                        "{}://{}", 
+                        name, 
+                        external_source.identifier
+                    ),
+                };
+                
+                if let Ok(uri) = ModelUri::parse(&uri_str) {
+                    // Check if model files still exist
+                    let model_exists = if let Some(local_path) = &metadata.local_path {
+                        local_path.exists()
+                    } else {
+                        let model_path = uri.local_path(&self.base_dir);
+                        model_path.exists()
+                    };
+                    
+                    if model_exists {
+                        models.push((uri, metadata.clone()));
+                    }
                 }
+            }
+        }
+        
+        Ok(models)
+    }
+    
+    /// List all models by UUID (new primary interface)
+    pub async fn list_all_models(&self) -> Result<Vec<(ModelId, ModelMetadata)>> {
+        let cache = self.metadata_cache.read().await;
+        let mut models = Vec::new();
+        
+        for (model_id, metadata) in cache.iter() {
+            // Check if model files still exist
+            let model_exists = if let Some(local_path) = &metadata.local_path {
+                local_path.exists()
+            } else if let Some(external_source) = metadata.external_sources.first() {
+                // Try to construct path from external source
+                match &external_source.source_type {
+                    SourceType::LocalPath => {
+                        std::path::Path::new(&external_source.identifier).exists()
+                    },
+                    _ => true, // For remote sources, assume they exist
+                }
+            } else {
+                false
+            };
+            
+            if model_exists {
+                models.push((model_id.clone(), metadata.clone()));
             }
         }
         
@@ -145,12 +414,27 @@ impl ModelStorage {
         let mut total_size = 0u64;
         let mut registry_counts = HashMap::new();
         
-        for metadata in cache.values() {
+        for (model_id, metadata) in cache.iter() {
             // Check if files still exist
-            let model_path = metadata.uri.local_path(&self.base_dir);
-            if model_path.exists() {
+            let model_exists = if let Some(local_path) = &metadata.local_path {
+                local_path.exists()
+            } else {
+                false
+            };
+            
+            if model_exists {
                 total_size += metadata.size_bytes;
-                *registry_counts.entry(metadata.uri.registry.clone()).or_insert(0) += 1;
+                // Extract registry from external sources
+                if let Some(external_source) = metadata.external_sources.first() {
+                    let registry = match &external_source.source_type {
+                        SourceType::HuggingFace => "hf".to_string(),
+                        SourceType::Ollama => "ollama".to_string(),
+                        SourceType::LocalPath => "local".to_string(),
+                        SourceType::HttpUrl => "http".to_string(),
+                        SourceType::Custom(name) => name.clone(),
+                    };
+                    *registry_counts.entry(registry).or_insert(0) += 1;
+                }
             }
         }
         
@@ -214,10 +498,28 @@ impl ModelStorage {
         })
     }
     
-    /// Update last accessed time for a model
+    /// Update last accessed time for a model by URI
     pub async fn update_access_time(&self, model_uri: &ModelUri) -> Result<()> {
+        // First get the UUID from URI mapping
+        let uri_map = self.uri_to_uuid.read().await;
+        if let Some(model_id) = uri_map.get(&model_uri.uri) {
+            let model_id = model_id.clone();
+            drop(uri_map);
+            
+            let mut cache = self.metadata_cache.write().await;
+            if let Some(metadata) = cache.get_mut(&model_id) {
+                metadata.last_accessed = chrono::Utc::now().timestamp();
+                drop(cache);
+                self.save_metadata().await?;
+            }
+        }
+        Ok(())
+    }
+    
+    /// Update last accessed time for a model by UUID
+    pub async fn update_access_time_by_id(&self, model_id: &ModelId) -> Result<()> {
         let mut cache = self.metadata_cache.write().await;
-        if let Some(metadata) = cache.get_mut(&model_uri.uri) {
+        if let Some(metadata) = cache.get_mut(model_id) {
             metadata.last_accessed = chrono::Utc::now().timestamp();
             drop(cache);
             self.save_metadata().await?;
@@ -263,8 +565,8 @@ impl ModelStorage {
         }
         
         // Check if all expected files exist
-        for filename in &metadata.files {
-            let file_path = model_path.join(filename);
+        for model_file in &metadata.files {
+            let file_path = model_path.join(&model_file.filename);
             if !file_path.exists() {
                 return Ok(false);
             }

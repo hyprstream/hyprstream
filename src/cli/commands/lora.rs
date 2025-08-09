@@ -18,7 +18,7 @@ pub enum LoRAAction {
         #[arg(long)]
         name: Option<String>,
         
-        /// Base model URI (e.g., hf://microsoft/DialoGPT-medium)
+        /// Base model URI (e.g., hf://microsoft/DialoGPT-medium) or UUID
         #[arg(long)]
         base_model: String,
         
