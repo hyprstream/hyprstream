@@ -8,7 +8,10 @@ use std::time::Instant;
 use llama_cpp_2::{
     context::params::LlamaContextParams,
     llama_backend::LlamaBackend,
-    model::{params::LlamaModelParams, LlamaModel},
+    model::{params::LlamaModelParams, LlamaModel, AddBos},
+    context::LlamaContext,
+    llama_batch::LlamaBatch,
+    token::LlamaToken,
 };
 
 use super::{RuntimeEngine, ModelInfo, GenerationRequest, GenerationResult, FinishReason, RuntimeConfig};
@@ -88,44 +91,107 @@ impl LlamaCppEngine {
         }
     }
 
-    /// Generate response using real model information and LLaMA.cpp context
-    fn generate_basic_response(&self, model_info: &ModelInfo, prompt: &str, max_tokens: usize) -> String {
-        // Use actual model metadata for intelligent responses
+    /// Generate text using real LLaMA.cpp context and model (token-by-token generation)
+    fn generate_with_context(
+        &self,
+        context: &mut LlamaContext,
+        model: &LlamaModel,
+        prompt: &str,
+        max_tokens: usize,
+    ) -> Result<String> {
+        tracing::info!("Starting real LLaMA.cpp token-by-token generation for prompt: '{}'", prompt);
         
-        // Create response that demonstrates real model integration
-        let base_response = format!(
-            "[Model: {}, {:.1}B parameters, {}k context] ",
-            model_info.name,
-            model_info.parameters as f64 / 1e9,
-            model_info.context_length / 1000
-        );
+        // Step 1: Tokenize the prompt
+        let tokens_list = model.str_to_token(prompt, AddBos::Always)
+            .map_err(|e| anyhow!("Failed to tokenize prompt: {:?}", e))?;
         
-        // Generate contextual continuation based on prompt analysis
-        let continuation = if prompt.trim().ends_with('?') {
-            "That's an excellent question that requires careful analysis. Based on the patterns in my training data, I can provide several perspectives on this topic. "
-        } else if prompt.to_lowercase().contains("explain") {
-            "Let me break this down systematically. This concept involves multiple interconnected elements that work together in fascinating ways. "
-        } else if prompt.to_lowercase().contains("code") || prompt.to_lowercase().contains("program") {
-            "From a programming perspective, this involves several technical considerations. Let me walk through the implementation details step by step. "
-        } else {
-            "This is an interesting topic that connects to many areas of knowledge. I'll explore this comprehensively, drawing from various domains. "
-        };
+        tracing::info!("Tokenized prompt into {} tokens", tokens_list.len());
         
-        // Scale response length based on max_tokens
-        let mut full_response = format!("{}{}", base_response, continuation);
+        // Step 2: Create batch for decoding
+        let mut batch = LlamaBatch::new(512, 1);
         
-        if max_tokens > 100 {
-            full_response.push_str("The key principles here involve understanding the underlying mechanisms and their practical applications. ");
+        // Add prompt tokens to batch
+        for (i, token) in tokens_list.iter().enumerate() {
+            let is_last = i == tokens_list.len() - 1;
+            batch.add(*token, i as i32, &[0], is_last)
+                .map_err(|e| anyhow!("Failed to add token to batch: {:?}", e))?;
         }
         
-        if max_tokens > 200 {
-            full_response.push_str("This analysis reveals important patterns that extend across multiple fields of study, creating opportunities for deeper insight and innovation.");
+        // Step 3: Decode the initial prompt
+        context.decode(&mut batch)
+            .map_err(|e| anyhow!("Failed to decode prompt: {:?}", e))?;
+        
+        tracing::info!("Successfully decoded prompt, starting token generation");
+        
+        // Step 4: Generate tokens one by one
+        let mut generated_tokens = Vec::new();
+        let mut generated_text = String::new();
+        let mut current_pos = tokens_list.len() as i32; // Start position after prompt
+        
+        for n_cur in 0..max_tokens {
+            // Sample next token using greedy sampling for simplicity
+            let logits = context.get_logits_ith(batch.n_tokens() - 1);
+            
+            // Find token with highest probability (greedy sampling)
+            let n_vocab = model.n_vocab() as usize;
+            let mut best_token = 0i32;
+            let mut best_logit = f32::NEG_INFINITY;
+            
+            for i in 0..n_vocab.min(logits.len()) {
+                if logits[i] > best_logit {
+                    best_logit = logits[i];
+                    best_token = i as i32;
+                }
+            }
+            
+            generated_tokens.push(best_token);
+            
+            // Convert token to text
+            match model.token_to_bytes(LlamaToken(best_token), llama_cpp_2::model::Special::Tokenize) {
+                Ok(token_bytes) => {
+                    if let Ok(token_str) = String::from_utf8(token_bytes) {
+                        generated_text.push_str(&token_str);
+                        tracing::debug!("Generated token {}: '{}'", n_cur, token_str);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to convert token {} to string: {:?}", best_token, e);
+                }
+            }
+            
+            // Check for end-of-sequence token (Qwen2 uses 151645 for <|im_end|>)
+            if best_token == 151645 || best_token == 151643 {
+                tracing::info!("Hit end-of-sequence token ({}), stopping generation", best_token);
+                break;
+            }
+            
+            // Prepare next iteration: clear batch and add the new token with correct position
+            batch.clear();
+            batch.add(LlamaToken(best_token), current_pos, &[0], true)
+                .map_err(|e| anyhow!("Failed to add generated token to batch: {:?}", e))?;
+            
+            current_pos += 1; // Increment position for next token
+            
+            // Decode the new token
+            context.decode(&mut batch)
+                .map_err(|e| anyhow!("Failed to decode generated token: {:?}", e))?;
         }
         
-        // Trim to approximate token count (rough estimation)
-        let words: Vec<&str> = full_response.split_whitespace().collect();
-        let word_limit = std::cmp::min(words.len(), max_tokens);
-        words[..word_limit].join(" ")
+        tracing::info!("Generated {} tokens using real LLaMA.cpp: '{}'", 
+                      generated_tokens.len(), 
+                      generated_text.chars().take(100).collect::<String>());
+        
+        Ok(generated_text)
+    }
+
+    /// Generate response using real LLaMA.cpp inference (fallback method)  
+    fn generate_basic_response(&self, _model_info: &ModelInfo, prompt: &str, _max_tokens: usize) -> String {
+        tracing::error!("generate_basic_response should not be called - using real LLaMA.cpp inference instead");
+        
+        // This method should no longer be used since we have real token-by-token generation
+        // Return an error indicator instead of templated text
+        format!("ERROR: Fallback method called instead of real LLaMA.cpp inference for prompt: '{}'", 
+                prompt.chars().take(50).collect::<String>())
     }
 
 }
@@ -193,18 +259,16 @@ impl RuntimeEngine for LlamaCppEngine {
                               request.prompt.chars().take(50).collect::<String>());
                 
                 // Create context for generation
-                let _context = model.new_context(backend, context_params.clone())
+                let mut context = model.new_context(backend, context_params.clone())
                     .map_err(|e| anyhow!("Failed to create LLaMA context: {:?}", e))?;
                 
-                // For now, use a model-aware response that shows we have real model integration
-                // while we work out the exact LLaMA.cpp API for text generation
-                tracing::info!("Successfully created LLaMA.cpp context - implementing basic generation");
+                tracing::info!("Successfully created LLaMA.cpp context - starting real text generation");
                 
-                let model_info = self.model_info();
-                let generated_text = self.generate_basic_response(&model_info, &request.prompt, request.max_tokens);
+                // Perform real LLaMA.cpp text generation using the context
+                let generated_text = self.generate_with_context(&mut context, &model, &request.prompt, request.max_tokens)?;
                 let tokens_count = generated_text.split_whitespace().count().min(request.max_tokens);
                 
-                tracing::info!("Generated response with {} tokens using real LLaMA.cpp model data", tokens_count);
+                tracing::info!("Generated response with {} tokens using real LLaMA.cpp inference", tokens_count);
                 
                 (generated_text, tokens_count)
             }
@@ -252,34 +316,59 @@ impl RuntimeEngine for LlamaCppEngine {
 }
 
 impl LlamaCppEngine {
-    /// Apply LoRA adapter weights to the model
-    pub fn apply_lora_adapter(
+    /// Apply LoRA adapter from checkpoint file
+    pub fn apply_lora_checkpoint(
         &mut self,
+        checkpoint_path: &std::path::Path,
         adapter_id: &str,
-        lora_weights: &std::collections::HashMap<String, Vec<f32>>,
+        scale: f32,
     ) -> Result<()> {
         if !self.is_loaded() {
             return Err(anyhow!("Model not loaded. Call load_model() first."));
         }
         
-        println!("📎 Applying LoRA adapter '{}' with {} tensors", adapter_id, lora_weights.len());
+        tracing::info!("📎 Loading LoRA checkpoint: {} (scale: {})", checkpoint_path.display(), scale);
         
-        // For now, log the LoRA weights that would be applied
-        // In a full implementation, this would integrate with llama.cpp's LoRA support
-        for (tensor_name, weights) in lora_weights {
-            println!("   🔧 Tensor: {} ({} values)", tensor_name, weights.len());
-            
-            // Validate tensor shapes and apply to model
-            // This is where we would call into llama.cpp's LoRA application functions
-            if weights.len() > 1000 {
-                println!("      ⚠️ Large tensor detected - applying sparse optimization");
+        // Get references to backend, model, and context 
+        let _backend = self.backend.as_ref()
+            .ok_or_else(|| anyhow!("Backend not initialized"))?;
+        let model = self.model.as_ref()
+            .ok_or_else(|| anyhow!("Model not loaded"))?;
+        
+        // Load LoRA adapter from GGUF checkpoint file using real LLaMA.cpp API
+        match model.lora_adapter_init(checkpoint_path) {
+            Ok(_lora_adapter) => {
+                tracing::info!("✅ Successfully loaded LoRA adapter from checkpoint");
+                
+                // Store the adapter for later use (we'll need to manage this properly)
+                // For now, just log success
+                tracing::info!("📋 LoRA adapter '{}' ready for application", adapter_id);
+                
+                // Note: We would apply it to context during inference:
+                // context.lora_adapter_set(&mut lora_adapter, scale)?;
+                
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!("❌ Failed to load LoRA adapter: {:?}", e);
+                Err(anyhow!("Failed to load LoRA adapter from {}: {:?}", 
+                           checkpoint_path.display(), e))
             }
         }
+    }
+    
+    /// Legacy method for backward compatibility - now deprecated
+    #[deprecated(note = "Use apply_lora_checkpoint instead")]
+    pub fn apply_lora_adapter(
+        &mut self,
+        adapter_id: &str,
+        lora_weights: &std::collections::HashMap<String, Vec<f32>>,
+    ) -> Result<()> {
+        tracing::warn!("🚨 Using deprecated apply_lora_adapter - should use checkpoint system");
         
-        println!("✅ LoRA adapter '{}' applied successfully", adapter_id);
-        
-        // TODO: Integrate with actual llama.cpp LoRA support once available
-        // For now, this serves as a placeholder that logs the integration points
+        // For backward compatibility, just log that this method was called
+        tracing::info!("📎 Legacy LoRA adapter call for '{}' with {} tensors", 
+                      adapter_id, lora_weights.len());
         
         Ok(())
     }

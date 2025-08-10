@@ -90,6 +90,7 @@ reqwest = { version = "0.11", features = ["json", "stream"] }
 indicatif = "0.17"              # Progress bars
 fastrand = "2.0"                # Fast random number generation for sampling
 xdg = "2.5"                     # XDG Base Directory specification
+blake3 = "1.5"                  # Fast cryptographic hashing for checksums
 
 # HTTP API dependencies
 axum = { version = "0.7", features = ["macros", "tokio"] }

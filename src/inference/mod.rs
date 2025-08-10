@@ -253,6 +253,16 @@ impl InferenceAPI {
         stats.clone()
     }
     
+    /// Generate text directly using the base model (for LoRA-enhanced inference)
+    pub async fn generate_text_direct(&self, prompt: &str, max_tokens: usize) -> Result<String> {
+        self.engine.generate_text(prompt, max_tokens).await
+    }
+    
+    /// Load model into the inference engine
+    pub async fn load_model(&self, model_path: &std::path::Path) -> Result<()> {
+        self.engine.load_model(model_path).await
+    }
+    
     /// List active sessions
     pub async fn list_sessions(&self) -> Vec<InferenceSession> {
         let sessions = self.sessions.read().await;

@@ -113,6 +113,10 @@ pub enum LoRAAction {
         /// LoRA ID to use for inference
         lora_id: String,
         
+        /// Use a specific checkpoint (optional)
+        #[arg(long)]
+        checkpoint: Option<String>,
+        
         /// Input prompt
         #[arg(long)]
         prompt: Option<String>,
@@ -132,6 +136,10 @@ pub enum LoRAAction {
         /// Top-p for nucleus sampling
         #[arg(long, default_value = "1.0")]
         top_p: f32,
+        
+        /// LoRA scaling factor (when using checkpoint)
+        #[arg(long, default_value = "1.0")]
+        scale: f32,
         
         /// Enable streaming output
         #[arg(long)]
@@ -194,6 +202,12 @@ pub enum LoRAAction {
         /// Auto-detect format
         #[arg(long)]
         auto_detect: bool,
+    },
+    
+    /// Checkpoint management
+    Checkpoint {
+        #[command(subcommand)]
+        action: CheckpointAction,
     },
 }
 
@@ -262,6 +276,152 @@ pub enum TrainingAction {
         /// Input file with training samples (JSON format)
         #[arg(long)]
         input_file: Option<String>,
+    },
+}
+
+/// Checkpoint management actions
+#[derive(Subcommand)]
+pub enum CheckpointAction {
+    /// Create a checkpoint from current LoRA state
+    Create {
+        /// LoRA ID to checkpoint
+        lora_id: String,
+        
+        /// Checkpoint tag (e.g., "v1.0", "epoch_100", "best")
+        #[arg(long)]
+        tag: String,
+        
+        /// Optional description
+        #[arg(long)]
+        description: Option<String>,
+        
+        /// Output format (json, table)
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
+    
+    /// List checkpoints for a LoRA adapter
+    List {
+        /// LoRA ID to list checkpoints for
+        lora_id: String,
+        
+        /// Output format (table, json)
+        #[arg(long, default_value = "table")]
+        format: String,
+        
+        /// Show only specific tag pattern
+        #[arg(long)]
+        tag_filter: Option<String>,
+        
+        /// Sort by (created, size, tag)
+        #[arg(long, default_value = "created")]
+        sort_by: String,
+        
+        /// Show detailed metrics
+        #[arg(long)]
+        detailed: bool,
+    },
+    
+    /// Load a checkpoint for inference
+    Load {
+        /// LoRA ID
+        lora_id: String,
+        
+        /// Checkpoint tag to load
+        #[arg(long)]
+        tag: String,
+        
+        /// LoRA scaling factor
+        #[arg(long, default_value = "1.0")]
+        scale: f32,
+        
+        /// Verify checkpoint integrity
+        #[arg(long)]
+        verify: bool,
+    },
+    
+    /// Delete a checkpoint
+    Delete {
+        /// LoRA ID
+        lora_id: String,
+        
+        /// Checkpoint tag to delete
+        #[arg(long)]
+        tag: String,
+        
+        /// Confirm deletion without prompting
+        #[arg(long)]
+        yes: bool,
+    },
+    
+    /// Show checkpoint statistics
+    Stats {
+        /// LoRA ID (optional, shows global stats if not specified)
+        lora_id: Option<String>,
+        
+        /// Output format (table, json)
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+    
+    /// Export checkpoint to external format
+    Export {
+        /// LoRA ID
+        lora_id: String,
+        
+        /// Checkpoint tag to export
+        #[arg(long)]
+        tag: String,
+        
+        /// Output file path
+        #[arg(long)]
+        output: String,
+        
+        /// Export format (gguf, safetensors)
+        #[arg(long, default_value = "gguf")]
+        format: String,
+    },
+    
+    /// Perform inference using a specific checkpoint
+    Infer {
+        /// LoRA ID
+        lora_id: String,
+        
+        /// Checkpoint tag to use for inference
+        #[arg(long)]
+        tag: String,
+        
+        /// Input prompt
+        #[arg(long)]
+        prompt: Option<String>,
+        
+        /// Input file containing prompt
+        #[arg(long)]
+        input_file: Option<String>,
+        
+        /// Maximum tokens to generate
+        #[arg(long, default_value = "100")]
+        max_tokens: usize,
+        
+        /// Temperature for sampling
+        #[arg(long, default_value = "1.0")]
+        temperature: f32,
+        
+        /// Top-p for nucleus sampling
+        #[arg(long, default_value = "1.0")]
+        top_p: f32,
+        
+        /// LoRA scaling factor
+        #[arg(long, default_value = "1.0")]
+        scale: f32,
+        
+        /// Enable streaming output
+        #[arg(long)]
+        stream: bool,
+        
+        /// Output format (text, json)
+        #[arg(long, default_value = "text")]
+        format: String,
     },
 }
 
@@ -383,4 +543,69 @@ pub struct InferenceResult {
     pub tokens_generated: usize,
     pub latency_ms: f64,
     pub finish_reason: String,
+}
+
+/// Checkpoint display information
+#[derive(Debug, Clone)]
+pub struct CheckpointDisplayInfo {
+    pub checkpoint_id: String,
+    pub lora_id: String,
+    pub tag: String,
+    pub created_at: String,
+    pub file_size: u64,
+    pub metrics: CheckpointMetricsDisplay,
+    pub file_path: String,
+    pub integrity_verified: bool,
+}
+
+/// Checkpoint metrics for display
+#[derive(Debug, Clone)]
+pub struct CheckpointMetricsDisplay {
+    pub loss: Option<f32>,
+    pub steps: u64,
+    pub sparsity: f32,
+    pub active_params: u64,
+    pub rank: usize,
+    pub alpha: f32,
+}
+
+impl CheckpointDisplayInfo {
+    /// Format file size for display
+    pub fn format_size(&self) -> String {
+        let size_mb = self.file_size as f64 / 1024.0 / 1024.0;
+        if size_mb < 1.0 {
+            format!("{:.2} KB", (self.file_size as f64 / 1024.0))
+        } else if size_mb < 1024.0 {
+            format!("{:.2} MB", size_mb)
+        } else {
+            format!("{:.2} GB", size_mb / 1024.0)
+        }
+    }
+    
+    /// Format sparsity as percentage
+    pub fn format_sparsity(&self) -> String {
+        format!("{:.1}%", self.metrics.sparsity * 100.0)
+    }
+    
+    /// Format creation time for display
+    pub fn format_created_at(&self) -> String {
+        self.created_at.clone()
+    }
+    
+    /// Format loss for display
+    pub fn format_loss(&self) -> String {
+        match self.metrics.loss {
+            Some(loss) => format!("{:.6}", loss),
+            None => "N/A".to_string(),
+        }
+    }
+    
+    /// Format integrity status
+    pub fn format_integrity(&self) -> String {
+        if self.integrity_verified {
+            "✅ Verified"
+        } else {
+            "⚠️ Unverified"
+        }.to_string()
+    }
 }
