@@ -5,6 +5,7 @@
 #include <openvdb/openvdb.h>
 #include <memory>
 #include <vector>
+#include "rust/cxx.h"
 
 namespace hyprstream {
 
@@ -36,8 +37,8 @@ public:
     void merge(const LoRAGrid& other, float scale = 1.0f);
     
     // I/O operations
-    bool writeToFile(const std::string& filename) const;
-    bool readFromFile(const std::string& filename);
+    bool writeToFile(rust::Str filename) const;
+    bool readFromFile(rust::Str filename);
     
     // Internal grid access
     GridType::Ptr getGrid() const { return grid_; }

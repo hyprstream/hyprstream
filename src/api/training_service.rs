@@ -358,7 +358,7 @@ impl TrainingService {
     pub async fn generate_embedding(
         &self,
         lora_id: &str,
-        input: &str,
+        _input: &str,
     ) -> Result<Vec<f32>> {
         // Create temporary inference session
         let session_id = self.create_inference_session(

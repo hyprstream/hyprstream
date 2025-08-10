@@ -379,7 +379,7 @@ impl VDBSparseStorage {
         // Load adapter from cache or storage
         let mut adapter_cache = self.adapter_cache.write().await;
         
-        if let Some(adapter) = adapter_cache.get_mut(adapter_id) {
+        if let Some(_adapter) = adapter_cache.get_mut(adapter_id) {
             // Apply updates to cached adapter
             // This would require implementing update methods on SparseLoRAAdapter
             // For now, we'll mark this as a TODO for the adapter implementation

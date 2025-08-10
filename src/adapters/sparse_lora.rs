@@ -177,7 +177,7 @@ impl SparseLoRAAdapter {
             None
         };
         
-        let metadata = AdapterMetadata {
+        let _metadata = AdapterMetadata {
             domain: "default".to_string(),
             adapter_type: "sparse_lora".to_string(),
             sparsity: config.sparsity,

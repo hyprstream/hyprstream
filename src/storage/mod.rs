@@ -14,6 +14,8 @@
 pub mod vdb;
 pub mod view;
 pub mod paths;
+pub mod lora_storage_manager;
+pub mod lora_weight_cache;
 
 // Re-export main VDB interfaces
 pub use vdb::{
@@ -21,6 +23,17 @@ pub use vdb::{
     SparseWeightUpdate, EmbeddingMatch, SparseStorageError,
     AdapterStats, StorageStats, CompactionStats,
     VDBStorage, VDBConfig, AdapterStore,
+};
+
+// Re-export LoRA storage manager and cache
+pub use lora_storage_manager::{
+    LoRAStorageManager, LoRAStorageConfig, 
+    LoRAAdapterInfo, LoRAStorageInfo, LoRAFullStats,
+};
+
+pub use lora_weight_cache::{
+    LoRAWeightCache, LoRAWeightCacheConfig, CachedLoRAAdapter,
+    AdapterCacheStats, CacheStats,
 };
 
 // Legacy view support (retained for compatibility)

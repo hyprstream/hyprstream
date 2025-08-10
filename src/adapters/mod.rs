@@ -4,5 +4,7 @@
 //! large language models with minimal memory overhead and real-time updates.
 
 pub mod sparse_lora;
+pub mod openvdb_lora;
 
 pub use sparse_lora::*;
+pub use openvdb_lora::*;

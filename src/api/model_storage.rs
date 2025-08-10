@@ -336,7 +336,7 @@ impl ModelStorage {
         let cache = self.metadata_cache.read().await;
         let mut models = Vec::new();
         
-        for (model_id, metadata) in cache.iter() {
+        for (_model_id, metadata) in cache.iter() {
             // Generate ModelUri from external sources for backward compatibility
             if let Some(external_source) = metadata.external_sources.first() {
                 let uri_str = match &external_source.source_type {
@@ -414,7 +414,7 @@ impl ModelStorage {
         let mut total_size = 0u64;
         let mut registry_counts = HashMap::new();
         
-        for (model_id, metadata) in cache.iter() {
+        for (_model_id, metadata) in cache.iter() {
             // Check if files still exist
             let model_exists = if let Some(local_path) = &metadata.local_path {
                 local_path.exists()

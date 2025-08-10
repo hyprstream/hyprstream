@@ -193,7 +193,7 @@ impl LoRARegistry {
     /// Unregister a LoRA layer by ID
     pub async fn unregister(&self, lora_id: &LoRAId) -> Result<()> {
         let mut layers = self.layers.write().await;
-        let layer = layers.remove(lora_id)
+        let _layer = layers.remove(lora_id)
             .ok_or_else(|| anyhow::anyhow!("LoRA layer {} not found", lora_id))?;
         
         let mut metrics = self.metrics.write().await;
@@ -325,6 +325,89 @@ impl LoRARegistry {
         self.save_registry().await?;
         
         Ok(())
+    }
+    
+    /// Batch update training progress for multiple adapters (optimization)
+    pub async fn batch_update_training_progress(
+        &self,
+        updates: &[(LoRAId, u64)]
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        
+        let mut layers = self.layers.write().await;
+        let now = chrono::Utc::now().timestamp();
+        
+        for (lora_id, tokens_trained) in updates {
+            if let Some(layer) = layers.get_mut(lora_id) {
+                layer.total_tokens_trained += tokens_trained;
+                layer.updated_at = now;
+            }
+        }
+        
+        // Release lock before saving
+        drop(layers);
+        
+        // Save to disk once for all updates
+        self.save_registry().await?;
+        
+        Ok(())
+    }
+    
+    /// Get storage path for a specific LoRA adapter's weights
+    pub fn get_lora_storage_path(&self, lora_id: &LoRAId) -> PathBuf {
+        self.base_dir.join("weights").join(format!("{}.vdb", lora_id))
+    }
+    
+    /// Validate LoRA configuration
+    pub fn validate_config(config: &crate::api::LoRAConfig) -> Result<()> {
+        if config.rank == 0 {
+            return Err(anyhow::anyhow!("LoRA rank must be greater than 0"));
+        }
+        
+        if config.alpha <= 0.0 {
+            return Err(anyhow::anyhow!("LoRA alpha must be positive"));
+        }
+        
+        if config.sparsity_ratio < 0.0 || config.sparsity_ratio >= 1.0 {
+            return Err(anyhow::anyhow!("Sparsity ratio must be in range [0.0, 1.0)"));
+        }
+        
+        if config.dropout < 0.0 || config.dropout >= 1.0 {
+            return Err(anyhow::anyhow!("Dropout must be in range [0.0, 1.0)"));
+        }
+        
+        if config.target_modules.is_empty() {
+            return Err(anyhow::anyhow!("At least one target module must be specified"));
+        }
+        
+        Ok(())
+    }
+    
+    /// Register a new LoRA layer with validation
+    pub async fn register_validated(&self, mut layer: LoRALayer) -> Result<LoRAId> {
+        // Validate configuration
+        Self::validate_config(&layer.config)?;
+        
+        // Ensure unique name
+        let name_to_id = self.name_to_id.read().await;
+        if name_to_id.contains_key(&layer.name) {
+            return Err(anyhow::anyhow!("LoRA layer with name '{}' already exists", layer.name));
+        }
+        drop(name_to_id);
+        
+        // Generate new UUID if not set
+        if layer.id.0.is_nil() {
+            layer.id = LoRAId::new();
+        }
+        
+        let layer_id = layer.id.clone();
+        
+        // Use the existing register method
+        self.register(layer).await?;
+        
+        Ok(layer_id)
     }
     
     /// List all registered adapter IDs

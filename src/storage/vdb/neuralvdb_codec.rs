@@ -506,7 +506,7 @@ impl NeuralVDBCodec {
         &self,
         adapter_id: &str,
         topology: &TopologyEncoding,
-        values: &ValueEncoding,
+        _values: &ValueEncoding,
     ) {
         let mut cache = self.temporal_cache.write().await;
         
@@ -600,7 +600,7 @@ impl NeuralVDBCodec {
         stats.avg_compression_ratio = compressed.compression_metadata.compression_ratio as f64;
         
         // Update running averages
-        let frames = stats.frames_processed as f64;
+        let _frames = stats.frames_processed as f64;
     }
 
     /// Reconstruct sparse weights from decoded topology and values
@@ -628,7 +628,7 @@ impl NeuralVDBCodec {
 
 impl TopologyClassifier {
     /// Create new topology classifier network
-    pub fn new(vs: &Path, input_dim: i64) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(_vs: &Path, input_dim: i64) -> Result<Self, Box<dyn std::error::Error>> {
         let mut network = Sequential::new();
         network.add_linear("topology_fc1", input_dim, 512);
         network.add_activation("relu");
@@ -667,7 +667,7 @@ impl TopologyClassifier {
 
 impl ValueRegressor {
     /// Create new value regressor network
-    pub fn new(vs: &Path, input_dim: i64, latent_dim: i64) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(_vs: &Path, input_dim: i64, latent_dim: i64) -> Result<Self, Box<dyn std::error::Error>> {
         // Encoder: values -> compressed representation
         let mut encoder = Sequential::new();
         encoder.add_linear("encoder_fc1", input_dim, 512);
@@ -708,7 +708,7 @@ impl ValueRegressor {
     }
 
     /// Decode compressed representation back to values
-    pub fn decode(&self, compressed: &Tensor) -> Result<Tensor, Box<dyn std::error::Error>> {
+    pub fn decode(&self, _compressed: &Tensor) -> Result<Tensor, Box<dyn std::error::Error>> {
         // For the placeholder decoder, return appropriate size
         Ok(Tensor {
             data: vec![0.0; 100], // Match the test expectation

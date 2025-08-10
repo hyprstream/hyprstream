@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 
 #[cxx::bridge(namespace = "hyprstream")]
-mod ffi {
+pub mod ffi {
     // WeightData struct (must be outside extern block)
     #[derive(Debug, Clone)]
     struct WeightData {
@@ -45,9 +45,9 @@ mod ffi {
         fn prune(self: Pin<&mut LoRAGrid>, tolerance: f32);
         fn merge(self: Pin<&mut LoRAGrid>, other: &LoRAGrid, scale: f32);
         
-        // I/O - simplified to avoid string conversion issues for now
-        // fn writeToFile(self: &LoRAGrid, filename: &str) -> bool;
-        // fn readFromFile(self: Pin<&mut LoRAGrid>, filename: &str) -> bool;
+        // I/O operations
+        fn writeToFile(self: &LoRAGrid, filename: &str) -> bool;
+        fn readFromFile(self: Pin<&mut LoRAGrid>, filename: &str) -> bool;
     }
     
     // ActiveWeightIterator methods - temporarily disabled due to CXX struct issues

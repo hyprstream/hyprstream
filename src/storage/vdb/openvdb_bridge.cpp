@@ -1,6 +1,7 @@
 //! OpenVDB C++ bridge implementation
 
 #include "openvdb_bridge.h"
+#include "rust/cxx.h"
 #include <openvdb/tools/Prune.h>
 #include <openvdb/tools/Composite.h>
 #include <openvdb/tools/GridOperators.h>
@@ -139,9 +140,10 @@ void LoRAGrid::merge(const LoRAGrid& other, float scale) {
     accessor_dirty_ = true;
 }
 
-bool LoRAGrid::writeToFile(const std::string& filename) const {
+bool LoRAGrid::writeToFile(rust::Str filename) const {
     try {
-        openvdb::io::File file(filename);
+        std::string filename_str(filename);
+        openvdb::io::File file(filename_str);
         openvdb::GridPtrVec grids;
         grids.push_back(grid_);
         file.write(grids);
@@ -153,9 +155,10 @@ bool LoRAGrid::writeToFile(const std::string& filename) const {
     }
 }
 
-bool LoRAGrid::readFromFile(const std::string& filename) {
+bool LoRAGrid::readFromFile(rust::Str filename) {
     try {
-        openvdb::io::File file(filename);
+        std::string filename_str(filename);
+        openvdb::io::File file(filename_str);
         file.open();
         
         // Read first grid from file

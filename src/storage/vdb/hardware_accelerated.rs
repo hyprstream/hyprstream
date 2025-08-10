@@ -345,7 +345,7 @@ impl AutoregressivePredictor {
         }
         
         // Generate context features based on neighboring patterns
-        let context_features = self.generate_context_features(history, current_morton);
+        let _context_features = self.generate_context_features(history, current_morton);
         
         Some(WeightUpdatePattern {
             morton_index: current_morton,
@@ -939,7 +939,7 @@ impl HardwareVDBStorage {
         &self,
         adapter: &mut crate::storage::vdb::openvdb_bindings::OpenVDBLoRAAdapter,
         sparse_data: &[(u32, f32)],
-        z_pattern: &ZOrderPattern
+        _z_pattern: &ZOrderPattern
     ) -> Result<(), VDBError> {
         // Level 2: Store fine-grained sparse weights following Z-order
         for &(idx, weight) in sparse_data.iter() {
@@ -995,7 +995,7 @@ impl HardwareVDBStorage {
         &self,
         adapter: &mut crate::storage::vdb::openvdb_bindings::OpenVDBLoRAAdapter,
         updates: &HashMap<Coordinate3D, f32>,
-        z_pattern: &ZOrderPattern
+        _z_pattern: &ZOrderPattern
     ) -> Result<(), VDBError> {
         // Sort updates by Z-order pattern for optimal cache behavior
         let mut sorted_updates: Vec<_> = updates.iter().collect();

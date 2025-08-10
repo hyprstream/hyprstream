@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 pub mod lora_registry;
 pub mod model_management;
@@ -293,201 +292,32 @@ async fn delete_lora_layer(
 
 /// OpenAI-compatible chat completions endpoint
 async fn openai_chat_completions(
-    State(state): State<ApiState>,
-    Path(lora_id): Path<String>,
-    Json(request): Json<openai_compat::ChatCompletionRequest>,
+    State(_state): State<ApiState>,
+    Path(_lora_id): Path<String>,
+    Json(_request): Json<openai_compat::ChatCompletionRequest>,
 ) -> Result<JsonResponse<openai_compat::ChatCompletionResponse>, StatusCode> {
-    // Load the LoRA adapter
-    
-    let _adapter = state.vdb_storage.load_adapter_neural_compressed(
-        &lora_id,
-        Default::default(),
-    ).await.map_err(|_| StatusCode::NOT_FOUND)?;
-    
-    
-    return Err(StatusCode::SERVICE_UNAVAILABLE);
-    
-    // Create inference session
-    let session_id = state.training_service.create_inference_session(
-        &lora_id,
-        vec![lora_id.clone()],
-    ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
-    // Convert OpenAI request to internal format
-    let input = crate::inference::InferenceInput {
-        prompt: Some(format_chat_messages(&request.messages)),
-        input_ids: None,
-        max_tokens: request.max_tokens.unwrap_or(2048),
-        temperature: request.temperature.unwrap_or(1.0),
-        top_p: request.top_p.unwrap_or(1.0),
-        stream: request.stream.unwrap_or(false),
-    };
-    
-    // Run inference
-    let output = state.training_service.infer(&session_id, input).await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
-    // If auto-regressive training is enabled, learn from this interaction
-    if let Some(endpoint) = state.endpoints.read().await.get(&lora_id) {
-        if endpoint.auto_regressive {
-            // Queue for training
-            state.training_service.queue_training_sample(
-                &lora_id,
-                TrainingSample {
-                    input: format_chat_messages(&request.messages),
-                    output: output.text.clone(),
-                    timestamp: chrono::Utc::now().timestamp(),
-                },
-            ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        }
-    }
-    
-    // Convert to OpenAI response format
-    let response = openai_compat::ChatCompletionResponse {
-        id: format!("chatcmpl-{}", Uuid::new_v4()),
-        object: "chat.completion".to_string(),
-        created: chrono::Utc::now().timestamp(),
-        model: format!("lora-{}", lora_id),
-        choices: vec![
-            openai_compat::ChatChoice {
-                index: 0,
-                message: openai_compat::ChatMessage {
-                    role: "assistant".to_string(),
-                    content: Some(output.text),
-                    function_call: None,
-                },
-                finish_reason: Some("stop".to_string()),
-            }
-        ],
-        usage: Some(openai_compat::Usage {
-            prompt_tokens: request.messages.len() * 10, // Estimate
-            completion_tokens: output.tokens_generated,
-            total_tokens: request.messages.len() * 10 + output.tokens_generated,
-        }),
-    };
-    
-    // Close session
-    let _ = state.training_service.close_inference_session(&session_id).await;
-    
-    Ok(JsonResponse(response))
+    // TODO: Implement full OpenAI chat completions when LoRA weight loading is ready
+    Err(StatusCode::SERVICE_UNAVAILABLE)
 }
 
 /// OpenAI-compatible completions endpoint
 async fn openai_completions(
-    State(state): State<ApiState>,
-    Path(lora_id): Path<String>,
-    Json(request): Json<openai_compat::CompletionRequest>,
+    State(_state): State<ApiState>,
+    Path(_lora_id): Path<String>,
+    Json(_request): Json<openai_compat::CompletionRequest>,
 ) -> Result<JsonResponse<openai_compat::CompletionResponse>, StatusCode> {
-    // Similar to chat completions but for raw completions
-    
-    let _adapter = state.vdb_storage.load_adapter_neural_compressed(
-        &lora_id,
-        Default::default(),
-    ).await.map_err(|_| StatusCode::NOT_FOUND)?;
-    
-    
-    return Err(StatusCode::SERVICE_UNAVAILABLE);
-    
-    let session_id = state.training_service.create_inference_session(
-        &lora_id,
-        vec![lora_id.clone()],
-    ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
-    let input = crate::inference::InferenceInput {
-        prompt: Some(request.prompt.clone()),
-        input_ids: None,
-        max_tokens: request.max_tokens.unwrap_or(2048),
-        temperature: request.temperature.unwrap_or(1.0),
-        top_p: request.top_p.unwrap_or(1.0),
-        stream: request.stream.unwrap_or(false),
-    };
-    
-    let output = state.training_service.infer(&session_id, input).await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
-    // Auto-regressive training
-    if let Some(endpoint) = state.endpoints.read().await.get(&lora_id) {
-        if endpoint.auto_regressive {
-            state.training_service.queue_training_sample(
-                &lora_id,
-                TrainingSample {
-                    input: request.prompt.clone(),
-                    output: output.text.clone(),
-                    timestamp: chrono::Utc::now().timestamp(),
-                },
-            ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        }
-    }
-    
-    let response = openai_compat::CompletionResponse {
-        id: format!("cmpl-{}", Uuid::new_v4()),
-        object: "text_completion".to_string(),
-        created: chrono::Utc::now().timestamp(),
-        model: format!("lora-{}", lora_id),
-        choices: vec![
-            openai_compat::CompletionChoice {
-                text: output.text,
-                index: 0,
-                logprobs: None,
-                finish_reason: Some("stop".to_string()),
-            }
-        ],
-        usage: Some(openai_compat::Usage {
-            prompt_tokens: request.prompt.len() / 4, // Rough estimate
-            completion_tokens: output.tokens_generated,
-            total_tokens: request.prompt.len() / 4 + output.tokens_generated,
-        }),
-    };
-    
-    let _ = state.training_service.close_inference_session(&session_id).await;
-    
-    Ok(JsonResponse(response))
+    // TODO: Implement full OpenAI completions when LoRA weight loading is ready
+    Err(StatusCode::SERVICE_UNAVAILABLE)
 }
 
 /// OpenAI-compatible embeddings endpoint
 async fn openai_embeddings(
-    State(state): State<ApiState>,
-    Path(lora_id): Path<String>,
-    Json(request): Json<openai_compat::EmbeddingRequest>,
+    State(_state): State<ApiState>,
+    Path(_lora_id): Path<String>,
+    Json(_request): Json<openai_compat::EmbeddingRequest>,
 ) -> Result<JsonResponse<openai_compat::EmbeddingResponse>, StatusCode> {
-    // Generate embeddings using the LoRA-adapted model
-    
-    let _adapter = state.vdb_storage.load_adapter_neural_compressed(
-        &lora_id,
-        Default::default(),
-    ).await.map_err(|_| StatusCode::NOT_FOUND)?;
-    
-    
-    return Err(StatusCode::SERVICE_UNAVAILABLE);
-    
-    let mut embeddings = Vec::new();
-    
-    for (idx, input) in request.input.iter().enumerate() {
-        // Generate embedding (simplified - would use actual model)
-        let embedding = state.training_service.generate_embedding(
-            &lora_id,
-            input,
-        ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        
-        embeddings.push(openai_compat::EmbeddingData {
-            object: "embedding".to_string(),
-            embedding,
-            index: idx,
-        });
-    }
-    
-    let response = openai_compat::EmbeddingResponse {
-        object: "list".to_string(),
-        data: embeddings,
-        model: format!("lora-{}", lora_id),
-        usage: openai_compat::Usage {
-            prompt_tokens: request.input.len() * 10,
-            completion_tokens: 0,
-            total_tokens: request.input.len() * 10,
-        },
-    };
-    
-    Ok(JsonResponse(response))
+    // TODO: Implement embeddings generation when LoRA weight loading is ready
+    Err(StatusCode::SERVICE_UNAVAILABLE)
 }
 
 /// List models (OpenAI-compatible)
@@ -617,4 +447,3 @@ fn format_chat_messages(messages: &[openai_compat::ChatMessage]) -> String {
 
 // Re-exports
 use chrono;
-use uuid;

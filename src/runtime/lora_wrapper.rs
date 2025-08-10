@@ -312,7 +312,7 @@ impl LoRAEngineWrapper {
 
 #[async_trait]
 impl RuntimeEngine for LoRAEngineWrapper {
-    async fn load_model(&mut self, path: &Path) -> Result<()> {
+    async fn load_model(&mut self, _path: &Path) -> Result<()> {
         // For now, we can't mutate the base engine through Arc
         // This would need to be redesigned for real usage
         tracing::warn!("LoRAEngineWrapper cannot directly load models - load on base engine first");

@@ -256,7 +256,7 @@ impl VDBStorage {
         // Map 2D weight matrices to 3D VDB space
         match shape.len() {
             2 => {
-                let (h, w) = (shape[0], shape[1]);
+                let (_h, w) = (shape[0], shape[1]);
                 let y = index / w;
                 let x = index % w;
                 Coordinate3D::new(x as i32, y as i32, 0)

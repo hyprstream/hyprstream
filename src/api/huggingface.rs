@@ -5,7 +5,7 @@ use crate::api::model_registry::{
     ModelRegistry, DownloadResult, SearchResult, RegistryModelInfo, ModelInfo,
     ModelFileInfo, RegistryConfig
 };
-use crate::api::model_storage::{ModelMetadata, ModelId, ExternalSource, SourceType, ModelFile, FileType};
+use crate::api::model_storage::{ModelMetadata, ModelId, ExternalSource, SourceType};
 
 use std::path::Path;
 use std::collections::HashMap;
@@ -51,7 +51,7 @@ impl HuggingFaceClient {
     /// Search for models on Hugging Face using hf_hub
     pub async fn search_models(&self, query: &str, limit: Option<usize>) -> Result<Vec<ModelInfo>> {
         // Use hf_hub API for searching
-        let api = hf_hub::api::tokio::ApiBuilder::new()
+        let _api = hf_hub::api::tokio::ApiBuilder::new()
             .with_token(self.config.token.clone())
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to initialize HF API: {}", e))?;
