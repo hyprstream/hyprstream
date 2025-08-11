@@ -23,6 +23,7 @@ use crate::config::HyprConfig;
 use tokio::sync::RwLock;
 use serde::{Serialize, Deserialize};
 use thiserror::Error;
+use chrono::{DateTime, Utc, Duration};
 
 /// Errors for VDB storage operations
 #[derive(Error, Debug)]
@@ -176,6 +177,39 @@ pub trait SparseStorage: Send + Sync + 'static {
     
     /// Get overall storage statistics
     async fn get_storage_stats(&self) -> Result<StorageStats, SparseStorageError>;
+    
+    /// Gradient-based temporal dependency methods
+    
+    /// Compute gradient dependencies between adapters
+    async fn compute_gradient_dependencies(
+        &self,
+        source_adapter_id: &str,
+        target_adapter_id: &str,
+        temporal_window_secs: u64,
+    ) -> Result<TemporalDependency, SparseStorageError>;
+    
+    /// Track temporal gradient accumulation for dependency analysis
+    async fn accumulate_temporal_gradient(
+        &self,
+        adapter_id: &str,
+        layer_name: &str,
+        gradient_values: &HashMap<Coordinate3D, f32>,
+        timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<f32, SparseStorageError>; // Returns gradient magnitude
+    
+    /// Build gradient-based DAG for temporal dependencies
+    async fn build_gradient_dependency_dag(
+        &self,
+        adapter_ids: &[String],
+        lookback_window_secs: u64,
+    ) -> Result<Vec<TemporalDependency>, SparseStorageError>;
+    
+    /// Select optimal temporal adapters based on gradient analysis
+    async fn select_temporal_adapters(
+        &self,
+        context: &TemporalAdaptationContext,
+        max_adapters: usize,
+    ) -> Result<TemporalSelection, SparseStorageError>;
 }
 
 /// Statistics for individual adapters
@@ -213,6 +247,37 @@ pub struct StorageStats {
     pub avg_sparsity_ratio: f32,
     pub updates_per_second: f64,
     pub neural_compression_stats: CompressionStats,
+}
+
+/// Temporal dependency between adapters based on gradient analysis
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemporalDependency {
+    pub source_adapter_id: String,
+    pub target_adapter_id: String,
+    pub dependency_strength: f32,
+    pub temporal_distance: Duration,
+    pub gradient_correlation: f32,
+    pub last_updated: DateTime<Utc>,
+}
+
+/// Context for temporal adaptation decisions
+#[derive(Debug, Clone)]
+pub struct TemporalAdaptationContext {
+    pub current_prompt: String,
+    pub recent_performance: Vec<f32>,
+    pub available_adapters: Vec<String>,
+    pub gradient_threshold: f32,
+    pub temporal_window_secs: u64,
+}
+
+/// Result of temporal adapter selection
+#[derive(Debug, Clone)]
+pub struct TemporalSelection {
+    pub selected_adapters: Vec<String>,
+    pub adapter_weights: HashMap<String, f32>,
+    pub confidence_score: f32,
+    pub dependency_chain: Vec<TemporalDependency>,
+    pub adaptation_rationale: String,
 }
 
 /// Main implementation of VDB-first sparse storage
@@ -772,6 +837,210 @@ impl SparseStorage for VDBSparseStorage {
     async fn get_storage_stats(&self) -> Result<StorageStats, SparseStorageError> {
         let stats = self.stats.read().await;
         Ok(stats.clone())
+    }
+    
+    /// Compute gradient dependencies between adapters
+    async fn compute_gradient_dependencies(
+        &self,
+        source_adapter_id: &str,
+        target_adapter_id: &str,
+        temporal_window_secs: u64,
+    ) -> Result<TemporalDependency, SparseStorageError> {
+        // Load both adapters
+        let source_adapter = self.load_adapter(source_adapter_id, SparseLoRAConfig::default()).await?;
+        let target_adapter = self.load_adapter(target_adapter_id, SparseLoRAConfig::default()).await?;
+        
+        // Compute gradient difference between adapters
+        let source_weights = source_adapter.to_vdb_weights().await;
+        let target_weights = target_adapter.to_vdb_weights().await;
+        
+        // Calculate gradient correlation using dot product of active weights
+        let mut correlation_sum = 0.0f32;
+        let mut source_magnitude = 0.0f32;
+        let mut target_magnitude = 0.0f32;
+        let mut common_coords = 0;
+        
+        for (coord, source_value) in source_weights.active_iter() {
+            if let Some(target_value) = target_weights.get_coordinate_opt(coord) {
+                correlation_sum += source_value * target_value;
+                source_magnitude += source_value * source_value;
+                target_magnitude += target_value * target_value;
+                common_coords += 1;
+            }
+        }
+        
+        let gradient_correlation = if source_magnitude > 0.0 && target_magnitude > 0.0 && common_coords > 0 {
+            correlation_sum / (source_magnitude.sqrt() * target_magnitude.sqrt())
+        } else {
+            0.0
+        };
+        
+        // Estimate dependency strength based on gradient correlation and weight similarity
+        let dependency_strength = gradient_correlation.abs();
+        
+        Ok(TemporalDependency {
+            source_adapter_id: source_adapter_id.to_string(),
+            target_adapter_id: target_adapter_id.to_string(),
+            dependency_strength,
+            temporal_distance: Duration::seconds(temporal_window_secs as i64),
+            gradient_correlation,
+            last_updated: Utc::now(),
+        })
+    }
+    
+    /// Track temporal gradient accumulation for dependency analysis
+    async fn accumulate_temporal_gradient(
+        &self,
+        adapter_id: &str,
+        layer_name: &str,
+        gradient_values: &HashMap<Coordinate3D, f32>,
+        timestamp: Option<DateTime<Utc>>,
+    ) -> Result<f32, SparseStorageError> {
+        let timestamp = timestamp.unwrap_or_else(Utc::now);
+        
+        // Compute gradient magnitude
+        let magnitude = gradient_values
+            .values()
+            .map(|v| v * v)
+            .sum::<f32>()
+            .sqrt();
+        
+        // Create sparse update for gradient accumulation
+        let gradient_update = SparseWeightUpdate {
+            adapter_id: format!("{}_gradient_{}", adapter_id, layer_name),
+            updates: gradient_values.clone(),
+            timestamp: timestamp.timestamp() as u64,
+            sequence: {
+                let mut counter = self.sequence_counter.write().await;
+                *counter += 1;
+                *counter
+            },
+        };
+        
+        // Store gradient update for future analysis
+        self.update_sparse_weights(&[gradient_update]).await?;
+        
+        println!("📊 Accumulated gradient for {}/{} with magnitude {:.6}", 
+                adapter_id, layer_name, magnitude);
+        
+        Ok(magnitude)
+    }
+    
+    /// Build gradient-based DAG for temporal dependencies
+    async fn build_gradient_dependency_dag(
+        &self,
+        adapter_ids: &[String],
+        lookback_window_secs: u64,
+    ) -> Result<Vec<TemporalDependency>, SparseStorageError> {
+        let mut dependencies = Vec::new();
+        
+        // Compute all pairwise dependencies
+        for i in 0..adapter_ids.len() {
+            for j in 0..adapter_ids.len() {
+                if i != j {
+                    let source_id = &adapter_ids[i];
+                    let target_id = &adapter_ids[j];
+                    
+                    match self.compute_gradient_dependencies(
+                        source_id,
+                        target_id,
+                        lookback_window_secs,
+                    ).await {
+                        Ok(dependency) => {
+                            // Only include dependencies with significant strength
+                            if dependency.dependency_strength > 0.1 {
+                                dependencies.push(dependency);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to compute dependency {} -> {}: {}", 
+                                         source_id, target_id, e);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Sort by dependency strength (strongest first)
+        dependencies.sort_by(|a, b| 
+            b.dependency_strength.partial_cmp(&a.dependency_strength).unwrap()
+        );
+        
+        println!("🕸️ Built gradient dependency DAG with {} dependencies", dependencies.len());
+        Ok(dependencies)
+    }
+    
+    /// Select optimal temporal adapters based on gradient analysis
+    async fn select_temporal_adapters(
+        &self,
+        context: &TemporalAdaptationContext,
+        max_adapters: usize,
+    ) -> Result<TemporalSelection, SparseStorageError> {
+        // Build dependency DAG for available adapters
+        let dependencies = self.build_gradient_dependency_dag(
+            &context.available_adapters,
+            context.temporal_window_secs,
+        ).await?;
+        
+        // Select adapters based on gradient dependencies and performance
+        let mut selected_adapters = Vec::new();
+        let mut adapter_weights = HashMap::new();
+        let mut confidence_score = 0.0;
+        let mut dependency_chain = Vec::new();
+        
+        // Start with highest-performing adapters
+        let mut performance_scores: Vec<(String, f32)> = context.available_adapters
+            .iter()
+            .enumerate()
+            .map(|(i, adapter_id)| {
+                let perf = context.recent_performance.get(i).cloned().unwrap_or(0.5);
+                (adapter_id.clone(), perf)
+            })
+            .collect();
+        
+        performance_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        
+        // Select top adapters with strong dependencies
+        for (adapter_id, performance) in performance_scores.iter().take(max_adapters) {
+            selected_adapters.push(adapter_id.clone());
+            
+            // Weight based on performance and gradient strength
+            let gradient_strength = dependencies
+                .iter()
+                .filter(|dep| dep.source_adapter_id == *adapter_id || dep.target_adapter_id == *adapter_id)
+                .map(|dep| dep.dependency_strength)
+                .fold(0.0f32, f32::max);
+            
+            let combined_weight = (performance * 0.6) + (gradient_strength * 0.4);
+            adapter_weights.insert(adapter_id.clone(), combined_weight);
+            confidence_score += combined_weight;
+            
+            // Add relevant dependencies to chain
+            for dep in &dependencies {
+                if (dep.source_adapter_id == *adapter_id || dep.target_adapter_id == *adapter_id) 
+                   && dep.dependency_strength > context.gradient_threshold {
+                    dependency_chain.push(dep.clone());
+                }
+            }
+        }
+        
+        confidence_score /= selected_adapters.len() as f32;
+        
+        let adaptation_rationale = format!(
+            "Selected {} adapters based on gradient dependencies (confidence: {:.2})", 
+            selected_adapters.len(), confidence_score
+        );
+        
+        println!("🎯 Selected temporal adapters: {:?} (confidence: {:.2})", 
+                selected_adapters, confidence_score);
+        
+        Ok(TemporalSelection {
+            selected_adapters,
+            adapter_weights,
+            confidence_score,
+            dependency_chain,
+            adaptation_rationale,
+        })
     }
 }
 

@@ -3,6 +3,7 @@
 use crate::storage::vdb::grid::Coordinate3D;
 use std::collections::HashMap;
 use anyhow::Result;
+use chrono::Utc;
 
 #[cxx::bridge(namespace = "hyprstream")]
 pub mod ffi {
@@ -48,6 +49,22 @@ pub mod ffi {
         // I/O operations
         fn writeToFile(self: &LoRAGrid, filename: &str) -> bool;
         fn readFromFile(self: Pin<&mut LoRAGrid>, filename: &str) -> bool;
+        
+        // NEW: Temporal streaming operations
+        fn setTimestamp(self: Pin<&mut LoRAGrid>, timestamp_ms: i64);
+        fn getTimestamp(self: &LoRAGrid) -> i64;
+        fn createTemporalSnapshot(self: &LoRAGrid) -> UniquePtr<LoRAGrid>;
+        fn interpolateWeights(self: &LoRAGrid, other: &LoRAGrid, alpha: f32) -> UniquePtr<LoRAGrid>;
+        
+        // NEW: Streaming update operations
+        fn beginStreamingUpdate(self: Pin<&mut LoRAGrid>);
+        fn endStreamingUpdate(self: Pin<&mut LoRAGrid>) -> bool;
+        fn streamingSetValue(self: Pin<&mut LoRAGrid>, row: i32, col: i32, weight: f32, timestamp_ms: i64);
+        
+        // NEW: Gradient-based operations
+        fn computeGradientMagnitude(self: &LoRAGrid) -> f32;
+        fn computeGradientDifference(self: &LoRAGrid, other: &LoRAGrid) -> UniquePtr<LoRAGrid>;
+        fn applyGradientUpdate(self: Pin<&mut LoRAGrid>, gradient: &LoRAGrid, learning_rate: f32);
     }
     
     // ActiveWeightIterator methods - temporarily disabled due to CXX struct issues
@@ -67,11 +84,15 @@ pub mod ffi {
 
 pub use ffi::*;
 
-/// Safe Rust wrapper for OpenVDB LoRA storage
+/// Safe Rust wrapper for OpenVDB LoRA storage with temporal streaming
 pub struct OpenVDBLoRAAdapter {
     grid: cxx::UniquePtr<ffi::LoRAGrid>,
     shape: (usize, usize),
     sparsity_threshold: f32,
+    /// Temporal streaming state
+    streaming_active: bool,
+    /// Last update timestamp
+    last_update_timestamp: i64,
 }
 
 impl OpenVDBLoRAAdapter {
@@ -83,6 +104,8 @@ impl OpenVDBLoRAAdapter {
             grid,
             shape: (rows, cols),
             sparsity_threshold: 1e-8,
+            streaming_active: false,
+            last_update_timestamp: 0,
         })
     }
     
@@ -249,6 +272,98 @@ impl OpenVDBLoRAAdapter {
     pub fn active_voxel_count(&self) -> u64 {
         // TODO: Get actual count from OpenVDB grid
         0
+    }
+
+    /// Temporal streaming methods for OpenVDB integration
+    
+    /// Set temporal timestamp for this adapter
+    pub fn set_temporal_timestamp(&mut self, timestamp_ms: i64) -> Result<()> {
+        self.grid.pin_mut().setTimestamp(timestamp_ms);
+        self.last_update_timestamp = timestamp_ms;
+        Ok(())
+    }
+
+    /// Get current temporal timestamp
+    pub fn get_temporal_timestamp(&self) -> i64 {
+        self.grid.getTimestamp()
+    }
+
+    /// Create temporal snapshot for interpolation
+    pub fn create_temporal_snapshot(&self) -> Result<OpenVDBLoRAAdapter> {
+        let snapshot_grid = self.grid.createTemporalSnapshot();
+        Ok(OpenVDBLoRAAdapter {
+            grid: snapshot_grid,
+            shape: self.shape,
+            sparsity_threshold: self.sparsity_threshold,
+            streaming_active: false,
+            last_update_timestamp: self.last_update_timestamp,
+        })
+    }
+
+    /// Interpolate weights with another adapter
+    pub fn interpolate_with(&self, other: &OpenVDBLoRAAdapter, alpha: f32) -> Result<OpenVDBLoRAAdapter> {
+        let interpolated_grid = self.grid.interpolateWeights(&other.grid, alpha);
+        Ok(OpenVDBLoRAAdapter {
+            grid: interpolated_grid,
+            shape: self.shape,
+            sparsity_threshold: self.sparsity_threshold,
+            streaming_active: false,
+            last_update_timestamp: chrono::Utc::now().timestamp_millis(),
+        })
+    }
+
+    /// Begin streaming update session
+    pub fn begin_streaming_update(&mut self) -> Result<()> {
+        self.grid.pin_mut().beginStreamingUpdate();
+        self.streaming_active = true;
+        Ok(())
+    }
+
+    /// End streaming update session
+    pub fn end_streaming_update(&mut self) -> Result<bool> {
+        let success = self.grid.pin_mut().endStreamingUpdate();
+        self.streaming_active = false;
+        Ok(success)
+    }
+
+    /// Apply streaming weight update with timestamp
+    pub fn streaming_set_weight(&mut self, row: i32, col: i32, weight: f32, timestamp_ms: i64) -> Result<()> {
+        if self.is_valid_coord(row, col) {
+            self.grid.pin_mut().streamingSetValue(row, col, weight, timestamp_ms);
+            self.last_update_timestamp = timestamp_ms;
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Coordinates out of bounds: ({}, {})", row, col))
+        }
+    }
+
+    /// Compute gradient magnitude for concept drift detection
+    pub fn compute_gradient_magnitude(&self) -> f32 {
+        self.grid.computeGradientMagnitude()
+    }
+
+    /// Compute gradient difference with another adapter
+    pub fn compute_gradient_difference(&self, other: &OpenVDBLoRAAdapter) -> Result<OpenVDBLoRAAdapter> {
+        let gradient_grid = self.grid.computeGradientDifference(&other.grid);
+        Ok(OpenVDBLoRAAdapter {
+            grid: gradient_grid,
+            shape: self.shape,
+            sparsity_threshold: self.sparsity_threshold,
+            streaming_active: false,
+            last_update_timestamp: chrono::Utc::now().timestamp_millis(),
+        })
+    }
+
+    /// Apply gradient update to this adapter
+    pub fn apply_gradient_update(&mut self, gradient: &OpenVDBLoRAAdapter, learning_rate: f32) -> Result<()> {
+        self.grid.pin_mut().applyGradientUpdate(&gradient.grid, learning_rate);
+        self.last_update_timestamp = chrono::Utc::now().timestamp_millis();
+        Ok(())
+    }
+
+    /// Check if streaming is currently active
+    pub fn is_streaming_active(&self) -> bool {
+        self.streaming_active
     }
 }
 

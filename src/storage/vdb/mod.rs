@@ -18,6 +18,7 @@ pub mod compression;
 pub mod adapter_store;
 pub mod neuralvdb_codec;
 pub mod sparse_storage; // New VDB-first storage interface
+pub mod temporal_streaming; // Temporal streaming layer with futures::Stream
 
 // OpenVDB integration (only VDB backend)
 
@@ -31,6 +32,7 @@ pub use grid::*;
 pub use compression::*;
 pub use adapter_store::*;
 pub use sparse_storage::*; // Export new VDB-first interface
+pub use temporal_streaming::*; // Export temporal streaming with futures::Stream
 
 // Export OpenVDB bindings when VDB feature enabled
 

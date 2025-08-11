@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use std::path::Path;
 use std::time::Instant;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use mistralrs::{
     GgufModelBuilder, GgufXLoraModelBuilder, Model, TextMessages, TextMessageRole, IsqType,
@@ -27,6 +28,10 @@ use mistralrs::{
 
 use super::{RuntimeEngine, ModelInfo, GenerationRequest, GenerationResult, FinishReason, RuntimeConfig};
 use crate::adapters::lora_checkpoints::{LoRACheckpoint, LoRAWeightsData};
+use crate::storage::vdb::{
+    TemporalStreamingLayer, TemporalStreamingConfig, TemporalWeightStream, 
+    TemporalWeightUpdate, VDBSparseStorage, SparseStorageConfig
+};
 
 /// Mistral.rs runtime engine implementation with X-LoRA support
 pub struct MistralEngine {
@@ -42,6 +47,10 @@ pub struct MistralEngine {
     adaptation_state: AdaptationState,
     /// Model builder type for reconstruction
     builder_config: ModelBuilderConfig,
+    /// Temporal streaming layer for real-time LoRA updates
+    temporal_streaming: Option<Arc<TemporalStreamingLayer>>,
+    /// Active temporal streams
+    active_streams: HashMap<String, TemporalWeightStream>,
 }
 
 /// X-LoRA adapter wrapper
@@ -181,12 +190,181 @@ impl MistralEngine {
                 tokenizer_json: None,
                 quantization: None,
             },
+            temporal_streaming: None,
+            active_streams: HashMap::new(),
         })
     }
 
     /// Create with default configuration
     pub fn new_default() -> Result<Self> {
         Self::new(RuntimeConfig::default())
+    }
+
+    /// Initialize temporal streaming layer for real-time LoRA updates
+    pub async fn initialize_temporal_streaming(&mut self) -> Result<()> {
+        tracing::info!("🌊 Initializing temporal streaming for real-time LoRA updates");
+        
+        // Create VDB sparse storage backend
+        let storage_config = SparseStorageConfig::default();
+        let vdb_storage = Arc::new(VDBSparseStorage::new(storage_config).await
+            .map_err(|e| anyhow!("Failed to create VDB storage: {}", e))?);
+        
+        // Create temporal streaming layer
+        let streaming_config = TemporalStreamingConfig::default();
+        let temporal_layer = Arc::new(TemporalStreamingLayer::new(
+            vdb_storage, 
+            streaming_config
+        ).await?);
+        
+        self.temporal_streaming = Some(temporal_layer);
+        
+        tracing::info!("✅ Temporal streaming layer initialized");
+        Ok(())
+    }
+
+    /// Create temporal streaming session for real-time weight updates
+    pub async fn create_temporal_stream(&mut self, adapter_id: String) -> Result<()> {
+        tracing::info!("🌊 Creating temporal stream for adapter: {}", adapter_id);
+        
+        let temporal_layer = self.temporal_streaming.as_ref()
+            .ok_or_else(|| anyhow!("Temporal streaming not initialized. Call initialize_temporal_streaming() first"))?;
+        
+        // Create streaming session
+        let stream = temporal_layer.create_temporal_stream(
+            adapter_id.clone(),
+            None, // No layer filtering for now
+        ).await?;
+        
+        // Store active stream
+        self.active_streams.insert(adapter_id.clone(), stream);
+        
+        tracing::info!("✅ Created temporal stream for adapter: {}", adapter_id);
+        Ok(())
+    }
+
+    /// Process temporal weight updates from stream
+    pub async fn process_temporal_updates(&mut self, adapter_id: &str) -> Result<Vec<TemporalWeightUpdate>> {
+        use futures_util::StreamExt;
+        
+        let stream = self.active_streams.get_mut(adapter_id)
+            .ok_or_else(|| anyhow!("No temporal stream found for adapter: {}", adapter_id))?;
+        
+        let mut updates = Vec::new();
+        
+        // Collect available updates (non-blocking)
+        while let Some(update_result) = stream.next().await {
+            match update_result {
+                Ok(update) => {
+                    tracing::debug!("📥 Received temporal update: {} weights", update.weights.len());
+                    updates.push(update);
+                }
+                Err(e) => {
+                    tracing::warn!("⚠️ Temporal stream error: {}", e);
+                    break;
+                }
+            }
+            
+            // Limit batch size to prevent blocking
+            if updates.len() >= 100 {
+                break;
+            }
+        }
+        
+        // Apply updates to model if available
+        if !updates.is_empty() {
+            self.apply_temporal_updates_to_model(&updates).await?;
+        }
+        
+        Ok(updates)
+    }
+
+    /// Apply temporal updates directly to mistral.rs model (when supported)
+    async fn apply_temporal_updates_to_model(&mut self, updates: &[TemporalWeightUpdate]) -> Result<()> {
+        tracing::debug!("🔄 Applying {} temporal updates to model", updates.len());
+        
+        // Current limitation: mistral.rs doesn't support real-time weight updates
+        // We track updates locally and apply them via X-LoRA adapter reloading
+        
+        for update in updates {
+            // Update local adapter tracking
+            if let Some(adapter) = self.xlora_adapters.get_mut(&update.adapter_id) {
+                adapter.last_updated = update.timestamp;
+                adapter.metrics.total_uses += 1;
+                
+                // Convert temporal update to our LoRA format
+                let lora_weights = self.convert_temporal_update_to_lora(update)?;
+                adapter.weights = lora_weights;
+                
+                tracing::debug!("🔄 Updated local tracking for adapter: {}", update.adapter_id);
+            } else {
+                tracing::warn!("⚠️ Adapter not found for temporal update: {}", update.adapter_id);
+            }
+        }
+        
+        // TODO: When mistral.rs adds runtime weight update APIs, apply updates directly
+        tracing::debug!("📋 Note: Real-time model updates pending mistral.rs runtime API support");
+        
+        Ok(())
+    }
+
+    /// Convert temporal weight update to LoRA format
+    fn convert_temporal_update_to_lora(&self, update: &TemporalWeightUpdate) -> Result<LoRAWeights> {
+        // Convert sparse coordinate updates to LoRA A/B matrix format
+        let mut a_matrices = HashMap::new();
+        let mut b_matrices = HashMap::new();
+        
+        // Simple mapping: split coordinates between A and B matrices
+        let mut a_weights = Vec::new();
+        let mut b_weights = Vec::new();
+        
+        for (coord, weight) in &update.weights {
+            if coord.x() % 2 == 0 {
+                a_weights.push(vec![*weight]); // Simplified: single-element rows
+            } else {
+                b_weights.push(vec![*weight]);
+            }
+        }
+        
+        // Store in layer-specific matrices
+        a_matrices.insert(update.layer_name.clone(), a_weights);
+        b_matrices.insert(update.layer_name.clone(), b_weights);
+        
+        Ok(LoRAWeights {
+            a_matrices,
+            b_matrices,
+            scaling: 1.0,
+            target_modules: vec![update.layer_name.clone()],
+        })
+    }
+
+    /// Enable real-time temporal adaptation with streaming
+    pub async fn enable_temporal_adaptation(&mut self, adapter_id: String) -> Result<()> {
+        tracing::info!("🧠 Enabling temporal adaptation for adapter: {}", adapter_id);
+        
+        // Initialize temporal streaming if not already done
+        if self.temporal_streaming.is_none() {
+            self.initialize_temporal_streaming().await?;
+        }
+        
+        // Create temporal stream for this adapter
+        self.create_temporal_stream(adapter_id.clone()).await?;
+        
+        // Update adaptation state
+        self.adaptation_state.adaptation_mode = AdaptationMode::XLoRA {
+            active_adapters: vec![adapter_id.clone()],
+            max_adapters: 4, // Default X-LoRA limit
+        };
+        
+        tracing::info!("✅ Temporal adaptation enabled for: {}", adapter_id);
+        Ok(())
+    }
+
+    /// Get temporal streaming statistics
+    pub async fn get_temporal_stats(&self) -> Result<crate::storage::vdb::TemporalStreamingStats> {
+        let temporal_layer = self.temporal_streaming.as_ref()
+            .ok_or_else(|| anyhow!("Temporal streaming not initialized"))?;
+        
+        Ok(temporal_layer.get_streaming_stats().await)
     }
 
     /// Load model with X-LoRA configuration
