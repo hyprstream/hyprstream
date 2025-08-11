@@ -1,63 +1,58 @@
 use crate::aggregation::{AggregateFunction, GroupBy, TimeWindow};
-// Temporarily disabled due to arrow dependency issues  
-// use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::SystemTime;
 
-/// Serializable schema representation
+/// Simplified schema representation for ML inference
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SerializableSchema {
-    fields: Vec<SerializableField>,
+pub struct Schema {
+    pub fields: Vec<Field>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SerializableField {
-    name: String,
-    data_type: String,
-    nullable: bool,
+pub struct Field {
+    pub name: String,
+    pub data_type: DataType,
+    pub nullable: bool,
 }
 
-impl From<&Schema> for SerializableSchema {
-    fn from(schema: &Schema) -> Self {
-        SerializableSchema {
-            fields: schema
-                .fields()
-                .iter()
-                .map(|f| SerializableField {
-                    name: f.name().clone(),
-                    data_type: format!("{:?}", f.data_type()),
-                    nullable: f.is_nullable(),
-                })
-                .collect(),
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DataType {
+    Int64,
+    Float64,
+    String,
+    Timestamp,
+}
+
+impl Field {
+    pub fn new(name: &str, data_type: DataType, nullable: bool) -> Self {
+        Self {
+            name: name.to_string(),
+            data_type,
+            nullable,
         }
+    }
+    
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    
+    pub fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+    
+    pub fn is_nullable(&self) -> bool {
+        self.nullable
     }
 }
 
-impl From<SerializableSchema> for Schema {
-    fn from(schema: SerializableSchema) -> Self {
-        let fields: Fields = schema
-            .fields
-            .into_iter()
-            .map(|f| {
-                Field::new(
-                    &f.name,
-                    // Parse data type from string representation
-                    match f.data_type.as_str() {
-                        "Int64" => DataType::Int64,
-                        "Float64" => DataType::Float64,
-                        "Utf8" => DataType::Utf8,
-                        "Timestamp(Nanosecond, None)" => DataType::Timestamp(TimeUnit::Nanosecond, None),
-                        _ => DataType::Utf8, // Default to string for unknown types
-                    },
-                    f.nullable,
-                )
-            })
-            .collect::<Vec<Field>>()
-            .into();
-
-        Schema::new(fields)
+impl Schema {
+    pub fn new(fields: Vec<Field>) -> Self {
+        Self { fields }
+    }
+    
+    pub fn fields(&self) -> &[Field] {
+        &self.fields
     }
 }
 
@@ -77,23 +72,7 @@ pub struct ViewDefinition {
     pub group_by: Option<GroupBy>,
     pub window: Option<TimeWindow>,
     pub dependencies: HashSet<String>,
-    #[serde(serialize_with = "serialize_schema", deserialize_with = "deserialize_schema")]
-    pub schema: Arc<Schema>,
-}
-
-fn serialize_schema<S>(schema: &Arc<Schema>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    SerializableSchema::from(schema.as_ref()).serialize(serializer)
-}
-
-fn deserialize_schema<'de, D>(deserializer: D) -> Result<Arc<Schema>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let serializable = SerializableSchema::deserialize(deserializer)?;
-    Ok(Arc::new(Schema::from(serializable)))
+    pub schema: Schema,
 }
 
 /// Metadata for a view stored in the backend
@@ -112,7 +91,7 @@ impl ViewDefinition {
         aggregations: Vec<AggregationSpec>,
         group_by: Option<GroupBy>,
         window: Option<TimeWindow>,
-        schema: Arc<Schema>,
+        schema: Schema,
     ) -> Self {
         // Calculate dependencies from source table and any referenced columns
         let mut dependencies = HashSet::new();

@@ -59,9 +59,4 @@ impl From<VDBErrorWrapper> for tonic::Status {
     }
 }
 
-// Convert Status wrapper to DataFusion error
-impl From<StatusWrapper> for datafusion::error::DataFusionError {
-    fn from(status: StatusWrapper) -> Self {
-        datafusion::error::DataFusionError::External(Box::new(status))
-    }
-}
+// DataFusion error conversion removed - no longer using datafusion

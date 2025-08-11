@@ -4,7 +4,7 @@ use crate::aggregation::{AggregateFunction, AggregateResult, GroupBy, TimeWindow
 use crate::metrics::MetricRecord;
 use crate::storage::VDBSparseStorage;
 use crate::storage::vdb::sparse_storage::SparseStorage;
-use arrow_schema::{DataType, Field, Schema};
+// Use simplified schema instead of arrow-schema
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::Status;
@@ -26,8 +26,7 @@ pub struct BatchAggregation {
     pub min_value: f64,
     /// Maximum value in the window
     pub max_value: f64,
-    /// Schema for the aggregation
-    pub schema: Arc<Schema>,
+    // Schema removed - simplified for VDB-first architecture
     /// Column to aggregate
     pub value_column: String,
     /// Grouping specification
@@ -41,7 +40,6 @@ impl BatchAggregation {
         metric_id: String,
         window_start: i64,
         window_end: i64,
-        schema: Arc<Schema>,
         value_column: String,
         group_by: GroupBy,
         window: Option<TimeWindow>,
@@ -54,7 +52,6 @@ impl BatchAggregation {
             running_count: 0,
             min_value: f64::INFINITY,
             max_value: f64::NEG_INFINITY,
-            schema,
             value_column,
             group_by,
             window,
@@ -67,11 +64,6 @@ impl BatchAggregation {
         window_end: i64,
         window: TimeWindow,
     ) -> Self {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("metric", DataType::Utf8, false),
-            Field::new("value", DataType::Float64, false),
-            Field::new("timestamp", DataType::Int64, false),
-        ]));
         let group_by = GroupBy {
             columns: vec!["metric".to_string()],
             time_column: Some("timestamp".to_string()),
@@ -84,7 +76,6 @@ impl BatchAggregation {
             running_count: 0,
             min_value: f64::INFINITY,
             max_value: f64::NEG_INFINITY,
-            schema,
             value_column: "value".to_string(),
             group_by,
             window: Some(window),
@@ -92,7 +83,6 @@ impl BatchAggregation {
     }
 
     pub fn new(
-        schema: Arc<Schema>,
         value_column: String,
         group_by: GroupBy,
         window: Option<TimeWindow>,
@@ -105,7 +95,6 @@ impl BatchAggregation {
             running_count: 0,
             min_value: f64::INFINITY,
             max_value: f64::NEG_INFINITY,
-            schema,
             value_column,
             group_by,
             window,
@@ -237,17 +226,17 @@ pub trait VDBMetricsStorage: Send + Sync + 'static {
         Ok(results)
     }
 
-    /// Get the VDB-optimized schema for metric records
-    fn get_metrics_schema() -> Schema {
-        Schema::new(vec![
-            Field::new("adapter_id", DataType::Utf8, false),
-            Field::new("timestamp", DataType::Int64, false),
-            Field::new("active_weights", DataType::Int64, false),
-            Field::new("sparsity_ratio", DataType::Float64, false),
-            Field::new("memory_usage", DataType::Int64, false),
-            Field::new("compression_ratio", DataType::Float64, false),
-            Field::new("updates_per_second", DataType::Float64, false),
-        ])
+    /// Get metric field names for VDB storage
+    fn get_metric_fields() -> Vec<&'static str> {
+        vec![
+            "adapter_id",
+            "timestamp", 
+            "active_weights",
+            "sparsity_ratio",
+            "memory_usage",
+            "compression_ratio", 
+            "updates_per_second"
+        ]
     }
 }
 

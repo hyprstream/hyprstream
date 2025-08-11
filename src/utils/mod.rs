@@ -1,8 +1,3 @@
-// Temporarily disabled due to arrow dependency issues
-// use arrow::array::{Int64Array, Float64Array, StringArray};
-// use arrow::record_batch::RecordBatch;
-// use arrow::datatypes::DataType;
-use serde_json::{Map, Value as JsonValue};
 use std::error::Error;
 
 // /// Convert an Arrow RecordBatch to a JSON array of objects

@@ -23,10 +23,7 @@ path = "src/bin/main.rs"
 doc = true
 
 [dependencies]
-arrow = "53.1.0"
-arrow-flight = { version = "53.1.0", features = ["cli", "flight-sql-experimental", "tls"] }
-datafusion = "42.2.0"
-datafusion-common = "42.2.0"
+# Arrow and DataFusion dependencies removed - focused on ML inference only
 bytes = "1.9.0"
 futures = { version = "0.3.31", features = ["alloc"] }
 polars = "0.45.1"
@@ -46,10 +43,7 @@ users = "0.11"
 rlimit = "0.10"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
 
-# ADBC dependencies
-arrow-array = "53.1.0"
-arrow-schema = "53.1.0"
-arrow-ipc = "53.1.0"
+# ADBC dependencies removed - focused on ML inference only
 
 # Configuration
 config = { version = "0.13", features = ["toml", "yaml", "json"] }
@@ -72,7 +66,7 @@ async-stream = "0.3"
 anyhow = "1.0.95"
 daemonize = "0.5.0"
 prost = "0.13"
-arrow-json = "53.1.0"
+# Arrow JSON removed - focused on ML inference only
 
 # NanoVDB and ML dependencies
 thiserror = "1.0"
@@ -81,9 +75,9 @@ rand = "0.8"
 # tch = "0.15"  # Temporarily disabled due to dependency issues
 
 # Runtime Integration Dependencies
-llama-cpp-2 = "0.1.67"          # Rust bindings for llama.cpp
-candle-core = "0.6"             # Tensor operations for LoRA
-candle-nn = "0.6"               # Neural network layers
+llama-cpp-2 = "0.1.67"          # TEMPORARY: Keep during migration, will be removed
+mistralrs = { path = "../mistral.rs/mistralrs" } # Local path to avoid dependency conflicts
+mistralrs-core = { path = "../mistral.rs/mistralrs-core" } # Core functionality
 hf-hub = { version = "0.4.3", features = ["tokio"] }  # HuggingFace model downloads
 uuid = { version = "1.0", features = ["v4", "serde"] }
 reqwest = { version = "0.11", features = ["json", "stream"] }

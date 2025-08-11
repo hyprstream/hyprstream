@@ -13,23 +13,17 @@ pub mod api;
 pub mod auth;
 pub mod cli;
 pub mod config;
-// Temporarily disabled due to datafusion dependency issues
-// pub mod error;
+pub mod error;
 pub mod inference;
-// pub mod metrics;
+pub mod metrics;
 pub mod models;
-// pub mod query;
+// pub mod query; // Removed - data processing features deprecated in favor of ML inference
 pub mod runtime;
 pub mod service;
 pub mod storage;
 pub mod utils;
 
-// Temporarily disabled due to datafusion dependency issues
-// pub use query::{
-//     DataFusionExecutor, DataFusionPlanner, ExecutorConfig, OptimizationHint, Query, QueryExecutor,
-//     QueryPlanner,
-// };
-// FlightSQL services removed - using REST API only
+// Query/DataFusion functionality removed - focused on ML inference only
 pub use storage::{
     VDBSparseStorage, SparseStorageConfig, SparseStorage,
     SparseWeightUpdate, EmbeddingMatch, SparseStorageError
