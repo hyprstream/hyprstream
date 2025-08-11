@@ -180,6 +180,45 @@ pub struct GenerationRequest {
     pub stop_tokens: Vec<String>,
     pub seed: Option<u32>,
     pub stream: bool,
+    
+    // NEW: X-LoRA and real-time adaptation fields
+    /// Active adapter IDs for this generation (X-LoRA feature)
+    pub active_adapters: Option<Vec<String>>,
+    
+    /// Real-time adaptation request
+    pub realtime_adaptation: Option<RealtimeAdaptationRequest>,
+    
+    /// User feedback for learning (optional)
+    pub user_feedback: Option<UserFeedbackRequest>,
+}
+
+/// Real-time adaptation request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RealtimeAdaptationRequest {
+    /// Target adapter ID for updates
+    pub adapter_id: String,
+    
+    /// Enable feedback integration for this generation
+    pub feedback_integration: bool,
+    
+    /// Learning rate override (optional)
+    pub learning_rate_override: Option<f32>,
+}
+
+/// User feedback request structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserFeedbackRequest {
+    /// Quality score from 0.0 to 1.0
+    pub quality_score: f32,
+    
+    /// Whether the response was helpful
+    pub helpful: bool,
+    
+    /// Optional text corrections or suggestions
+    pub corrections: Option<String>,
+    
+    /// Additional context about the feedback
+    pub context: Option<String>,
 }
 
 impl From<&GenerationConfig> for GenerationRequest {
@@ -194,6 +233,9 @@ impl From<&GenerationConfig> for GenerationRequest {
             stop_tokens: config.stop_tokens.clone(),
             seed: config.seed,
             stream: config.stream,
+            active_adapters: None,
+            realtime_adaptation: None,
+            user_feedback: None,
         }
     }
 }

@@ -214,6 +214,9 @@ impl InferenceEngine {
             stop_tokens: vec!["</s>".to_string(), "<|endoftext|>".to_string()],
             seed: None,
             stream: true,
+            active_adapters: None,
+            realtime_adaptation: None,
+            user_feedback: None,
         };
         
         // Generate text using the inference engine

@@ -790,6 +790,97 @@ pub async fn handle_model_command(
             println!();
             println!("Configure registries with 'hyprstream config' command");
         }
+        ModelAction::Test { path, prompt, max_tokens, xlora, xlora_model_id, max_adapters } => {
+            info!("🧪 Testing model inference with MistralEngine: {}", path.display());
+            
+            use crate::runtime::{MistralEngine, RuntimeConfig, XLoRARoutingStrategy};
+            use mistralrs::Ordering;
+            
+            if !path.exists() {
+                eprintln!("❌ Model file not found: {}", path.display());
+                eprintln!("Please check the path and try again.");
+                return Ok(());
+            }
+            
+            println!("🚀 Initializing MistralEngine...");
+            let runtime_config = RuntimeConfig::default();
+            let mut engine = MistralEngine::new(runtime_config)?;
+            
+            if xlora {
+                if let Some(xlora_id) = xlora_model_id {
+                    println!("🔀 Loading model with X-LoRA configuration...");
+                    println!("   Model: {}", path.display());
+                    println!("   X-LoRA ID: {}", xlora_id);
+                    println!("   Max Adapters: {}", max_adapters);
+                    
+                    // Create simple ordering for testing
+                    let ordering = Ordering {
+                        adapters: Some(vec!["default".to_string()]),
+                        layers: None,
+                        base_model_id: "test-model".to_string(),
+                        preload_adapters: None,
+                    };
+                    
+                    match engine.load_model_with_xlora(
+                        &path,
+                        xlora_id,
+                        ordering,
+                        max_adapters,
+                        XLoRARoutingStrategy::Learned,
+                    ).await {
+                        Ok(_) => println!("✅ X-LoRA model loaded successfully"),
+                        Err(e) => {
+                            eprintln!("❌ Failed to load X-LoRA model: {}", e);
+                            eprintln!("💡 Try without --xlora flag for basic model testing");
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    eprintln!("❌ --xlora-model-id is required when using --xlora");
+                    return Ok(());
+                }
+            } else {
+                println!("📥 Loading model...");
+                match engine.load_model(&path).await {
+                    Ok(_) => println!("✅ Model loaded successfully"),
+                    Err(e) => {
+                        eprintln!("❌ Failed to load model: {}", e);
+                        return Ok(());
+                    }
+                }
+            }
+            
+            println!("🤖 Generating response...");
+            println!("   Prompt: \"{}\"", prompt);
+            println!("   Max tokens: {}", max_tokens);
+            println!();
+            
+            let start_time = std::time::Instant::now();
+            match engine.generate(&prompt, max_tokens).await {
+                Ok(response) => {
+                    let duration = start_time.elapsed();
+                    println!("✅ Generated response in {:.2}s:", duration.as_secs_f64());
+                    println!();
+                    println!("📝 Response:");
+                    println!("{}", response.trim());
+                    println!();
+                    
+                    // Show model info
+                    let model_info = engine.model_info();
+                    println!("📊 Model Information:");
+                    println!("   Name: {}", model_info.name);
+                    println!("   Architecture: {}", model_info.architecture);
+                    if let Some(quant) = &model_info.quantization {
+                        println!("   Quantization: {}", quant);
+                    }
+                    println!("   Context Length: {}", model_info.context_length);
+                }
+                Err(e) => {
+                    eprintln!("❌ Generation failed: {}", e);
+                    eprintln!("This may indicate compatibility issues with the model format.");
+                }
+            }
+        }
     }
     
     Ok(())
@@ -1996,6 +2087,9 @@ async fn perform_checkpoint_inference_with_weights(
         stop_tokens: vec!["</s>".to_string(), "<|endoftext|>".to_string()],
         seed: None,
         stream: false,
+        active_adapters: None,
+        realtime_adaptation: None,
+        user_feedback: None,
     };
     
     // Perform inference using the base model

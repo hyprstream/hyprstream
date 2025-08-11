@@ -1,5 +1,6 @@
 use crate::aggregation::{AggregateFunction, GroupBy, TimeWindow};
-use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
+// Temporarily disabled due to arrow dependency issues  
+// use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;

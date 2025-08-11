@@ -12,7 +12,8 @@
 
 // VDB-first storage for sparse adaptive layers
 pub mod vdb;
-pub mod view;
+// Temporarily disabled due to arrow dependency issues
+// pub mod view;
 pub mod paths;
 pub mod lora_storage_manager;
 pub mod lora_weight_cache;
@@ -37,7 +38,8 @@ pub use lora_weight_cache::{
 };
 
 // Legacy view support (retained for compatibility)
-pub use view::{ViewDefinition, ViewMetadata};
+// Temporarily disabled due to arrow dependency issues
+// pub use view::{ViewDefinition, ViewMetadata};
 
 // XDG-compliant path management (internal use only)
 // Note: StoragePaths should only be used by config module

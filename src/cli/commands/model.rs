@@ -99,6 +99,32 @@ pub enum ModelAction {
     
     /// List available registries
     Registries,
+    
+    /// Test a model with inference
+    Test {
+        /// Model path (local GGUF file)
+        path: std::path::PathBuf,
+        
+        /// Test prompt
+        #[arg(long, default_value = "Hello, how are you?")]
+        prompt: String,
+        
+        /// Maximum tokens to generate
+        #[arg(long, default_value = "50")]
+        max_tokens: usize,
+        
+        /// Use X-LoRA if available
+        #[arg(long)]
+        xlora: bool,
+        
+        /// X-LoRA model ID (required if --xlora is used)
+        #[arg(long)]
+        xlora_model_id: Option<String>,
+        
+        /// Maximum adapters for X-LoRA
+        #[arg(long, default_value = "4")]
+        max_adapters: usize,
+    },
 }
 
 /// Cache management actions

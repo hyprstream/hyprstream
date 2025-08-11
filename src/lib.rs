@@ -13,26 +13,29 @@ pub mod api;
 pub mod auth;
 pub mod cli;
 pub mod config;
-pub mod error;
+// Temporarily disabled due to datafusion dependency issues
+// pub mod error;
 pub mod inference;
-pub mod metrics;
+// pub mod metrics;
 pub mod models;
-pub mod query;
+// pub mod query;
 pub mod runtime;
 pub mod service;
 pub mod storage;
 pub mod utils;
 
-pub use query::{
-    DataFusionExecutor, DataFusionPlanner, ExecutorConfig, OptimizationHint, Query, QueryExecutor,
-    QueryPlanner,
-};
+// Temporarily disabled due to datafusion dependency issues
+// pub use query::{
+//     DataFusionExecutor, DataFusionPlanner, ExecutorConfig, OptimizationHint, Query, QueryExecutor,
+//     QueryPlanner,
+// };
 // FlightSQL services removed - using REST API only
 pub use storage::{
     VDBSparseStorage, SparseStorageConfig, SparseStorage,
     SparseWeightUpdate, EmbeddingMatch, SparseStorageError
 };
 pub use runtime::{
-    RuntimeEngine, LlamaCppEngine, LoRAEngineWrapper, SparseLoRAAdapter, LoRAConfig,
-    ModelInfo, GenerationRequest, GenerationResult, FinishReason, RuntimeConfig
+    RuntimeEngine, MistralEngine, LlamaCppEngine, LoRAEngineWrapper, SparseLoRAAdapter, LoRAConfig,
+    ModelInfo, GenerationRequest, GenerationResult, FinishReason, RuntimeConfig,
+    XLoRAAdapter, AdaptationMode, UserFeedback, XLoRARoutingStrategy, AdapterMetrics
 };
