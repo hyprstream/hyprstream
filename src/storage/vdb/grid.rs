@@ -277,6 +277,70 @@ impl SparseWeights {
             sum / self.active_weights.len() as f32
         }
     }
+
+    /// Get weight value by 3D coordinate (required for temporal streaming)
+    pub fn get_coordinate(&self, coord: Coordinate3D) -> f32 {
+        let linear_idx = self.coord_to_linear(coord);
+        self.get(linear_idx)
+    }
+
+    /// Get weight value by 3D coordinate (optional variant)
+    pub fn get_coordinate_opt(&self, coord: Coordinate3D) -> Option<f32> {
+        let linear_idx = self.coord_to_linear(coord);
+        self.active_weights.get(&linear_idx).copied()
+    }
+
+    /// Set weight by 3D coordinate
+    pub fn set_coordinate(&mut self, coord: Coordinate3D, value: f32) {
+        let linear_idx = self.coord_to_linear(coord);
+        self.set(linear_idx, value);
+    }
+
+    /// Iterator over active weights as 3D coordinates
+    pub fn active_coord_iter(&self) -> impl Iterator<Item = (Coordinate3D, f32)> + '_ {
+        self.active_weights.iter().map(|(&idx, &val)| {
+            let coord = self.linear_to_coord(idx);
+            (coord, val)
+        })
+    }
+
+    /// Convert 3D coordinate to linear index
+    fn coord_to_linear(&self, coord: Coordinate3D) -> usize {
+        match self.shape.len() {
+            2 => {
+                let w = self.shape[1];
+                (coord.y() as usize) * w + (coord.x() as usize)
+            }
+            3 => {
+                let h = self.shape[1];
+                let w = self.shape[2];
+                (coord.z() as usize) * h * w + (coord.y() as usize) * w + (coord.x() as usize)
+            }
+            _ => coord.x() as usize // Fallback for 1D
+        }
+    }
+
+    /// Convert linear index to 3D coordinate
+    fn linear_to_coord(&self, index: usize) -> Coordinate3D {
+        match self.shape.len() {
+            2 => {
+                let w = self.shape[1];
+                let y = index / w;
+                let x = index % w;
+                Coordinate3D::new(x as i32, y as i32, 0)
+            }
+            3 => {
+                let h = self.shape[1];
+                let w = self.shape[2];
+                let z = index / (h * w);
+                let remainder = index % (h * w);
+                let y = remainder / w;
+                let x = remainder % w;
+                Coordinate3D::new(x as i32, y as i32, z as i32)
+            }
+            _ => Coordinate3D::new(index as i32, 0, 0) // Fallback
+        }
+    }
     
     /// Calculate standard deviation of active weights
     pub fn std_value(&self) -> f32 {

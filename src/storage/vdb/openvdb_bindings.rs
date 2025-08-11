@@ -190,26 +190,22 @@ impl OpenVDBLoRAAdapter {
         Ok(())
     }
     
-    /// Save adapter to file (temporarily disabled due to CXX string issues)
-    pub fn save(&self, _filename: &str) -> Result<()> {
-        // TODO: Re-enable once we resolve CXX string parameter issues
-        // if self.grid.writeToFile(filename) {
-        //     Ok(())
-        // } else {
-        //     Err(anyhow::anyhow!("Failed to write LoRA adapter to {}", filename))
-        // }
-        Err(anyhow::anyhow!("File I/O temporarily disabled"))
+    /// Save adapter to file (now enabled with proper OpenVDB integration)
+    pub fn save(&self, filename: &str) -> Result<()> {
+        if self.grid.writeToFile(filename) {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Failed to write LoRA adapter to {}", filename))
+        }
     }
     
-    /// Load adapter from file (temporarily disabled due to CXX string issues)
-    pub fn load(&mut self, _filename: &str) -> Result<()> {
-        // TODO: Re-enable once we resolve CXX string parameter issues
-        // if self.grid.pin_mut().readFromFile(filename) {
-        //     Ok(())
-        // } else {
-        //     Err(anyhow::anyhow!("Failed to read LoRA adapter from {}", filename))
-        // }
-        Err(anyhow::anyhow!("File I/O temporarily disabled"))
+    /// Load adapter from file (now enabled with proper OpenVDB integration)
+    pub fn load(&mut self, filename: &str) -> Result<()> {
+        if self.grid.pin_mut().readFromFile(filename) {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Failed to read LoRA adapter from {}", filename))
+        }
     }
     
     /// Create iterator over active weights (temporarily disabled)
@@ -261,17 +257,35 @@ impl OpenVDBLoRAAdapter {
         (col as usize) < self.shape.1
     }
     
-    /// Sparse matrix multiplication (placeholder)
-    pub fn sparse_multiply(&self, _input: &[f32], _output: &mut [f32]) -> Result<()> {
-        // TODO: Implement sparse matrix multiplication using OpenVDB
-        println!("⚠️ sparse_multiply not yet implemented");
+    /// Sparse matrix multiplication using OpenVDB active voxel iteration
+    pub fn sparse_multiply(&self, input: &[f32], output: &mut [f32]) -> Result<()> {
+        // Reset output
+        output.fill(0.0);
+        
+        // Iterate over active weights and perform sparse multiplication
+        // For a 2D weight matrix W and input vector x: y = W * x
+        let (rows, cols) = self.shape;
+        
+        if input.len() != cols || output.len() != rows {
+            return Err(anyhow::anyhow!(
+                "Dimension mismatch: input={}, output={}, weight={}x{}",
+                input.len(), output.len(), rows, cols
+            ));
+        }
+        
+        // Use OpenVDB iterator to multiply only active (non-zero) weights
+        for (row, col, weight) in self.active_weights() {
+            if row >= 0 && (row as usize) < rows && col >= 0 && (col as usize) < cols {
+                output[row as usize] += weight * input[col as usize];
+            }
+        }
+        
         Ok(())
     }
     
-    /// Get active voxel count
+    /// Get active voxel count from OpenVDB
     pub fn active_voxel_count(&self) -> u64 {
-        // TODO: Get actual count from OpenVDB grid
-        0
+        self.grid.activeVoxelCount() as u64
     }
 
     /// Temporal streaming methods for OpenVDB integration

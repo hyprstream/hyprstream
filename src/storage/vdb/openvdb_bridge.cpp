@@ -8,13 +8,17 @@
 #include <openvdb/io/File.h>
 #include <iostream>
 #include <algorithm>
+#include <chrono>
 
 namespace hyprstream {
 
 LoRAGrid::LoRAGrid() 
     : grid_(openvdb::FloatGrid::create(0.0f))  // Background value = 0
     , access_count_(0)
-    , accessor_dirty_(true) 
+    , accessor_dirty_(true)
+    , timestamp_ms_(0)
+    , streaming_active_(false)
+    , streaming_updates_(0)
 {
     // Initialize OpenVDB
     openvdb::initialize();
@@ -234,6 +238,168 @@ void SparseBatchOps::optimizeSparsity(LoRAGrid& grid, float sparsity_threshold) 
     }
     
     grid.prune();
+}
+
+// NEW: Temporal streaming operations implementation
+
+void LoRAGrid::setTimestamp(int64_t timestamp_ms) {
+    timestamp_ms_ = timestamp_ms;
+    
+    // Store timestamp in grid metadata
+    grid_->insertMeta("timestamp", openvdb::Int64Metadata(timestamp_ms));
+}
+
+int64_t LoRAGrid::getTimestamp() const {
+    return timestamp_ms_;
+}
+
+std::unique_ptr<LoRAGrid> LoRAGrid::createTemporalSnapshot() const {
+    auto snapshot = std::make_unique<LoRAGrid>();
+    
+    // Deep copy the grid
+    snapshot->grid_ = grid_->deepCopy();
+    snapshot->timestamp_ms_ = timestamp_ms_;
+    
+    return snapshot;
+}
+
+std::unique_ptr<LoRAGrid> LoRAGrid::interpolateWeights(const LoRAGrid& other, float alpha) const {
+    auto result = std::make_unique<LoRAGrid>();
+    
+    // Linear interpolation: result = (1-alpha) * this + alpha * other
+    // First copy this grid scaled by (1-alpha)
+    result->grid_ = grid_->deepCopy();
+    
+    openvdb::tools::foreach(result->grid_->beginValueOn(), 
+        [alpha](const auto& iter) {
+            auto value = iter.getValue();
+            const_cast<decltype(iter)&>(iter).setValue(value * (1.0f - alpha));
+        });
+    
+    // Then add the other grid scaled by alpha
+    auto scaled_other = other.grid_->deepCopy();
+    openvdb::tools::foreach(scaled_other->beginValueOn(), 
+        [alpha](const auto& iter) {
+            auto value = iter.getValue();
+            const_cast<decltype(iter)&>(iter).setValue(value * alpha);
+        });
+    
+    result->grid_->tree().merge(scaled_other->tree());
+    
+    // Set interpolated timestamp
+    result->timestamp_ms_ = static_cast<int64_t>(
+        (1.0f - alpha) * timestamp_ms_ + alpha * other.timestamp_ms_
+    );
+    
+    return result;
+}
+
+void LoRAGrid::beginStreamingUpdate() {
+    streaming_active_ = true;
+    streaming_updates_ = 0;
+    
+    // Pre-allocate accessor for performance
+    if (!accessor_ || accessor_dirty_) {
+        accessor_ = std::make_unique<AccessorType>(grid_->getAccessor());
+        accessor_dirty_ = false;
+    }
+}
+
+bool LoRAGrid::endStreamingUpdate() {
+    streaming_active_ = false;
+    
+    // Prune small values after streaming updates
+    if (streaming_updates_ > 0) {
+        prune(1e-8f);
+        accessor_dirty_ = true;
+        
+        std::cout << "Streaming update completed: " << streaming_updates_ 
+                  << " updates, active voxels: " << activeVoxelCount() << std::endl;
+    }
+    
+    return true;
+}
+
+void LoRAGrid::streamingSetValue(int32_t row, int32_t col, float weight, int64_t timestamp_ms) {
+    // Update timestamp
+    timestamp_ms_ = timestamp_ms;
+    
+    // Set value using cached accessor for performance
+    if (!accessor_ || accessor_dirty_) {
+        accessor_ = std::make_unique<AccessorType>(grid_->getAccessor());
+        accessor_dirty_ = false;
+    }
+    
+    auto coord = to3D(row, col);
+    
+    if (std::abs(weight) > 1e-8f) {
+        accessor_->setValue(coord, weight);
+    } else {
+        accessor_->setValueOff(coord);
+    }
+    
+    ++streaming_updates_;
+    ++access_count_;
+}
+
+float LoRAGrid::computeGradientMagnitude() const {
+    float magnitude_squared = 0.0f;
+    size_t count = 0;
+    
+    // Compute L2 norm of all active values
+    for (auto iter = grid_->cbeginValueOn(); iter; ++iter) {
+        float value = iter.getValue();
+        magnitude_squared += value * value;
+        ++count;
+    }
+    
+    return count > 0 ? std::sqrt(magnitude_squared) : 0.0f;
+}
+
+std::unique_ptr<LoRAGrid> LoRAGrid::computeGradientDifference(const LoRAGrid& other) const {
+    auto gradient = std::make_unique<LoRAGrid>();
+    
+    // Create union of active coordinates from both grids
+    auto result_grid = grid_->deepCopy();
+    
+    // Subtract other grid: gradient = this - other
+    for (auto iter = other.grid_->cbeginValueOn(); iter; ++iter) {
+        auto coord = iter.getCoord();
+        auto other_value = iter.getValue();
+        auto this_value = result_grid->tree().getValue(coord);
+        
+        float diff = this_value - other_value;
+        if (std::abs(diff) > 1e-8f) {
+            result_grid->tree().setValue(coord, diff);
+        } else {
+            result_grid->tree().setValueOff(coord);
+        }
+    }
+    
+    // Also handle coordinates only in this grid
+    for (auto iter = grid_->cbeginValueOn(); iter; ++iter) {
+        auto coord = iter.getCoord();
+        if (!other.grid_->tree().isValueOn(coord)) {
+            // This coordinate exists only in this grid
+            result_grid->tree().setValue(coord, iter.getValue());
+        }
+    }
+    
+    gradient->grid_ = result_grid;
+    gradient->prune(1e-8f);
+    
+    return gradient;
+}
+
+void LoRAGrid::applyGradientUpdate(const LoRAGrid& gradient, float learning_rate) {
+    // Apply: this = this + learning_rate * gradient
+    merge(gradient, learning_rate);
+    
+    // Update timestamp to current time
+    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+    timestamp_ms_ = now;
 }
 
 // Free functions for CXX bridge compatibility

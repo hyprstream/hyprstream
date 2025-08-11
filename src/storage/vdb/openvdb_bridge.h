@@ -40,6 +40,22 @@ public:
     bool writeToFile(rust::Str filename) const;
     bool readFromFile(rust::Str filename);
     
+    // NEW: Temporal streaming operations
+    void setTimestamp(int64_t timestamp_ms);
+    int64_t getTimestamp() const;
+    std::unique_ptr<LoRAGrid> createTemporalSnapshot() const;
+    std::unique_ptr<LoRAGrid> interpolateWeights(const LoRAGrid& other, float alpha) const;
+    
+    // NEW: Streaming update operations
+    void beginStreamingUpdate();
+    bool endStreamingUpdate();
+    void streamingSetValue(int32_t row, int32_t col, float weight, int64_t timestamp_ms);
+    
+    // NEW: Gradient-based operations
+    float computeGradientMagnitude() const;
+    std::unique_ptr<LoRAGrid> computeGradientDifference(const LoRAGrid& other) const;
+    void applyGradientUpdate(const LoRAGrid& gradient, float learning_rate);
+    
     // Internal grid access
     GridType::Ptr getGrid() const { return grid_; }
     
@@ -53,6 +69,11 @@ private:
     // Performance tracking
     mutable size_t access_count_;
     mutable bool accessor_dirty_;
+    
+    // Temporal streaming state
+    int64_t timestamp_ms_;
+    bool streaming_active_;
+    size_t streaming_updates_;
 };
 
 // /// Iterator for active (non-zero) weights (temporarily disabled)
