@@ -70,6 +70,12 @@ pub struct SparseStorageConfig {
     
     /// Batch size for sparse updates
     pub update_batch_size: usize,
+    
+    /// Enable 3D layer-aware mapping
+    pub layer_aware_mapping: bool,
+    
+    /// Sparsity threshold for pruning
+    pub sparsity_threshold: f32,
 }
 
 impl Default for SparseStorageConfig {
@@ -84,6 +90,8 @@ impl Default for SparseStorageConfig {
             compaction_interval_secs: 300, // 5 minutes
             streaming_updates: true,
             update_batch_size: 1000,
+            layer_aware_mapping: true,
+            sparsity_threshold: 1e-8,
         }
     }
 }
@@ -455,6 +463,30 @@ impl VDBSparseStorage {
             });
         }
         
+        Ok(())
+    }
+    
+    /// Apply weight delta for temporal gradient updates
+    pub async fn apply_weight_delta(
+        &self,
+        coord: &Coordinate3D,
+        delta: f32,
+    ) -> Result<(), SparseStorageError> {
+        // Apply delta directly to VDB storage
+        if let Err(e) = self.hardware_storage.apply_delta(coord, delta).await {
+            return Err(SparseStorageError::HardwareError(
+                format!("Failed to apply weight delta: {}", e)
+            ));
+        }
+        
+        // Update statistics
+        {
+            let mut stats = self.stats.write().await;
+            stats.total_adapters += 1; // Use available field
+            // Note: last_update_timestamp not available in StorageStats
+        }
+        
+        tracing::trace!("✅ Applied weight delta {} at coordinate {:?}", delta, coord);
         Ok(())
     }
     
@@ -860,8 +892,9 @@ impl SparseStorage for VDBSparseStorage {
         let mut target_magnitude = 0.0f32;
         let mut common_coords = 0;
         
-        for (coord, source_value) in source_weights.active_iter() {
-            if let Some(target_value) = target_weights.get_coordinate_opt(coord) {
+        for (linear_idx, source_value) in source_weights.active_iter() {
+            let target_value = target_weights.get(linear_idx);
+            if target_value > 0.0 {
                 correlation_sum += source_value * target_value;
                 source_magnitude += source_value * source_value;
                 target_magnitude += target_value * target_value;

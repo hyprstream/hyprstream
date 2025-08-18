@@ -321,7 +321,7 @@ impl SparseWeights {
     }
 
     /// Convert linear index to 3D coordinate
-    fn linear_to_coord(&self, index: usize) -> Coordinate3D {
+    pub fn linear_to_coord(&self, index: usize) -> Coordinate3D {
         match self.shape.len() {
             2 => {
                 let w = self.shape[1];

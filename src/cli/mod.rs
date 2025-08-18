@@ -10,4 +10,4 @@
 pub mod commands;
 pub mod handlers;
 
-pub use handlers::{handle_config, handle_server, handle_model_command, handle_lora_command};
+pub use handlers::{handle_config, handle_server, handle_model_command, handle_lora_command, handle_chat_command};

@@ -5,7 +5,7 @@ use hf_hub::api::tokio::ApiBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
 use crate::{auth::HfAuth, config::HyprConfig};
-use crate::api::model_storage::{ModelStorage, ModelMetadata, ModelId, ExternalSource, SourceType, ModelFile, FileType};
+use crate::api::model_storage::{ModelStorage, ModelMetadata, ModelId, ExternalSource, SourceType, ModelFile, FileType, ModelRegistry};
 use crate::api::model_management::ModelUri;
 
 /// Download a model from HuggingFace Hub
@@ -129,7 +129,7 @@ pub async fn download_model_by_uri(
     model_uri: &str,
     filename: Option<&str>,
     config: Option<&HyprConfig>,
-) -> Result<PathBuf> {
+) -> Result<ModelId> {
     let config = config.map(|c| c.clone()).unwrap_or_else(|| HyprConfig::load().unwrap_or_default());
     let base_dir = config.models_dir();
     
@@ -190,19 +190,21 @@ pub async fn download_model_by_uri(
         
         // Still register the existing model with storage system to ensure it appears in model list
         println!("📝 Registering existing model with storage system...");
-        if let Err(e) = register_downloaded_model(
-            model_uri, 
-            &local_path, 
-            target_filename,
-            &config
-        ).await {
-            eprintln!("⚠️  Warning: Failed to register existing model with storage system: {}", e);
-            eprintln!("   Model exists but may not appear in 'model list'");
-        } else {
-            println!("✅ Model registered with storage system");
+        match register_model_and_get_id(model_uri, &local_path, target_filename, &config).await {
+            Ok(model_id) => {
+                println!("✅ Model registered with storage system");
+                println!("🆔 Model UUID: {}", model_id);
+                return Ok(model_id);
+            }
+            Err(e) => {
+                eprintln!("⚠️  Warning: Failed to register existing model with storage system: {}", e);
+                eprintln!("   Model exists but may not appear in 'model list'");
+                // Create fallback ModelId
+                let model_id = ModelId::from_content_hash(&repo_path.replace("/", "-"), "language_model", None);
+                println!("🆔 Model UUID (fallback): {}", model_id);
+                return Ok(model_id);
+            }
         }
-        
-        return Ok(local_path);
     }
     
     // Create progress bar
@@ -221,17 +223,21 @@ pub async fn download_model_by_uri(
             println!("💾 Model saved to: {}", local_path.display());
             
             // Register model with storage system for proper indexing
-            if let Err(e) = register_downloaded_model(
-                model_uri, 
-                &local_path, 
-                target_filename,
-                &config
-            ).await {
-                eprintln!("⚠️  Warning: Failed to register model with storage system: {}", e);
-                eprintln!("   Model downloaded successfully but may not appear in 'model list'");
+            match register_model_and_get_id(model_uri, &local_path, target_filename, &config).await {
+                Ok(model_id) => {
+                    println!("✅ Model registered with storage system");
+                    println!("🆔 Model UUID: {}", model_id);
+                    Ok(model_id)
+                }
+                Err(e) => {
+                    eprintln!("⚠️  Warning: Failed to register model with storage system: {}", e);
+                    eprintln!("   Model downloaded successfully but may not appear in 'model list'");
+                    // Create fallback ModelId
+                    let model_id = ModelId::from_content_hash(&repo_path.replace("/", "-"), "language_model", None);
+                    println!("🆔 Model UUID (fallback): {}", model_id);
+                    Ok(model_id)
+                }
             }
-            
-            Ok(local_path)
         }
         Err(e) => {
             pb.finish_with_message("❌ Download failed");
@@ -327,7 +333,7 @@ pub async fn download_model(
     config: Option<&HyprConfig>,
     filename: Option<String>,
     show_progress: bool,
-) -> Result<PathBuf> {
+) -> Result<ModelId> {
     if show_progress {
         download_model_by_uri(model_path, filename.as_deref(), config).await
     } else {
@@ -353,7 +359,7 @@ async fn register_downloaded_model(
     local_path: &Path,
     filename: &str,
     config: &HyprConfig,
-) -> Result<()> {
+) -> Result<ModelId> {
     // Create ModelUri from the URI string
     let uri_with_scheme = if model_uri.starts_with("hf://") {
         model_uri.to_string()
@@ -425,7 +431,7 @@ async fn register_downloaded_model(
     
     // Create metadata with UUID system
     let metadata = ModelMetadata {
-        model_id,
+        model_id: model_id.clone(),
         name: model_uri_obj.name.clone(),
         display_name: None,
         architecture: architecture.unwrap_or_else(|| "unknown".to_string()),
@@ -467,7 +473,8 @@ async fn register_downloaded_model(
     
     println!("📝 Model registered with storage system");
     println!("🦙 Model validated for llamacpp compatibility");
-    Ok(())
+    println!("🆔 Model UUID: {}", model_id);
+    Ok(model_id.clone())
 }
 
 /// Validate that a file is in GGUF format for llamacpp compatibility
@@ -536,6 +543,40 @@ pub async fn register_existing_model(
     Ok(())
 }
 
+
+/// Register a model with ModelRegistry and return its UUID
+async fn register_model_and_get_id(
+    model_uri: &str, 
+    local_path: &Path, 
+    _target_filename: &str,
+    config: &HyprConfig
+) -> Result<ModelId> {
+    // Parse model URI to extract name and architecture info
+    let repo_name = model_uri.replace("hf://", "").replace("/", "-");
+    
+    // Create model registry
+    let registry = ModelRegistry::new(config.models_dir().to_path_buf()).await?;
+    
+    // Create external source
+    let external_source = ExternalSource {
+        source_type: SourceType::HuggingFace,
+        identifier: model_uri.replace("hf://", ""),
+        revision: None,
+        download_url: None,
+        last_verified: chrono::Utc::now().timestamp(),
+    };
+    
+    // Register the model
+    let model_id = registry.register_model(
+        repo_name.clone(),
+        "language_model".to_string(), // Default architecture
+        None, // Parameters unknown for now
+        local_path.to_path_buf(),
+        vec![external_source],
+    ).await?;
+    
+    Ok(model_id)
+}
 
 #[cfg(test)]
 mod tests {

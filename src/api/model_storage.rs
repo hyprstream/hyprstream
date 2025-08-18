@@ -4,14 +4,20 @@ use crate::api::model_management::ModelUri;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs;
+use tokio::sync::RwLock;
 use serde::{Deserialize, Serialize};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use uuid::Uuid;
 
 /// UUID-based model identifier
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ModelId(pub Uuid);
+
+/// UUID-based composed model identifier (base model + LoRA stack)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ComposedModelId(pub Uuid);
 
 impl ModelId {
     pub fn new() -> Self {
@@ -45,6 +51,26 @@ impl std::fmt::Display for ModelId {
 }
 
 impl std::str::FromStr for ModelId {
+    type Err = uuid::Error;
+    
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(s)?))
+    }
+}
+
+impl ComposedModelId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl std::fmt::Display for ComposedModelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for ComposedModelId {
     type Err = uuid::Error;
     
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -134,6 +160,17 @@ pub struct ModelMetadata {
     pub created_at: i64,
     pub last_accessed: i64,
     pub last_updated: i64,
+}
+
+/// Composed model metadata (base model + LoRA stack)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComposedModelMetadata {
+    pub composed_id: ComposedModelId,
+    pub name: String,
+    pub base_model_id: ModelId,
+    pub lora_stack: Vec<String>, // LoRA IDs in application order
+    pub created_at: i64,
+    pub last_used: i64,
 }
 
 /// Local model storage manager
@@ -619,6 +656,242 @@ pub struct SizeMismatch {
     pub filename: String,
     pub expected_size: u64,
     pub actual_size: u64,
+}
+
+/// UUID-based model registry for managing model metadata
+pub struct ModelRegistry {
+    storage: Arc<ModelStorage>,
+    composed_models: Arc<RwLock<HashMap<ComposedModelId, ComposedModelMetadata>>>,
+    composed_file: PathBuf,
+}
+
+impl ModelRegistry {
+    /// Create new model registry
+    pub async fn new(base_dir: PathBuf) -> Result<Self> {
+        let storage = Arc::new(ModelStorage::new(base_dir.clone()).await?);
+        let composed_file = base_dir.join("composed_models.json");
+        
+        let registry = Self {
+            storage,
+            composed_models: Arc::new(RwLock::new(HashMap::new())),
+            composed_file,
+        };
+        
+        // Load composed models
+        registry.load_composed_models().await?;
+        
+        Ok(registry)
+    }
+    
+    /// Register a downloaded model and return its UUID
+    pub async fn register_model(
+        &self,
+        name: String,
+        architecture: String,
+        parameters: Option<u64>,
+        local_path: PathBuf,
+        external_sources: Vec<ExternalSource>,
+    ) -> Result<ModelId> {
+        // Create deterministic ModelId based on content
+        let model_id = ModelId::from_content_hash(&name, &architecture, parameters);
+        
+        let uri_string = format!("hf://{}", external_sources[0].identifier);
+        
+        let metadata = ModelMetadata {
+            model_id: model_id.clone(),
+            name: name.clone(),
+            display_name: Some(name),
+            architecture,
+            parameters,
+            model_type: "language_model".to_string(),
+            tokenizer_type: None,
+            size_bytes: self.calculate_directory_size(&local_path).await?,
+            files: self.scan_model_files(&local_path).await?,
+            external_sources,
+            local_path: Some(local_path),
+            is_cached: true,
+            tags: vec![],
+            description: None,
+            license: None,
+            created_at: chrono::Utc::now().timestamp(),
+            last_accessed: chrono::Utc::now().timestamp(),
+            last_updated: chrono::Utc::now().timestamp(),
+        };
+        
+        // Store in underlying storage
+        let model_uri = ModelUri::parse(&uri_string)?;
+        self.storage.store_metadata(&model_uri, metadata).await?;
+        
+        Ok(model_id)
+    }
+    
+    /// Get model metadata by UUID
+    pub async fn get_model(&self, model_id: &ModelId) -> Result<Option<ModelMetadata>> {
+        match self.storage.get_metadata_by_id(model_id).await {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(_) => Ok(None), // Model not found
+        }
+    }
+    
+    /// Create a composed model (base + LoRA stack)
+    pub async fn create_composed_model(
+        &self,
+        name: String,
+        base_model_id: ModelId,
+        lora_ids: Vec<String>,
+    ) -> Result<ComposedModelId> {
+        let composed_id = ComposedModelId::new();
+        
+        // Verify base model exists
+        if self.get_model(&base_model_id).await?.is_none() {
+            return Err(anyhow!("Base model not found: {}", base_model_id));
+        }
+        
+        let composed_metadata = ComposedModelMetadata {
+            composed_id: composed_id.clone(),
+            name,
+            base_model_id,
+            lora_stack: lora_ids,
+            created_at: chrono::Utc::now().timestamp(),
+            last_used: chrono::Utc::now().timestamp(),
+        };
+        
+        // Store composed model
+        {
+            let mut composed = self.composed_models.write().await;
+            composed.insert(composed_id.clone(), composed_metadata);
+        }
+        
+        // Save to disk
+        self.save_composed_models().await?;
+        
+        Ok(composed_id)
+    }
+    
+    /// Get composed model metadata
+    pub async fn get_composed_model(&self, composed_id: &ComposedModelId) -> Option<ComposedModelMetadata> {
+        let composed = self.composed_models.read().await;
+        composed.get(composed_id).cloned()
+    }
+    
+    /// List all models
+    pub async fn list_models(&self) -> Result<Vec<ModelId>> {
+        let models = self.storage.list_all_models().await?;
+        Ok(models.into_iter().map(|(id, _)| id).collect())
+    }
+    
+    /// List all composed models  
+    pub async fn list_composed_models(&self) -> Vec<ComposedModelId> {
+        let composed = self.composed_models.read().await;
+        composed.keys().cloned().collect()
+    }
+    
+    // Helper methods
+    fn calculate_directory_size<'a>(&'a self, path: &'a Path) -> std::pin::Pin<std::boxed::Box<dyn std::future::Future<Output = Result<u64>> + Send + 'a>> {
+        Box::pin(async move {
+            // Check if path is a file or directory
+            let metadata = fs::metadata(path).await?;
+            
+            if metadata.is_file() {
+                // If it's a file, just return its size
+                Ok(metadata.len())
+            } else {
+                // If it's a directory, calculate total size recursively
+                let mut total_size = 0;
+                let mut entries = fs::read_dir(path).await?;
+                
+                while let Some(entry) = entries.next_entry().await? {
+                    let metadata = entry.metadata().await?;
+                    if metadata.is_file() {
+                        total_size += metadata.len();
+                    } else if metadata.is_dir() {
+                        total_size += self.calculate_directory_size(&entry.path()).await?;
+                    }
+                }
+                
+                Ok(total_size)
+            }
+        })
+    }
+    
+    async fn scan_model_files(&self, path: &Path) -> Result<Vec<ModelFile>> {
+        let mut files = Vec::new();
+        
+        // Check if path is a file or directory
+        let metadata = fs::metadata(path).await?;
+        
+        if metadata.is_file() {
+            // If it's a single file, create a ModelFile entry for it
+            let filename = path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("model.gguf")
+                .to_string();
+            let file_type = self.determine_file_type(&filename);
+            
+            files.push(ModelFile {
+                filename,
+                size_bytes: metadata.len(),
+                checksum: None,
+                file_type,
+            });
+        } else {
+            // If it's a directory, scan all files in it
+            let mut entries = fs::read_dir(path).await?;
+            
+            while let Some(entry) = entries.next_entry().await? {
+                let metadata = entry.metadata().await?;
+                if metadata.is_file() {
+                    let filename = entry.file_name().to_string_lossy().to_string();
+                    let file_type = self.determine_file_type(&filename);
+                    
+                    files.push(ModelFile {
+                        filename,
+                        size_bytes: metadata.len(),
+                        checksum: None,
+                        file_type,
+                    });
+                }
+            }
+        }
+        
+        Ok(files)
+    }
+    
+    fn determine_file_type(&self, filename: &str) -> FileType {
+        match filename {
+            f if f.ends_with(".safetensors") || f.ends_with(".bin") || f.ends_with(".gguf") => FileType::Model,
+            f if f.contains("tokenizer") => FileType::Tokenizer,
+            f if f.ends_with(".json") => FileType::Config,
+            f if f.to_lowercase().contains("readme") => FileType::Readme,
+            _ => FileType::Other,
+        }
+    }
+    
+    async fn load_composed_models(&self) -> Result<()> {
+        if !self.composed_file.exists() {
+            return Ok(());
+        }
+        
+        let content = fs::read_to_string(&self.composed_file).await?;
+        if content.trim().is_empty() {
+            return Ok(());
+        }
+        
+        let composed_map: HashMap<ComposedModelId, ComposedModelMetadata> = 
+            serde_json::from_str(&content)?;
+        
+        let mut composed = self.composed_models.write().await;
+        *composed = composed_map;
+        
+        Ok(())
+    }
+    
+    async fn save_composed_models(&self) -> Result<()> {
+        let composed = self.composed_models.read().await;
+        let content = serde_json::to_string_pretty(&*composed)?;
+        fs::write(&self.composed_file, content).await?;
+        Ok(())
+    }
 }
 
 use chrono;

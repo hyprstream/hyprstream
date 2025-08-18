@@ -26,6 +26,8 @@ doc = true
 # Arrow and DataFusion dependencies removed - focused on ML inference only
 bytes = "1.9.0"
 futures = { version = "0.3.31", features = ["alloc"] }
+futures-util = "0.3.31"
+pin-project-lite = "0.2"
 polars = "0.45.1"
 tokio = { version = "1.43.0", features = ["rt-multi-thread", "signal", "fs"] }
 tokio-rustls = "0.26.1"
@@ -61,7 +63,7 @@ tracing-appender = "0.2"
 bincode = "1.3.3"
 tokio-stream = "0.1.17"
 hex = "0.4"
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 async-stream = "0.3"
 anyhow = "1.0.95"
 daemonize = "0.5.0"
@@ -74,10 +76,18 @@ memmap2 = "0.9"
 rand = "0.8"
 # tch = "0.15"  # Temporarily disabled due to dependency issues
 
+# Candle ML Framework (replacing mistral.rs)
+candle-core = "0.9.1"
+candle-nn = "0.9.1"
+candle-transformers = "0.9.1"
+candle-examples = "0.9.1"
+tokenizers = { version = "0.20", features = ["onig"] }
+
 # Runtime Integration Dependencies
 llama-cpp-2 = "0.1.67"          # TEMPORARY: Keep during migration, will be removed
-mistralrs = { path = "../mistral.rs/mistralrs" } # Local path to avoid dependency conflicts
-mistralrs-core = { path = "../mistral.rs/mistralrs-core" } # Core functionality
+# mistralrs dependencies commented out during Candle migration
+# mistralrs = { path = "../mistral.rs/mistralrs" } 
+# mistralrs-core = { path = "../mistral.rs/mistralrs-core" }
 hf-hub = { version = "0.4.3", features = ["tokio"] }  # HuggingFace model downloads
 uuid = { version = "1.0", features = ["v4", "serde"] }
 reqwest = { version = "0.11", features = ["json", "stream"] }
@@ -105,5 +115,9 @@ pkg-config = "0.3"
 criterion = "0.5.1"
 tempfile = "3.9.0"
 tokio-stream = "0.1.14"
+
+[[bench]]
+name = "sparse_ops_bench"
+harness = false
 
 

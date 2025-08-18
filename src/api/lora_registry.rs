@@ -8,6 +8,7 @@ use tokio::fs;
 use serde::{Deserialize, Serialize};
 use anyhow::Result;
 use uuid::Uuid;
+use crate::api::model_storage::{ComposedModelId, ComposedModelMetadata, ModelId};
 
 /// UUID-based LoRA identifier
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -437,6 +438,42 @@ fn estimate_compression_ratio(layer: &LoRALayer) -> f32 {
         base_ratio * 10.0 // Neural compression adds 10x
     } else {
         base_ratio
+    }
+}
+
+impl LoRARegistry {
+    /// Create a composed model (base + LoRA stack)
+    pub async fn create_composed_model(
+        &self,
+        name: String,
+        base_model_id: ModelId,
+        lora_ids: Vec<String>,
+    ) -> Result<ComposedModelId> {
+        let composed_id = ComposedModelId::new();
+        
+        // Verify all LoRAs exist
+        for lora_id_str in &lora_ids {
+            let lora_id: LoRAId = lora_id_str.parse()
+                .map_err(|_| anyhow::anyhow!("Invalid LoRA ID: {}", lora_id_str))?;
+            self.get(&lora_id).await
+                .map_err(|_| anyhow::anyhow!("LoRA not found: {}", lora_id_str))?;
+        }
+        
+        let composed_metadata = ComposedModelMetadata {
+            composed_id: composed_id.clone(),
+            name,
+            base_model_id,
+            lora_stack: lora_ids,
+            created_at: chrono::Utc::now().timestamp(),
+            last_used: chrono::Utc::now().timestamp(),
+        };
+        
+        // Store composed model metadata (simplified for now)
+        // In a full implementation, this would use proper storage
+        tracing::info!("Created composed model: {} with {} LoRA layers", 
+                      composed_id, composed_metadata.lora_stack.len());
+        
+        Ok(composed_id)
     }
 }
 

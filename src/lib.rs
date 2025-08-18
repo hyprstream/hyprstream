@@ -29,7 +29,11 @@ pub use storage::{
     SparseWeightUpdate, EmbeddingMatch, SparseStorageError
 };
 pub use runtime::{
-    RuntimeEngine, MistralEngine, LlamaCppEngine, LoRAEngineWrapper, SparseLoRAAdapter, LoRAConfig,
+    RuntimeEngine, CandleEngine, LlamaCppEngine, LoRAEngineWrapper, SparseLoRAAdapter, LoRAConfig,
     ModelInfo, GenerationRequest, GenerationResult, FinishReason, RuntimeConfig,
-    XLoRAAdapter, AdaptationMode, UserFeedback, XLoRARoutingStrategy, AdapterMetrics
+    XLoRAAdapter, AdaptationMode, UserFeedback, XLoRARoutingStrategy, AdapterMetrics,
+    // Model Evolution System exports
+    ConversationRouter, ConversationSession, ConversationTurn, ConversationResponse,
+    ConversationContext, ModelPool, AdaptationType, AdaptationTrigger, ModelState,
+    PoolStats, RoutingConfig, create_conversation_router
 };

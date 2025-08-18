@@ -7,7 +7,7 @@ use clap::Parser;
 use config::Config;
 use hyprstream_core::{
     cli::commands::Commands,
-    cli::handlers::{handle_server, handle_embedding_query, handle_model_command, handle_lora_command, handle_auth_command},
+    cli::handlers::{handle_server, handle_embedding_query, handle_model_command, handle_lora_command, handle_auth_command, handle_chat_command},
 };
 use tracing::{info, Level};
 use tracing_subscriber::EnvFilter;
@@ -31,6 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Lora(_) => (&"info", &None),
         Commands::QuickStart(_) => (&"info", &None),
         Commands::Auth(_) => (&"info", &None),
+        Commands::Chat(_) => (&"info", &None),
     };
 
     // Initialize logging
@@ -102,6 +103,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Auth(cmd) => {
             handle_auth_command(cmd).await?
+        }
+        Commands::Chat(cmd) => {
+            let server_url = "http://localhost:50051".to_string(); // Default server URL
+            handle_chat_command(cmd, server_url).await?
         }
     }
 

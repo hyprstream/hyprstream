@@ -35,6 +35,7 @@ LoRAGrid::~LoRAGrid() = default;
 
 openvdb::Coord LoRAGrid::to3D(int32_t row, int32_t col) const {
     // Map 2D matrix coordinates to 3D with Z=0
+    // TODO: This constrains everything to a 2D plane, missing VDB's 3D advantages
     return openvdb::Coord(row, col, 0);
 }
 

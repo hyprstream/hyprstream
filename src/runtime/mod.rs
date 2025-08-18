@@ -1,8 +1,8 @@
 //! Runtime abstraction layer for inference engines
 //! 
 //! This module provides a unified interface for different inference engines:
-//! - MistralEngine: Primary engine with X-LoRA and real-time adaptation (NEW)
-//! - LlamaCppEngine: Legacy engine for reference during migration (DEPRECATED)
+//! - CandleEngine: Primary engine with VDB storage and temporal adaptation
+//! - LlamaCppEngine: Legacy engine for reference (DEPRECATED)
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -14,14 +14,50 @@ pub use crate::config::{
     ModelInfo, GenerationRequest, GenerationResult, FinishReason
 };
 
-pub mod mistral_engine;      // NEW: Primary inference engine
-pub mod llamacpp_engine;     // TEMPORARY: Keep during migration
+pub mod candle_engine;        // NEW: Candle-based engine with VDB integration
+// pub mod mistral_engine;       // DEPRECATED: Disabled during Candle migration
+pub mod llamacpp_engine;      // TEMPORARY: Keep during migration
 pub mod lora_wrapper;
+pub mod conversation_router;  // NEW: Seamless model evolution and routing
 
-// Primary exports - use MistralEngine as default
-pub use mistral_engine::{
-    MistralEngine, XLoRAAdapter, AdaptationMode, UserFeedback, 
-    XLoRARoutingStrategy, AdapterMetrics, ModelBuilderConfig
+// Primary exports - use CandleEngine as default
+pub use candle_engine::CandleEngine;
+
+// Temporary placeholder types during migration
+#[derive(Debug, Clone)]
+pub struct MistralEngine;
+
+#[derive(Debug, Clone)]
+pub struct XLoRAAdapter {
+    pub id: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum AdaptationMode {
+    Disabled,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserFeedback;
+
+#[derive(Debug, Clone)]
+pub enum XLoRARoutingStrategy {
+    Default,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AdapterMetrics;
+
+#[derive(Debug, Clone)]
+pub enum ModelBuilderConfig {
+    Default,
+}
+
+// Conversation routing exports - Model Evolution System  
+pub use conversation_router::{
+    ConversationRouter, ConversationSession, ConversationTurn, ConversationResponse,
+    ConversationContext, ModelPool, AdaptationType, AdaptationTrigger, ModelState,
+    PoolStats, RoutingConfig
 };
 
 // Temporary exports for migration period
@@ -89,19 +125,32 @@ pub trait RuntimeEngine: Send + Sync {
     }
 }
 
-/// Create the default runtime engine (now uses mistral.rs)
-pub fn create_engine(config: &RuntimeConfig) -> Result<MistralEngine> {
-    MistralEngine::new(config.clone())
+/// Create the default runtime engine (now uses Candle)
+pub fn create_engine(config: &RuntimeConfig) -> Result<CandleEngine> {
+    CandleEngine::new(config.clone())
+}
+
+/// Create conversation router with model pool and temporal streaming
+pub async fn create_conversation_router(
+    model_pool: std::sync::Arc<ModelPool>,
+    temporal_streaming: std::sync::Arc<crate::storage::vdb::TemporalStreamingLayer>,
+    config: Option<RoutingConfig>,
+) -> Result<ConversationRouter> {
+    ConversationRouter::new(
+        model_pool,
+        temporal_streaming,
+        config.unwrap_or_default(),
+    ).await
 }
 
 /// Create the legacy LLaMA.cpp engine (deprecated)
-#[deprecated(note = "Use create_engine() which returns MistralEngine instead")]
+#[deprecated(note = "Use create_engine() which returns CandleEngine instead")]
 pub fn create_llamacpp_engine(config: &RuntimeConfig) -> Result<LlamaCppEngine> {
     LlamaCppEngine::new(config.clone())
 }
 
 /// Create engine with LoRA wrapper (deprecated - use X-LoRA instead)
-#[deprecated(note = "Use MistralEngine with X-LoRA for better performance")]
+#[deprecated(note = "Use CandleEngine with VDB storage for better performance")]
 pub fn create_lora_engine(
     base_engine: Box<dyn RuntimeEngine>, 
     _lora_config: &LoRAConfig

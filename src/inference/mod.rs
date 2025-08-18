@@ -13,6 +13,9 @@ use anyhow::Result;
 pub mod model_loader;
 pub mod inference_engine;
 pub mod lora_fusion;
+pub mod paged_attention;
+pub mod block_engine;
+pub mod scheduler;
 
 // Re-export unified config system
 pub use crate::config::{HyprConfig, GenerationRequest, GenerationResult, ModelInfo};
@@ -20,6 +23,9 @@ pub use crate::config::{HyprConfig, GenerationRequest, GenerationResult, ModelIn
 pub use model_loader::{ModelLoader, BaseModelHandle};
 pub use inference_engine::{InferenceEngine, InferenceEngineStats};
 pub use lora_fusion::{LoRAFusion, FusionStrategy};
+pub use paged_attention::{VDBPagedAttention, PagedAttentionConfig, InputMetadata};
+pub use block_engine::{VDBBlockEngine, BlockEngineStats, AllocStatus};
+pub use scheduler::{HyprScheduler, SchedulerConfig, SchedulerOutput, SchedulerStats};
 
 /// Inference session with active LoRA adapters
 #[derive(Debug, Clone)]

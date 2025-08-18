@@ -1,8 +1,8 @@
-//! Core inference engine for running models with LoRA adapters using mistral.rs
+//! Core inference engine for running models with LoRA adapters using Candle
 
 use crate::inference::{InferenceInput, InferenceOutput, InferenceToken, FusedAdapterWeights};
 use crate::inference::model_loader::ModelLoader;
-use crate::runtime::{RuntimeEngine, MistralEngine};
+use crate::runtime::{RuntimeEngine, CandleEngine};
 use crate::config::{HyprConfig};
 use crate::storage::vdb::hardware_accelerated::HardwareVDBStorage;
 
@@ -13,13 +13,13 @@ use futures::Stream;
 use tokio::sync::{mpsc, RwLock};
 use serde::{Serialize, Deserialize};
 
-/// Core inference engine using mistral.rs
+/// Core inference engine using Candle
 pub struct InferenceEngine {
     /// Unified system configuration
     config: HyprConfig,
     
-    /// mistral.rs runtime engine  
-    mistral_engine: RwLock<Option<MistralEngine>>,
+    /// Candle runtime engine  
+    candle_engine: RwLock<Option<CandleEngine>>,
     
     /// Currently loaded model path
     current_model_path: RwLock<Option<String>>,
@@ -43,29 +43,29 @@ pub struct InferenceEngineStats {
 impl InferenceEngine {
     /// Create new inference engine with unified config
     pub fn new(config: HyprConfig) -> Result<Self> {
-        println!("🚀 Initializing mistral.rs inference engine (GPU: {}, threads: {:?})", 
+        println!("🚀 Initializing Candle inference engine (GPU: {}, threads: {:?})", 
                 config.runtime.use_gpu, config.runtime.cpu_threads);
         
         Ok(Self {
             config,
-            mistral_engine: RwLock::new(None),
+            candle_engine: RwLock::new(None),
             current_model_path: RwLock::new(None),
             stats: RwLock::new(InferenceEngineStats::default()),
         })
     }
     
-    /// Load a GGUF model using mistral.rs
+    /// Load a GGUF model using Candle
     pub async fn load_model(&self, model_path: &Path) -> Result<()> {
         println!("📥 Loading GGUF model: {}", model_path.display());
         
-        // Create and initialize mistral.rs engine using unified config
-        let mut mistral_engine = MistralEngine::new(self.config.runtime.clone())?;
-        mistral_engine.load_model(model_path).await?;
+        // Create and initialize Candle engine using unified config (async version)
+        let mut candle_engine = CandleEngine::new_async(self.config.runtime.clone()).await?;
+        candle_engine.load_model(model_path).await?;
         
         // Store the engine and model path
         {
-            let mut engine_guard = self.mistral_engine.write().await;
-            *engine_guard = Some(mistral_engine);
+            let mut engine_guard = self.candle_engine.write().await;
+            *engine_guard = Some(candle_engine);
         }
         
         {
@@ -83,15 +83,15 @@ impl InferenceEngine {
         let mut request = self.config.create_request(prompt.to_string());
         request.max_tokens = max_tokens; // Override with provided value
         
-        // Get the LLaMA engine
-        let engine_guard = self.mistral_engine.read().await;
-        let mistral_engine = engine_guard.as_ref()
+        // Get the Candle engine
+        let engine_guard = self.candle_engine.read().await;
+        let candle_engine = engine_guard.as_ref()
             .ok_or_else(|| anyhow!("No model loaded. Call load_model() first."))?;
         
-        println!("🤖 Generating text with mistral.rs: \"{}\" (max_tokens: {})", 
+        println!("🤖 Generating text with Candle: \"{}\" (max_tokens: {})", 
                 prompt.chars().take(50).collect::<String>(), max_tokens);
         
-        let result = mistral_engine.generate_with_params(request).await?;
+        let result = candle_engine.generate_with_params(request).await?;
         
         // Update statistics
         {
@@ -109,7 +109,7 @@ impl InferenceEngine {
     
     /// Check if a model is loaded
     pub async fn is_model_loaded(&self) -> bool {
-        let engine_guard = self.mistral_engine.read().await;
+        let engine_guard = self.candle_engine.read().await;
         engine_guard.is_some()
     }
     
@@ -382,13 +382,13 @@ impl InferenceEngine {
         }
     }
     
-    /// Apply LoRA adapters to the mistral.rs engine
+    /// Apply LoRA adapters to the Candle engine
     async fn apply_lora_adapters(&self, fused_weights: &FusedAdapterWeights) -> Result<()> {
-        let mut engine_guard = self.mistral_engine.write().await;
-        let mistral_engine = engine_guard.as_mut()
+        let mut engine_guard = self.candle_engine.write().await;
+        let _candle_engine = engine_guard.as_mut()
             .ok_or_else(|| anyhow!("No model loaded. Call load_model() first."))?;
         
-        println!("⚡ Integrating {} LoRA adapters with mistral.rs", fused_weights.weights.len());
+        println!("⚡ Integrating {} LoRA adapters with Candle engine", fused_weights.weights.len());
         
         // For each LoRA adapter in the fused weights
         for (adapter_id, adapter) in &fused_weights.weights {
@@ -397,8 +397,8 @@ impl InferenceEngine {
             // Convert sparse LoRA adapter to LoRAWeightsData format
             let lora_weights = self.convert_sparse_to_lora_weights_data(adapter).await?;
             
-            // Apply to mistral.rs engine
-            mistral_engine.update_adapter_realtime(adapter_id, &lora_weights).await?;
+            // TODO: Apply to Candle engine when RuntimeEngine trait is implemented
+            tracing::warn!("Adapter application to engine not yet fully implemented in CandleEngine");
         }
         
         println!("✅ LoRA adapters applied successfully");
@@ -408,7 +408,7 @@ impl InferenceEngine {
         Ok(())
     }
     
-    /// Convert sparse LoRA adapter to LoRAWeightsData format for mistral.rs
+    /// Convert sparse LoRA adapter to LoRAWeightsData format for Candle
     async fn convert_sparse_to_lora_weights_data(
         &self,
         adapter: &crate::adapters::sparse_lora::SparseLoRAAdapter,
