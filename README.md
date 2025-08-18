@@ -213,7 +213,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## 📄 License
 
-Apache 2.0 - See [LICENSE](LICENSE) for details.
+GNU AFFERO GENERAL PUBLIC LICENSE 3
 
 ## 🙏 Acknowledgments
 
