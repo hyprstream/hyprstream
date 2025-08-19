@@ -1185,18 +1185,69 @@ pub async fn handle_lora_command(
                 }
             }
         }
-        LoRAAction::Delete { lora_id, yes } => {
-            info!("🗑️ Deleting LoRA adapter: {}", lora_id);
-            
-            let adapter_exists = lora_id.starts_with("lora_") || lora_id.contains("adapter");
-            
-            if !adapter_exists {
-                println!("❌ LoRA adapter '{}' not found", lora_id);
+        LoRAAction::Delete { lora_ids, yes } => {
+            if lora_ids.is_empty() {
+                println!("❌ No LoRA adapters specified for deletion");
+                println!("Usage: hyprstream lora delete [OPTIONS] LORA_ID...");
                 return Ok(());
             }
             
+            let num_adapters = lora_ids.len();
+            info!("🗑️ Processing {} LoRA adapter(s) for deletion", num_adapters);
+            
+            // Parse as UUID or use as string ID - get_by_id_or_name handles both
+            let storage_paths = crate::storage::paths::StoragePaths::new()?;
+            let lora_registry = crate::api::lora_registry::LoRARegistry::new(storage_paths.loras_dir()?).await?;
+            
+            // Collect all adapters to delete
+            let mut adapters_to_delete = Vec::new();
+            let mut not_found = Vec::new();
+            
+            for lora_id in &lora_ids {
+                match lora_registry.get_by_id_or_name(&lora_id).await {
+                    Ok(adapter) => {
+                        info!("Found LoRA adapter: {} (UUID: {})", adapter.name, adapter.id.0);
+                        adapters_to_delete.push(adapter);
+                    }
+                    Err(_) => {
+                        // Try to parse as raw UUID if the lookup failed
+                        if let Ok(uuid) = lora_id.parse::<uuid::Uuid>() {
+                            // Try to find by UUID string representation
+                            match lora_registry.get_by_id_or_name(&uuid.to_string()).await {
+                                Ok(adapter) => adapters_to_delete.push(adapter),
+                                Err(_) => not_found.push(lora_id.clone()),
+                            }
+                        } else {
+                            not_found.push(lora_id.clone());
+                        }
+                    }
+                }
+            }
+            
+            // Report not found adapters
+            if !not_found.is_empty() {
+                println!("⚠️ The following adapters were not found:");
+                for id in &not_found {
+                    println!("   • {}", id);
+                }
+                println!();
+            }
+            
+            // If no adapters were found, exit
+            if adapters_to_delete.is_empty() {
+                println!("❌ No valid LoRA adapters found to delete");
+                return Ok(());
+            }
+            
+            // Confirm deletion
             if !yes {
-                println!("Are you sure you want to delete LoRA adapter '{}'? (y/N)", lora_id);
+                println!("Are you sure you want to delete {} LoRA adapter(s)? (y/N)", adapters_to_delete.len());
+                println!();
+                println!("Adapters to delete:");
+                for adapter in &adapters_to_delete {
+                    println!("  • {} (UUID: {})", adapter.name, adapter.id.0);
+                }
+                println!();
                 println!("This will permanently remove:");
                 println!("  • All adapter weights and sparse matrices");
                 println!("  • Training history and metadata");
@@ -1207,13 +1258,80 @@ pub async fn handle_lora_command(
                 return Ok(());
             }
             
-            println!("🗑️ Deleting LoRA adapter: {}", lora_id);
-            println!("   ✅ Removed sparse weight matrices from VDB");
-            println!("   ✅ Cleaned up training metadata");
-            println!("   ✅ Freed storage space");
-            println!("   ✅ Updated adapter registry");
-            println!();
-            println!("✅ LoRA adapter '{}' deleted successfully", lora_id);
+            // Delete each adapter
+            let mut success_count = 0;
+            let mut failed_count = 0;
+            
+            for adapter in adapters_to_delete {
+                let adapter_name = adapter.name.clone();
+                let adapter_id = adapter.id.0.to_string();
+                let lora_registry_id = adapter.id.clone();
+                
+                println!("🗑️ Deleting LoRA adapter '{}' (UUID: {})", adapter_name, adapter_id);
+                
+                // Actually delete the adapter from the registry
+                match lora_registry.unregister(&lora_registry_id).await {
+                    Ok(_) => {
+                        println!("   ✅ Removed from adapter registry");
+                        
+                        // Also try to delete the physical files
+                        let adapter_dir = storage_paths.loras_dir()?.join(&adapter_id);
+                        if adapter_dir.exists() {
+                            match std::fs::remove_dir_all(&adapter_dir) {
+                                Ok(_) => println!("   ✅ Deleted adapter files from disk"),
+                                Err(e) => println!("   ⚠️ Failed to delete files: {}", e),
+                            }
+                        }
+                        
+                        // Also check for directory with adapter name
+                        let adapter_name_dir = storage_paths.loras_dir()?.join(&adapter_name);
+                        if adapter_name_dir.exists() && adapter_name_dir != adapter_dir {
+                            match std::fs::remove_dir_all(&adapter_name_dir) {
+                                Ok(_) => println!("   ✅ Deleted named adapter directory"),
+                                Err(e) => println!("   ⚠️ Failed to delete named directory: {}", e),
+                            }
+                        }
+                        
+                        // Delete VDB storage entries
+                        let vdb_path = storage_paths.cache_dir()?.join("vdb_lora").join(&adapter_id);
+                        if vdb_path.exists() {
+                            match std::fs::remove_dir_all(&vdb_path) {
+                                Ok(_) => println!("   ✅ Removed VDB storage entries"),
+                                Err(e) => println!("   ⚠️ Failed to delete VDB entries: {}", e),
+                            }
+                        }
+                        
+                        // Also check VDB path with adapter name
+                        let vdb_name_path = storage_paths.cache_dir()?.join("vdb_lora").join(&adapter_name);
+                        if vdb_name_path.exists() && vdb_name_path != vdb_path {
+                            match std::fs::remove_dir_all(&vdb_name_path) {
+                                Ok(_) => println!("   ✅ Removed named VDB entries"),
+                                Err(e) => println!("   ⚠️ Failed to delete named VDB entries: {}", e),
+                            }
+                        }
+                        
+                        success_count += 1;
+                        println!("   ✅ Successfully deleted '{}'", adapter_name);
+                    }
+                    Err(e) => {
+                        failed_count += 1;
+                        println!("   ❌ Failed to delete '{}': {}", adapter_name, e);
+                    }
+                }
+                println!();
+            }
+            
+            // Summary
+            println!("════════════════════════════════════════");
+            if success_count > 0 {
+                println!("✅ Successfully deleted {} adapter(s)", success_count);
+            }
+            if failed_count > 0 {
+                println!("❌ Failed to delete {} adapter(s)", failed_count);
+            }
+            if !not_found.is_empty() {
+                println!("⚠️ {} adapter(s) not found", not_found.len());
+            }
         }
         LoRAAction::Train { action: _ } => {
             info!("🏋️ Managing LoRA training");
@@ -1486,6 +1604,20 @@ pub async fn handle_lora_command(
         }
         LoRAAction::Chat { lora_id, max_tokens, temperature, history, save_history } => {
             info!("💬 Starting chat with LoRA: {}", lora_id);
+            
+            // Resolve LoRA adapter by ID, name, or UUID
+            let storage_paths = crate::storage::paths::StoragePaths::new()?;
+            let lora_registry = crate::api::lora_registry::LoRARegistry::new(storage_paths.loras_dir()?).await?;
+            let lora_layer = match lora_registry.get_by_id_or_name(&lora_id).await {
+                Ok(layer) => layer,
+                Err(_) => {
+                    println!("❌ LoRA adapter '{}' not found", lora_id);
+                    println!("Use 'hyprstream lora list' to see available adapters");
+                    return Ok(());
+                }
+            };
+            
+            println!("💬 Starting chat with LoRA adapter: {} (UUID: {})", lora_layer.name, lora_layer.id.0);
             println!("LoRA chat functionality is under development");
             println!("Max tokens: {}, Temperature: {}", max_tokens, temperature);
             if let Some(hist) = history {
@@ -1497,6 +1629,20 @@ pub async fn handle_lora_command(
         }
         LoRAAction::Export { lora_id, output, format, precision, include_base } => {
             info!("📤 Exporting LoRA: {}", lora_id);
+            
+            // Resolve LoRA adapter by ID, name, or UUID
+            let storage_paths = crate::storage::paths::StoragePaths::new()?;
+            let lora_registry = crate::api::lora_registry::LoRARegistry::new(storage_paths.loras_dir()?).await?;
+            let lora_layer = match lora_registry.get_by_id_or_name(&lora_id).await {
+                Ok(layer) => layer,
+                Err(_) => {
+                    println!("❌ LoRA adapter '{}' not found", lora_id);
+                    println!("Use 'hyprstream lora list' to see available adapters");
+                    return Ok(());
+                }
+            };
+            
+            println!("📤 Exporting LoRA adapter: {} (UUID: {})", lora_layer.name, lora_layer.id.0);
             println!("LoRA export functionality is under development");
             println!("Output: {}, Format: {}, Include base: {}", output, format, include_base);
         }

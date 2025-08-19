@@ -87,7 +87,7 @@ impl Default for SparseLoRAConfig {
 }
 
 /// Sparse LoRA adapter implementation
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SparseLoRAAdapter {
     /// Configuration
     config: SparseLoRAConfig,

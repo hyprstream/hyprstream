@@ -14,14 +14,15 @@ pub use crate::config::{
     ModelInfo, GenerationRequest, GenerationResult, FinishReason
 };
 
-pub mod candle_engine;        // NEW: Candle-based engine with VDB integration
+pub mod candle_engine;        // Candle-based engine with VDB integration
 // pub mod mistral_engine;       // DEPRECATED: Disabled during Candle migration
 pub mod llamacpp_engine;      // TEMPORARY: Keep during migration
 pub mod lora_wrapper;
-pub mod conversation_router;  // NEW: Seamless model evolution and routing
-pub mod precision;           // NEW: BF16/FP8 precision management
-pub mod converter;           // NEW: GGUF to SafeTensors converter with BF16
-pub mod fp8;                 // NEW: FP8 (E4M3/E5M2) quantization support
+pub mod conversation_router;  // Seamless model evolution and routing
+pub mod precision;           // BF16/FP8 precision management
+pub mod converter;           // GGUF to SafeTensors converter with BF16
+pub mod fp8;                 // FP8 (E4M3/E5M2) quantization support
+pub mod architectures;       // Architecture-specific model implementations
 
 // Primary exports - use CandleEngine as default
 pub use candle_engine::CandleEngine;
@@ -56,7 +57,7 @@ pub enum ModelBuilderConfig {
     Default,
 }
 
-// Conversation routing exports - Model Evolution System  
+// Conversation routing exports
 pub use conversation_router::{
     ConversationRouter, ConversationSession, ConversationTurn, ConversationResponse,
     ConversationContext, ModelPool, AdaptationType, AdaptationTrigger, ModelState,

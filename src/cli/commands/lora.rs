@@ -100,10 +100,10 @@ pub enum LoRAAction {
         include_stats: bool,
     },
     
-    /// Delete a LoRA adapter
+    /// Delete one or more LoRA adapters
     Delete {
-        /// LoRA ID or name
-        lora_id: String,
+        /// LoRA IDs, names, or UUIDs (can specify multiple)
+        lora_ids: Vec<String>,
         
         /// Confirm deletion without prompting
         #[arg(long)]
@@ -118,7 +118,7 @@ pub enum LoRAAction {
     
     /// Test inference with a LoRA adapter
     Infer {
-        /// LoRA ID to use for inference
+        /// LoRA ID, name, or UUID to use for inference
         lora_id: String,
         
         /// Use a specific checkpoint (optional)
@@ -164,7 +164,7 @@ pub enum LoRAAction {
     
     /// Chat with a LoRA adapter
     Chat {
-        /// LoRA ID to use for chat
+        /// LoRA ID, name, or UUID to use for chat
         lora_id: String,
         
         /// Maximum tokens per response
@@ -186,7 +186,7 @@ pub enum LoRAAction {
     
     /// Export LoRA adapter
     Export {
-        /// LoRA ID to export
+        /// LoRA ID, name, or UUID to export
         lora_id: String,
         
         /// Output file path
@@ -366,7 +366,7 @@ pub enum CheckpointAction {
     
     /// Delete a checkpoint
     Delete {
-        /// LoRA ID
+        /// LoRA ID, name, or UUID
         lora_id: String,
         
         /// Checkpoint tag to delete
@@ -390,7 +390,7 @@ pub enum CheckpointAction {
     
     /// Export checkpoint to external format
     Export {
-        /// LoRA ID
+        /// LoRA ID, name, or UUID
         lora_id: String,
         
         /// Checkpoint tag to export
