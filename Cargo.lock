@@ -2228,6 +2228,7 @@ dependencies = [
  "rlimit",
  "rustls",
  "rustls-pemfile 2.2.0",
+ "safetensors",
  "serde",
  "serde_derive",
  "serde_json",

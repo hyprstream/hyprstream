@@ -94,6 +94,8 @@ pub async fn handle_quick_start(cmd: QuickStartCommand) -> Result<()> {
         gpu_layers: cmd.gpu_layers,
         mmap: true,
         kv_cache_size_mb: 2048,
+        precision_mode: Some("auto".to_string()),
+        auto_convert_for_lora: true,
     };
 
     println!("🔧 Initializing runtime engine...");

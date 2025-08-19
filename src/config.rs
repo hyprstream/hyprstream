@@ -49,7 +49,7 @@ pub struct ModelConfig {
 }
 
 /// LLaMA.cpp runtime configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
     /// Context window size
     pub context_length: usize,
@@ -65,6 +65,26 @@ pub struct RuntimeConfig {
     pub mmap: bool,
     /// KV cache size in MB
     pub kv_cache_size_mb: usize,
+    /// Precision mode (BF16/FP16/FP32/FP8)
+    pub precision_mode: Option<String>, // "bf16", "fp16", "fp32", "fp8-mixed"
+    /// Auto-convert GGUF to SafeTensors for LoRA
+    pub auto_convert_for_lora: bool,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            context_length: 4096,
+            batch_size: 512,
+            cpu_threads: None,
+            use_gpu: true,
+            gpu_layers: None,
+            mmap: true,
+            kv_cache_size_mb: 2048,
+            precision_mode: Some("auto".to_string()),
+            auto_convert_for_lora: true,
+        }
+    }
 }
 
 /// Text generation parameters
@@ -135,6 +155,8 @@ impl Default for HyprConfig {
                 gpu_layers: None,
                 mmap: true,
                 kv_cache_size_mb: 2048,
+                precision_mode: Some("auto".to_string()),
+                auto_convert_for_lora: true,
             },
             generation: GenerationConfig {
                 max_tokens: 100,

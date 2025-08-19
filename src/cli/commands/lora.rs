@@ -58,6 +58,14 @@ pub enum LoRAAction {
         #[arg(long, default_value = "8")]
         batch_size: usize,
         
+        /// Precision mode (bf16, fp16, fp32, fp8-e4m3, auto)
+        #[arg(long, default_value = "auto")]
+        precision: String,
+        
+        /// Auto-convert GGUF to SafeTensors if needed
+        #[arg(long, default_value = "true")]
+        auto_convert: bool,
+        
         /// Output format (json, table)
         #[arg(long, default_value = "json")]
         format: String,
@@ -145,6 +153,10 @@ pub enum LoRAAction {
         #[arg(long)]
         stream: bool,
         
+        /// Precision mode for inference (bf16, fp16, fp32, fp8-e4m3, auto)
+        #[arg(long, default_value = "auto")]
+        precision: String,
+        
         /// Output format (text, json)
         #[arg(long, default_value = "text")]
         format: String,
@@ -184,6 +196,10 @@ pub enum LoRAAction {
         /// Export format (safetensors, pytorch, gguf)
         #[arg(long, default_value = "safetensors")]
         format: String,
+        
+        /// Export precision (bf16, fp16, fp32, fp8-e4m3)
+        #[arg(long, default_value = "bf16")]
+        precision: String,
         
         /// Include base model weights
         #[arg(long)]
@@ -231,9 +247,17 @@ pub enum TrainingAction {
         #[arg(long, default_value = "5")]
         frequency: usize,
         
-        /// Enable mixed precision
+        /// Enable mixed precision (deprecated, use --precision)
         #[arg(long)]
         mixed_precision: bool,
+        
+        /// Precision mode (bf16, fp16, fp32, fp8-e4m3, auto)
+        #[arg(long, default_value = "bf16")]
+        precision: String,
+        
+        /// Gradient accumulation steps
+        #[arg(long, default_value = "1")]
+        gradient_accumulation: usize,
     },
     
     /// Stop auto-regressive training

@@ -884,7 +884,7 @@ pub async fn handle_lora_command(
     use crate::cli::commands::lora::LoRAAction;
     
     match cmd.action {
-        LoRAAction::Create { name, base_model, rank, alpha, dropout, target_modules, sparsity, neural_compression, auto_regressive, learning_rate, batch_size, format } => {
+        LoRAAction::Create { name, base_model, rank, alpha, dropout, target_modules, sparsity, neural_compression, auto_regressive, learning_rate, batch_size, precision, auto_convert, format } => {
             let adapter_name = name.unwrap_or_else(|| "unnamed".to_string());
             info!("🧠 Creating LoRA adapter: {}", adapter_name);
             
@@ -1220,7 +1220,7 @@ pub async fn handle_lora_command(
             println!("LoRA training management is under development");
             println!("Will support auto-regressive training with 99% sparsity");
         }
-        LoRAAction::Infer { lora_id, checkpoint, prompt, input_file, max_tokens, temperature, top_p, scale, stream, format } => {
+        LoRAAction::Infer { lora_id, checkpoint, prompt, input_file, max_tokens, temperature, top_p, scale, stream, precision, format } => {
             info!("🔮 Running inference with LoRA: {}", lora_id);
             
             // Check if using checkpoint inference
@@ -1495,7 +1495,7 @@ pub async fn handle_lora_command(
                 println!("Save to: {}", save);
             }
         }
-        LoRAAction::Export { lora_id, output, format, include_base } => {
+        LoRAAction::Export { lora_id, output, format, precision, include_base } => {
             info!("📤 Exporting LoRA: {}", lora_id);
             println!("LoRA export functionality is under development");
             println!("Output: {}, Format: {}, Include base: {}", output, format, include_base);

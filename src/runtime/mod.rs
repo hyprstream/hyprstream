@@ -19,6 +19,9 @@ pub mod candle_engine;        // NEW: Candle-based engine with VDB integration
 pub mod llamacpp_engine;      // TEMPORARY: Keep during migration
 pub mod lora_wrapper;
 pub mod conversation_router;  // NEW: Seamless model evolution and routing
+pub mod precision;           // NEW: BF16/FP8 precision management
+pub mod converter;           // NEW: GGUF to SafeTensors converter with BF16
+pub mod fp8;                 // NEW: FP8 (E4M3/E5M2) quantization support
 
 // Primary exports - use CandleEngine as default
 pub use candle_engine::CandleEngine;

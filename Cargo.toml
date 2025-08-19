@@ -82,6 +82,7 @@ candle-nn = "0.9.1"
 candle-transformers = "0.9.1"
 candle-examples = "0.9.1"
 tokenizers = { version = "0.20", features = ["onig"] }
+safetensors = "0.4"
 
 # Runtime Integration Dependencies
 llama-cpp-2 = "0.1.67"          # TEMPORARY: Keep during migration, will be removed
