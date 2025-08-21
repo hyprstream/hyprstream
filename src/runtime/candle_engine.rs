@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::sync::{RwLock, Mutex};
 
-use candle_core::{Device, Tensor, IndexOp};
+use candle_core::{Device, DType, Tensor, IndexOp};
 use candle_transformers::models::quantized_llama::{ModelWeights as LlamaWeights};
 // Support for multiple architectures - will auto-detect and use appropriate loader
 // For Gemma models, we should use the Gemma-specific loaders when available
@@ -88,7 +88,7 @@ pub struct CandleEngine {
     gguf_content: Option<Arc<gguf_file::Content>>,
     /// GGUF vocabulary for tokenization
     gguf_vocab: Option<Arc<Vec<String>>>,
-    /// SafeTensors base model weights for inference (BF16)
+    /// SafeTensors base model weights for inference (F32 for CPU, BF16 for GPU)
     base_model_weights: Option<Arc<HashMap<String, Tensor>>>,
     /// Active LoRA adapter loaded from VDB
     active_lora: Option<Arc<SparseLoRAAdapter>>,
@@ -204,7 +204,11 @@ impl CandleEngine {
         
         // IMPORTANT: Keep base model weights in memory for inference
         // VDB is only for LoRA adapters, not base models
-        tracing::info!("📦 Keeping base model weights in memory (BF16)");
+        let dtype_str = match &self.device {
+            Device::Cpu => "F32",
+            Device::Cuda(_) | Device::Metal(_) => "BF16",
+        };
+        tracing::info!("📦 Keeping base model weights in memory ({})", dtype_str);
         let tensors_arc = Arc::new(tensors);
         self.base_model_weights = Some(tensors_arc.clone());
         
@@ -266,7 +270,11 @@ impl CandleEngine {
         
         // IMPORTANT: Keep base model weights in memory for inference
         // VDB is only for LoRA adapters, not base models
-        tracing::info!("📦 Keeping base model weights in memory (BF16)");
+        let dtype_str = match &self.device {
+            Device::Cpu => "F32",
+            Device::Cuda(_) | Device::Metal(_) => "BF16",
+        };
+        tracing::info!("📦 Keeping base model weights in memory ({})", dtype_str);
         let tensors_arc = Arc::new(all_tensors);
         self.base_model_weights = Some(tensors_arc.clone());
         
@@ -289,8 +297,25 @@ impl CandleEngine {
     /// Load a single SafeTensors file
     fn load_safetensors_file(&self, path: &Path) -> Result<HashMap<String, Tensor>> {
         // Use Candle's built-in SafeTensors loading - much more efficient!
-        candle_core::safetensors::load(path, &self.device)
-            .map_err(|e| anyhow::anyhow!("Failed to load SafeTensors file: {}", e))
+        let mut tensors = candle_core::safetensors::load(path, &self.device)
+            .map_err(|e| anyhow::anyhow!("Failed to load SafeTensors file: {}", e))?;
+        
+        // Convert BF16 tensors to F32 on CPU (CPU doesn't support BF16 matmul)
+        if matches!(self.device, Device::Cpu) {
+            tensors = tensors.into_iter()
+                .map(|(name, tensor)| {
+                    let converted = if tensor.dtype() == DType::BF16 {
+                        tensor.to_dtype(DType::F32)
+                            .unwrap_or_else(|_| tensor.clone())
+                    } else {
+                        tensor
+                    };
+                    (name, converted)
+                })
+                .collect();
+        }
+        
+        Ok(tensors)
     }
     
     /// Parse config.json to get model parameters
@@ -699,13 +724,10 @@ impl CandleEngine {
         Ok(None)
     }
     
-    /// Generate text using VDB-backed weights
+    /// Generate text using VDB-backed weights (internal, accumulates all tokens)
     async fn generate_with_vdb(&self, prompt: &str, max_tokens: usize) -> Result<String> {
-        tracing::info!("🚀 Starting VDB-backed text generation");
-        
         // Step 1: Tokenize the prompt
         let tokens = self.tokenize_prompt(prompt)?;
-        tracing::debug!("📝 Tokenized prompt: {} tokens", tokens.len());
         
         // Step 2: Prepare generation context
         let mut generated_tokens = Vec::new();
@@ -721,7 +743,6 @@ impl CandleEngine {
             
             // Check for end-of-sequence
             if self.is_eos_token(next_token) {
-                tracing::debug!("🏁 Reached end-of-sequence at token {}", i);
                 break;
             }
             
@@ -742,9 +763,78 @@ impl CandleEngine {
         
         // Step 4: Decode the output
         let output = self.decode_tokens(&generated_tokens)?;
-        
-        tracing::info!("✅ Generated {} tokens", generated_tokens.len());
         Ok(output)
+    }
+    
+    /// Generate text with streaming output - yields tokens as they're generated
+    pub async fn generate_streaming<F>(&self, prompt: &str, max_tokens: usize, mut on_token: F) -> Result<String>
+    where
+        F: FnMut(&str) + Send,
+    {
+        // Debug: Verify streaming is being called
+        eprintln!("DEBUG: generate_streaming called with prompt: '{}', max_tokens: {}", prompt, max_tokens);
+        
+        // Step 1: Tokenize the prompt
+        let tokens = self.tokenize_prompt(prompt)?;
+        eprintln!("DEBUG: Tokenized {} prompt tokens", tokens.len());
+        
+        // Step 2: Prepare generation context
+        let mut generated_tokens = Vec::new();
+        let mut context = tokens.clone();
+        
+        // Step 3: Generate tokens one by one
+        for i in 0..max_tokens {
+            eprintln!("DEBUG: Generating token {}/{}", i + 1, max_tokens);
+            
+            // Load relevant sparse weights from VDB
+            let weights = self.load_sparse_weights_for_context(&context).await?;
+            
+            // Run forward pass with sparse weights
+            let next_token = self.forward_pass_sparse(&context, &weights).await?;
+            eprintln!("DEBUG: Generated token ID: {}", next_token);
+            
+            // Check for end-of-sequence
+            if self.is_eos_token(next_token) {
+                eprintln!("DEBUG: Hit EOS token, stopping");
+                break;
+            }
+            
+            // Decode and stream the single token
+            match self.decode_tokens(&[next_token]) {
+                Ok(token_text) => {
+                    eprintln!("DEBUG: Decoded token text: '{}'", token_text);
+                    on_token(&token_text);
+                    // Flush stdout immediately after each token
+                    use std::io::{self, Write};
+                    io::stdout().flush().ok();
+                }
+                Err(e) => {
+                    eprintln!("DEBUG: Failed to decode token {}: {}", next_token, e);
+                    // If we can't decode, at least show the token ID
+                    let fallback = format!("[{}]", next_token);
+                    on_token(&fallback);
+                    use std::io::{self, Write};
+                    io::stdout().flush().ok();
+                }
+            }
+            
+            // Add to generated tokens and context
+            generated_tokens.push(next_token);
+            context.push(next_token);
+            
+            // Optional: Apply temporal weight updates
+            if self.temporal_streaming.is_some() {
+                self.apply_temporal_update(&context, next_token).await?;
+            }
+            
+            // Keep context within limits
+            if context.len() > 2048 {
+                context.drain(0..100); // Simple sliding window
+            }
+        }
+        
+        // Return the complete output
+        self.decode_tokens(&generated_tokens)
     }
     
     /// Tokenize the input prompt
@@ -973,12 +1063,24 @@ impl CandleEngine {
         let arch_name = detected_arch.name();
         tracing::info!("Creating {} model from SafeTensors weights", arch_name);
         
+        // Choose dtype based on device - CPU doesn't support BF16 matmul
+        let dtype = match &self.device {
+            Device::Cpu => {
+                tracing::info!("Using F32 dtype for CPU compatibility");
+                candle_core::DType::F32
+            },
+            Device::Cuda(_) | Device::Metal(_) => {
+                tracing::info!("Using BF16 dtype for GPU");
+                candle_core::DType::BF16
+            }
+        };
+        
         // Use the ModelFactory to create the appropriate model
         // This ensures we use the proper abstraction and can easily add new architectures
-        let model = ModelFactory::from_weights(weights, detected_arch, &self.device, candle_core::DType::BF16)?;
+        let model = ModelFactory::from_weights(weights, detected_arch, &self.device, dtype)?;
         self.arch_model = Some(Arc::new(Mutex::new(model)));
         
-        tracing::info!("✅ Created {} architecture model from SafeTensors", arch_name);
+        tracing::info!("✅ Created {} architecture model from SafeTensors with dtype {:?}", arch_name, dtype);
         Ok(())
     }
     

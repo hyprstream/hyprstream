@@ -1043,13 +1043,21 @@ pub async fn handle_model_command(
             println!();
             
             let start_time = std::time::Instant::now();
-            match engine.generate(&prompt, max_tokens).await {
-                Ok(response) => {
+            
+            // Use streaming generation and print tokens as they arrive
+            use std::io::{self, Write};
+            println!("📝 Response:");
+            let result = engine.generate_streaming(&prompt, max_tokens, |token| {
+                print!("{}", token);
+                io::stdout().flush().unwrap();
+            }).await;
+            
+            match result {
+                Ok(_) => {
+                    println!(); // New line after generation
                     let duration = start_time.elapsed();
-                    println!("✅ Generated response in {:.2}s:", duration.as_secs_f64());
                     println!();
-                    println!("📝 Response:");
-                    println!("{}", response.trim());
+                    println!("✅ Generated response in {:.2}s", duration.as_secs_f64());
                     println!();
                     
                     // Show model info

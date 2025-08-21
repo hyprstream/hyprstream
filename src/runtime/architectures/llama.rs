@@ -195,8 +195,10 @@ impl LlamaAttention {
         let (batch_size, seq_len, hidden_size) = hidden_states.dims3()?;
         
         // Debug: Check shapes before matmul
-        tracing::debug!("Attention forward - hidden_states shape: {:?}", hidden_states.dims());
-        tracing::debug!("Attention forward - q_proj shape: {:?}", self.q_proj.dims());
+        // tracing::debug!("Attention forward - hidden_states shape: {:?}", hidden_states.dims());
+        // tracing::debug!("Attention forward - q_proj shape: {:?}", self.q_proj.dims());
+        // tracing::debug!("Attention config - num_heads: {}, head_dim: {}, total: {}", 
+        //               self.num_heads, self.head_dim, self.num_heads * self.head_dim);
         
         // Reshape hidden_states for matmul: [batch*seq, hidden_size]
         let hidden_states_2d = hidden_states.reshape(&[batch_size * seq_len, hidden_size])?;
@@ -206,12 +208,46 @@ impl LlamaAttention {
         let k = hidden_states_2d.matmul(&self.k_proj)?;
         let v = hidden_states_2d.matmul(&self.v_proj)?;
         
+        // tracing::debug!("After projection - Q shape: {:?}, K shape: {:?}, V shape: {:?}", 
+        //               q.dims(), k.dims(), v.dims());
+        // tracing::debug!("Expected reshape: [{}, {}, {}, {}] = {} elements, actual Q elements: {}", 
+        //               batch_size, seq_len, self.num_heads, self.head_dim, 
+        //               batch_size * seq_len * self.num_heads * self.head_dim,
+        //               q.dims().iter().product::<usize>());
+        
+        // Determine actual K/V heads from tensor dimensions
+        let k_elements = k.dims().iter().product::<usize>();
+        let v_elements = v.dims().iter().product::<usize>();
+        
+        // For K and V, we need to figure out the actual number of heads
+        // They might be different from what we detected in config
+        let kv_heads = if k_elements == batch_size * seq_len * self.num_kv_heads * self.head_dim {
+            self.num_kv_heads  // Config is correct
+        } else if k_elements % (batch_size * seq_len * self.head_dim) == 0 {
+            // Recalculate based on actual size
+            k_elements / (batch_size * seq_len * self.head_dim)
+        } else if k_elements % (batch_size * seq_len) == 0 {
+            // Try different head_dim
+            let kv_dim = k_elements / (batch_size * seq_len);
+            if kv_dim == 256 && self.head_dim == 128 {
+                2  // 2 heads with 128 dim
+            } else if kv_dim == 256 {
+                8  // 8 heads with 32 dim
+            } else {
+                self.num_kv_heads  // Fallback to config
+            }
+        } else {
+            self.num_kv_heads  // Fallback
+        };
+        
+        // tracing::debug!("Actual KV heads: {}, config KV heads: {}", kv_heads, self.num_kv_heads);
+        
         // Reshape for attention
         // Q: [batch, seq, num_heads, head_dim]
         let q = q.reshape(&[batch_size, seq_len, self.num_heads, self.head_dim])?;
-        // K, V: [batch, seq, num_kv_heads, head_dim]
-        let k = k.reshape(&[batch_size, seq_len, self.num_kv_heads, self.head_dim])?;
-        let v = v.reshape(&[batch_size, seq_len, self.num_kv_heads, self.head_dim])?;
+        // K, V: [batch, seq, num_kv_heads, head_dim] - use actual kv_heads
+        let k = k.reshape(&[batch_size, seq_len, kv_heads, self.head_dim])?;
+        let v = v.reshape(&[batch_size, seq_len, kv_heads, self.head_dim])?;
         
         // Apply RoPE if position_ids provided
         let (q, k) = if let Some(pos_ids) = position_ids {
@@ -224,10 +260,11 @@ impl LlamaAttention {
         };
         
         // Expand K, V for GQA if needed
-        let (k, v) = if self.num_kv_heads < self.num_heads {
+        let (k, v) = if kv_heads < self.num_heads {
+            // tracing::debug!("Expanding KV from {} heads to {} heads", kv_heads, self.num_heads);
             (
-                self.expand_kv_for_gqa(&k)?,
-                self.expand_kv_for_gqa(&v)?
+                self.expand_kv_for_gqa_with_heads(&k, kv_heads)?,
+                self.expand_kv_for_gqa_with_heads(&v, kv_heads)?
             )
         } else {
             (k, v)
@@ -236,13 +273,27 @@ impl LlamaAttention {
         // Compute attention scores
         let scores = self.compute_attention_scores(&q, &k)?;
         
-        // Apply attention to values
+        // V: [batch, seq, heads, dim] -> [batch, heads, seq, dim]  
+        let v = v.transpose(1, 2)?;
+        
+        // Apply attention to values: [batch, heads, seq, seq] x [batch, heads, seq, dim] = [batch, heads, seq, dim]
         let attn_output = scores.matmul(&v)?;
         
-        // Reshape and project output
+        // Transpose back: [batch, heads, seq, dim] -> [batch, seq, heads, dim]
+        let attn_output = attn_output.transpose(1, 2)?;
+        
+        // Reshape to combine heads: [batch, seq, heads*dim]
         let attn_output = attn_output
-            .reshape(&[batch_size, seq_len, self.num_heads * self.head_dim])?
-            .matmul(&self.o_proj)?;
+            .reshape(&[batch_size, seq_len, self.num_heads * self.head_dim])?;
+        
+        // Reshape for output projection: [batch*seq, heads*dim]
+        let attn_output_2d = attn_output.reshape(&[batch_size * seq_len, self.num_heads * self.head_dim])?;
+        
+        // Apply output projection: [batch*seq, heads*dim] x [heads*dim, hidden_size] = [batch*seq, hidden_size]
+        let attn_output = attn_output_2d.matmul(&self.o_proj)?;
+        
+        // Reshape back to 3D: [batch, seq, hidden_size]
+        let attn_output = attn_output.reshape(&[batch_size, seq_len, hidden_size])?;
         
         Ok(attn_output)
     }
@@ -262,6 +313,24 @@ impl LlamaAttention {
             .reshape(&[batch_size, seq_len, self.num_heads, head_dim])?)
     }
     
+    /// Expand KV tensors for GQA with explicit head count
+    fn expand_kv_for_gqa_with_heads(&self, kv: &Tensor, actual_kv_heads: usize) -> Result<Tensor> {
+        let (batch_size, seq_len, _detected_heads, head_dim) = kv.dims4()?;
+        let repeat_factor = self.num_heads / actual_kv_heads;
+        
+        if repeat_factor == 1 {
+            return Ok(kv.clone());
+        }
+        
+        // tracing::debug!("GQA expansion: {} KV heads -> {} Q heads (repeat {}x)", 
+        //               actual_kv_heads, self.num_heads, repeat_factor);
+        
+        // Expand by repeating KV heads
+        Ok(kv.unsqueeze(3)?  // [batch, seq, num_kv_heads, 1, head_dim]
+            .expand(&[batch_size, seq_len, actual_kv_heads, repeat_factor, head_dim])?
+            .reshape(&[batch_size, seq_len, self.num_heads, head_dim])?)
+    }
+    
     /// Apply Rotary Position Embeddings with optional scaling
     fn apply_rope(&self, tensor: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
         // Simplified RoPE implementation
@@ -274,14 +343,15 @@ impl LlamaAttention {
     fn compute_attention_scores(&self, q: &Tensor, k: &Tensor) -> Result<Tensor> {
         let scale = 1.0 / (self.head_dim as f32).sqrt();
         
-        // Transpose for matmul
-        let k_t = k.transpose(1, 2)?.transpose(2, 3)?;
-        let q_t = q.transpose(1, 2)?;
+        // Q: [batch, seq, heads, dim] -> [batch, heads, seq, dim]
+        let q = q.transpose(1, 2)?;
+        // K: [batch, seq, heads, dim] -> [batch, heads, seq, dim] -> [batch, heads, dim, seq]
+        let k = k.transpose(1, 2)?.transpose(2, 3)?;
         
-        // Compute attention scores
-        let scores = q_t.matmul(&k_t)?.affine(scale as f64, 0.0)?;
+        // Compute attention scores: [batch, heads, seq, seq]
+        let scores = q.matmul(&k)?.affine(scale as f64, 0.0)?;
         
-        // Apply softmax
+        // Apply softmax along last dimension
         Ok(candle_nn::ops::softmax_last_dim(&scores)?)
     }
 }
@@ -480,16 +550,65 @@ impl LlamaModel {
             config.num_hidden_layers = layer_count;
         }
         
-        // Get attention heads from q_proj shape
+        // Get attention heads from q_proj and k_proj shapes
         if let Some(q_proj) = weights.get("model.layers.0.self_attn.q_proj.weight") {
-            let shape = q_proj.dims();
-            if shape.len() >= 2 {
+            let q_shape = q_proj.dims();
+            if q_shape.len() >= 2 {
                 // shape[0] is output dim (num_heads * head_dim)
                 // shape[1] is hidden_size
-                config.hidden_size = shape[1];
-                // Estimate num_heads assuming head_dim=128
-                config.num_attention_heads = shape[0] / 128;
-                config.head_dim = shape[0] / config.num_attention_heads;
+                config.hidden_size = q_shape[1];
+                let q_proj_out_dim = q_shape[0];
+                
+                // Also check k_proj to detect GQA (Grouped Query Attention)
+                let k_proj_out_dim = if let Some(k_proj) = weights.get("model.layers.0.self_attn.k_proj.weight") {
+                    k_proj.dims()[0]
+                } else {
+                    q_proj_out_dim // Assume same as Q if K not found
+                };
+                
+                tracing::debug!("Q projection output: {}, K projection output: {}", q_proj_out_dim, k_proj_out_dim);
+                
+                // Try common head_dim values to find the right configuration
+                // For smaller models, try smaller head dimensions first
+                let possible_head_dims = if q_proj_out_dim <= 512 {
+                    vec![32, 64, 48, 40, 128] // Smaller models often use smaller head_dim
+                } else {
+                    vec![128, 64, 80, 96, 160]
+                };
+                
+                let mut found_config = false;
+                
+                for &head_dim in &possible_head_dims {
+                    if q_proj_out_dim % head_dim == 0 && k_proj_out_dim % head_dim == 0 {
+                        config.num_attention_heads = q_proj_out_dim / head_dim;
+                        config.num_key_value_heads = k_proj_out_dim / head_dim;
+                        config.head_dim = head_dim;
+                        found_config = true;
+                        tracing::info!("Detected attention config: Q={} heads, KV={} heads, dim={}, total Q={}", 
+                                     config.num_attention_heads, config.num_key_value_heads, 
+                                     config.head_dim, q_proj_out_dim);
+                        break;
+                    }
+                }
+                
+                if !found_config {
+                    // Fallback: try to guess based on common patterns
+                    // Many small models use head_dim=32 or 64
+                    if q_proj_out_dim == 256 && k_proj_out_dim == 256 {
+                        // Likely 8 heads with dim 32
+                        config.num_attention_heads = 8;
+                        config.num_key_value_heads = 8;
+                        config.head_dim = 32;
+                        tracing::info!("Using common small model config: 8 heads x 32 dim");
+                    } else {
+                        // Last resort defaults
+                        config.num_attention_heads = 8;
+                        config.num_key_value_heads = 8;
+                        config.head_dim = 64;
+                        tracing::warn!("Could not detect attention config from shapes Q:{:?} K:{:?}, using defaults", 
+                                     q_shape, k_proj_out_dim);
+                    }
+                }
             }
         }
         
@@ -529,17 +648,21 @@ impl LlamaModel {
             let q_proj = q_proj_orig.transpose(0, 1)?.contiguous()?;
             tracing::debug!("Layer {} q_proj transposed shape: {:?}", layer_idx, q_proj.dims());
             
-            (
-                q_proj,
-                weights.get(&format!("{}.self_attn.k_proj.weight", prefix))
-                    .ok_or_else(|| anyhow!("Missing k_proj weight"))?
-                    .transpose(0, 1)?  // Transpose from [out, in] to [in, out]
-                    .contiguous()?,
-                weights.get(&format!("{}.self_attn.v_proj.weight", prefix))
-                    .ok_or_else(|| anyhow!("Missing v_proj weight"))?
-                    .transpose(0, 1)?  // Transpose from [out, in] to [in, out]
-                    .contiguous()?,
-            )
+            // Get and transpose k_proj weight
+            let k_proj_orig = weights.get(&format!("{}.self_attn.k_proj.weight", prefix))
+                .ok_or_else(|| anyhow!("Missing k_proj weight"))?;
+            tracing::debug!("Layer {} k_proj original shape: {:?}", layer_idx, k_proj_orig.dims());
+            let k_proj = k_proj_orig.transpose(0, 1)?.contiguous()?;
+            tracing::debug!("Layer {} k_proj transposed shape: {:?}", layer_idx, k_proj.dims());
+            
+            // Get and transpose v_proj weight
+            let v_proj_orig = weights.get(&format!("{}.self_attn.v_proj.weight", prefix))
+                .ok_or_else(|| anyhow!("Missing v_proj weight"))?;
+            tracing::debug!("Layer {} v_proj original shape: {:?}", layer_idx, v_proj_orig.dims());
+            let v_proj = v_proj_orig.transpose(0, 1)?.contiguous()?;
+            tracing::debug!("Layer {} v_proj transposed shape: {:?}", layer_idx, v_proj.dims());
+            
+            (q_proj, k_proj, v_proj)
         } else {
             // Combined QKV projection (some Qwen models use c_attn)
             let c_attn = weights.get(&format!("{}.self_attn.c_attn.weight", prefix))
@@ -782,7 +905,7 @@ impl ModelOperations for LlamaModel {
         tracing::debug!("Total layers to process: {}", self.layers.len());
         for (idx, layer) in self.layers.iter().enumerate() {
             let residual = hidden_states.clone();
-            tracing::debug!("Processing layer {}, hidden_states shape: {:?}", idx, hidden_states.dims());
+            // tracing::debug!("Processing layer {}, hidden_states shape: {:?}", idx, hidden_states.dims());
             
             // Self-attention block
             hidden_states = layer.input_layernorm.forward(&hidden_states)?;

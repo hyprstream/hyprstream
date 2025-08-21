@@ -79,10 +79,6 @@ impl InferenceEngine {
     
     /// Generate text using LLaMA.cpp with unified config
     pub async fn generate_text(&self, prompt: &str, max_tokens: usize) -> Result<String> {
-        // Create generation request from unified config
-        let mut request = self.config.create_request(prompt.to_string());
-        request.max_tokens = max_tokens; // Override with provided value
-        
         // Get the Candle engine
         let engine_guard = self.candle_engine.read().await;
         let candle_engine = engine_guard.as_ref()
@@ -91,20 +87,41 @@ impl InferenceEngine {
         println!("🤖 Generating text with Candle: \"{}\" (max_tokens: {})", 
                 prompt.chars().take(50).collect::<String>(), max_tokens);
         
-        let result = candle_engine.generate_with_params(request).await?;
+        // Use streaming generation and print tokens as they arrive
+        use std::io::{self, Write};
+        let start_time = std::time::Instant::now();
+        let mut token_count = 0;
+        
+        let result = candle_engine.generate_streaming(prompt, max_tokens, |token| {
+            print!("{}", token);
+            io::stdout().flush().unwrap();
+            token_count += 1;
+        }).await?;
+        
+        let duration = start_time.elapsed();
+        let tokens_per_second = if duration.as_secs_f64() > 0.0 {
+            token_count as f64 / duration.as_secs_f64()
+        } else {
+            0.0
+        };
         
         // Update statistics
         {
             let mut stats = self.stats.write().await;
             stats.total_inferences += 1;
-            stats.total_tokens_generated += result.tokens_generated as u64;
-            stats.avg_tokens_per_second = result.tokens_per_second as f64;
-            stats.avg_latency_ms = result.generation_time_ms as f64;
+            stats.total_tokens_generated += token_count as u64;
+            stats.avg_tokens_per_second = tokens_per_second;
+            stats.avg_latency_ms = duration.as_millis() as f64;
             stats.last_inference_time = chrono::Utc::now().timestamp();
         }
         
-        println!("✅ Generated {} tokens at {:.1} tok/s", result.tokens_generated, result.tokens_per_second);
-        Ok(result.text)
+        println!("\n✅ Generated {} tokens at {:.1} tok/s", token_count, tokens_per_second);
+        Ok(result)
+    }
+    
+    /// Generate text with direct API access (alias for generate_text)
+    pub async fn generate_text_direct(&self, prompt: &str, max_tokens: usize) -> Result<String> {
+        self.generate_text(prompt, max_tokens).await
     }
     
     /// Check if a model is loaded
