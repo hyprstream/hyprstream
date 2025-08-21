@@ -16,6 +16,8 @@ pub mod lora_registry;
 pub mod model_management;
 pub mod model_registry;
 pub mod model_storage;
+// Removed: safetensors_models - functionality merged into model_downloader
+pub mod model_downloader;
 pub mod huggingface;
 pub mod openai_compat;
 pub mod training_service;

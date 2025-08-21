@@ -12,6 +12,7 @@ use std::path::Path;
 pub mod detector;
 pub mod llama;
 pub mod gemma;
+pub mod qwen;
 pub mod config;
 pub mod lora_adapter;
 
@@ -151,6 +152,59 @@ pub trait ModelOperations: Send + Sync {
 pub struct ModelFactory;
 
 impl ModelFactory {
+    /// Create a model from pre-loaded weights based on architecture
+    pub fn from_weights(
+        weights: &std::collections::HashMap<String, Tensor>,
+        architecture: ModelArchitecture,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Box<dyn ModelOperations>> {
+        use crate::runtime::architectures::llama::LlamaModel;
+        use crate::runtime::architectures::gemma::GemmaModel;
+        use crate::runtime::architectures::qwen::QwenAdapter;
+        
+        match architecture {
+            ModelArchitecture::Llama { .. } => {
+                let model = LlamaModel::from_weights(weights, device, dtype)?;
+                Ok(Box::new(model))
+            }
+            ModelArchitecture::Qwen { version, is_moe, context_length } => {
+                // Use QwenAdapter to create model with proper configurations
+                QwenAdapter::from_weights(weights, version, is_moe, context_length, device, dtype)
+            }
+            ModelArchitecture::Mistral { .. } => {  // Mistral is Llama-like
+                let model = LlamaModel::from_weights(weights, device, dtype)?;
+                Ok(Box::new(model))
+            }
+            ModelArchitecture::Gemma => {
+                // Gemma has its own architecture with GeGLU activation
+                let model = GemmaModel::from_weights(weights, device, dtype)?;
+                Ok(Box::new(model))
+            }
+            ModelArchitecture::Phi { .. } => {
+                // Phi is similar to Llama but with different layer norm
+                // For now, use Llama as fallback
+                tracing::warn!("Phi architecture not fully implemented, using Llama fallback");
+                let model = LlamaModel::from_weights(weights, device, dtype)?;
+                Ok(Box::new(model))
+            }
+            ModelArchitecture::GPTOSS { .. } => {
+                // GPT-OSS would need MoE support
+                tracing::warn!("GPT-OSS MoE not implemented, using Llama fallback");
+                let model = LlamaModel::from_weights(weights, device, dtype)?;
+                Ok(Box::new(model))
+            }
+            _ => {
+                tracing::warn!(
+                    "Architecture {} not yet implemented, using Llama fallback",
+                    architecture.name()
+                );
+                let model = LlamaModel::from_weights(weights, device, dtype)?;
+                Ok(Box::new(model))
+            }
+        }
+    }
+    
     /// Load a model from GGUF file
     pub async fn from_gguf(
         path: &Path,

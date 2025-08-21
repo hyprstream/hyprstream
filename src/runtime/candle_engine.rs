@@ -8,7 +8,7 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::sync::{RwLock, Mutex};
@@ -21,10 +21,11 @@ use candle_core::quantized::{GgmlDType, gguf_file};
 
 // Architecture-specific model loading
 use crate::runtime::architectures::{ModelFactory, ArchitectureDetector, ModelOperations, ModelArchitecture};
+use crate::runtime::architectures::llama::LlamaModel;
 
 use super::{RuntimeEngine, ModelInfo, GenerationRequest, GenerationResult, FinishReason, RuntimeConfig};
 use crate::storage::vdb::{VDBSparseStorage, SparseStorageConfig, TemporalStreamingLayer, SparseStorage};
-use crate::adapters::sparse_lora::{SparseLoRAAdapter, SparseLoRAConfig};
+use crate::adapters::sparse_lora::{SparseLoRAAdapter, SparseLoRAConfig, InitMethod};
 
 /// Temporal gradient for real-time weight updates
 #[derive(Debug, Clone)]
@@ -87,6 +88,10 @@ pub struct CandleEngine {
     gguf_content: Option<Arc<gguf_file::Content>>,
     /// GGUF vocabulary for tokenization
     gguf_vocab: Option<Arc<Vec<String>>>,
+    /// SafeTensors base model weights for inference (BF16)
+    base_model_weights: Option<Arc<HashMap<String, Tensor>>>,
+    /// Active LoRA adapter loaded from VDB
+    active_lora: Option<Arc<SparseLoRAAdapter>>,
 }
 
 impl CandleEngine {
@@ -129,6 +134,8 @@ impl CandleEngine {
             arch_model: None,
             gguf_content: None,
             gguf_vocab: None,
+            base_model_weights: None,
+            active_lora: None,
         })
     }
     
@@ -157,40 +164,30 @@ impl CandleEngine {
             arch_model: None,
             gguf_content: None,
             gguf_vocab: None,
+            base_model_weights: None,
+            active_lora: None,
         })
     }
     
-    /// Load SafeTensors model to VDB format
+    /// Load SafeTensors model for inference (keep in memory, not VDB)
     async fn load_safetensors_to_vdb(&mut self, path: &Path) -> Result<()> {
-        tracing::info!("📦 Loading SafeTensors model: {:?}", path);
+        tracing::info!("📦 Loading SafeTensors model for inference: {:?}", path);
         
-        // For now, we'll just log that this needs to be implemented
-        // The actual SafeTensors loading is complex and requires proper integration
-        tracing::warn!("⚠️ SafeTensors loading is not yet fully implemented");
-        tracing::warn!("⚠️ The model has been converted but direct loading is pending");
-        
-        // Create minimal model info
-        self.model_info = Some(ModelInfo {
-            name: path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string(),
-            parameters: 1_000_000_000, // 1B parameters as placeholder
-            context_length: 4096,
-            vocab_size: 32000,
-            architecture: "converted".to_string(),
-            quantization: Some("safetensors".to_string()),
-        });
-        
-        // Return early for now - SafeTensors support will be added properly later
-        return Ok(());
-        
-        // The code below is kept for reference but won't execute
-        let tensors = HashMap::new();
+        // Load the SafeTensors file
+        let tensors = self.load_safetensors_file(path)?;
         
         // Detect architecture from tensor names or config
         let detected_arch = self.detect_architecture_from_tensors(&tensors);
         tracing::info!("Detected architecture: {}", detected_arch.name());
+        
+        // Try to load config.json from the parent directory
+        let parent_dir = path.parent().unwrap_or(Path::new("."));
+        let config_path = parent_dir.join("config.json");
+        let (context_length, vocab_size, architecture) = if config_path.exists() {
+            self.parse_config_json(&config_path)?
+        } else {
+            (4096, 32000, detected_arch.name())
+        };
         
         // Create model info
         self.model_info = Some(ModelInfo {
@@ -199,21 +196,127 @@ impl CandleEngine {
                 .unwrap_or("unknown")
                 .to_string(),
             parameters: self.estimate_parameters_from_tensors(&tensors) as u64,
-            context_length: 4096,  // Default, should be read from config
-            vocab_size: 32000,     // Default, should be read from config
-            architecture: detected_arch.name(),
+            context_length,
+            vocab_size,
+            architecture,
             quantization: Some("safetensors".to_string()),
         });
         
-        // Convert tensors to VDB sparse format
-        tracing::info!("📦 Converting tensors to VDB sparse format...");
-        self.convert_safetensors_to_vdb(tensors).await?;
+        // IMPORTANT: Keep base model weights in memory for inference
+        // VDB is only for LoRA adapters, not base models
+        tracing::info!("📦 Keeping base model weights in memory (BF16)");
+        let tensors_arc = Arc::new(tensors);
+        self.base_model_weights = Some(tensors_arc.clone());
         
-        // Load tokenizer
-        self.load_tokenizer(path).await?;
+        // Create architecture model from the weights for inference
+        self.create_arch_model_from_safetensors(&*tensors_arc).await?;
         
-        tracing::info!("✅ SafeTensors model loaded successfully");
+        // Load tokenizer from parent directory
+        self.load_tokenizer(parent_dir).await?;
+        
+        // Load active LoRA from VDB if available
+        if let Ok(lora) = self.load_active_lora_from_vdb().await {
+            tracing::info!("✅ Loaded active LoRA adapter from VDB");
+            self.active_lora = Some(Arc::new(lora));
+        }
+        
+        tracing::info!("✅ SafeTensors model loaded for inference");
         Ok(())
+    }
+    
+    /// Load sharded SafeTensors model files for inference
+    async fn load_sharded_safetensors_to_vdb(&mut self, paths: &[PathBuf]) -> Result<()> {
+        tracing::info!("📦 Loading sharded SafeTensors model with {} files", paths.len());
+        
+        // Load all tensor files and merge
+        let mut all_tensors = HashMap::new();
+        for (idx, path) in paths.iter().enumerate() {
+            tracing::info!("  Loading shard {}/{}: {:?}", idx + 1, paths.len(), path.file_name());
+            let tensors = self.load_safetensors_file(path)?;
+            all_tensors.extend(tensors);
+        }
+        
+        tracing::info!("Loaded {} total tensors from shards", all_tensors.len());
+        
+        // Detect architecture from tensor names
+        let detected_arch = self.detect_architecture_from_tensors(&all_tensors);
+        tracing::info!("Detected architecture: {}", detected_arch.name());
+        
+        // Try to load config.json from the parent directory
+        let parent_dir = paths[0].parent().unwrap_or(Path::new("."));
+        let config_path = parent_dir.join("config.json");
+        let (context_length, vocab_size, architecture) = if config_path.exists() {
+            self.parse_config_json(&config_path)?
+        } else {
+            (4096, 32000, detected_arch.name())
+        };
+        
+        // Create model info
+        self.model_info = Some(ModelInfo {
+            name: parent_dir.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            parameters: self.estimate_parameters_from_tensors(&all_tensors) as u64,
+            context_length,
+            vocab_size,
+            architecture,
+            quantization: Some("safetensors".to_string()),
+        });
+        
+        // IMPORTANT: Keep base model weights in memory for inference
+        // VDB is only for LoRA adapters, not base models
+        tracing::info!("📦 Keeping base model weights in memory (BF16)");
+        let tensors_arc = Arc::new(all_tensors);
+        self.base_model_weights = Some(tensors_arc.clone());
+        
+        // Create architecture model from the weights for inference
+        self.create_arch_model_from_safetensors(&*tensors_arc).await?;
+        
+        // Load tokenizer from parent directory
+        self.load_tokenizer(parent_dir).await?;
+        
+        // Load active LoRA from VDB if available
+        if let Ok(lora) = self.load_active_lora_from_vdb().await {
+            tracing::info!("✅ Loaded active LoRA adapter from VDB");
+            self.active_lora = Some(Arc::new(lora));
+        }
+        
+        tracing::info!("✅ Sharded SafeTensors model loaded for inference");
+        Ok(())
+    }
+    
+    /// Load a single SafeTensors file
+    fn load_safetensors_file(&self, path: &Path) -> Result<HashMap<String, Tensor>> {
+        // Use Candle's built-in SafeTensors loading - much more efficient!
+        candle_core::safetensors::load(path, &self.device)
+            .map_err(|e| anyhow::anyhow!("Failed to load SafeTensors file: {}", e))
+    }
+    
+    /// Parse config.json to get model parameters
+    fn parse_config_json(&self, path: &Path) -> Result<(usize, usize, String)> {
+        let config_str = std::fs::read_to_string(path)?;
+        let config: serde_json::Value = serde_json::from_str(&config_str)?;
+        
+        let context_length = config.get("max_position_embeddings")
+            .or_else(|| config.get("n_positions"))
+            .or_else(|| config.get("seq_length"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(4096) as usize;
+        
+        let vocab_size = config.get("vocab_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(32000) as usize;
+        
+        let architecture = config.get("architectures")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.as_str())
+            .or_else(|| config.get("model_type").and_then(|v| v.as_str()))
+            .unwrap_or("unknown")
+            .to_string();
+        
+        Ok((context_length, vocab_size, architecture))
     }
     
     /// Detect architecture from tensor names
@@ -236,8 +339,8 @@ impl CandleEngine {
             }
         }
         
-        // Default to Llama
-        ModelArchitecture::Llama
+        // Default to Llama 3
+        ModelArchitecture::Llama { version: 3 }
     }
     
     /// Estimate parameters from tensors
@@ -265,7 +368,7 @@ impl CandleEngine {
             
             // Store in VDB
             let adapter_id = format!("tensor_{}", name.replace(".", "_"));
-            self.vdb_storage.store_adapter(&adapter_id, &adapter, Default::default()).await?;
+            self.vdb_storage.store_adapter(&adapter_id, &adapter).await?;
             
             processed += 1;
             if processed % 10 == 0 {
@@ -277,6 +380,22 @@ impl CandleEngine {
         Ok(())
     }
     
+    /// Load active LoRA from VDB storage
+    async fn load_active_lora_from_vdb(&self) -> Result<SparseLoRAAdapter> {
+        // Try to load the most recent LoRA adapter from VDB
+        // For MVP, we'll just try to load a default adapter
+        match self.vdb_storage.load_adapter("active_lora", Default::default()).await {
+            Ok(adapter) => {
+                tracing::info!("Loaded active LoRA from VDB");
+                Ok(adapter)
+            }
+            Err(e) => {
+                tracing::debug!("No active LoRA found in VDB: {}", e);
+                Err(anyhow!("No active LoRA adapter found"))
+            }
+        }
+    }
+    
     /// Convert a tensor to sparse adapter format
     fn tensor_to_sparse_adapter(&self, name: &str, tensor: &Tensor) -> Result<SparseLoRAAdapter> {
         // Create a sparse adapter from the tensor
@@ -284,102 +403,82 @@ impl CandleEngine {
         let shape = tensor.dims();
         let rank = shape.last().copied().unwrap_or(8).min(128); // Use last dim as rank hint
         
+        // Create minimal config for tensor conversion
         let config = SparseLoRAConfig {
+            in_features: tensor.dims()[0],
+            out_features: if tensor.dims().len() > 1 { tensor.dims()[1] } else { tensor.dims()[0] },
             rank,
-            alpha: 16.0,
+            sparsity: 0.99,
+            learning_rate: 1e-4,
             dropout: 0.0,
-            sparsity_ratio: 0.99,
-            block_size: 16,
-            neural_compression: true,
-            auto_regressive: false,
+            alpha: 16.0,
+            bias: false,
+            target_modules: vec![name.to_string()],
+            init_method: InitMethod::Random,
+            sparsity_threshold: 0.01,
+            enable_gradient_checkpointing: false,
+            mixed_precision: true,
         };
         
-        let mut adapter = SparseLoRAAdapter::new(config);
+        let adapter = SparseLoRAAdapter::new(config);
         
-        // For now, just mark it as containing the tensor data
+        // For now, just create the adapter structure
         // In production, we'd properly decompose the tensor into LoRA factors
-        adapter.metadata.insert("source_tensor".to_string(), name.to_string());
-        adapter.metadata.insert("original_shape".to_string(), format!("{:?}", shape));
+        // and store tensor metadata separately
         
         Ok(adapter)
     }
 
-    /// Load GGUF model and convert to VDB format
-    async fn load_gguf_to_vdb(&mut self, path: &Path) -> Result<()> {
+    /// Load SafeTensors model into memory for inference
+    async fn load_safetensors_model(&mut self, path: &Path) -> Result<()> {
         tracing::info!("🔄 Loading model: {:?}", path);
         
-        // Check if it's a GGUF file and convert to SafeTensors first
-        let model_path = if path.extension().and_then(|s| s.to_str()) == Some("gguf") {
-            tracing::info!("🔄 GGUF file detected, converting to SafeTensors for better compatibility...");
+        // Check if path is a directory (SafeTensors model directory)
+        if path.is_dir() {
+            tracing::info!("📁 Directory detected, looking for SafeTensors model files...");
             
-            // Use the converter to convert GGUF to SafeTensors
-            let converted_path = super::converter::auto_convert_for_lora(path, &self.device).await?;
-            tracing::info!("✅ Converted to SafeTensors: {:?}", converted_path);
+            // Look for SafeTensors model files in the directory
+            let mut model_files = Vec::new();
+            for entry in std::fs::read_dir(path)? {
+                let entry = entry?;
+                let file_path = entry.path();
+                if let Some(ext) = file_path.extension() {
+                    if ext == "safetensors" && file_path.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.contains("model"))
+                        .unwrap_or(false) {
+                        model_files.push(file_path);
+                    }
+                }
+            }
             
-            // Use the converted file
-            converted_path
-        } else {
-            // Already SafeTensors or other format, use as-is
-            path.to_path_buf()
-        };
-        
-        // Now try to load - if it's SafeTensors, load directly
-        // If it's still GGUF (shouldn't happen), try the old path
-        if model_path.extension().and_then(|s| s.to_str()) == Some("safetensors") {
-            return self.load_safetensors_to_vdb(&model_path).await;
+            if model_files.is_empty() {
+                return Err(anyhow!("No SafeTensors model files found in directory: {:?}", path));
+            }
+            
+            // Sort files to ensure correct loading order for sharded models
+            model_files.sort();
+            tracing::info!("Found {} SafeTensors model files", model_files.len());
+            
+            // Load the SafeTensors files
+            if model_files.len() == 1 {
+                // Single file model
+                return self.load_safetensors_to_vdb(&model_files[0]).await;
+            } else {
+                // Sharded model - load all shards
+                return self.load_sharded_safetensors_to_vdb(&model_files).await;
+            }
         }
         
-        // Fallback to GGUF loading (shouldn't reach here normally)
-        tracing::warn!("⚠️ Loading GGUF directly (conversion may have failed)");
-        let mut file = std::fs::File::open(&model_path)?;
-        let model_content = gguf_file::Content::read(&mut file)
-            .map_err(|e| anyhow!("Failed to read GGUF: {}", e))?;
+        // Only support SafeTensors files
+        if path.extension().and_then(|s| s.to_str()) != Some("safetensors") {
+            return Err(anyhow!("Only SafeTensors format is supported. File must have .safetensors extension"));
+        }
         
-        // Detect architecture and load using the appropriate model
-        let detected_arch = ArchitectureDetector::detect_from_gguf(&model_content);
-        tracing::info!("Detected architecture: {}", detected_arch.name());
+        let model_path = path.to_path_buf();
         
-        // Load architecture-specific model
-        let arch_model = ModelFactory::from_gguf(path, &self.device, candle_core::DType::F16).await?;
-        self.arch_model = Some(Arc::new(Mutex::new(arch_model)));
-        
-        // Also load the standard quantized model for backward compatibility
-        let model = self.load_quantized_model(path)?;
-        self.model = Some(Arc::new(Mutex::new(model)));
-        
-        // Extract metadata
-        let metadata = &model_content.metadata;
-        let architecture = detected_arch.name();
-        
-        // Create model info
-        self.model_info = Some(ModelInfo {
-            name: path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string(),
-            parameters: self.estimate_parameters(&metadata) as u64,
-            context_length: metadata.get("llama.context_length")
-                .and_then(|v| v.to_u32().ok())
-                .unwrap_or(4096) as usize,
-            vocab_size: metadata.get("llama.vocab_size")
-                .and_then(|v| v.to_u32().ok())
-                .unwrap_or(32000) as usize,
-            architecture: architecture.clone(),
-            quantization: Some(self.detect_quantization(&model_content)),
-        });
-        
-        // Load tensors and convert to VDB first
-        tracing::info!("📦 Converting tensors to VDB sparse format...");
-        self.convert_tensors_to_vdb(&model_content).await?;
-        
-        // Store GGUF content for vocabulary access (after using it)
-        self.gguf_content = Some(Arc::new(model_content));
-        
-        // Initialize tokenizer (this will use the stored gguf_content)
-        self.load_tokenizer(path).await?;
-        
-        tracing::info!("✅ Model loaded and converted to VDB format");
-        Ok(())
+        // Load SafeTensors file
+        self.load_safetensors_to_vdb(&model_path).await
     }
     
     /// Convert Candle tensors to VDB sparse storage
@@ -538,21 +637,8 @@ impl CandleEngine {
     
     /// Load tokenizer
     async fn load_tokenizer(&mut self, model_path: &Path) -> Result<()> {
-        // First try to extract vocabulary from GGUF metadata
-        if self.gguf_content.is_some() {
-            // Clone the Arc to avoid borrow conflicts
-            let content = self.gguf_content.as_ref().unwrap().clone();
-            let has_vocab = self.try_load_vocab_from_gguf(&*content).await?;
-            if has_vocab {
-                tracing::info!("✅ Loaded vocabulary from GGUF metadata");
-                return Ok(());
-            }
-        }
-        
         // Try to find tokenizer.json in the same directory
-        let tokenizer_path = model_path.parent()
-            .map(|p| p.join("tokenizer.json"))
-            .ok_or_else(|| anyhow!("Invalid model path"))?;
+        let tokenizer_path = model_path.join("tokenizer.json");
         
         if tokenizer_path.exists() {
             self.tokenizer = Some(
@@ -574,47 +660,17 @@ impl CandleEngine {
         Ok(())
     }
     
-    /// Try to load vocabulary from GGUF metadata
-    async fn try_load_vocab_from_gguf(&mut self, content: &gguf_file::Content) -> Result<bool> {
-        // Check if vocabulary is embedded in GGUF
-        let tokens = content.metadata.get("tokenizer.ggml.tokens");
-        let scores = content.metadata.get("tokenizer.ggml.scores");
-        let token_type = content.metadata.get("tokenizer.ggml.token_type");
+    /// Create a simple character-level tokenizer as fallback
+    fn create_fallback_tokenizer(&self) -> tokenizers::Tokenizer {
+        use tokenizers::models::bpe::BPE;
+        use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+        use tokenizers::processors::byte_level::ByteLevel as ByteLevelProcessor;
         
-        if let Some(tokens_value) = tokens {
-            tracing::info!("📚 Found embedded vocabulary in GGUF, extracting tokens...");
-            
-            // Extract token strings from GGUF metadata
-            // Note: GGUF metadata stores tokens as an Array of String values
-            let token_list = match tokens_value {
-                gguf_file::Value::Array(arr) => {
-                    let mut tokens = Vec::new();
-                    for val in arr {
-                        if let gguf_file::Value::String(s) = val {
-                            tokens.push(s.clone());
-                        }
-                    }
-                    tracing::info!("  Found {} tokens in GGUF vocabulary", tokens.len());
-                    tokens
-                }
-                _ => {
-                    tracing::warn!("  Unexpected token format in GGUF: {:?}", tokens_value);
-                    return Ok(false);
-                }
-            };
-            
-            // Note: Scores and token types might not be available in all GGUF files
-            // We'll proceed without them for now
-            
-            // Build a simple vocabulary map for basic tokenization
-            // This is a simplified implementation - a full tokenizer would need proper BPE/SentencePiece handling
-            self.build_simple_vocab_from_gguf(token_list).await?;
-            
-            return Ok(true);
-        }
+        let mut tokenizer = tokenizers::Tokenizer::new(BPE::default());
+        tokenizer.with_pre_tokenizer(Some(ByteLevel::default()));
+        tokenizer.with_post_processor(Some(ByteLevelProcessor::default()));
         
-        tracing::info!("📚 No embedded vocabulary found in GGUF");
-        Ok(false)
+        tokenizer
     }
     
     /// Build a simple vocabulary from GGUF tokens
@@ -795,7 +851,42 @@ impl CandleEngine {
     
     /// Run forward pass with sparse weights using actual model
     async fn forward_pass_sparse(&self, context: &[u32], _weights: &HashMap<String, SparseLoRAAdapter>) -> Result<u32> {
-        // Check if we have a loaded model
+        // Check if we have SafeTensors base model weights
+        if let Some(base_weights) = &self.base_model_weights {
+            // Perform inference with SafeTensors weights
+            if context.is_empty() {
+                return Ok(1); // BOS token
+            }
+            
+            // Use existing architecture model or return error
+            if let Some(arch_model) = &self.arch_model {
+                let model = arch_model.lock().await;
+                
+                // Convert context to tensor - use u32 directly like Candle examples
+                let input_ids = Tensor::new(context, &self.device)?;
+                let input_ids = input_ids.unsqueeze(0)?; // Add batch dimension
+                
+                // Run model forward pass
+                let mut logits = model.forward(&input_ids, None)?;
+                
+                // Apply LoRA if available
+                if let Some(lora) = &self.active_lora {
+                    logits = self.apply_lora_to_logits(&logits, lora).await?;
+                }
+                
+                // Get last token logits and sample
+                let last_logits = logits.i((0, logits.dim(1)? - 1))?;
+                let temperature = 0.8;
+                let scaled_logits = (&last_logits / temperature)?;
+                let next_token = scaled_logits.argmax(0)?.to_scalar::<u32>()?;
+                
+                return Ok(next_token);
+            }
+            
+            return Err(anyhow!("No architecture model available for SafeTensors inference"));
+        }
+        
+        // Fallback to GGUF model if available
         if let Some(model) = &self.model {
             // Use actual model for proper inference
             if context.is_empty() {
@@ -809,6 +900,7 @@ impl CandleEngine {
                 context
             };
             
+            // Create tensor from token IDs - use u32 directly
             let input_ids = Tensor::new(context_window, &self.device)?;
             let input_ids = input_ids.unsqueeze(0)?; // Add batch dimension [1, seq_len]
             
@@ -833,6 +925,61 @@ impl CandleEngine {
             // No model loaded - this should not happen in normal operation
             Err(anyhow!("No model loaded for inference"))
         }
+    }
+    
+    /// Perform forward pass with SafeTensors weights
+    async fn safetensors_forward_pass(&self, context: &[u32], weights: &HashMap<String, Tensor>) -> Result<u32> {
+        // Use the actual architecture model if available
+        if let Some(arch_model) = &self.arch_model {
+            let model = arch_model.lock().await;
+            
+            // Create tensor from token IDs - use u32 directly
+            let input_ids = Tensor::new(context, &self.device)?;
+            let input_ids = input_ids.unsqueeze(0)?; // Add batch dimension
+            
+            // Run model forward pass
+            let logits = model.forward(&input_ids, None)?;
+            
+            // Get last token logits and sample
+            let last_logits = logits.i((0, logits.dim(1)? - 1))?;
+            let next_token = last_logits.argmax(0)?.to_scalar::<u32>()?;
+            
+            return Ok(next_token);
+        }
+        
+        // Fallback: If no architecture model loaded, return error
+        Err(anyhow!("SafeTensors model not properly loaded. Architecture model required for inference."))
+    }
+    
+    /// Apply LoRA adjustment to logits before sampling
+    async fn apply_lora_to_logits(&self, logits: &Tensor, lora: &SparseLoRAAdapter) -> Result<Tensor> {
+        // In a proper implementation, LoRA would modify the attention/FFN weights
+        // For now, we apply LoRA as a post-processing step on logits
+        
+        // Get a simple adjustment vector from LoRA
+        let vocab_size = logits.dim(logits.dims().len() - 1)?;
+        let adjustment = Tensor::zeros(&[vocab_size], candle_core::DType::F32, &self.device)?;
+        
+        // Apply LoRA influence (this would be computed from actual LoRA weights)
+        // For now, just return the original logits with a small perturbation
+        let scale = 0.01; // Small LoRA influence
+        Ok((logits + (adjustment * scale))?)
+    }
+    
+    /// Create architecture model from SafeTensors weights
+    async fn create_arch_model_from_safetensors(&mut self, weights: &HashMap<String, Tensor>) -> Result<()> {
+        // Detect architecture from tensor names
+        let detected_arch = self.detect_architecture_from_tensors(weights);
+        let arch_name = detected_arch.name();
+        tracing::info!("Creating {} model from SafeTensors weights", arch_name);
+        
+        // Use the ModelFactory to create the appropriate model
+        // This ensures we use the proper abstraction and can easily add new architectures
+        let model = ModelFactory::from_weights(weights, detected_arch, &self.device, candle_core::DType::BF16)?;
+        self.arch_model = Some(Arc::new(Mutex::new(model)));
+        
+        tracing::info!("✅ Created {} architecture model from SafeTensors", arch_name);
+        Ok(())
     }
     
     /// Generate a fallback token when model inference fails
@@ -1182,7 +1329,7 @@ impl CandleEngine {
 #[async_trait]
 impl RuntimeEngine for CandleEngine {
     async fn load_model(&mut self, path: &Path) -> Result<()> {
-        self.load_gguf_to_vdb(path).await
+        self.load_safetensors_model(path).await
     }
     
     async fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String> {

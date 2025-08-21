@@ -7,7 +7,7 @@ pub use crate::config::{
 };
 
 // Re-export the runtime engine - models are just wrappers around this
-pub use crate::runtime::{RuntimeEngine, LlamaCppEngine, create_engine};
+pub use crate::runtime::{RuntimeEngine, CandleEngine, create_engine};
 
 pub mod model_registry;
 pub mod qwen3;

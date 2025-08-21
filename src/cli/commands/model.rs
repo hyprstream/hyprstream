@@ -25,6 +25,14 @@ pub enum ModelAction {
         #[arg(long, value_delimiter = ',')]
         files: Option<Vec<String>>,
         
+        /// Preferred format (safetensors, gguf, pytorch)
+        #[arg(long, default_value = "safetensors")]
+        format: String,
+        
+        /// Auto-convert to SafeTensors if not available
+        #[arg(long, default_value = "true")]
+        auto_convert: bool,
+        
         /// Show download progress
         #[arg(long, default_value = "true")]
         progress: bool,
@@ -97,12 +105,34 @@ pub enum ModelAction {
         action: CacheAction,
     },
     
+    /// Convert model between formats
+    Convert {
+        /// Source model path or URI
+        source: String,
+        
+        /// Target format (safetensors, gguf)
+        #[arg(long, default_value = "safetensors")]
+        to: String,
+        
+        /// Output path (optional, defaults to same directory)
+        #[arg(long)]
+        output: Option<String>,
+        
+        /// Target precision (bf16, fp16, fp32)
+        #[arg(long, default_value = "bf16")]
+        precision: String,
+        
+        /// Verify conversion accuracy
+        #[arg(long)]
+        verify: bool,
+    },
+    
     /// List available registries
     Registries,
     
     /// Test a model with inference
     Test {
-        /// Model path (local GGUF file)
+        /// Model path (local SafeTensors file)
         path: std::path::PathBuf,
         
         /// Test prompt

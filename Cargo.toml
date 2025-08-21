@@ -83,6 +83,7 @@ candle-transformers = "0.9.1"
 candle-examples = "0.9.1"
 tokenizers = { version = "0.20", features = ["onig"] }
 safetensors = "0.4"
+regex = "1.11"
 
 # Runtime Integration Dependencies
 llama-cpp-2 = "0.1.67"          # TEMPORARY: Keep during migration, will be removed
@@ -96,11 +97,13 @@ indicatif = "0.17"              # Progress bars
 fastrand = "2.0"                # Fast random number generation for sampling
 xdg = "2.5"                     # XDG Base Directory specification
 blake3 = "1.5"                  # Fast cryptographic hashing for checksums
+tempfile = "3.9"                # Temporary files for GGUF conversion
 
 # HTTP API dependencies
 axum = { version = "0.7", features = ["macros", "tokio"] }
 url = "2.5"
 urlencoding = "2.1"
+half = "2.6.0"
 
 [features]
 default = []

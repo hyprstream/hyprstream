@@ -15,12 +15,9 @@ pub use crate::config::{
 };
 
 pub mod candle_engine;        // Candle-based engine with VDB integration
-// pub mod mistral_engine;       // DEPRECATED: Disabled during Candle migration
-pub mod llamacpp_engine;      // TEMPORARY: Keep during migration
 pub mod lora_wrapper;
 pub mod conversation_router;  // Seamless model evolution and routing
 pub mod precision;           // BF16/FP8 precision management
-pub mod converter;           // GGUF to SafeTensors converter with BF16
 pub mod fp8;                 // FP8 (E4M3/E5M2) quantization support
 pub mod architectures;       // Architecture-specific model implementations
 
@@ -64,8 +61,7 @@ pub use conversation_router::{
     PoolStats, RoutingConfig
 };
 
-// Temporary exports for migration period
-pub use llamacpp_engine::LlamaCppEngine;
+// LoRA and adapter exports
 pub use lora_wrapper::{LoRAEngineWrapper, RuntimeLoRAAdapter};
 pub use crate::adapters::sparse_lora::SparseLoRAAdapter;
 
@@ -147,11 +143,6 @@ pub async fn create_conversation_router(
     ).await
 }
 
-/// Create the legacy LLaMA.cpp engine (deprecated)
-#[deprecated(note = "Use create_engine() which returns CandleEngine instead")]
-pub fn create_llamacpp_engine(config: &RuntimeConfig) -> Result<LlamaCppEngine> {
-    LlamaCppEngine::new(config.clone())
-}
 
 /// Create engine with LoRA wrapper (deprecated - use X-LoRA instead)
 #[deprecated(note = "Use CandleEngine with VDB storage for better performance")]

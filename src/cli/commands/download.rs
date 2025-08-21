@@ -38,9 +38,10 @@ pub async fn download_qwen3_model(config: Option<&HyprConfig>) -> Result<PathBuf
     // Get the model repository
     let repo = api.model("Qwen/Qwen2-1.5B-Instruct-GGUF".to_string());
     
-    // Target filename for the quantized model
-    let filename = "qwen2-1_5b-instruct-q4_0.gguf";
-    let local_path = base_dir.join(filename);
+    // Target filename - always save as SafeTensors
+    let gguf_filename = "qwen2-1_5b-instruct-q4_0.gguf";
+    let safetensors_filename = "qwen2-1_5b-instruct-q4_0.safetensors";
+    let local_path = base_dir.join(safetensors_filename);
     
     // Check if model already exists
     if local_path.exists() {
@@ -48,7 +49,7 @@ pub async fn download_qwen3_model(config: Option<&HyprConfig>) -> Result<PathBuf
         return Ok(local_path);
     }
     
-    println!("🌐 Downloading: {}", filename);
+    println!("🌐 Downloading: {} (will convert to SafeTensors)", gguf_filename);
     
     // Create progress bar
     let pb = ProgressBar::new(100);
@@ -60,36 +61,16 @@ pub async fn download_qwen3_model(config: Option<&HyprConfig>) -> Result<PathBuf
     );
     pb.set_message("Initializing download...");
     
-    // Use a timeout-aware download with progress tracking
-    match download_with_progress(&repo, filename, &local_path, &pb).await {
-        Ok(()) => {
-            pb.finish_with_message("✅ Download completed");
-            println!("💾 Model saved to: {}", local_path.display());
-            
-            // Verify the downloaded file
-            let file_size = tokio::fs::metadata(&local_path).await
-                .map_err(|e| anyhow!("Failed to get file metadata: {}", e))?
-                .len();
-            
-            println!("📊 File size: {:.2} MB", file_size as f64 / 1_048_576.0);
-            
-            if file_size < 1_048_576 { // Less than 1MB is suspicious
-                return Err(anyhow!("Downloaded file seems too small, download may have failed"));
-            }
-            
-            Ok(local_path)
-        }
-        Err(e) => {
-            pb.finish_with_message("❌ Download failed");
-            
-            // Clean up partial download
-            if local_path.exists() {
-                let _ = tokio::fs::remove_file(&local_path).await;
-            }
-            
-            Err(anyhow!("Download failed: {}", e))
-        }
-    }
+    // GGUF format is no longer supported
+    pb.finish_with_message("❌ GGUF format not supported");
+    eprintln!("");
+    eprintln!("❌ GGUF format is no longer supported in HyprStream.");
+    eprintln!("   Please download models in SafeTensors format.");
+    eprintln!("   Try searching for SafeTensors versions on HuggingFace.");
+    eprintln!("");
+    eprintln!("   For example: hyprstream model pull hf://Qwen/Qwen2-1.5B");
+    
+    Err(anyhow!("GGUF format not supported"))
 }
 
 /// Download with progress tracking

@@ -59,6 +59,16 @@ impl ModelManagementState {
     pub async fn get_cache_stats(&self) -> Result<crate::api::model_storage::CacheStats> {
         self.storage.get_cache_stats().await
     }
+    
+    /// Remove model metadata
+    pub async fn remove_metadata(&self, model_uri: &ModelUri) -> Result<()> {
+        self.storage.remove_metadata(model_uri).await
+    }
+    
+    /// Remove model metadata by ID
+    pub async fn remove_metadata_by_id(&self, model_id: &crate::api::model_storage::ModelId) -> Result<()> {
+        self.storage.remove_metadata_by_id(model_id).await
+    }
 }
 
 /// Configuration for model management

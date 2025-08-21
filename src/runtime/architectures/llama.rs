@@ -192,12 +192,19 @@ struct LlamaAttention {
 impl LlamaAttention {
     /// Apply attention with optional GQA
     fn forward(&self, hidden_states: &Tensor, position_ids: Option<&Tensor>) -> Result<Tensor> {
-        let (batch_size, seq_len, _) = hidden_states.dims3()?;
+        let (batch_size, seq_len, hidden_size) = hidden_states.dims3()?;
         
-        // Project to Q, K, V
-        let q = hidden_states.matmul(&self.q_proj)?;
-        let k = hidden_states.matmul(&self.k_proj)?;
-        let v = hidden_states.matmul(&self.v_proj)?;
+        // Debug: Check shapes before matmul
+        tracing::debug!("Attention forward - hidden_states shape: {:?}", hidden_states.dims());
+        tracing::debug!("Attention forward - q_proj shape: {:?}", self.q_proj.dims());
+        
+        // Reshape hidden_states for matmul: [batch*seq, hidden_size]
+        let hidden_states_2d = hidden_states.reshape(&[batch_size * seq_len, hidden_size])?;
+        
+        // Project to Q, K, V using 2D matmul
+        let q = hidden_states_2d.matmul(&self.q_proj)?;
+        let k = hidden_states_2d.matmul(&self.k_proj)?;
+        let v = hidden_states_2d.matmul(&self.v_proj)?;
         
         // Reshape for attention
         // Q: [batch, seq, num_heads, head_dim]
@@ -288,6 +295,29 @@ struct LlamaMLP {
 
 impl LlamaMLP {
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        // Get dimensions
+        let original_shape = hidden_states.dims();
+        let (batch_size, seq_len, hidden_size) = if original_shape.len() == 3 {
+            (original_shape[0], original_shape[1], original_shape[2])
+        } else {
+            // Already 2D
+            return self.forward_2d(hidden_states);
+        };
+        
+        // Reshape to 2D for matmul
+        let hidden_2d = hidden_states.reshape(&[batch_size * seq_len, hidden_size])?;
+        
+        // Llama uses SiLU activation
+        let gate = candle_nn::ops::silu(&hidden_2d.matmul(&self.gate_proj)?)?;
+        let up = hidden_2d.matmul(&self.up_proj)?;
+        let output = gate.mul(&up)?.matmul(&self.down_proj)?;
+        
+        // Reshape back to 3D
+        let out_size = output.dims()[1];
+        Ok(output.reshape(&[batch_size, seq_len, out_size])?)
+    }
+    
+    fn forward_2d(&self, hidden_states: &Tensor) -> Result<Tensor> {
         // Llama uses SiLU activation
         let gate = candle_nn::ops::silu(&hidden_states.matmul(&self.gate_proj)?)?;
         let up = hidden_states.matmul(&self.up_proj)?;
@@ -368,6 +398,220 @@ impl LlamaModel {
             norm: None,
             lm_head: None,
         })
+    }
+    
+    /// Create Llama model from pre-loaded weight tensors
+    pub fn from_weights(
+        weights: &HashMap<String, Tensor>,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        // Parse config from weights if possible, otherwise use defaults
+        let config = Self::detect_config_from_weights(weights)?;
+        Self::from_weights_with_config(weights, config, device, dtype)
+    }
+    
+    /// Create Llama model with explicit config (allows Qwen models to override)
+    pub fn from_weights_with_config(
+        weights: &HashMap<String, Tensor>,
+        config: LlamaConfig,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        
+        // Extract key tensors
+        let embed_tokens = weights.get("model.embed_tokens.weight")
+            .or_else(|| weights.get("embed_tokens.weight"))
+            .cloned();
+        
+        // Transpose lm_head from [vocab_size, hidden_size] to [hidden_size, vocab_size]
+        let lm_head = weights.get("lm_head.weight")
+            .or_else(|| weights.get("model.lm_head.weight"))
+            .map(|w| w.transpose(0, 1).and_then(|t| t.contiguous()))
+            .transpose()?;
+        
+        // Extract final layer norm
+        let norm = weights.get("model.norm.weight")
+            .or_else(|| weights.get("norm.weight"))
+            .map(|w| RMSNorm {
+                weight: w.clone(),
+                eps: config.rms_norm_eps,
+            });
+        
+        // Build transformer layers
+        let mut layers = Vec::new();
+        for layer_idx in 0..config.num_hidden_layers {
+            if let Some(layer) = Self::build_layer(layer_idx, weights, &config, device)? {
+                layers.push(layer);
+            }
+        }
+        
+        Ok(Self {
+            config,
+            device: device.clone(),
+            dtype,
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+        })
+    }
+    
+    /// Detect configuration from weight tensor shapes
+    pub fn detect_config_from_weights(weights: &HashMap<String, Tensor>) -> Result<LlamaConfig> {
+        // Try to infer config from tensor shapes
+        let mut config = LlamaConfig::default();
+        
+        // Get vocab size from embedding
+        if let Some(embed) = weights.get("model.embed_tokens.weight")
+            .or_else(|| weights.get("embed_tokens.weight")) {
+            let shape = embed.dims();
+            if shape.len() >= 2 {
+                config.vocab_size = shape[0];
+                config.hidden_size = shape[1];
+            }
+        }
+        
+        // Count layers
+        let layer_count = weights.keys()
+            .filter(|k| k.contains("layers.") && k.contains(".self_attn.q_proj"))
+            .count();
+        if layer_count > 0 {
+            config.num_hidden_layers = layer_count;
+        }
+        
+        // Get attention heads from q_proj shape
+        if let Some(q_proj) = weights.get("model.layers.0.self_attn.q_proj.weight") {
+            let shape = q_proj.dims();
+            if shape.len() >= 2 {
+                // shape[0] is output dim (num_heads * head_dim)
+                // shape[1] is hidden_size
+                config.hidden_size = shape[1];
+                // Estimate num_heads assuming head_dim=128
+                config.num_attention_heads = shape[0] / 128;
+                config.head_dim = shape[0] / config.num_attention_heads;
+            }
+        }
+        
+        Ok(config)
+    }
+    
+    /// Build a single transformer layer from weights
+    fn build_layer(
+        layer_idx: usize,
+        weights: &HashMap<String, Tensor>,
+        config: &LlamaConfig,
+        device: &Device,
+    ) -> Result<Option<LlamaLayer>> {
+        let prefix = format!("model.layers.{}", layer_idx);
+        
+        // Check if this layer exists (handle both separate and combined projections)
+        let has_separate_qkv = weights.contains_key(&format!("{}.self_attn.q_proj.weight", prefix));
+        let has_combined_qkv = weights.contains_key(&format!("{}.self_attn.c_attn.weight", prefix));
+        
+        if !has_separate_qkv && !has_combined_qkv {
+            return Ok(None);
+        }
+        
+        // Build attention
+        // Note: PyTorch/HuggingFace stores linear weights as [out_features, in_features]
+        // but we need [in_features, out_features] for matmul, so transpose them
+        let (q_proj, k_proj, v_proj) = if has_separate_qkv {
+            // Standard separate Q, K, V projections (Llama style)
+            
+            // Get and transpose q_proj weight
+            let q_proj_orig = weights.get(&format!("{}.self_attn.q_proj.weight", prefix))
+                .ok_or_else(|| anyhow!("Missing q_proj weight"))?;
+            tracing::debug!("Layer {} q_proj original shape: {:?}", layer_idx, q_proj_orig.dims());
+            
+            // Transpose from PyTorch format [out, in] to [in, out] for matmul
+            // Make sure to make it contiguous after transpose
+            let q_proj = q_proj_orig.transpose(0, 1)?.contiguous()?;
+            tracing::debug!("Layer {} q_proj transposed shape: {:?}", layer_idx, q_proj.dims());
+            
+            (
+                q_proj,
+                weights.get(&format!("{}.self_attn.k_proj.weight", prefix))
+                    .ok_or_else(|| anyhow!("Missing k_proj weight"))?
+                    .transpose(0, 1)?  // Transpose from [out, in] to [in, out]
+                    .contiguous()?,
+                weights.get(&format!("{}.self_attn.v_proj.weight", prefix))
+                    .ok_or_else(|| anyhow!("Missing v_proj weight"))?
+                    .transpose(0, 1)?  // Transpose from [out, in] to [in, out]
+                    .contiguous()?,
+            )
+        } else {
+            // Combined QKV projection (some Qwen models use c_attn)
+            let c_attn = weights.get(&format!("{}.self_attn.c_attn.weight", prefix))
+                .ok_or_else(|| anyhow!("Missing c_attn weight"))?
+                .transpose(0, 1)?  // Transpose from [out, in] to [in, out]
+                .contiguous()?;
+            
+            // Split c_attn into Q, K, V
+            // c_attn has shape [hidden_size, 3 * projection_size]
+            let dims = c_attn.dims();
+            let hidden_size = dims[0];
+            let total_proj_size = dims[1];
+            let proj_size = total_proj_size / 3;
+            
+            let q = c_attn.narrow(1, 0, proj_size)?;
+            let k = c_attn.narrow(1, proj_size, proj_size)?;
+            let v = c_attn.narrow(1, proj_size * 2, proj_size)?;
+            
+            (q, k, v)
+        };
+        
+        let self_attn = LlamaAttention {
+            num_heads: config.num_attention_heads,
+            num_kv_heads: config.num_key_value_heads,
+            head_dim: config.head_dim,
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj: weights.get(&format!("{}.self_attn.o_proj.weight", prefix))
+                .or_else(|| weights.get(&format!("{}.self_attn.c_proj.weight", prefix)))  // Some models use c_proj for output
+                .ok_or_else(|| anyhow!("Missing o_proj/c_proj weight"))?
+                .transpose(0, 1)?  // Transpose from [out, in] to [in, out]
+                .contiguous()?,
+            rope_theta: config.rope_theta,
+            rope_scaling: config.rope_scaling.clone(),
+        };
+        
+        // Build MLP
+        let mlp = LlamaMLP {
+            gate_proj: weights.get(&format!("{}.mlp.gate_proj.weight", prefix))
+                .ok_or_else(|| anyhow!("Missing gate_proj weight"))?
+                .transpose(0, 1)?  // Transpose from [out, in] to [in, out]
+                .contiguous()?,
+            up_proj: weights.get(&format!("{}.mlp.up_proj.weight", prefix))
+                .ok_or_else(|| anyhow!("Missing up_proj weight"))?
+                .transpose(0, 1)?  // Transpose from [out, in] to [in, out]
+                .contiguous()?,
+            down_proj: weights.get(&format!("{}.mlp.down_proj.weight", prefix))
+                .ok_or_else(|| anyhow!("Missing down_proj weight"))?
+                .transpose(0, 1)?  // Transpose from [out, in] to [in, out]
+                .contiguous()?,
+        };
+        
+        // Build layer norms
+        let input_layernorm = RMSNorm {
+            weight: weights.get(&format!("{}.input_layernorm.weight", prefix))
+                .ok_or_else(|| anyhow!("Missing input_layernorm weight"))?.clone(),
+            eps: config.rms_norm_eps,
+        };
+        
+        let post_attention_layernorm = RMSNorm {
+            weight: weights.get(&format!("{}.post_attention_layernorm.weight", prefix))
+                .ok_or_else(|| anyhow!("Missing post_attention_layernorm weight"))?.clone(),
+            eps: config.rms_norm_eps,
+        };
+        
+        Ok(Some(LlamaLayer {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+        }))
     }
     
     /// Extract configuration from GGUF metadata
@@ -494,17 +738,51 @@ impl ModelOperations for LlamaModel {
     }
     
     fn forward(&self, input: &Tensor, _past_kv: Option<&Tensor>) -> Result<Tensor> {
-        let mut hidden_states = input.clone();
-        
-        // Embedding layer
-        if let Some(embed) = &self.embed_tokens {
-            // Input should be token IDs for embedding
-            // hidden_states = embed.index_select(&hidden_states, 0)?;
-        }
+        // Input should be token IDs with shape [batch_size, seq_len]
+        let mut hidden_states = if let Some(embed) = &self.embed_tokens {
+            // Convert token IDs to embeddings
+            // The embedding tensor has shape [vocab_size, hidden_size]
+            // Input has shape [batch_size, seq_len] with token IDs
+            
+            // Get input shape
+            let input_shape = input.dims();
+            tracing::debug!("Input tensor shape: {:?}, dtype: {:?}", input_shape, input.dtype());
+            tracing::debug!("Embedding matrix shape: {:?}, dtype: {:?}", embed.dims(), embed.dtype());
+            
+            let batch_size = input_shape[0];
+            let seq_len = if input_shape.len() > 1 { input_shape[1] } else { 1 };
+            
+            // Flatten input for embedding lookup (embedding expects 1D tensor)
+            let flat_input = input.flatten_all()?;
+            tracing::debug!("Flattened input shape: {:?}, dtype: {:?}", flat_input.dims(), flat_input.dtype());
+            
+            // Try to print the actual token IDs if the tensor is small
+            if flat_input.elem_count() <= 10 {
+                if let Ok(values) = flat_input.to_vec1::<u32>() {
+                    tracing::debug!("Token IDs: {:?}", values);
+                }
+            }
+            
+            // Perform embedding lookup
+            let embeddings = embed.embedding(&flat_input)?;
+            
+            // Get the actual hidden size from the embedding result
+            let emb_dims = embeddings.dims();
+            let hidden_size = emb_dims[emb_dims.len() - 1]; // Last dimension is hidden size
+            tracing::debug!("Embeddings shape after lookup: {:?}, hidden_size: {}", emb_dims, hidden_size);
+            
+            // Reshape back to [batch_size, seq_len, hidden_size]
+            embeddings.reshape(&[batch_size, seq_len, hidden_size])?
+        } else {
+            // If no embedding layer, assume input is already embedded
+            input.clone()
+        };
         
         // Apply transformer layers
-        for layer in &self.layers {
+        tracing::debug!("Total layers to process: {}", self.layers.len());
+        for (idx, layer) in self.layers.iter().enumerate() {
             let residual = hidden_states.clone();
+            tracing::debug!("Processing layer {}, hidden_states shape: {:?}", idx, hidden_states.dims());
             
             // Self-attention block
             hidden_states = layer.input_layernorm.forward(&hidden_states)?;
@@ -525,6 +803,7 @@ impl ModelOperations for LlamaModel {
         
         // LM head
         if let Some(lm_head) = &self.lm_head {
+            // LM head weight also needs to be transposed
             hidden_states = hidden_states.matmul(lm_head)?;
         }
         

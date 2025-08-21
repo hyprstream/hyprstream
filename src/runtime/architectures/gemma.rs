@@ -309,6 +309,27 @@ impl GemmaModel {
         })
     }
     
+    /// Create Gemma model from pre-loaded weights
+    pub fn from_weights(
+        weights: &HashMap<String, Tensor>,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        // For now, return a simplified implementation
+        // Full implementation would extract weights and build layers like LlamaModel does
+        tracing::warn!("Gemma from_weights not fully implemented, using simplified version");
+        
+        Ok(Self {
+            config: GemmaConfig::default(),
+            device: device.clone(),
+            dtype,
+            embed_tokens: None,
+            layers: Vec::new(),
+            norm: None,
+            lm_head: None,
+        })
+    }
+    
     /// Extract configuration from GGUF metadata
     fn extract_config(content: &gguf_file::Content) -> Result<GemmaConfig> {
         let metadata = &content.metadata;
@@ -376,13 +397,30 @@ impl ModelOperations for GemmaModel {
     }
     
     fn forward(&self, input: &Tensor, _past_kv: Option<&Tensor>) -> Result<Tensor> {
-        let mut hidden_states = input.clone();
-        
-        // Embedding layer
-        if let Some(embed) = &self.embed_tokens {
-            // Input should be token IDs for embedding
-            // hidden_states = embed.index_select(&hidden_states, 0)?;
-        }
+        // Input should be token IDs with shape [batch_size, seq_len]
+        let mut hidden_states = if let Some(embed) = &self.embed_tokens {
+            // Convert token IDs to embeddings
+            // Get input shape
+            let input_shape = input.dims();
+            let batch_size = input_shape[0];
+            let seq_len = if input_shape.len() > 1 { input_shape[1] } else { 1 };
+            
+            // Flatten input for embedding lookup (embedding expects 1D tensor)
+            let flat_input = input.flatten_all()?;
+            
+            // Perform embedding lookup
+            let embeddings = embed.embedding(&flat_input)?;
+            
+            // Get the actual hidden size from the embedding result
+            let emb_dims = embeddings.dims();
+            let hidden_size = emb_dims[emb_dims.len() - 1]; // Last dimension is hidden size
+            
+            // Reshape back to [batch_size, seq_len, hidden_size]
+            embeddings.reshape(&[batch_size, seq_len, hidden_size])?
+        } else {
+            // If no embedding layer, assume input is already embedded
+            input.clone()
+        };
         
         // Apply transformer layers
         for layer in &self.layers {

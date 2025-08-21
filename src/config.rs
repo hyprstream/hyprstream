@@ -67,8 +67,6 @@ pub struct RuntimeConfig {
     pub kv_cache_size_mb: usize,
     /// Precision mode (BF16/FP16/FP32/FP8)
     pub precision_mode: Option<String>, // "bf16", "fp16", "fp32", "fp8-mixed"
-    /// Auto-convert GGUF to SafeTensors for LoRA
-    pub auto_convert_for_lora: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -82,7 +80,6 @@ impl Default for RuntimeConfig {
             mmap: true,
             kv_cache_size_mb: 2048,
             precision_mode: Some("auto".to_string()),
-            auto_convert_for_lora: true,
         }
     }
 }
@@ -156,7 +153,6 @@ impl Default for HyprConfig {
                 mmap: true,
                 kv_cache_size_mb: 2048,
                 precision_mode: Some("auto".to_string()),
-                auto_convert_for_lora: true,
             },
             generation: GenerationConfig {
                 max_tokens: 100,

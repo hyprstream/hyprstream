@@ -29,7 +29,7 @@ pub use storage::{
     SparseWeightUpdate, EmbeddingMatch, SparseStorageError
 };
 pub use runtime::{
-    RuntimeEngine, CandleEngine, LlamaCppEngine, LoRAEngineWrapper, SparseLoRAAdapter, LoRAConfig,
+    RuntimeEngine, CandleEngine, LoRAEngineWrapper, SparseLoRAAdapter, LoRAConfig,
     ModelInfo, GenerationRequest, GenerationResult, FinishReason, RuntimeConfig,
     XLoRAAdapter, AdaptationMode, UserFeedback, XLoRARoutingStrategy, AdapterMetrics,
     // Model Evolution System exports

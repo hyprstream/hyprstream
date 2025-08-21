@@ -386,8 +386,7 @@ async fn rollback_to_checkpoint(
     system.conversation_router.seamless_transition(
         session_id,
         rollback_model_id.clone(),
-        format!("Rollback to snapshot: {} ({})", 
-               snapshot.checkpoint_id, snapshot.metadata.description),
+        format!("Rollback to snapshot: {}", snapshot.checkpoint_id),
     ).await?;
     
     // Verify rollback success

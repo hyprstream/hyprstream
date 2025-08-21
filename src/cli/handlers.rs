@@ -10,6 +10,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    str::FromStr,
 };
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -406,144 +407,297 @@ pub async fn handle_model_command(
                 }
             }
         }
-        ModelAction::Pull { uri, force: _, files, progress } => {
-            info!("📥 Pulling model: {}", uri);
+        ModelAction::Pull { uri, force, files: _, format, auto_convert, progress } => {
+            info!("📥 Pulling model: {} (format: {})", uri, format);
             
-            // Parse URI format (hf://author/model, ollama://model, etc.)
-            if uri.starts_with("hf://") {
-                let model_path = uri.strip_prefix("hf://").unwrap();
-
-                // Check if this is a tag-based URI (contains colon)
-                let target_filename = if let Some(colon_pos) = model_path.rfind(':') {
-                    let repo_path = &model_path[..colon_pos];
-                    let tag = &model_path[colon_pos + 1..];
+            // Use the unified model downloader
+            let storage_paths = crate::storage::paths::StoragePaths::new()?;
+            let models_dir = storage_paths.models_dir()?;
+            
+            // Get HuggingFace token if available
+            let hf_auth = crate::auth::HfAuth::new()?;
+            let hf_token = hf_auth.get_token().await?;
+            
+            // Create downloader with token
+            let downloader = crate::api::model_downloader::ModelDownloader::new(models_dir, hf_token).await?;
+            
+            // Set up download options
+            let options = crate::api::model_downloader::DownloadOptions {
+                preferred_format: match format.as_str() {
+                    "safetensors" => crate::api::model_downloader::ModelFormat::SafeTensors,
+                    "gguf" => crate::api::model_downloader::ModelFormat::GGUF,
+                    "pytorch" => crate::api::model_downloader::ModelFormat::PyTorch,
+                    _ => crate::api::model_downloader::ModelFormat::SafeTensors,
+                },
+                force,
+                show_progress: progress,
+                files_filter: None, // Could use 'files' parameter here
+                verify_checksums: true,
+                max_size_bytes: None,
+            };
+            
+            // Download the model
+            match downloader.download(&uri, options).await {
+                Ok(model) => {
+                    println!("✅ Model downloaded successfully!");
+                    println!("📦 Format: {:?}", model.format);
+                    println!("📊 Size: {:.2} GB", model.total_size_bytes as f64 / 1_073_741_824.0);
+                    println!("📁 Location: {}", model.local_path.display());
                     
-                    // Use direct download with tag resolution
-                    println!("📌 Resolving tag '{}' for repository '{}'", tag, repo_path);
-                    match crate::cli::commands::download::download_model_by_uri(
-                        model_path, // Pass the full URI with tag for resolution
-                        files.as_ref().and_then(|f| f.first()).map(|s| s.as_str()),
-                        None, // Use default HyprConfig
-                    ).await {
-                        Ok(model_id) => {
-                            println!("✅ Model downloaded successfully!");
-                            println!("{}", model_id); // Print just the UUID for easy capture
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            eprintln!("❌ Download failed: {}", e);
-                            return Err(e.into());
-                        }
+                    if let Some(config) = &model.config {
+                        println!("🏗️ Architecture: {}", config.architecture);
+                        println!("🔢 Parameters: {} layers, {} hidden size", 
+                            config.num_hidden_layers, config.hidden_size);
                     }
-                } else if files.is_some() {
-                    files.as_ref().map(|f| f.first().unwrap_or(&"model.gguf".to_string()).clone())
-                } else {
-                    println!("🔍 Discovering available files in repository...");
-                    match crate::cli::commands::download::list_repo_files(model_path).await {
-                        Ok(file_list) => {
-                            // Try to find a suitable GGUF file
-                            let gguf_files: Vec<_> = file_list.iter()
-                                .filter(|f| f.ends_with(".gguf"))
-                                .collect();
-                            
-                            if gguf_files.is_empty() {
-                                println!("❌ No GGUF files found in repository");
-                                println!("💡 Available files:");
-                                for file in &file_list[..std::cmp::min(10, file_list.len())] {
-                                    println!("   {}", file);
-                                }
-                                if file_list.len() > 10 {
-                                    println!("   ... and {} more files", file_list.len() - 10);
-                                }
-                                return Ok(());
+                    
+                    // Register the model with the storage system
+                    println!("📝 Registering model with storage system...");
+                    
+                    // Parse the model URI
+                    let model_uri = crate::api::model_management::ModelUri::parse(&uri)?;
+                    
+                    // Create model metadata
+                    let model_id = crate::api::model_storage::ModelId::from_content_hash(
+                        &model.model_id,
+                        &model.config.as_ref().map(|c| c.architecture.clone()).unwrap_or_else(|| "unknown".to_string()),
+                        model.config.as_ref().and_then(|c| {
+                            // Try to estimate parameters from layers and hidden size
+                            if c.num_hidden_layers > 0 && c.hidden_size > 0 {
+                                Some((c.num_hidden_layers as u64) * (c.hidden_size as u64) * 1_000_000)
+                            } else {
+                                None
                             }
-                            
-                            // If multiple GGUF files, suggest the user specify which one
-                            if gguf_files.len() > 1 {
-                                println!("📂 Multiple GGUF files found:");
-                                for file in &gguf_files {
-                                    println!("   {}", file);
-                                }
-                                println!("💡 Please specify which file to download using --files flag:");
-                                println!("   hyprstream model pull {} --files {}", uri, gguf_files[0]);
-                                return Ok(());
+                        }),
+                    );
+                    
+                    // Create external source info
+                    let external_source = crate::api::model_storage::ExternalSource {
+                        source_type: crate::api::model_storage::SourceType::HuggingFace,
+                        identifier: format!("{}/{}", model_uri.org, model_uri.name),
+                        revision: model_uri.revision.clone(),
+                        download_url: None,
+                        last_verified: chrono::Utc::now().timestamp(),
+                    };
+                    
+                    // Convert downloaded files to ModelFile format
+                    let model_files: Vec<crate::api::model_storage::ModelFile> = model.files.iter().map(|f| {
+                        crate::api::model_storage::ModelFile {
+                            filename: f.filename.clone(),
+                            size_bytes: f.size_bytes,
+                            checksum: f.sha256.clone(),
+                            file_type: match f.file_type {
+                                crate::api::model_downloader::FileType::Weights => crate::api::model_storage::FileType::Model,
+                                crate::api::model_downloader::FileType::Config => crate::api::model_storage::FileType::Config,
+                                crate::api::model_downloader::FileType::Tokenizer => crate::api::model_storage::FileType::Tokenizer,
+                                crate::api::model_downloader::FileType::Vocabulary => crate::api::model_storage::FileType::Other,
+                                crate::api::model_downloader::FileType::Metadata => crate::api::model_storage::FileType::Other,
+                            },
+                        }
+                    }).collect();
+                    
+                    // Create metadata
+                    let metadata = crate::api::model_storage::ModelMetadata {
+                        model_id: model_id.clone(),
+                        name: model_uri.name.clone(),
+                        display_name: Some(model.model_id.clone()),
+                        architecture: model.config.as_ref().map(|c| c.architecture.clone()).unwrap_or_else(|| "unknown".to_string()),
+                        parameters: model.config.as_ref().and_then(|c| {
+                            if c.num_hidden_layers > 0 && c.hidden_size > 0 {
+                                Some((c.num_hidden_layers as u64) * (c.hidden_size as u64) * 1_000_000)
+                            } else {
+                                None
                             }
-                            
-                            // Use the single GGUF file found
-                            println!("✅ Found GGUF file: {}", gguf_files[0]);
-                            Some(gguf_files[0].clone())
-                        }
-                        Err(_e) => {
-                            println!("⚠️ Could not list repository files, using default filename");
-                            Some("model.gguf".to_string())
-                        }
-                    }
-                };
-                
-                // Use our download system
-                match crate::cli::commands::download::download_model(
-                    model_path,
-                    None, // Use default models directory
-                    target_filename,
-                    progress
-                ).await {
-                    Ok(model_id) => {
-                        println!("✅ Model downloaded successfully!");
-                        println!("{}", model_id);
-                    }
-                    Err(e) => {
-                        eprintln!("❌ Download failed: {}", e);
-                        return Err(e.into());
+                        }),
+                        model_type: format!("{:?}", model.format).to_lowercase(),
+                        tokenizer_type: model.tokenizer.as_ref().and_then(|t| t.tokenizer_class.clone()),
+                        size_bytes: model.total_size_bytes,
+                        files: model_files,
+                        external_sources: vec![external_source],
+                        local_path: Some(model.local_path.clone()),
+                        is_cached: true,
+                        tags: vec![],
+                        description: None,
+                        license: None,
+                        created_at: chrono::Utc::now().timestamp(),
+                        last_accessed: chrono::Utc::now().timestamp(),
+                        last_updated: chrono::Utc::now().timestamp(),
+                    };
+                    
+                    // Store the metadata
+                    let model_manager = crate::api::model_management::ModelManager::new().await?;
+                    let storage = crate::api::model_storage::ModelStorage::new(storage_paths.models_dir()?).await?;
+                    storage.store_metadata(&model_uri, metadata).await?;
+                    
+                    println!("✅ Model registered with ID: {}", model_id);
+                    
+                    // Check if GGUF format (no longer supported)
+                    if model.format == crate::api::model_downloader::ModelFormat::GGUF {
+                        println!("⚠️ Warning: GGUF format is no longer supported.");
+                        println!("   Please download models in SafeTensors format.");
+                        println!("   Try: hyprstream model pull hf://<model-name> --format safetensors");
                     }
                 }
-            } else if uri.starts_with("ollama://") {
-                println!("🦙 Ollama integration coming soon!");
-                println!("For now, please download models manually and use file paths.");
-            } else {
-                // Assume it's a direct HuggingFace path
-                match crate::cli::commands::download::download_model(
-                    &uri,
-                    None,
-                    files.as_ref().map(|f| f.first().unwrap_or(&"model.gguf".to_string()).clone()),
-                    progress
-                ).await {
-                    Ok(model_id) => {
-                        println!("✅ Model downloaded successfully!");
-                        println!("{}", model_id);
-                    }
-                    Err(e) => {
-                        eprintln!("❌ Download failed: {}", e);
-                        return Err(e.into());
-                    }
+                Err(e) => {
+                    eprintln!("❌ Download failed: {}", e);
+                    return Err(e.into());
                 }
             }
         }
+        
         ModelAction::Remove { uri, keep_metadata, yes } => {
             info!("🗑️ Removing model: {}", uri);
             
-            // Parse and validate model path
-            let _model_path = if uri.starts_with("hf://") {
-                uri.strip_prefix("hf://").unwrap_or(&uri)
-            } else {
-                &uri
-            };
-            
             // Check if confirmation is needed
             if !yes {
-                println!("Are you sure you want to remove model '{}'? (y/N)", uri);
+                println!("⚠️  Are you sure you want to remove model '{}'?", uri);
                 println!("This action cannot be undone.");
-                // In a real implementation, we'd wait for user input
-                println!("Use --yes to skip confirmation");
+                println!("");
+                println!("Type 'yes' to confirm, or use --yes flag to skip confirmation:");
+                
+                use std::io::{self, BufRead};
+                let stdin = io::stdin();
+                let mut line = String::new();
+                stdin.lock().read_line(&mut line)?;
+                
+                if line.trim().to_lowercase() != "yes" {
+                    println!("❌ Removal cancelled");
+                    return Ok(());
+                }
+            }
+            
+            // Use the model management system to remove the model
+            let model_manager = crate::api::model_management::ModelManager::new().await?;
+            
+            // Try to parse as URI first, otherwise search by name/ID
+            let model_uri = if uri.contains("://") {
+                // It's a full URI
+                crate::api::model_management::ModelUri::parse(&uri)
+                    .map_err(|e| format!("Failed to parse model URI: {}", e))?
+            } else {
+                // Try to find by name or ID in cached models
+                let cached_models = model_manager.list_cached_models().await
+                    .map_err(|e| format!("Failed to list cached models: {}", e))?;
+                
+                // Search for exact match or partial match
+                let found = cached_models.iter()
+                    .find(|(cached_uri, metadata)| {
+                        cached_uri.name == uri || 
+                        cached_uri.uri == uri ||
+                        cached_uri.uri.ends_with(&uri) ||
+                        // Also check if it matches a model ID (UUID)
+                        if let Ok(model_id) = crate::api::model_storage::ModelId::from_str(&uri) {
+                            metadata.model_id == model_id
+                        } else {
+                            false
+                        }
+                    });
+                
+                if let Some((model_uri, _)) = found {
+                    model_uri.clone()
+                } else {
+                    // Try to construct a default HF URI
+                    let default_uri = if uri.contains('/') {
+                        format!("hf://{}", uri)
+                    } else {
+                        // Single name, might need org prefix
+                        format!("hf://library/{}", uri)
+                    };
+                    
+                    crate::api::model_management::ModelUri::parse(&default_uri)
+                        .unwrap_or_else(|_| {
+                            // Fallback: create a simple URI
+                            crate::api::model_management::ModelUri {
+                                registry: "hf".to_string(),
+                                org: "library".to_string(),
+                                name: uri.clone(),
+                                revision: None,
+                                uri: format!("hf://library/{}", uri),
+                            }
+                        })
+                }
+            };
+            
+            // Get the actual local path from metadata
+            let storage_paths = crate::storage::paths::StoragePaths::new()?;
+            let models_dir = storage_paths.models_dir()?;
+            
+            // Get the metadata to find the actual file path
+            let cached_models = model_manager.list_cached_models().await?;
+            let model_data = cached_models.iter()
+                .find(|(cached_uri, metadata)| {
+                    cached_uri.uri == model_uri.uri ||
+                    // Also check if it matches a model ID (UUID)
+                    if let Ok(model_id) = crate::api::model_storage::ModelId::from_str(&uri) {
+                        metadata.model_id == model_id
+                    } else {
+                        false
+                    }
+                });
+            
+            let local_path = if let Some((_, metadata)) = model_data {
+                // Use the actual path from metadata
+                if let Some(ref path) = metadata.local_path {
+                    path.clone()
+                } else {
+                    // Fallback to computed path
+                    model_uri.local_path(&models_dir)
+                }
+            } else {
+                // Fallback to computed path
+                model_uri.local_path(&models_dir)
+            };
+            
+            // Check if model exists locally
+            if !local_path.exists() {
+                eprintln!("❌ Model '{}' not found in local storage", uri);
+                eprintln!("   Path checked: {}", local_path.display());
+                
+                // List available models to help user
+                println!("\nAvailable models:");
+                if let Ok(cached_models) = model_manager.list_cached_models().await {
+                    for (model_uri, _metadata) in cached_models.iter().take(10) {
+                        println!("  - {}", model_uri.uri);
+                    }
+                    if cached_models.len() > 10 {
+                        println!("  ... and {} more", cached_models.len() - 10);
+                    }
+                } else {
+                    println!("  (unable to list models)");
+                }
                 return Ok(());
             }
             
-            // Simulate model removal
-            println!("✅ Model '{}' removed successfully", uri);
-            if keep_metadata {
-                println!("📋 Model metadata preserved");
-            } else {
-                println!("🗑️ Model metadata also removed");
+            // Remove the model files (check if it's a file or directory)
+            println!("🗑️ Removing model files from: {}", local_path.display());
+            let metadata = tokio::fs::metadata(&local_path).await?;
+            if metadata.is_file() {
+                // Remove single file
+                if let Err(e) = tokio::fs::remove_file(&local_path).await {
+                    eprintln!("❌ Failed to remove model file: {}", e);
+                    eprintln!("   You may need to manually remove: {}", local_path.display());
+                    return Err(e.into());
+                }
+            } else if metadata.is_dir() {
+                // Remove directory
+                if let Err(e) = tokio::fs::remove_dir_all(&local_path).await {
+                    eprintln!("❌ Failed to remove model directory: {}", e);
+                    eprintln!("   You may need to manually remove: {}", local_path.display());
+                    return Err(e.into());
+                }
             }
+            
+            // Remove metadata unless keeping it
+            if !keep_metadata {
+                if let Err(e) = model_manager.remove_metadata(&model_uri).await {
+                    eprintln!("⚠️  Failed to remove metadata: {}", e);
+                    // Continue anyway since files are already deleted
+                }
+                println!("🗑️ Model metadata removed");
+            } else {
+                println!("📋 Model metadata preserved");
+            }
+            
+            println!("✅ Model '{}' removed successfully", uri);
         }
         ModelAction::Info { uri, format } => {
             info!("ℹ️ Getting model info: {}", uri);
@@ -737,6 +891,48 @@ pub async fn handle_model_command(
                     }
                 }
             }
+        }
+        ModelAction::Convert { source, to, output, precision, verify } => {
+            info!("🔄 Converting model from {} to {}", source, to);
+            
+            use std::path::PathBuf;
+            
+            // Parse source path
+            let source_path = PathBuf::from(&source);
+            if !source_path.exists() {
+                eprintln!("❌ Source file not found: {}", source);
+                return Ok(());
+            }
+            
+            // Determine output path
+            let output_path = if let Some(out) = output {
+                PathBuf::from(out)
+            } else {
+                // Generate output filename based on format
+                let stem = source_path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("model");
+                let ext = match to.as_str() {
+                    "safetensors" => "safetensors",
+                    "gguf" => "gguf",
+                    _ => "bin",
+                };
+                source_path.with_file_name(format!("{}_{}.{}", stem, precision, ext))
+            };
+            
+            // Parse precision
+            let target_dtype = Some(precision.clone());
+            
+            println!("📂 Source: {}", source_path.display());
+            println!("📂 Output: {}", output_path.display());
+            println!("🎯 Target precision: {:?}", target_dtype);
+            
+            // GGUF conversion is no longer supported
+            eprintln!("❌ Model conversion has been removed.");
+            eprintln!("   GGUF format is no longer supported in HyprStream.");
+            eprintln!("   Please download models directly in SafeTensors format.");
+            eprintln!("");
+            eprintln!("   Try: hyprstream model pull hf://<model-name> --format safetensors");
         }
         ModelAction::Cache { action: _ } => {
             info!("🗄️ Managing model cache");
@@ -2209,25 +2405,22 @@ async fn perform_checkpoint_inference_with_weights(
     scale: f32,
     _stream: bool,
 ) -> anyhow::Result<InferenceResponse> {
-    // Validate paths exist
+    // Validate paths exist and are correct format
     if !model_path.exists() {
         return Err(anyhow::anyhow!("Base model file not found: {}", model_path.display()));
+    }
+    if model_path.extension().and_then(|s| s.to_str()) != Some("safetensors") {
+        return Err(anyhow::anyhow!("Base model must be in SafeTensors format (.safetensors)"));
     }
     if !weights_path.exists() {
         return Err(anyhow::anyhow!("Weights file not found: {}", weights_path.display()));
     }
     
-    println!("📥 Loading base model into LlamaCppEngine...");
+    println!("📥 Loading base model with CandleEngine...");
     
-    // Create LlamaCppEngine with optimized config for inference
-    let mut engine_config = crate::runtime::RuntimeConfig::default();
-    engine_config.context_length = 4096;
-    engine_config.batch_size = 512;
-    engine_config.use_gpu = true;
-    engine_config.gpu_layers = Some(99); // Use GPU if available
-    engine_config.cpu_threads = Some(num_cpus::get());
-    
-    let mut engine = crate::runtime::llamacpp_engine::LlamaCppEngine::new(engine_config)?;
+    // Create CandleEngine for SafeTensors inference
+    let engine_config = crate::runtime::RuntimeConfig::default();
+    let mut engine = crate::runtime::CandleEngine::new(engine_config)?;
     
     // Load the base model
     engine.load_model(model_path).await?;

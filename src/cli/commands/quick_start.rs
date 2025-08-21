@@ -5,7 +5,7 @@ use anyhow::Result;
 use std::path::Path;
 use std::time::Instant;
 
-use crate::runtime::{LlamaCppEngine, RuntimeConfig, RuntimeEngine};
+use crate::runtime::{CandleEngine, RuntimeConfig, RuntimeEngine};
 
 #[derive(Args)]
 pub struct QuickStartCommand {
@@ -95,24 +95,23 @@ pub async fn handle_quick_start(cmd: QuickStartCommand) -> Result<()> {
         mmap: true,
         kv_cache_size_mb: 2048,
         precision_mode: Some("auto".to_string()),
-        auto_convert_for_lora: true,
     };
 
     println!("🔧 Initializing runtime engine...");
     
-    // Initialize llama.cpp engine
-    let mut llama_engine = LlamaCppEngine::new(config)?;
+    // Initialize Candle engine
+    let mut engine = CandleEngine::new(config)?;
     
     println!("📦 Loading model...");
     let load_start = Instant::now();
-    llama_engine.load_model(model_path).await?;
+    engine.load_model(model_path).await?;
     let load_time = load_start.elapsed();
     
     println!("✅ Model loaded in {:.2}s", load_time.as_secs_f32());
     
     // Show model information if requested
     if cmd.show_info {
-        let info = llama_engine.model_info();
+        let info = engine.model_info();
         println!();
         println!("📊 Model Information:");
         println!("   Name: {}", info.name);
@@ -143,7 +142,7 @@ pub async fn handle_quick_start(cmd: QuickStartCommand) -> Result<()> {
     println!("🔮 Generating text...");
     
     let generation_start = Instant::now();
-    let result = llama_engine.generate(&cmd.prompt, cmd.max_tokens).await?;
+    let result = engine.generate(&cmd.prompt, cmd.max_tokens).await?;
     let total_time = generation_start.elapsed();
 
     // Display results
