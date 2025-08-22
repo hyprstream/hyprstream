@@ -62,7 +62,7 @@ pub enum LoRAAction {
         #[arg(long, default_value = "auto")]
         precision: String,
         
-        /// Auto-convert GGUF to SafeTensors if needed
+        /// Auto-convert to SafeTensors if needed
         #[arg(long, default_value = "true")]
         auto_convert: bool,
         
@@ -193,7 +193,7 @@ pub enum LoRAAction {
         #[arg(long)]
         output: String,
         
-        /// Export format (safetensors, pytorch, gguf)
+        /// Export format (safetensors, pytorch)
         #[arg(long, default_value = "safetensors")]
         format: String,
         
@@ -401,8 +401,8 @@ pub enum CheckpointAction {
         #[arg(long)]
         output: String,
         
-        /// Export format (gguf, safetensors)
-        #[arg(long, default_value = "gguf")]
+        /// Export format (json, safetensors)
+        #[arg(long, default_value = "json")]
         format: String,
     },
     

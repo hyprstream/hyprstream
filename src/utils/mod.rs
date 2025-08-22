@@ -45,7 +45,7 @@ mod tests {
     fn test_sanitize_filename() {
         assert_eq!(sanitize_filename("hello/world"), "hello_world");
         assert_eq!(sanitize_filename("model:v1.0"), "model_v1.0");
-        assert_eq!(sanitize_filename("test file.gguf"), "test_file.gguf");
+        assert_eq!(sanitize_filename("test file.safetensors"), "test_file.safetensors");
         assert_eq!(sanitize_filename("normal_name"), "normal_name");
         assert_eq!(sanitize_filename(""), "");
     }

@@ -18,7 +18,6 @@ use tempfile::NamedTempFile;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ModelFormat {
     SafeTensors,
-    GGUF,
     PyTorch,
 }
 
@@ -27,7 +26,6 @@ impl ModelFormat {
     pub fn extensions(&self) -> Vec<&'static str> {
         match self {
             ModelFormat::SafeTensors => vec!["safetensors"],
-            ModelFormat::GGUF => vec!["gguf", "ggml"],
             ModelFormat::PyTorch => vec!["bin", "pt", "pth"],
         }
     }
@@ -197,10 +195,6 @@ impl HuggingFaceSource {
                 formats.entry(ModelFormat::SafeTensors)
                     .or_default()
                     .push(file);
-            } else if filename.ends_with(".gguf") || filename.ends_with(".ggml") {
-                formats.entry(ModelFormat::GGUF)
-                    .or_default()
-                    .push(file);
             } else if filename.ends_with(".bin") || filename.ends_with(".pth") || filename.ends_with(".pt") ||
                       (filename.starts_with("pytorch_model") && filename.ends_with(".bin")) {
                 formats.entry(ModelFormat::PyTorch)
@@ -217,7 +211,7 @@ impl HuggingFaceSource {
             files.retain(|f| f.contains("model") || f.contains("pytorch"));
         }
         
-        // Choose the best format (SafeTensors > PyTorch > GGUF)
+        // Choose the best format (SafeTensors > PyTorch)
         if let Some(files) = formats.get(&ModelFormat::SafeTensors) {
             if !files.is_empty() {
                 Ok((ModelFormat::SafeTensors, files.clone()))
@@ -232,8 +226,6 @@ impl HuggingFaceSource {
                 formats.remove(&ModelFormat::PyTorch);
                 self.choose_next_best_format(formats)
             }
-        } else if let Some(files) = formats.get(&ModelFormat::GGUF) {
-            Ok((ModelFormat::GGUF, files.clone()))
         } else {
             Err(anyhow!("No supported model format found"))
         }
@@ -243,11 +235,6 @@ impl HuggingFaceSource {
         if let Some(files) = formats.get(&ModelFormat::PyTorch) {
             if !files.is_empty() {
                 return Ok((ModelFormat::PyTorch, files.clone()));
-            }
-        }
-        if let Some(files) = formats.get(&ModelFormat::GGUF) {
-            if !files.is_empty() {
-                return Ok((ModelFormat::GGUF, files.clone()));
             }
         }
         Err(anyhow!("No supported model format found"))
@@ -266,10 +253,6 @@ impl HuggingFaceSource {
                 formats.entry(ModelFormat::SafeTensors)
                     .or_default()
                     .push(file.clone());
-            } else if filename.ends_with(".gguf") || filename.ends_with(".ggml") {
-                formats.entry(ModelFormat::GGUF)
-                    .or_default()
-                    .push(file.clone());
             } else if (filename.ends_with(".bin") && 
                       (filename.contains("pytorch_model") || filename.contains("model"))) ||
                       filename.ends_with(".pth") || filename.ends_with(".pt") {
@@ -279,7 +262,7 @@ impl HuggingFaceSource {
             }
         }
         
-        // Choose the best format (SafeTensors > PyTorch > GGUF)
+        // Choose the best format (SafeTensors > PyTorch)
         if let Some(files) = formats.get(&ModelFormat::SafeTensors) {
             if !files.is_empty() {
                 Ok((ModelFormat::SafeTensors, files.clone()))
@@ -291,12 +274,6 @@ impl HuggingFaceSource {
                 Ok((ModelFormat::PyTorch, files.clone()))
             } else {
                 self.choose_next_best_format(formats)
-            }
-        } else if let Some(files) = formats.get(&ModelFormat::GGUF) {
-            if !files.is_empty() {
-                Ok((ModelFormat::GGUF, files.clone()))
-            } else {
-                Err(anyhow!("No supported model format found"))
             }
         } else {
             Err(anyhow!("No supported model format found in files: {:?}", files))
@@ -610,7 +587,7 @@ impl ModelSource for HuggingFaceSource {
             }
         };
         
-        // Download weight files - convert GGUF to SafeTensors on the fly
+        // Download weight files
         let pb = ProgressBar::new(weight_files.len() as u64);
         pb.set_style(
             ProgressStyle::default_bar()
@@ -619,20 +596,14 @@ impl ModelSource for HuggingFaceSource {
                 .progress_chars("#>-")
         );
         
-        // Determine final format (always SafeTensors for weights)
-        let final_format = if format == ModelFormat::GGUF {
-            ModelFormat::SafeTensors
-        } else {
-            format
-        };
+        // Use the detected format
+        let final_format = format;
         
         for weight_file in &weight_files {
             let filename = Path::new(weight_file).file_name().unwrap().to_str().unwrap();
             
-            // Always save as SafeTensors
-            let safetensors_filename = if filename.ends_with(".gguf") {
-                filename.replace(".gguf", ".safetensors")
-            } else if filename.ends_with(".bin") || filename.ends_with(".pth") {
+            // Convert PyTorch to SafeTensors if needed
+            let safetensors_filename = if filename.ends_with(".bin") || filename.ends_with(".pth") {
                 // PyTorch files also get converted
                 let base = Path::new(filename).file_stem().unwrap().to_str().unwrap();
                 format!("{}.safetensors", base)
@@ -661,26 +632,18 @@ impl ModelSource for HuggingFaceSource {
             } else {
                 pb.set_message(format!("Downloading {}", filename));
                 
-                if format == ModelFormat::GGUF {
-                    // GGUF is no longer supported - reject immediately
-                    return Err(anyhow!(
-                        "GGUF format is no longer supported. Please download models in SafeTensors format.\n\
-                        Try searching for SafeTensors versions of this model on HuggingFace."
-                    ));
-                } else {
-                    // Download directly for non-GGUF formats
-                    let size = self.download_file_with_progress(&repo, weight_file, &target_path, Some(&pb)).await?;
-                    
-                    files.push(ModelFile {
-                        filename: safetensors_filename,
-                        path: target_path,
-                        size_bytes: size,
-                        format: final_format,
-                        file_type: FileType::Weights,
-                        sha256: None,
-                    });
-                    total_size += size;
-                }
+                // Download the file
+                let size = self.download_file_with_progress(&repo, weight_file, &target_path, Some(&pb)).await?;
+                
+                files.push(ModelFile {
+                    filename: safetensors_filename,
+                    path: target_path,
+                    size_bytes: size,
+                    format: final_format,
+                    file_type: FileType::Weights,
+                    sha256: None,
+                });
+                total_size += size;
             }
         }
         
@@ -761,12 +724,11 @@ impl ModelDownloader {
         let source = self.sources.get(source_name)
             .ok_or_else(|| anyhow!("Unknown model source: {}", source_name))?;
         
-        // Download the model (GGUF will be automatically converted to SafeTensors)
+        // Download the model
         let target_dir = self.cache_dir.join(source_name);
         let model = source.download_model(model_name, &target_dir).await?;
         
-        // No need for post-download conversion since GGUF is converted during download
-        // The model.format will already be SafeTensors if it was originally GGUF
+        // Model is downloaded in its native format
         
         Ok(model)
     }

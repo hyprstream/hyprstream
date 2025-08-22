@@ -38,7 +38,7 @@ pub struct StorageConfig {
 /// Model loading and identification
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
-    /// Path to GGUF model file
+    /// Path to model file
     pub path: PathBuf,
     /// Model identifier (e.g., "qwen2-1.5b")
     pub name: String,

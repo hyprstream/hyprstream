@@ -4,7 +4,6 @@ use super::{ModelArchitecture, ModelOperations, ArchitectureConfig};
 use super::lora_adapter::ArchitectureAwareLoRAAdapter;
 use anyhow::{Result, anyhow};
 use candle_core::{Device, DType, Tensor, D};
-use candle_core::quantized::gguf_file;
 use candle_nn::{Module, VarBuilder};
 use std::collections::HashMap;
 use std::path::Path;
@@ -414,28 +413,13 @@ impl RMSNorm {
 }
 
 impl LlamaModel {
-    /// Create Llama model from GGUF file
-    pub fn from_gguf(
-        mut content: gguf_file::Content,
-        file: &mut std::fs::File,
-        device: &Device,
-        dtype: DType,
+    /// Create Llama model from file (deprecated)
+    pub fn from_file(
+        _path: &Path,
+        _device: &Device,
+        _dtype: DType,
     ) -> Result<Self> {
-        // Extract configuration from metadata
-        let config = Self::extract_config(&content)?;
-        
-        // Load weights (simplified)
-        let layers = Vec::new();
-        
-        Ok(Self {
-            config,
-            device: device.clone(),
-            dtype,
-            embed_tokens: None,
-            layers,
-            norm: None,
-            lm_head: None,
-        })
+        Err(anyhow!("Model format not supported. Please use SafeTensors format."))
     }
     
     /// Create Llama model from SafeTensors
@@ -494,11 +478,21 @@ impl LlamaModel {
             .or_else(|| weights.get("embed_tokens.weight"))
             .cloned();
         
-        // Transpose lm_head from [vocab_size, hidden_size] to [hidden_size, vocab_size]
+        // Handle lm_head - Gemma models use weight tying (lm_head shares weights with embed_tokens)
+        // Try to find explicit lm_head first, otherwise we'll use tied weights from embeddings
         let lm_head = weights.get("lm_head.weight")
             .or_else(|| weights.get("model.lm_head.weight"))
-            .map(|w| w.transpose(0, 1).and_then(|t| t.contiguous()))
+            .map(|w| {
+                // LM head is stored as [vocab_size, hidden_size] in HuggingFace
+                // We need [hidden_size, vocab_size] for matmul
+                w.transpose(0, 1).and_then(|t| t.contiguous())
+            })
             .transpose()?;
+        
+        // Check if this is a model with tied weights (like Gemma)
+        if lm_head.is_none() && embed_tokens.is_some() {
+            tracing::info!("Model appears to use weight tying (lm_head = embed_tokens.T), like Gemma models");
+        }
         
         // Extract final layer norm
         let norm = weights.get("model.norm.weight")
@@ -737,10 +731,8 @@ impl LlamaModel {
         }))
     }
     
-    /// Extract configuration from GGUF metadata
-    fn extract_config(content: &gguf_file::Content) -> Result<LlamaConfig> {
-        let metadata = &content.metadata;
-        
+    /// Extract configuration from metadata (deprecated)
+    fn extract_config(metadata: &HashMap<String, String>) -> Result<LlamaConfig> {
         // Detect Llama version
         let version = if metadata.contains_key("llama.rope.scaling.type") {
             3  // Llama 3 has rope scaling
@@ -753,50 +745,49 @@ impl LlamaModel {
         let mut config = LlamaConfig {
             version,
             num_attention_heads: metadata.get("llama.attention.head_count")
-                .and_then(|v| v.to_u32().ok())
-                .unwrap_or(32) as usize,
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(32),
             num_key_value_heads: metadata.get("llama.attention.head_count_kv")
-                .and_then(|v| v.to_u32().ok())
+                .and_then(|v| v.parse().ok())
                 .unwrap_or_else(|| {
                     metadata.get("llama.attention.head_count")
-                        .and_then(|v| v.to_u32().ok())
+                        .and_then(|v| v.parse().ok())
                         .unwrap_or(32)
-                }) as usize,
+                }),
             hidden_size: metadata.get("llama.embedding_length")
-                .and_then(|v| v.to_u32().ok())
-                .unwrap_or(4096) as usize,
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4096),
             head_dim: metadata.get("llama.rope.dimension_count")
-                .and_then(|v| v.to_u32().ok())
-                .unwrap_or(128) as usize,
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(128),
             intermediate_size: metadata.get("llama.feed_forward_length")
-                .and_then(|v| v.to_u32().ok())
-                .unwrap_or(11008) as usize,
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(11008),
             max_position_embeddings: metadata.get("llama.context_length")
-                .and_then(|v| v.to_u32().ok())
-                .unwrap_or(4096) as usize,
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4096),
             rms_norm_eps: metadata.get("llama.attention.layer_norm_rms_epsilon")
-                .and_then(|v| v.to_f32().ok())
+                .and_then(|v| v.parse().ok())
                 .unwrap_or(1e-5),
             vocab_size: metadata.get("tokenizer.ggml.model.vocab_size")
-                .and_then(|v| v.to_u32().ok())
-                .unwrap_or(32000) as usize,
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(32000),
             num_hidden_layers: metadata.get("llama.block_count")
-                .and_then(|v| v.to_u32().ok())
-                .unwrap_or(32) as usize,
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(32),
             rope_theta: metadata.get("llama.rope.freq_base")
-                .and_then(|v| v.to_f32().ok())
+                .and_then(|v| v.parse().ok())
                 .unwrap_or(10000.0),
             rope_scaling: None,
         };
         
         // Check for Llama 3 rope scaling
         if version == 3 {
-            if let Some(scaling_type) = metadata.get("llama.rope.scaling.type")
-                .and_then(|v| v.to_string().ok()) {
+            if let Some(scaling_type) = metadata.get("llama.rope.scaling.type") {
                 config.rope_scaling = Some(RopeScaling {
                     scaling_type: scaling_type.clone(),
                     factor: metadata.get("llama.rope.scaling.factor")
-                        .and_then(|v| v.to_f32().ok())
+                        .and_then(|v| v.parse().ok())
                         .unwrap_or(8.0),
                 });
             }
@@ -928,6 +919,38 @@ impl ModelOperations for LlamaModel {
         if let Some(lm_head) = &self.lm_head {
             // LM head weight also needs to be transposed
             hidden_states = hidden_states.matmul(lm_head)?;
+        } else if let Some(embed) = &self.embed_tokens {
+            // Gemma and some other models tie weights: lm_head = embed_tokens.T
+            // The embedding matrix is [vocab_size, hidden_size]
+            // For output projection we need [hidden_size, vocab_size]
+            // So we transpose: [262144, 640] -> [640, 262144]
+            tracing::debug!("Using tied weights: projecting with transposed embedding matrix");
+            
+            // Get the shape for debugging
+            let embed_shape = embed.dims();
+            tracing::debug!("Embedding shape: {:?}, hidden_states shape: {:?}", embed_shape, hidden_states.dims());
+            
+            // The embedding tensor is [vocab_size, hidden_size]
+            // We need to transpose it for the projection
+            let output_proj = embed.t()?.contiguous()?;
+            tracing::debug!("Output projection shape after transpose: {:?}", output_proj.dims());
+            
+            // Ensure hidden_states is the right shape for matmul
+            // Should be [batch * seq_len, hidden_size] for the matmul
+            let hs_shape = hidden_states.dims();
+            if hs_shape.len() == 3 {
+                let (batch_size, seq_len, hidden_size) = (hs_shape[0], hs_shape[1], hs_shape[2]);
+                // Reshape to 2D for matmul: [batch * seq_len, hidden_size]
+                let hidden_2d = hidden_states.reshape(&[batch_size * seq_len, hidden_size])?;
+                // Perform matmul: [batch * seq_len, hidden_size] x [hidden_size, vocab_size] = [batch * seq_len, vocab_size]
+                let logits_2d = hidden_2d.matmul(&output_proj)?;
+                // Reshape back to 3D: [batch, seq_len, vocab_size]
+                hidden_states = logits_2d.reshape(&[batch_size, seq_len, output_proj.dim(1)?])?;
+            } else {
+                hidden_states = hidden_states.matmul(&output_proj)?;
+            }
+        } else {
+            tracing::warn!("No LM head or embedding weights found - returning hidden states!");
         }
         
         Ok(hidden_states)

@@ -81,7 +81,7 @@ mod tests {
     
     #[test]
     fn test_qwen3_creation() {
-        let model_path = PathBuf::from("test_model.gguf");
+        let model_path = PathBuf::from("test_model.safetensors");
         let wrapper = Qwen3Wrapper::new_default(&model_path);
         assert!(wrapper.is_ok());
         

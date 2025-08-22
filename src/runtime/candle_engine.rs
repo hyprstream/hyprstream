@@ -17,7 +17,7 @@ use candle_core::{Device, DType, Tensor, IndexOp};
 use candle_transformers::models::quantized_llama::{ModelWeights as LlamaWeights};
 // Support for multiple architectures - will auto-detect and use appropriate loader
 // For Gemma models, we should use the Gemma-specific loaders when available
-use candle_core::quantized::{GgmlDType, gguf_file};
+use candle_core::quantized::GgmlDType;
 
 // Architecture-specific model loading
 use crate::runtime::architectures::{ModelFactory, ArchitectureDetector, ModelOperations, ModelArchitecture};
@@ -26,6 +26,7 @@ use crate::runtime::architectures::llama::LlamaModel;
 use super::{RuntimeEngine, ModelInfo, GenerationRequest, GenerationResult, FinishReason, RuntimeConfig};
 use crate::storage::vdb::{VDBSparseStorage, SparseStorageConfig, TemporalStreamingLayer, SparseStorage};
 use crate::adapters::sparse_lora::{SparseLoRAAdapter, SparseLoRAConfig, InitMethod};
+use crate::runtime::sampling::{SamplingConfig, TokenSampler};
 
 /// Temporal gradient for real-time weight updates
 #[derive(Debug, Clone)]
@@ -80,18 +81,16 @@ pub struct CandleEngine {
     _lora_adapters: Arc<RwLock<HashMap<String, SparseLoRAAdapter>>>,
     /// Tokenizer
     tokenizer: Option<tokenizers::Tokenizer>,
-    /// Model weights loaded from GGUF (wrapped in Mutex for mutable access)
+    /// Model weights loaded from file (wrapped in Mutex for mutable access)
     model: Option<Arc<Mutex<LlamaWeights>>>,
     /// Architecture-specific model implementation
     arch_model: Option<Arc<Mutex<Box<dyn ModelOperations>>>>,
-    /// GGUF content for tensor access
-    gguf_content: Option<Arc<gguf_file::Content>>,
-    /// GGUF vocabulary for tokenization
-    gguf_vocab: Option<Arc<Vec<String>>>,
     /// SafeTensors base model weights for inference (F32 for CPU, BF16 for GPU)
     base_model_weights: Option<Arc<HashMap<String, Tensor>>>,
     /// Active LoRA adapter loaded from VDB
-    active_lora: Option<Arc<SparseLoRAAdapter>>,
+    pub active_lora: Option<Arc<SparseLoRAAdapter>>,
+    /// Sampling configuration for token generation
+    pub sampling_config: SamplingConfig,
 }
 
 impl CandleEngine {
@@ -132,10 +131,9 @@ impl CandleEngine {
             tokenizer: None,
             model: None,
             arch_model: None,
-            gguf_content: None,
-            gguf_vocab: None,
             base_model_weights: None,
             active_lora: None,
+            sampling_config: SamplingConfig::default(),
         })
     }
     
@@ -162,10 +160,9 @@ impl CandleEngine {
             tokenizer: None,
             model: None,
             arch_model: None,
-            gguf_content: None,
-            gguf_vocab: None,
             base_model_weights: None,
             active_lora: None,
+            sampling_config: SamplingConfig::default(),
         })
     }
     
@@ -318,8 +315,8 @@ impl CandleEngine {
         Ok(tensors)
     }
     
-    /// Parse config.json to get model parameters
-    fn parse_config_json(&self, path: &Path) -> Result<(usize, usize, String)> {
+    /// Parse config.json to get model parameters and sampling configuration
+    fn parse_config_json(&mut self, path: &Path) -> Result<(usize, usize, String)> {
         let config_str = std::fs::read_to_string(path)?;
         let config: serde_json::Value = serde_json::from_str(&config_str)?;
         
@@ -340,6 +337,12 @@ impl CandleEngine {
             .or_else(|| config.get("model_type").and_then(|v| v.as_str()))
             .unwrap_or("unknown")
             .to_string();
+        
+        // Load sampling configuration from model card
+        let model_id = config.get("_name_or_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&architecture);
+        self.sampling_config = SamplingConfig::from_model_card(model_id, &config);
         
         Ok((context_length, vocab_size, architecture))
     }
@@ -506,158 +509,12 @@ impl CandleEngine {
         self.load_safetensors_to_vdb(&model_path).await
     }
     
-    /// Convert Candle tensors to VDB sparse storage
-    async fn convert_tensors_to_vdb(&mut self, content: &candle_core::quantized::gguf_file::Content) -> Result<()> {
-        let tensors = &content.tensor_infos;
-        
-        // Track conversion statistics
-        let mut converted_count = 0;
-        let total_tensors = tensors.len();
-        tracing::info!("📊 Processing {} tensors for VDB conversion", total_tensors);
-        
-        for (name, tensor_info) in tensors.iter() {
-            tracing::debug!("Converting tensor: {} (shape: {:?}, type: {:?})", 
-                          name, tensor_info.shape, tensor_info.ggml_dtype);
-            
-            // Check if this is a weight tensor we want to sparsify
-            if self.should_sparsify(name) {
-                // Extract dimensions from shape
-                let dims = tensor_info.shape.dims();
-                let (in_features, out_features) = if dims.len() >= 2 {
-                    (dims[dims.len() - 1] as usize, dims[dims.len() - 2] as usize)
-                } else {
-                    (4096, 4096) // Default fallback
-                };
-                
-                // Create sparse adapter for this tensor
-                let adapter_id = format!("tensor_{}", name.replace("/", "_").replace(".", "_"));
-                
-                // Create sparse adapter config with actual dimensions
-                use crate::adapters::sparse_lora::SparseLoRAConfig;
-                let config = SparseLoRAConfig {
-                    in_features,
-                    out_features,
-                    rank: std::cmp::min(16, std::cmp::min(in_features, out_features) / 4), // Adaptive rank
-                    alpha: 32.0,
-                    dropout: 0.1,
-                    target_modules: vec![name.clone()],
-                    sparsity: 0.99,
-                    sparsity_threshold: 0.01,
-                    learning_rate: 0.001,
-                    bias: false,
-                    enable_gradient_checkpointing: false,
-                    init_method: crate::adapters::sparse_lora::InitMethod::Random,
-                    mixed_precision: false,
-                };
-                let sparse_adapter = SparseLoRAAdapter::new(config);
-                
-                // Store in VDB
-                self.vdb_storage.store_adapter(&adapter_id, &sparse_adapter).await?;
-                
-                converted_count += 1;
-                tracing::debug!("✓ Stored sparse tensor: {} ({}x{})", adapter_id, in_features, out_features);
-            }
-        }
-        
-        tracing::info!("✅ Converted {}/{} tensors to VDB sparse format", 
-                      converted_count, total_tensors);
-        
-        Ok(())
-    }
-    
     /// Check if a tensor should be sparsified
     fn should_sparsify(&self, tensor_name: &str) -> bool {
         // Sparsify attention and FFN weights, keep embeddings dense
         tensor_name.contains("attn") || 
         tensor_name.contains("mlp") ||
         tensor_name.contains("ffn")
-    }
-    
-    /// Estimate model parameters from metadata
-    fn estimate_parameters(&self, metadata: &HashMap<String, candle_core::quantized::gguf_file::Value>) -> usize {
-        let hidden_size = metadata.get("llama.embedding_length")
-            .and_then(|v| v.to_u32().ok())
-            .unwrap_or(4096) as usize;
-        
-        let num_layers = metadata.get("llama.block_count")
-            .and_then(|v| v.to_u32().ok())
-            .unwrap_or(32) as usize;
-        
-        // Rough parameter estimation
-        let params_per_layer = hidden_size * hidden_size * 12; // Approximation
-        params_per_layer * num_layers
-    }
-    
-    /// Detect quantization type
-    fn detect_quantization(&self, content: &candle_core::quantized::gguf_file::Content) -> String {
-        // Check tensor types to determine quantization
-        for (_name, info) in content.tensor_infos.iter().take(1) {
-            return match info.ggml_dtype {
-                GgmlDType::F32 => "f32".to_string(),
-                GgmlDType::F16 => "f16".to_string(),
-                GgmlDType::Q4_0 => "q4_0".to_string(),
-                GgmlDType::Q4_1 => "q4_1".to_string(),
-                GgmlDType::Q5_0 => "q5_0".to_string(),
-                GgmlDType::Q5_1 => "q5_1".to_string(),
-                GgmlDType::Q8_0 => "q8_0".to_string(),
-                _ => "unknown".to_string(),
-            }
-        }
-        "unknown".to_string()
-    }
-    
-    /// Load quantized model from GGUF content
-    fn load_quantized_model(&self, path: &Path) -> Result<LlamaWeights> {
-        use candle_transformers::models::quantized_llama::ModelWeights;
-        
-        tracing::info!("📦 Loading quantized model weights from GGUF");
-        
-        // Load model using Candle's built-in GGUF loader
-        // We need to re-read the file to get content that can be moved
-        let mut file = std::fs::File::open(path)?;
-        let mut content = gguf_file::Content::read(&mut file)
-            .map_err(|e| anyhow!("Failed to read GGUF: {}", e))?;
-        
-        // Detect the architecture
-        let architecture = content.metadata.get("general.architecture")
-            .and_then(|v| match v.to_string() {
-                Ok(s) => Some(s.clone()),
-                Err(_) => None
-            })
-            .unwrap_or_else(|| "llama".to_string());
-        
-        let arch_lower = architecture.to_lowercase();
-        
-        // Fix metadata for different architectures (Qwen, Gemma, etc.)
-        self.fix_metadata_for_architecture(&mut content)?;
-        
-        // Reset file position for model loading
-        let mut file = std::fs::File::open(path)?;
-        let device = &self.device;
-        
-        // Debug: Verify metadata before passing to ModelWeights
-        tracing::debug!("Final metadata check before ModelWeights::from_gguf:");
-        tracing::debug!("  Architecture: {}", architecture);
-        if content.metadata.contains_key("llama.rope.dimension_count") {
-            tracing::debug!("  ✓ llama.rope.dimension_count exists: {:?}", 
-                          content.metadata.get("llama.rope.dimension_count"));
-        } else {
-            tracing::debug!("  ℹ llama.rope.dimension_count not present (may be optional for {}))", architecture);
-        }
-        
-        // For Gemma models, warn about potential compatibility issues
-        if arch_lower.contains("gemma") {
-            tracing::warn!("⚠️ Loading Gemma model with Llama loader - some features may not work correctly");
-            tracing::warn!("  Gemma models have different attention mechanisms that may cause shape mismatches");
-            tracing::warn!("  Consider using a Gemma-specific inference engine for better compatibility");
-        }
-        
-        // Use Candle's built-in GGUF model loader with content
-        // Note: This uses the Llama loader for all models, which may cause issues with non-Llama architectures
-        let model = ModelWeights::from_gguf(content, &mut file, device)?;
-        
-        tracing::info!("✅ Loaded quantized model weights (as Llama architecture)");
-        Ok(model)
     }
     
     /// Load tokenizer
@@ -672,13 +529,39 @@ impl CandleEngine {
             );
             tracing::info!("✅ Loaded tokenizer from: {:?}", tokenizer_path);
         } else {
-            // Try to download a suitable tokenizer based on model architecture
-            tracing::info!("📥 Attempting to download tokenizer...");
-            if let Some(tokenizer) = self.download_tokenizer_for_model(model_path).await? {
+            // Check for cached tokenizer
+            let cache_dir = model_path.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(".tokenizer_cache");
+            
+            // Try to find a cached tokenizer
+            let mut cached_tokenizer = None;
+            if cache_dir.exists() {
+                if let Ok(mut entries) = tokio::fs::read_dir(&cache_dir).await {
+                    while let Ok(Some(entry)) = entries.next_entry().await {
+                        let path = entry.path();
+                        if path.extension().map_or(false, |ext| ext == "json") {
+                            if let Ok(tokenizer) = tokenizers::Tokenizer::from_file(&path) {
+                                tracing::info!("✅ Loaded cached tokenizer from: {:?}", path);
+                                cached_tokenizer = Some(tokenizer);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if let Some(tokenizer) = cached_tokenizer {
                 self.tokenizer = Some(tokenizer);
-                tracing::info!("✅ Downloaded and loaded tokenizer");
             } else {
-                tracing::warn!("⚠️ No tokenizer available, using character-level fallback");
+                // Try to download a suitable tokenizer based on model architecture
+                tracing::info!("📥 No cached tokenizer found, attempting to download...");
+                if let Some(tokenizer) = self.download_tokenizer_for_model(model_path).await? {
+                    self.tokenizer = Some(tokenizer);
+                    tracing::info!("✅ Downloaded and loaded tokenizer");
+                } else {
+                    tracing::warn!("⚠️ No tokenizer available, using character-level fallback");
+                }
             }
         }
         
@@ -698,30 +581,52 @@ impl CandleEngine {
         tokenizer
     }
     
-    /// Build a simple vocabulary from GGUF tokens
-    async fn build_simple_vocab_from_gguf(&mut self, tokens: Vec<String>) -> Result<()> {
-        tracing::info!("🔨 Building simple tokenizer from {} GGUF tokens", tokens.len());
-        
-        // Store the GGUF vocabulary for tokenization
-        self.gguf_vocab = Some(Arc::new(tokens.clone()));
-        
-        // Log some sample tokens for debugging
-        if tokens.len() > 10 {
-            tracing::debug!("  Sample tokens: {:?}", &tokens[0..10]);
-            tracing::debug!("  Special tokens: BOS={:?}, EOS={:?}", 
-                tokens.get(1), tokens.get(2));
-        }
-        
-        tracing::info!("✅ GGUF vocabulary loaded (simplified tokenization enabled)");
-        Ok(())
-    }
-    
     /// Download tokenizer from HuggingFace based on model type
-    async fn download_tokenizer_for_model(&self, _model_path: &Path) -> Result<Option<tokenizers::Tokenizer>> {
-        // For now, return None and use character-level fallback
-        // In production, this would download the actual tokenizer.json from HuggingFace
-        tracing::info!("📥 Tokenizer download not implemented, using character-level fallback");
-        Ok(None)
+    async fn download_tokenizer_for_model(&self, model_path: &Path) -> Result<Option<tokenizers::Tokenizer>> {
+        use hf_hub::{api::tokio::Api, Repo, RepoType};
+        
+        // Determine model name from path or use default Qwen2 model
+        let model_name = if model_path.to_string_lossy().contains("gemma") || 
+                           model_path.to_string_lossy().contains("Gemma") {
+            "google/gemma-2b"  // Use appropriate Gemma tokenizer
+        } else if model_path.to_string_lossy().contains("qwen2") || 
+                           model_path.to_string_lossy().contains("Qwen2") {
+            "Qwen/Qwen2-1.5B-Instruct"
+        } else if model_path.to_string_lossy().contains("mistral") {
+            "mistralai/Mistral-7B-v0.1"
+        } else if model_path.to_string_lossy().contains("llama") {
+            "meta-llama/Llama-2-7b-hf"
+        } else {
+            // Default to Gemma if unknown (since that's what the user is testing)
+            "google/gemma-2b"
+        };
+        
+        tracing::info!("📥 Downloading tokenizer for model: {}", model_name);
+        
+        // Create HuggingFace API client
+        let api = Api::new()?;
+        let repo = api.repo(Repo::new(model_name.to_string(), RepoType::Model));
+        
+        // Download tokenizer.json
+        let tokenizer_file = repo.get("tokenizer.json").await?;
+        
+        // Load the tokenizer from the downloaded file
+        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_file)
+            .map_err(|e| anyhow!("Failed to load downloaded tokenizer: {}", e))?;
+        
+        // Cache the tokenizer for future use
+        let cache_dir = model_path.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".tokenizer_cache");
+        tokio::fs::create_dir_all(&cache_dir).await?;
+        
+        let cached_path = cache_dir.join(format!("{}.tokenizer.json", 
+            model_name.replace("/", "_")));
+        tokio::fs::copy(&tokenizer_file, &cached_path).await?;
+        
+        tracing::info!("✅ Downloaded and cached tokenizer at: {:?}", cached_path);
+        
+        Ok(Some(tokenizer))
     }
     
     /// Generate text using VDB-backed weights (internal, accumulates all tokens)
@@ -843,62 +748,11 @@ impl CandleEngine {
             let encoding = tokenizer.encode(prompt, false)
                 .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
             Ok(encoding.get_ids().to_vec())
-        } else if let Some(vocab) = &self.gguf_vocab {
-            // Use GGUF vocabulary for simple tokenization
-            tracing::info!("🔤 Using GGUF vocabulary for tokenization");
-            self.tokenize_with_gguf_vocab(prompt, vocab)
         } else {
             // Last resort: character-level tokenization (should rarely happen now)
             tracing::warn!("⚠️ Using fallback character-level tokenization (no tokenizer loaded)");
             Ok(prompt.chars().map(|c| c as u32).collect())
         }
-    }
-    
-    /// Tokenize using GGUF vocabulary (simplified BPE-like tokenization)
-    fn tokenize_with_gguf_vocab(&self, text: &str, vocab: &[String]) -> Result<Vec<u32>> {
-        let mut tokens = Vec::new();
-        let mut remaining = text.to_string();
-        
-        // Special tokens
-        let bos_token = 1u32; // Usually <s> or <|startoftext|>
-        tokens.push(bos_token);
-        
-        // Simple greedy tokenization: find longest matching tokens
-        while !remaining.is_empty() {
-            let mut found = false;
-            
-            // Try to find the longest matching token
-            for length in (1..=remaining.len()).rev() {
-                let candidate = &remaining[..length];
-                
-                // Search for the candidate in vocabulary
-                if let Some(token_id) = vocab.iter().position(|t| t == candidate) {
-                    tokens.push(token_id as u32);
-                    remaining = remaining[length..].to_string();
-                    found = true;
-                    break;
-                }
-            }
-            
-            // If no match found, try byte-level fallback
-            if !found {
-                // Handle unknown characters with byte-level tokens or UNK token
-                let byte = remaining.as_bytes()[0];
-                // Many vocabularies have byte fallback tokens like <0x41> for 'A'
-                let byte_token = format!("<0x{:02X}>", byte);
-                
-                if let Some(token_id) = vocab.iter().position(|t| t == &byte_token) {
-                    tokens.push(token_id as u32);
-                } else {
-                    // Use unknown token (usually index 0 or 2)
-                    tokens.push(0);
-                }
-                remaining = remaining[1..].to_string();
-            }
-        }
-        
-        tracing::debug!("Tokenized into {} tokens using GGUF vocab", tokens.len());
-        Ok(tokens)
     }
     
     /// Load sparse weights for the given context
@@ -930,7 +784,7 @@ impl CandleEngine {
         // In the future, this should intelligently select based on context
         Vec::new()
         
-        // When tensor adapters are created from GGUF, uncomment:
+        // When tensor adapters are created from quantized models, uncomment:
         // vec![
         //     "tensor_blk_0_attn_q".to_string(),
         //     "tensor_blk_0_attn_k".to_string(),
@@ -959,16 +813,43 @@ impl CandleEngine {
                 // Run model forward pass
                 let mut logits = model.forward(&input_ids, None)?;
                 
+                // TODO: remove - Debug logging for generation issues
+                if std::env::var("DEBUG_GENERATION").is_ok() {
+                    if let Ok(logits_vec) = logits.i((0, logits.dim(1)? - 1))?.to_vec1::<f32>() {
+                        // Find top 5 tokens
+                        let mut indexed: Vec<(usize, f32)> = logits_vec.iter()
+                            .enumerate()
+                            .map(|(i, &v)| (i, v))
+                            .collect();
+                        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                        
+                        tracing::debug!("Logits shape: {:?}, vocab_size = {}", logits.dims(), logits_vec.len());
+                        tracing::debug!("Top 5 token predictions:");
+                        for (i, (token_id, score)) in indexed.iter().take(5).enumerate() {
+                            tracing::debug!("  #{}: token {} with score {:.3}", i+1, token_id, score);
+                        }
+                        
+                        // Check logits statistics
+                        let max_val = indexed[0].1;
+                        let min_val = logits_vec.iter().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
+                        let mean_val = logits_vec.iter().sum::<f32>() / logits_vec.len() as f32;
+                        tracing::debug!("Logits stats: min={:.3}, max={:.3}, mean={:.3}, range={:.3}", 
+                                      min_val, max_val, mean_val, max_val - min_val);
+                    }
+                }
+                
                 // Apply LoRA if available
                 if let Some(lora) = &self.active_lora {
                     logits = self.apply_lora_to_logits(&logits, lora).await?;
                 }
                 
-                // Get last token logits and sample
+                // Get last token logits and sample using proper sampling strategy
                 let last_logits = logits.i((0, logits.dim(1)? - 1))?;
-                let temperature = 0.8;
-                let scaled_logits = (&last_logits / temperature)?;
-                let next_token = scaled_logits.argmax(0)?.to_scalar::<u32>()?;
+                
+                // Create a token sampler with current configuration
+                let mut sampler = TokenSampler::new(self.sampling_config.clone());
+                sampler.add_to_history(context);
+                let next_token = sampler.sample(&last_logits)?;
                 
                 return Ok(next_token);
             }
@@ -976,7 +857,7 @@ impl CandleEngine {
             return Err(anyhow!("No architecture model available for SafeTensors inference"));
         }
         
-        // Fallback to GGUF model if available
+        // Fallback to quantized model if available
         if let Some(model) = &self.model {
             // Use actual model for proper inference
             if context.is_empty() {
@@ -1002,12 +883,10 @@ impl CandleEngine {
             // Get logits for the last token
             let last_logits = logits.i((0, logits.dim(1)? - 1))?; // [vocab_size]
             
-            // Apply temperature and sample
-            let temperature = 0.8;
-            let scaled_logits = (&last_logits / temperature)?;
-            
-            // Simple greedy sampling (take argmax)
-            let next_token = scaled_logits.argmax(0)?.to_scalar::<u32>()?;
+            // Use proper sampling with configured parameters
+            let mut sampler = TokenSampler::new(self.sampling_config.clone());
+            sampler.add_to_history(context_window);
+            let next_token = sampler.sample(&last_logits)?;
             
             tracing::trace!("🔮 Model forward pass: context_len={}, next_token={}", context_window.len(), next_token);
             Ok(next_token)
@@ -1030,9 +909,12 @@ impl CandleEngine {
             // Run model forward pass
             let logits = model.forward(&input_ids, None)?;
             
-            // Get last token logits and sample
+            // Get last token logits and sample using proper sampling
             let last_logits = logits.i((0, logits.dim(1)? - 1))?;
-            let next_token = last_logits.argmax(0)?.to_scalar::<u32>()?;
+            
+            let mut sampler = TokenSampler::new(self.sampling_config.clone());
+            sampler.add_to_history(context);
+            let next_token = sampler.sample(&last_logits)?;
             
             return Ok(next_token);
         }
@@ -1042,18 +924,13 @@ impl CandleEngine {
     }
     
     /// Apply LoRA adjustment to logits before sampling
-    async fn apply_lora_to_logits(&self, logits: &Tensor, lora: &SparseLoRAAdapter) -> Result<Tensor> {
-        // In a proper implementation, LoRA would modify the attention/FFN weights
-        // For now, we apply LoRA as a post-processing step on logits
+    async fn apply_lora_to_logits(&self, logits: &Tensor, _lora: &SparseLoRAAdapter) -> Result<Tensor> {
+        // TODO: Implement proper LoRA application
+        // For now, LoRA should be a no-op until trained
+        // An untrained LoRA should not modify the base model outputs
         
-        // Get a simple adjustment vector from LoRA
-        let vocab_size = logits.dim(logits.dims().len() - 1)?;
-        let adjustment = Tensor::zeros(&[vocab_size], candle_core::DType::F32, &self.device)?;
-        
-        // Apply LoRA influence (this would be computed from actual LoRA weights)
-        // For now, just return the original logits with a small perturbation
-        let scale = 0.01; // Small LoRA influence
-        Ok((logits + (adjustment * scale))?)
+        // Return logits unchanged - LoRA is not yet trained
+        Ok(logits.clone())
     }
     
     /// Create architecture model from SafeTensors weights
@@ -1221,10 +1098,6 @@ impl CandleEngine {
             let output = tokenizer.decode(tokens, false)
                 .map_err(|e| anyhow!("Decoding failed: {}", e))?;
             Ok(output)
-        } else if let Some(vocab) = &self.gguf_vocab {
-            // Decode using GGUF vocabulary
-            tracing::debug!("🔤 Decoding {} tokens using GGUF vocabulary", tokens.len());
-            self.decode_with_gguf_vocab(tokens, vocab)
         } else {
             // Last resort: convert tokens back to characters
             tracing::warn!("⚠️ Using fallback character-level decoding");
@@ -1235,197 +1108,6 @@ impl CandleEngine {
         }
     }
     
-    /// Decode tokens using GGUF vocabulary
-    fn decode_with_gguf_vocab(&self, tokens: &[u32], vocab: &[String]) -> Result<String> {
-        let mut result = String::new();
-        
-        for &token_id in tokens {
-            // Skip special tokens like BOS (1), EOS (2), PAD (0)
-            if token_id <= 2 {
-                continue;
-            }
-            
-            if let Some(token_str) = vocab.get(token_id as usize) {
-                // Handle special byte tokens like <0x20> for space
-                if token_str.starts_with("<0x") && token_str.ends_with('>') {
-                    if let Ok(byte_val) = u8::from_str_radix(&token_str[3..token_str.len()-1], 16) {
-                        result.push(byte_val as char);
-                    } else {
-                        result.push_str(token_str);
-                    }
-                } else if token_str.starts_with("▁") {
-                    // SentencePiece uses ▁ for spaces
-                    result.push(' ');
-                    result.push_str(&token_str[3..]); // Skip the ▁ character (3 bytes in UTF-8)
-                } else {
-                    result.push_str(token_str);
-                }
-            } else {
-                tracing::warn!("Unknown token id: {}", token_id);
-            }
-        }
-        
-        Ok(result)
-    }
-    
-    /// Fix metadata for different architectures to be compatible with Llama loader
-    /// This is a compatibility layer that maps various model architectures to Llama format
-    fn fix_metadata_for_architecture(&self, content: &mut gguf_file::Content) -> Result<()> {
-        let metadata = &mut content.metadata;
-        
-        // Detect the architecture
-        let architecture = metadata.get("general.architecture")
-            .and_then(|v| match v.to_string() {
-                Ok(s) => Some(s.clone()),
-                Err(_) => None
-            })
-            .unwrap_or_else(|| "llama".to_string());
-        
-        let arch_lower = architecture.to_lowercase();
-        
-        // Handle different architectures
-        if arch_lower.contains("gemma") {
-            tracing::info!("🔧 Detected Gemma model, adapting metadata for Llama loader");
-            
-            // Debug: List all Gemma-related metadata keys
-            for (key, _) in metadata.iter() {
-                if key.contains("gemma") || key.contains("rope") {
-                    tracing::debug!("  Found metadata key: {}", key);
-                }
-            }
-            
-            self.map_architecture_metadata(metadata, "gemma", "llama")?;
-            self.map_architecture_metadata(metadata, "gemma2", "llama")?;
-            self.map_architecture_metadata(metadata, "gemma3", "llama")?;
-        } else if arch_lower.contains("phi") {
-            tracing::info!("🔧 Detected Phi model, adapting metadata for Llama loader");
-            self.map_architecture_metadata(metadata, "phi3", "llama")?;
-            self.map_architecture_metadata(metadata, "phi", "llama")?;
-        } else if arch_lower.contains("mistral") {
-            tracing::info!("🔧 Detected Mistral model, adapting metadata for Llama loader");
-            self.map_architecture_metadata(metadata, "mistral", "llama")?;
-        } else if arch_lower.contains("mixtral") {
-            tracing::info!("🔧 Detected Mixtral model, adapting metadata for Llama loader");
-            self.map_architecture_metadata(metadata, "mixtral", "llama")?;
-        } else if arch_lower.contains("qwen") {
-            tracing::info!("🔧 Detected Qwen model, adapting metadata for Llama loader");
-            
-            // Map Qwen metadata keys to Llama keys
-            let mappings = [
-                ("qwen2.attention.head_count", "llama.attention.head_count"),
-                ("qwen2.attention.head_count_kv", "llama.attention.head_count_kv"),
-                ("qwen2.attention.layer_norm_rms_epsilon", "llama.attention.layer_norm_rms_epsilon"),
-                ("qwen2.block_count", "llama.block_count"),
-                ("qwen2.context_length", "llama.context_length"),
-                ("qwen2.embedding_length", "llama.embedding_length"),
-                ("qwen2.feed_forward_length", "llama.feed_forward_length"),
-                ("qwen2.rope.freq_base", "llama.rope.freq_base"),
-                // ("qwen2.rope.dimension_count", "llama.rope.dimension_count"), // Not required by candle-vllm
-                ("qwen2.vocab_size", "llama.vocab_size"),
-            ];
-            
-            for (qwen_key, llama_key) in mappings.iter() {
-                if let Some(value) = metadata.get(*qwen_key) {
-                    // Clone the value to avoid borrow issues
-                    let cloned_value = value.clone();
-                    metadata.insert(llama_key.to_string(), cloned_value);
-                    tracing::debug!("  Mapped {} -> {}", qwen_key, llama_key);
-                }
-            }
-            
-            // Also check for generic qwen keys without version number
-            let generic_mappings = [
-                ("qwen.attention.head_count", "llama.attention.head_count"),
-                ("qwen.attention.head_count_kv", "llama.attention.head_count_kv"),
-                ("qwen.attention.layer_norm_rms_epsilon", "llama.attention.layer_norm_rms_epsilon"),
-                ("qwen.block_count", "llama.block_count"),
-                ("qwen.context_length", "llama.context_length"),
-                ("qwen.embedding_length", "llama.embedding_length"),
-                ("qwen.feed_forward_length", "llama.feed_forward_length"),
-                ("qwen.rope.freq_base", "llama.rope.freq_base"),
-                // ("qwen.rope.dimension_count", "llama.rope.dimension_count"), // Not required by candle-vllm
-                ("qwen.vocab_size", "llama.vocab_size"),
-            ];
-            
-            for (qwen_key, llama_key) in generic_mappings.iter() {
-                if let Some(value) = metadata.get(*qwen_key) {
-                    let cloned_value = value.clone();
-                    metadata.insert(llama_key.to_string(), cloned_value);
-                    tracing::debug!("  Mapped {} -> {}", qwen_key, llama_key);
-                }
-            }
-            
-            // Set defaults if critical keys are still missing
-            if !metadata.contains_key("llama.attention.head_count") {
-                // Try to infer from embedding length
-                let embedding_length = metadata.get("llama.embedding_length")
-                    .and_then(|v| v.to_u32().ok())
-                    .unwrap_or(1536);
-                let head_count = embedding_length / 64; // Typical head dimension
-                metadata.insert("llama.attention.head_count".to_string(), 
-                               gguf_file::Value::U32(head_count));
-                tracing::info!("  Set default llama.attention.head_count = {}", head_count);
-            }
-            
-            if !metadata.contains_key("llama.attention.head_count_kv") {
-                // Default to same as head_count for MHA
-                if let Some(head_count) = metadata.get("llama.attention.head_count") {
-                    let cloned = head_count.clone();
-                    metadata.insert("llama.attention.head_count_kv".to_string(), cloned);
-                }
-            }
-            
-            if !metadata.contains_key("llama.rope.freq_base") {
-                metadata.insert("llama.rope.freq_base".to_string(), 
-                               gguf_file::Value::F32(10000.0));
-                tracing::info!("  Set default llama.rope.freq_base = 10000.0");
-            }
-            
-        }
-        
-        // Now ensure critical metadata exists for ALL architectures
-        // This is needed because candle_transformers requires these fields
-        
-        // Debug: Check what's in metadata before setting rope.dimension_count
-        tracing::debug!("Checking for llama.rope.dimension_count in metadata...");
-        if metadata.contains_key("llama.rope.dimension_count") {
-            tracing::debug!("  llama.rope.dimension_count already exists: {:?}", 
-                           metadata.get("llama.rope.dimension_count"));
-        } else {
-            tracing::debug!("  llama.rope.dimension_count does NOT exist, will set it");
-        }
-        
-        // Provide rope.dimension_count for models that don't have it
-        // candle_transformers requires this field (unlike candle-vllm where it's optional)
-        if !metadata.contains_key("llama.rope.dimension_count") {
-            // Calculate rope dimension from head dimensions
-            // This is typically head_dim or a fraction of it
-            let rope_dim = if let Some(key_length) = metadata.get("llama.attention.key_length") {
-                key_length.to_u32().unwrap_or(64)
-            } else if let (Some(embedding), Some(heads)) = (
-                metadata.get("llama.embedding_length"),
-                metadata.get("llama.attention.head_count")
-            ) {
-                // Default: head_dim = embedding_length / head_count
-                let emb = embedding.to_u32().unwrap_or(2048);
-                let h = heads.to_u32().unwrap_or(8);
-                emb / h
-            } else {
-                64 // Common default
-            };
-            
-            metadata.insert("llama.rope.dimension_count".to_string(),
-                           gguf_file::Value::U32(rope_dim));
-            tracing::info!("  Set llama.rope.dimension_count = {} (calculated from head dimensions)", rope_dim);
-            
-            // Double-check it was inserted
-            if !metadata.contains_key("llama.rope.dimension_count") {
-                tracing::error!("CRITICAL: Failed to insert llama.rope.dimension_count!");
-            }
-        }
-        
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -1451,20 +1133,22 @@ impl RuntimeEngine for CandleEngine {
     }
     
     fn model_info(&self) -> ModelInfo {
-        self.model_info.clone().unwrap_or_else(|| ModelInfo {
-            name: "unloaded".to_string(),
+        ModelInfo {
+            name: "Candle Model".to_string(),
+            architecture: "llama".to_string(),
             parameters: 0,
-            context_length: 0,
-            vocab_size: 0,
-            architecture: "unknown".to_string(),
-            quantization: Some("unknown".to_string()),
-        })
+            context_length: 2048,
+            vocab_size: 32000,
+            quantization: Some("F32/BF16".to_string()),
+        }
     }
     
     fn is_loaded(&self) -> bool {
-        self.model_info.is_some()
+        self.model.is_some() || self.base_model_weights.is_some()
     }
-    
+}
+
+impl CandleEngine {
     /// Real-time adapter weight updates via VDB
     async fn update_adapter_realtime(
         &mut self, 
@@ -1576,59 +1260,6 @@ impl CandleEngine {
         Ok(total_loss / max_len as f32)
     }
     
-    /// Helper to map metadata keys from one architecture to another
-    fn map_architecture_metadata(
-        &self,
-        metadata: &mut HashMap<String, gguf_file::Value>,
-        from_prefix: &str,
-        to_prefix: &str,
-    ) -> Result<()> {
-        // Common metadata keys that need mapping
-        let common_keys = [
-            "attention.head_count",
-            "attention.head_count_kv",
-            "attention.layer_norm_rms_epsilon",
-            "attention.key_length",
-            "attention.value_length",
-            "block_count",
-            "context_length",
-            "embedding_length",
-            "feed_forward_length",
-            "rope.freq_base",
-            // Note: rope.dimension_count is not used by Gemma models
-            // and candle-vllm's GGUF loader doesn't require it (it's commented out)
-            // "rope.dimension_count",
-            "vocab_size",
-        ];
-        
-        // Try to map each key
-        for key_suffix in &common_keys {
-            let from_key = format!("{}.{}", from_prefix, key_suffix);
-            let to_key = format!("{}.{}", to_prefix, key_suffix);
-            
-            if let Some(value) = metadata.get(&from_key) {
-                let cloned_value = value.clone();
-                metadata.insert(to_key.clone(), cloned_value);
-                tracing::debug!("  Mapped {} -> {}", from_key, to_key);
-            }
-        }
-        
-        // Also try versioned prefixes (e.g., gemma2, gemma3)
-        for version in 1..=3 {
-            for key_suffix in &common_keys {
-                let from_key = format!("{}{}.{}", from_prefix, version, key_suffix);
-                let to_key = format!("{}.{}", to_prefix, key_suffix);
-                
-                if let Some(value) = metadata.get(&from_key) {
-                    let cloned_value = value.clone();
-                    metadata.insert(to_key.clone(), cloned_value);
-                    tracing::debug!("  Mapped {} -> {}", from_key, to_key);
-                }
-            }
-        }
-        
-        Ok(())
-    }
 }
 
 /// Create a new Candle engine

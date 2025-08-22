@@ -91,7 +91,6 @@ pub struct ExternalSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SourceType {
     HuggingFace,
-    Ollama,
     LocalPath,
     HttpUrl,
     Custom(String),
@@ -246,10 +245,6 @@ impl ModelStorage {
                             "hf://{}", 
                             external_source.identifier
                         ),
-                        SourceType::Ollama => format!(
-                            "ollama://{}", 
-                            external_source.identifier
-                        ),
                         SourceType::LocalPath => format!(
                             "local://{}", 
                             external_source.identifier
@@ -381,10 +376,6 @@ impl ModelStorage {
                         "hf://{}", 
                         external_source.identifier
                     ),
-                    SourceType::Ollama => format!(
-                        "ollama://{}", 
-                        external_source.identifier
-                    ),
                     SourceType::LocalPath => format!(
                         "local://{}", 
                         external_source.identifier
@@ -465,7 +456,6 @@ impl ModelStorage {
                 if let Some(external_source) = metadata.external_sources.first() {
                     let registry = match &external_source.source_type {
                         SourceType::HuggingFace => "hf".to_string(),
-                        SourceType::Ollama => "ollama".to_string(),
                         SourceType::LocalPath => "local".to_string(),
                         SourceType::HttpUrl => "http".to_string(),
                         SourceType::Custom(name) => name.clone(),
@@ -824,7 +814,7 @@ impl ModelRegistry {
             // If it's a single file, create a ModelFile entry for it
             let filename = path.file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or("model.gguf")
+                .unwrap_or("model.safetensors")
                 .to_string();
             let file_type = self.determine_file_type(&filename);
             
@@ -859,7 +849,7 @@ impl ModelRegistry {
     
     fn determine_file_type(&self, filename: &str) -> FileType {
         match filename {
-            f if f.ends_with(".safetensors") || f.ends_with(".bin") || f.ends_with(".gguf") => FileType::Model,
+            f if f.ends_with(".safetensors") || f.ends_with(".bin") || f.ends_with(".pt") || f.ends_with(".pth") => FileType::Model,
             f if f.contains("tokenizer") => FileType::Tokenizer,
             f if f.ends_with(".json") => FileType::Config,
             f if f.to_lowercase().contains("readme") => FileType::Readme,

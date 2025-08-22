@@ -26,7 +26,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get logging config from command
     let (level, filter) = match &cli.command {
         Commands::Server(cmd) => (&cmd.logging.get_effective_level(), &cmd.logging.log_filter),
-        Commands::Sql(cmd) => (&cmd.logging.get_effective_level(), &cmd.logging.log_filter),
         Commands::Model(_) => (&"info", &None),
         Commands::Lora(_) => (&"info", &None),
         Commands::QuickStart(_) => (&"info", &None),
@@ -78,17 +77,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let config = config.build()?;
             handle_server(config).await?
-        }
-        Commands::Sql(cmd) => {
-            handle_embedding_query(
-                cmd.host,
-                &cmd.query,
-                cmd.tls_cert.as_deref(),
-                cmd.tls_key.as_deref(),
-                cmd.tls_ca.as_deref(),
-                cmd.tls_skip_verify,
-                cmd.logging.verbose > 0,
-            ).await?
         }
         Commands::Model(cmd) => {
             let server_url = "http://localhost:50051".to_string(); // Default server URL

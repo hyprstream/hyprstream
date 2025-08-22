@@ -12,7 +12,6 @@ use anyhow::Result;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ModelRegistryType {
     HuggingFace,
-    Ollama,
     Custom(String),
 }
 
@@ -20,7 +19,6 @@ impl ModelRegistryType {
     pub fn from_string(s: &str) -> Self {
         match s {
             "hf" | "huggingface" => Self::HuggingFace,
-            "ollama" => Self::Ollama,
             _ => Self::Custom(s.to_string()),
         }
     }
@@ -28,7 +26,6 @@ impl ModelRegistryType {
     pub fn to_string(&self) -> String {
         match self {
             Self::HuggingFace => "hf".to_string(),
-            Self::Ollama => "ollama".to_string(),
             Self::Custom(name) => name.clone(),
         }
     }

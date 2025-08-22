@@ -54,9 +54,9 @@ impl InferenceEngine {
         })
     }
     
-    /// Load a GGUF model using Candle
+    /// Load a model using Candle
     pub async fn load_model(&self, model_path: &Path) -> Result<()> {
-        println!("📥 Loading GGUF model: {}", model_path.display());
+        println!("📥 Loading model: {}", model_path.display());
         
         // Create and initialize Candle engine using unified config (async version)
         let mut candle_engine = CandleEngine::new_async(self.config.runtime.clone()).await?;
@@ -355,9 +355,8 @@ impl InferenceEngine {
         let models_dir = config.models_dir();
         
         let candidate_paths = vec![
-            models_dir.join("default.gguf"),
-            models_dir.join("qwen2-1_5b-instruct-q4_0.gguf"),
-            models_dir.join("qwen3-1_7b-chat-q4_0.gguf"),
+            models_dir.join("model.safetensors"),
+            models_dir.join("default.safetensors"),
         ];
         
         for path in candidate_paths {
@@ -373,7 +372,7 @@ impl InferenceEngine {
                 let mut entries = tokio::fs::read_dir(&models_dir).await?;
                 while let Some(entry) = entries.next_entry().await? {
                     let path = entry.path();
-                    if path.extension().map_or(false, |ext| ext == "gguf") {
+                    if path.extension().map_or(false, |ext| ext == "safetensors") {
                         println!("✅ Found model in storage: {}", path.display());
                         return Ok(path);
                     }
@@ -382,8 +381,8 @@ impl InferenceEngine {
         }
         
         Err(anyhow::anyhow!(
-            "No GGUF model files found. Please download a model first:\n\
-             hyprstream model download qwen2-1.5b-instruct"
+            "No model files found. Please download a model first:\n\
+             hyprstream model pull hf://model-name"
         ))
     }
     
@@ -470,8 +469,8 @@ impl InferenceEngine {
         let lora_a = adapter.get_lora_a().await;
         let lora_b = adapter.get_lora_b().await;
         
-        // Convert to named weight tensors for LLaMA.cpp
-        // This maps to the expected tensor names in the GGUF format
+        // Convert to named weight tensors for inference
+        // This maps to the expected tensor names in the model format
         for (i, layer_idx) in (0..self.config.runtime.context_length / 128).enumerate() {
             // Self-attention query projection
             let q_proj_a_name = format!("model.layers.{}.self_attn.q_proj.lora_a", layer_idx);

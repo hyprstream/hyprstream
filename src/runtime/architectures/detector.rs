@@ -2,7 +2,6 @@
 
 use super::ModelArchitecture;
 use anyhow::{Result, anyhow};
-use candle_core::quantized::gguf_file;
 use std::path::Path;
 use std::collections::HashMap;
 
@@ -10,17 +9,15 @@ use std::collections::HashMap;
 pub struct ArchitectureDetector;
 
 impl ArchitectureDetector {
-    /// Detect architecture from GGUF content
-    pub fn detect_from_gguf(content: &gguf_file::Content) -> ModelArchitecture {
+    /// Detect architecture from metadata (deprecated - use SafeTensors)
+    pub fn detect_from_metadata(metadata: &HashMap<String, String>) -> ModelArchitecture {
         // First try explicit architecture field
-        if let Some(arch_value) = content.metadata.get("general.architecture") {
-            if let Ok(arch_str) = arch_value.to_string() {
-                return Self::parse_architecture_string(&arch_str);
-            }
+        if let Some(arch_str) = metadata.get("general.architecture") {
+            return Self::parse_architecture_string(arch_str);
         }
         
-        // Fallback to pattern matching on metadata keys
-        Self::detect_by_metadata_patterns(&content.metadata)
+        // Default to Llama
+        ModelArchitecture::Llama { version: 2 }
     }
     
     /// Detect architecture from SafeTensors path (looks for config.json)
@@ -139,8 +136,8 @@ impl ArchitectureDetector {
         }
     }
     
-    /// Detect by checking specific metadata patterns
-    fn detect_by_metadata_patterns(metadata: &HashMap<String, gguf_file::Value>) -> ModelArchitecture {
+    /// Detect by checking specific metadata patterns (deprecated)
+    fn detect_by_metadata_patterns(metadata: &HashMap<String, String>) -> ModelArchitecture {
         // Gemma-specific patterns
         if metadata.contains_key("gemma.attention.head_count_kv") ||
            metadata.contains_key("gemma.block_count") ||
@@ -165,8 +162,8 @@ impl ArchitectureDetector {
                         metadata.contains_key("qwen3.moe.experts_per_token");
             
             let context_length = metadata.get("qwen.context_length")
-                .and_then(|v| v.to_u64().ok())
-                .unwrap_or(if version == 3 { 128000 } else { 4096 }) as usize;
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(if version == 3 { 128000 } else { 4096 });
             
             return ModelArchitecture::Qwen { version, is_moe, context_length };
         }
@@ -201,12 +198,12 @@ impl ArchitectureDetector {
            metadata.contains_key("gptoss.tensor_parallel") ||
            metadata.contains_key("openai.moe.experts_per_token") {
             let total_params_b = metadata.get("gptoss.total_params")
-                .and_then(|v| v.to_u64().ok())
+                .and_then(|v| v.parse::<u64>().ok())
                 .map(|p| (p / 1_000_000_000) as u16)
                 .unwrap_or(120);
             
             let active_params_b = metadata.get("gptoss.active_params")
-                .and_then(|v| v.to_f32().ok())
+                .and_then(|v| v.parse::<f32>().ok())
                 .unwrap_or(if total_params_b == 120 { 5.1 } else { 3.6 });
             
             return ModelArchitecture::GPTOSS {

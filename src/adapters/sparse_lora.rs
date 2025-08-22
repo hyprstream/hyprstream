@@ -198,16 +198,21 @@ impl SparseLoRAAdapter {
     
     /// Initialize with random sparse weights
     pub async fn initialize_random(&self) {
-        // Initialize LoRA A with small random values
+        // Initialize both LoRA A and B with zeros for identity/no-op
+        // This ensures untrained LoRA doesn't modify base model
         {
             let mut lora_a = self.lora_a.write().await;
-            lora_a.initialize_gaussian(0.0, 0.02);
+            // Clear all data - sparse matrix with no entries = all zeros
+            lora_a.data.clear();
+            lora_a.update_sparsity();
         }
         
-        // Initialize LoRA B with zeros (standard practice)
+        // Initialize LoRA B with zeros
         {
-            let _lora_b = self.lora_b.write().await;
-            // B starts at zero so adapter initially has no effect
+            let mut lora_b = self.lora_b.write().await;
+            // Clear all data - sparse matrix with no entries = all zeros
+            lora_b.data.clear();
+            lora_b.update_sparsity();
         }
         
         // Initialize bias if enabled

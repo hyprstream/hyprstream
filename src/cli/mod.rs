@@ -3,8 +3,7 @@
 //! This module provides the CLI functionality for:
 //! - Server management
 //! - Configuration handling
-//! - SQL query execution
-//! - Model management (HuggingFace, Ollama, etc.)
+//! - Model management (HuggingFace, etc.)
 //! - LoRA adapter creation and training
 
 pub mod commands;

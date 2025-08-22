@@ -107,7 +107,7 @@ impl Default for ModelManagementConfig {
 /// Model URI for registry-agnostic model identification
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ModelUri {
-    /// Registry type (hf, ollama, custom, etc.)
+    /// Registry type (hf, custom, etc.)
     pub registry: String,
     
     /// Organization/namespace
@@ -128,7 +128,6 @@ impl ModelUri {
     /// Formats:
     /// - hf://microsoft/DialoGPT-medium
     /// - hf://microsoft/DialoGPT-medium@main
-    /// - ollama://llama2:7b
     /// - custom://company.com/model-name
     pub fn parse(uri: &str) -> Result<Self> {
         let url = Url::parse(uri)
@@ -174,16 +173,6 @@ impl ModelUri {
                     (org.to_string(), name.to_string(), Some(rev[1..].to_string()))
                 } else {
                     (org.to_string(), name_part.to_string(), None)
-                }
-            }
-            "ollama" => {
-                // ollama://llama2:7b
-                let model_spec = if host.is_empty() { path } else { host };
-                if let Some(colon_pos) = model_spec.find(':') {
-                    let (name, tag) = model_spec.split_at(colon_pos);
-                    ("ollama".to_string(), name.to_string(), Some(tag[1..].to_string()))
-                } else {
-                    ("ollama".to_string(), model_spec.to_string(), None)
                 }
             }
             _ => {
@@ -348,7 +337,6 @@ async fn pull_model(
     let external_source = ExternalSource {
         source_type: match model_uri.registry.as_str() {
             "hf" | "huggingface" => SourceType::HuggingFace,
-            "ollama" => SourceType::Ollama,
             _ => SourceType::Custom(model_uri.registry.clone()),
         },
         identifier: format!("{}/{}", model_uri.org, model_uri.name),
@@ -362,7 +350,7 @@ async fn pull_model(
         filename: filename.clone(),
         size_bytes: 0, // TODO: Get individual file sizes
         checksum: None,
-        file_type: if filename.ends_with(".gguf") {
+        file_type: if filename.ends_with(".safetensors") || filename.ends_with(".bin") || filename.ends_with(".pt") {
             FileType::Model
         } else if filename.contains("tokenizer") {
             FileType::Tokenizer

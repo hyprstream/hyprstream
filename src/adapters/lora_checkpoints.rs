@@ -1,6 +1,6 @@
 //! LoRA checkpoint management system
 //! 
-//! Handles conversion from VDB sparse storage to GGUF checkpoints for LLaMA.cpp inference
+//! Handles conversion from VDB sparse storage to checkpoints for inference
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};

@@ -25,7 +25,7 @@ pub enum ModelAction {
         #[arg(long, value_delimiter = ',')]
         files: Option<Vec<String>>,
         
-        /// Preferred format (safetensors, gguf, pytorch)
+        /// Preferred format (safetensors, pytorch)
         #[arg(long, default_value = "safetensors")]
         format: String,
         
@@ -40,7 +40,7 @@ pub enum ModelAction {
     
     /// List available models
     List {
-        /// Filter by registry type (hf, ollama, custom)
+        /// Filter by registry type (hf, custom)
         #[arg(long)]
         registry: Option<String>,
         
@@ -110,7 +110,7 @@ pub enum ModelAction {
         /// Source model path or URI
         source: String,
         
-        /// Target format (safetensors, gguf)
+        /// Target format (safetensors)
         #[arg(long, default_value = "safetensors")]
         to: String,
         
@@ -154,6 +154,40 @@ pub enum ModelAction {
         /// Maximum adapters for X-LoRA
         #[arg(long, default_value = "4")]
         max_adapters: usize,
+    },
+    
+    /// Run pure base model inference without any LoRA adapters
+    Infer {
+        /// Model name or UUID (e.g., "google/gemma-2b", UUID from model list)
+        model: String,
+        
+        /// Prompt text
+        #[arg(short, long)]
+        prompt: String,
+        
+        /// Maximum tokens to generate (overrides model default)
+        #[arg(short = 'm', long)]
+        max_tokens: Option<usize>,
+        
+        /// Temperature for sampling (overrides model default)
+        #[arg(short = 't', long)]
+        temperature: Option<f32>,
+        
+        /// Top-p (nucleus) sampling (overrides model default)
+        #[arg(long)]
+        top_p: Option<f32>,
+        
+        /// Top-k sampling (overrides model default)
+        #[arg(long)]
+        top_k: Option<usize>,
+        
+        /// Stream output tokens as they're generated
+        #[arg(short = 's', long)]
+        stream: bool,
+        
+        /// Force re-download even if cached
+        #[arg(long)]
+        force_download: bool,
     },
 }
 

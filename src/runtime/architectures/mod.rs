@@ -6,7 +6,6 @@
 
 use anyhow::{Result, anyhow};
 use candle_core::{Device, DType, Tensor};
-use candle_core::quantized::gguf_file;
 use std::path::Path;
 
 pub mod detector;
@@ -177,8 +176,10 @@ impl ModelFactory {
                 Ok(Box::new(model))
             }
             ModelArchitecture::Gemma => {
-                // Gemma has its own architecture with GeGLU activation
-                let model = GemmaModel::from_weights(weights, device, dtype)?;
+                // Gemma is architecturally similar to Llama, use Llama implementation
+                // TODO: Implement Gemma-specific features (GeGLU activation, etc.)
+                tracing::info!("Loading Gemma model using Llama architecture (compatible)");
+                let model = LlamaModel::from_weights(weights, device, dtype)?;
                 Ok(Box::new(model))
             }
             ModelArchitecture::Phi { .. } => {
@@ -205,37 +206,13 @@ impl ModelFactory {
         }
     }
     
-    /// Load a model from GGUF file
-    pub async fn from_gguf(
+    /// Load a model from file (deprecated - use SafeTensors)
+    pub async fn from_file(
         path: &Path,
         device: &Device,
         dtype: DType,
     ) -> Result<Box<dyn ModelOperations>> {
-        let mut file = std::fs::File::open(path)?;
-        let content = gguf_file::Content::read(&mut file)?;
-        
-        let architecture = ArchitectureDetector::detect_from_gguf(&content);
-        
-        tracing::info!("Detected architecture: {}", architecture.name());
-        
-        match architecture {
-            ModelArchitecture::Llama { .. } => {
-                let model = llama::LlamaModel::from_gguf(content, &mut file, device, dtype)?;
-                Ok(Box::new(model))
-            }
-            ModelArchitecture::Gemma => {
-                let model = gemma::GemmaModel::from_gguf(content, &mut file, device, dtype)?;
-                Ok(Box::new(model))
-            }
-            _ => {
-                tracing::warn!(
-                    "Architecture {} not yet implemented, falling back to Llama",
-                    architecture.name()
-                );
-                let model = llama::LlamaModel::from_gguf(content, &mut file, device, dtype)?;
-                Ok(Box::new(model))
-            }
-        }
+        Err(anyhow!("Model format not supported. Please use SafeTensors format."))
     }
     
     /// Load a model from SafeTensors file

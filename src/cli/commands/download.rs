@@ -36,41 +36,16 @@ pub async fn download_qwen3_model(config: Option<&HyprConfig>) -> Result<PathBuf
     };
     
     // Get the model repository
-    let repo = api.model("Qwen/Qwen2-1.5B-Instruct-GGUF".to_string());
+    let _repo = api.model("Qwen/Qwen2-1.5B-Instruct".to_string());
     
-    // Target filename - always save as SafeTensors
-    let gguf_filename = "qwen2-1_5b-instruct-q4_0.gguf";
-    let safetensors_filename = "qwen2-1_5b-instruct-q4_0.safetensors";
-    let local_path = base_dir.join(safetensors_filename);
-    
-    // Check if model already exists
-    if local_path.exists() {
-        println!("✅ Model already exists at: {}", local_path.display());
-        return Ok(local_path);
-    }
-    
-    println!("🌐 Downloading: {} (will convert to SafeTensors)", gguf_filename);
-    
-    // Create progress bar
-    let pb = ProgressBar::new(100);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>7}/{len:7} {msg}")
-            .unwrap()
-            .progress_chars("#>-")
-    );
-    pb.set_message("Initializing download...");
-    
-    // GGUF format is no longer supported
-    pb.finish_with_message("❌ GGUF format not supported");
+    // Only SafeTensors format is supported
     eprintln!("");
-    eprintln!("❌ GGUF format is no longer supported in HyprStream.");
+    eprintln!("❌ Model format not supported.");
     eprintln!("   Please download models in SafeTensors format.");
-    eprintln!("   Try searching for SafeTensors versions on HuggingFace.");
     eprintln!("");
     eprintln!("   For example: hyprstream model pull hf://Qwen/Qwen2-1.5B");
     
-    Err(anyhow!("GGUF format not supported"))
+    Err(anyhow!("Model format not supported"))
 }
 
 /// Download with progress tracking
@@ -161,7 +136,7 @@ pub async fn download_model_by_uri(
     }
     
     // Use the provided filename directly, or default
-    let target_filename = filename.unwrap_or("model.gguf");
+    let target_filename = filename.unwrap_or("model.safetensors");
     let filename_prefix = format!("{}_{}", model_name.replace('/', "_"), target_filename);
     let local_path = base_dir.join(filename_prefix);
     
@@ -356,8 +331,8 @@ async fn register_downloaded_model(
     let file_size = file_metadata.len();
     
     // Determine model type and architecture from filename/URI
-    let model_type = if filename.ends_with(".gguf") {
-        "gguf".to_string()
+    let model_type = if filename.ends_with(".safetensors") {
+        "safetensors".to_string()
     } else {
         "unknown".to_string()
     };
@@ -440,9 +415,9 @@ async fn register_downloaded_model(
         last_updated: chrono::Utc::now().timestamp(),
     };
     
-    // Validate GGUF format for llamacpp compatibility
-    if !validate_gguf_format(local_path).await? {
-        return Err(anyhow!("Downloaded file is not a valid GGUF format for llamacpp inference"));
+    // Validate model format
+    if !local_path.exists() {
+        return Err(anyhow!("Model file not found after download"));
     }
     
     // Initialize model storage and register the metadata
@@ -453,50 +428,11 @@ async fn register_downloaded_model(
     storage.store_metadata(&model_uri_obj, metadata).await?;
     
     println!("📝 Model registered with storage system");
-    println!("🦙 Model validated for llamacpp compatibility");
+    println!("✅ Model validated");
     println!("🆔 Model UUID: {}", model_id);
     Ok(model_id.clone())
 }
 
-/// Validate that a file is in GGUF format for llamacpp compatibility
-async fn validate_gguf_format(file_path: &Path) -> Result<bool> {
-    // Check file extension first
-    if !file_path.extension().map_or(false, |ext| ext == "gguf") {
-        return Ok(false);
-    }
-    
-    // Check file exists and has reasonable size (GGUF files should be substantial)
-    let metadata = tokio::fs::metadata(file_path).await?;
-    if metadata.len() < 1_000_000 { // Less than 1MB is suspicious for a model
-        return Ok(false);
-    }
-    
-    // Read GGUF magic number (first 4 bytes should be "GGUF")
-    let mut file = tokio::fs::File::open(file_path).await?;
-    let mut magic_bytes = [0u8; 4];
-    
-    use tokio::io::AsyncReadExt;
-    if let Err(_) = file.read_exact(&mut magic_bytes).await {
-        return Ok(false);
-    }
-    
-    // GGUF files start with "GGUF" magic bytes
-    let is_gguf = magic_bytes == [b'G', b'G', b'U', b'F'];
-    
-    if is_gguf {
-        // Additional validation: try to read version (next 4 bytes after magic)
-        let mut version_bytes = [0u8; 4];
-        if file.read_exact(&mut version_bytes).await.is_ok() {
-            let version = u32::from_le_bytes(version_bytes);
-            // GGUF versions should be reasonable (currently 1-3)
-            if version >= 1 && version <= 10 { // Allow some future versions
-                return Ok(true);
-            }
-        }
-    }
-    
-    Ok(false)
-}
 
 /// Register an already-downloaded model with the storage system
 pub async fn register_existing_model(
@@ -513,7 +449,7 @@ pub async fn register_existing_model(
     // Extract filename from path
     let filename = model_path.file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("unknown.gguf");
+        .unwrap_or("unknown.safetensors");
     
     println!("📝 Registering existing model: {}", filename);
     
@@ -569,7 +505,7 @@ mod tests {
         // Test valid URI format
         let result = download_model_by_uri(
             "microsoft/DialoGPT-medium",
-            Some("model.gguf"),
+            Some("model.safetensors"),
             None,
         ).await;
         

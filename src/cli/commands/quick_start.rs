@@ -9,8 +9,8 @@ use crate::runtime::{CandleEngine, RuntimeConfig, RuntimeEngine};
 
 #[derive(Args)]
 pub struct QuickStartCommand {
-    /// Path to GGUF model file
-    #[arg(short, long, help = "Path to GGUF model file (e.g., qwen3-1.7b-q4_0.gguf)")]
+    /// Path to model file
+    #[arg(short, long, help = "Path to model file (SafeTensors format)")]
     pub model_path: String,
 
     /// Prompt to generate from

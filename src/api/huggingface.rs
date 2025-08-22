@@ -61,9 +61,9 @@ impl HuggingFaceClient {
         let results = match query.to_lowercase().as_str() {
             q if q.contains("qwen") => vec![
                 ModelInfo {
-                    name: "Qwen/Qwen2-1.5B-Instruct-GGUF".to_string(),
-                    id: "Qwen/Qwen2-1.5B-Instruct-GGUF".to_string(),
-                    description: "Qwen2 1.5B Instruct model in GGUF format".to_string(),
+                    name: "Qwen/Qwen2-1.5B-Instruct".to_string(),
+                    id: "Qwen/Qwen2-1.5B-Instruct".to_string(),
+                    description: "Qwen2 1.5B Instruct model in SafeTensors format".to_string(),
                     size_bytes: Some(1_100_000_000),
                     downloads: Some(5000),
                     likes: Some(250),

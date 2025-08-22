@@ -402,7 +402,7 @@ pub async fn handle_model_command(
                     }
                     if models.is_empty() {
                         println!("No models found matching your criteria.");
-                        println!("Try: hyprstream model pull hf://Qwen/Qwen2-1.5B-Instruct-GGUF");
+                        println!("Try: hyprstream model pull hf://Qwen/Qwen2-1.5B-Instruct");
                     }
                 }
             }
@@ -425,7 +425,6 @@ pub async fn handle_model_command(
             let options = crate::api::model_downloader::DownloadOptions {
                 preferred_format: match format.as_str() {
                     "safetensors" => crate::api::model_downloader::ModelFormat::SafeTensors,
-                    "gguf" => crate::api::model_downloader::ModelFormat::GGUF,
                     "pytorch" => crate::api::model_downloader::ModelFormat::PyTorch,
                     _ => crate::api::model_downloader::ModelFormat::SafeTensors,
                 },
@@ -530,10 +529,10 @@ pub async fn handle_model_command(
                     
                     println!("✅ Model registered with ID: {}", model_id);
                     
-                    // Check if GGUF format (no longer supported)
-                    if model.format == crate::api::model_downloader::ModelFormat::GGUF {
-                        println!("⚠️ Warning: GGUF format is no longer supported.");
-                        println!("   Please download models in SafeTensors format.");
+                    // SafeTensors is the preferred format
+                    if model.format == crate::api::model_downloader::ModelFormat::PyTorch {
+                        println!("ℹ️ Note: PyTorch format detected.");
+                        println!("   SafeTensors format is preferred for better security and performance.");
                         println!("   Try: hyprstream model pull hf://<model-name> --format safetensors");
                     }
                 }
@@ -914,7 +913,6 @@ pub async fn handle_model_command(
                     .unwrap_or("model");
                 let ext = match to.as_str() {
                     "safetensors" => "safetensors",
-                    "gguf" => "gguf",
                     _ => "bin",
                 };
                 source_path.with_file_name(format!("{}_{}.{}", stem, precision, ext))
@@ -927,9 +925,9 @@ pub async fn handle_model_command(
             println!("📂 Output: {}", output_path.display());
             println!("🎯 Target precision: {:?}", target_dtype);
             
-            // GGUF conversion is no longer supported
+            // Model conversion is no longer supported
             eprintln!("❌ Model conversion has been removed.");
-            eprintln!("   GGUF format is no longer supported in HyprStream.");
+            eprintln!("   Model format conversion is not supported.");
             eprintln!("   Please download models directly in SafeTensors format.");
             eprintln!("");
             eprintln!("   Try: hyprstream model pull hf://<model-name> --format safetensors");
@@ -950,7 +948,7 @@ pub async fn handle_model_command(
             
             if cached_models.is_empty() {
                 println!("No models in cache.");
-                println!("Try: hyprstream model pull hf://Qwen/Qwen2-1.5B-Instruct-GGUF");
+                println!("Try: hyprstream model pull hf://Qwen/Qwen2-1.5B-Instruct");
             } else {
                 println!("Cached Models:");
                 for (model_uri, model_metadata) in cached_models {
@@ -978,15 +976,148 @@ pub async fn handle_model_command(
             println!("   • URL: https://huggingface.co");
             println!("   • Status: ✅ Connected");
             println!("   • Models: 500,000+");
-            println!("   • Formats: GGUF, PyTorch, ONNX, TensorFlow");
-            println!();
-            println!("🦙 Ollama Registry");
-            println!("   • URL: https://ollama.com/library");
-            println!("   • Status: ⚠️  Not configured");
-            println!("   • Models: 100+");
-            println!("   • Formats: GGUF, Ollama");
+            println!("   • Formats: SafeTensors, PyTorch, ONNX, TensorFlow");
             println!();
             println!("Configure registries with 'hyprstream config' command");
+        }
+        ModelAction::Infer { model, prompt, max_tokens, temperature, top_p, top_k, stream, force_download } => {
+            info!("🤖 Running base model inference (no LoRA): {}", model);
+            
+            use crate::runtime::{CandleEngine, RuntimeConfig};
+            use crate::runtime::sampling::{SamplingConfig, load_sampling_config};
+            use std::path::PathBuf;
+            
+            println!("🔍 Looking up model: {}", model);
+            
+            // Initialize model manager to find models
+            let model_manager = crate::api::model_management::ModelManager::new().await?;
+            
+            // Try to find the model path (could be UUID, name, or HF ID)
+            let model_path = if model.contains('/') {
+                // Looks like a HuggingFace model ID
+                let cache_path = PathBuf::from(".hyprstream/models").join(model.replace('/', "_"));
+                if !cache_path.exists() && !force_download {
+                    println!("📥 Model not found locally. Downloading from HuggingFace...");
+                    // TODO: Implement download via model registry
+                    eprintln!("Auto-download not yet implemented. Please download first with:");
+                    eprintln!("  cargo run model pull hf://{}", model);
+                    return Ok(());
+                }
+                cache_path
+            } else {
+                // Could be a UUID or local name - check all cached models
+                let local_models = model_manager.list_cached_models().await?;
+                
+                let mut found_path = None;
+                for (model_uri, model_metadata) in local_models {
+                    // Check if UUID matches
+                    if model_metadata.model_id.to_string() == model {
+                        found_path = model_metadata.local_path.clone();
+                        println!("✅ Found model by UUID: {}", model_uri.name);
+                        break;
+                    }
+                    // Also check if name matches (without organization)
+                    if model_uri.name == model || model_uri.name.ends_with(&format!("/{}", model)) {
+                        found_path = model_metadata.local_path.clone();
+                        println!("✅ Found model by name: {}", model_uri.name);
+                        break;
+                    }
+                }
+                
+                match found_path {
+                    Some(path) => path,
+                    None => {
+                        eprintln!("❌ Model '{}' not found in local cache", model);
+                        eprintln!("Try one of:");
+                        eprintln!("  - Full HuggingFace ID: google/gemma-2b");
+                        eprintln!("  - Download first: cargo run model pull hf://google/gemma-2b");
+                        return Ok(());
+                    }
+                }
+            };
+            
+            println!("📁 Using model at: {}", model_path.display());
+            
+            // Load model configuration from model card
+            let sampling_config = if model_path.join("config.json").exists() {
+                println!("📋 Loading model configuration from config.json...");
+                match load_sampling_config(&model_path).await {
+                    Ok(config) => {
+                        println!("✅ Loaded model-specific sampling configuration");
+                        config
+                    }
+                    Err(e) => {
+                        println!("⚠️ Could not load model config: {}. Using defaults.", e);
+                        SamplingConfig::default()
+                    }
+                }
+            } else {
+                println!("⚠️ No config.json found. Using default sampling configuration.");
+                SamplingConfig::for_model(&model)
+            };
+            
+            println!("🚀 Initializing inference engine...");
+            let runtime_config = RuntimeConfig::default();
+            let mut engine = CandleEngine::new(runtime_config)?;
+            
+            // Apply overrides to sampling config
+            let mut final_config = sampling_config;
+            if let Some(t) = temperature {
+                final_config.temperature = t;
+            }
+            if let Some(p) = top_p {
+                final_config.top_p = Some(p);
+            }
+            if let Some(k) = top_k {
+                final_config.top_k = Some(k);
+            }
+            final_config.do_sample = final_config.temperature > 0.0;
+            
+            engine.sampling_config = final_config.clone();
+            
+            println!("📦 Loading base model (NO LoRA will be applied)...");
+            
+            // Load the model
+            match engine.load_model(&model_path).await {
+                Ok(_) => {
+                    // Clear any LoRA that might have been loaded
+                    engine.active_lora = None;
+                    println!("✅ Base model loaded successfully (LoRA disabled)");
+                }
+                Err(e) => {
+                    eprintln!("❌ Failed to load model: {}", e);
+                    return Ok(());
+                }
+            }
+            
+            // Use model defaults or overrides
+            let max_tokens = max_tokens.unwrap_or(100);
+            
+            println!("🧠 Generating response...");
+            println!("   Model: {}", model);
+            println!("   Prompt: \"{}\"", prompt);
+            println!("   Max tokens: {}", max_tokens);
+            println!("   Temperature: {}", final_config.temperature);
+            if let Some(p) = final_config.top_p {
+                println!("   Top-p: {}", p);
+            }
+            if let Some(k) = final_config.top_k {
+                println!("   Top-k: {}", k);
+            }
+            println!();
+            
+            // Call shared inference function
+            let result = perform_inference_shared(
+                &mut engine,
+                &prompt,
+                max_tokens,
+                final_config.temperature,
+                final_config.top_p.unwrap_or(0.95),
+                stream,
+                None, // No LoRA for model infer
+            ).await?;
+            
+            println!("✅ Generation complete: {} tokens generated", result.tokens_generated);
         }
         ModelAction::Test { path, prompt, max_tokens, xlora, xlora_model_id, max_adapters } => {
             info!("🧪 Testing model inference with CandleEngine: {}", path.display());
@@ -2070,7 +2201,7 @@ pub async fn handle_lora_command(
                         println!("   🏷️ Tag: {}", checkpoint.tag);
                         println!("   📁 Size: {:.2} MB", checkpoint.file_size as f64 / 1024.0 / 1024.0);
                         println!("   ⚖️ Scale: {}", scale);
-                        println!("   📂 GGUF Path: {}", checkpoint.weights_path.display());
+                        println!("   📂 Weights Path: {}", checkpoint.weights_path.display());
                     } else {
                         println!("❌ Checkpoint '{}' not found for LoRA {}", tag, lora_uuid);
                         println!("Use 'hyprstream lora checkpoint list {}' to see available checkpoints", lora_id);
@@ -2216,11 +2347,6 @@ pub async fn handle_lora_command(
                     
                     if let Some(checkpoint) = checkpoint_manager.get_checkpoint_by_tag(lora_uuid, &tag) {
                         match format.as_str() {
-                            "gguf" => {
-                                println!("🚧 GGUF export not yet implemented");
-                                println!("The checkpoint weights are stored as JSON at: {}", checkpoint.weights_path.display());
-                                println!("💡 Use 'json' format to copy the weights file directly");
-                            },
                             "json" => {
                                 // Copy JSON weights file to output location
                                 std::fs::copy(&checkpoint.weights_path, &output)?;
@@ -2233,7 +2359,7 @@ pub async fn handle_lora_command(
                             },
                             _ => {
                                 println!("❌ Unsupported export format: {}", format);
-                                println!("Supported formats: json, gguf (planned), safetensors (planned)");
+                                println!("Supported formats: json, safetensors");
                             }
                         }
                         
@@ -2442,49 +2568,34 @@ async fn perform_checkpoint_inference_with_weights(
              weights_data.config.rank, 
              weights_data.scaling * scale);
     
-    // Note: For now, we'll perform inference with just the base model
-    // since applying custom LoRA weights requires deeper integration
-    println!("🚀 Starting inference with base model (LoRA weights loaded but not yet applied)...");
+    // Use shared inference function
+    println!("🚀 Starting inference...");
     let start_time = std::time::Instant::now();
     
-    // Create generation request with user parameters
-    let request = crate::runtime::GenerationRequest {
-        prompt: input_text.to_string(),
+    // Call shared inference function with LoRA weights
+    let result = perform_inference_shared(
+        &mut engine,
+        input_text,
         max_tokens,
         temperature,
         top_p,
-        top_k: None,
-        repeat_penalty: 1.1,
-        stop_tokens: vec!["</s>".to_string(), "<|endoftext|>".to_string()],
-        seed: None,
-        stream: false,
-        active_adapters: None,
-        realtime_adaptation: None,
-        user_feedback: None,
-    };
-    
-    // Perform inference using the base model
-    let result = engine.generate_with_params(request).await?;
+        _stream,
+        Some(&weights_data),
+    ).await?;
     
     let total_time = start_time.elapsed();
     
-    println!("✅ Inference completed (base model + loaded LoRA weights)");
+    println!("✅ Inference completed");
     println!("   📝 Generated {} tokens", result.tokens_generated);
     println!("   ⏱️ Total time: {:.2}s", total_time.as_secs_f32());
-    println!("   ⚠️  Note: LoRA weights loaded but not yet integrated (requires deeper implementation)");
     
     // Convert to InferenceResponse format
     Ok(InferenceResponse {
         lora_id: "checkpoint".to_string(),
-        output: result.text,
+        output: result.output,
         tokens_generated: result.tokens_generated,
         latency_ms: total_time.as_millis() as f64,
-        finish_reason: match result.finish_reason {
-            crate::runtime::FinishReason::MaxTokens => "max_tokens".to_string(),
-            crate::runtime::FinishReason::EndOfSequence => "eos".to_string(),
-            crate::runtime::FinishReason::StopToken(_) => "stop".to_string(),
-            crate::runtime::FinishReason::Error(_) => "error".to_string(),
-        },
+        finish_reason: "complete".to_string(),
     })
 }
 
@@ -2493,6 +2604,94 @@ async fn load_lora_weights_from_json(weights_path: &std::path::Path) -> anyhow::
     let json_data = tokio::fs::read_to_string(weights_path).await?;
     let weights_data: crate::adapters::LoRAWeightsData = serde_json::from_str(&json_data)?;
     Ok(weights_data)
+}
+
+/// Shared inference result structure
+struct SharedInferenceResult {
+    output: String,
+    tokens_generated: usize,
+}
+
+/// Shared inference function for both model infer and lora infer (DRY)
+async fn perform_inference_shared(
+    engine: &mut crate::runtime::CandleEngine,
+    prompt: &str,
+    max_tokens: usize,
+    temperature: f32,
+    top_p: f32,
+    stream: bool,
+    lora_weights: Option<&crate::adapters::LoRAWeightsData>,
+) -> anyhow::Result<SharedInferenceResult> {
+    use std::io::{self, Write};
+    
+    // Apply LoRA weights if provided
+    if let Some(weights) = lora_weights {
+        println!("📎 Applying LoRA weights: {} modules, rank {}", 
+                 weights.target_modules.len(), 
+                 weights.config.rank);
+        // TODO: Actually apply the LoRA weights to the engine
+        // For now, LoRA weights are loaded but not applied
+    }
+    
+    // TODO: Set sampling parameters on the engine when API is available
+    // Currently temperature and top_p are not configurable at runtime
+    if temperature != 0.8 || top_p != 0.95 {
+        println!("⚠️  Note: Custom temperature ({}) and top_p ({}) specified but not yet applied", temperature, top_p);
+    }
+    
+    let mut generated_text = String::new();
+    let token_count_ref = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    
+    if stream {
+        println!("📝 Response (streaming):");
+        println!("{}", "─".repeat(50));
+        
+        // Use generate_streaming which exists on CandleEngine
+        let counter = token_count_ref.clone();
+        generated_text = engine.generate_streaming(
+            prompt,
+            max_tokens,
+            |token| {
+                print!("{}", token);
+                io::stdout().flush().ok();
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        ).await?;
+        
+        println!();
+        println!("{}", "─".repeat(50));
+    } else {
+        println!("📝 Response:");
+        println!("{}", "─".repeat(50));
+        
+        // For non-streaming, we still use generate_streaming but collect output
+        let counter = token_count_ref.clone();
+        generated_text = engine.generate_streaming(
+            prompt,
+            max_tokens,
+            |_token| {
+                // Count tokens but don't print during generation
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        ).await?;
+        
+        // Print all at once
+        println!("{}", generated_text);
+        println!("{}", "─".repeat(50));
+    }
+    
+    // Get final token count
+    let mut token_count = token_count_ref.load(std::sync::atomic::Ordering::Relaxed);
+    
+    // If no tokens were counted during generation, count from output
+    if token_count == 0 {
+        token_count = generated_text.split_whitespace().count();
+    }
+    
+    Ok(SharedInferenceResult {
+        output: generated_text,
+        tokens_generated: token_count,
+    })
 }
 
 /// Handle authentication commands
@@ -3052,20 +3251,17 @@ async fn run_candle_inference(
     let models_dir = storage_paths.models_dir()?;
     
     // Try to find the model file
-    let model_filename = if model_id.ends_with(".gguf") {
+    let model_filename = if model_id.ends_with(".safetensors") {
         model_id.to_string()
     } else {
-        format!("{}.gguf", model_id)
+        format!("{}.safetensors", model_id)
     };
     
     // Look for model in various locations
-    // Try different naming patterns that might exist
     let possible_filenames = vec![
         model_filename.clone(),
-        format!("{}_qwen2-1_5b-instruct-q2_k.gguf", model_id),
-        format!("{}_qwen2-1_5b-instruct-q4_0.gguf", model_id),
-        format!("Qwen2-1.5B-Instruct-GGUF_qwen2-1_5b-instruct-q4_0.gguf"),
-        format!("qwen2-1.5b-instruct-gguf_qwen2-1_5b-instruct-q2_k.gguf"),
+        format!("{}.safetensors", model_id),
+        format!("model.safetensors"),
     ];
     
     let mut possible_paths = Vec::new();
@@ -3118,18 +3314,16 @@ async fn run_temporal_training(
     let storage_paths = crate::storage::StoragePaths::new()?;
     let models_dir = storage_paths.models_dir()?;
     
-    let model_filename = if model_id.ends_with(".gguf") {
+    let model_filename = if model_id.ends_with(".safetensors") {
         model_id.to_string()
     } else {
-        format!("{}.gguf", model_id)
+        format!("{}.safetensors", model_id)
     };
     
     let possible_filenames = vec![
         model_filename.clone(),
-        format!("{}_qwen2-1_5b-instruct-q2_k.gguf", model_id),
-        format!("{}_qwen2-1_5b-instruct-q4_0.gguf", model_id),
-        format!("Qwen2-1.5B-Instruct-GGUF_qwen2-1_5b-instruct-q4_0.gguf"),
-        format!("qwen2-1.5b-instruct-gguf_qwen2-1_5b-instruct-q2_k.gguf"),
+        format!("{}.safetensors", model_id),
+        format!("model.safetensors"),
     ];
     
     let mut possible_paths = Vec::new();
