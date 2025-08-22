@@ -97,7 +97,7 @@ indicatif = "0.17"              # Progress bars
 fastrand = "2.0"                # Fast random number generation for sampling
 xdg = "2.5"                     # XDG Base Directory specification
 blake3 = "1.5"                  # Fast cryptographic hashing for checksums
-tempfile = "3.9"                # Temporary files for GGUF conversion
+tempfile = "3.9"                # Temporary files for model conversion
 
 # HTTP API dependencies
 axum = { version = "0.7", features = ["macros", "tokio"] }

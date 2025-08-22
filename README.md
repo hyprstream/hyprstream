@@ -49,7 +49,7 @@ Traditional ML inference engines load dense models into memory. Hyprstream takes
 ├─────────────────────────────────────────────┤
 │          Candle Runtime Engine              │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐ │
-│  │   GGUF   │→ │  Sparse  │→ │   VDB    │ │
+│  │SafeTensor│→ │  Sparse  │→ │   VDB    │ │
 │  │  Loader  │  │Conversion│  │ Storage  │ │
 │  └──────────┘  └──────────┘  └──────────┘ │
 ├─────────────────────────────────────────────┤
@@ -98,10 +98,10 @@ hyprstream server --port 50051
 hyprstream model download hf://mistralai/Mistral-7B-v0.1
 
 # Interactive chat
-hyprstream chat --model /path/to/model.gguf
+hyprstream chat --model /path/to/model.safetensors
 
 # Chat with real-time training
-hyprstream chat --model /path/to/model.gguf --train
+hyprstream chat --model /path/to/model.safetensors --train
 ```
 
 ## 🔧 Configuration
@@ -141,7 +141,7 @@ presence_penalty = 0.0
 - Candle ML framework integration
 - OpenVDB C++ bindings
 - VDB sparse storage layer
-- GGUF model loading
+- SafeTensors model loading
 - Tensor sparsification
 - CLI interface
 - Basic chat functionality
@@ -163,7 +163,7 @@ presence_penalty = 0.0
 ## 🔬 Technical Deep Dive
 
 ### Sparsification Process
-1. **Load GGUF**: Read quantized model weights
+1. **Load Model**: Read model weights from SafeTensors
 2. **Identify Sparse Tensors**: Select attention/FFN layers
 3. **Apply Pruning**: Remove weights below threshold
 4. **Create VDB Grid**: Store in hierarchical format

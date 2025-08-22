@@ -21,9 +21,11 @@ pub mod precision;           // BF16/FP8 precision management
 pub mod fp8;                 // FP8 (E4M3/E5M2) quantization support
 pub mod architectures;       // Architecture-specific model implementations
 pub mod sampling;            // Token sampling strategies with model-specific configs
+pub mod inference;           // Clean inference interface with request/response patterns
 
 // Primary exports - use CandleEngine as default
 pub use candle_engine::CandleEngine;
+pub use inference::{InferenceRequest, InferenceResult, InferenceExt};
 
 // Temporary placeholder types during migration
 #[derive(Debug, Clone)]

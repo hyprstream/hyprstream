@@ -1106,18 +1106,41 @@ pub async fn handle_model_command(
             }
             println!();
             
-            // Call shared inference function
-            let result = perform_inference_shared(
-                &mut engine,
-                &prompt,
-                max_tokens,
-                final_config.temperature,
-                final_config.top_p.unwrap_or(0.95),
-                stream,
-                None, // No LoRA for model infer
-            ).await?;
+            // Use clean inference interface
+            use crate::runtime::InferenceExt;
+            use std::io::{self, Write};
             
-            println!("✅ Generation complete: {} tokens generated", result.tokens_generated);
+            let request = crate::runtime::InferenceRequest {
+                prompt: prompt.clone(),
+                max_tokens,
+                temperature: final_config.temperature,
+                top_p: final_config.top_p.unwrap_or(0.95),
+                top_k: final_config.top_k,
+                stream,
+                lora_weights: None, // No LoRA for model infer
+            };
+            
+            let result = if stream {
+                println!("📝 Response (streaming):");
+                println!("{}", "─".repeat(50));
+                
+                engine.run_inference_streaming(request, |token| {
+                    print!("{}", token);
+                    io::stdout().flush().ok();
+                }).await?
+            } else {
+                println!("📝 Response:");
+                println!("{}", "─".repeat(50));
+                
+                let result = engine.run_inference(request).await?;
+                println!("{}", result.text);
+                result
+            };
+            
+            println!("{}", "─".repeat(50));
+            println!("✅ Generation complete: {} tokens generated in {:.2}s", 
+                     result.tokens_generated, 
+                     result.latency_ms as f64 / 1000.0);
         }
         ModelAction::Test { path, prompt, max_tokens, xlora, xlora_model_id, max_adapters } => {
             info!("🧪 Testing model inference with CandleEngine: {}", path.display());
@@ -1754,7 +1777,7 @@ pub async fn handle_lora_command(
                     println!("   📂 Weights Path: {}", checkpoint_info.weights_path.display());
                     
                     // Perform checkpoint inference
-                    match perform_checkpoint_inference_with_weights(
+                    match run_checkpoint_inference(
                         &base_model_path,
                         &checkpoint_info.weights_path,
                         &input_text,
@@ -1883,7 +1906,7 @@ pub async fn handle_lora_command(
             println!();
             
             // Create inference session
-            match create_lora_inference_session(&base_model_path, &lora_layer, &input_text, max_tokens, temperature, top_p, stream).await {
+            match run_lora_inference_with_vdb(&base_model_path, &lora_layer, &input_text, max_tokens, temperature, top_p, stream).await {
                 Ok(response) => {
                     match format.as_str() {
                         "json" => {
@@ -2456,7 +2479,7 @@ pub async fn handle_lora_command(
                         println!("📂 Checkpoint: {}", checkpoint.weights_path.display());
                         
                         // Perform inference with checkpoint weights
-                        match perform_checkpoint_inference_with_weights(
+                        match run_checkpoint_inference(
                             &base_model_path,
                             &checkpoint.weights_path,
                             &input_text,
@@ -2528,8 +2551,8 @@ pub async fn handle_lora_command(
     Ok(())
 }
 
-/// Perform inference using checkpoint weights loaded from JSON
-async fn perform_checkpoint_inference_with_weights(
+/// Run inference using checkpoint weights loaded from JSON
+async fn run_checkpoint_inference(
     model_path: &std::path::Path,
     weights_path: &std::path::Path,
     input_text: &str,
@@ -2568,33 +2591,34 @@ async fn perform_checkpoint_inference_with_weights(
              weights_data.config.rank, 
              weights_data.scaling * scale);
     
-    // Use shared inference function
-    println!("🚀 Starting inference...");
-    let start_time = std::time::Instant::now();
+    // Use clean inference interface
+    use crate::runtime::InferenceExt;
+    use std::sync::Arc;
     
-    // Call shared inference function with LoRA weights
-    let result = perform_inference_shared(
-        &mut engine,
-        input_text,
+    println!("🚀 Starting inference...");
+    
+    let request = crate::runtime::InferenceRequest {
+        prompt: input_text.to_string(),
         max_tokens,
         temperature,
         top_p,
-        _stream,
-        Some(&weights_data),
-    ).await?;
+        top_k: None,
+        stream: _stream,
+        lora_weights: Some(Arc::new(weights_data)),
+    };
     
-    let total_time = start_time.elapsed();
+    let result = engine.run_inference(request).await?;
     
     println!("✅ Inference completed");
     println!("   📝 Generated {} tokens", result.tokens_generated);
-    println!("   ⏱️ Total time: {:.2}s", total_time.as_secs_f32());
+    println!("   ⏱️ Total time: {:.2}s", result.latency_ms as f64 / 1000.0);
     
     // Convert to InferenceResponse format
     Ok(InferenceResponse {
         lora_id: "checkpoint".to_string(),
-        output: result.output,
+        output: result.text,
         tokens_generated: result.tokens_generated,
-        latency_ms: total_time.as_millis() as f64,
+        latency_ms: result.latency_ms as f64,
         finish_reason: "complete".to_string(),
     })
 }
@@ -2606,93 +2630,6 @@ async fn load_lora_weights_from_json(weights_path: &std::path::Path) -> anyhow::
     Ok(weights_data)
 }
 
-/// Shared inference result structure
-struct SharedInferenceResult {
-    output: String,
-    tokens_generated: usize,
-}
-
-/// Shared inference function for both model infer and lora infer (DRY)
-async fn perform_inference_shared(
-    engine: &mut crate::runtime::CandleEngine,
-    prompt: &str,
-    max_tokens: usize,
-    temperature: f32,
-    top_p: f32,
-    stream: bool,
-    lora_weights: Option<&crate::adapters::LoRAWeightsData>,
-) -> anyhow::Result<SharedInferenceResult> {
-    use std::io::{self, Write};
-    
-    // Apply LoRA weights if provided
-    if let Some(weights) = lora_weights {
-        println!("📎 Applying LoRA weights: {} modules, rank {}", 
-                 weights.target_modules.len(), 
-                 weights.config.rank);
-        // TODO: Actually apply the LoRA weights to the engine
-        // For now, LoRA weights are loaded but not applied
-    }
-    
-    // TODO: Set sampling parameters on the engine when API is available
-    // Currently temperature and top_p are not configurable at runtime
-    if temperature != 0.8 || top_p != 0.95 {
-        println!("⚠️  Note: Custom temperature ({}) and top_p ({}) specified but not yet applied", temperature, top_p);
-    }
-    
-    let mut generated_text = String::new();
-    let token_count_ref = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    
-    if stream {
-        println!("📝 Response (streaming):");
-        println!("{}", "─".repeat(50));
-        
-        // Use generate_streaming which exists on CandleEngine
-        let counter = token_count_ref.clone();
-        generated_text = engine.generate_streaming(
-            prompt,
-            max_tokens,
-            |token| {
-                print!("{}", token);
-                io::stdout().flush().ok();
-                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        ).await?;
-        
-        println!();
-        println!("{}", "─".repeat(50));
-    } else {
-        println!("📝 Response:");
-        println!("{}", "─".repeat(50));
-        
-        // For non-streaming, we still use generate_streaming but collect output
-        let counter = token_count_ref.clone();
-        generated_text = engine.generate_streaming(
-            prompt,
-            max_tokens,
-            |_token| {
-                // Count tokens but don't print during generation
-                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        ).await?;
-        
-        // Print all at once
-        println!("{}", generated_text);
-        println!("{}", "─".repeat(50));
-    }
-    
-    // Get final token count
-    let mut token_count = token_count_ref.load(std::sync::atomic::Ordering::Relaxed);
-    
-    // If no tokens were counted during generation, count from output
-    if token_count == 0 {
-        token_count = generated_text.split_whitespace().count();
-    }
-    
-    Ok(SharedInferenceResult {
-        output: generated_text,
-        tokens_generated: token_count,
-    })
-}
 
 /// Handle authentication commands
 pub async fn handle_auth_command(cmd: crate::cli::commands::AuthCommand) -> Result<(), Box<dyn std::error::Error>> {
@@ -2804,8 +2741,8 @@ fn mask_token(token: &str) -> String {
     }
 }
 
-/// Create a LoRA inference session and perform inference
-async fn create_lora_inference_session(
+/// Run LoRA inference using VDB storage and InferenceAPI
+async fn run_lora_inference_with_vdb(
     model_path: &Path,
     lora_layer: &crate::api::lora_registry::LoRALayer,
     input_text: &str,
@@ -3109,37 +3046,6 @@ pub async fn chat_completion_via_api(
     }
 }
 
-/// Perform inference via REST API  
-pub async fn inference_via_api(
-    base_url: &str,
-    lora_id: &str,
-    prompt: &str,
-    max_tokens: usize,
-    temperature: f32,
-) -> Result<Value, Box<dyn std::error::Error>> {
-    let client = create_http_client();
-    let url = format!("{}/v1/inference/{}/completions", base_url, lora_id);
-    
-    let request_body = json!({
-        "model": format!("lora-{}", lora_id),
-        "prompt": prompt,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "stream": false
-    });
-    
-    let response = client.post(&url).json(&request_body).send().await?;
-    
-    if response.status().is_success() {
-        let result: Value = response.json().await?;
-        Ok(result)
-    } else {
-        let status_code = response.status();
-        let error_text = response.text().await?;
-        Err(format!("Failed to perform inference: HTTP {} - {}", status_code, error_text).into())
-    }
-}
-
 /// Handle chat command - inference with models/composed models
 pub async fn handle_chat_command(
     cmd: crate::cli::commands::ChatCommand,
@@ -3160,7 +3066,7 @@ pub async fn handle_chat_command(
         println!("\n🤖 Processing prompt: {}", prompt);
         
         // Try to run actual inference with CandleEngine
-        match run_candle_inference(&cmd.model_id, &prompt, cmd.max_tokens, cmd.temperature).await {
+        match run_chat_inference(&cmd.model_id, &prompt, cmd.max_tokens, cmd.temperature).await {
             Ok(response) => {
                 println!("\n📤 Response:");
                 println!("========");
@@ -3229,8 +3135,8 @@ pub async fn handle_chat_command(
     Ok(())
 }
 
-/// Run inference using CandleEngine directly
-async fn run_candle_inference(
+/// Run chat inference - finds and loads model, then generates response
+async fn run_chat_inference(
     model_id: &str,
     prompt: &str,
     max_tokens: usize,
@@ -3286,11 +3192,24 @@ async fn run_candle_inference(
     // Load the model
     engine.load_model(&model_path).await?;
     
-    // Generate text
-    println!("🔮 Generating response...");
-    let response = engine.generate(prompt, max_tokens).await?;
+    // Use clean inference interface
+    use crate::runtime::InferenceExt;
     
-    Ok(response)
+    println!("🔮 Generating response...");
+    
+    let request = crate::runtime::InferenceRequest {
+        prompt: prompt.to_string(),
+        max_tokens,
+        temperature,
+        top_p: 0.95,
+        top_k: Some(40),
+        stream: false,
+        lora_weights: None,
+    };
+    
+    let result = engine.run_inference(request).await?;
+    
+    Ok(result.text)
 }
 
 /// Run temporal LoRA training using CandleEngine

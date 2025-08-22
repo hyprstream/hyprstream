@@ -121,9 +121,9 @@ async fn test_update_adapter_realtime() {
 async fn test_model_loading_placeholder() {
     // Create a temporary directory for testing
     let temp_dir = TempDir::new().unwrap();
-    let model_path = temp_dir.path().join("test_model.gguf");
+    let model_path = temp_dir.path().join("test_model.safetensors");
     
-    // Create a dummy file (actual GGUF loading would fail, but that's ok for this test)
+    // Create a dummy file (actual SafeTensors loading would fail, but that's ok for this test)
     std::fs::write(&model_path, b"dummy model data").unwrap();
     
     let config = create_test_config();
