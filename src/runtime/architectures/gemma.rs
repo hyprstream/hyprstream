@@ -160,10 +160,10 @@ impl GemmaAttention {
         // Reshape for 2D matmul
         let hidden_states_2d = hidden_states.reshape(&[batch_size * seq_len, hidden_size])?;
         
-        // Project to Q, K, V
-        let q = hidden_states_2d.matmul(&self.q_proj)?;
-        let k = hidden_states_2d.matmul(&self.k_proj)?;
-        let v = hidden_states_2d.matmul(&self.v_proj)?;
+        // Project to Q, K, V - weights are [out, in] so transpose for matmul
+        let q = hidden_states_2d.matmul(&self.q_proj.t()?)?;
+        let k = hidden_states_2d.matmul(&self.k_proj.t()?)?;
+        let v = hidden_states_2d.matmul(&self.v_proj.t()?)?;
         
         // Reshape for attention
         // Q: [batch, seq, num_heads, head_dim]
@@ -216,11 +216,11 @@ impl GemmaAttention {
         // Transpose back: [batch, heads, seq, dim] -> [batch, seq, heads, dim]
         let attn_output = attn_output.transpose(1, 2)?;
         
-        // Reshape and project output
+        // Reshape and project output - transpose o_proj for matmul
         let attn_output = attn_output
             .reshape(&[batch_size, seq_len, self.num_heads * self.head_dim])?
             .reshape(&[batch_size * seq_len, self.num_heads * self.head_dim])?
-            .matmul(&self.o_proj)?
+            .matmul(&self.o_proj.t()?)?
             .reshape(&[batch_size, seq_len, hidden_size])?;
         
         Ok(attn_output)
@@ -403,7 +403,8 @@ impl GemmaMLP {
             hidden_states.clone()
         };
         
-        let gate_pre_activation = hidden_2d.matmul(&self.gate_proj)?;
+        // Weights are [out, in] so transpose for matmul
+        let gate_pre_activation = hidden_2d.matmul(&self.gate_proj.t()?)?;
         
         // Apply activation based on config
         let gate = match self.activation.as_str() {
@@ -411,8 +412,8 @@ impl GemmaMLP {
             "silu" | _ => candle_nn::ops::silu(&gate_pre_activation)?,
         };
         
-        let up = hidden_2d.matmul(&self.up_proj)?;
-        let output = gate.mul(&up)?.matmul(&self.down_proj)?;
+        let up = hidden_2d.matmul(&self.up_proj.t()?)?;
+        let output = gate.mul(&up)?.matmul(&self.down_proj.t()?)?;
         
         // Reshape back to 3D if input was 3D
         if needs_reshape {
@@ -590,10 +591,10 @@ impl GemmaModel {
             .cloned();
         
         // Gemma uses weight tying - lm_head shares weights with embed_tokens
+        // Keep lm_head as [vocab_size, hidden_size], transpose during use
         let lm_head = weights.get("lm_head.weight")
             .or_else(|| weights.get("model.lm_head.weight"))
-            .map(|w| w.transpose(0, 1).and_then(|t| t.contiguous()))
-            .transpose()?;
+            .cloned();
         
         if lm_head.is_none() && embed_tokens.is_some() {
             tracing::info!("Gemma model uses weight tying (lm_head = embed_tokens.T)");
@@ -695,19 +696,19 @@ impl GemmaModel {
         }
         
         // Get attention weights - SafeTensors stores as [out_features, in_features]
-        // For matmul we need [in_features, out_features] so transpose
+        // Keep them as-is, we'll transpose during matmul
         let q_proj = weights.get(&format!("{}.self_attn.q_proj.weight", prefix))
             .ok_or_else(|| anyhow!("Missing q_proj weight"))?
-            .transpose(0, 1)?.contiguous()?;
+            .clone();
         let k_proj = weights.get(&format!("{}.self_attn.k_proj.weight", prefix))
             .ok_or_else(|| anyhow!("Missing k_proj weight"))?
-            .transpose(0, 1)?.contiguous()?;
+            .clone();
         let v_proj = weights.get(&format!("{}.self_attn.v_proj.weight", prefix))
             .ok_or_else(|| anyhow!("Missing v_proj weight"))?
-            .transpose(0, 1)?.contiguous()?;
+            .clone();
         let o_proj = weights.get(&format!("{}.self_attn.o_proj.weight", prefix))
             .ok_or_else(|| anyhow!("Missing o_proj weight"))?
-            .transpose(0, 1)?.contiguous()?;
+            .clone();
         
         // Check for QK-norm weights (Gemma3)
         let q_norm = weights.get(&format!("{}.self_attn.q_norm.weight", prefix))
@@ -759,17 +760,17 @@ impl GemmaModel {
             layer_type,
         };
         
-        // Build MLP - transpose for matmul
+        // Build MLP - keep weights as [out, in], transpose during matmul
         let mlp = GemmaMLP {
             gate_proj: weights.get(&format!("{}.mlp.gate_proj.weight", prefix))
                 .ok_or_else(|| anyhow!("Missing gate_proj weight"))?
-                .transpose(0, 1)?.contiguous()?,
+                .clone(),
             up_proj: weights.get(&format!("{}.mlp.up_proj.weight", prefix))
                 .ok_or_else(|| anyhow!("Missing up_proj weight"))?
-                .transpose(0, 1)?.contiguous()?,
+                .clone(),
             down_proj: weights.get(&format!("{}.mlp.down_proj.weight", prefix))
                 .ok_or_else(|| anyhow!("Missing down_proj weight"))?
-                .transpose(0, 1)?.contiguous()?,
+                .clone(),
             activation: config.hidden_activation.clone(),
         };
         
@@ -943,25 +944,21 @@ impl ModelOperations for GemmaModel {
         // LM head - handle weight tying for Gemma
         if let Some(lm_head) = &self.lm_head {
             // Use explicit lm_head if available
-            hidden_states = hidden_states.matmul(lm_head)?;
+            // lm_head is [vocab_size, hidden_size], need to transpose for matmul
+            let (batch_size, seq_len, hidden_size) = hidden_states.dims3()?;
+            let hidden_2d = hidden_states.reshape(&[batch_size * seq_len, hidden_size])?;
+            let logits = hidden_2d.matmul(&lm_head.t()?)?;
+            let vocab_size = logits.dims()[1];
+            hidden_states = logits.reshape(&[batch_size, seq_len, vocab_size])?;
         } else if let Some(embed) = &self.embed_tokens {
             // Gemma uses weight tying: lm_head = embed_tokens.T
-            // Get dimensions for proper reshaping
+            // embed_tokens is [vocab_size, hidden_size], use it directly as lm_head
             let (batch_size, seq_len, hidden_size) = hidden_states.dims3()?;
-            
-            // Reshape to 2D for matmul
             let hidden_2d = hidden_states.reshape(&[batch_size * seq_len, hidden_size])?;
             
-            // Transpose embedding matrix for output projection
-            let lm_head = embed.transpose(0, 1)?;
-            
-            // Apply projection
-            let logits = hidden_2d.matmul(&lm_head)?;
-            
-            // Get vocab size from result
+            // For weight tying, embed_tokens already acts as the transposed lm_head
+            let logits = hidden_2d.matmul(&embed.t()?)?;
             let vocab_size = logits.dims()[1];
-            
-            // Reshape back to 3D
             hidden_states = logits.reshape(&[batch_size, seq_len, vocab_size])?;
         }
         
