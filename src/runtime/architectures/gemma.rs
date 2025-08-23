@@ -29,8 +29,18 @@ pub struct GemmaConfig {
     pub vocab_size: usize,
     /// Number of hidden layers
     pub num_hidden_layers: usize,
-    /// RoPE theta
+    /// RoPE theta for global attention
     pub rope_theta: f32,
+    /// RoPE theta for local attention (Gemma3)
+    pub rope_local_base_freq: f32,
+    /// Sliding window size (Gemma3)
+    pub sliding_window: Option<usize>,
+    /// Layer types (sliding_attention or full_attention)
+    pub layer_types: Vec<String>,
+    /// Query pre-attention scalar (QK-norm for Gemma3)
+    pub query_pre_attn_scalar: Option<f32>,
+    /// Hidden activation function
+    pub hidden_activation: String,
 }
 
 impl Default for GemmaConfig {
@@ -47,6 +57,11 @@ impl Default for GemmaConfig {
             vocab_size: 256000,
             num_hidden_layers: 28,
             rope_theta: 10000.0,
+            rope_local_base_freq: 10000.0,
+            sliding_window: None,
+            layer_types: vec![],
+            query_pre_attn_scalar: None,
+            hidden_activation: "silu".to_string(),
         }
     }
 }
@@ -127,24 +142,43 @@ struct GemmaAttention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    rope_theta: f32,
+    // QK-norm weights (Gemma3)
+    q_norm: Option<Tensor>,
+    k_norm: Option<Tensor>,
+    query_pre_attn_scalar: Option<f32>,
+    // Sliding window (Gemma3)
+    sliding_window: Option<usize>,
+    layer_type: String,
 }
 
 impl GemmaAttention {
-    /// Apply Multi-Query Attention
+    /// Apply Multi-Query Attention with optional QK-norm and sliding window
     fn forward(&self, hidden_states: &Tensor, position_ids: Option<&Tensor>) -> Result<Tensor> {
-        let (batch_size, seq_len, _) = hidden_states.dims3()?;
+        let (batch_size, seq_len, hidden_size) = hidden_states.dims3()?;
+        
+        // Reshape for 2D matmul
+        let hidden_states_2d = hidden_states.reshape(&[batch_size * seq_len, hidden_size])?;
         
         // Project to Q, K, V
-        let q = hidden_states.matmul(&self.q_proj)?;
-        let k = hidden_states.matmul(&self.k_proj)?;
-        let v = hidden_states.matmul(&self.v_proj)?;
+        let q = hidden_states_2d.matmul(&self.q_proj)?;
+        let k = hidden_states_2d.matmul(&self.k_proj)?;
+        let v = hidden_states_2d.matmul(&self.v_proj)?;
         
-        // Reshape for MQA
+        // Reshape for attention
         // Q: [batch, seq, num_heads, head_dim]
-        let q = q.reshape(&[batch_size, seq_len, self.num_heads, self.head_dim])?;
+        let mut q = q.reshape(&[batch_size, seq_len, self.num_heads, self.head_dim])?;
         // K, V: [batch, seq, num_kv_heads, head_dim]
-        let k = k.reshape(&[batch_size, seq_len, self.num_kv_heads, self.head_dim])?;
+        let mut k = k.reshape(&[batch_size, seq_len, self.num_kv_heads, self.head_dim])?;
         let v = v.reshape(&[batch_size, seq_len, self.num_kv_heads, self.head_dim])?;
+        
+        // Apply QK-norm if configured (Gemma3)
+        if let Some(q_norm) = &self.q_norm {
+            q = self.apply_qk_norm(&q, q_norm, self.num_heads)?;
+        }
+        if let Some(k_norm) = &self.k_norm {
+            k = self.apply_qk_norm(&k, k_norm, self.num_kv_heads)?;
+        }
         
         // Apply RoPE if position_ids provided
         let (q, k) = if let Some(pos_ids) = position_ids {
@@ -156,20 +190,36 @@ impl GemmaAttention {
             (q, k)
         };
         
+        // Apply query pre-attention scalar if configured (Gemma3)
+        let q = if let Some(scalar) = self.query_pre_attn_scalar {
+            let scale_tensor = Tensor::new(&[scalar.sqrt()], q.device())?;
+            q.broadcast_mul(&scale_tensor)?
+        } else {
+            q
+        };
+        
         // Expand K, V for MQA (repeat KV heads to match Q heads)
         let k = self.expand_kv_for_mqa(&k)?;
         let v = self.expand_kv_for_mqa(&v)?;
         
-        // Compute attention scores
+        // Compute attention scores with optional sliding window
         let scores = self.compute_attention_scores(&q, &k)?;
         
-        // Apply attention to values
+        // Transpose V for matmul: [batch, seq, heads, dim] -> [batch, heads, seq, dim]
+        let v = v.transpose(1, 2)?;
+        
+        // Apply attention to values: [batch, heads, seq, seq] x [batch, heads, seq, dim]
         let attn_output = scores.matmul(&v)?;
+        
+        // Transpose back: [batch, heads, seq, dim] -> [batch, seq, heads, dim]
+        let attn_output = attn_output.transpose(1, 2)?;
         
         // Reshape and project output
         let attn_output = attn_output
             .reshape(&[batch_size, seq_len, self.num_heads * self.head_dim])?
-            .matmul(&self.o_proj)?;
+            .reshape(&[batch_size * seq_len, self.num_heads * self.head_dim])?
+            .matmul(&self.o_proj)?
+            .reshape(&[batch_size, seq_len, hidden_size])?;
         
         Ok(attn_output)
     }
@@ -190,28 +240,131 @@ impl GemmaAttention {
     }
     
     /// Apply Rotary Position Embeddings
-    fn apply_rope(&self, tensor: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
-        // Simplified RoPE implementation
-        // In production, use proper RoPE with sin/cos caching
-        Ok(tensor.clone())  // Placeholder
+    fn apply_rope(&self, tensor: &Tensor, _position_ids: &Tensor) -> Result<Tensor> {
+        // tensor shape: [batch, seq, heads, dim]
+        let (_batch_size, seq_len, _num_heads, head_dim) = tensor.dims4()?;
+        
+        // Generate position embeddings
+        let theta = self.rope_theta;
+        let device = tensor.device();
+        let dtype = tensor.dtype();
+        
+        // Create frequency bands
+        let inv_freq = (0..head_dim / 2)
+            .map(|i| 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32))
+            .collect::<Vec<_>>();
+        
+        // Create position indices
+        let positions = Tensor::arange(0u32, seq_len as u32, device)?
+            .to_dtype(DType::F32)?;
+        
+        // Compute sin and cos for each position and frequency
+        let mut sin_vals = Vec::new();
+        let mut cos_vals = Vec::new();
+        
+        for pos in 0..seq_len {
+            for freq_idx in 0..head_dim / 2 {
+                let angle = pos as f32 * inv_freq[freq_idx];
+                sin_vals.push(angle.sin());
+                cos_vals.push(angle.cos());
+            }
+        }
+        
+        // Create sin and cos tensors
+        let sin = Tensor::from_vec(sin_vals.clone(), &[seq_len, head_dim / 2], device)?
+            .to_dtype(dtype)?;
+        let cos = Tensor::from_vec(cos_vals.clone(), &[seq_len, head_dim / 2], device)?
+            .to_dtype(dtype)?;
+        
+        // Split tensor into two halves for rotation
+        let x1 = tensor.narrow(D::Minus1, 0, head_dim / 2)?;
+        let x2 = tensor.narrow(D::Minus1, head_dim / 2, head_dim / 2)?;
+        
+        // Apply rotation
+        let rotated_x1 = x1.broadcast_mul(&cos)?.broadcast_sub(&x2.broadcast_mul(&sin)?)?;
+        let rotated_x2 = x1.broadcast_mul(&sin)?.broadcast_add(&x2.broadcast_mul(&cos)?)?;
+        
+        // Concatenate back together
+        Ok(Tensor::cat(&[rotated_x1, rotated_x2], D::Minus1)?)
     }
     
-    /// Compute scaled dot-product attention scores
+    /// Apply QK-norm (Gemma3)
+    fn apply_qk_norm(&self, tensor: &Tensor, norm_weight: &Tensor, num_heads: usize) -> Result<Tensor> {
+        // tensor shape: [batch, seq, heads, dim]
+        // norm_weight shape: [heads * dim] or [dim] for single head
+        let (batch_size, seq_len, _tensor_heads, head_dim) = tensor.dims4()?;
+        
+        // Reshape norm_weight to match tensor dimensions
+        let norm_weight = if norm_weight.dims()[0] == head_dim {
+            // Single head normalization (K in Gemma3)
+            norm_weight.unsqueeze(0)?  // [1, dim]
+                .expand(&[num_heads, head_dim])?  // [heads, dim]
+                .reshape(&[num_heads * head_dim])?
+        } else {
+            norm_weight.clone()
+        };
+        
+        // Reshape tensor for normalization
+        let tensor_flat = tensor.reshape(&[batch_size * seq_len, num_heads * head_dim])?;
+        
+        // Apply normalization
+        let normalized = tensor_flat.broadcast_mul(&norm_weight)?;
+        
+        // Reshape back
+        Ok(normalized.reshape(&[batch_size, seq_len, num_heads, head_dim])?)
+    }
+    
+    /// Compute scaled dot-product attention scores with optional sliding window
     fn compute_attention_scores(&self, q: &Tensor, k: &Tensor) -> Result<Tensor> {
         let scale = 1.0 / (self.head_dim as f32).sqrt();
         
-        // Q: [batch, seq, num_heads, head_dim]
-        // K: [batch, seq, num_heads, head_dim]
+        // Q: [batch, seq, num_heads, head_dim] -> [batch, num_heads, seq, head_dim]
+        let q = q.transpose(1, 2)?;
+        // K: [batch, seq, num_heads, head_dim] -> [batch, num_heads, seq, head_dim] -> [batch, num_heads, head_dim, seq]
+        let k = k.transpose(1, 2)?.transpose(2, 3)?;
         
-        // Transpose K for matmul: [batch, num_heads, head_dim, seq]
-        let k_t = k.transpose(1, 2)?.transpose(2, 3)?;
-        let q_t = q.transpose(1, 2)?;  // [batch, num_heads, seq, head_dim]
+        // Compute attention scores: [batch, num_heads, seq, seq]
+        let mut scores = q.matmul(&k)?.affine(scale as f64, 0.0)?;
         
-        // Compute attention scores
-        let scores = q_t.matmul(&k_t)?.affine(scale as f64, 0.0)?;
+        // Apply sliding window mask if configured (Gemma3)
+        if let Some(window_size) = self.sliding_window {
+            if self.layer_type == "local" {
+                scores = self.apply_sliding_window_mask(&scores, window_size)?;
+            }
+            // Global layers use full attention (no mask)
+        }
         
         // Apply softmax
         Ok(candle_nn::ops::softmax_last_dim(&scores)?)
+    }
+    
+    /// Apply sliding window mask for local attention layers
+    fn apply_sliding_window_mask(&self, scores: &Tensor, window_size: usize) -> Result<Tensor> {
+        let (batch_size, num_heads, seq_len, _) = scores.dims4()?;
+        let device = scores.device();
+        let dtype = scores.dtype();
+        
+        // Create sliding window mask where each position can only attend to window_size previous positions
+        let mut mask_values = vec![0f32; seq_len * seq_len];
+        for i in 0..seq_len {
+            for j in 0..seq_len {
+                if j <= i && i - j < window_size {
+                    mask_values[i * seq_len + j] = 0.0;  // Can attend
+                } else {
+                    mask_values[i * seq_len + j] = -10000.0;  // Mask out
+                }
+            }
+        }
+        
+        // Create mask tensor and broadcast to match scores shape
+        let mask = Tensor::from_vec(mask_values, &[seq_len, seq_len], device)?
+            .to_dtype(dtype)?
+            .unsqueeze(0)?  // [1, seq, seq]
+            .unsqueeze(0)?  // [1, 1, seq, seq]
+            .expand(&[batch_size, num_heads, seq_len, seq_len])?;
+        
+        // Add mask to scores
+        Ok(scores.broadcast_add(&mask)?)
     }
 }
 
@@ -220,14 +373,78 @@ struct GemmaMLP {
     gate_proj: Tensor,
     up_proj: Tensor,
     down_proj: Tensor,
+    activation: String,  // "silu" or "gelu_pytorch_tanh"
 }
 
 impl GemmaMLP {
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
-        // Gemma uses SiLU activation (Swish)
-        let gate = candle_nn::ops::silu(&hidden_states.matmul(&self.gate_proj)?)?;
-        let up = hidden_states.matmul(&self.up_proj)?;
-        Ok(gate.mul(&up)?.matmul(&self.down_proj)?)
+        // Handle 3D input: [batch_size, seq_len, hidden_size]
+        let input_dims = hidden_states.dims();
+        let needs_reshape = input_dims.len() == 3;
+        
+        let (batch_size, seq_len, hidden_size) = if needs_reshape {
+            (input_dims[0], input_dims[1], input_dims[2])
+        } else {
+            (1, 1, input_dims[input_dims.len() - 1])
+        };
+        
+        // Reshape to 2D for matmul if needed
+        let hidden_2d = if needs_reshape {
+            hidden_states.reshape(&[batch_size * seq_len, hidden_size])?
+        } else {
+            hidden_states.clone()
+        };
+        
+        let gate_pre_activation = hidden_2d.matmul(&self.gate_proj)?;
+        
+        // Apply activation based on config
+        let gate = match self.activation.as_str() {
+            "gelu_pytorch_tanh" => self.gelu_pytorch_tanh(&gate_pre_activation)?,
+            "silu" | _ => candle_nn::ops::silu(&gate_pre_activation)?,
+        };
+        
+        let up = hidden_2d.matmul(&self.up_proj)?;
+        let output = gate.mul(&up)?.matmul(&self.down_proj)?;
+        
+        // Reshape back to 3D if input was 3D
+        if needs_reshape {
+            let output_hidden_size = output.dims()[1];
+            Ok(output.reshape(&[batch_size, seq_len, output_hidden_size])?)
+        } else {
+            Ok(output)
+        }
+    }
+    
+    /// GELU activation with PyTorch tanh approximation
+    /// GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
+    fn gelu_pytorch_tanh(&self, x: &Tensor) -> Result<Tensor> {
+        use std::f32::consts::PI;
+        
+        // Constants for the approximation
+        let sqrt_2_over_pi = (2.0_f32 / PI).sqrt();
+        let coeff = 0.044715_f32;
+        
+        // x^3
+        let x_cubed = x.powf(3.0)?;
+        
+        // x + 0.044715 * x^3
+        let coeff_tensor = Tensor::new(&[coeff], x.device())?;
+        let inner = (x + (x_cubed.broadcast_mul(&coeff_tensor)?))?;
+        
+        // sqrt(2/π) * (x + 0.044715 * x^3)
+        let sqrt_tensor = Tensor::new(&[sqrt_2_over_pi], x.device())?;
+        let scaled = inner.broadcast_mul(&sqrt_tensor)?;
+        
+        // tanh(sqrt(2/π) * (x + 0.044715 * x^3))
+        let tanh_result = scaled.tanh()?;
+        
+        // 1 + tanh(...)
+        let one_tensor = Tensor::new(&[1.0_f32], x.device())?;
+        let one_plus_tanh = tanh_result.broadcast_add(&one_tensor)?;
+        
+        // 0.5 * x * (1 + tanh(...))
+        let half_tensor = Tensor::new(&[0.5_f32], x.device())?;
+        Ok(x.mul(&one_plus_tanh)?.broadcast_mul(&half_tensor)?)
     }
 }
 
@@ -250,14 +467,6 @@ impl RMSNorm {
 }
 
 impl GemmaModel {
-    /// Create Gemma model from file (deprecated)
-    pub fn from_file(
-        _path: &Path,
-        _device: &Device,
-        _dtype: DType,
-    ) -> Result<Self> {
-        Err(anyhow!("Model format not supported. Please use SafeTensors format."))
-    }
     
     /// Create Gemma model from SafeTensors
     pub fn from_safetensors(
@@ -298,87 +507,300 @@ impl GemmaModel {
         device: &Device,
         dtype: DType,
     ) -> Result<Self> {
-        // Gemma uses the same architecture as Llama, just with different naming
-        // We can directly use LlamaModel since they're compatible
-        tracing::info!("Loading Gemma model (using Llama architecture for Gemma weights)");
+        let config = Self::detect_config_from_weights(weights)?;
+        Self::from_weights_with_config(weights, config, device, dtype)
+    }
+    
+    /// Create Gemma3 model with specific configuration
+    pub fn from_weights_gemma3(
+        weights: &HashMap<String, Tensor>,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        let mut config = Self::detect_config_from_weights(weights)?;
         
-        // Delegate directly to Llama since Gemma is architecturally identical
-        use super::llama::LlamaModel;
-        LlamaModel::from_weights(weights, device, dtype)
-            .map(|llama| {
-                // Create a wrapper that will delegate to Llama
-                // But for simplicity, we'll just re-export the Llama model as Gemma
-                // This is a temporary fix - TODO: Implement proper Gemma-specific handling
+        // Override with Gemma3-specific settings
+        config.hidden_activation = "gelu_pytorch_tanh".to_string();
+        config.query_pre_attn_scalar = Some(256.0);
+        config.sliding_window = Some(512);
+        config.rope_theta = 1000000.0;  // Global attention theta
+        config.rope_local_base_freq = 10000.0;  // Local attention theta
+        
+        tracing::info!("Loading Gemma3 with:");
+        tracing::info!("  - GELU PyTorch tanh activation");
+        tracing::info!("  - Sliding window attention (512 tokens)");
+        tracing::info!("  - QK-norm with scalar {}", config.query_pre_attn_scalar.unwrap());
+        tracing::info!("  - RoPE theta: global={}, local={}", config.rope_theta, config.rope_local_base_freq);
+        
+        Self::from_weights_with_config(weights, config, device, dtype)
+    }
+    
+    fn from_weights_with_config(
+        weights: &HashMap<String, Tensor>,
+        config: GemmaConfig,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        // Extract embeddings
+        let embed_tokens = weights.get("model.embed_tokens.weight")
+            .or_else(|| weights.get("embed_tokens.weight"))
+            .cloned();
+        
+        // Gemma uses weight tying - lm_head shares weights with embed_tokens
+        let lm_head = weights.get("lm_head.weight")
+            .or_else(|| weights.get("model.lm_head.weight"))
+            .map(|w| w.transpose(0, 1).and_then(|t| t.contiguous()))
+            .transpose()?;
+        
+        if lm_head.is_none() && embed_tokens.is_some() {
+            tracing::info!("Gemma model uses weight tying (lm_head = embed_tokens.T)");
+        }
+        
+        // Extract final layer norm
+        let norm = weights.get("model.norm.weight")
+            .or_else(|| weights.get("norm.weight"))
+            .map(|w| RMSNorm {
+                weight: w.clone(),
+                eps: config.rms_norm_eps,
+            });
+        
+        // Build transformer layers
+        let mut layers = Vec::new();
+        for layer_idx in 0..config.num_hidden_layers {
+            if let Some(layer) = Self::build_layer(layer_idx, weights, &config, device)? {
+                layers.push(layer);
+            }
+        }
+        
+        Ok(Self {
+            config,
+            device: device.clone(),
+            dtype,
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+        })
+    }
+    
+    fn detect_config_from_weights(weights: &HashMap<String, Tensor>) -> Result<GemmaConfig> {
+        let mut config = GemmaConfig::default();
+        
+        // Get vocab size from embedding
+        if let Some(embed) = weights.get("model.embed_tokens.weight")
+            .or_else(|| weights.get("embed_tokens.weight")) {
+            let shape = embed.dims();
+            if shape.len() >= 2 {
+                config.vocab_size = shape[0];
+                config.hidden_size = shape[1];
+            }
+        }
+        
+        // Count layers
+        let layer_count = weights.keys()
+            .filter(|k| k.contains("layers.") && k.contains(".input_layernorm.weight"))
+            .count();
+        config.num_hidden_layers = layer_count;
+        
+        // Detect attention config from q_proj shape
+        if let Some(q_proj) = weights.get("model.layers.0.self_attn.q_proj.weight") {
+            let q_shape = q_proj.dims();
+            if q_shape.len() >= 2 {
+                let q_proj_out_dim = q_shape[0];  // PyTorch format [out, in]
                 
-                // Actually, we can't easily convert here. Let's just fail over to Llama
-                tracing::warn!("Gemma model loaded as Llama architecture (architecturally compatible)");
-                
-                // Return a stub for now - the real fix is to modify ModelFactory
-                Self {
-                    config: GemmaConfig::default(),
-                    device: device.clone(),
-                    dtype,
-                    embed_tokens: None,
-                    layers: Vec::new(),
-                    norm: None,
-                    lm_head: None,
+                // Detect Gemma3 with 4 heads x 256 dim = 1024
+                if config.vocab_size == 262144 && q_proj_out_dim == 1024 {
+                    config.num_attention_heads = 4;
+                    config.head_dim = 256;
+                    config.num_key_value_heads = 1;  // Gemma3 uses 1 KV head
+                } else {
+                    // Try to infer from dimensions
+                    config.head_dim = if q_proj_out_dim % 256 == 0 { 256 } else { 128 };
+                    config.num_attention_heads = q_proj_out_dim / config.head_dim;
+                    
+                    // Check K proj for KV heads
+                    if let Some(k_proj) = weights.get("model.layers.0.self_attn.k_proj.weight") {
+                        let k_proj_out = k_proj.dims()[0];
+                        config.num_key_value_heads = k_proj_out / config.head_dim;
+                    }
                 }
-            })
+            }
+        }
+        
+        // Get intermediate size from gate_proj
+        if let Some(gate_proj) = weights.get("model.layers.0.mlp.gate_proj.weight") {
+            config.intermediate_size = gate_proj.dims()[0];
+        }
+        
+        Ok(config)
     }
     
-    /// Extract configuration from metadata (deprecated)
-    fn extract_config(metadata: &HashMap<String, String>) -> Result<GemmaConfig> {
-        Ok(GemmaConfig {
-            num_attention_heads: metadata.get("gemma.attention.head_count")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(16),
-            num_key_value_heads: metadata.get("gemma.attention.head_count_kv")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(4),
-            hidden_size: metadata.get("gemma.embedding_length")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(3072),
-            head_dim: metadata.get("gemma.rope.dimension_count")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(256),
-            intermediate_size: metadata.get("gemma.feed_forward_length")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(24576),
-            max_position_embeddings: metadata.get("gemma.context_length")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8192),
-            rms_norm_eps: metadata.get("gemma.attention.layer_norm_rms_epsilon")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1e-6),
-            vocab_size: metadata.get("tokenizer.ggml.model.vocab_size")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(256000),
-            num_hidden_layers: metadata.get("gemma.block_count")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(28),
-            rope_theta: metadata.get("gemma.rope.freq_base")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10000.0),
-        })
+    fn build_layer(
+        layer_idx: usize,
+        weights: &HashMap<String, Tensor>,
+        config: &GemmaConfig,
+        device: &Device,
+    ) -> Result<Option<GemmaLayer>> {
+        let prefix = format!("model.layers.{}", layer_idx);
+        
+        // Check if layer exists
+        if !weights.contains_key(&format!("{}.self_attn.q_proj.weight", prefix)) {
+            return Ok(None);
+        }
+        
+        // Get attention weights and transpose from PyTorch format
+        let q_proj = weights.get(&format!("{}.self_attn.q_proj.weight", prefix))
+            .ok_or_else(|| anyhow!("Missing q_proj weight"))?
+            .transpose(0, 1)?.contiguous()?;
+        let k_proj = weights.get(&format!("{}.self_attn.k_proj.weight", prefix))
+            .ok_or_else(|| anyhow!("Missing k_proj weight"))?
+            .transpose(0, 1)?.contiguous()?;
+        let v_proj = weights.get(&format!("{}.self_attn.v_proj.weight", prefix))
+            .ok_or_else(|| anyhow!("Missing v_proj weight"))?
+            .transpose(0, 1)?.contiguous()?;
+        let o_proj = weights.get(&format!("{}.self_attn.o_proj.weight", prefix))
+            .ok_or_else(|| anyhow!("Missing o_proj weight"))?
+            .transpose(0, 1)?.contiguous()?;
+        
+        // Check for QK-norm weights (Gemma3)
+        let q_norm = weights.get(&format!("{}.self_attn.q_norm.weight", prefix))
+            .cloned();
+        let k_norm = weights.get(&format!("{}.self_attn.k_norm.weight", prefix))
+            .cloned();
+        
+        // Determine layer type for sliding window (Gemma3)
+        let layer_type = if config.sliding_window.is_some() {
+            // Every 6th layer is global, others are local
+            if (layer_idx + 1) % 6 == 0 {
+                "global".to_string()
+            } else {
+                "local".to_string()
+            }
+        } else {
+            "global".to_string()
+        };
+        
+        // Use different RoPE theta for local vs global
+        let rope_theta = if layer_type == "local" {
+            config.rope_local_base_freq
+        } else {
+            config.rope_theta
+        };
+        
+        let sliding_window = if layer_type == "local" {
+            config.sliding_window
+        } else {
+            None
+        };
+        
+        let self_attn = GemmaAttention {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            num_heads: config.num_attention_heads,
+            num_kv_heads: config.num_key_value_heads,
+            head_dim: config.head_dim,
+            rope_theta,
+            q_norm,
+            k_norm,
+            query_pre_attn_scalar: config.query_pre_attn_scalar,
+            sliding_window,
+            layer_type,
+        };
+        
+        // Build MLP
+        let mlp = GemmaMLP {
+            gate_proj: weights.get(&format!("{}.mlp.gate_proj.weight", prefix))
+                .ok_or_else(|| anyhow!("Missing gate_proj weight"))?
+                .transpose(0, 1)?.contiguous()?,
+            up_proj: weights.get(&format!("{}.mlp.up_proj.weight", prefix))
+                .ok_or_else(|| anyhow!("Missing up_proj weight"))?
+                .transpose(0, 1)?.contiguous()?,
+            down_proj: weights.get(&format!("{}.mlp.down_proj.weight", prefix))
+                .ok_or_else(|| anyhow!("Missing down_proj weight"))?
+                .transpose(0, 1)?.contiguous()?,
+            activation: config.hidden_activation.clone(),
+        };
+        
+        // Build layer norms
+        let input_layernorm = RMSNorm {
+            weight: weights.get(&format!("{}.input_layernorm.weight", prefix))
+                .ok_or_else(|| anyhow!("Missing input_layernorm weight"))?.clone(),
+            eps: config.rms_norm_eps,
+        };
+        
+        let post_attention_layernorm = RMSNorm {
+            weight: weights.get(&format!("{}.post_attention_layernorm.weight", prefix))
+                .ok_or_else(|| anyhow!("Missing post_attention_layernorm weight"))?.clone(),
+            eps: config.rms_norm_eps,
+        };
+        
+        Ok(Some(GemmaLayer {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+        }))
     }
     
-    /// Parse configuration from JSON
-    fn parse_config(json_str: &str) -> Result<GemmaConfig> {
-        let json: serde_json::Value = serde_json::from_str(json_str)?;
+    /// Parse Gemma configuration from config.json
+    fn parse_config(config_str: &str) -> Result<GemmaConfig> {
+        let config: serde_json::Value = serde_json::from_str(config_str)?;
         
         Ok(GemmaConfig {
-            num_attention_heads: json["num_attention_heads"].as_u64().unwrap_or(16) as usize,
-            num_key_value_heads: json["num_key_value_heads"].as_u64().unwrap_or(4) as usize,
-            hidden_size: json["hidden_size"].as_u64().unwrap_or(3072) as usize,
-            head_dim: json["head_dim"].as_u64().unwrap_or(256) as usize,
-            intermediate_size: json["intermediate_size"].as_u64().unwrap_or(24576) as usize,
-            max_position_embeddings: json["max_position_embeddings"].as_u64().unwrap_or(8192) as usize,
-            rms_norm_eps: json["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32,
-            vocab_size: json["vocab_size"].as_u64().unwrap_or(256000) as usize,
-            num_hidden_layers: json["num_hidden_layers"].as_u64().unwrap_or(28) as usize,
-            rope_theta: json["rope_base"].as_f64().unwrap_or(10000.0) as f32,
+            num_attention_heads: config.get("num_attention_heads")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(4) as usize,
+            num_key_value_heads: config.get("num_key_value_heads")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as usize,
+            hidden_size: config.get("hidden_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(640) as usize,
+            head_dim: config.get("head_dim")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(256) as usize,
+            intermediate_size: config.get("intermediate_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(2048) as usize,
+            max_position_embeddings: config.get("max_position_embeddings")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(32768) as usize,
+            rms_norm_eps: config.get("rms_norm_eps")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1e-6) as f32,
+            vocab_size: config.get("vocab_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(262144) as usize,
+            num_hidden_layers: config.get("num_hidden_layers")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(18) as usize,
+            rope_theta: config.get("rope_theta")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1000000.0) as f32,
+            rope_local_base_freq: config.get("rope_local_base_freq")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(10000.0) as f32,
+            sliding_window: config.get("sliding_window")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize),
+            layer_types: config.get("layer_types")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect())
+                .unwrap_or_default(),
+            query_pre_attn_scalar: config.get("query_pre_attn_scalar")
+                .and_then(|v| v.as_f64())
+                .map(|v| v as f32),
+            hidden_activation: config.get("hidden_activation")
+                .and_then(|v| v.as_str())
+                .unwrap_or("silu")
+                .to_string(),
         })
     }
+    
 }
 
 impl ModelOperations for GemmaModel {
@@ -410,7 +832,17 @@ impl ModelOperations for GemmaModel {
             let hidden_size = emb_dims[emb_dims.len() - 1]; // Last dimension is hidden size
             
             // Reshape back to [batch_size, seq_len, hidden_size]
-            embeddings.reshape(&[batch_size, seq_len, hidden_size])?
+            let mut embeddings = embeddings.reshape(&[batch_size, seq_len, hidden_size])?;
+            
+            // Apply embedding scaling for Gemma3 (scale by sqrt(hidden_size))
+            if self.config.query_pre_attn_scalar.is_some() {
+                let scale = (hidden_size as f32).sqrt();
+                let scale_tensor = Tensor::new(&[scale], embeddings.device())?;
+                embeddings = embeddings.broadcast_mul(&scale_tensor)?;
+                tracing::debug!("Applied Gemma3 embedding scaling by sqrt({})", hidden_size);
+            }
+            
+            embeddings
         } else {
             // If no embedding layer, assume input is already embedded
             input.clone()
@@ -437,9 +869,29 @@ impl ModelOperations for GemmaModel {
             hidden_states = norm.forward(&hidden_states)?;
         }
         
-        // LM head
+        // LM head - handle weight tying for Gemma
         if let Some(lm_head) = &self.lm_head {
+            // Use explicit lm_head if available
             hidden_states = hidden_states.matmul(lm_head)?;
+        } else if let Some(embed) = &self.embed_tokens {
+            // Gemma uses weight tying: lm_head = embed_tokens.T
+            // Get dimensions for proper reshaping
+            let (batch_size, seq_len, hidden_size) = hidden_states.dims3()?;
+            
+            // Reshape to 2D for matmul
+            let hidden_2d = hidden_states.reshape(&[batch_size * seq_len, hidden_size])?;
+            
+            // Transpose embedding matrix for output projection
+            let lm_head = embed.transpose(0, 1)?;
+            
+            // Apply projection
+            let logits = hidden_2d.matmul(&lm_head)?;
+            
+            // Get vocab size from result
+            let vocab_size = logits.dims()[1];
+            
+            // Reshape back to 3D
+            hidden_states = logits.reshape(&[batch_size, seq_len, vocab_size])?;
         }
         
         Ok(hidden_states)

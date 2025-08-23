@@ -16,7 +16,6 @@ pub mod lora_registry;
 pub mod model_management;
 pub mod model_registry;
 pub mod model_storage;
-// Removed: safetensors_models - functionality merged into model_downloader
 pub mod model_downloader;
 pub mod huggingface;
 pub mod openai_compat;
@@ -41,6 +40,26 @@ pub struct ApiState {
     
     /// Active endpoints mapping
     endpoints: Arc<RwLock<HashMap<String, LoRAEndpoint>>>,
+}
+
+impl ApiState {
+    /// Get model information with architecture configuration
+    /// This should eventually integrate with the model registry to get actual model configs
+    async fn get_model_info(&self, model_name: &str) -> Result<ModelArchitectureInfo, String> {
+        // For now, return an error to force proper implementation
+        // This ensures we don't create LoRA adapters without proper model configuration
+        Err(format!(
+            "Model configuration lookup not implemented. Please ensure model '{}' is registered in the model registry with proper architecture configuration.",
+            model_name
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ModelArchitectureInfo {
+    hidden_size: usize,
+    vocab_size: usize,
+    architecture: crate::runtime::architectures::ModelArchitecture,
 }
 
 /// LoRA endpoint configuration
@@ -149,6 +168,10 @@ async fn create_lora_layer(
 ) -> Result<JsonResponse<CreateLoRAResponse>, StatusCode> {
     let lora_id = LoRAId::new();
     
+    // Get model info from model registry first
+    let model_info = state.get_model_info(&request.base_model).await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    
     // Create the LoRA layer in the registry
     let layer = LoRALayer {
         id: lora_id.clone(),
@@ -166,13 +189,15 @@ async fn create_lora_layer(
     state.lora_registry.register(layer.clone()).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     
-    // Create sparse adapter in VDB storage
+    // Create sparse adapter configuration using model registry information
     let adapter_config = crate::adapters::sparse_lora::SparseLoRAConfig {
-        in_features: 1536, // TODO: get from model config
-        out_features: 1536, // TODO: get from model config
+        in_features: model_info.hidden_size,
+        out_features: model_info.hidden_size,
         rank: request.config.rank,
         sparsity: request.config.sparsity_ratio,
-        learning_rate: 1e-4, // TODO: get from request
+        learning_rate: request.training_config.as_ref()
+            .map(|tc| tc.learning_rate)
+            .unwrap_or(1e-4),
         dropout: request.config.dropout,
         alpha: request.config.alpha,
         bias: false,
@@ -295,31 +320,31 @@ async fn delete_lora_layer(
 /// OpenAI-compatible chat completions endpoint
 async fn openai_chat_completions(
     State(_state): State<ApiState>,
-    Path(_lora_id): Path<String>,
+    Path(lora_id): Path<String>,
     Json(_request): Json<openai_compat::ChatCompletionRequest>,
 ) -> Result<JsonResponse<openai_compat::ChatCompletionResponse>, StatusCode> {
-    // TODO: Implement full OpenAI chat completions when LoRA weight loading is ready
-    Err(StatusCode::SERVICE_UNAVAILABLE)
+    tracing::error!("Chat completions not implemented for LoRA {}", lora_id);
+    Err(StatusCode::NOT_IMPLEMENTED)
 }
 
 /// OpenAI-compatible completions endpoint
 async fn openai_completions(
     State(_state): State<ApiState>,
-    Path(_lora_id): Path<String>,
+    Path(lora_id): Path<String>,
     Json(_request): Json<openai_compat::CompletionRequest>,
 ) -> Result<JsonResponse<openai_compat::CompletionResponse>, StatusCode> {
-    // TODO: Implement full OpenAI completions when LoRA weight loading is ready
-    Err(StatusCode::SERVICE_UNAVAILABLE)
+    tracing::error!("Text completions not implemented for LoRA {}", lora_id);
+    Err(StatusCode::NOT_IMPLEMENTED)
 }
 
 /// OpenAI-compatible embeddings endpoint
 async fn openai_embeddings(
     State(_state): State<ApiState>,
-    Path(_lora_id): Path<String>,
+    Path(lora_id): Path<String>,
     Json(_request): Json<openai_compat::EmbeddingRequest>,
 ) -> Result<JsonResponse<openai_compat::EmbeddingResponse>, StatusCode> {
-    // TODO: Implement embeddings generation when LoRA weight loading is ready
-    Err(StatusCode::SERVICE_UNAVAILABLE)
+    tracing::error!("Embeddings not implemented for LoRA {}", lora_id);
+    Err(StatusCode::NOT_IMPLEMENTED)
 }
 
 /// List models (OpenAI-compatible)
@@ -439,6 +464,7 @@ pub struct LoRAStats {
     pub memory_usage_mb: u64,
     pub compression_ratio: f32,
 }
+
 
 fn format_chat_messages(messages: &[openai_compat::ChatMessage]) -> String {
     messages.iter()

@@ -258,29 +258,3 @@ impl VDBMetricsStorage for VDBMetricsStorageImpl {
     }
 }
 
-/// Legacy compatibility trait (deprecated - use VDBMetricsStorage instead)
-#[deprecated(note = "Use VDBMetricsStorage for VDB-first architecture")]
-#[async_trait::async_trait]
-pub trait MetricsStorage: Send + Sync + 'static {
-    async fn init(&self) -> Result<(), Status> {
-        Ok(())
-    }
-
-    async fn insert_metrics(&self, _metrics: Vec<MetricRecord>) -> Result<(), Status> {
-        Err(Status::unimplemented("Legacy metrics storage deprecated. Use VDBMetricsStorage."))
-    }
-
-    async fn query_metrics(&self, _from_timestamp: i64) -> Result<Vec<MetricRecord>, Status> {
-        Err(Status::unimplemented("Legacy metrics storage deprecated. Use VDBMetricsStorage."))
-    }
-
-    async fn aggregate_metrics(
-        &self,
-        _function: AggregateFunction,
-        _group_by: &GroupBy,
-        _from_timestamp: i64,
-        _to_timestamp: Option<i64>,
-    ) -> Result<Vec<AggregateResult>, Status> {
-        Err(Status::unimplemented("Legacy metrics storage deprecated. Use VDBMetricsStorage."))
-    }
-}

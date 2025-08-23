@@ -9,7 +9,7 @@ use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// Sampling configuration for text generation
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SamplingConfig {
     /// Temperature for sampling (higher = more random)
     pub temperature: f32,
@@ -236,6 +236,12 @@ impl TokenSampler {
     
     /// Sample next token from logits
     pub fn sample(&mut self, logits: &Tensor) -> Result<u32> {
+        // Debug: Check logits statistics
+        if let Ok(logits_vec) = logits.to_vec1::<f32>() {
+            let max = logits_vec.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
+            let min = logits_vec.iter().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
+            eprintln!("DEBUG: Logits shape: {:?}, min={:.3}, max={:.3}", logits.dims(), min, max);
+        }
         // Apply repetition penalty if needed
         let logits = if self.config.repetition_penalty != 1.0 && !self.token_history.is_empty() {
             self.apply_repetition_penalty(logits)?
@@ -246,6 +252,7 @@ impl TokenSampler {
         // If not sampling, use greedy decoding
         if !self.config.do_sample {
             let token = logits.argmax(0)?.to_scalar::<u32>()?;
+            eprintln!("DEBUG: Using greedy decoding, selected token {}", token);
             self.token_history.push(token);
             return Ok(token);
         }

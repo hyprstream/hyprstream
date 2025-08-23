@@ -176,44 +176,42 @@ impl ModelFactory {
                 Ok(Box::new(model))
             }
             ModelArchitecture::Gemma => {
-                // Gemma is architecturally similar to Llama, use Llama implementation
-                // TODO: Implement Gemma-specific features (GeGLU activation, etc.)
-                tracing::info!("Loading Gemma model using Llama architecture (compatible)");
-                let model = LlamaModel::from_weights(weights, device, dtype)?;
-                Ok(Box::new(model))
+                // Check if this is Gemma3 by looking for specific config indicators
+                let is_gemma3 = weights.keys().any(|k| k.contains("model.layers.0.mlp.gate_proj"))
+                    && weights.get("model.embed_tokens.weight")
+                        .map(|w| w.dims()[0] == 262144) // Gemma3 has 262k vocab
+                        .unwrap_or(false);
+                
+                if is_gemma3 {
+                    tracing::info!("Loading Gemma3 model with GELU PyTorch tanh activation");
+                    // Use GemmaModel with Gemma3-specific config
+                    let model = GemmaModel::from_weights_gemma3(weights, device, dtype)?;
+                    Ok(Box::new(model))
+                } else {
+                    tracing::info!("Loading Gemma model");
+                    let model = GemmaModel::from_weights(weights, device, dtype)?;
+                    Ok(Box::new(model))
+                }
             }
             ModelArchitecture::Phi { .. } => {
-                // Phi is similar to Llama but with different layer norm
-                // For now, use Llama as fallback
-                tracing::warn!("Phi architecture not fully implemented, using Llama fallback");
-                let model = LlamaModel::from_weights(weights, device, dtype)?;
-                Ok(Box::new(model))
+                Err(anyhow!(
+                    "Phi architecture not yet supported. Supported architectures: Llama, Gemma, Qwen"
+                ))
             }
             ModelArchitecture::GPTOSS { .. } => {
-                // GPT-OSS would need MoE support
-                tracing::warn!("GPT-OSS MoE not implemented, using Llama fallback");
-                let model = LlamaModel::from_weights(weights, device, dtype)?;
-                Ok(Box::new(model))
+                Err(anyhow!(
+                    "GPT-OSS architecture not yet supported. Supported architectures: Llama, Gemma, Qwen"
+                ))
             }
             _ => {
-                tracing::warn!(
-                    "Architecture {} not yet implemented, using Llama fallback",
+                Err(anyhow!(
+                    "Architecture {} not supported. Supported architectures: Llama, Gemma, Qwen",
                     architecture.name()
-                );
-                let model = LlamaModel::from_weights(weights, device, dtype)?;
-                Ok(Box::new(model))
+                ))
             }
         }
     }
     
-    /// Load a model from file (deprecated - use SafeTensors)
-    pub async fn from_file(
-        path: &Path,
-        device: &Device,
-        dtype: DType,
-    ) -> Result<Box<dyn ModelOperations>> {
-        Err(anyhow!("Model format not supported. Please use SafeTensors format."))
-    }
     
     /// Load a model from SafeTensors file
     pub async fn from_safetensors(

@@ -91,6 +91,8 @@ pub struct CandleEngine {
     pub active_lora: Option<Arc<SparseLoRAAdapter>>,
     /// Sampling configuration for token generation
     pub sampling_config: SamplingConfig,
+    /// Detected model architecture
+    detected_architecture: Option<ModelArchitecture>,
 }
 
 impl CandleEngine {
@@ -134,6 +136,7 @@ impl CandleEngine {
             base_model_weights: None,
             active_lora: None,
             sampling_config: SamplingConfig::default(),
+            detected_architecture: None,
         })
     }
     
@@ -163,6 +166,7 @@ impl CandleEngine {
             base_model_weights: None,
             active_lora: None,
             sampling_config: SamplingConfig::default(),
+            detected_architecture: None,
         })
     }
     
@@ -180,11 +184,25 @@ impl CandleEngine {
         // Try to load config.json from the parent directory
         let parent_dir = path.parent().unwrap_or(Path::new("."));
         let config_path = parent_dir.join("config.json");
-        let (context_length, vocab_size, architecture) = if config_path.exists() {
+        let (context_length, vocab_size, mut architecture) = if config_path.exists() {
             self.parse_config_json(&config_path)?
         } else {
             (4096, 32000, detected_arch.name())
         };
+        
+        // Override architecture for Gemma models based on config
+        if architecture.contains("Gemma") || architecture.contains("gemma") {
+            // Check if it's Gemma3 specifically
+            if architecture.contains("Gemma3") || architecture.contains("gemma3") {
+                architecture = "Gemma3".to_string();
+                self.detected_architecture = Some(ModelArchitecture::Gemma);
+                tracing::info!("Detected Gemma3 model from config, using Gemma architecture with Gemma3 specifics");
+            } else {
+                architecture = "Gemma".to_string();
+                self.detected_architecture = Some(ModelArchitecture::Gemma);
+                tracing::info!("Detected Gemma model from config, overriding architecture");
+            }
+        }
         
         // Create model info
         self.model_info = Some(ModelInfo {
@@ -338,11 +356,14 @@ impl CandleEngine {
             .unwrap_or("unknown")
             .to_string();
         
-        // Load sampling configuration from model card
-        let model_id = config.get("_name_or_path")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&architecture);
-        self.sampling_config = SamplingConfig::from_model_card(model_id, &config);
+        // Load sampling configuration from model card only if it hasn't been customized
+        // This preserves any configuration set by the CLI
+        if self.sampling_config == SamplingConfig::default() {
+            let model_id = config.get("_name_or_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&architecture);
+            self.sampling_config = SamplingConfig::from_model_card(model_id, &config);
+        }
         
         Ok((context_length, vocab_size, architecture))
     }
@@ -848,6 +869,14 @@ impl CandleEngine {
                 
                 // Create a token sampler with current configuration
                 let mut sampler = TokenSampler::new(self.sampling_config.clone());
+                
+                // Debug: Log sampling configuration
+                eprintln!("DEBUG: Sampling config - temp={}, top_k={:?}, top_p={:?}, do_sample={}", 
+                         self.sampling_config.temperature,
+                         self.sampling_config.top_k,
+                         self.sampling_config.top_p,
+                         self.sampling_config.do_sample);
+                
                 sampler.add_to_history(context);
                 let next_token = sampler.sample(&last_logits)?;
                 
@@ -935,8 +964,10 @@ impl CandleEngine {
     
     /// Create architecture model from SafeTensors weights
     async fn create_arch_model_from_safetensors(&mut self, weights: &HashMap<String, Tensor>) -> Result<()> {
-        // Detect architecture from tensor names
-        let detected_arch = self.detect_architecture_from_tensors(weights);
+        // Use the already detected architecture (from config or tensor names)
+        let detected_arch = self.detected_architecture
+            .clone()
+            .unwrap_or_else(|| self.detect_architecture_from_tensors(weights));
         let arch_name = detected_arch.name();
         tracing::info!("Creating {} model from SafeTensors weights", arch_name);
         

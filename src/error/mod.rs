@@ -58,5 +58,3 @@ impl From<VDBErrorWrapper> for tonic::Status {
         }
     }
 }
-
-// DataFusion error conversion removed - no longer using datafusion

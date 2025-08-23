@@ -35,6 +35,18 @@ pub struct LlamaConfig {
     pub rope_theta: f32,
     /// RoPE scaling (for Llama 3)
     pub rope_scaling: Option<RopeScaling>,
+    /// Hidden activation function (silu for Llama, gelu_pytorch_tanh for Gemma3)
+    pub hidden_activation: String,
+    /// Query pre-attention scalar for QK-norm (Gemma3)
+    pub query_pre_attn_scalar: Option<f32>,
+    /// Use QK-norm (Gemma3)
+    pub use_qk_norm: bool,
+    /// Scale embeddings by sqrt(hidden_size) (Gemma3)
+    pub scale_embeddings: bool,
+    /// Layer types for sliding window attention (Gemma3)
+    pub layer_types: Vec<String>,
+    /// RoPE theta for local attention layers (Gemma3)
+    pub rope_local_base_freq: Option<f32>,
 }
 
 /// RoPE scaling configuration (Llama 3)
@@ -60,6 +72,12 @@ impl Default for LlamaConfig {
             num_hidden_layers: 32,
             rope_theta: 10000.0,
             rope_scaling: None,
+            hidden_activation: "silu".to_string(),
+            query_pre_attn_scalar: None,
+            use_qk_norm: false,
+            scale_embeddings: false,
+            layer_types: vec![],
+            rope_local_base_freq: None,
         }
     }
 }
@@ -83,6 +101,12 @@ impl LlamaConfig {
                 scaling_type: "linear".to_string(),
                 factor: 8.0,
             }),
+            hidden_activation: "silu".to_string(),
+            query_pre_attn_scalar: None,
+            use_qk_norm: false,
+            scale_embeddings: false,
+            layer_types: vec![],
+            rope_local_base_freq: None,
         }
     }
 
@@ -104,6 +128,12 @@ impl LlamaConfig {
                 scaling_type: "linear".to_string(),
                 factor: 8.0,
             }),
+            hidden_activation: "silu".to_string(),
+            query_pre_attn_scalar: None,
+            use_qk_norm: false,
+            scale_embeddings: false,
+            layer_types: vec![],
+            rope_local_base_freq: None,
         }
     }
 }
@@ -186,6 +216,14 @@ struct LlamaAttention {
     head_dim: usize,
     rope_theta: f32,
     rope_scaling: Option<RopeScaling>,
+    // QK-norm weights (Gemma3)
+    q_norm: Option<Tensor>,
+    k_norm: Option<Tensor>,
+    query_pre_attn_scalar: Option<f32>,
+    // Sliding window attention (Gemma3)
+    sliding_window: Option<usize>,
+    layer_type: String,  // "local" or "global" for Gemma3
+    layer_idx: usize,
 }
 
 impl LlamaAttention {
@@ -243,10 +281,18 @@ impl LlamaAttention {
         
         // Reshape for attention
         // Q: [batch, seq, num_heads, head_dim]
-        let q = q.reshape(&[batch_size, seq_len, self.num_heads, self.head_dim])?;
+        let mut q = q.reshape(&[batch_size, seq_len, self.num_heads, self.head_dim])?;
         // K, V: [batch, seq, num_kv_heads, head_dim] - use actual kv_heads
-        let k = k.reshape(&[batch_size, seq_len, kv_heads, self.head_dim])?;
+        let mut k = k.reshape(&[batch_size, seq_len, kv_heads, self.head_dim])?;
         let v = v.reshape(&[batch_size, seq_len, kv_heads, self.head_dim])?;
+        
+        // Apply QK-norm if configured (Gemma3)
+        if let Some(q_norm) = &self.q_norm {
+            q = self.apply_qk_norm(&q, q_norm, self.num_heads)?;
+        }
+        if let Some(k_norm) = &self.k_norm {
+            k = self.apply_qk_norm(&k, k_norm, kv_heads)?;
+        }
         
         // Apply RoPE if position_ids provided
         let (q, k) = if let Some(pos_ids) = position_ids {
@@ -332,10 +378,105 @@ impl LlamaAttention {
     
     /// Apply Rotary Position Embeddings with optional scaling
     fn apply_rope(&self, tensor: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
-        // Simplified RoPE implementation
-        // In production, implement proper RoPE with sin/cos caching
-        // and Llama 3 scaling if configured
-        Ok(tensor.clone())  // Placeholder
+        // tensor shape: [batch, seq, heads, dim]
+        let (_batch_size, seq_len, _num_heads, head_dim) = tensor.dims4()?;
+        
+        // Generate position embeddings
+        let theta = self.rope_theta;
+        let device = tensor.device();
+        let dtype = tensor.dtype();
+        
+        // Create frequency bands (exponentially decreasing)
+        let inv_freq = (0..head_dim / 2)
+            .map(|i| 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32))
+            .collect::<Vec<_>>();
+        
+        // Create position indices [0, 1, 2, ..., seq_len-1]
+        let positions = Tensor::arange(0u32, seq_len as u32, device)?
+            .to_dtype(DType::F32)?;
+        
+        // Compute sinusoidal embeddings
+        let mut sin_vals = Vec::new();
+        let mut cos_vals = Vec::new();
+        
+        for i in 0..seq_len {
+            for j in 0..head_dim / 2 {
+                let angle = (i as f32) * inv_freq[j];
+                sin_vals.push(angle.sin());
+                cos_vals.push(angle.cos());
+            }
+        }
+        
+        // Create sin and cos tensors [seq_len, head_dim/2]
+        let sin = Tensor::from_vec(sin_vals, &[seq_len, head_dim / 2], device)?
+            .to_dtype(dtype)?;
+        let cos = Tensor::from_vec(cos_vals, &[seq_len, head_dim / 2], device)?
+            .to_dtype(dtype)?;
+        
+        // Apply rotary embeddings
+        // Split tensor into first half and second half along head_dim
+        let x1 = tensor.narrow(D::Minus1, 0, head_dim / 2)?;
+        let x2 = tensor.narrow(D::Minus1, head_dim / 2, head_dim / 2)?;
+        
+        // Expand sin/cos to match tensor shape [1, seq, 1, head_dim/2]
+        let sin = sin.unsqueeze(0)?.unsqueeze(2)?;
+        let cos = cos.unsqueeze(0)?.unsqueeze(2)?;
+        
+        // Apply rotation: x' = x * cos - rotate(x) * sin
+        // For complex rotation: (x1 + ix2) * (cos + isin) = (x1*cos - x2*sin) + i(x1*sin + x2*cos)
+        let rotated_x1 = x1.broadcast_mul(&cos)?.broadcast_sub(&x2.broadcast_mul(&sin)?)?;
+        let rotated_x2 = x1.broadcast_mul(&sin)?.broadcast_add(&x2.broadcast_mul(&cos)?)?;
+        
+        // Concatenate back together
+        Ok(Tensor::cat(&[rotated_x1, rotated_x2], D::Minus1)?)
+    }
+    
+    /// Apply QK-norm (Gemma3)
+    fn apply_qk_norm(&self, tensor: &Tensor, norm_weight: &Tensor, actual_heads: usize) -> Result<Tensor> {
+        // QK-norm normalizes each head separately
+        // tensor shape: [batch, seq, heads, dim]
+        // norm_weight shape: [heads * dim] where heads could be Q heads or KV heads
+        let (_batch_size, _seq_len, tensor_heads, head_dim) = tensor.dims4()?;
+        
+        // Debug logging
+        tracing::debug!("apply_qk_norm: tensor heads={}, head_dim={}, actual_heads={}, norm_weight shape={:?}", 
+                       tensor_heads, head_dim, actual_heads, norm_weight.dims());
+        
+        // First, reshape the norm weights to match [1, 1, heads, dim]
+        // The norm weights are typically stored as a flat vector [heads * dim]
+        let norm_weight_reshaped = if norm_weight.dims().len() == 1 {
+            let norm_elements = norm_weight.dims()[0];
+            // For Gemma3, norm weights are per-head
+            // If norm has 256 elements and we have 1 KV head with 256 dim, reshape to [1, 256]
+            // If norm has 1024 elements and we have 4 Q heads with 256 dim, reshape to [4, 256]
+            if norm_elements == actual_heads * head_dim {
+                // Standard case: reshape from [heads * dim] to [1, 1, heads, dim]
+                norm_weight
+                    .reshape(&[actual_heads, head_dim])?
+                    .unsqueeze(0)?  // Add batch dimension
+                    .unsqueeze(0)?  // Add seq dimension
+            } else if norm_elements == head_dim {
+                // Special case: norm is per-dimension only (for single head)
+                norm_weight
+                    .unsqueeze(0)?  // Add head dimension
+                    .unsqueeze(0)?  // Add batch dimension
+                    .unsqueeze(0)?  // Add seq dimension
+            } else {
+                return Err(anyhow!("QK-norm weight size {} doesn't match expected size for {} heads with dim {}", 
+                                   norm_elements, actual_heads, head_dim));
+            }
+        } else {
+            norm_weight.clone()
+        };
+        
+        // Apply RMSNorm per head
+        let x2 = tensor.sqr()?;
+        let mean = x2.mean_keepdim(D::Minus1)?;
+        let eps = 1e-6;
+        let rrms = mean.affine(1.0, eps)?.recip()?.sqrt()?;
+        
+        // Apply normalization and scale with norm weights
+        Ok(tensor.broadcast_mul(&rrms)?.broadcast_mul(&norm_weight_reshaped)?)
     }
     
     /// Compute scaled dot-product attention scores
@@ -348,10 +489,51 @@ impl LlamaAttention {
         let k = k.transpose(1, 2)?.transpose(2, 3)?;
         
         // Compute attention scores: [batch, heads, seq, seq]
-        let scores = q.matmul(&k)?.affine(scale as f64, 0.0)?;
+        let mut scores = q.matmul(&k)?.affine(scale as f64, 0.0)?;
+        
+        // Apply sliding window mask if configured (Gemma3)
+        if let Some(window_size) = self.sliding_window {
+            if self.layer_type == "local" {
+                scores = self.apply_sliding_window_mask(&scores, window_size)?;
+            }
+            // Global layers use full attention (no mask)
+        }
         
         // Apply softmax along last dimension
         Ok(candle_nn::ops::softmax_last_dim(&scores)?)
+    }
+    
+    /// Apply sliding window mask for local attention layers
+    fn apply_sliding_window_mask(&self, scores: &Tensor, window_size: usize) -> Result<Tensor> {
+        let (batch_size, num_heads, seq_len, _) = scores.dims4()?;
+        let device = scores.device();
+        let dtype = scores.dtype();
+        
+        // Create sliding window mask
+        // Each position can only attend to window_size positions before it
+        let mut mask_values = vec![0f32; seq_len * seq_len];
+        for i in 0..seq_len {
+            for j in 0..seq_len {
+                // Can attend to positions within window_size before current position
+                // and the current position itself
+                if j <= i && i - j < window_size {
+                    mask_values[i * seq_len + j] = 0.0;
+                } else {
+                    // Mask out positions outside the window with large negative value
+                    mask_values[i * seq_len + j] = -10000.0;
+                }
+            }
+        }
+        
+        // Create mask tensor and broadcast to match scores shape
+        let mask = Tensor::from_vec(mask_values, &[seq_len, seq_len], device)?
+            .to_dtype(dtype)?
+            .unsqueeze(0)?  // [1, seq, seq]
+            .unsqueeze(0)?  // [1, 1, seq, seq]
+            .expand(&[batch_size, num_heads, seq_len, seq_len])?;
+        
+        // Add mask to scores (masked positions get large negative values)
+        Ok(scores.broadcast_add(&mask)?)
     }
 }
 
@@ -360,6 +542,7 @@ struct LlamaMLP {
     gate_proj: Tensor,
     up_proj: Tensor,
     down_proj: Tensor,
+    activation: String,  // Activation function name
 }
 
 impl LlamaMLP {
@@ -376,8 +559,9 @@ impl LlamaMLP {
         // Reshape to 2D for matmul
         let hidden_2d = hidden_states.reshape(&[batch_size * seq_len, hidden_size])?;
         
-        // Llama uses SiLU activation
-        let gate = candle_nn::ops::silu(&hidden_2d.matmul(&self.gate_proj)?)?;
+        // Apply activation based on config
+        let gate_pre = hidden_2d.matmul(&self.gate_proj)?;
+        let gate = self.apply_activation(&gate_pre)?;
         let up = hidden_2d.matmul(&self.up_proj)?;
         let output = gate.mul(&up)?.matmul(&self.down_proj)?;
         
@@ -387,10 +571,61 @@ impl LlamaMLP {
     }
     
     fn forward_2d(&self, hidden_states: &Tensor) -> Result<Tensor> {
-        // Llama uses SiLU activation
-        let gate = candle_nn::ops::silu(&hidden_states.matmul(&self.gate_proj)?)?;
+        // Apply activation based on config
+        let gate_pre = hidden_states.matmul(&self.gate_proj)?;
+        let gate = self.apply_activation(&gate_pre)?;
         let up = hidden_states.matmul(&self.up_proj)?;
         Ok(gate.mul(&up)?.matmul(&self.down_proj)?)
+    }
+    
+    /// Apply the configured activation function
+    fn apply_activation(&self, x: &Tensor) -> Result<Tensor> {
+        match self.activation.as_str() {
+            "silu" => Ok(candle_nn::ops::silu(x)?),
+            "gelu_pytorch_tanh" => self.gelu_pytorch_tanh(x),
+            "gelu" => {
+                // Standard GELU approximation
+                // GELU(x) = x * Φ(x) where Φ is the CDF of standard normal
+                // Using tanh approximation: 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
+                self.gelu_pytorch_tanh(x)
+            },
+            _ => {
+                tracing::warn!("Unknown activation '{}', falling back to SiLU", self.activation);
+                Ok(candle_nn::ops::silu(x)?)
+            }
+        }
+    }
+    
+    /// GELU activation with PyTorch tanh approximation (for Gemma3)
+    /// GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
+    fn gelu_pytorch_tanh(&self, x: &Tensor) -> Result<Tensor> {
+        use std::f32::consts::PI;
+        
+        // Constants for the approximation
+        let sqrt_2_over_pi = (2.0_f32 / PI).sqrt();
+        let coeff = 0.044715_f32;
+        
+        // x^3
+        let x_cubed = x.powf(3.0)?;
+        
+        // x + 0.044715 * x^3
+        let coeff_tensor = Tensor::new(&[coeff], x.device())?;
+        let inner = (x + (x_cubed.broadcast_mul(&coeff_tensor)?))?;
+        
+        // sqrt(2/π) * (x + 0.044715 * x^3)
+        let sqrt_tensor = Tensor::new(&[sqrt_2_over_pi], x.device())?;
+        let scaled = inner.broadcast_mul(&sqrt_tensor)?;
+        
+        // tanh(sqrt(2/π) * (x + 0.044715 * x^3))
+        let tanh_result = scaled.tanh()?;
+        
+        // 1 + tanh(...)
+        let one_tensor = Tensor::new(&[1.0_f32], x.device())?;
+        let one_plus_tanh = tanh_result.broadcast_add(&one_tensor)?;
+        
+        // 0.5 * x * (1 + tanh(...))
+        let half_tensor = Tensor::new(&[0.5_f32], x.device())?;
+        Ok(x.mul(&one_plus_tanh)?.broadcast_mul(&half_tensor)?)
     }
 }
 
@@ -413,14 +648,6 @@ impl RMSNorm {
 }
 
 impl LlamaModel {
-    /// Create Llama model from file (deprecated)
-    pub fn from_file(
-        _path: &Path,
-        _device: &Device,
-        _dtype: DType,
-    ) -> Result<Self> {
-        Err(anyhow!("Model format not supported. Please use SafeTensors format."))
-    }
     
     /// Create Llama model from SafeTensors
     pub fn from_safetensors(
@@ -533,6 +760,21 @@ impl LlamaModel {
             if shape.len() >= 2 {
                 config.vocab_size = shape[0];
                 config.hidden_size = shape[1];
+                
+                // Detect Gemma3 by vocab size (262144) and set specific parameters
+                if config.vocab_size == 262144 {
+                    config.hidden_activation = "gelu_pytorch_tanh".to_string();
+                    config.use_qk_norm = true;
+                    config.scale_embeddings = true;
+                    config.query_pre_attn_scalar = Some(256.0); // Common value for Gemma3
+                    config.rope_local_base_freq = Some(10000.0);
+                    config.rope_theta = 1000000.0; // Global attention theta for Gemma3
+                    tracing::info!("Detected Gemma3 model (vocab_size=262144), configuring with:");
+                    tracing::info!("  - GELU PyTorch tanh activation");
+                    tracing::info!("  - QK-norm enabled");
+                    tracing::info!("  - Embedding scaling enabled");
+                    tracing::info!("  - RoPE theta: global=1000000, local=10000");
+                }
             }
         }
         
@@ -563,11 +805,14 @@ impl LlamaModel {
                 tracing::debug!("Q projection output: {}, K projection output: {}", q_proj_out_dim, k_proj_out_dim);
                 
                 // Try common head_dim values to find the right configuration
-                // For smaller models, try smaller head dimensions first
-                let possible_head_dims = if q_proj_out_dim <= 512 {
+                // Gemma3 uses head_dim=256, so check that first for Gemma models
+                let possible_head_dims = if config.vocab_size == 262144 {
+                    // Gemma3 detected - prioritize 256 head dim
+                    vec![256, 128, 64, 32]
+                } else if q_proj_out_dim <= 512 {
                     vec![32, 64, 48, 40, 128] // Smaller models often use smaller head_dim
                 } else {
-                    vec![128, 64, 80, 96, 160]
+                    vec![128, 64, 80, 96, 160, 256]
                 };
                 
                 let mut found_config = false;
@@ -678,6 +923,44 @@ impl LlamaModel {
             (q, k, v)
         };
         
+        // Check for QK-norm weights (Gemma3)
+        let q_norm = weights.get(&format!("{}.self_attn.q_norm.weight", prefix))
+            .cloned();
+        let k_norm = weights.get(&format!("{}.self_attn.k_norm.weight", prefix))
+            .cloned();
+        
+        if q_norm.is_some() || k_norm.is_some() {
+            tracing::debug!("Layer {} has QK-norm weights", layer_idx);
+        }
+        
+        // Determine layer type for Gemma3 sliding window attention
+        let layer_type = if !config.layer_types.is_empty() && layer_idx < config.layer_types.len() {
+            config.layer_types[layer_idx].clone()
+        } else if config.layer_types.is_empty() && config.use_qk_norm {
+            // Gemma3 pattern: every 6th layer is global, others are local
+            if (layer_idx + 1) % 6 == 0 {
+                "global".to_string()
+            } else {
+                "local".to_string()
+            }
+        } else {
+            "global".to_string()  // Default to global attention
+        };
+        
+        // Determine sliding window size for Gemma3
+        let sliding_window = if config.use_qk_norm && layer_type == "local" {
+            Some(512)  // Gemma3 uses 512 token sliding window
+        } else {
+            None
+        };
+        
+        // Use different RoPE theta for local vs global layers if configured
+        let rope_theta = if layer_type == "local" && config.rope_local_base_freq.is_some() {
+            config.rope_local_base_freq.unwrap()
+        } else {
+            config.rope_theta
+        };
+        
         let self_attn = LlamaAttention {
             num_heads: config.num_attention_heads,
             num_kv_heads: config.num_key_value_heads,
@@ -690,8 +973,14 @@ impl LlamaModel {
                 .ok_or_else(|| anyhow!("Missing o_proj/c_proj weight"))?
                 .transpose(0, 1)?  // Transpose from [out, in] to [in, out]
                 .contiguous()?,
-            rope_theta: config.rope_theta,
+            rope_theta,
             rope_scaling: config.rope_scaling.clone(),
+            q_norm,
+            k_norm,
+            query_pre_attn_scalar: config.query_pre_attn_scalar,
+            sliding_window,
+            layer_type,
+            layer_idx,
         };
         
         // Build MLP
@@ -708,6 +997,7 @@ impl LlamaModel {
                 .ok_or_else(|| anyhow!("Missing down_proj weight"))?
                 .transpose(0, 1)?  // Transpose from [out, in] to [in, out]
                 .contiguous()?,
+            activation: config.hidden_activation.clone(),
         };
         
         // Build layer norms
@@ -731,70 +1021,6 @@ impl LlamaModel {
         }))
     }
     
-    /// Extract configuration from metadata (deprecated)
-    fn extract_config(metadata: &HashMap<String, String>) -> Result<LlamaConfig> {
-        // Detect Llama version
-        let version = if metadata.contains_key("llama.rope.scaling.type") {
-            3  // Llama 3 has rope scaling
-        } else if metadata.contains_key("llama.attention.head_count_kv") {
-            2  // Llama 2 has GQA
-        } else {
-            1  // Original Llama
-        };
-        
-        let mut config = LlamaConfig {
-            version,
-            num_attention_heads: metadata.get("llama.attention.head_count")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(32),
-            num_key_value_heads: metadata.get("llama.attention.head_count_kv")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or_else(|| {
-                    metadata.get("llama.attention.head_count")
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(32)
-                }),
-            hidden_size: metadata.get("llama.embedding_length")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(4096),
-            head_dim: metadata.get("llama.rope.dimension_count")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(128),
-            intermediate_size: metadata.get("llama.feed_forward_length")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(11008),
-            max_position_embeddings: metadata.get("llama.context_length")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(4096),
-            rms_norm_eps: metadata.get("llama.attention.layer_norm_rms_epsilon")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1e-5),
-            vocab_size: metadata.get("tokenizer.ggml.model.vocab_size")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(32000),
-            num_hidden_layers: metadata.get("llama.block_count")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(32),
-            rope_theta: metadata.get("llama.rope.freq_base")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10000.0),
-            rope_scaling: None,
-        };
-        
-        // Check for Llama 3 rope scaling
-        if version == 3 {
-            if let Some(scaling_type) = metadata.get("llama.rope.scaling.type") {
-                config.rope_scaling = Some(RopeScaling {
-                    scaling_type: scaling_type.clone(),
-                    factor: metadata.get("llama.rope.scaling.factor")
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(8.0),
-                });
-            }
-        }
-        
-        Ok(config)
-    }
     
     /// Parse configuration from JSON
     fn parse_config(json_str: &str) -> Result<LlamaConfig> {
@@ -818,7 +1044,22 @@ impl LlamaModel {
             hidden_size: json["hidden_size"].as_u64().unwrap_or(4096) as usize,
             head_dim: json.get("head_dim")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(128) as usize,
+                .map(|v| v as usize)
+                .unwrap_or_else(|| {
+                    // If head_dim not specified, calculate from hidden_size / num_attention_heads
+                    let heads = json.get("num_attention_heads").and_then(|v| v.as_u64()).unwrap_or(32) as usize;
+                    let hidden = json.get("hidden_size").and_then(|v| v.as_u64()).unwrap_or(4096) as usize;
+                    // Common head_dim values are 64, 128, 256
+                    if hidden % (heads * 256) == 0 {
+                        256
+                    } else if hidden % (heads * 128) == 0 {
+                        128
+                    } else if hidden % (heads * 64) == 0 {
+                        64
+                    } else {
+                        128 // Default fallback
+                    }
+                }),
             intermediate_size: json["intermediate_size"].as_u64().unwrap_or(11008) as usize,
             max_position_embeddings: json["max_position_embeddings"].as_u64().unwrap_or(4096) as usize,
             rms_norm_eps: json["rms_norm_eps"].as_f64().unwrap_or(1e-5) as f32,
@@ -828,6 +1069,17 @@ impl LlamaModel {
                 .and_then(|v| v.as_f64())
                 .unwrap_or(10000.0) as f32,
             rope_scaling: None,
+            hidden_activation: json.get("hidden_activation")
+                .and_then(|v| v.as_str())
+                .unwrap_or("silu")
+                .to_string(),
+            query_pre_attn_scalar: json.get("query_pre_attn_scalar")
+                .and_then(|v| v.as_f64())
+                .map(|v| v as f32),
+            use_qk_norm: false,  // Will be set based on vocab size or explicit config
+            scale_embeddings: false,  // Will be set based on vocab size or explicit config
+            layer_types: vec![],
+            rope_local_base_freq: None,
         };
         
         // Parse rope scaling if present
@@ -836,6 +1088,19 @@ impl LlamaModel {
                 scaling_type: rope_scaling["type"].as_str().unwrap_or("linear").to_string(),
                 factor: rope_scaling["factor"].as_f64().unwrap_or(8.0) as f32,
             });
+        }
+        
+        // Check for Gemma3 specific configurations
+        if config.vocab_size == 262144 {
+            config.hidden_activation = "gelu_pytorch_tanh".to_string();
+            config.use_qk_norm = true;
+            config.scale_embeddings = true;
+            if config.query_pre_attn_scalar.is_none() {
+                config.query_pre_attn_scalar = Some(256.0);
+            }
+            config.rope_local_base_freq = Some(10000.0);
+            config.rope_theta = 1000000.0;  // Global attention theta
+            tracing::info!("Detected Gemma3 model from config.json, applying Gemma3 settings");
         }
         
         Ok(config)
@@ -886,7 +1151,17 @@ impl ModelOperations for LlamaModel {
             tracing::debug!("Embeddings shape after lookup: {:?}, hidden_size: {}", emb_dims, hidden_size);
             
             // Reshape back to [batch_size, seq_len, hidden_size]
-            embeddings.reshape(&[batch_size, seq_len, hidden_size])?
+            let mut embeddings = embeddings.reshape(&[batch_size, seq_len, hidden_size])?;
+            
+            // Scale embeddings by sqrt(hidden_size) for Gemma3
+            if self.config.scale_embeddings {
+                let scale = (hidden_size as f32).sqrt();
+                let scale_tensor = Tensor::new(&[scale], embeddings.device())?;
+                embeddings = embeddings.broadcast_mul(&scale_tensor)?;
+                tracing::debug!("Scaled embeddings by sqrt(hidden_size) = {}", scale);
+            }
+            
+            embeddings
         } else {
             // If no embedding layer, assume input is already embedded
             input.clone()
@@ -1073,6 +1348,7 @@ mod tests {
                 scaling_type: "linear".to_string(),
                 factor: 8.0,
             }),
+            hidden_activation: "silu".to_string(),
         };
         
         // Create KV tensor with 8 heads

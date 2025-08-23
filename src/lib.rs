@@ -17,13 +17,11 @@ pub mod error;
 pub mod inference;
 pub mod metrics;
 pub mod models;
-// pub mod query; // Removed - data processing features deprecated in favor of ML inference
 pub mod runtime;
 pub mod service;
 pub mod storage;
 pub mod utils;
 
-// Query/DataFusion functionality removed - focused on ML inference only
 pub use storage::{
     VDBSparseStorage, SparseStorageConfig, SparseStorage,
     SparseWeightUpdate, EmbeddingMatch, SparseStorageError

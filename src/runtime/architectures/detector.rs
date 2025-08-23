@@ -9,16 +9,6 @@ use std::collections::HashMap;
 pub struct ArchitectureDetector;
 
 impl ArchitectureDetector {
-    /// Detect architecture from metadata (deprecated - use SafeTensors)
-    pub fn detect_from_metadata(metadata: &HashMap<String, String>) -> ModelArchitecture {
-        // First try explicit architecture field
-        if let Some(arch_str) = metadata.get("general.architecture") {
-            return Self::parse_architecture_string(arch_str);
-        }
-        
-        // Default to Llama
-        ModelArchitecture::Llama { version: 2 }
-    }
     
     /// Detect architecture from SafeTensors path (looks for config.json)
     pub fn detect_from_safetensors(path: &Path) -> Result<ModelArchitecture> {
@@ -136,105 +126,6 @@ impl ArchitectureDetector {
         }
     }
     
-    /// Detect by checking specific metadata patterns (deprecated)
-    fn detect_by_metadata_patterns(metadata: &HashMap<String, String>) -> ModelArchitecture {
-        // Gemma-specific patterns
-        if metadata.contains_key("gemma.attention.head_count_kv") ||
-           metadata.contains_key("gemma.block_count") ||
-           metadata.contains_key("gemma.context_length") {
-            return ModelArchitecture::Gemma;
-        }
-        
-        // Qwen-specific patterns
-        if metadata.contains_key("qwen.attention.layer_norm_rms_epsilon") ||
-           metadata.contains_key("qwen.rope.freq_base") ||
-           metadata.contains_key("qwen3.attention.gqa.num_groups") {
-            let version = if metadata.contains_key("qwen3.attention.gqa.num_groups") ||
-                            metadata.contains_key("qwen3.sparse_attention.enabled") {
-                3
-            } else if metadata.contains_key("qwen2.rope.dimension_count") {
-                2
-            } else {
-                1
-            };
-            
-            let is_moe = metadata.contains_key("qwen.moe.num_experts") ||
-                        metadata.contains_key("qwen3.moe.experts_per_token");
-            
-            let context_length = metadata.get("qwen.context_length")
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(if version == 3 { 128000 } else { 4096 });
-            
-            return ModelArchitecture::Qwen { version, is_moe, context_length };
-        }
-        
-        // Phi-specific patterns
-        if metadata.contains_key("phi.context_length") ||
-           metadata.contains_key("phi3.rope.dimension_count") {
-            let version = if metadata.contains_key("phi3.rope.dimension_count") {
-                3
-            } else if metadata.contains_key("phi2.context_length") {
-                2
-            } else {
-                1
-            };
-            return ModelArchitecture::Phi { version };
-        }
-        
-        // Mistral-specific patterns
-        if metadata.contains_key("mistral.context_length") ||
-           metadata.contains_key("mistral.sliding_window") {
-            return ModelArchitecture::Mistral;
-        }
-        
-        // Falcon-specific patterns
-        if metadata.contains_key("falcon.tensor_data_layout") ||
-           metadata.contains_key("falcon.attention.use_bias") {
-            return ModelArchitecture::Falcon;
-        }
-        
-        // GPT-OSS specific patterns
-        if metadata.contains_key("gptoss.moe.num_experts") ||
-           metadata.contains_key("gptoss.tensor_parallel") ||
-           metadata.contains_key("openai.moe.experts_per_token") {
-            let total_params_b = metadata.get("gptoss.total_params")
-                .and_then(|v| v.parse::<u64>().ok())
-                .map(|p| (p / 1_000_000_000) as u16)
-                .unwrap_or(120);
-            
-            let active_params_b = metadata.get("gptoss.active_params")
-                .and_then(|v| v.parse::<f32>().ok())
-                .unwrap_or(if total_params_b == 120 { 5.1 } else { 3.6 });
-            
-            return ModelArchitecture::GPTOSS {
-                total_params_b,
-                active_params_b,
-                num_experts: 128,
-                experts_per_token: 8,
-            };
-        }
-        
-        // GPT-J specific patterns
-        if metadata.contains_key("gptj.rotary_dim") ||
-           metadata.contains_key("gptj.n_positions") {
-            return ModelArchitecture::GPTJ;
-        }
-        
-        // Check for Llama version indicators
-        if metadata.contains_key("llama.rope.scaling.type") {
-            // Llama 3 has rope scaling
-            return ModelArchitecture::Llama { version: 3 };
-        } else if metadata.contains_key("llama.attention.head_count_kv") {
-            // Llama 2 with GQA
-            return ModelArchitecture::Llama { version: 2 };
-        } else if metadata.contains_key("llama.attention.head_count") {
-            // Original Llama
-            return ModelArchitecture::Llama { version: 1 };
-        }
-        
-        // Default to Llama 2
-        ModelArchitecture::Llama { version: 2 }
-    }
     
     /// Get expected tensor shapes for an architecture
     pub fn get_expected_shapes(

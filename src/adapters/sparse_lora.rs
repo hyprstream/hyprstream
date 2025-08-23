@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use serde::{Serialize, Deserialize};
+use anyhow::{Result, anyhow};
 
 /// Initialization methods for sparse LoRA adapters
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -424,10 +425,8 @@ impl SparseLoRAAdapter {
     }
     
     /// Load sparse weights from a collection (placeholder implementation)
-    pub async fn load_sparse_weights(&self, _weights: &std::collections::HashMap<crate::storage::vdb::grid::Coordinate3D, f32>) {
-        // TODO: Implement loading weights from coordinate-based structure
-        // This would involve mapping coordinates to matrix positions and updating the sparse matrices
-        println!("⚠️ load_sparse_weights not yet implemented");
+    pub async fn load_sparse_weights(&self, _weights: &std::collections::HashMap<crate::storage::vdb::grid::Coordinate3D, f32>) -> Result<()> {
+        Err(anyhow!("Sparse weight loading not yet implemented. Use initialize_random() to create new adapters."))
     }
     
     /// Get LoRA A matrix data (async accessor)

@@ -147,12 +147,3 @@ pub async fn create_conversation_router(
 }
 
 
-/// Create engine with LoRA wrapper (deprecated - use X-LoRA instead)
-#[deprecated(note = "Use CandleEngine with VDB storage for better performance")]
-pub fn create_lora_engine(
-    base_engine: Box<dyn RuntimeEngine>, 
-    _lora_config: &LoRAConfig
-) -> Result<LoRAEngineWrapper> {
-    use std::sync::Arc;
-    LoRAEngineWrapper::new(Arc::from(base_engine))
-}
