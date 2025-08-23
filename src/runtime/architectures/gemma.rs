@@ -191,8 +191,10 @@ impl GemmaAttention {
         };
         
         // Apply query pre-attention scalar if configured (Gemma3)
+        // Scale by scalar^(-0.5) which is 1/sqrt(scalar)
         let q = if let Some(scalar) = self.query_pre_attn_scalar {
-            let scale_tensor = Tensor::new(&[scalar.sqrt()], q.device())?;
+            let scale = scalar.powf(-0.5);  // scalar^(-0.5) = 1/sqrt(scalar)
+            let scale_tensor = Tensor::new(&[scale], q.device())?;
             q.broadcast_mul(&scale_tensor)?
         } else {
             q
@@ -316,7 +318,13 @@ impl GemmaAttention {
     
     /// Compute scaled dot-product attention scores with optional sliding window
     fn compute_attention_scores(&self, q: &Tensor, k: &Tensor) -> Result<Tensor> {
-        let scale = 1.0 / (self.head_dim as f32).sqrt();
+        // If query_pre_attn_scalar is set, queries are already scaled, so use 1.0
+        // Otherwise, use standard scaling of 1/sqrt(head_dim)
+        let scale = if self.query_pre_attn_scalar.is_some() {
+            1.0
+        } else {
+            1.0 / (self.head_dim as f32).sqrt()
+        };
         
         // Q: [batch, seq, num_heads, head_dim] -> [batch, num_heads, seq, head_dim]
         let q = q.transpose(1, 2)?;
@@ -452,6 +460,7 @@ impl GemmaMLP {
 struct RMSNorm {
     weight: Tensor,
     eps: f32,
+    add_unit_offset: bool,  // For Gemma2/3
 }
 
 impl RMSNorm {
@@ -461,8 +470,19 @@ impl RMSNorm {
         let mean = x2.mean_keepdim(D::Minus1)?;
         let rrms = mean.affine(1.0, self.eps as f64)?.recip()?.sqrt()?;
         
-        // Apply normalization and scaling
-        Ok(x.broadcast_mul(&rrms)?.broadcast_mul(&self.weight)?)
+        // Apply normalization
+        let normalized = x.broadcast_mul(&rrms)?;
+        
+        // Apply weight with optional unit offset for Gemma2/3
+        if self.add_unit_offset {
+            // Gemma2/3: output * (1 + weight)
+            let one = Tensor::ones_like(&self.weight)?;
+            let weight_plus_one = (&one + &self.weight)?;
+            Ok(normalized.broadcast_mul(&weight_plus_one)?)
+        } else {
+            // Standard: output * weight
+            Ok(normalized.broadcast_mul(&self.weight)?)
+        }
     }
 }
 
@@ -474,6 +494,8 @@ impl GemmaModel {
         device: &Device,
         dtype: DType,
     ) -> Result<Self> {
+        use candle_core::safetensors::load;
+        
         // Load configuration
         let config_path = path.parent()
             .ok_or_else(|| anyhow!("Invalid model path"))?
@@ -481,24 +503,44 @@ impl GemmaModel {
         
         let config = if config_path.exists() {
             let config_str = std::fs::read_to_string(&config_path)?;
-            Self::parse_config(&config_str)?
+            let parsed_config = Self::parse_config(&config_str)?;
+            tracing::info!("Loaded Gemma3 config: hidden_size={}, num_layers={}, vocab_size={}", 
+                parsed_config.hidden_size, parsed_config.num_hidden_layers, parsed_config.vocab_size);
+            tracing::info!("  activation={}, query_pre_attn_scalar={:?}", 
+                parsed_config.hidden_activation, parsed_config.query_pre_attn_scalar);
+            parsed_config
         } else {
+            tracing::warn!("No config.json found, using default Gemma config");
             GemmaConfig::default()
         };
         
-        // Load weights from SafeTensors
-        // Note: Simplified implementation
-        let layers = Vec::new();
+        // Load weights from SafeTensors files
+        let mut weights = HashMap::new();
         
-        Ok(Self {
-            config,
-            device: device.clone(),
-            dtype,
-            embed_tokens: None,
-            layers,
-            norm: None,
-            lm_head: None,
-        })
+        // Find all .safetensors files in the directory
+        let parent_dir = path.parent()
+            .ok_or_else(|| anyhow!("Invalid model path"))?;
+        
+        for entry in std::fs::read_dir(parent_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("safetensors") {
+                tracing::info!("Loading weights from: {:?}", path);
+                let tensors = load(&path, device)?;
+                for (name, tensor) in tensors {
+                    weights.insert(name, tensor);
+                }
+            }
+        }
+        
+        if weights.is_empty() {
+            return Err(anyhow!("No SafeTensors files found in {:?}", parent_dir));
+        }
+        
+        tracing::info!("Loaded {} weight tensors", weights.len());
+        
+        // Now build the model from weights
+        Self::from_weights_with_config(&weights, config, device, dtype)
     }
     
     /// Create Gemma model from pre-loaded weights
@@ -557,11 +599,14 @@ impl GemmaModel {
         }
         
         // Extract final layer norm
+        // Use add_unit_offset for Gemma3 (detected by presence of query_pre_attn_scalar)
+        let is_gemma3 = config.query_pre_attn_scalar.is_some();
         let norm = weights.get("model.norm.weight")
             .or_else(|| weights.get("norm.weight"))
             .map(|w| RMSNorm {
                 weight: w.clone(),
                 eps: config.rms_norm_eps,
+                add_unit_offset: is_gemma3,
             });
         
         // Build transformer layers
@@ -668,9 +713,12 @@ impl GemmaModel {
         let k_norm = weights.get(&format!("{}.self_attn.k_norm.weight", prefix))
             .cloned();
         
-        // Determine layer type for sliding window (Gemma3)
-        let layer_type = if config.sliding_window.is_some() {
-            // Every 6th layer is global, others are local
+        // Determine layer type from config or use default pattern
+        let layer_type = if !config.layer_types.is_empty() && layer_idx < config.layer_types.len() {
+            // Use layer type from config
+            config.layer_types[layer_idx].clone()
+        } else if config.sliding_window.is_some() {
+            // Fallback: Every 6th layer is global, others are local
             if (layer_idx + 1) % 6 == 0 {
                 "global".to_string()
             } else {
@@ -724,16 +772,21 @@ impl GemmaModel {
         };
         
         // Build layer norms
+        // Use add_unit_offset for Gemma3 (detected by presence of query_pre_attn_scalar)
+        let is_gemma3 = config.query_pre_attn_scalar.is_some();
+        
         let input_layernorm = RMSNorm {
             weight: weights.get(&format!("{}.input_layernorm.weight", prefix))
                 .ok_or_else(|| anyhow!("Missing input_layernorm weight"))?.clone(),
             eps: config.rms_norm_eps,
+            add_unit_offset: is_gemma3,
         };
         
         let post_attention_layernorm = RMSNorm {
             weight: weights.get(&format!("{}.post_attention_layernorm.weight", prefix))
                 .ok_or_else(|| anyhow!("Missing post_attention_layernorm weight"))?.clone(),
             eps: config.rms_norm_eps,
+            add_unit_offset: is_gemma3,
         };
         
         Ok(Some(GemmaLayer {
@@ -747,6 +800,30 @@ impl GemmaModel {
     /// Parse Gemma configuration from config.json
     fn parse_config(config_str: &str) -> Result<GemmaConfig> {
         let config: serde_json::Value = serde_json::from_str(config_str)?;
+        
+        // Parse layer_types and convert to local/global
+        let layer_types = config.get("layer_types")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter()
+                .map(|v| {
+                    match v.as_str().unwrap_or("") {
+                        "sliding_attention" => "local".to_string(),
+                        "full_attention" => "global".to_string(),
+                        _ => "global".to_string(),
+                    }
+                })
+                .collect())
+            .unwrap_or_default();
+        
+        // Parse query_pre_attn_scalar - this is an integer in the config
+        let query_pre_attn_scalar = config.get("query_pre_attn_scalar")
+            .and_then(|v| {
+                if let Some(int_val) = v.as_u64() {
+                    Some(int_val as f32)
+                } else {
+                    v.as_f64().map(|f| f as f32)
+                }
+            });
         
         Ok(GemmaConfig {
             num_attention_heads: config.get("num_attention_heads")
@@ -785,15 +862,8 @@ impl GemmaModel {
             sliding_window: config.get("sliding_window")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize),
-            layer_types: config.get("layer_types")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect())
-                .unwrap_or_default(),
-            query_pre_attn_scalar: config.get("query_pre_attn_scalar")
-                .and_then(|v| v.as_f64())
-                .map(|v| v as f32),
+            layer_types,
+            query_pre_attn_scalar,
             hidden_activation: config.get("hidden_activation")
                 .and_then(|v| v.as_str())
                 .unwrap_or("silu")
@@ -834,13 +904,12 @@ impl ModelOperations for GemmaModel {
             // Reshape back to [batch_size, seq_len, hidden_size]
             let mut embeddings = embeddings.reshape(&[batch_size, seq_len, hidden_size])?;
             
-            // Apply embedding scaling for Gemma3 (scale by sqrt(hidden_size))
-            if self.config.query_pre_attn_scalar.is_some() {
-                let scale = (hidden_size as f32).sqrt();
-                let scale_tensor = Tensor::new(&[scale], embeddings.device())?;
-                embeddings = embeddings.broadcast_mul(&scale_tensor)?;
-                tracing::debug!("Applied Gemma3 embedding scaling by sqrt({})", hidden_size);
-            }
+            // Apply embedding scaling for Gemma - scale by sqrt(hidden_size)
+            // Note: This is different from query_pre_attn_scalar which is used in attention
+            let scale = (hidden_size as f32).sqrt();
+            let scale_tensor = Tensor::new(&[scale], embeddings.device())?;
+            embeddings = embeddings.broadcast_mul(&scale_tensor)?;
+            tracing::debug!("Applied Gemma embedding scaling by sqrt(hidden_size={}) = {}", hidden_size, scale);
             
             embeddings
         } else {
