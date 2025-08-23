@@ -465,23 +465,24 @@ struct RMSNorm {
 
 impl RMSNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // Compute RMS
-        let x2 = x.sqr()?;
-        let mean = x2.mean_keepdim(D::Minus1)?;
-        let rrms = mean.affine(1.0, self.eps as f64)?.recip()?.sqrt()?;
+        // Get hidden size from last dimension
+        let hidden_size = x.dims()[x.dims().len() - 1];
         
-        // Apply normalization
-        let normalized = x.broadcast_mul(&rrms)?;
+        // Compute RMS normalization
+        // norm_x = sum(x^2) / hidden_size
+        let norm_x = x.sqr()?.sum_keepdim(D::Minus1)?.affine(1.0 / hidden_size as f64, 0.0)?;
+        
+        // x_normed = x / sqrt(norm_x + eps)
+        let x_normed = x.broadcast_div(&norm_x.affine(1.0, self.eps as f64)?.sqrt()?)?;
         
         // Apply weight with optional unit offset for Gemma2/3
         if self.add_unit_offset {
-            // Gemma2/3: output * (1 + weight)
-            let one = Tensor::ones_like(&self.weight)?;
-            let weight_plus_one = (&one + &self.weight)?;
-            Ok(normalized.broadcast_mul(&weight_plus_one)?)
+            // Gemma2/3: (weight + 1) * normalized
+            let weight_plus_one = (&self.weight + 1.0)?;
+            Ok(x_normed.broadcast_mul(&weight_plus_one)?)
         } else {
-            // Standard: output * weight
-            Ok(normalized.broadcast_mul(&self.weight)?)
+            // Standard: weight * normalized
+            Ok(x_normed.broadcast_mul(&self.weight)?)
         }
     }
 }
@@ -693,7 +694,8 @@ impl GemmaModel {
             return Ok(None);
         }
         
-        // Get attention weights and transpose from PyTorch format
+        // Get attention weights - SafeTensors stores as [out_features, in_features]
+        // For matmul we need [in_features, out_features] so transpose
         let q_proj = weights.get(&format!("{}.self_attn.q_proj.weight", prefix))
             .ok_or_else(|| anyhow!("Missing q_proj weight"))?
             .transpose(0, 1)?.contiguous()?;
@@ -757,7 +759,7 @@ impl GemmaModel {
             layer_type,
         };
         
-        // Build MLP
+        // Build MLP - transpose for matmul
         let mlp = GemmaMLP {
             gate_proj: weights.get(&format!("{}.mlp.gate_proj.weight", prefix))
                 .ok_or_else(|| anyhow!("Missing gate_proj weight"))?
