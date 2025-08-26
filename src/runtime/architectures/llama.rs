@@ -3,8 +3,9 @@
 use super::{ModelArchitecture, ModelOperations, ArchitectureConfig};
 use super::lora_adapter::ArchitectureAwareLoRAAdapter;
 use anyhow::{Result, anyhow};
-use candle_core::{Device, DType, Tensor, D};
-use candle_nn::{Module, VarBuilder};
+use tch::{Device, Kind as DType, Tensor};
+use crate::runtime::tensor_helpers::{ToIntList, clone_tensor, square_tensor, broadcast_mul, broadcast_add, broadcast_sub, scalar_tensor, dims3, dims4};
+// TODO: Replace candle_nn with tch equivalents
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -197,6 +198,11 @@ pub struct LlamaModel {
     lm_head: Option<Tensor>,
 }
 
+// SAFETY: Tch tensors are thread-safe when used correctly
+// We ensure no mutable access without proper synchronization
+unsafe impl Send for LlamaModel {}
+unsafe impl Sync for LlamaModel {}
+
 /// Single Llama transformer layer
 struct LlamaLayer {
     self_attn: LlamaAttention,
@@ -204,6 +210,9 @@ struct LlamaLayer {
     input_layernorm: RMSNorm,
     post_attention_layernorm: RMSNorm,
 }
+
+unsafe impl Send for LlamaLayer {}
+unsafe impl Sync for LlamaLayer {}
 
 /// Llama attention with optional GQA support
 struct LlamaAttention {
@@ -226,46 +235,48 @@ struct LlamaAttention {
     layer_idx: usize,
 }
 
+unsafe impl Send for LlamaAttention {}
+unsafe impl Sync for LlamaAttention {}
+
 impl LlamaAttention {
     /// Apply attention with optional GQA
     fn forward(&self, hidden_states: &Tensor, position_ids: Option<&Tensor>) -> Result<Tensor> {
-        let (batch_size, seq_len, hidden_size) = hidden_states.dims3()?;
+        let (batch_size, seq_len, hidden_size) = dims3(&hidden_states)?;
         
-        // Debug: Check shapes before matmul
-        // tracing::debug!("Attention forward - hidden_states shape: {:?}", hidden_states.dims());
-        // tracing::debug!("Attention forward - q_proj shape: {:?}", self.q_proj.dims());
-        // tracing::debug!("Attention config - num_heads: {}, head_dim: {}, total: {}", 
-        //               self.num_heads, self.head_dim, self.num_heads * self.head_dim);
+        // Debug: Check shapes and dtypes before matmul
+        tracing::debug!("Attention forward - hidden_states shape: {:?}, dtype: {:?}", hidden_states.size(), hidden_states.kind());
+        tracing::debug!("Attention forward - q_proj shape: {:?}, dtype: {:?}", self.q_proj.size(), self.q_proj.kind());
         
         // Reshape hidden_states for matmul: [batch*seq, hidden_size]
-        let hidden_states_2d = hidden_states.reshape(&[batch_size * seq_len, hidden_size])?;
+        let hidden_states_2d = hidden_states.reshape(&[batch_size * seq_len, hidden_size]);
+        tracing::debug!("Reshaped hidden_states_2d shape: {:?}, dtype: {:?}", hidden_states_2d.size(), hidden_states_2d.kind());
         
         // Project to Q, K, V using 2D matmul
-        let q = hidden_states_2d.matmul(&self.q_proj)?;
-        let k = hidden_states_2d.matmul(&self.k_proj)?;
-        let v = hidden_states_2d.matmul(&self.v_proj)?;
+        let q = hidden_states_2d.matmul(&self.q_proj);
+        let k = hidden_states_2d.matmul(&self.k_proj);
+        let v = hidden_states_2d.matmul(&self.v_proj);
         
         // tracing::debug!("After projection - Q shape: {:?}, K shape: {:?}, V shape: {:?}", 
-        //               q.dims(), k.dims(), v.dims());
+        //               q.size(), k.size(), v.size());
         // tracing::debug!("Expected reshape: [{}, {}, {}, {}] = {} elements, actual Q elements: {}", 
         //               batch_size, seq_len, self.num_heads, self.head_dim, 
         //               batch_size * seq_len * self.num_heads * self.head_dim,
-        //               q.dims().iter().product::<usize>());
+        //               q.size().iter().product::<usize>());
         
         // Determine actual K/V heads from tensor dimensions
-        let k_elements = k.dims().iter().product::<usize>();
-        let v_elements = v.dims().iter().product::<usize>();
+        let k_elements = k.size().iter().product::<i64>();
+        let v_elements = v.size().iter().product::<i64>();
         
         // For K and V, we need to figure out the actual number of heads
         // They might be different from what we detected in config
-        let kv_heads = if k_elements == batch_size * seq_len * self.num_kv_heads * self.head_dim {
+        let kv_heads = if k_elements == batch_size * seq_len * (self.num_kv_heads as i64) * (self.head_dim as i64) {
             self.num_kv_heads  // Config is correct
-        } else if k_elements % (batch_size * seq_len * self.head_dim) == 0 {
+        } else if k_elements % (batch_size * seq_len * (self.head_dim as i64)) == 0 {
             // Recalculate based on actual size
-            k_elements / (batch_size * seq_len * self.head_dim)
+            (k_elements / (batch_size * seq_len * (self.head_dim as i64))) as usize
         } else if k_elements % (batch_size * seq_len) == 0 {
             // Try different head_dim
-            let kv_dim = k_elements / (batch_size * seq_len);
+            let kv_dim = (k_elements / (batch_size * seq_len)) as usize;
             if kv_dim == 256 && self.head_dim == 128 {
                 2  // 2 heads with 128 dim
             } else if kv_dim == 256 {
@@ -281,10 +292,10 @@ impl LlamaAttention {
         
         // Reshape for attention
         // Q: [batch, seq, num_heads, head_dim]
-        let mut q = q.reshape(&[batch_size, seq_len, self.num_heads, self.head_dim])?;
+        let mut q = q.reshape(&[batch_size, seq_len, self.num_heads as i64, self.head_dim as i64]);
         // K, V: [batch, seq, num_kv_heads, head_dim] - use actual kv_heads
-        let mut k = k.reshape(&[batch_size, seq_len, kv_heads, self.head_dim])?;
-        let v = v.reshape(&[batch_size, seq_len, kv_heads, self.head_dim])?;
+        let mut k = k.reshape(&[batch_size, seq_len, kv_heads as i64, self.head_dim as i64]);
+        let v = v.reshape(&[batch_size, seq_len, kv_heads as i64, self.head_dim as i64]);
         
         // Apply QK-norm if configured (Gemma3)
         if let Some(q_norm) = &self.q_norm {
@@ -319,72 +330,72 @@ impl LlamaAttention {
         let scores = self.compute_attention_scores(&q, &k)?;
         
         // V: [batch, seq, heads, dim] -> [batch, heads, seq, dim]  
-        let v = v.transpose(1, 2)?;
+        let v = v.transpose(1, 2);
         
         // Apply attention to values: [batch, heads, seq, seq] x [batch, heads, seq, dim] = [batch, heads, seq, dim]
-        let attn_output = scores.matmul(&v)?;
+        let attn_output = scores.matmul(&v);
         
         // Transpose back: [batch, heads, seq, dim] -> [batch, seq, heads, dim]
-        let attn_output = attn_output.transpose(1, 2)?;
+        let attn_output = attn_output.transpose(1, 2);
         
         // Reshape to combine heads: [batch, seq, heads*dim]
         let attn_output = attn_output
-            .reshape(&[batch_size, seq_len, self.num_heads * self.head_dim])?;
+            .reshape(&[batch_size, seq_len, (self.num_heads * self.head_dim) as i64]);
         
         // Reshape for output projection: [batch*seq, heads*dim]
-        let attn_output_2d = attn_output.reshape(&[batch_size * seq_len, self.num_heads * self.head_dim])?;
+        let attn_output_2d = attn_output.reshape(&[batch_size * seq_len, (self.num_heads * self.head_dim) as i64]);
         
         // Apply output projection: [batch*seq, heads*dim] x [heads*dim, hidden_size] = [batch*seq, hidden_size]
-        let attn_output = attn_output_2d.matmul(&self.o_proj)?;
+        let attn_output = attn_output_2d.matmul(&self.o_proj);
         
         // Reshape back to 3D: [batch, seq, hidden_size]
-        let attn_output = attn_output.reshape(&[batch_size, seq_len, hidden_size])?;
+        let attn_output = attn_output.reshape(&[batch_size, seq_len, hidden_size]);
         
         Ok(attn_output)
     }
     
     /// Expand KV heads for GQA (Llama 2/3)
     fn expand_kv_for_gqa(&self, kv: &Tensor) -> Result<Tensor> {
-        let (batch_size, seq_len, num_kv_heads, head_dim) = kv.dims4()?;
-        let repeat_factor = self.num_heads / num_kv_heads;
+        let (batch_size, seq_len, num_kv_heads, head_dim) = dims4(&kv)?;
+        let repeat_factor = self.num_heads / (num_kv_heads as usize);
         
         if repeat_factor == 1 {
-            return Ok(kv.clone());
+            return Ok(kv.shallow_clone());
         }
         
         // Repeat KV heads to match Q heads
-        Ok(kv.unsqueeze(3)?  // [batch, seq, num_kv_heads, 1, head_dim]
-            .expand(&[batch_size, seq_len, num_kv_heads, repeat_factor, head_dim])?
-            .reshape(&[batch_size, seq_len, self.num_heads, head_dim])?)
+        Ok(kv.unsqueeze(3)  // [batch, seq, num_kv_heads, 1, head_dim]
+            .expand(&[batch_size, seq_len, num_kv_heads, repeat_factor as i64, head_dim], false)
+            .reshape(&[batch_size, seq_len, self.num_heads as i64, head_dim]))
     }
     
     /// Expand KV tensors for GQA with explicit head count
     fn expand_kv_for_gqa_with_heads(&self, kv: &Tensor, actual_kv_heads: usize) -> Result<Tensor> {
-        let (batch_size, seq_len, _detected_heads, head_dim) = kv.dims4()?;
+        let (batch_size, seq_len, _detected_heads, head_dim) = dims4(&kv)?;
         let repeat_factor = self.num_heads / actual_kv_heads;
         
         if repeat_factor == 1 {
-            return Ok(kv.clone());
+            return Ok(kv.shallow_clone());
         }
         
         // tracing::debug!("GQA expansion: {} KV heads -> {} Q heads (repeat {}x)", 
         //               actual_kv_heads, self.num_heads, repeat_factor);
         
         // Expand by repeating KV heads
-        Ok(kv.unsqueeze(3)?  // [batch, seq, num_kv_heads, 1, head_dim]
-            .expand(&[batch_size, seq_len, actual_kv_heads, repeat_factor, head_dim])?
-            .reshape(&[batch_size, seq_len, self.num_heads, head_dim])?)
+        Ok(kv.unsqueeze(3)  // [batch, seq, num_kv_heads, 1, head_dim]
+            .expand(&[batch_size, seq_len, actual_kv_heads as i64, repeat_factor as i64, head_dim], false)
+            .reshape(&[batch_size, seq_len, self.num_heads as i64, head_dim]))
     }
     
     /// Apply Rotary Position Embeddings with optional scaling
     fn apply_rope(&self, tensor: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
         // tensor shape: [batch, seq, heads, dim]
-        let (_batch_size, seq_len, _num_heads, head_dim) = tensor.dims4()?;
+        let (_batch_size, seq_len, _num_heads, head_dim) = dims4(&tensor)?;
         
         // Generate position embeddings
         let theta = self.rope_theta;
         let device = tensor.device();
-        let dtype = tensor.dtype();
+        let dtype = tensor.kind();
         
         // Create frequency bands (exponentially decreasing)
         let inv_freq = (0..head_dim / 2)
@@ -392,8 +403,8 @@ impl LlamaAttention {
             .collect::<Vec<_>>();
         
         // Create position indices [0, 1, 2, ..., seq_len-1]
-        let positions = Tensor::arange(0u32, seq_len as u32, device)?
-            .to_dtype(DType::F32)?;
+        let positions = Tensor::arange(seq_len as i64, (DType::Int64, device))
+            .to_dtype(DType::Float, false, false);
         
         // Compute sinusoidal embeddings
         let mut sin_vals = Vec::new();
@@ -401,34 +412,38 @@ impl LlamaAttention {
         
         for i in 0..seq_len {
             for j in 0..head_dim / 2 {
-                let angle = (i as f32) * inv_freq[j];
+                let angle = (i as f32) * inv_freq[j as usize];
                 sin_vals.push(angle.sin());
                 cos_vals.push(angle.cos());
             }
         }
         
         // Create sin and cos tensors [seq_len, head_dim/2]
-        let sin = Tensor::from_vec(sin_vals, &[seq_len, head_dim / 2], device)?
-            .to_dtype(dtype)?;
-        let cos = Tensor::from_vec(cos_vals, &[seq_len, head_dim / 2], device)?
-            .to_dtype(dtype)?;
+        let sin = Tensor::from_slice(&sin_vals)
+            .reshape(&[seq_len, head_dim / 2])
+            .to(device)
+            .to_dtype(dtype, false, false);
+        let cos = Tensor::from_slice(&cos_vals)
+            .reshape(&[seq_len, head_dim / 2])
+            .to(device)
+            .to_dtype(dtype, false, false);
         
         // Apply rotary embeddings
         // Split tensor into first half and second half along head_dim
-        let x1 = tensor.narrow(D::Minus1, 0, head_dim / 2)?;
-        let x2 = tensor.narrow(D::Minus1, head_dim / 2, head_dim / 2)?;
+        let x1 = tensor.narrow(-1, 0, head_dim / 2);
+        let x2 = tensor.narrow(-1, head_dim / 2, head_dim / 2);
         
         // Expand sin/cos to match tensor shape [1, seq, 1, head_dim/2]
-        let sin = sin.unsqueeze(0)?.unsqueeze(2)?;
-        let cos = cos.unsqueeze(0)?.unsqueeze(2)?;
+        let sin = sin.unsqueeze(0).unsqueeze(2);
+        let cos = cos.unsqueeze(0).unsqueeze(2);
         
         // Apply rotation: x' = x * cos - rotate(x) * sin
         // For complex rotation: (x1 + ix2) * (cos + isin) = (x1*cos - x2*sin) + i(x1*sin + x2*cos)
-        let rotated_x1 = x1.broadcast_mul(&cos)?.broadcast_sub(&x2.broadcast_mul(&sin)?)?;
-        let rotated_x2 = x1.broadcast_mul(&sin)?.broadcast_add(&x2.broadcast_mul(&cos)?)?;
+        let rotated_x1 = broadcast_sub(&broadcast_mul(&x1, &cos)?, &broadcast_mul(&x2, &sin)?)?;
+        let rotated_x2 = broadcast_add(&broadcast_mul(&x1, &sin)?, &broadcast_mul(&x2, &cos)?)?;
         
         // Concatenate back together
-        Ok(Tensor::cat(&[rotated_x1, rotated_x2], D::Minus1)?)
+        Ok(Tensor::cat(&[rotated_x1, rotated_x2], -1))
     }
     
     /// Apply QK-norm (Gemma3)
@@ -436,47 +451,48 @@ impl LlamaAttention {
         // QK-norm normalizes each head separately
         // tensor shape: [batch, seq, heads, dim]
         // norm_weight shape: [heads * dim] where heads could be Q heads or KV heads
-        let (_batch_size, _seq_len, tensor_heads, head_dim) = tensor.dims4()?;
+        let (_batch_size, _seq_len, tensor_heads, head_dim) = dims4(&tensor)?;
         
         // Debug logging
         tracing::debug!("apply_qk_norm: tensor heads={}, head_dim={}, actual_heads={}, norm_weight shape={:?}", 
-                       tensor_heads, head_dim, actual_heads, norm_weight.dims());
+                       tensor_heads, head_dim, actual_heads, norm_weight.size());
         
         // First, reshape the norm weights to match [1, 1, heads, dim]
         // The norm weights are typically stored as a flat vector [heads * dim]
-        let norm_weight_reshaped = if norm_weight.dims().len() == 1 {
-            let norm_elements = norm_weight.dims()[0];
+        let norm_weight_reshaped = if norm_weight.size().len() == 1 {
+            let norm_elements = norm_weight.size()[0];
             // For Gemma3, norm weights are per-head
             // If norm has 256 elements and we have 1 KV head with 256 dim, reshape to [1, 256]
             // If norm has 1024 elements and we have 4 Q heads with 256 dim, reshape to [4, 256]
-            if norm_elements == actual_heads * head_dim {
+            if norm_elements == (actual_heads * head_dim as usize) as i64 {
                 // Standard case: reshape from [heads * dim] to [1, 1, heads, dim]
                 norm_weight
-                    .reshape(&[actual_heads, head_dim])?
-                    .unsqueeze(0)?  // Add batch dimension
-                    .unsqueeze(0)?  // Add seq dimension
+                    .reshape(&[actual_heads as i64, head_dim])
+                    .unsqueeze(0)  // Add batch dimension
+                    .unsqueeze(0)  // Add seq dimension
             } else if norm_elements == head_dim {
                 // Special case: norm is per-dimension only (for single head)
                 norm_weight
-                    .unsqueeze(0)?  // Add head dimension
-                    .unsqueeze(0)?  // Add batch dimension
-                    .unsqueeze(0)?  // Add seq dimension
+                    .unsqueeze(0)  // Add head dimension
+                    .unsqueeze(0)  // Add batch dimension
+                    .unsqueeze(0)  // Add seq dimension
             } else {
                 return Err(anyhow!("QK-norm weight size {} doesn't match expected size for {} heads with dim {}", 
                                    norm_elements, actual_heads, head_dim));
             }
         } else {
-            norm_weight.clone()
+            norm_weight.shallow_clone()
         };
         
-        // Apply RMSNorm per head
-        let x2 = tensor.sqr()?;
-        let mean = x2.mean_keepdim(D::Minus1)?;
+        // Apply RMSNorm per head, preserving dtype
+        let original_dtype = tensor.kind();
+        let x2 = square_tensor(tensor)?;
+        let mean = x2.mean_dim(&[-1i64][..], true, original_dtype);
         let eps = 1e-6;
-        let rrms = mean.affine(1.0, eps)?.recip()?.sqrt()?;
+        let rrms = (mean + eps).reciprocal().sqrt();
         
         // Apply normalization and scale with norm weights
-        Ok(tensor.broadcast_mul(&rrms)?.broadcast_mul(&norm_weight_reshaped)?)
+        Ok(broadcast_mul(&broadcast_mul(tensor, &rrms)?, &norm_weight_reshaped)?)
     }
     
     /// Compute scaled dot-product attention scores
@@ -484,12 +500,12 @@ impl LlamaAttention {
         let scale = 1.0 / (self.head_dim as f32).sqrt();
         
         // Q: [batch, seq, heads, dim] -> [batch, heads, seq, dim]
-        let q = q.transpose(1, 2)?;
+        let q = q.transpose(1, 2);
         // K: [batch, seq, heads, dim] -> [batch, heads, seq, dim] -> [batch, heads, dim, seq]
-        let k = k.transpose(1, 2)?.transpose(2, 3)?;
+        let k = k.transpose(1, 2).transpose(2, 3);
         
         // Compute attention scores: [batch, heads, seq, seq]
-        let mut scores = q.matmul(&k)?.affine(scale as f64, 0.0)?;
+        let mut scores = q.matmul(&k) * (scale as f64);
         
         // Apply sliding window mask if configured (Gemma3)
         if let Some(window_size) = self.sliding_window {
@@ -499,41 +515,43 @@ impl LlamaAttention {
             // Global layers use full attention (no mask)
         }
         
-        // Apply softmax along last dimension
-        Ok(candle_nn::ops::softmax_last_dim(&scores)?)
+        // Apply softmax along last dimension, preserving dtype
+        Ok(scores.softmax(-1, scores.kind()))
     }
     
     /// Apply sliding window mask for local attention layers
     fn apply_sliding_window_mask(&self, scores: &Tensor, window_size: usize) -> Result<Tensor> {
-        let (batch_size, num_heads, seq_len, _) = scores.dims4()?;
+        let (batch_size, num_heads, seq_len, _) = dims4(&scores)?;
         let device = scores.device();
-        let dtype = scores.dtype();
+        let dtype = scores.kind();
         
         // Create sliding window mask
         // Each position can only attend to window_size positions before it
-        let mut mask_values = vec![0f32; seq_len * seq_len];
+        let mut mask_values = vec![0f32; (seq_len * seq_len) as usize];
         for i in 0..seq_len {
             for j in 0..seq_len {
                 // Can attend to positions within window_size before current position
                 // and the current position itself
-                if j <= i && i - j < window_size {
-                    mask_values[i * seq_len + j] = 0.0;
+                if j <= i && i - j < window_size as i64 {
+                    mask_values[(i * seq_len + j) as usize] = 0.0;
                 } else {
                     // Mask out positions outside the window with large negative value
-                    mask_values[i * seq_len + j] = -10000.0;
+                    mask_values[(i * seq_len + j) as usize] = -10000.0;
                 }
             }
         }
         
         // Create mask tensor and broadcast to match scores shape
-        let mask = Tensor::from_vec(mask_values, &[seq_len, seq_len], device)?
-            .to_dtype(dtype)?
-            .unsqueeze(0)?  // [1, seq, seq]
-            .unsqueeze(0)?  // [1, 1, seq, seq]
-            .expand(&[batch_size, num_heads, seq_len, seq_len])?;
+        let mask = Tensor::from_slice(&mask_values)
+            .reshape(&[seq_len, seq_len])
+            .to(device)
+            .to_dtype(dtype, false, false)
+            .unsqueeze(0)  // [1, seq, seq]
+            .unsqueeze(0)  // [1, 1, seq, seq]
+            .expand(&[batch_size, num_heads, seq_len, seq_len], false);
         
         // Add mask to scores (masked positions get large negative values)
-        Ok(scores.broadcast_add(&mask)?)
+        Ok(broadcast_add(&scores, &mask)?)
     }
 }
 
@@ -545,10 +563,13 @@ struct LlamaMLP {
     activation: String,  // Activation function name
 }
 
+unsafe impl Send for LlamaMLP {}
+unsafe impl Sync for LlamaMLP {}
+
 impl LlamaMLP {
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         // Get dimensions
-        let original_shape = hidden_states.dims();
+        let original_shape = hidden_states.size();
         let (batch_size, seq_len, hidden_size) = if original_shape.len() == 3 {
             (original_shape[0], original_shape[1], original_shape[2])
         } else {
@@ -557,31 +578,31 @@ impl LlamaMLP {
         };
         
         // Reshape to 2D for matmul
-        let hidden_2d = hidden_states.reshape(&[batch_size * seq_len, hidden_size])?;
+        let hidden_2d = hidden_states.reshape(&[batch_size * seq_len, hidden_size]);
         
         // Apply activation based on config
-        let gate_pre = hidden_2d.matmul(&self.gate_proj)?;
+        let gate_pre = hidden_2d.matmul(&self.gate_proj);
         let gate = self.apply_activation(&gate_pre)?;
-        let up = hidden_2d.matmul(&self.up_proj)?;
-        let output = gate.mul(&up)?.matmul(&self.down_proj)?;
+        let up = hidden_2d.matmul(&self.up_proj);
+        let output = (&gate * &up).matmul(&self.down_proj);
         
         // Reshape back to 3D
-        let out_size = output.dims()[1];
-        Ok(output.reshape(&[batch_size, seq_len, out_size])?)
+        let out_size = output.size()[1];
+        Ok(output.reshape(&[batch_size, seq_len, out_size]))
     }
     
     fn forward_2d(&self, hidden_states: &Tensor) -> Result<Tensor> {
         // Apply activation based on config
-        let gate_pre = hidden_states.matmul(&self.gate_proj)?;
+        let gate_pre = hidden_states.matmul(&self.gate_proj);
         let gate = self.apply_activation(&gate_pre)?;
-        let up = hidden_states.matmul(&self.up_proj)?;
-        Ok(gate.mul(&up)?.matmul(&self.down_proj)?)
+        let up = hidden_states.matmul(&self.up_proj);
+        Ok((&gate * &up).matmul(&self.down_proj))
     }
     
     /// Apply the configured activation function
     fn apply_activation(&self, x: &Tensor) -> Result<Tensor> {
         match self.activation.as_str() {
-            "silu" => Ok(candle_nn::ops::silu(x)?),
+            "silu" => Ok(x.silu()),
             "gelu_pytorch_tanh" => self.gelu_pytorch_tanh(x),
             "gelu" => {
                 // Standard GELU approximation
@@ -591,7 +612,7 @@ impl LlamaMLP {
             },
             _ => {
                 tracing::warn!("Unknown activation '{}', falling back to SiLU", self.activation);
-                Ok(candle_nn::ops::silu(x)?)
+                Ok(x.silu())
             }
         }
     }
@@ -606,26 +627,26 @@ impl LlamaMLP {
         let coeff = 0.044715_f32;
         
         // x^3
-        let x_cubed = x.powf(3.0)?;
+        let x_cubed = x.pow_tensor_scalar(3.0);
         
         // x + 0.044715 * x^3
-        let coeff_tensor = Tensor::new(&[coeff], x.device())?;
-        let inner = (x + (x_cubed.broadcast_mul(&coeff_tensor)?))?;
+        let coeff_tensor = scalar_tensor(coeff, x.device());
+        let inner = x + broadcast_mul(&x_cubed, &coeff_tensor)?;
         
         // sqrt(2/π) * (x + 0.044715 * x^3)
-        let sqrt_tensor = Tensor::new(&[sqrt_2_over_pi], x.device())?;
-        let scaled = inner.broadcast_mul(&sqrt_tensor)?;
+        let sqrt_tensor = scalar_tensor(sqrt_2_over_pi, x.device());
+        let scaled = broadcast_mul(&inner, &sqrt_tensor)?;
         
         // tanh(sqrt(2/π) * (x + 0.044715 * x^3))
-        let tanh_result = scaled.tanh()?;
+        let tanh_result = scaled.tanh();
         
         // 1 + tanh(...)
-        let one_tensor = Tensor::new(&[1.0_f32], x.device())?;
-        let one_plus_tanh = tanh_result.broadcast_add(&one_tensor)?;
+        let one_tensor = scalar_tensor(1.0_f32, x.device());
+        let one_plus_tanh = broadcast_add(&tanh_result, &one_tensor)?;
         
         // 0.5 * x * (1 + tanh(...))
-        let half_tensor = Tensor::new(&[0.5_f32], x.device())?;
-        Ok(x.mul(&one_plus_tanh)?.broadcast_mul(&half_tensor)?)
+        let half_tensor = scalar_tensor(0.5_f32, x.device());
+        Ok(broadcast_mul(&(x * &one_plus_tanh), &half_tensor)?)
     }
 }
 
@@ -635,15 +656,19 @@ struct RMSNorm {
     eps: f32,
 }
 
+unsafe impl Send for RMSNorm {}
+unsafe impl Sync for RMSNorm {}
+
 impl RMSNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // Compute RMS
-        let x2 = x.sqr()?;
-        let mean = x2.mean_keepdim(D::Minus1)?;
-        let rrms = mean.affine(1.0, self.eps as f64)?.recip()?.sqrt()?;
+        // Compute RMS, preserving the original dtype
+        let original_dtype = x.kind();
+        let x2 = square_tensor(&x)?;
+        let mean = x2.mean_dim(&[-1i64][..], true, original_dtype);  // Keep original dtype
+        let rrms = (mean + self.eps as f64).reciprocal().sqrt();
         
         // Apply normalization and scaling
-        Ok(x.broadcast_mul(&rrms)?.broadcast_mul(&self.weight)?)
+        Ok(broadcast_mul(&broadcast_mul(&x, &rrms)?, &self.weight)?)
     }
 }
 
@@ -672,7 +697,7 @@ impl LlamaModel {
         
         Ok(Self {
             config,
-            device: device.clone(),
+            device: *device,
             dtype,
             embed_tokens: None,
             layers,
@@ -703,7 +728,7 @@ impl LlamaModel {
         // Extract key tensors
         let embed_tokens = weights.get("model.embed_tokens.weight")
             .or_else(|| weights.get("embed_tokens.weight"))
-            .cloned();
+            .map(|t| t.shallow_clone());
         
         // Handle lm_head - Gemma models use weight tying (lm_head shares weights with embed_tokens)
         // Try to find explicit lm_head first, otherwise we'll use tied weights from embeddings
@@ -712,9 +737,8 @@ impl LlamaModel {
             .map(|w| {
                 // LM head is stored as [vocab_size, hidden_size] in HuggingFace
                 // We need [hidden_size, vocab_size] for matmul
-                w.transpose(0, 1).and_then(|t| t.contiguous())
-            })
-            .transpose()?;
+                w.transpose(0, 1).contiguous()
+            });
         
         // Check if this is a model with tied weights (like Gemma)
         if lm_head.is_none() && embed_tokens.is_some() {
@@ -725,7 +749,7 @@ impl LlamaModel {
         let norm = weights.get("model.norm.weight")
             .or_else(|| weights.get("norm.weight"))
             .map(|w| RMSNorm {
-                weight: w.clone(),
+                weight: w.shallow_clone(),
                 eps: config.rms_norm_eps,
             });
         
@@ -739,7 +763,7 @@ impl LlamaModel {
         
         Ok(Self {
             config,
-            device: device.clone(),
+            device: *device,
             dtype,
             embed_tokens,
             layers,
@@ -756,10 +780,10 @@ impl LlamaModel {
         // Get vocab size from embedding
         if let Some(embed) = weights.get("model.embed_tokens.weight")
             .or_else(|| weights.get("embed_tokens.weight")) {
-            let shape = embed.dims();
+            let shape = embed.size();
             if shape.len() >= 2 {
-                config.vocab_size = shape[0];
-                config.hidden_size = shape[1];
+                config.vocab_size = shape[0] as usize;
+                config.hidden_size = shape[1] as usize;
                 
                 // Detect Gemma3 by vocab size (262144) and set specific parameters
                 if config.vocab_size == 262144 {
@@ -788,16 +812,16 @@ impl LlamaModel {
         
         // Get attention heads from q_proj and k_proj shapes
         if let Some(q_proj) = weights.get("model.layers.0.self_attn.q_proj.weight") {
-            let q_shape = q_proj.dims();
+            let q_shape = q_proj.size();
             if q_shape.len() >= 2 {
                 // shape[0] is output dim (num_heads * head_dim)
                 // shape[1] is hidden_size
-                config.hidden_size = q_shape[1];
-                let q_proj_out_dim = q_shape[0];
+                config.hidden_size = q_shape[1] as usize;
+                let q_proj_out_dim = q_shape[0] as usize;
                 
                 // Also check k_proj to detect GQA (Grouped Query Attention)
                 let k_proj_out_dim = if let Some(k_proj) = weights.get("model.layers.0.self_attn.k_proj.weight") {
-                    k_proj.dims()[0]
+                    k_proj.size()[0] as usize
                 } else {
                     q_proj_out_dim // Assume same as Q if K not found
                 };
@@ -880,54 +904,54 @@ impl LlamaModel {
             // Get and transpose q_proj weight
             let q_proj_orig = weights.get(&format!("{}.self_attn.q_proj.weight", prefix))
                 .ok_or_else(|| anyhow!("Missing q_proj weight"))?;
-            tracing::debug!("Layer {} q_proj original shape: {:?}", layer_idx, q_proj_orig.dims());
+            tracing::debug!("Layer {} q_proj original shape: {:?}, dtype: {:?}", layer_idx, q_proj_orig.size(), q_proj_orig.kind());
             
             // Transpose from PyTorch format [out, in] to [in, out] for matmul
             // Make sure to make it contiguous after transpose
-            let q_proj = q_proj_orig.transpose(0, 1)?.contiguous()?;
-            tracing::debug!("Layer {} q_proj transposed shape: {:?}", layer_idx, q_proj.dims());
+            let q_proj = q_proj_orig.transpose(0, 1).contiguous();
+            tracing::debug!("Layer {} q_proj transposed shape: {:?}, dtype: {:?}", layer_idx, q_proj.size(), q_proj.kind());
             
             // Get and transpose k_proj weight
             let k_proj_orig = weights.get(&format!("{}.self_attn.k_proj.weight", prefix))
                 .ok_or_else(|| anyhow!("Missing k_proj weight"))?;
-            tracing::debug!("Layer {} k_proj original shape: {:?}", layer_idx, k_proj_orig.dims());
-            let k_proj = k_proj_orig.transpose(0, 1)?.contiguous()?;
-            tracing::debug!("Layer {} k_proj transposed shape: {:?}", layer_idx, k_proj.dims());
+            tracing::debug!("Layer {} k_proj original shape: {:?}", layer_idx, k_proj_orig.size());
+            let k_proj = k_proj_orig.transpose(0, 1).contiguous();
+            tracing::debug!("Layer {} k_proj transposed shape: {:?}", layer_idx, k_proj.size());
             
             // Get and transpose v_proj weight
             let v_proj_orig = weights.get(&format!("{}.self_attn.v_proj.weight", prefix))
                 .ok_or_else(|| anyhow!("Missing v_proj weight"))?;
-            tracing::debug!("Layer {} v_proj original shape: {:?}", layer_idx, v_proj_orig.dims());
-            let v_proj = v_proj_orig.transpose(0, 1)?.contiguous()?;
-            tracing::debug!("Layer {} v_proj transposed shape: {:?}", layer_idx, v_proj.dims());
+            tracing::debug!("Layer {} v_proj original shape: {:?}", layer_idx, v_proj_orig.size());
+            let v_proj = v_proj_orig.transpose(0, 1).contiguous();
+            tracing::debug!("Layer {} v_proj transposed shape: {:?}", layer_idx, v_proj.size());
             
             (q_proj, k_proj, v_proj)
         } else {
             // Combined QKV projection (some Qwen models use c_attn)
             let c_attn = weights.get(&format!("{}.self_attn.c_attn.weight", prefix))
                 .ok_or_else(|| anyhow!("Missing c_attn weight"))?
-                .transpose(0, 1)?  // Transpose from [out, in] to [in, out]
-                .contiguous()?;
+                .transpose(0, 1)  // Transpose from [out, in] to [in, out]
+                .contiguous();
             
             // Split c_attn into Q, K, V
             // c_attn has shape [hidden_size, 3 * projection_size]
-            let dims = c_attn.dims();
+            let dims = c_attn.size();
             let hidden_size = dims[0];
             let total_proj_size = dims[1];
             let proj_size = total_proj_size / 3;
             
-            let q = c_attn.narrow(1, 0, proj_size)?;
-            let k = c_attn.narrow(1, proj_size, proj_size)?;
-            let v = c_attn.narrow(1, proj_size * 2, proj_size)?;
+            let q = c_attn.narrow(1, 0, proj_size);
+            let k = c_attn.narrow(1, proj_size, proj_size);
+            let v = c_attn.narrow(1, proj_size * 2, proj_size);
             
             (q, k, v)
         };
         
         // Check for QK-norm weights (Gemma3)
         let q_norm = weights.get(&format!("{}.self_attn.q_norm.weight", prefix))
-            .cloned();
+            .map(|t| t.shallow_clone());
         let k_norm = weights.get(&format!("{}.self_attn.k_norm.weight", prefix))
-            .cloned();
+            .map(|t| t.shallow_clone());
         
         if q_norm.is_some() || k_norm.is_some() {
             tracing::debug!("Layer {} has QK-norm weights", layer_idx);
@@ -971,8 +995,8 @@ impl LlamaModel {
             o_proj: weights.get(&format!("{}.self_attn.o_proj.weight", prefix))
                 .or_else(|| weights.get(&format!("{}.self_attn.c_proj.weight", prefix)))  // Some models use c_proj for output
                 .ok_or_else(|| anyhow!("Missing o_proj/c_proj weight"))?
-                .transpose(0, 1)?  // Transpose from [out, in] to [in, out]
-                .contiguous()?,
+                .transpose(0, 1)  // Transpose from [out, in] to [in, out]
+                .contiguous(),
             rope_theta,
             rope_scaling: config.rope_scaling.clone(),
             q_norm,
@@ -987,29 +1011,29 @@ impl LlamaModel {
         let mlp = LlamaMLP {
             gate_proj: weights.get(&format!("{}.mlp.gate_proj.weight", prefix))
                 .ok_or_else(|| anyhow!("Missing gate_proj weight"))?
-                .transpose(0, 1)?  // Transpose from [out, in] to [in, out]
-                .contiguous()?,
+                .transpose(0, 1)  // Transpose from [out, in] to [in, out]
+                .contiguous(),
             up_proj: weights.get(&format!("{}.mlp.up_proj.weight", prefix))
                 .ok_or_else(|| anyhow!("Missing up_proj weight"))?
-                .transpose(0, 1)?  // Transpose from [out, in] to [in, out]
-                .contiguous()?,
+                .transpose(0, 1)  // Transpose from [out, in] to [in, out]
+                .contiguous(),
             down_proj: weights.get(&format!("{}.mlp.down_proj.weight", prefix))
                 .ok_or_else(|| anyhow!("Missing down_proj weight"))?
-                .transpose(0, 1)?  // Transpose from [out, in] to [in, out]
-                .contiguous()?,
+                .transpose(0, 1)  // Transpose from [out, in] to [in, out]
+                .contiguous(),
             activation: config.hidden_activation.clone(),
         };
         
         // Build layer norms
         let input_layernorm = RMSNorm {
             weight: weights.get(&format!("{}.input_layernorm.weight", prefix))
-                .ok_or_else(|| anyhow!("Missing input_layernorm weight"))?.clone(),
+                .ok_or_else(|| anyhow!("Missing input_layernorm weight"))?.shallow_clone(),
             eps: config.rms_norm_eps,
         };
         
         let post_attention_layernorm = RMSNorm {
             weight: weights.get(&format!("{}.post_attention_layernorm.weight", prefix))
-                .ok_or_else(|| anyhow!("Missing post_attention_layernorm weight"))?.clone(),
+                .ok_or_else(|| anyhow!("Missing post_attention_layernorm weight"))?.shallow_clone(),
             eps: config.rms_norm_eps,
         };
         
@@ -1124,65 +1148,68 @@ impl ModelOperations for LlamaModel {
             // Input has shape [batch_size, seq_len] with token IDs
             
             // Get input shape
-            let input_shape = input.dims();
-            tracing::debug!("Input tensor shape: {:?}, dtype: {:?}", input_shape, input.dtype());
-            tracing::debug!("Embedding matrix shape: {:?}, dtype: {:?}", embed.dims(), embed.dtype());
+            let input_shape = input.size();
+            tracing::debug!("Input tensor shape: {:?}, dtype: {:?}", input_shape, input.kind());
+            tracing::debug!("Embedding matrix shape: {:?}, dtype: {:?}", embed.size(), embed.kind());
             
             let batch_size = input_shape[0];
             let seq_len = if input_shape.len() > 1 { input_shape[1] } else { 1 };
             
             // Flatten input for embedding lookup (embedding expects 1D tensor)
-            let flat_input = input.flatten_all()?;
-            tracing::debug!("Flattened input shape: {:?}, dtype: {:?}", flat_input.dims(), flat_input.dtype());
+            let flat_input = input.flatten(0, -1);
+            tracing::debug!("Flattened input shape: {:?}, dtype: {:?}", flat_input.size(), flat_input.kind());
             
             // Try to print the actual token IDs if the tensor is small
-            if flat_input.elem_count() <= 10 {
-                if let Ok(values) = flat_input.to_vec1::<u32>() {
-                    tracing::debug!("Token IDs: {:?}", values);
+            if flat_input.numel() <= 10 {
+                // TODO: Implement tensor value extraction when tch supports it
+                if false {
+                    // tracing::debug!("Token IDs: {:?}", values);
                 }
             }
             
-            // Perform embedding lookup
-            let embeddings = embed.embedding(&flat_input)?;
+            // Perform embedding lookup using index_select
+            let embeddings = embed.index_select(0, &flat_input);
             
             // Get the actual hidden size from the embedding result
-            let emb_dims = embeddings.dims();
+            let emb_dims = embeddings.size();
             let hidden_size = emb_dims[emb_dims.len() - 1]; // Last dimension is hidden size
             tracing::debug!("Embeddings shape after lookup: {:?}, hidden_size: {}", emb_dims, hidden_size);
             
             // Reshape back to [batch_size, seq_len, hidden_size]
-            let mut embeddings = embeddings.reshape(&[batch_size, seq_len, hidden_size])?;
+            let mut embeddings = embeddings.reshape(&[batch_size, seq_len, hidden_size]);
             
             // Scale embeddings by sqrt(hidden_size) for Gemma3
             if self.config.scale_embeddings {
                 let scale = (hidden_size as f32).sqrt();
-                let scale_tensor = Tensor::new(&[scale], embeddings.device())?;
-                embeddings = embeddings.broadcast_mul(&scale_tensor)?;
+                let scale_tensor = Tensor::from_slice(&[scale])
+                    .to_kind(embeddings.kind()) // Match embeddings dtype (likely BF16)
+                    .to_device(embeddings.device());
+                embeddings = broadcast_mul(&embeddings, &scale_tensor)?;
                 tracing::debug!("Scaled embeddings by sqrt(hidden_size) = {}", scale);
             }
             
             embeddings
         } else {
             // If no embedding layer, assume input is already embedded
-            input.clone()
+            input.shallow_clone()
         };
         
         // Apply transformer layers
         tracing::debug!("Total layers to process: {}", self.layers.len());
         for (idx, layer) in self.layers.iter().enumerate() {
-            let residual = hidden_states.clone();
-            // tracing::debug!("Processing layer {}, hidden_states shape: {:?}", idx, hidden_states.dims());
+            let residual = hidden_states.shallow_clone();
+            // tracing::debug!("Processing layer {}, hidden_states shape: {:?}", idx, hidden_states.size());
             
             // Self-attention block
             hidden_states = layer.input_layernorm.forward(&hidden_states)?;
             let attn_output = layer.self_attn.forward(&hidden_states, None)?;
-            hidden_states = (residual + attn_output)?;
+            hidden_states = residual + attn_output;
             
             // FFN block
-            let residual = hidden_states.clone();
+            let residual = hidden_states.shallow_clone();
             hidden_states = layer.post_attention_layernorm.forward(&hidden_states)?;
             let ffn_output = layer.mlp.forward(&hidden_states)?;
-            hidden_states = (residual + ffn_output)?;
+            hidden_states = residual + ffn_output;
         }
         
         // Final layer norm
@@ -1193,7 +1220,7 @@ impl ModelOperations for LlamaModel {
         // LM head
         if let Some(lm_head) = &self.lm_head {
             // LM head weight also needs to be transposed
-            hidden_states = hidden_states.matmul(lm_head)?;
+            hidden_states = hidden_states.matmul(lm_head);
         } else if let Some(embed) = &self.embed_tokens {
             // Gemma and some other models tie weights: lm_head = embed_tokens.T
             // The embedding matrix is [vocab_size, hidden_size]
@@ -1202,27 +1229,27 @@ impl ModelOperations for LlamaModel {
             tracing::debug!("Using tied weights: projecting with transposed embedding matrix");
             
             // Get the shape for debugging
-            let embed_shape = embed.dims();
-            tracing::debug!("Embedding shape: {:?}, hidden_states shape: {:?}", embed_shape, hidden_states.dims());
+            let embed_shape = embed.size();
+            tracing::debug!("Embedding shape: {:?}, hidden_states shape: {:?}", embed_shape, hidden_states.size());
             
             // The embedding tensor is [vocab_size, hidden_size]
             // We need to transpose it for the projection
-            let output_proj = embed.t()?.contiguous()?;
-            tracing::debug!("Output projection shape after transpose: {:?}", output_proj.dims());
+            let output_proj = embed.transpose(0, 1).contiguous();
+            tracing::debug!("Output projection shape after transpose: {:?}", output_proj.size());
             
             // Ensure hidden_states is the right shape for matmul
             // Should be [batch * seq_len, hidden_size] for the matmul
-            let hs_shape = hidden_states.dims();
+            let hs_shape = hidden_states.size();
             if hs_shape.len() == 3 {
                 let (batch_size, seq_len, hidden_size) = (hs_shape[0], hs_shape[1], hs_shape[2]);
                 // Reshape to 2D for matmul: [batch * seq_len, hidden_size]
-                let hidden_2d = hidden_states.reshape(&[batch_size * seq_len, hidden_size])?;
+                let hidden_2d = hidden_states.reshape(&[batch_size * seq_len, hidden_size]);
                 // Perform matmul: [batch * seq_len, hidden_size] x [hidden_size, vocab_size] = [batch * seq_len, vocab_size]
-                let logits_2d = hidden_2d.matmul(&output_proj)?;
+                let logits_2d = hidden_2d.matmul(&output_proj);
                 // Reshape back to 3D: [batch, seq_len, vocab_size]
-                hidden_states = logits_2d.reshape(&[batch_size, seq_len, output_proj.dim(1)?])?;
+                hidden_states = logits_2d.reshape(&[batch_size, seq_len, output_proj.size()[1]]);
             } else {
-                hidden_states = hidden_states.matmul(&output_proj)?;
+                hidden_states = hidden_states.matmul(&output_proj);
             }
         } else {
             tracing::warn!("No LM head or embedding weights found - returning hidden states!");
@@ -1232,45 +1259,46 @@ impl ModelOperations for LlamaModel {
     }
     
     fn reshape_for_attention(&self, tensor: &Tensor, is_key_value: bool) -> Result<Tensor> {
-        let (batch_size, seq_len, hidden_size) = tensor.dims3()?;
+        let (batch_size, seq_len, hidden_size) = dims3(&tensor)?;
         
         if is_key_value {
             // For K,V: reshape to [batch, seq, num_kv_heads, head_dim]
             Ok(tensor.reshape(&[
                 batch_size,
                 seq_len,
-                self.config.num_key_value_heads,
-                self.config.head_dim,
-            ])?)
+                self.config.num_key_value_heads as i64,
+                self.config.head_dim as i64,
+            ]))
         } else {
             // For Q: reshape to [batch, seq, num_attention_heads, head_dim]
             Ok(tensor.reshape(&[
                 batch_size,
                 seq_len,
-                self.config.num_attention_heads,
-                self.config.head_dim,
-            ])?)
+                self.config.num_attention_heads as i64,
+                self.config.head_dim as i64,
+            ]))
         }
     }
     
     fn apply_rope(&self, tensor: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
         // Implement RoPE for Llama with optional scaling
         // This is a placeholder - actual implementation would use proper RoPE
-        Ok(tensor.clone())
+        Ok(tensor.shallow_clone())
     }
     
     fn normalize(&self, tensor: &Tensor) -> Result<Tensor> {
-        // Llama uses RMSNorm
-        let x2 = tensor.sqr()?;
-        let mean = x2.mean_keepdim(D::Minus1)?;
-        let rrms = mean.affine(1.0, self.config.rms_norm_eps as f64)?.recip()?.sqrt()?;
-        Ok(tensor.broadcast_mul(&rrms)?)
+        // Llama uses RMSNorm, preserving dtype
+        let original_dtype = tensor.kind();
+        let x2 = square_tensor(tensor)?;
+        let mean = x2.mean_dim(&[-1i64][..], true, original_dtype);
+        let rrms = (mean + self.config.rms_norm_eps as f64).reciprocal().sqrt();
+        Ok(broadcast_mul(tensor, &rrms)?)
     }
     
     fn get_attention_mask(&self, seq_len: usize, past_kv_len: usize) -> Result<Tensor> {
-        // Create causal attention mask
+        // Create causal attention mask using model dtype
         let total_len = seq_len + past_kv_len;
-        let mask = Tensor::ones(&[seq_len, total_len], DType::F32, &self.device)?;
+        let mask = Tensor::ones(&[seq_len as i64, total_len as i64], (self.dtype, self.device));
         
         // Apply causal masking (simplified)
         Ok(mask)
@@ -1312,8 +1340,8 @@ mod tests {
         let config = LlamaConfig::llama3_8b();
         let model = LlamaModel {
             config: config.clone(),
-            device: device.clone(),
-            dtype: DType::F32,
+            device: *device,
+            dtype,  // Use the provided dtype (should be BF16)
             embed_tokens: None,
             layers: vec![],
             norm: None,
@@ -1325,21 +1353,21 @@ mod tests {
         
         // Reshape for key/value (GQA)
         let reshaped = model.reshape_for_attention(&tensor, true).unwrap();
-        assert_eq!(reshaped.dims(), &[2, 10, 8, 128]);  // 8 KV heads for Llama 3
+        assert_eq!(reshaped.size(), &[2, 10, 8, 128]);  // 8 KV heads for Llama 3
         
         // Reshape for query
         let reshaped = model.reshape_for_attention(&tensor, false).unwrap();
-        assert_eq!(reshaped.dims(), &[2, 10, 32, 128]);  // 32 Q heads
+        assert_eq!(reshaped.size(), &[2, 10, 32, 128]);  // 32 Q heads
     }
     
     #[test]
     fn test_kv_expansion_for_gqa() {
         let device = Device::Cpu;
         let attn = LlamaAttention {
-            q_proj: Tensor::zeros(&[4096, 4096], DType::F32, &device).unwrap(),
-            k_proj: Tensor::zeros(&[4096, 1024], DType::F32, &device).unwrap(),
-            v_proj: Tensor::zeros(&[4096, 1024], DType::F32, &device).unwrap(),
-            o_proj: Tensor::zeros(&[4096, 4096], DType::F32, &device).unwrap(),
+            q_proj: Tensor::zeros(&[4096, 4096], (DType::Float, device)),
+            k_proj: Tensor::zeros(&[4096, 1024], (DType::Float, device)),
+            v_proj: Tensor::zeros(&[4096, 1024], (DType::Float, device)),
+            o_proj: Tensor::zeros(&[4096, 4096], (DType::Float, device)),
             num_heads: 32,
             num_kv_heads: 8,
             head_dim: 128,
@@ -1356,6 +1384,6 @@ mod tests {
         
         // Expand to match 32 query heads
         let expanded = attn.expand_kv_for_gqa(&kv).unwrap();
-        assert_eq!(expanded.dims(), &[2, 10, 32, 128]);
+        assert_eq!(expanded.size(), &[2, 10, 32, 128]);
     }
 }

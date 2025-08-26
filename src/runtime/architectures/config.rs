@@ -1,6 +1,6 @@
 //! Architecture configuration traits and implementations
 
-use candle_core::DType;
+use tch::Kind as DType;
 
 /// Core configuration for model architectures
 pub trait ArchitectureConfig: Send + Sync {
@@ -60,9 +60,9 @@ pub trait ArchitectureConfig: Send + Sync {
         }
     }
     
-    /// Default dtype for this architecture
+    /// Default dtype for this architecture  
     fn default_dtype(&self) -> DType {
-        DType::F16
+        DType::Half  // F16 equivalent in tch
     }
 }
 

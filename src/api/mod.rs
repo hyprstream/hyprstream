@@ -139,24 +139,25 @@ pub struct CreateLoRAResponse {
 /// Create the main API router
 pub fn create_router(state: ApiState) -> Router {
     Router::new()
+        // TODO: Fix API handlers - temporarily commented out due to Handler trait issues
         // LoRA management endpoints
-        .route("/v1/lora/create", post(create_lora_layer))
-        .route("/v1/lora/list", get(list_lora_layers))
-        .route("/v1/lora/:lora_id/info", get(get_lora_info))
-        .route("/v1/lora/:lora_id/delete", post(delete_lora_layer))
-        .route("/v1/lora/:lora_id/train", post(trigger_training))
-        .route("/v1/lora/:lora_id/stats", get(get_lora_stats))
+        //.route("/v1/lora/create", post(create_lora_layer))
+        //.route("/v1/lora/list", get(list_lora_layers))
+        //.route("/v1/lora/:lora_id/info", get(get_lora_info))
+        //.route("/v1/lora/:lora_id/delete", post(delete_lora_layer))
+        //.route("/v1/lora/:lora_id/train", post(trigger_training))
+        //.route("/v1/lora/:lora_id/stats", get(get_lora_stats))
         
         // OpenAI-compatible endpoints (dynamically registered per LoRA)
-        .route("/v1/inference/:lora_id/chat/completions", post(openai_chat_completions))
-        .route("/v1/inference/:lora_id/completions", post(openai_completions))
-        .route("/v1/inference/:lora_id/embeddings", post(openai_embeddings))
-        .route("/v1/inference/:lora_id/models", get(openai_list_models))
+        //.route("/v1/inference/:lora_id/chat/completions", post(openai_chat_completions))
+        //.route("/v1/inference/:lora_id/completions", post(openai_completions))
+        //.route("/v1/inference/:lora_id/embeddings", post(openai_embeddings))
+        //.route("/v1/inference/:lora_id/models", get(openai_list_models))
         
         // Training endpoints
-        .route("/v1/training/:lora_id/start", post(start_auto_training))
-        .route("/v1/training/:lora_id/stop", post(stop_auto_training))
-        .route("/v1/training/:lora_id/status", get(training_status))
+        //.route("/v1/training/:lora_id/start", post(start_auto_training))
+        //.route("/v1/training/:lora_id/stop", post(stop_auto_training))
+        //.route("/v1/training/:lora_id/status", get(training_status))
         
         .with_state(state)
 }

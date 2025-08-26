@@ -27,7 +27,7 @@ pub use storage::{
     SparseWeightUpdate, EmbeddingMatch, SparseStorageError
 };
 pub use runtime::{
-    RuntimeEngine, CandleEngine, LoRAEngineWrapper, SparseLoRAAdapter, LoRAConfig,
+    RuntimeEngine, TorchEngine, LoRAEngineWrapper, SparseLoRAAdapter, LoRAConfig,
     ModelInfo, GenerationRequest, GenerationResult, FinishReason, RuntimeConfig,
     XLoRAAdapter, AdaptationMode, UserFeedback, XLoRARoutingStrategy, AdapterMetrics,
     // Model Evolution System exports
@@ -35,3 +35,9 @@ pub use runtime::{
     ConversationContext, ModelPool, AdaptationType, AdaptationTrigger, ModelState,
     PoolStats, RoutingConfig, create_conversation_router
 };
+
+// Export TorchEngine as HyprStreamEngine for backward compatibility
+pub use runtime::TorchEngine as HyprStreamEngine;
+
+// Export init function from runtime 
+pub use runtime::create_engine as init;

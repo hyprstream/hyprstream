@@ -3,7 +3,7 @@
 use crate::{
     storage::{VDBSparseStorage, SparseStorageConfig},
     inference::InferenceAPI,
-    runtime::{RuntimeEngine, CandleEngine},
+    runtime::{RuntimeEngine, TorchEngine},
 };
 use ::config::{Config, File};
 use std::{
@@ -983,7 +983,7 @@ pub async fn handle_model_command(
         ModelAction::Infer { model, prompt, max_tokens, temperature, top_p, top_k, stream, force_download } => {
             info!("🤖 Running base model inference (no LoRA): {}", model);
             
-            use crate::runtime::{CandleEngine, RuntimeConfig};
+            use crate::runtime::{TorchEngine, RuntimeConfig};
             use crate::runtime::sampling::{SamplingConfig, load_sampling_config};
             use std::path::PathBuf;
             
@@ -1058,7 +1058,7 @@ pub async fn handle_model_command(
             
             println!("🚀 Initializing inference engine...");
             let runtime_config = RuntimeConfig::default();
-            let mut engine = CandleEngine::new(runtime_config)?;
+            let mut engine = TorchEngine::new(runtime_config)?;
             
             // Apply overrides to sampling config
             let mut final_config = sampling_config;
@@ -1073,7 +1073,9 @@ pub async fn handle_model_command(
             }
             final_config.do_sample = final_config.temperature > 0.0;
             
-            engine.sampling_config = final_config.clone();
+            // Store the sampling config for later use
+            // Note: TorchEngine doesn't have direct sampling config fields yet
+            // This will be used when generating text
             
             println!("📦 Loading base model (NO LoRA will be applied)...");
             
@@ -1143,9 +1145,9 @@ pub async fn handle_model_command(
                      result.latency_ms as f64 / 1000.0);
         }
         ModelAction::Test { path, prompt, max_tokens, xlora, xlora_model_id, max_adapters } => {
-            info!("🧪 Testing model inference with CandleEngine: {}", path.display());
+            info!("🧪 Testing model inference with TorchEngine: {}", path.display());
             
-            use crate::runtime::{CandleEngine, RuntimeConfig};
+            use crate::runtime::{TorchEngine, RuntimeConfig};
             
             if !path.exists() {
                 eprintln!("❌ Model file not found: {}", path.display());
@@ -1153,9 +1155,9 @@ pub async fn handle_model_command(
                 return Ok(());
             }
             
-            println!("🚀 Initializing CandleEngine...");
+            println!("🚀 Initializing TorchEngine...");
             let runtime_config = RuntimeConfig::default();
-            let mut engine = CandleEngine::new(runtime_config)?;
+            let mut engine = TorchEngine::new(runtime_config)?;
             
             if xlora {
                 if let Some(xlora_id) = xlora_model_id {
@@ -2573,11 +2575,11 @@ async fn run_checkpoint_inference(
         return Err(anyhow::anyhow!("Weights file not found: {}", weights_path.display()));
     }
     
-    println!("📥 Loading base model with CandleEngine...");
+    println!("📥 Loading base model with TorchEngine...");
     
-    // Create CandleEngine for SafeTensors inference
+    // Create TorchEngine for SafeTensors inference
     let engine_config = crate::runtime::RuntimeConfig::default();
-    let mut engine = crate::runtime::CandleEngine::new(engine_config)?;
+    let mut engine = crate::runtime::TorchEngine::new(engine_config)?;
     
     // Load the base model
     engine.load_model(model_path).await?;
@@ -3065,7 +3067,7 @@ pub async fn handle_chat_command(
     if let Some(prompt) = cmd.prompt {
         println!("\n🤖 Processing prompt: {}", prompt);
         
-        // Try to run actual inference with CandleEngine
+        // Try to run actual inference with TorchEngine
         match run_chat_inference(&cmd.model_id, &prompt, cmd.max_tokens, cmd.temperature).await {
             Ok(response) => {
                 println!("\n📤 Response:");
@@ -3083,11 +3085,8 @@ pub async fn handle_chat_command(
                     let expected_response = format!("Hello! I'm a helpful AI assistant. How can I help you today?");
                     
                     match run_temporal_training(&cmd.model_id, &prompt, &expected_response).await {
-                        Ok(training_result) => {
-                            println!("✅ Training completed:");
-                            println!("   Loss: {:.4}", training_result.loss);
-                            println!("   Gradient updates: {}", training_result.gradient_updates);
-                            println!("   Tokens processed: {}", training_result.tokens_processed);
+                        Ok(()) => {
+                            println!("✅ Training completed successfully");
                         }
                         Err(e) => {
                             println!("⚠️ Training error: {}", e);
@@ -3149,8 +3148,8 @@ async fn run_chat_inference(
     let runtime_config = RuntimeConfig::default();
     // Temperature will be used in generation request, not runtime config
     
-    // Create CandleEngine
-    let mut engine = CandleEngine::new_async(runtime_config).await?;
+    // Create TorchEngine
+    let mut engine = TorchEngine::new_async(runtime_config).await?;
     
     // Find and load the model
     let storage_paths = crate::storage::StoragePaths::new()?;
@@ -3212,22 +3211,22 @@ async fn run_chat_inference(
     Ok(result.text)
 }
 
-/// Run temporal LoRA training using CandleEngine
+/// Run temporal LoRA training using TorchEngine
 async fn run_temporal_training(
     model_id: &str,
     prompt: &str,
     expected_response: &str,
-) -> Result<crate::runtime::candle_engine::TrainingResult, Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>> {
     use crate::config::RuntimeConfig;
-    use crate::runtime::candle_engine::CandleEngine;
+    use crate::runtime::TorchEngine;
     
     tracing::info!("🎓 Starting temporal LoRA training for model: {}", model_id);
     
     // Create runtime config
     let runtime_config = RuntimeConfig::default();
     
-    // Create CandleEngine
-    let mut engine = CandleEngine::new_async(runtime_config).await?;
+    // Create TorchEngine
+    let mut engine = TorchEngine::new_async(runtime_config).await?;
     
     // Find and load the model (reuse same logic as run_candle_inference)
     let storage_paths = crate::storage::StoragePaths::new()?;
@@ -3267,10 +3266,9 @@ async fn run_temporal_training(
     
     // Run temporal LoRA training
     let learning_rate = 0.001; // Default learning rate
-    let training_result = engine.train_temporal_lora(prompt, expected_response, learning_rate).await?;
+    engine.train_temporal_lora(prompt, expected_response, learning_rate).await?;
     
-    tracing::info!("✅ Temporal LoRA training completed with {} gradient updates", 
-                  training_result.gradient_updates);
+    tracing::info!("✅ Temporal LoRA training completed");
     
-    Ok(training_result)
+    Ok(())
 }

@@ -7,7 +7,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::CandleEngine;
+use super::TorchEngine;
 use crate::adapters::LoRAWeightsData;
 
 /// Request for text generation
@@ -54,7 +54,7 @@ pub struct InferenceResult {
     pub latency_ms: u64,
 }
 
-/// Extension trait for CandleEngine to add clean inference methods
+/// Extension trait for TorchEngine to add clean inference methods
 pub trait InferenceExt {
     /// Run inference with the given request
     async fn run_inference(&mut self, request: InferenceRequest) -> Result<InferenceResult>;
@@ -69,7 +69,7 @@ pub trait InferenceExt {
         F: FnMut(&str) + Send;
 }
 
-impl InferenceExt for CandleEngine {
+impl InferenceExt for TorchEngine {
     async fn run_inference(&mut self, request: InferenceRequest) -> Result<InferenceResult> {
         let start_time = std::time::Instant::now();
         
@@ -151,7 +151,7 @@ impl InferenceExt for CandleEngine {
 }
 
 /// Apply LoRA weights to the engine
-async fn apply_lora_to_engine(engine: &mut CandleEngine, weights: &LoRAWeightsData) -> Result<()> {
+async fn apply_lora_to_engine(engine: &mut TorchEngine, weights: &LoRAWeightsData) -> Result<()> {
     // TODO: Implement actual LoRA weight application
     // For now, this is a placeholder that logs the intent
     tracing::debug!(

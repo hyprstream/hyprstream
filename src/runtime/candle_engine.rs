@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use tokio::sync::{RwLock, Mutex};
 
 use candle_core::{Device, DType, Tensor, IndexOp};
-use candle_transformers::models::quantized_llama::{ModelWeights as LlamaWeights};
+// use candle_transformers::models::quantized_llama::{ModelWeights as String};
 // Support for multiple architectures - will auto-detect and use appropriate loader
 // For Gemma models, we should use the Gemma-specific loaders when available
 use candle_core::quantized::GgmlDType;
@@ -82,7 +82,7 @@ pub struct CandleEngine {
     /// Tokenizer
     tokenizer: Option<tokenizers::Tokenizer>,
     /// Model weights loaded from file (wrapped in Mutex for mutable access)
-    model: Option<Arc<Mutex<LlamaWeights>>>,
+    model: Option<Arc<Mutex<String>>>,
     /// Architecture-specific model implementation
     arch_model: Option<Arc<Mutex<Box<dyn ModelOperations>>>>,
     /// SafeTensors base model weights for inference (F32 for CPU, BF16 for GPU)

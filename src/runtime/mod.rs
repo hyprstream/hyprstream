@@ -1,7 +1,8 @@
 //! Runtime abstraction layer for inference engines
 //! 
 //! This module provides a unified interface for different inference engines:
-//! - CandleEngine: Primary engine with VDB storage and temporal adaptation
+//! - TorchEngine: Primary PyTorch-based engine with tch-rs
+//! - CandleEngine: Legacy Candle engine (DEPRECATED)
 //! - LlamaCppEngine: Legacy engine for reference (DEPRECATED)
 
 use anyhow::Result;
@@ -14,7 +15,8 @@ pub use crate::config::{
     ModelInfo, GenerationRequest, GenerationResult, FinishReason
 };
 
-pub mod candle_engine;        // Candle-based engine with VDB integration
+pub mod torch_engine;         // PyTorch-based engine with tch-rs
+pub mod tensor_helpers;      // Helper functions for Tch tensor operations
 pub mod lora_wrapper;
 pub mod conversation_router;  // Seamless model evolution and routing
 pub mod precision;           // BF16/FP8 precision management
@@ -23,8 +25,8 @@ pub mod architectures;       // Architecture-specific model implementations
 pub mod sampling;            // Token sampling strategies with model-specific configs
 pub mod inference;           // Clean inference interface with request/response patterns
 
-// Primary exports - use CandleEngine as default
-pub use candle_engine::CandleEngine;
+// Primary exports - use TorchEngine as default
+pub use torch_engine::TorchEngine;
 pub use inference::{InferenceRequest, InferenceResult, InferenceExt};
 
 // Temporary placeholder types during migration
@@ -128,9 +130,9 @@ pub trait RuntimeEngine: Send + Sync {
     }
 }
 
-/// Create the default runtime engine (now uses Candle)
-pub fn create_engine(config: &RuntimeConfig) -> Result<CandleEngine> {
-    CandleEngine::new(config.clone())
+/// Create the default runtime engine (now uses PyTorch)
+pub fn create_engine(config: &RuntimeConfig) -> Result<TorchEngine> {
+    TorchEngine::new(config.clone())
 }
 
 /// Create conversation router with model pool and temporal streaming

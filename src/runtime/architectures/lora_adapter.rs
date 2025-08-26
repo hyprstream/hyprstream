@@ -3,7 +3,7 @@
 use super::ModelArchitecture;
 use crate::adapters::sparse_lora::SparseLoRAAdapter;
 use anyhow::{Result, anyhow};
-use candle_core::{Device, DType, Tensor};
+use tch::{Device, Kind as DType, Tensor};
 use std::collections::HashMap;
 
 /// Architecture-aware LoRA adapter that handles shape conversions
@@ -150,39 +150,41 @@ impl ArchitectureAwareLoRAAdapter {
             self.apply_transformation(weights, mapping)
         } else {
             // No specific mapping, return as-is
-            Ok(weights.clone())
+            Ok(weights.shallow_clone())
         }
     }
     
     /// Apply shape transformation
     fn apply_transformation(&self, tensor: &Tensor, mapping: &ShapeMapping) -> Result<Tensor> {
         match &mapping.transform {
-            TransformType::Identity => Ok(tensor.clone()),
+            TransformType::Identity => Ok(tensor.shallow_clone()),
             
             TransformType::Reshape => {
-                Ok(tensor.reshape(mapping.target_shape.as_slice())?)
+                let target_shape: Vec<i64> = mapping.target_shape.iter().map(|&x| x as i64).collect();
+                Ok(tensor.reshape(&target_shape))
             }
             
             TransformType::Repeat { axis, factor } => {
                 // Repeat along specified axis
-                let mut new_shape = tensor.dims().to_vec();
-                new_shape[*axis] *= factor;
-                Ok(tensor.unsqueeze(*axis + 1)?
-                    .expand(new_shape.as_slice())?
-                    .reshape(mapping.target_shape.as_slice())?)
+                let mut new_shape = tensor.size();
+                new_shape[*axis] *= *factor as i64;
+                let target_shape: Vec<i64> = mapping.target_shape.iter().map(|&x| x as i64).collect();
+                Ok(tensor.unsqueeze((*axis + 1) as i64)
+                    .expand(&new_shape, false)
+                    .reshape(&target_shape))
             }
             
             TransformType::Split { axis, num_splits } => {
                 // Split tensor along axis
-                let _chunk_size = tensor.dim(*axis)? / num_splits;
-                let chunks = tensor.chunk(*num_splits, *axis)?;
+                let _chunk_size = tensor.size()[*axis] / (*num_splits as i64);
+                let chunks = tensor.chunk(*num_splits as i64, *axis as i64);
                 
                 // Stack chunks to create new dimension
-                Ok(Tensor::stack(&chunks, 0)?)
+                Ok(Tensor::stack(&chunks, 0))
             }
             
             TransformType::Transpose { dim1, dim2 } => {
-                Ok(tensor.transpose(*dim1, *dim2)?)
+                Ok(tensor.transpose(*dim1 as i64, *dim2 as i64))
             }
         }
     }
@@ -360,6 +362,6 @@ mod tests {
         
         // Adapt for k_proj (should work with Gemma's MQA)
         let adapted = adapter.adapt_weights("k_proj", &weight).unwrap();
-        assert_eq!(adapted.dims(), weight.dims());  // Identity transform for Gemma K
+        assert_eq!(adapted.size(), weight.size());  // Identity transform for Gemma K
     }
 }

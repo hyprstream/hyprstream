@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use async_trait::async_trait;
-use candle_core::Device;
+use tch::Device;
 use tempfile::NamedTempFile;
 
 /// Model format types

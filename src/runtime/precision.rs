@@ -4,7 +4,7 @@
 //! for different hardware targets and use cases.
 
 use anyhow::{Result, anyhow};
-use candle_core::{DType, Device, Tensor};
+use tch::{Kind as DType, Device, Tensor};
 use std::fmt;
 use super::fp8::{FP8Format, FP8Config, FP8Scaler};
 
@@ -51,28 +51,28 @@ impl PrecisionConfig {
                     return Err(anyhow!("BF16 not supported on this device"));
                 }
                 Ok(Self {
-                    base_model_dtype: DType::BF16,
-                    lora_adapter_dtype: DType::BF16,
-                    gradient_dtype: DType::BF16,
-                    optimizer_dtype: DType::F32,
-                    compute_dtype: DType::BF16,
+                    base_model_dtype: DType::Half,
+                    lora_adapter_dtype: DType::Half,
+                    gradient_dtype: DType::Half,
+                    optimizer_dtype: DType::Float,
+                    compute_dtype: DType::Half,
                     scaling_manager: None,
                 })
             }
             PrecisionMode::FP16Fallback => Ok(Self {
-                base_model_dtype: DType::F16,
-                lora_adapter_dtype: DType::F16,
-                gradient_dtype: DType::F16,
-                optimizer_dtype: DType::F32,
-                compute_dtype: DType::F16,
+                base_model_dtype: DType::Half,
+                lora_adapter_dtype: DType::Half,
+                gradient_dtype: DType::Half,
+                optimizer_dtype: DType::Float,
+                compute_dtype: DType::Half,
                 scaling_manager: None,
             }),
             PrecisionMode::FP32Full => Ok(Self {
-                base_model_dtype: DType::F32,
-                lora_adapter_dtype: DType::F32,
-                gradient_dtype: DType::F32,
-                optimizer_dtype: DType::F32,
-                compute_dtype: DType::F32,
+                base_model_dtype: DType::Float,
+                lora_adapter_dtype: DType::Float,
+                gradient_dtype: DType::Float,
+                optimizer_dtype: DType::Float,
+                compute_dtype: DType::Float,
                 scaling_manager: None,
             }),
             PrecisionMode::FP8Mixed { forward, backward, master } => {
@@ -83,10 +83,10 @@ impl PrecisionConfig {
                 }
                 
                 Ok(Self {
-                    base_model_dtype: forward.to_dtype().unwrap_or(DType::BF16),
+                    base_model_dtype: forward.to_dtype().unwrap_or(DType::Half),
                     lora_adapter_dtype: master, // LoRA stays in higher precision!
-                    gradient_dtype: backward.to_dtype().unwrap_or(DType::BF16),
-                    optimizer_dtype: DType::F32,
+                    gradient_dtype: backward.to_dtype().unwrap_or(DType::Half),
+                    optimizer_dtype: DType::Float,
                     compute_dtype: master,
                     scaling_manager: Some(ScalingManager::new()),
                 })
@@ -105,7 +105,7 @@ impl PrecisionConfig {
                 PrecisionMode::FP8Mixed {
                     forward: FP8Format::E4M3,
                     backward: FP8Format::E5M2,
-                    master: DType::BF16,
+                    master: DType::Half,
                 },
                 device,
             ).unwrap_or_else(|_| Self::bf16_default())
@@ -115,7 +115,7 @@ impl PrecisionConfig {
                 PrecisionMode::FP8Mixed {
                     forward: FP8Format::E4M3,
                     backward: FP8Format::E4M3, // Use E4M3 for both
-                    master: DType::BF16,
+                    master: DType::Half,
                 },
                 device,
             ).unwrap_or_else(|_| Self::bf16_default())
@@ -129,11 +129,11 @@ impl PrecisionConfig {
     /// BF16 default configuration
     pub fn bf16_default() -> Self {
         Self {
-            base_model_dtype: DType::BF16,
-            lora_adapter_dtype: DType::BF16,
-            gradient_dtype: DType::BF16,
-            optimizer_dtype: DType::F32,
-            compute_dtype: DType::BF16,
+            base_model_dtype: DType::Half,
+            lora_adapter_dtype: DType::Half,
+            gradient_dtype: DType::Half,
+            optimizer_dtype: DType::Float,
+            compute_dtype: DType::Half,
             scaling_manager: None,
         }
     }
@@ -141,11 +141,11 @@ impl PrecisionConfig {
     /// FP16 fallback configuration
     pub fn fp16_fallback() -> Self {
         Self {
-            base_model_dtype: DType::F16,
-            lora_adapter_dtype: DType::F16,
-            gradient_dtype: DType::F16,
-            optimizer_dtype: DType::F32,
-            compute_dtype: DType::F16,
+            base_model_dtype: DType::Half,
+            lora_adapter_dtype: DType::Half,
+            gradient_dtype: DType::Half,
+            optimizer_dtype: DType::Float,
+            compute_dtype: DType::Half,
             scaling_manager: None,
         }
     }
@@ -160,7 +160,8 @@ impl PrecisionConfig {
                 // This is a simplified check - real implementation would query device
                 true // Assume modern GPU for now
             }
-            Device::Metal(_) => true, // M1/M2/M3 support BF16
+            Device::Mps => true, // M1/M2/M3 support BF16
+            Device::Vulkan => false, // Vulkan support varies by implementation
         }
     }
 
@@ -179,14 +180,14 @@ impl PrecisionConfig {
             TensorTarget::Compute => self.compute_dtype,
         };
 
-        if tensor.dtype() == target_dtype {
-            Ok(tensor.clone())
+        if tensor.kind() == target_dtype {
+            Ok(super::tensor_helpers::clone_tensor(tensor))
         } else {
             // Apply scaling if needed (for FP8)
             if let Some(ref scaler) = self.scaling_manager {
                 scaler.scale_and_convert(tensor, target_dtype)
             } else {
-                Ok(tensor.to_dtype(target_dtype)?)
+                Ok(tensor.to_dtype(target_dtype, false, false))
             }
         }
     }
@@ -225,7 +226,7 @@ impl ScalingManager {
         // 4. Convert to FP8
         // 5. Store scale factor for backward pass
         
-        Ok(tensor.to_dtype(target_dtype)?)
+        Ok(tensor.to_dtype(target_dtype, false, false))
     }
 
     /// Update scaling based on gradient statistics
@@ -273,7 +274,7 @@ impl HardwareCapabilities {
                     compute_capability: Some((8, 6)), // Example: RTX 3090
                 }
             }
-            Device::Metal(_) => Self {
+            Device::Mps => Self {
                 supports_bf16: true,
                 supports_fp8: false,
                 supports_int8: false,
@@ -285,6 +286,13 @@ impl HardwareCapabilities {
                 supports_fp8: false,
                 supports_int8: true,
                 memory_gb: 64.0, // System RAM placeholder
+                compute_capability: None,
+            },
+            Device::Vulkan => Self {
+                supports_bf16: false,
+                supports_fp8: false,
+                supports_int8: false,
+                memory_gb: 8.0, // Placeholder
                 compute_capability: None,
             },
         }
@@ -299,7 +307,7 @@ impl HardwareCapabilities {
                 } else {
                     FP8Format::E4M3 // Fallback to E4M3 for both
                 },
-                master: DType::BF16,
+                master: DType::Half,
             }
         } else if self.supports_bf16 {
             PrecisionMode::BF16Standard

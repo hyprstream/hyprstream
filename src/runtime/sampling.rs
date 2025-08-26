@@ -4,7 +4,7 @@
 //! with model-specific configurations loaded from HuggingFace model cards.
 
 use anyhow::Result;
-use candle_core::Tensor;
+use tch::Tensor;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -237,21 +237,21 @@ impl TokenSampler {
     /// Sample next token from logits
     pub fn sample(&mut self, logits: &Tensor) -> Result<u32> {
         // Debug: Check logits statistics
-        if let Ok(logits_vec) = logits.to_vec1::<f32>() {
+        if let Ok(logits_vec) = Vec::<f32>::try_from(logits.shallow_clone()) {
             let max = logits_vec.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
             let min = logits_vec.iter().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
-            eprintln!("DEBUG: Logits shape: {:?}, min={:.3}, max={:.3}", logits.dims(), min, max);
+            eprintln!("DEBUG: Logits shape: {:?}, min={:.3}, max={:.3}", logits.size(), min, max);
         }
         // Apply repetition penalty if needed
         let logits = if self.config.repetition_penalty != 1.0 && !self.token_history.is_empty() {
             self.apply_repetition_penalty(logits)?
         } else {
-            logits.clone()
+            logits.shallow_clone()
         };
         
         // If not sampling, use greedy decoding
         if !self.config.do_sample {
-            let token = logits.argmax(0)?.to_scalar::<u32>()?;
+            let token = logits.argmax(0, false).int64_value(&[]) as u32;
             eprintln!("DEBUG: Using greedy decoding, selected token {}", token);
             self.token_history.push(token);
             return Ok(token);
@@ -259,8 +259,7 @@ impl TokenSampler {
         
         // Apply temperature
         let logits = if self.config.temperature != 1.0 {
-            let temp_scalar = Tensor::new(&[self.config.temperature], logits.device())?;
-            logits.broadcast_div(&temp_scalar)?
+            logits / self.config.temperature as f64
         } else {
             logits
         };
@@ -280,7 +279,7 @@ impl TokenSampler {
     
     /// Apply repetition penalty to logits
     fn apply_repetition_penalty(&self, logits: &Tensor) -> Result<Tensor> {
-        let mut logits_vec = logits.to_vec1::<f32>()?;
+        let mut logits_vec: Vec<f32> = Vec::try_from(logits.shallow_clone()).map_err(|e| anyhow::anyhow!("Tensor conversion failed: {:?}", e))?;
         
         for &token_id in &self.token_history {
             if (token_id as usize) < logits_vec.len() {
@@ -293,14 +292,13 @@ impl TokenSampler {
             }
         }
         
-        Tensor::from_vec(logits_vec, logits.shape(), &logits.device())
-            .map_err(|e| anyhow::anyhow!("Failed to create tensor from vector: {}", e))
+        Ok(Tensor::from_slice(&logits_vec).to_device(logits.device()).view_as(logits))
     }
     
     /// Top-k and top-p sampling
     fn top_k_top_p_sampling(&mut self, logits: &Tensor) -> Result<u32> {
-        let probs = candle_nn::ops::softmax(logits, 0)?;
-        let mut probs_vec = probs.to_vec1::<f32>()?;
+        let probs = logits.softmax(0, tch::Kind::Float);
+        let mut probs_vec: Vec<f32> = Vec::try_from(probs).map_err(|e| anyhow::anyhow!("Tensor conversion failed: {:?}", e))?;
         
         // Get indices sorted by probability
         let mut indices: Vec<usize> = (0..probs_vec.len()).collect();
@@ -353,8 +351,8 @@ impl TokenSampler {
     
     /// Typical-p sampling (locally typical sampling)
     fn typical_p_sampling(&mut self, logits: &Tensor, typical_p: f32) -> Result<u32> {
-        let probs = candle_nn::ops::softmax(logits, 0)?;
-        let probs_vec = probs.to_vec1::<f32>()?;
+        let probs = logits.softmax(0, tch::Kind::Float);
+        let probs_vec: Vec<f32> = Vec::try_from(probs).map_err(|e| anyhow::anyhow!("Tensor conversion failed: {:?}", e))?;
         
         // Calculate entropy
         let entropy: f32 = probs_vec.iter()
@@ -414,8 +412,8 @@ impl TokenSampler {
     
     /// Simple multinomial sampling from logits
     fn multinomial_sampling(&mut self, logits: &Tensor) -> Result<u32> {
-        let probs = candle_nn::ops::softmax(logits, 0)?;
-        let probs_vec = probs.to_vec1::<f32>()?;
+        let probs = logits.softmax(0, tch::Kind::Float);
+        let probs_vec: Vec<f32> = Vec::try_from(probs).map_err(|e| anyhow::anyhow!("Tensor conversion failed: {:?}", e))?;
         self.sample_from_probs(&probs_vec)
     }
     

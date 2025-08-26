@@ -9,7 +9,7 @@
 use super::{ModelArchitecture, ModelOperations, ArchitectureConfig};
 use super::llama::{LlamaModel, LlamaConfig};
 use anyhow::{Result, anyhow};
-use candle_core::{Device, DType, Tensor};
+use tch::{Device, Kind as DType, Tensor};
 use std::collections::HashMap;
 
 /// Create a Qwen model by adapting Llama implementation
@@ -48,7 +48,7 @@ impl QwenAdapter {
                 // Update vocab size if detected from weights
                 if let Some(embed) = weights.get("model.embed_tokens.weight")
                     .or_else(|| weights.get("embed_tokens.weight")) {
-                    config.vocab_size = embed.dims()[0];
+                    config.vocab_size = embed.size()[0] as usize;
                 }
             }
             2 => {

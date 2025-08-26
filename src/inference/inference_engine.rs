@@ -2,7 +2,7 @@
 
 use crate::inference::{InferenceInput, InferenceOutput, InferenceToken, FusedAdapterWeights};
 use crate::inference::model_loader::ModelLoader;
-use crate::runtime::{RuntimeEngine, CandleEngine};
+use crate::runtime::{RuntimeEngine, TorchEngine};
 use crate::config::{HyprConfig};
 use crate::storage::vdb::hardware_accelerated::HardwareVDBStorage;
 
@@ -19,7 +19,7 @@ pub struct InferenceEngine {
     config: HyprConfig,
     
     /// Candle runtime engine  
-    candle_engine: RwLock<Option<CandleEngine>>,
+    torch_engine: RwLock<Option<TorchEngine>>,
     
     /// Currently loaded model path
     current_model_path: RwLock<Option<String>>,
@@ -48,7 +48,7 @@ impl InferenceEngine {
         
         Ok(Self {
             config,
-            candle_engine: RwLock::new(None),
+            torch_engine: RwLock::new(None),
             current_model_path: RwLock::new(None),
             stats: RwLock::new(InferenceEngineStats::default()),
         })
@@ -59,13 +59,13 @@ impl InferenceEngine {
         println!("📥 Loading model: {}", model_path.display());
         
         // Create and initialize Candle engine using unified config (async version)
-        let mut candle_engine = CandleEngine::new_async(self.config.runtime.clone()).await?;
-        candle_engine.load_model(model_path).await?;
+        let mut torch_engine = TorchEngine::new_async(self.config.runtime.clone()).await?;
+        torch_engine.load_model(model_path).await?;
         
         // Store the engine and model path
         {
-            let mut engine_guard = self.candle_engine.write().await;
-            *engine_guard = Some(candle_engine);
+            let mut engine_guard = self.torch_engine.write().await;
+            *engine_guard = Some(torch_engine);
         }
         
         {
@@ -80,8 +80,8 @@ impl InferenceEngine {
     /// Generate text using LLaMA.cpp with unified config
     pub async fn generate_text(&self, prompt: &str, max_tokens: usize) -> Result<String> {
         // Get the Candle engine
-        let engine_guard = self.candle_engine.read().await;
-        let candle_engine = engine_guard.as_ref()
+        let engine_guard = self.torch_engine.read().await;
+        let torch_engine = engine_guard.as_ref()
             .ok_or_else(|| anyhow!("No model loaded. Call load_model() first."))?;
         
         println!("🤖 Generating text with Candle: \"{}\" (max_tokens: {})", 
@@ -92,7 +92,7 @@ impl InferenceEngine {
         let start_time = std::time::Instant::now();
         let mut token_count = 0;
         
-        let result = candle_engine.generate_streaming(prompt, max_tokens, |token| {
+        let result = torch_engine.generate_streaming(prompt, max_tokens, |token| {
             print!("{}", token);
             io::stdout().flush().unwrap();
             token_count += 1;
@@ -126,7 +126,7 @@ impl InferenceEngine {
     
     /// Check if a model is loaded
     pub async fn is_model_loaded(&self) -> bool {
-        let engine_guard = self.candle_engine.read().await;
+        let engine_guard = self.torch_engine.read().await;
         engine_guard.is_some()
     }
     
@@ -400,8 +400,8 @@ impl InferenceEngine {
     
     /// Apply LoRA adapters to the Candle engine
     async fn apply_lora_adapters(&self, fused_weights: &FusedAdapterWeights) -> Result<()> {
-        let mut engine_guard = self.candle_engine.write().await;
-        let _candle_engine = engine_guard.as_mut()
+        let mut engine_guard = self.torch_engine.write().await;
+        let _torch_engine = engine_guard.as_mut()
             .ok_or_else(|| anyhow!("No model loaded. Call load_model() first."))?;
         
         println!("⚡ Integrating {} LoRA adapters with Candle engine", fused_weights.weights.len());
@@ -414,7 +414,7 @@ impl InferenceEngine {
             let lora_weights = self.convert_sparse_to_lora_weights_data(adapter).await?;
             
             // TODO: Apply to Candle engine when RuntimeEngine trait is implemented
-            tracing::warn!("Adapter application to engine not yet fully implemented in CandleEngine");
+            tracing::warn!("Adapter application to engine not yet fully implemented in TorchEngine");
         }
         
         println!("✅ LoRA adapters applied successfully");

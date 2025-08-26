@@ -28,7 +28,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Server(cmd) => (&cmd.logging.get_effective_level(), &cmd.logging.log_filter),
         Commands::Model(_) => (&"info", &None),
         Commands::Lora(_) => (&"info", &None),
-        Commands::QuickStart(_) => (&"info", &None),
         Commands::Auth(_) => (&"info", &None),
         Commands::Chat(_) => (&"info", &None),
     };
@@ -85,9 +84,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Lora(cmd) => {
             let server_url = "http://localhost:50051".to_string(); // Default server URL
             handle_lora_command(cmd, server_url).await?
-        }
-        Commands::QuickStart(cmd) => {
-            hyprstream_core::cli::commands::quick_start::handle_quick_start(cmd).await?
         }
         Commands::Auth(cmd) => {
             handle_auth_command(cmd).await?

@@ -298,17 +298,6 @@ pub async fn download_model(
     }
 }
 
-/// Quick start model downloader - downloads the recommended model for testing
-pub async fn quick_start_download() -> Result<PathBuf> {
-    println!("🚀 Quick Start Model Download");
-    println!("📥 This will download a small quantized model suitable for testing");
-    println!();
-    
-    // Use configuration-managed storage paths
-    let config = HyprConfig::load().unwrap_or_default();
-    download_qwen3_model(Some(&config)).await
-}
-
 /// Register a downloaded model with the storage system
 async fn register_downloaded_model(
     model_uri: &str,

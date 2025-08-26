@@ -5,7 +5,7 @@
 //! tensor shape handling and LoRA compatibility.
 
 use anyhow::{Result, anyhow};
-use candle_core::{Device, DType, Tensor};
+use tch::{Device, Kind as DType, Tensor};
 use std::path::Path;
 
 pub mod detector;
@@ -179,7 +179,7 @@ impl ModelFactory {
                 // Check if this is Gemma3 by looking for specific config indicators
                 let is_gemma3 = weights.keys().any(|k| k.contains("model.layers.0.mlp.gate_proj"))
                     && weights.get("model.embed_tokens.weight")
-                        .map(|w| w.dims()[0] == 262144) // Gemma3 has 262k vocab
+                        .map(|w| w.size()[0] == 262144) // Gemma3 has 262k vocab
                         .unwrap_or(false);
                 
                 if is_gemma3 {

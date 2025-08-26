@@ -4,7 +4,7 @@
 //! based on the NVIDIA Transformer Engine approach used by DeepL.
 
 use anyhow::{Result, anyhow};
-use candle_core::{DType, Device, Tensor};
+use tch::{Kind as DType, Device, Tensor};
 use std::sync::Arc;
 use parking_lot::RwLock;
 
@@ -108,7 +108,7 @@ impl FP8Scaler {
         };
         
         // Find max absolute value in tensor
-        let max_val = tensor.abs()?.max_all()?.to_scalar::<f32>()?;
+        let max_val = tensor.abs().max().double_value(&[]) as f32;
         
         // Calculate optimal scale to fit in FP8 range
         let target_max = format.max_value() * self.margin;
@@ -119,16 +119,16 @@ impl FP8Scaler {
         };
         
         // Apply scaling
-        let scale_tensor = Tensor::new(&[computed_scale], tensor.device())?;
-        let scaled = tensor.broadcast_mul(&scale_tensor)?;
+        let scale_tensor = Tensor::from_slice(&[computed_scale]).to(tensor.device());
+        let scaled = tensor * &scale_tensor;
         
         // Convert to FP8 (if supported)
         let quantized = if format.is_supported() {
-            scaled.to_dtype(format.to_dtype()?)?
+            scaled.to_dtype(format.to_dtype()?, false, false)
         } else {
             // Fallback to BF16 for unsupported formats
             tracing::warn!("FP8 format {:?} not supported, using BF16", format);
-            scaled.to_dtype(DType::BF16)?
+            scaled.to_dtype(DType::Half, false, false)
         };
         
         Ok((quantized, computed_scale))
@@ -137,9 +137,9 @@ impl FP8Scaler {
     /// Dequantize FP8 tensor back to higher precision
     pub fn dequantize(&self, tensor: &Tensor, scale: f32, target_dtype: DType) -> Result<Tensor> {
         // Convert to target dtype and rescale
-        let dequantized = tensor.to_dtype(target_dtype)?;
-        let inv_scale = Tensor::new(&[1.0 / scale], tensor.device())?;
-        Ok(dequantized.broadcast_mul(&inv_scale)?)
+        let dequantized = tensor.to_dtype(target_dtype, false, false);
+        let inv_scale = Tensor::from_slice(&[1.0 / scale]).to(tensor.device());
+        Ok(&dequantized * &inv_scale)
     }
     
     /// Update scaling factors based on observed values
@@ -218,8 +218,8 @@ impl Default for FP8Config {
         Self {
             forward_format: FP8Format::E4M3,
             backward_format: FP8Format::E5M2, // Will fallback to BF16
-            master_dtype: DType::BF16,
-            lora_dtype: DType::BF16, // LoRA always needs precision
+            master_dtype: DType::Half,
+            lora_dtype: DType::Half, // LoRA always needs precision
             dynamic_scaling: true,
             scaler: Arc::new(FP8Scaler::new()),
         }
@@ -232,8 +232,8 @@ impl FP8Config {
         Self {
             forward_format: FP8Format::E4M3,
             backward_format: FP8Format::E4M3, // No gradients in inference
-            master_dtype: DType::BF16,
-            lora_dtype: DType::BF16,
+            master_dtype: DType::Half,
+            lora_dtype: DType::Half,
             dynamic_scaling: false, // No need for dynamic scaling
             scaler: Arc::new(FP8Scaler::new()),
         }
@@ -244,8 +244,8 @@ impl FP8Config {
         Self {
             forward_format: FP8Format::E4M3,
             backward_format: FP8Format::E5M2,
-            master_dtype: DType::F32, // Higher precision for optimizer
-            lora_dtype: DType::BF16,
+            master_dtype: DType::Float, // Higher precision for optimizer
+            lora_dtype: DType::Half,
             dynamic_scaling: true,
             scaler: Arc::new(FP8Scaler::new()),
         }
@@ -315,8 +315,8 @@ impl FP8Engine {
         
         for weight in weights {
             // Keep master copy
-            let master = weight.to_dtype(self.config.master_dtype)?;
-            master_weights.push(master.clone());
+            let master = weight.to_dtype(self.config.master_dtype, false, false);
+            master_weights.push(master.shallow_clone());
             
             // Quantize to FP8
             let (fp8_weight, _scale) = self.config.scaler.quantize(&weight, self.config.forward_format)?;
@@ -338,21 +338,21 @@ impl FP8Engine {
         // In practice, this would call into model-specific logic
         
         // For now, just show the pattern
-        let mut output = input.clone();
+        let mut output = input.shallow_clone();
         
         for weight in weights {
             // Dequantize weight for computation (or use FP8 kernels if available)
             // Since FP8 is not yet available, weights are already in BF16/F16
-            let weight_bf16 = weight.clone();
+            let weight_bf16 = weight.shallow_clone();
             
             // Apply weight (simplified)
-            output = output.matmul(&weight_bf16)?;
+            output = output.matmul(&weight_bf16);
         }
         
         // Apply LoRA if present
         if let Some(lora_weights) = &self.lora_weights {
             let lora_output = self.apply_lora(&input, lora_weights)?;
-            output = (output + lora_output)?;
+            output = &output + &lora_output;
         }
         
         Ok(output)
@@ -361,7 +361,7 @@ impl FP8Engine {
     /// Apply LoRA adapter (always in higher precision)
     fn apply_lora(&self, input: &Tensor, lora_weights: &[Tensor]) -> Result<Tensor> {
         // LoRA computation stays in BF16/FP32
-        let mut output = Tensor::zeros_like(input)?;
+        let mut output = Tensor::zeros_like(input);
         
         for (i, weight) in lora_weights.iter().enumerate() {
             if i % 2 == 0 && i + 1 < lora_weights.len() {
@@ -369,9 +369,9 @@ impl FP8Engine {
                 let a = &lora_weights[i];
                 let b = &lora_weights[i + 1];
                 
-                let intermediate = input.matmul(a)?;
-                let lora_out = intermediate.matmul(b)?;
-                output = (output + lora_out)?;
+                let intermediate = input.matmul(a);
+                let lora_out = intermediate.matmul(b);
+                output = &output + &lora_out;
             }
         }
         
@@ -385,16 +385,14 @@ impl FP8Engine {
             self.config.scaler.quantize(grad_output, self.config.backward_format)?
         } else {
             // Fallback to BF16
-            (grad_output.to_dtype(DType::BF16)?, 1.0)
+            (grad_output.to_dtype(DType::Half, false, false), 1.0)
         };
         
         // Update scaler statistics
-        let grad_max = grad_output.abs()?.max_all()?.to_scalar::<f32>()?;
+        let grad_max = grad_output.abs().max().double_value(&[]) as f32;
         let weight_max = self.master_weights.as_ref()
             .and_then(|w| w.first())
-            .and_then(|w| w.abs().ok())
-            .and_then(|w| w.max_all().ok())
-            .and_then(|w| w.to_scalar::<f32>().ok())
+            .map(|w| w.abs().max().double_value(&[]) as f32)
             .unwrap_or(1.0);
         
         self.config.scaler.update_scales(weight_max, grad_max);
@@ -427,8 +425,8 @@ pub fn optimal_fp8_config(device: &Device) -> FP8Config {
         FP8Config {
             forward_format: FP8Format::E4M3, // Use E4M3 if available
             backward_format: FP8Format::E4M3, // Can't use E5M2 yet
-            master_dtype: DType::BF16,
-            lora_dtype: DType::BF16,
+            master_dtype: DType::Half,
+            lora_dtype: DType::Half,
             dynamic_scaling: true,
             scaler: Arc::new(FP8Scaler::new()),
         }

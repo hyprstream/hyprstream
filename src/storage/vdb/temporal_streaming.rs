@@ -442,49 +442,24 @@ impl TemporalStreamingLayer {
     /// Apply gradient update to temporal streaming layer
     pub async fn apply_gradient_update(
         &self,
-        gradient: crate::runtime::candle_engine::TemporalGradient,
+        gradient: &TemporalGradient,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        tracing::info!("🔄 Applying temporal gradient update to {} layers", gradient.layer_gradients.len());
+        tracing::info!("🔄 Applying temporal gradient update for layer: {}", gradient.layer_name);
         
-        // Apply gradients to each layer
-        for (layer_name, layer_gradient) in gradient.layer_gradients.iter() {
-            self.apply_layer_gradient(layer_name, layer_gradient, gradient.learning_rate).await?;
+        // Apply gradient to the layer using the values map
+        let learning_rate = 0.001; // Default learning rate
+        for (coord, delta) in &gradient.values {
+            if let Err(e) = self.vdb_storage.apply_weight_delta(coord, *delta * learning_rate).await {
+                tracing::warn!("Failed to apply weight delta at {:?}: {}", coord, e);
+            }
         }
         
-        // Update temporal statistics
-        self.update_learning_stats(gradient.timestamp).await;
+        // Update temporal statistics  
+        self.update_learning_stats(std::time::SystemTime::now()).await;
         
         Ok(())
     }
     
-    /// Apply gradient to specific layer
-    async fn apply_layer_gradient(
-        &self,
-        layer_name: &str,
-        gradient: &crate::runtime::candle_engine::LayerGradient,
-        learning_rate: f32,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        tracing::debug!("📝 Applying gradient to layer: {}", layer_name);
-        
-        // Apply sparse weight updates based on sparsity mask
-        let mut update_count = 0;
-        for (i, &is_active) in gradient.sparsity_mask.iter().enumerate() {
-            if is_active && i < gradient.weight_deltas.len() {
-                let weight_update = gradient.weight_deltas[i] * learning_rate;
-                
-                // Convert to VDB coordinate and update
-                let coord = self.index_to_coordinate(i);
-                if let Err(e) = self.vdb_storage.apply_weight_delta(&coord, weight_update).await {
-                    tracing::warn!("Failed to apply weight delta at {:?}: {}", coord, e);
-                } else {
-                    update_count += 1;
-                }
-            }
-        }
-        
-        tracing::debug!("✅ Applied {} sparse weight updates to layer: {}", update_count, layer_name);
-        Ok(())
-    }
     
     /// Convert linear index to VDB coordinate
     fn index_to_coordinate(&self, index: usize) -> Coordinate3D {

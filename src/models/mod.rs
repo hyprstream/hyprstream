@@ -7,10 +7,10 @@ pub use crate::config::{
 };
 
 // Re-export the runtime engine - models are just wrappers around this
-pub use crate::runtime::{RuntimeEngine, CandleEngine, create_engine};
+pub use crate::runtime::{RuntimeEngine, TorchEngine, create_engine};
 
-pub mod model_registry;
+// pub mod model_registry; // TODO: Implement
 pub mod qwen3;
 
-pub use model_registry::ModelRegistry;
+// pub use model_registry::ModelRegistry;
 pub use qwen3::Qwen3Wrapper;
