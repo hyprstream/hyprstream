@@ -705,38 +705,47 @@ impl TorchEngine {
     }
 
 
-    /// Sample next token from logits
+    /// Sample next token from logits with proper ordering
     fn sample_token(&self, logits: &[f32], temperature: f32, top_p: f32, top_k: Option<usize>, repeat_penalty: f32, previous_tokens: &[i64]) -> Result<usize> {
         if logits.is_empty() {
             return Err(anyhow!("Empty logits"));
         }
 
-        // Apply repetition penalty first
-        let mut penalized_logits = logits.to_vec();
-        if repeat_penalty != 1.0 {
-            for &prev_token in previous_tokens.iter().take(100) {  // Only consider last 100 tokens
-                let token_id = prev_token as usize;
-                if token_id < penalized_logits.len() {
-                    if penalized_logits[token_id] > 0.0 {
-                        penalized_logits[token_id] /= repeat_penalty;
+        // STEP 1: Apply repetition penalty to LOGITS (before softmax)
+        // This is much more effective than applying to probabilities
+        let mut adjusted_logits = logits.to_vec();
+        if repeat_penalty != 1.0 && !previous_tokens.is_empty() {
+            // Create a frequency map for recent tokens
+            let mut token_counts = std::collections::HashMap::new();
+            for &token_id in previous_tokens.iter().rev().take(64) {  // Last 64 tokens
+                *token_counts.entry(token_id as usize).or_insert(0) += 1;
+            }
+            
+            // Apply penalty based on frequency
+            for (token_id, count) in token_counts {
+                if token_id < adjusted_logits.len() {
+                    // Stronger penalty for more frequent tokens
+                    let penalty = repeat_penalty.powf(count as f32);
+                    if adjusted_logits[token_id] > 0.0 {
+                        adjusted_logits[token_id] /= penalty;
                     } else {
-                        penalized_logits[token_id] *= repeat_penalty;
+                        adjusted_logits[token_id] *= penalty;
                     }
                 }
             }
         }
 
-        // Apply temperature
-        let scaled_logits: Vec<f32> = if temperature > 0.0 {
-            penalized_logits.iter().map(|&x| x / temperature).collect()
+        // STEP 2: Apply temperature scaling  
+        let scaled_logits: Vec<f32> = if temperature > 0.0 && temperature != 1.0 {
+            adjusted_logits.iter().map(|&x| x / temperature).collect()
         } else {
-            penalized_logits
+            adjusted_logits
         };
 
-        // Find max for numerical stability
+        // Find max for numerical stability in softmax
         let max_logit = scaled_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         
-        // Compute probabilities
+        // Compute softmax probabilities
         let exp_logits: Vec<f32> = scaled_logits.iter()
             .map(|&x| (x - max_logit).exp())
             .collect();
@@ -744,7 +753,7 @@ impl TorchEngine {
         let sum: f32 = exp_logits.iter().sum();
         let mut probs: Vec<f32> = exp_logits.iter().map(|&x| x / sum).collect();
 
-        // Apply top-k filtering
+        // STEP 3: Apply top-k filtering (select top k most likely tokens)
         if let Some(k) = top_k {
             let mut indices: Vec<usize> = (0..probs.len()).collect();
             indices.sort_by(|&a, &b| {
@@ -762,7 +771,7 @@ impl TorchEngine {
             }
         }
 
-        // Apply top-p (nucleus) sampling
+        // STEP 4: Apply top-p (nucleus) sampling (cumulative probability threshold)
         if top_p < 1.0 {
             let mut indices: Vec<usize> = (0..probs.len()).collect();
             indices.sort_by(|&a, &b| {
@@ -791,7 +800,7 @@ impl TorchEngine {
             }
         }
 
-        // Sample from distribution
+        // STEP 5: Sample from the final distribution
         let rand_val: f32 = fastrand::f32();
         let mut cumsum = 0.0;
         

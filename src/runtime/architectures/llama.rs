@@ -514,7 +514,7 @@ impl LlamaAttention {
         Ok(broadcast_mul(&broadcast_mul(tensor, &rrms)?, &norm_weight_reshaped)?)
     }
     
-    /// Compute scaled dot-product attention scores
+    /// Compute scaled dot-product attention scores with causal masking
     fn compute_attention_scores(&self, q: &Tensor, k: &Tensor) -> Result<Tensor> {
         let scale = 1.0 / (self.head_dim as f32).sqrt();
         
@@ -525,6 +525,30 @@ impl LlamaAttention {
         
         // Compute attention scores: [batch, heads, seq, seq]
         let mut scores = q.matmul(&k) * (scale as f64);
+        
+        // Apply causal mask - CRITICAL for autoregressive generation
+        // Get sequence lengths from tensor dimensions
+        let score_shape = scores.size();
+        let q_len = score_shape[2]; // query sequence length
+        let k_len = score_shape[3]; // key sequence length
+        
+        // Create causal mask where future positions are -inf
+        // This prevents the model from attending to future tokens
+        if q_len > 1 || k_len > 1 {
+            // Create a lower triangular mask
+            let mask = Tensor::ones(&[q_len, k_len], (tch::Kind::Float, scores.device()))
+                .tril(0) // Lower triangular (1s at and below diagonal, 0s above)
+                .unsqueeze(0) // Add batch dimension
+                .unsqueeze(0); // Add head dimension
+            
+            // Apply mask: set future positions to -inf (they become 0 after softmax)
+            let mask_value = Tensor::from(-10000.0f32)
+                .to_device(scores.device())
+                .to_kind(scores.kind());
+            
+            // Where mask is 0, set score to -10000 (effectively -inf)
+            scores = scores.where_self(&mask.to_kind(tch::Kind::Bool), &(scores.ones_like() * mask_value));
+        }
         
         // Apply sliding window mask if configured (Gemma3)
         if let Some(window_size) = self.sliding_window {
