@@ -993,8 +993,17 @@ impl RuntimeEngine for TorchEngine {
 
 // Additional methods needed by inference layer
 impl TorchEngine {
-    /// Generate text with streaming callback
-    pub async fn generate_streaming<F>(&self, prompt: &str, max_tokens: usize, mut callback: F) -> Result<String> 
+    /// Generate text with streaming callback and custom parameters
+    pub async fn generate_streaming_with_params<F>(
+        &self, 
+        prompt: &str, 
+        max_tokens: usize, 
+        temperature: f32,
+        top_p: f32,
+        top_k: Option<usize>,
+        repeat_penalty: f32,
+        mut callback: F
+    ) -> Result<String>
     where 
         F: FnMut(&str)
     {
@@ -1006,10 +1015,10 @@ impl TorchEngine {
         let request = GenerationRequest {
             prompt: prompt.to_string(),
             max_tokens,
-            temperature: 0.8,
-            top_p: 0.95,
-            top_k: Some(50),
-            repeat_penalty: 1.1,
+            temperature,
+            top_p,
+            top_k,
+            repeat_penalty,
             stop_tokens: vec![],
             seed: None,
             stream: true,
@@ -1017,6 +1026,39 @@ impl TorchEngine {
             realtime_adaptation: None,
             user_feedback: None,
         };
+        
+        // Use the internal streaming implementation with these parameters
+        self.generate_streaming_internal(request, callback).await
+    }
+    
+    /// Generate text with streaming callback (using default parameters)
+    pub async fn generate_streaming<F>(&self, prompt: &str, max_tokens: usize, mut callback: F) -> Result<String> 
+    where 
+        F: FnMut(&str)
+    {
+        // Use model-specific defaults or fallback to generic defaults
+        self.generate_streaming_with_params(
+            prompt,
+            max_tokens,
+            0.8,       // Default temperature
+            0.95,      // Default top_p
+            Some(50),  // Default top_k
+            1.1,       // Default repeat_penalty
+            callback
+        ).await
+    }
+    
+    /// Internal streaming implementation
+    async fn generate_streaming_internal<F>(&self, request: GenerationRequest, mut callback: F) -> Result<String>
+    where
+        F: FnMut(&str)
+    {
+        let prompt = &request.prompt;
+        let max_tokens = request.max_tokens;
+        let temperature = request.temperature;
+        let top_p = request.top_p;
+        let top_k = request.top_k;
+        let repeat_penalty = request.repeat_penalty;
 
         // REAL streaming: generate tokens one by one and call callback for each
         let start_time = std::time::Instant::now();
@@ -1026,6 +1068,9 @@ impl TorchEngine {
         let mut generated_text = String::new();
         let mut tokens_generated = 0;
         let prompt_len = input_ids.len();
+        
+        tracing::info!("Starting generation with prompt of {} tokens", prompt_len);
+        tracing::debug!("Initial token IDs: {:?}", &input_ids[..prompt_len.min(20)]);
 
         for i in 0..max_tokens {
             // Use KV cached forward pass after first iteration
@@ -1034,16 +1079,17 @@ impl TorchEngine {
                 self.forward(&input_ids)?
             } else {
                 // Subsequent passes: only process new token with KV cache
+                // Position is prompt_len + (i-1) since we're processing the token generated in the previous iteration
                 self.forward_cached(&input_ids, prompt_len + i - 1, true)?
             };
             
             // Sample next token
             let next_token = self.sample_token(
                 &logits,
-                request.temperature,
-                request.top_p,
-                request.top_k,
-                request.repeat_penalty,
+                temperature,
+                top_p,
+                top_k,
+                repeat_penalty,
                 &input_ids,
             )?;
 
@@ -1054,6 +1100,9 @@ impl TorchEngine {
             // Decode token and stream it immediately
             let token_text = self.detokenize(&[next_token as i64])?;
             generated_text.push_str(&token_text);
+            
+            tracing::debug!("Iteration {}: generated token {} -> '{}'", 
+                         i, next_token, token_text);
             
             // Stream the token immediately (real streaming)
             callback(&token_text);

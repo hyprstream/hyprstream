@@ -1121,6 +1121,7 @@ pub async fn handle_model_command(
                 temperature: final_config.temperature,
                 top_p: final_config.top_p.unwrap_or(0.95),
                 top_k: final_config.top_k,
+                repeat_penalty: final_config.repetition_penalty,
                 stream,
                 lora_weights: None, // No LoRA for model infer
             };
@@ -1146,94 +1147,6 @@ pub async fn handle_model_command(
             println!("✅ Generation complete: {} tokens generated in {:.2}s", 
                      result.tokens_generated, 
                      result.latency_ms as f64 / 1000.0);
-        }
-        ModelAction::Test { path, prompt, max_tokens, xlora, xlora_model_id, max_adapters } => {
-            info!("🧪 Testing model inference with TorchEngine: {}", path.display());
-            
-            use crate::runtime::{TorchEngine, RuntimeConfig};
-            
-            if !path.exists() {
-                eprintln!("❌ Model file not found: {}", path.display());
-                eprintln!("Please check the path and try again.");
-                return Ok(());
-            }
-            
-            println!("🚀 Initializing TorchEngine...");
-            let runtime_config = RuntimeConfig::default();
-            let mut engine = TorchEngine::new(runtime_config)?;
-            
-            if xlora {
-                if let Some(xlora_id) = xlora_model_id {
-                    println!("🔀 Loading model with X-LoRA configuration...");
-                    println!("   Model: {}", path.display());
-                    println!("   X-LoRA ID: {}", xlora_id);
-                    println!("   Max Adapters: {}", max_adapters);
-                    
-                    // TODO: Implement X-LoRA ordering for Candle engine
-                    tracing::info!("X-LoRA ordering will be implemented in Candle engine");
-                    
-                    // For now, just load the base model
-                    match engine.load_model(&path).await {
-                        Ok(_) => println!("✅ X-LoRA model loaded successfully"),
-                        Err(e) => {
-                            eprintln!("❌ Failed to load X-LoRA model: {}", e);
-                            eprintln!("💡 Try without --xlora flag for basic model testing");
-                            return Ok(());
-                        }
-                    }
-                } else {
-                    eprintln!("❌ --xlora-model-id is required when using --xlora");
-                    return Ok(());
-                }
-            } else {
-                println!("📥 Loading model...");
-                match engine.load_model(&path).await {
-                    Ok(_) => println!("✅ Model loaded successfully"),
-                    Err(e) => {
-                        eprintln!("❌ Failed to load model: {}", e);
-                        return Ok(());
-                    }
-                }
-            }
-            
-            println!("🤖 Generating response...");
-            println!("   Prompt: \"{}\"", prompt);
-            println!("   Max tokens: {}", max_tokens);
-            println!();
-            
-            let start_time = std::time::Instant::now();
-            
-            // Use streaming generation and print tokens as they arrive
-            use std::io::{self, Write};
-            println!("📝 Response:");
-            let result = engine.generate_streaming(&prompt, max_tokens, |token| {
-                print!("{}", token);
-                io::stdout().flush().unwrap();
-            }).await;
-            
-            match result {
-                Ok(_) => {
-                    println!(); // New line after generation
-                    let duration = start_time.elapsed();
-                    println!();
-                    println!("✅ Generated response in {:.2}s", duration.as_secs_f64());
-                    println!();
-                    
-                    // Show model info
-                    let model_info = engine.model_info();
-                    println!("📊 Model Information:");
-                    println!("   Name: {}", model_info.name);
-                    println!("   Architecture: {}", model_info.architecture);
-                    if let Some(quant) = &model_info.quantization {
-                        println!("   Quantization: {}", quant);
-                    }
-                    println!("   Context Length: {}", model_info.context_length);
-                }
-                Err(e) => {
-                    eprintln!("❌ Generation failed: {}", e);
-                    eprintln!("This may indicate compatibility issues with the model format.");
-                }
-            }
         }
     }
     
@@ -2608,6 +2521,7 @@ async fn run_checkpoint_inference(
         temperature,
         top_p,
         top_k: None,
+        repeat_penalty: 1.1,  // Default for LoRA inference
         stream: _stream,
         lora_weights: Some(Arc::new(weights_data)),
     };
@@ -3205,6 +3119,7 @@ async fn run_chat_inference(
         temperature,
         top_p: 0.95,
         top_k: Some(40),
+        repeat_penalty: 1.1,  // Default for composed model
         stream: false,
         lora_weights: None,
     };

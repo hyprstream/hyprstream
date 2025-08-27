@@ -23,6 +23,8 @@ pub struct InferenceRequest {
     pub top_p: f32,
     /// Top-k sampling parameter
     pub top_k: Option<usize>,
+    /// Repetition penalty (1.0 = no penalty, >1.0 = discourage repetition)
+    pub repeat_penalty: f32,
     /// Whether to stream output
     pub stream: bool,
     /// Optional LoRA weights to apply
@@ -37,6 +39,7 @@ impl Default for InferenceRequest {
             temperature: 0.8,
             top_p: 0.95,
             top_k: Some(40),
+            repeat_penalty: 1.1,
             stream: false,
             lora_weights: None,
         }
@@ -78,16 +81,17 @@ impl InferenceExt for TorchEngine {
             apply_lora_to_engine(self, lora_weights).await?;
         }
         
-        // TODO: Apply sampling parameters when engine API supports it
-        // For now, temperature and top_p are not configurable at runtime
-        
         let token_counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = token_counter.clone();
         
-        // Generate text using the engine's streaming API
-        let generated_text = self.generate_streaming(
+        // Generate text using the engine's streaming API with custom parameters
+        let generated_text = self.generate_streaming_with_params(
             &request.prompt,
             request.max_tokens,
+            request.temperature,
+            request.top_p,
+            request.top_k,
+            request.repeat_penalty,
             |_token| {
                 counter_clone.fetch_add(1, Ordering::Relaxed);
             }
@@ -125,10 +129,14 @@ impl InferenceExt for TorchEngine {
         let token_counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = token_counter.clone();
         
-        // Generate text with streaming callback
-        let generated_text = self.generate_streaming(
+        // Generate text with streaming callback and custom parameters
+        let generated_text = self.generate_streaming_with_params(
             &request.prompt,
             request.max_tokens,
+            request.temperature,
+            request.top_p,
+            request.top_k,
+            request.repeat_penalty,
             |token| {
                 on_token(token);
                 counter_clone.fetch_add(1, Ordering::Relaxed);

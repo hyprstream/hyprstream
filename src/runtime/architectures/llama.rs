@@ -536,18 +536,24 @@ impl LlamaAttention {
         // This prevents the model from attending to future tokens
         if q_len > 1 || k_len > 1 {
             // Create a lower triangular mask
-            let mask = Tensor::ones(&[q_len, k_len], (tch::Kind::Float, scores.device()))
-                .tril(0) // Lower triangular (1s at and below diagonal, 0s above)
-                .unsqueeze(0) // Add batch dimension
-                .unsqueeze(0); // Add head dimension
+            // For KV cache case: q_len=1, k_len=full_seq, we need a mask of [1, k_len]
+            // where all positions are allowed (since they're all past positions)
+            let mask = if q_len == 1 && k_len > 1 {
+                // Single query attending to all past keys - all positions valid
+                Tensor::ones(&[q_len, k_len], (tch::Kind::Float, scores.device()))
+            } else {
+                // Standard causal mask for multiple queries
+                Tensor::ones(&[q_len, k_len], (tch::Kind::Float, scores.device()))
+                    .tril(0) // Lower triangular (1s at and below diagonal, 0s above)
+            };
             
-            // Apply mask: set future positions to -inf (they become 0 after softmax)
-            let mask_value = Tensor::from(-10000.0f32)
-                .to_device(scores.device())
-                .to_kind(scores.kind());
+            // Expand mask to match scores dimensions [batch, heads, q_len, k_len]
+            let mask = mask.unsqueeze(0).unsqueeze(0).expand_as(&scores);
             
-            // Where mask is 0, set score to -10000 (effectively -inf)
-            scores = scores.where_self(&mask.to_kind(tch::Kind::Bool), &(scores.ones_like() * mask_value));
+            // Apply mask: set future positions (where mask=0) to -inf
+            // Use masked_fill to set positions where mask == 0 to -10000
+            let mask_value = -10000.0f64;
+            scores = scores.masked_fill(&mask.eq(0.0), mask_value);
         }
         
         // Apply sliding window mask if configured (Gemma3)
