@@ -9,6 +9,46 @@ use std::collections::HashMap;
 use serde_json;
 use crate::config::{GenerationRequest, GenerationResult, ModelInfo, RuntimeConfig, FinishReason};
 use crate::runtime::RuntimeEngine;
+
+/// Qwen2 special token IDs (based on official HuggingFace implementation)
+#[derive(Debug, Clone)]
+pub struct QwenSpecialTokens {
+    /// "<|endoftext|>" - Used as BOS, EOS, and PAD token
+    pub endoftext: u32,
+    /// "<|im_start|>" - Instruction/message start
+    pub im_start: u32,
+    /// "<|im_end|>" - Instruction/message end (primary EOS for conversations)
+    pub im_end: u32,
+    /// Additional special tokens for multimodal support
+    pub object_ref_start: u32,
+    pub object_ref_end: u32,
+    pub box_start: u32,
+    pub box_end: u32,
+    pub vision_start: u32,
+    pub vision_end: u32,
+    pub vision_pad: u32,
+    pub image_pad: u32,
+    pub video_pad: u32,
+}
+
+impl Default for QwenSpecialTokens {
+    fn default() -> Self {
+        Self {
+            endoftext: 151643,      // "<|endoftext|>"
+            im_start: 151644,       // "<|im_start|>" 
+            im_end: 151645,         // "<|im_end|>"
+            object_ref_start: 151646,
+            object_ref_end: 151647,
+            box_start: 151648,
+            box_end: 151649,
+            vision_start: 151652,
+            vision_end: 151653,
+            vision_pad: 151654,
+            image_pad: 151655,
+            video_pad: 151656,
+        }
+    }
+}
 use crate::runtime::architectures::ModelOperations;
 
 /// Basic context state for tracking generation state
@@ -55,6 +95,8 @@ pub struct TorchEngine {
     pub active_lora: Option<String>,
     /// Sampling configuration
     pub sampling_config: RuntimeConfig,
+    /// Qwen special tokens for proper conversation handling
+    special_tokens: QwenSpecialTokens,
 }
 
 /// Helper functions for tensor operations
@@ -164,6 +206,7 @@ impl TorchEngine {
             },
             active_lora: None,
             sampling_config: config,
+            special_tokens: QwenSpecialTokens::default(),
         })
     }
 
@@ -223,14 +266,17 @@ impl TorchEngine {
             }
         }
         
-        // Fallback to weight-based detection
+        // Try weight-based detection as last resort
         use crate::runtime::architectures::qwen::QwenAdapter;
         if QwenAdapter::is_qwen_model(weights) {
             return Ok("qwen".to_string());
         }
         
-        // Default to gemma if no clear architecture detected
-        Ok("gemma".to_string())
+        // No architecture could be detected - fail with clear error
+        Err(anyhow!(
+            "Could not detect model architecture. Ensure config.json exists with valid 'model_type' or 'architectures' field. \
+            Supported architectures: qwen3, qwen2, Qwen3ForCausalLM, gemma"
+        ))
     }
 
     /// Load SafeTensors model using safetensors crate and pre-convert all tensors to cache
@@ -393,9 +439,15 @@ impl TorchEngine {
                 println!("🏗️ Initializing persistent Qwen3ForCausalLM model from cached weights");
                 QwenAdapter::from_weights(weights, 3, false, 262144, &self.device, tch::Kind::BFloat16)?
             }
-            "gemma" | _ => {
-                println!("🏗️ Initializing persistent Gemma model from cached weights (fallback)");
+            "gemma" => {
+                println!("🏗️ Initializing persistent Gemma model from cached weights");
                 Box::new(GemmaModel::from_weights(weights, &self.device, tch::Kind::BFloat16)?)
+            }
+            unknown => {
+                return Err(anyhow!(
+                    "Unsupported model architecture: '{}'. Supported architectures: qwen3, qwen2, Qwen3ForCausalLM, gemma",
+                    unknown
+                ));
             }
         };
         
@@ -422,8 +474,10 @@ impl TorchEngine {
                 .map_err(|e| anyhow!("Failed to load tokenizer: {}", e))?;
             self.tokenizer = Some(tokenizer);
         } else {
-            println!("⚠️ No tokenizer found, using fallback");
-            // TODO: Create a simple fallback tokenizer
+            return Err(anyhow!(
+                "Tokenizer not found at {}. A proper tokenizer.json file is required for inference.",
+                tokenizer_path.display()
+            ));
         }
 
         Ok(())
@@ -431,34 +485,66 @@ impl TorchEngine {
 
     /// Tokenize text to input IDs
     fn tokenize(&self, text: &str) -> Result<Vec<i64>> {
-        if let Some(tokenizer) = &self.tokenizer {
-            let encoding = tokenizer.encode(text, false)
-                .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
-            let token_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
-            tracing::debug!("Tokenized '{}' -> {:?}", text, token_ids);
-            Ok(token_ids)
-        } else {
-            // Fallback: simple character-based tokenization
-            let fallback_ids: Vec<i64> = text.chars().map(|c| c as i64).collect();
-            tracing::warn!("Using fallback tokenization for '{}' -> {:?}", text, fallback_ids);
-            Ok(fallback_ids)
+        let tokenizer = self.tokenizer.as_ref()
+            .ok_or_else(|| anyhow!("Tokenizer not loaded. Call load_tokenizer() first."))?;
+        
+        let encoding = tokenizer.encode(text, false)
+            .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
+        let token_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
+        
+        if token_ids.is_empty() {
+            return Err(anyhow!("Tokenization produced empty token sequence for text: '{}'", text));
         }
+        
+        tracing::debug!("Tokenized '{}' -> {:?}", text, token_ids);
+        Ok(token_ids)
+    }
+
+    /// Format text with Qwen2 chat template (basic implementation)
+    fn format_chat_message(&self, system: Option<&str>, user: &str) -> String {
+        let mut formatted = String::new();
+        
+        // Add system message if provided
+        if let Some(system_msg) = system {
+            formatted.push_str("<|im_start|>system\n");
+            formatted.push_str(system_msg);
+            formatted.push_str("<|im_end|>\n");
+        }
+        
+        // Add user message
+        formatted.push_str("<|im_start|>user\n");
+        formatted.push_str(user);
+        formatted.push_str("<|im_end|>\n");
+        
+        // Add assistant prompt
+        formatted.push_str("<|im_start|>assistant\n");
+        
+        formatted
+    }
+    
+    /// Check if a token ID is a special EOS token for Qwen
+    fn is_eos_token(&self, token_id: usize) -> bool {
+        let token_id_u32 = token_id as u32;
+        // Qwen can end on either im_end (for conversations) or endoftext (for completion)
+        token_id_u32 == self.special_tokens.im_end || 
+        token_id_u32 == self.special_tokens.endoftext
     }
 
     /// Detokenize IDs back to text
     fn detokenize(&self, ids: &[i64]) -> Result<String> {
-        if let Some(tokenizer) = &self.tokenizer {
-            let ids_u32: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
-            let decoded_text = tokenizer.decode(&ids_u32, false)
-                .map_err(|e| anyhow!("Detokenization failed: {}", e))?;
-            tracing::debug!("Detokenized {:?} -> '{}'", ids, decoded_text);
-            Ok(decoded_text)
-        } else {
-            // Fallback: convert back to characters
-            let text: String = ids.iter().map(|&id| id as u8 as char).collect();
-            tracing::warn!("Using fallback detokenization for {:?} -> '{}'", ids, text);
-            Ok(text)
+        let tokenizer = self.tokenizer.as_ref()
+            .ok_or_else(|| anyhow!("Tokenizer not loaded. Call load_tokenizer() first."))?;
+        
+        if ids.is_empty() {
+            return Ok(String::new());
         }
+        
+        let ids_u32: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
+        let decoded_text = tokenizer.decode(&ids_u32, false)
+            .map_err(|e| anyhow!("Detokenization failed for token IDs {:?}: {}", ids, e))?;
+        
+        tracing::debug!("Detokenized {:?} -> '{}'", ids, decoded_text);
+        Ok(decoded_text)
     }
 
     /// Run inference on the model (supports both TorchScript and VarStore models)
@@ -681,8 +767,14 @@ impl RuntimeEngine for TorchEngine {
     }
 
     async fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String> {
+        // Format prompt with Qwen2 chat template
+        let formatted_prompt = self.format_chat_message(
+            Some("You are Qwen, created by Alibaba Cloud. You are a helpful assistant."), 
+            prompt
+        );
+        
         let request = GenerationRequest {
-            prompt: prompt.to_string(),
+            prompt: formatted_prompt,
             max_tokens,
             temperature: 0.7,  // Official recommendation
             top_p: 0.8,        // Official recommendation  
@@ -743,8 +835,9 @@ impl RuntimeEngine for TorchEngine {
                 break;
             }
 
-            // Simple EOS check (token ID 2 is often EOS)
-            if next_token == 2 {
+            // Proper EOS check for Qwen2 (im_end or endoftext tokens)
+            if self.is_eos_token(next_token) {
+                tracing::info!("EOS token detected: {}", next_token);
                 break;
             }
         }
@@ -838,8 +931,9 @@ impl TorchEngine {
                 break;
             }
 
-            // Simple EOS check (token ID 2 is often EOS)
-            if next_token == 2 {
+            // Proper EOS check for Qwen2 (im_end or endoftext tokens)
+            if self.is_eos_token(next_token) {
+                tracing::info!("EOS token detected: {}", next_token);
                 break;
             }
         }
@@ -858,6 +952,33 @@ impl TorchEngine {
     pub fn is_persistent_model_ready(&self) -> bool {
         self.persistent_model.is_some() && 
         self.context_state.as_ref().map_or(false, |c| c.initialized)
+    }
+
+    /// Generate text with raw prompt (no chat formatting)
+    pub async fn generate_raw(&self, prompt: &str, max_tokens: usize) -> Result<String> {
+        let request = GenerationRequest {
+            prompt: prompt.to_string(),
+            max_tokens,
+            temperature: 0.7,
+            top_p: 0.8,
+            top_k: Some(20),
+            repeat_penalty: 1.1,
+            stop_tokens: vec![],
+            seed: None,
+            stream: false,
+            active_adapters: None,
+            realtime_adaptation: None,
+            user_feedback: None,
+        };
+
+        let result = self.generate_with_params(request).await?;
+        Ok(result.text)
+    }
+
+    /// Generate text with custom chat formatting
+    pub async fn generate_chat(&self, system: Option<&str>, user: &str, max_tokens: usize) -> Result<String> {
+        let formatted_prompt = self.format_chat_message(system, user);
+        self.generate_raw(&formatted_prompt, max_tokens).await
     }
 
     /// Train temporal LoRA adapter (placeholder implementation)
