@@ -118,8 +118,5 @@ criterion = "0.5.1"
 tempfile = "3.9.0"
 tokio-stream = "0.1.14"
 
-[[bench]]
-name = "sparse_ops_bench"
-harness = false
 
 

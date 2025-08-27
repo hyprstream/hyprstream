@@ -123,7 +123,8 @@ impl RoPE {
         }
         
         // Return reference to cached values, truncated to requested length
-        let (sin, cos) = self.cache.as_ref().unwrap();
+        let (sin, cos) = self.cache.as_ref()
+            .ok_or_else(|| anyhow!("RoPE cache not initialized"))?;
         Ok((sin, cos))
     }
     
@@ -267,7 +268,8 @@ impl RoPEManager {
             let rope = RoPE::new(dim, base, max_seq_len, device)?;
             self.ropes.insert(layer_name.to_string(), rope);
         }
-        Ok(self.ropes.get_mut(layer_name).unwrap())
+        self.ropes.get_mut(layer_name)
+            .ok_or_else(|| anyhow!("RoPE not found for layer: {}", layer_name))
     }
     
     /// Get or create a RoPE instance with specific dtype
@@ -276,7 +278,8 @@ impl RoPEManager {
             let rope = RoPE::new_with_dtype(dim, base, max_seq_len, device, dtype)?;
             self.ropes.insert(layer_name.to_string(), rope);
         }
-        Ok(self.ropes.get_mut(layer_name).unwrap())
+        self.ropes.get_mut(layer_name)
+            .ok_or_else(|| anyhow!("RoPE not found for layer: {}", layer_name))
     }
     
     /// Apply RoPE to a tensor using the appropriate layer configuration

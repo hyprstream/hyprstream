@@ -1083,7 +1083,10 @@ pub async fn handle_model_command(
             match engine.load_model(&model_path).await {
                 Ok(_) => {
                     // Clear any LoRA that might have been loaded
-                    engine.active_lora = None;
+                    {
+                        let mut lora_guard = engine.active_lora.lock().unwrap();
+                        *lora_guard = None;
+                    }
                     println!("✅ Base model loaded successfully (LoRA disabled)");
                 }
                 Err(e) => {

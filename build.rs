@@ -50,13 +50,19 @@ fn build_cpu_only() {
             println!("cargo:warning=✅ Built with OpenVDB support - VDB features enabled");
         }
         Err(e) => {
-            println!("cargo:warning=❌ OpenVDB not found - VDB is required for Hyprstream");
-            println!("cargo:warning=Error: {}", e);
-            println!("cargo:warning=Install OpenVDB to enable sparse LoRA storage");
-            println!("cargo:warning=See OPENVDB_SETUP.md for installation instructions");
-            
-            // VDB is always required, so fail build if not available
-            panic!("VDB is required for Hyprstream but OpenVDB not found. Install OpenVDB to continue.");
+            eprintln!("Error: OpenVDB is required for Hyprstream but was not found.");
+            eprintln!("Details: {}", e);
+            eprintln!("");
+            eprintln!("To fix this issue:");
+            eprintln!("1. Install OpenVDB development packages:");
+            eprintln!("   - Ubuntu/Debian: sudo apt install libopenvdb-dev");
+            eprintln!("   - macOS: brew install openvdb");
+            eprintln!("   - See OPENVDB_SETUP.md for detailed instructions");
+            eprintln!("");
+            eprintln!("2. Ensure pkg-config can find OpenVDB:");
+            eprintln!("   export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH");
+            eprintln!("");
+            std::process::exit(1);
         }
     }
 }

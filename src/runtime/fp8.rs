@@ -176,7 +176,7 @@ impl FP8Scaler {
                 if !history.is_empty() {
                     // Use 95th percentile to be robust to outliers
                     let mut sorted = history.clone();
-                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                     let percentile_95 = sorted[sorted.len() * 95 / 100];
                     
                     let mut scale = self.backward_scale.write();

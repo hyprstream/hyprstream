@@ -25,6 +25,7 @@ pub mod architectures;       // Architecture-specific model implementations
 pub mod sampling;            // Token sampling strategies with model-specific configs
 pub mod inference;           // Clean inference interface with request/response patterns
 pub mod rope;                // Rotary Position Embedding (RoPE) implementation
+pub mod kv_cache;            // Key-Value caching for efficient autoregressive generation
 
 // Primary exports - use TorchEngine as default
 pub use torch_engine::TorchEngine;

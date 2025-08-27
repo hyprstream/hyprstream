@@ -3,7 +3,7 @@
 //! Implements various sampling methods including temperature, top-k, and top-p (nucleus) sampling
 //! with model-specific configurations loaded from HuggingFace model cards.
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use tch::Tensor;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -238,8 +238,10 @@ impl TokenSampler {
     pub fn sample(&mut self, logits: &Tensor) -> Result<u32> {
         // Debug: Check logits statistics
         if let Ok(logits_vec) = Vec::<f32>::try_from(logits.shallow_clone()) {
-            let max = logits_vec.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
-            let min = logits_vec.iter().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
+            let max = logits_vec.iter().max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .ok_or_else(|| anyhow!("Empty logits tensor"))?;
+            let min = logits_vec.iter().min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .ok_or_else(|| anyhow!("Empty logits tensor"))?;
             eprintln!("DEBUG: Logits shape: {:?}, min={:.3}, max={:.3}", logits.size(), min, max);
         }
         // Apply repetition penalty if needed

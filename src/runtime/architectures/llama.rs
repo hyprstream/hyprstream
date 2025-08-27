@@ -198,6 +198,9 @@ pub struct LlamaModel {
     norm: Option<RMSNorm>,
     lm_head: Option<Tensor>,
     
+    // KV cache for efficient generation (interior mutability for &self forward)
+    kv_cache: Option<std::cell::RefCell<crate::runtime::kv_cache::KVCacheManager>>,
+    
     // RoPE manager for position encoding
     rope_manager: std::cell::RefCell<RoPEManager>,
 }
@@ -243,8 +246,14 @@ unsafe impl Send for LlamaAttention {}
 unsafe impl Sync for LlamaAttention {}
 
 impl LlamaAttention {
-    /// Apply attention with optional GQA
-    fn forward(&self, hidden_states: &Tensor, position_ids: Option<&Tensor>) -> Result<Tensor> {
+    /// Apply attention with optional GQA and KV caching
+    fn forward(
+        &self, 
+        hidden_states: &Tensor, 
+        position_ids: Option<&Tensor>,
+        kv_cache: Option<&mut crate::runtime::kv_cache::LayerKVCache>,
+        start_pos: usize,
+    ) -> Result<Tensor> {
         let (batch_size, seq_len, hidden_size) = dims3(&hidden_states)?;
         
         // Debug: Check shapes and dtypes before matmul
@@ -319,22 +328,35 @@ impl LlamaAttention {
             (q, k)
         };
         
-        // Expand K, V for GQA if needed
-        let (k, v) = if kv_heads < self.num_heads {
+        // Handle KV caching
+        let (k_for_attn, v_for_attn) = if let Some(cache) = kv_cache {
+            // Update cache with new K and V
+            cache.update(&k, &v, start_pos)?;
+            
+            // Get full cached K and V for attention computation
+            let (cached_k, cached_v) = cache.get()?;
+            (cached_k, cached_v)
+        } else {
+            // No caching, use current K and V directly
+            (k.shallow_clone(), v.shallow_clone())
+        };
+        
+        // Expand K, V for GQA if needed (use cached versions)
+        let (k_expanded, v_expanded) = if kv_heads < self.num_heads {
             // tracing::debug!("Expanding KV from {} heads to {} heads", kv_heads, self.num_heads);
             (
-                self.expand_kv_for_gqa_with_heads(&k, kv_heads)?,
-                self.expand_kv_for_gqa_with_heads(&v, kv_heads)?
+                self.expand_kv_for_gqa_with_heads(&k_for_attn, kv_heads)?,
+                self.expand_kv_for_gqa_with_heads(&v_for_attn, kv_heads)?
             )
         } else {
-            (k, v)
+            (k_for_attn, v_for_attn)
         };
         
         // Compute attention scores
-        let scores = self.compute_attention_scores(&q, &k)?;
+        let scores = self.compute_attention_scores(&q, &k_expanded)?;
         
         // V: [batch, seq, heads, dim] -> [batch, heads, seq, dim]  
-        let v = v.transpose(1, 2);
+        let v = v_expanded.transpose(1, 2);
         
         // Apply attention to values: [batch, heads, seq, seq] x [batch, heads, seq, dim] = [batch, heads, seq, dim]
         let attn_output = scores.matmul(&v);
@@ -700,6 +722,7 @@ impl LlamaModel {
             layers,
             norm: None,
             lm_head: None,
+            kv_cache: None, // Cache initialized on first use
             rope_manager: std::cell::RefCell::new(RoPEManager::new()),
         })
     }
@@ -759,6 +782,18 @@ impl LlamaModel {
             }
         }
         
+        // Initialize KV cache if we have layers
+        let kv_cache = if !layers.is_empty() {
+            Some(std::cell::RefCell::new(
+                crate::runtime::kv_cache::KVCacheManager::new(
+                    layers.len(),
+                    config.max_position_embeddings,
+                )
+            ))
+        } else {
+            None
+        };
+        
         Ok(Self {
             config,
             device: *device,
@@ -767,6 +802,7 @@ impl LlamaModel {
             layers,
             norm,
             lm_head,
+            kv_cache,
             rope_manager: std::cell::RefCell::new(RoPEManager::new()),
         })
     }
@@ -1161,9 +1197,6 @@ impl ModelOperations for LlamaModel {
             // Try to print the actual token IDs if the tensor is small
             if flat_input.numel() <= 10 {
                 // TODO: Implement tensor value extraction when tch supports it
-                if false {
-                    // tracing::debug!("Token IDs: {:?}", values);
-                }
             }
             
             // Perform embedding lookup using index_select
@@ -1200,13 +1233,42 @@ impl ModelOperations for LlamaModel {
         let seq_len = hidden_states.size()[1];
         let position_ids = Tensor::arange(seq_len, (tch::Kind::Int64, hidden_states.device()));
         
+        // Track position for KV cache (assuming generation, start_pos would be passed in for real use)
+        let start_pos = 0; // TODO: This should be passed as a parameter for proper generation
+        
         for (idx, layer) in self.layers.iter().enumerate() {
             let residual = hidden_states.shallow_clone();
             // tracing::debug!("Processing layer {}, hidden_states shape: {:?}", idx, hidden_states.size());
             
-            // Self-attention block
+            // Self-attention block with optional KV cache
             hidden_states = layer.input_layernorm.forward(&hidden_states)?;
-            let attn_output = layer.self_attn.forward(&hidden_states, Some(&position_ids))?;
+            
+            // Handle KV cache per layer
+            let attn_output = if let Some(cache_ref) = self.kv_cache.as_ref() {
+                let mut cache_manager = cache_ref.borrow_mut();
+                if let Some(layer_cache) = cache_manager.get_layer_cache(idx) {
+                    layer.self_attn.forward(
+                        &hidden_states, 
+                        Some(&position_ids),
+                        Some(layer_cache),
+                        start_pos,
+                    )?
+                } else {
+                    layer.self_attn.forward(
+                        &hidden_states, 
+                        Some(&position_ids),
+                        None,
+                        start_pos,
+                    )?
+                }
+            } else {
+                layer.self_attn.forward(
+                    &hidden_states, 
+                    Some(&position_ids),
+                    None,
+                    start_pos,
+                )?
+            };
             hidden_states = residual + attn_output;
             
             // FFN block
@@ -1311,7 +1373,25 @@ impl ModelOperations for LlamaModel {
     fn apply_lora(&mut self, adapter: &ArchitectureAwareLoRAAdapter) -> Result<()> {
         // Apply LoRA weights with architecture-specific handling
         // The adapter will handle GQA shape conversions for Llama 2/3
+        let _ = adapter;
         Ok(())
+    }
+}
+
+impl LlamaModel {
+    /// Clear KV cache (e.g., for new generation)
+    pub fn clear_kv_cache(&self) {
+        if let Some(cache_ref) = self.kv_cache.as_ref() {
+            let mut cache_manager = cache_ref.borrow_mut();
+            cache_manager.clear_all();
+        }
+    }
+    
+    /// Get KV cache memory usage in bytes
+    pub fn kv_cache_memory_usage(&self) -> usize {
+        self.kv_cache.as_ref()
+            .map(|cache_ref| cache_ref.borrow().memory_usage())
+            .unwrap_or(0)
     }
 }
 
