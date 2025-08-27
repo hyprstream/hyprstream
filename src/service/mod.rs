@@ -1,1 +1,0 @@
-//! Service module for REST API-based ML inference

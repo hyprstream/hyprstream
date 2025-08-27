@@ -7,7 +7,6 @@
 //! - Memory-mapped disk persistence with zero-copy operations
 //! - FlightSQL interface for embeddings and similarity search
 
-pub mod aggregation;
 pub mod adapters;
 pub mod api;
 pub mod auth;
@@ -15,10 +14,7 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod inference;
-pub mod metrics;
-pub mod models;
 pub mod runtime;
-pub mod service;
 pub mod storage;
 pub mod utils;
 

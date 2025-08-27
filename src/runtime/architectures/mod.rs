@@ -121,7 +121,9 @@ impl ModelArchitecture {
 }
 
 /// Core trait for architecture-specific model operations
-pub trait ModelOperations: Send + Sync {
+/// Note: Removed Sync bound because tch::Tensor is not Sync (contains raw pointers to C code).
+/// Thread safety is handled by Arc<Mutex<>> wrapper in the engine.
+pub trait ModelOperations: Send {
     /// Get the architecture type
     fn architecture(&self) -> ModelArchitecture;
     

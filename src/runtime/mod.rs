@@ -24,6 +24,7 @@ pub mod fp8;                 // FP8 (E4M3/E5M2) quantization support
 pub mod architectures;       // Architecture-specific model implementations
 pub mod sampling;            // Token sampling strategies with model-specific configs
 pub mod inference;           // Clean inference interface with request/response patterns
+pub mod rope;                // Rotary Position Embedding (RoPE) implementation
 
 // Primary exports - use TorchEngine as default
 pub use torch_engine::TorchEngine;

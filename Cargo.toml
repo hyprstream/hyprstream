@@ -17,14 +17,7 @@ name = "hyprstream_core"
 path = "src/lib.rs"
 doctest = true
 
-[[bin]]
-name = "hyprstream"
-path = "src/bin/main.rs"
-doc = true
-
-[[bin]]
-name = "test_qwen_direct"
-path = "test_qwen_direct.rs"
+# Binaries removed - library only for inference
 
 [dependencies]
 # Arrow and DataFusion dependencies removed - focused on ML inference only

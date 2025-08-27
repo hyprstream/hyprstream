@@ -89,18 +89,22 @@ impl InferenceEngine {
         
         // Use streaming generation and print tokens as they arrive
         use std::io::{self, Write};
+        use std::sync::{Arc, Mutex};
         let start_time = std::time::Instant::now();
-        let mut token_count = 0;
+        let token_count = Arc::new(Mutex::new(0));
+        let token_count_clone = token_count.clone();
         
-        let result = torch_engine.generate_streaming(prompt, max_tokens, |token| {
+        let result = torch_engine.generate_streaming(prompt, max_tokens, move |token| {
             print!("{}", token);
             io::stdout().flush().unwrap();
-            token_count += 1;
+            *token_count_clone.lock().unwrap() += 1;
         }).await?;
+        
+        let final_token_count = *token_count.lock().unwrap();
         
         let duration = start_time.elapsed();
         let tokens_per_second = if duration.as_secs_f64() > 0.0 {
-            token_count as f64 / duration.as_secs_f64()
+            final_token_count as f64 / duration.as_secs_f64()
         } else {
             0.0
         };
@@ -109,13 +113,13 @@ impl InferenceEngine {
         {
             let mut stats = self.stats.write().await;
             stats.total_inferences += 1;
-            stats.total_tokens_generated += token_count as u64;
+            stats.total_tokens_generated += final_token_count as u64;
             stats.avg_tokens_per_second = tokens_per_second;
             stats.avg_latency_ms = duration.as_millis() as f64;
             stats.last_inference_time = chrono::Utc::now().timestamp();
         }
         
-        println!("\n✅ Generated {} tokens at {:.1} tok/s", token_count, tokens_per_second);
+        println!("\n✅ Generated {} tokens at {:.1} tok/s", final_token_count, tokens_per_second);
         Ok(result)
     }
     

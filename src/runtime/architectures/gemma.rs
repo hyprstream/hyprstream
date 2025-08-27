@@ -5,6 +5,7 @@ use super::lora_adapter::ArchitectureAwareLoRAAdapter;
 use anyhow::{Result, anyhow};
 use tch::{Device, Kind as DType, Tensor};
 use crate::runtime::tensor_helpers::{ToIntList, clone_tensor, square_tensor, broadcast_mul, broadcast_add, broadcast_sub, scalar_tensor, dims3, dims4};
+use crate::runtime::rope::RoPE;
 // Using tch tensor operations for Gemma architecture
 use std::collections::HashMap;
 use std::path::Path;
@@ -1013,9 +1014,14 @@ impl ModelOperations for GemmaModel {
     }
     
     fn apply_rope(&self, tensor: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
-        // Implement RoPE for Gemma
-        // This is a placeholder - actual implementation would use proper RoPE
-        Ok(clone_tensor(tensor))
+        // Use the centralized RoPE module with standard base frequency and matching dtype
+        let mut rope = crate::runtime::rope::RoPE::new_standard_with_dtype(
+            self.config.head_dim as i64,
+            8192, // max_seq_len
+            tensor.device(),
+            tensor.kind()  // Use same dtype as input tensor
+        )?;
+        rope.forward(tensor, Some(position_ids))
     }
     
     fn normalize(&self, tensor: &Tensor) -> Result<Tensor> {

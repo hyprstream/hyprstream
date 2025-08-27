@@ -5,6 +5,7 @@ use super::lora_adapter::ArchitectureAwareLoRAAdapter;
 use anyhow::{Result, anyhow};
 use tch::{Device, Kind as DType, Tensor};
 use crate::runtime::tensor_helpers::{ToIntList, clone_tensor, square_tensor, broadcast_mul, broadcast_add, broadcast_sub, scalar_tensor, dims3, dims4};
+use crate::runtime::rope::{RoPE, RoPEManager};
 // TODO: Replace candle_nn with tch equivalents
 use std::collections::HashMap;
 use std::path::Path;
@@ -196,6 +197,9 @@ pub struct LlamaModel {
     layers: Vec<LlamaLayer>,
     norm: Option<RMSNorm>,
     lm_head: Option<Tensor>,
+    
+    // RoPE manager for position encoding
+    rope_manager: std::cell::RefCell<RoPEManager>,
 }
 
 // SAFETY: Tch tensors are thread-safe when used correctly
@@ -389,61 +393,54 @@ impl LlamaAttention {
     
     /// Apply Rotary Position Embeddings with optional scaling
     fn apply_rope(&self, tensor: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
-        // tensor shape: [batch, seq, heads, dim]
-        let (_batch_size, seq_len, _num_heads, head_dim) = dims4(&tensor)?;
-        
-        // Generate position embeddings
-        let theta = self.rope_theta;
-        let device = tensor.device();
-        let dtype = tensor.kind();
-        
-        // Create frequency bands (exponentially decreasing)
-        let inv_freq = (0..head_dim / 2)
-            .map(|i| 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32))
-            .collect::<Vec<_>>();
-        
-        // Create position indices [0, 1, 2, ..., seq_len-1]
-        let positions = Tensor::arange(seq_len as i64, (DType::Int64, device))
-            .to_dtype(DType::Float, false, false);
-        
-        // Compute sinusoidal embeddings
-        let mut sin_vals = Vec::new();
-        let mut cos_vals = Vec::new();
-        
-        for i in 0..seq_len {
-            for j in 0..head_dim / 2 {
-                let angle = (i as f32) * inv_freq[j as usize];
-                sin_vals.push(angle.sin());
-                cos_vals.push(angle.cos());
-            }
+        // Use a thread-local RoPE instance cache for efficiency
+        thread_local! {
+            static ROPE_CACHE: std::cell::RefCell<std::collections::HashMap<(usize, i64, u32), RoPE>> = 
+                std::cell::RefCell::new(std::collections::HashMap::new());
         }
         
-        // Create sin and cos tensors [seq_len, head_dim/2]
-        let sin = Tensor::from_slice(&sin_vals)
-            .reshape(&[seq_len, head_dim / 2])
-            .to(device)
-            .to_dtype(dtype, false, false);
-        let cos = Tensor::from_slice(&cos_vals)
-            .reshape(&[seq_len, head_dim / 2])
-            .to(device)
-            .to_dtype(dtype, false, false);
-        
-        // Apply rotary embeddings
-        // Split tensor into first half and second half along head_dim
-        let x1 = tensor.narrow(-1, 0, head_dim / 2);
-        let x2 = tensor.narrow(-1, head_dim / 2, head_dim / 2);
-        
-        // Expand sin/cos to match tensor shape [1, seq, 1, head_dim/2]
-        let sin = sin.unsqueeze(0).unsqueeze(2);
-        let cos = cos.unsqueeze(0).unsqueeze(2);
-        
-        // Apply rotation: x' = x * cos - rotate(x) * sin
-        // For complex rotation: (x1 + ix2) * (cos + isin) = (x1*cos - x2*sin) + i(x1*sin + x2*cos)
-        let rotated_x1 = broadcast_sub(&broadcast_mul(&x1, &cos)?, &broadcast_mul(&x2, &sin)?)?;
-        let rotated_x2 = broadcast_add(&broadcast_mul(&x1, &sin)?, &broadcast_mul(&x2, &cos)?)?;
-        
-        // Concatenate back together
-        Ok(Tensor::cat(&[rotated_x1, rotated_x2], -1))
+        ROPE_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            
+            // Create a unique key for this layer's RoPE configuration
+            let key = (
+                self.layer_idx, 
+                self.head_dim as i64,
+                (self.rope_theta * 1000.0) as u32  // Convert to integer for hashing
+            );
+            
+            // Get or create RoPE instance
+            if !cache.contains_key(&key) {
+                // Use appropriate base frequency for layer type
+                let base = if self.layer_type == "local" {
+                    // Local layers in Gemma3 use different base
+                    10000.0
+                } else {
+                    self.rope_theta as f64
+                };
+                
+                tracing::debug!(
+                    "Creating RoPE for layer {} with base={}, head_dim={}",
+                    self.layer_idx, base, self.head_dim
+                );
+                
+                // Create RoPE with the same dtype as the input tensor
+                let rope = RoPE::new_with_dtype(
+                    self.head_dim as i64,
+                    base,
+                    8192,  // max_seq_len - should come from config
+                    tensor.device(),
+                    tensor.kind()  // Use same dtype as input tensor
+                ).map_err(|e| anyhow!("Failed to create RoPE for layer {}: {}", self.layer_idx, e))?;
+                
+                cache.insert(key, rope);
+            }
+            
+            let rope = cache.get_mut(&key).unwrap();
+            
+            // Apply RoPE with the actual position_ids
+            rope.forward(tensor, Some(position_ids))
+        })
     }
     
     /// Apply QK-norm (Gemma3)
@@ -703,6 +700,7 @@ impl LlamaModel {
             layers,
             norm: None,
             lm_head: None,
+            rope_manager: std::cell::RefCell::new(RoPEManager::new()),
         })
     }
     
@@ -769,6 +767,7 @@ impl LlamaModel {
             layers,
             norm,
             lm_head,
+            rope_manager: std::cell::RefCell::new(RoPEManager::new()),
         })
     }
     
@@ -1196,13 +1195,18 @@ impl ModelOperations for LlamaModel {
         
         // Apply transformer layers
         tracing::debug!("Total layers to process: {}", self.layers.len());
+        
+        // Generate position_ids for RoPE
+        let seq_len = hidden_states.size()[1];
+        let position_ids = Tensor::arange(seq_len, (tch::Kind::Int64, hidden_states.device()));
+        
         for (idx, layer) in self.layers.iter().enumerate() {
             let residual = hidden_states.shallow_clone();
             // tracing::debug!("Processing layer {}, hidden_states shape: {:?}", idx, hidden_states.size());
             
             // Self-attention block
             hidden_states = layer.input_layernorm.forward(&hidden_states)?;
-            let attn_output = layer.self_attn.forward(&hidden_states, None)?;
+            let attn_output = layer.self_attn.forward(&hidden_states, Some(&position_ids))?;
             hidden_states = residual + attn_output;
             
             // FFN block
@@ -1281,9 +1285,9 @@ impl ModelOperations for LlamaModel {
     }
     
     fn apply_rope(&self, tensor: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
-        // Implement RoPE for Llama with optional scaling
-        // This is a placeholder - actual implementation would use proper RoPE
-        Ok(tensor.shallow_clone())
+        // RoPE is applied in the attention layers, not at the model level
+        // This method should not be called
+        Err(anyhow!("RoPE should be applied in attention layers, not at model level"))
     }
     
     fn normalize(&self, tensor: &Tensor) -> Result<Tensor> {
@@ -1337,15 +1341,17 @@ mod tests {
     #[test]
     fn test_llama_reshape_for_gqa() {
         let device = Device::Cpu;
+        let dtype = DType::BFloat16;
         let config = LlamaConfig::llama3_8b();
         let model = LlamaModel {
             config: config.clone(),
-            device: *device,
+            device: device,
             dtype,  // Use the provided dtype (should be BF16)
             embed_tokens: None,
             layers: vec![],
             norm: None,
             lm_head: None,
+            rope_manager: std::cell::RefCell::new(RoPEManager::new()),
         };
         
         // Test tensor with shape [2, 10, 4096]

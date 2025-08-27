@@ -9,6 +9,18 @@ use std::collections::HashMap;
 use serde_json;
 use crate::config::{GenerationRequest, GenerationResult, ModelInfo, RuntimeConfig, FinishReason};
 use crate::runtime::RuntimeEngine;
+use crate::runtime::architectures::ModelOperations;
+
+/// Basic context state for tracking generation state
+#[derive(Debug, Clone)]
+pub struct ContextState {
+    /// Current sequence length
+    pub sequence_length: usize,
+    /// Context window size
+    pub context_window: usize,
+    /// Whether model is initialized
+    pub initialized: bool,
+}
 
 /// PyTorch inference engine using tch-rs
 /// 
@@ -26,6 +38,11 @@ pub struct TorchEngine {
     cached_weights: Option<HashMap<String, Tensor>>,
     /// Detected model architecture
     model_architecture: Option<String>,
+    /// Persistent model instance to avoid recreation on every forward pass
+    /// Using Arc<Mutex<>> for interior mutability since ModelOperations has mutable methods
+    persistent_model: Option<std::sync::Arc<std::sync::Mutex<Box<dyn ModelOperations>>>>,
+    /// Basic KV cache storage for context tracking
+    context_state: Option<ContextState>,
     /// Tokenizer for text processing
     tokenizer: Option<Tokenizer>,
     /// Device for computation (CPU/CUDA/ROCm)
@@ -132,6 +149,8 @@ impl TorchEngine {
             safetensors_data: None,
             cached_weights: None,
             model_architecture: None,
+            persistent_model: None,
+            context_state: None,
             tokenizer: None,
             device,
             config: config.clone(),
@@ -301,6 +320,13 @@ impl TorchEngine {
         self.cached_weights = Some(cached_weights);
         self.model_architecture = Some(architecture.clone());
         
+        // Determine context window first before moving architecture
+        let context_window = match architecture.as_str() {
+            "qwen3" => 262144,
+            "qwen2" => 131072,
+            _ => 32768,
+        };
+        
         // Update model info
         self.model_info.architecture = architecture;
         
@@ -308,7 +334,18 @@ impl TorchEngine {
         let vs = VarStore::new(self.device);
         self.var_store = Some(vs);
         
+        // Initialize persistent model once during loading
+        self.initialize_persistent_model()?;
+        
+        // Initialize context state
+        self.context_state = Some(ContextState {
+            sequence_length: 0,
+            context_window,
+            initialized: true,
+        });
+        
         println!("✅ SafeTensors model loaded and cached ({} tensors converted to BF16 in memory)", total_tensor_count);
+        println!("🚀 Persistent model initialized - ready for efficient inference");
         Ok(())
     }
 
@@ -329,6 +366,42 @@ impl TorchEngine {
     /// Check if model is loaded via VarStore
     pub fn has_varstore(&self) -> bool {
         self.var_store.is_some()
+    }
+
+    /// Initialize the persistent model instance from cached weights
+    fn initialize_persistent_model(&mut self) -> Result<()> {
+        use crate::runtime::architectures::gemma::GemmaModel;
+        use crate::runtime::architectures::qwen::QwenAdapter;
+        
+        let weights = self.cached_weights.as_ref()
+            .ok_or_else(|| anyhow!("No cached tensors available for persistent model initialization"))?;
+        
+        let architecture = self.model_architecture.as_ref()
+            .ok_or_else(|| anyhow!("No model architecture detected for persistent model initialization"))?;
+        
+        // Create model based on detected architecture (only once!)
+        let model: Box<dyn ModelOperations> = match architecture.as_str() {
+            "qwen3" => {
+                println!("🏗️ Initializing persistent Qwen3 model from cached weights");
+                QwenAdapter::from_weights(weights, 3, false, 262144, &self.device, tch::Kind::BFloat16)?
+            }
+            "qwen2" => {
+                println!("🏗️ Initializing persistent Qwen2 model from cached weights");
+                QwenAdapter::from_weights(weights, 2, false, 131072, &self.device, tch::Kind::BFloat16)?
+            }
+            "Qwen3ForCausalLM" => {
+                println!("🏗️ Initializing persistent Qwen3ForCausalLM model from cached weights");
+                QwenAdapter::from_weights(weights, 3, false, 262144, &self.device, tch::Kind::BFloat16)?
+            }
+            "gemma" | _ => {
+                println!("🏗️ Initializing persistent Gemma model from cached weights (fallback)");
+                Box::new(GemmaModel::from_weights(weights, &self.device, tch::Kind::BFloat16)?)
+            }
+        };
+        
+        self.persistent_model = Some(std::sync::Arc::new(std::sync::Mutex::new(model)));
+        println!("✅ Persistent model initialized successfully");
+        Ok(())
     }
 
     /// Load tokenizer
@@ -361,10 +434,14 @@ impl TorchEngine {
         if let Some(tokenizer) = &self.tokenizer {
             let encoding = tokenizer.encode(text, false)
                 .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
-            Ok(encoding.get_ids().iter().map(|&id| id as i64).collect())
+            let token_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
+            tracing::debug!("Tokenized '{}' -> {:?}", text, token_ids);
+            Ok(token_ids)
         } else {
             // Fallback: simple character-based tokenization
-            Ok(text.chars().map(|c| c as i64).collect())
+            let fallback_ids: Vec<i64> = text.chars().map(|c| c as i64).collect();
+            tracing::warn!("Using fallback tokenization for '{}' -> {:?}", text, fallback_ids);
+            Ok(fallback_ids)
         }
     }
 
@@ -372,11 +449,14 @@ impl TorchEngine {
     fn detokenize(&self, ids: &[i64]) -> Result<String> {
         if let Some(tokenizer) = &self.tokenizer {
             let ids_u32: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
-            tokenizer.decode(&ids_u32, false)
-                .map_err(|e| anyhow!("Detokenization failed: {}", e))
+            let decoded_text = tokenizer.decode(&ids_u32, false)
+                .map_err(|e| anyhow!("Detokenization failed: {}", e))?;
+            tracing::debug!("Detokenized {:?} -> '{}'", ids, decoded_text);
+            Ok(decoded_text)
         } else {
             // Fallback: convert back to characters
             let text: String = ids.iter().map(|&id| id as u8 as char).collect();
+            tracing::warn!("Using fallback detokenization for {:?} -> '{}'", ids, text);
             Ok(text)
         }
     }
@@ -396,38 +476,19 @@ impl TorchEngine {
         Err(anyhow!("No model loaded (neither VarStore nor TorchScript)"))
     }
 
-    /// Run inference using VarStore (SafeTensors models) with cached tensors
+    /// Run inference using VarStore (SafeTensors models) with persistent model
     fn forward_varstore(&self, input_ids: &[i64]) -> Result<Vec<f32>> {
-        use crate::runtime::architectures::gemma::GemmaModel;
-        use crate::runtime::architectures::qwen::QwenAdapter;
-        use crate::runtime::architectures::ModelOperations;
+        // Use the persistent model instance - NO recreation!
+        let model_arc = self.persistent_model.as_ref()
+            .ok_or_else(|| anyhow!("Persistent model not initialized - call load_model() first"))?;
         
-        // Use cached tensors for performance
-        let weights = self.cached_weights.as_ref()
-            .ok_or_else(|| anyhow!("No cached tensors available - model not properly loaded"))?;
+        // Verify context state
+        let context_state = self.context_state.as_ref()
+            .ok_or_else(|| anyhow!("Context state not initialized"))?;
         
-        let architecture = self.model_architecture.as_ref()
-            .ok_or_else(|| anyhow!("No model architecture detected"))?;
-        
-        // Create model based on detected architecture
-        let model: Box<dyn ModelOperations> = match architecture.as_str() {
-            "qwen3" => {
-                println!("🔧 Creating Qwen3 model from cached weights");
-                QwenAdapter::from_weights(weights, 3, false, 262144, &self.device, tch::Kind::BFloat16)?
-            }
-            "qwen2" => {
-                println!("🔧 Creating Qwen2 model from cached weights");
-                QwenAdapter::from_weights(weights, 2, false, 131072, &self.device, tch::Kind::BFloat16)?
-            }
-            "Qwen3ForCausalLM" => {
-                println!("🔧 Creating Qwen3ForCausalLM model from cached weights");
-                QwenAdapter::from_weights(weights, 3, false, 262144, &self.device, tch::Kind::BFloat16)?
-            }
-            "gemma" | _ => {
-                println!("🔧 Creating Gemma model from cached weights (fallback)");
-                Box::new(GemmaModel::from_weights(weights, &self.device, tch::Kind::BFloat16)?)
-            }
-        };
+        if !context_state.initialized {
+            return Err(anyhow!("Model not properly initialized"));
+        }
         
         // Convert input IDs to tensor (keep as int64 for embeddings)
         let input_tensor = Tensor::from_slice(input_ids)
@@ -435,7 +496,8 @@ impl TorchEngine {
             .to_device(self.device)
             .unsqueeze(0); // Add batch dimension: [1, seq_len]
         
-        // Run forward pass through Gemma model
+        // Lock the model and run forward pass (efficient!)
+        let model = model_arc.lock().map_err(|e| anyhow!("Failed to lock model: {}", e))?;
         let logits = model.forward(&input_tensor, None)?;
         
         // Extract logits for the last token
@@ -464,16 +526,31 @@ impl TorchEngine {
     }
 
     /// Sample next token from logits
-    fn sample_token(&self, logits: &[f32], temperature: f32, top_p: f32, top_k: Option<usize>) -> Result<usize> {
+    fn sample_token(&self, logits: &[f32], temperature: f32, top_p: f32, top_k: Option<usize>, repeat_penalty: f32, previous_tokens: &[i64]) -> Result<usize> {
         if logits.is_empty() {
             return Err(anyhow!("Empty logits"));
         }
 
+        // Apply repetition penalty first
+        let mut penalized_logits = logits.to_vec();
+        if repeat_penalty != 1.0 {
+            for &prev_token in previous_tokens.iter().take(100) {  // Only consider last 100 tokens
+                let token_id = prev_token as usize;
+                if token_id < penalized_logits.len() {
+                    if penalized_logits[token_id] > 0.0 {
+                        penalized_logits[token_id] /= repeat_penalty;
+                    } else {
+                        penalized_logits[token_id] *= repeat_penalty;
+                    }
+                }
+            }
+        }
+
         // Apply temperature
         let scaled_logits: Vec<f32> = if temperature > 0.0 {
-            logits.iter().map(|&x| x / temperature).collect()
+            penalized_logits.iter().map(|&x| x / temperature).collect()
         } else {
-            logits.to_vec()
+            penalized_logits
         };
 
         // Find max for numerical stability
@@ -607,9 +684,9 @@ impl RuntimeEngine for TorchEngine {
         let request = GenerationRequest {
             prompt: prompt.to_string(),
             max_tokens,
-            temperature: 0.8,
-            top_p: 0.95,
-            top_k: Some(50),
+            temperature: 0.7,  // Official recommendation
+            top_p: 0.8,        // Official recommendation  
+            top_k: Some(20),   // Official recommendation
             repeat_penalty: 1.1,
             stop_tokens: vec![],
             seed: None,
@@ -624,6 +701,11 @@ impl RuntimeEngine for TorchEngine {
     }
 
     async fn generate_with_params(&self, request: GenerationRequest) -> Result<GenerationResult> {
+        // Ensure persistent model is ready
+        if !self.is_persistent_model_ready() {
+            return Err(anyhow!("Model not properly initialized - persistent model not ready"));
+        }
+        
         let start_time = std::time::Instant::now();
 
         // Tokenize input
@@ -631,17 +713,21 @@ impl RuntimeEngine for TorchEngine {
         let mut generated_text = String::new();
         let mut tokens_generated = 0;
 
-        for _ in 0..request.max_tokens {
-            // Run forward pass
+        for _i in 0..request.max_tokens {
+            // Run forward pass with persistent model (efficient!)
             let logits = self.forward(&input_ids)?;
             
-            // Sample next token
+            // Sample next token with proper parameters
             let next_token = self.sample_token(
                 &logits,
                 request.temperature,
                 request.top_p,
                 request.top_k,
+                request.repeat_penalty,
+                &input_ids,
             )?;
+            
+            tracing::info!("Sampled token ID: {}", next_token);
 
             // Add to sequence
             input_ids.push(next_token as i64);
@@ -649,6 +735,7 @@ impl RuntimeEngine for TorchEngine {
 
             // Decode token
             let token_text = self.detokenize(&[next_token as i64])?;
+            tracing::info!("Token text: '{}'", token_text);
             generated_text.push_str(&token_text);
 
             // Check stop tokens
@@ -682,7 +769,7 @@ impl RuntimeEngine for TorchEngine {
     }
 
     fn is_loaded(&self) -> bool {
-        self.model.is_some() || self.var_store.is_some()
+        self.model.is_some() || self.var_store.is_some() || self.persistent_model.is_some()
     }
 }
 
@@ -693,6 +780,11 @@ impl TorchEngine {
     where 
         F: FnMut(&str)
     {
+        // Ensure persistent model is ready
+        if !self.is_persistent_model_ready() {
+            return Err(anyhow!("Model not properly initialized - persistent model not ready"));
+        }
+        
         let request = GenerationRequest {
             prompt: prompt.to_string(),
             max_tokens,
@@ -717,7 +809,7 @@ impl TorchEngine {
         let mut tokens_generated = 0;
 
         for _ in 0..max_tokens {
-            // Run forward pass for current sequence
+            // Run forward pass for current sequence with persistent model
             let logits = self.forward(&input_ids)?;
             
             // Sample next token
@@ -726,6 +818,8 @@ impl TorchEngine {
                 request.temperature,
                 request.top_p,
                 request.top_k,
+                request.repeat_penalty,
+                &input_ids,
             )?;
 
             // Add to sequence
@@ -751,6 +845,19 @@ impl TorchEngine {
         }
 
         Ok(generated_text)
+    }
+
+    /// Update context state for tracking generation progress
+    /// Note: This is currently a no-op since generation methods take &self
+    fn update_context_state(&self, _sequence_length: usize) {
+        // TODO: Implement with interior mutability if needed
+        // Currently disabled to avoid borrowing conflicts
+    }
+
+    /// Check if persistent model is initialized
+    pub fn is_persistent_model_ready(&self) -> bool {
+        self.persistent_model.is_some() && 
+        self.context_state.as_ref().map_or(false, |c| c.initialized)
     }
 
     /// Train temporal LoRA adapter (placeholder implementation)
