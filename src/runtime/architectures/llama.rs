@@ -1200,6 +1200,11 @@ impl ModelOperations for LlamaModel {
     }
     
     fn forward(&self, input: &Tensor, _past_kv: Option<&Tensor>) -> Result<Tensor> {
+        // Default forward just calls forward_with_cache with start_pos = 0
+        self.forward_with_cache(input, 0)
+    }
+    
+    fn forward_with_cache(&self, input: &Tensor, start_pos: usize) -> Result<Tensor> {
         // Input should be token IDs with shape [batch_size, seq_len]
         let mut hidden_states = if let Some(embed) = &self.embed_tokens {
             // Convert token IDs to embeddings
@@ -1253,12 +1258,19 @@ impl ModelOperations for LlamaModel {
         // Apply transformer layers
         tracing::debug!("Total layers to process: {}", self.layers.len());
         
-        // Generate position_ids for RoPE
+        // Generate position_ids based on start_pos (for proper KV cache usage)
         let seq_len = hidden_states.size()[1];
-        let position_ids = Tensor::arange(seq_len, (tch::Kind::Int64, hidden_states.device()));
-        
-        // Track position for KV cache (assuming generation, start_pos would be passed in for real use)
-        let start_pos = 0; // TODO: This should be passed as a parameter for proper generation
+        let position_ids = if start_pos == 0 {
+            // Processing full prompt - positions from 0 to seq_len
+            Tensor::arange(seq_len, (tch::Kind::Int64, hidden_states.device()))
+        } else {
+            // Processing new tokens - positions from start_pos onwards
+            Tensor::arange_start(
+                start_pos as i64,
+                (start_pos + seq_len as usize) as i64,
+                (tch::Kind::Int64, hidden_states.device())
+            )
+        };
         
         for (idx, layer) in self.layers.iter().enumerate() {
             let residual = hidden_states.shallow_clone();
@@ -1267,7 +1279,7 @@ impl ModelOperations for LlamaModel {
             // Self-attention block with optional KV cache
             hidden_states = layer.input_layernorm.forward(&hidden_states)?;
             
-            // Handle KV cache per layer
+            // Handle KV cache per layer with proper start_pos
             let attn_output = if let Some(cache_ref) = self.kv_cache.as_ref() {
                 let mut cache_manager = cache_ref.borrow_mut();
                 if let Some(layer_cache) = cache_manager.get_layer_cache(idx) {

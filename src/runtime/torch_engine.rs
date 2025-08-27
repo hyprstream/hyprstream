@@ -682,9 +682,8 @@ impl TorchEngine {
         // Run forward pass with position info for proper KV cache usage
         let model = self.handle_poison(model_arc.lock())?;
         
-        // TODO: Modify ModelOperations trait to accept start_pos parameter
-        // For now, use regular forward which will still benefit from internal caching
-        let logits = model.forward(&input_tensor, None)?;
+        // Use the new forward_with_cache method that properly tracks position
+        let logits = model.forward_with_cache(&input_tensor, start_pos)?;
         
         // Extract logits for the last token
         let logits_shape = logits.size();

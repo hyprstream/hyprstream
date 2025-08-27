@@ -133,6 +133,13 @@ pub trait ModelOperations: Send {
     /// Forward pass through the model
     fn forward(&self, input: &Tensor, past_kv: Option<&Tensor>) -> Result<Tensor>;
     
+    /// Forward pass with position information for KV caching
+    fn forward_with_cache(&self, input: &Tensor, start_pos: usize) -> Result<Tensor> {
+        // Default implementation just calls regular forward
+        // Models that support KV caching should override this
+        self.forward(input, None)
+    }
+    
     /// Reshape tensor for attention computation
     fn reshape_for_attention(&self, tensor: &Tensor, is_key_value: bool) -> Result<Tensor>;
     

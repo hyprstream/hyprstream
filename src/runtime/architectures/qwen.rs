@@ -1,10 +1,11 @@
 //! Qwen model adapter that reuses Llama implementation with Qwen-specific configurations
 //! 
 //! Qwen models are architecturally similar to Llama but with key differences:
-//! - Different RoPE parameters (base frequency 1M for long context)
-//! - Support for longer context windows (128K-262K tokens)
-//! - Some models use combined c_attn weights instead of separate q/k/v projections
-//! - Grouped Query Attention (GQA) configurations vary by model size
+//! - Standard RoPE base of 10,000 (same as Llama, but supports YARN scaling for longer context)
+//! - Default context window of 32K tokens (can extend via YARN to 131K+)
+//! - Vocabulary size of 151,936 tokens (Qwen3)
+//! - SiLU activation function (same as Llama)
+//! - Most models use same num_attention_heads and num_key_value_heads (no GQA reduction)
 
 use super::{ModelArchitecture, ModelOperations, ArchitectureConfig};
 use super::llama::{LlamaModel, LlamaConfig};
@@ -31,30 +32,35 @@ impl QwenAdapter {
         // Apply Qwen-specific overrides based on version
         match version {
             3 => {
-                // Qwen3 specific configurations
-                config.rope_theta = 1_000_000.0;  // 1M for long context support
-                config.max_position_embeddings = context_length;
+                // Qwen3 specific configurations from official spec
+                config.rope_theta = 10_000.0;  // Standard RoPE base (NOT 1M!)
+                config.max_position_embeddings = context_length.min(32_768);  // Default 32K
                 
                 // Qwen3 uses GQA with different ratios based on model size
-                // This will be auto-detected from weights, but we can override if needed
+                // Official configs show num_key_value_heads often equals num_attention_heads
                 if config.hidden_size == 2560 {  // Qwen3-1.5B
-                    config.num_attention_heads = 32;
-                    config.num_key_value_heads = 8;  // 4:1 GQA ratio
+                    config.num_attention_heads = 20;  // Actual from model
+                    config.num_key_value_heads = 20;  // Same as attention heads
                 } else if config.hidden_size == 4096 {  // Qwen3-7B/8B
                     config.num_attention_heads = 32;
-                    config.num_key_value_heads = 8;  // 4:1 GQA ratio
+                    config.num_key_value_heads = 32;  // Default: same as num_attention_heads
                 }
                 
-                // Update vocab size if detected from weights
+                // Qwen3 default vocab size
                 if let Some(embed) = weights.get("model.embed_tokens.weight")
                     .or_else(|| weights.get("embed_tokens.weight")) {
                     config.vocab_size = embed.size()[0] as usize;
+                } else {
+                    config.vocab_size = 151_936;  // Qwen3 default
                 }
+                
+                // Set intermediate size (for FFN)
+                config.intermediate_size = 22_016;  // Qwen3 default
             }
             2 => {
-                // Qwen2 configurations
-                config.rope_theta = 1_000_000.0;
-                config.max_position_embeddings = context_length.min(131_072);
+                // Qwen2 configurations  
+                config.rope_theta = 10_000.0;  // Standard RoPE
+                config.max_position_embeddings = context_length.min(32_768);
             }
             _ => {
                 // Qwen1 or unknown version - use conservative defaults
