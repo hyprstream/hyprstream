@@ -2,10 +2,10 @@
 name = "hyprstream"
 version = "0.1.0-alpha-7"
 edition = "2021"
-description = "High-performance metrics storage and query service using Arrow Flight SQL"
+description = "Real-time adaptive ML inference server with dynamic sparse weight adjustments using NanoVDB"
 documentation = "https://docs.rs/hyprstream"
 readme = "README.md"
-license = "Apache-2.0"
+license = "AGPL-3.0"
 license-file = "LICENSE"
 exclude = [
     "**/*.pyc",
@@ -21,16 +21,13 @@ doctest = true
 [[bin]]
 name = "hyprstream"
 path = "src/bin/main.rs"
-doc = true
 
 [dependencies]
-arrow = "53.1.0"
-arrow-flight = { version = "53.1.0", features = ["cli", "flight-sql-experimental", "tls"] }
-datafusion = "42.2.0"
-datafusion-common = "42.2.0"
+# Arrow and DataFusion dependencies removed - focused on ML inference only
 bytes = "1.9.0"
-duckdb = { version = "1.1.1", features = ["bundled"] }
 futures = { version = "0.3.31", features = ["alloc"] }
+futures-util = "0.3.31"
+pin-project-lite = "0.2"
 polars = "0.45.1"
 tokio = { version = "1.43.0", features = ["rt-multi-thread", "signal", "fs"] }
 tokio-rustls = "0.26.1"
@@ -39,7 +36,6 @@ rustls = "0.23.1"
 rustls-pemfile = "2.1.0"
 async-trait = "0.1"
 sqlparser = "0.39.0"
-adbc_core = { version = "0.15.0", features = ["driver_manager"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_derive = "1.0"
 lazy_static = "1.4"
@@ -49,39 +45,81 @@ users = "0.11"
 rlimit = "0.10"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
 
-# ADBC dependencies
-arrow-array = "53.1.0"
-arrow-schema = "53.1.0"
-arrow-ipc = "53.1.0"
+# ADBC dependencies removed - focused on ML inference only
 
 # Configuration
-config = { version = "0.13", features = ["toml"] }
+config = { version = "0.13", features = ["toml", "yaml", "json"] }
+toml = "0.8"
+serde_yaml = "0.9"
 clap = { version = "4.4", features = ["derive", "env"] }
 tracing = "0.1"
 parking_lot = "0.12"
 num_cpus = "1.16"
+
+# OpenVDB integration
+cxx = "1.0"
 tracing-log = "0.2"
 tracing-appender = "0.2"
 bincode = "1.3.3"
 tokio-stream = "0.1.17"
 hex = "0.4"
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 async-stream = "0.3"
 anyhow = "1.0.95"
 daemonize = "0.5.0"
 prost = "0.13"
-arrow-json = "53.1.0"
+# Arrow JSON removed - focused on ML inference only
+
+# NanoVDB and ML dependencies
+thiserror = "1.0"
+memmap2 = "0.9"
+rand = "0.8"
+# PyTorch Rust bindings - replaces Candle  
+tch = { version = "0.20", features = ["download-libtorch"] }
+
+# Candle ML Framework - REMOVED: Fully migrated to Tch (PyTorch Rust bindings)
+# candle-core = "0.9.1"
+# candle-nn = "0.9.1"
+# candle-transformers = "0.9.1"
+# candle-examples = "0.9.1"
+tokenizers = { version = "0.20", features = ["onig"] }
+safetensors = "0.4"
+regex = "1.11"
+
+# Runtime Integration Dependencies
+# llama-cpp-2 = "0.1.67"          # REMOVED: Replaced by Tch (PyTorch) inference
+# mistralrs dependencies commented out during Candle migration
+# mistralrs = { path = "../mistral.rs/mistralrs" } 
+# mistralrs-core = { path = "../mistral.rs/mistralrs-core" }
+hf-hub = { version = "0.4.3", features = ["tokio"] }  # HuggingFace model downloads
+uuid = { version = "1.0", features = ["v4", "serde"] }
+reqwest = { version = "0.11", features = ["json", "stream"] }
+indicatif = "0.17"              # Progress bars
+fastrand = "2.0"                # Fast random number generation for sampling
+xdg = "2.5"                     # XDG Base Directory specification
+blake3 = "1.5"                  # Fast cryptographic hashing for checksums
+tempfile = "3.9"                # Temporary files for model conversion
+
+# HTTP API dependencies
+axum = { version = "0.7", features = ["macros", "tokio"] }
+url = "2.5"
+urlencoding = "2.1"
+half = "2.6.0"
+
+[features]
+default = []
+cuda = []
+
+[build-dependencies]
+cc = "1.0"
+bindgen = "0.70"
+cxx-build = "1.0"
+pkg-config = "0.3"
 
 [dev-dependencies]
 criterion = "0.5.1"
 tempfile = "3.9.0"
 tokio-stream = "0.1.14"
 
-[source.crates-io]
-replace-with = "vendored-sources"
 
-[source.vendored-sources]
-directory = "vendor"
 
-[build]
-rustflags = ["-L", "/home/birdetta/.local/share/mamba/lib"] # Add linker search path

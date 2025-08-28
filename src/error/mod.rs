@@ -17,32 +17,44 @@ impl fmt::Display for StatusWrapper {
     }
 }
 
-// Wrapper for DuckDB errors
+// Wrapper for VDB storage errors
 #[derive(Debug)]
-pub struct DuckDbErrorWrapper(pub duckdb::Error);
+pub struct VDBErrorWrapper(pub crate::storage::SparseStorageError);
 
-impl Error for DuckDbErrorWrapper {
+impl Error for VDBErrorWrapper {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Some(&self.0)
     }
 }
 
-impl fmt::Display for DuckDbErrorWrapper {
+impl fmt::Display for VDBErrorWrapper {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
 }
 
-// Convert DuckDB error wrapper to Status
-impl From<DuckDbErrorWrapper> for tonic::Status {
-    fn from(err: DuckDbErrorWrapper) -> Self {
-        tonic::Status::internal(format!("DuckDB error: {}", err.0))
-    }
-}
-
-// Convert Status wrapper to DataFusion error
-impl From<StatusWrapper> for datafusion::error::DataFusionError {
-    fn from(status: StatusWrapper) -> Self {
-        datafusion::error::DataFusionError::External(Box::new(status))
+// Convert VDB error wrapper to Status
+impl From<VDBErrorWrapper> for tonic::Status {
+    fn from(err: VDBErrorWrapper) -> Self {
+        match err.0 {
+            crate::storage::SparseStorageError::AdapterNotFound { id } => {
+                tonic::Status::not_found(format!("Adapter not found: {}", id))
+            }
+            crate::storage::SparseStorageError::InvalidCoordinates { reason } => {
+                tonic::Status::invalid_argument(format!("Invalid coordinates: {}", reason))
+            }
+            crate::storage::SparseStorageError::DiskError(ref io_err) => {
+                tonic::Status::internal(format!("Disk I/O error: {}", io_err))
+            }
+            crate::storage::SparseStorageError::CompressionError(ref msg) => {
+                tonic::Status::internal(format!("Compression error: {}", msg))
+            }
+            crate::storage::SparseStorageError::HardwareError(ref msg) => {
+                tonic::Status::internal(format!("Hardware acceleration error: {}", msg))
+            }
+            crate::storage::SparseStorageError::ConcurrencyError { ref id } => {
+                tonic::Status::aborted(format!("Concurrent modification detected for adapter: {}", id))
+            }
+        }
     }
 }

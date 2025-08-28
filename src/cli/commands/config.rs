@@ -124,9 +124,6 @@ impl LoggingConfig {
         }
     }
 
-    fn is_valid_level(level: &str) -> bool {
-        matches!(level, "trace" | "debug" | "info" | "warn" | "error")
-    }
 }
 
 impl ConfigSection for LoggingConfig {

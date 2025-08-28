@@ -1,4 +1,7 @@
+.claude
 .env
 .aider*
+.context
 _future
 target
+models
