@@ -256,6 +256,9 @@ impl LlamaAttention {
     ) -> Result<Tensor> {
         let (batch_size, seq_len, hidden_size) = dims3(&hidden_states)?;
         
+        tracing::debug!("LlamaAttention forward: batch_size={}, seq_len={}, hidden_size={}, start_pos={}, has_cache={}", 
+                      batch_size, seq_len, hidden_size, start_pos, kv_cache.is_some());
+        
         // Debug: Check shapes and dtypes before matmul
         tracing::debug!("Attention forward - hidden_states shape: {:?}, dtype: {:?}", hidden_states.size(), hidden_states.kind());
         tracing::debug!("Attention forward - q_proj shape: {:?}, dtype: {:?}", self.q_proj.size(), self.q_proj.kind());
@@ -841,6 +844,7 @@ impl LlamaModel {
     pub fn detect_config_from_weights(weights: &HashMap<String, Tensor>) -> Result<LlamaConfig> {
         // Try to infer config from tensor shapes
         let mut config = LlamaConfig::default();
+        tracing::info!("Starting detect_config_from_weights, default rope_theta={}", config.rope_theta);
         
         // Get vocab size from embedding
         if let Some(embed) = weights.get("model.embed_tokens.weight")
@@ -940,6 +944,8 @@ impl LlamaModel {
             }
         }
         
+        tracing::info!("Finished detect_config_from_weights, final rope_theta={}, vocab_size={}", 
+                     config.rope_theta, config.vocab_size);
         Ok(config)
     }
     
@@ -1112,7 +1118,7 @@ impl LlamaModel {
     
     
     /// Parse configuration from JSON
-    fn parse_config(json_str: &str) -> Result<LlamaConfig> {
+    pub fn parse_config(json_str: &str) -> Result<LlamaConfig> {
         let json: serde_json::Value = serde_json::from_str(json_str)?;
         
         // Detect version from config
@@ -1192,6 +1198,7 @@ impl LlamaModel {
             tracing::info!("Detected Gemma3 model from config.json, applying Gemma3 settings");
         }
         
+        tracing::info!("Parsed Llama config from JSON: rope_theta={}, vocab_size={}", config.rope_theta, config.vocab_size);
         Ok(config)
     }
 }
@@ -1211,6 +1218,9 @@ impl ModelOperations for LlamaModel {
     }
     
     fn forward_with_cache(&self, input: &Tensor, start_pos: usize) -> Result<Tensor> {
+        tracing::info!("LlamaModel forward_with_cache: input shape={:?}, start_pos={}, config: hidden_size={}, num_layers={}", 
+                     input.size(), start_pos, self.config.hidden_size, self.layers.len());
+        
         // Input should be token IDs with shape [batch_size, seq_len]
         let mut hidden_states = if let Some(embed) = &self.embed_tokens {
             // Convert token IDs to embeddings
@@ -1289,6 +1299,7 @@ impl ModelOperations for LlamaModel {
             let attn_output = if let Some(cache_ref) = self.kv_cache.as_ref() {
                 let mut cache_manager = cache_ref.borrow_mut();
                 if let Some(layer_cache) = cache_manager.get_layer_cache(idx) {
+                    tracing::debug!("Layer {}: Using KV cache, cache_pos={}", idx, layer_cache.seq_pos);
                     layer.self_attn.forward(
                         &hidden_states, 
                         Some(&position_ids),
@@ -1296,6 +1307,7 @@ impl ModelOperations for LlamaModel {
                         start_pos,
                     )?
                 } else {
+                    tracing::debug!("Layer {}: No KV cache available", idx);
                     layer.self_attn.forward(
                         &hidden_states, 
                         Some(&position_ids),
@@ -1304,6 +1316,7 @@ impl ModelOperations for LlamaModel {
                     )?
                 }
             } else {
+                tracing::debug!("Layer {}: KV cache not initialized", idx);
                 layer.self_attn.forward(
                     &hidden_states, 
                     Some(&position_ids),
@@ -1326,9 +1339,12 @@ impl ModelOperations for LlamaModel {
         }
         
         // LM head
+        tracing::info!("Before LM head: hidden_states shape={:?}", hidden_states.size());
         if let Some(lm_head) = &self.lm_head {
             // LM head weight also needs to be transposed
+            tracing::info!("Using LM head: shape={:?}", lm_head.size());
             hidden_states = hidden_states.matmul(lm_head);
+            tracing::info!("After LM head: logits shape={:?}", hidden_states.size());
         } else if let Some(embed) = &self.embed_tokens {
             // Gemma and some other models tie weights: lm_head = embed_tokens.T
             // The embedding matrix is [vocab_size, hidden_size]

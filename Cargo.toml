@@ -17,7 +17,9 @@ name = "hyprstream_core"
 path = "src/lib.rs"
 doctest = true
 
-# Binaries removed - library only for inference
+[[bin]]
+name = "hyprstream"
+path = "src/bin/main.rs"
 
 [dependencies]
 # Arrow and DataFusion dependencies removed - focused on ML inference only

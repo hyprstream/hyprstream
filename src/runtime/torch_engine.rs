@@ -71,11 +71,13 @@ pub struct TorchEngine {
     /// VarStore for native PyTorch weight management - not thread safe, requires external sync
     var_store: Arc<Mutex<Option<VarStore>>>,
     /// SafeTensors raw data for on-demand tensor creation - thread safe after initialization
-    safetensors_data: Arc<Mutex<Option<Vec<u8>>>>,
+    // safetensors_data removed - no longer needed with ModelFactory
     /// Cached converted tensors (for performance optimization) - thread safe after initialization
-    cached_weights: Arc<Mutex<Option<HashMap<String, Tensor>>>>,
+    // cached_weights removed - ModelFactory handles weight loading
     /// Detected model architecture - thread safe after initialization
     model_architecture: Arc<Mutex<Option<String>>>,
+    /// Model config.json content if available
+    // model_config_json removed - ModelFactory handles config loading
     /// Persistent model instance to avoid recreation on every forward pass
     /// Using Arc<Mutex<>> for interior mutability since ModelOperations has mutable methods
     persistent_model: Option<Arc<Mutex<Box<dyn ModelOperations>>>>,
@@ -111,67 +113,7 @@ impl TorchEngine {
     }
     
     /// Convert SafeTensors data to tch Tensor with consistent BF16 dtype for Gemma
-    fn safetensors_to_tensor(
-        name: &str,
-        tensor_view: &safetensors::tensor::TensorView,
-        device: Device,
-    ) -> Result<Tensor> {
-        let shape: Vec<i64> = tensor_view.shape().iter().map(|&s| s as i64).collect();
-        let tensor_data = tensor_view.data();
-        
-        // Convert all tensors to BF16 for consistent dtype in Gemma models
-        let tensor = match tensor_view.dtype() {
-            safetensors::Dtype::F32 => {
-                let f32_slice = unsafe { 
-                    std::slice::from_raw_parts(
-                        tensor_data.as_ptr() as *const f32,
-                        tensor_data.len() / 4
-                    )
-                };
-                Tensor::from_slice(f32_slice)
-                    .to_kind(tch::Kind::BFloat16)  // Convert to BF16
-                    .view(shape.as_slice())
-                    .to_device(device)
-            }
-            safetensors::Dtype::F16 => {
-                let f16_slice = unsafe {
-                    std::slice::from_raw_parts(
-                        tensor_data.as_ptr() as *const u16,
-                        tensor_data.len() / 2
-                    )
-                };
-                let f32_data: Vec<f32> = f16_slice.iter().map(|&x| {
-                    half::f16::from_bits(x).to_f32()
-                }).collect();
-                Tensor::from_slice(&f32_data)
-                    .to_kind(tch::Kind::BFloat16)  // Convert to BF16
-                    .view(shape.as_slice())
-                    .to_device(device)
-            }
-            safetensors::Dtype::BF16 => {
-                let bf16_slice = unsafe {
-                    std::slice::from_raw_parts(
-                        tensor_data.as_ptr() as *const u16,
-                        tensor_data.len() / 2
-                    )
-                };
-                let f32_data: Vec<f32> = bf16_slice.iter().map(|&x| {
-                    f32::from_bits((x as u32) << 16)
-                }).collect();
-                Tensor::from_slice(&f32_data)
-                    .to_kind(tch::Kind::BFloat16)  // Already BF16
-                    .view(shape.as_slice())
-                    .to_device(device)
-            }
-            _ => {
-                println!("⚠️ Unsupported dtype for {}, creating zero tensor", name);
-                Tensor::zeros(shape.as_slice(), (tch::Kind::BFloat16, device))  // BF16 zero tensor
-            }
-        };
-        
-        // println!("🔧 Converted tensor '{}' to BF16, shape: {:?}", name, shape); // Suppressed for cleaner output
-        Ok(tensor)
-    }
+    // NOTE: safetensors_to_tensor removed - all weight loading now handled by ModelFactory
 
     /// Create new PyTorch engine
     pub fn new(config: RuntimeConfig) -> Result<Self> {
@@ -196,9 +138,10 @@ impl TorchEngine {
 
         Ok(Self {
             var_store: Arc::new(Mutex::new(None)),
-            safetensors_data: Arc::new(Mutex::new(None)),
-            cached_weights: Arc::new(Mutex::new(None)),
+            // safetensors_data removed - handled by ModelFactory
+            // cached_weights removed - handled by ModelFactory
             model_architecture: Arc::new(Mutex::new(None)),
+            // model_config_json removed - handled by ModelFactory
             persistent_model: None,
             context_state: Arc::new(Mutex::new(None)),
             tokenizer: Arc::new(Mutex::new(None)),
@@ -248,163 +191,43 @@ impl TorchEngine {
         Ok(())
     }
 
-    /// Detect model architecture from config.json and weights - thread safe
-    fn detect_architecture(&self, model_dir: &Path, weights: &HashMap<String, Tensor>) -> Result<String> {
-        // First try to read config.json for architecture info
-        let config_path = model_dir.join("config.json");
-        if config_path.exists() {
-            if let Ok(config_content) = std::fs::read_to_string(&config_path) {
-                if let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_content) {
-                    // Check model_type field first
-                    if let Some(model_type) = config["model_type"].as_str() {
-                        return Ok(model_type.to_string());
-                    }
-                    
-                    // Check architectures field
-                    if let Some(architectures) = config["architectures"].as_array() {
-                        if let Some(arch) = architectures.first() {
-                            if let Some(arch_str) = arch.as_str() {
-                                return Ok(arch_str.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Try weight-based detection as last resort
-        use crate::runtime::architectures::qwen::QwenAdapter;
-        if QwenAdapter::is_qwen_model(weights) {
-            return Ok("qwen".to_string());
-        }
-        
-        // No architecture could be detected - fail with clear error
-        Err(anyhow!(
-            "Could not detect model architecture. Ensure config.json exists with valid 'model_type' or 'architectures' field. \
-            Supported architectures: qwen3, qwen2, Qwen3ForCausalLM, gemma"
-        ))
-    }
 
-    /// Load SafeTensors model using safetensors crate and pre-convert all tensors to cache
+    /// Load SafeTensors model using ModelFactory for unified weight loading
     async fn load_safetensors(&mut self, path: &Path) -> Result<()> {
-        println!("🚀 Loading SafeTensors with native PyTorch VarStore: {}", path.display());
+        println!("🚀 Loading SafeTensors model: {}", path.display());
         
-        let mut cached_weights = HashMap::new();
-        let mut all_buffers = Vec::new();
-        let mut total_tensor_count = 0;
-        
-        // Check if this is a sharded model (path points to first shard)
-        if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-            if filename.starts_with("model-00001-of-") && filename.ends_with(".safetensors") {
-                // This is a sharded model - find all shards
-                println!("🔍 Loading sharded SafeTensors model...");
-                
-                let parent_dir = path.parent().ok_or_else(|| anyhow!("Invalid path structure"))?;
-                
-                // Extract the total number of shards from filename like "model-00001-of-00003.safetensors"
-                let parts: Vec<&str> = filename.split('-').collect();
-                if parts.len() >= 4 {
-                    if let Some(total_shards_str) = parts.get(3).and_then(|s| s.split('.').next()) {
-                        if let Ok(total_shards) = total_shards_str.parse::<u32>() {
-                            println!("📊 Found {} total shards to load", total_shards);
-                            
-                            // Load all shards in order
-                            for shard_num in 1..=total_shards {
-                                let shard_filename = format!("model-{:05}-of-{}.safetensors", shard_num, total_shards_str);
-                                let shard_path = parent_dir.join(&shard_filename);
-                                
-                                if shard_path.exists() {
-                                    println!("📦 Loading shard {}/{}: {}", shard_num, total_shards, shard_filename);
-                                    
-                                    let buffer = std::fs::read(&shard_path)?;
-                                    let safetensors = safetensors::SafeTensors::deserialize(&buffer)
-                                        .map_err(|e| anyhow!("Failed to parse SafeTensors shard {}: {}", shard_num, e))?;
-                                    
-                                    // Add tensors from this shard
-                                    for (name, tensor_view) in safetensors.tensors() {
-                                        let tensor = Self::safetensors_to_tensor(&name, &tensor_view, self.device)?;
-                                        cached_weights.insert(name.to_string(), tensor);
-                                        total_tensor_count += 1;
-                                    }
-                                    
-                                    all_buffers.push(buffer);
-                                } else {
-                                    return Err(anyhow!("Missing shard: {}", shard_path.display()));
-                                }
-                            }
-                        } else {
-                            return Err(anyhow!("Failed to parse shard count from filename: {}", filename));
-                        }
-                    } else {
-                        return Err(anyhow!("Invalid shard filename format: {}", filename));
-                    }
-                } else {
-                    return Err(anyhow!("Invalid shard filename format: {}", filename));
-                }
-            } else {
-                // Single SafeTensors file
-                let buffer = std::fs::read(path)?;
-                let safetensors = safetensors::SafeTensors::deserialize(&buffer)
-                    .map_err(|e| anyhow!("Failed to parse SafeTensors: {}", e))?;
-                
-                total_tensor_count = safetensors.tensors().len();
-                
-                for (name, tensor_view) in safetensors.tensors() {
-                    let tensor = Self::safetensors_to_tensor(&name, &tensor_view, self.device)?;
-                    cached_weights.insert(name.to_string(), tensor);
-                }
-                
-                all_buffers.push(buffer);
-            }
-        } else {
-            return Err(anyhow!("Invalid file path"));
-        }
-        
-        println!("📊 Converting {} total tensors to BF16 and caching in memory...", total_tensor_count);
-        
-        // Detect model architecture
+        // Get the model directory (parent of the safetensors file)
         let model_dir = path.parent().unwrap_or(path);
-        let architecture = self.detect_architecture(model_dir, &cached_weights)?;
-        println!("🏗️ Detected model architecture: {}", architecture);
         
-        // Store the first buffer for compatibility (or combined if needed) - thread safe
-        {
-            let mut safetensors_guard = self.handle_poison(self.safetensors_data.lock())?;
-            *safetensors_guard = all_buffers.into_iter().next();
-        }
-        {
-            let mut cached_weights_guard = self.handle_poison(self.cached_weights.lock())?;
-            *cached_weights_guard = Some(cached_weights);
-        }
-        {
-            let mut arch_guard = self.handle_poison(self.model_architecture.lock())?;
-            *arch_guard = Some(architecture.clone());
-        }
+        // Use ModelFactory to load the model (handles all weight loading internally)
+        self.initialize_persistent_model(model_dir)?;
         
-        // Determine context window first before moving architecture
-        let context_window = match architecture.as_str() {
-            "qwen3" => 262144,
-            "qwen2" => 131072,
-            _ => 32768,
-        };
-        
-        // Update model info with thread safety
-        {
-            let mut model_info_guard = self.handle_poison(self.model_info.lock())?;
-            model_info_guard.architecture = architecture;
+        // Extract model info from the loaded model
+        if let Some(model) = &self.persistent_model {
+            let model_guard = self.handle_poison(model.lock())?;
+            
+            // Get architecture info from the model
+            // For now, use a default since we don't have a method to query this
+            let architecture = "auto".to_string();
+            
+            // Update model info
+            {
+                let mut model_info_guard = self.handle_poison(self.model_info.lock())?;
+                model_info_guard.architecture = architecture.clone();
+            }
+            
+            // Set architecture
+            {
+                let mut arch_guard = self.handle_poison(self.model_architecture.lock())?;
+                *arch_guard = Some(architecture.clone());
+            }
         }
         
-        // Create dummy VarStore for compatibility - thread safe
-        {
-            let vs = VarStore::new(self.device);
-            let mut var_store_guard = self.handle_poison(self.var_store.lock())?;
-            *var_store_guard = Some(vs);
-        }
+        // Determine context window based on architecture
+        // This should eventually come from the model config
+        let context_window = 32768; // Default, will be overridden by model config
         
-        // Initialize persistent model once during loading
-        self.initialize_persistent_model()?;
-        
-        // Initialize context state - thread safe
+        // Initialize context state
         {
             let mut context_guard = self.handle_poison(self.context_state.lock())?;
             *context_guard = Some(ContextState {
@@ -414,8 +237,16 @@ impl TorchEngine {
             });
         }
         
-        println!("✅ SafeTensors model loaded and cached ({} tensors converted to BF16 in memory)", total_tensor_count);
-        println!("🚀 Persistent model initialized - ready for efficient inference");
+        // Create dummy VarStore for backward compatibility
+        // This can be removed once we fully migrate away from VarStore
+        {
+            let vs = VarStore::new(self.device);
+            let mut var_store_guard = self.handle_poison(self.var_store.lock())?;
+            *var_store_guard = Some(vs);
+        }
+        
+        println!("✅ SafeTensors model loaded via ModelFactory");
+        println!("🚀 Model initialized and ready for inference");
         Ok(())
     }
 
@@ -446,56 +277,14 @@ impl TorchEngine {
             .unwrap_or(false)
     }
 
-    /// Initialize the persistent model instance from cached weights - thread safe
-    fn initialize_persistent_model(&mut self) -> Result<()> {
-        use crate::runtime::architectures::gemma::GemmaModel;
-        use crate::runtime::architectures::qwen::QwenAdapter;
+    /// Initialize the persistent model instance using ModelFactory
+    fn initialize_persistent_model(&mut self, model_path: &Path) -> Result<()> {
+        use crate::runtime::model_factory::ModelFactory;
         
-        // Get cached weights with thread safety - clone to avoid lifetime issues
-        let cached_weights_guard = self.handle_poison(self.cached_weights.lock())?;
-        let weights = match cached_weights_guard.as_ref() {
-            Some(w) => w.clone(),
-            None => {
-                return Err(anyhow!("No cached tensors available for persistent model initialization"));
-            }
-        };
-        // cached_weights_guard automatically dropped here
+        println!("🏗️ Initializing persistent model using ModelFactory");
         
-        // Get architecture with thread safety - clone to avoid lifetime issues  
-        let arch_guard = self.handle_poison(self.model_architecture.lock())?;
-        let architecture = match arch_guard.as_ref() {
-            Some(a) => a.clone(),
-            None => {
-                return Err(anyhow!("No model architecture detected for persistent model initialization"));
-            }
-        };
-        // arch_guard automatically dropped here
-        
-        // Create model based on detected architecture (only once!)
-        let model: Box<dyn ModelOperations> = match architecture.as_str() {
-            "qwen3" => {
-                println!("🏗️ Initializing persistent Qwen3 model from cached weights");
-                QwenAdapter::from_weights(&weights, 3, false, 262144, &self.device, tch::Kind::BFloat16)?
-            }
-            "qwen2" => {
-                println!("🏗️ Initializing persistent Qwen2 model from cached weights");
-                QwenAdapter::from_weights(&weights, 2, false, 131072, &self.device, tch::Kind::BFloat16)?
-            }
-            "Qwen3ForCausalLM" => {
-                println!("🏗️ Initializing persistent Qwen3ForCausalLM model from cached weights");
-                QwenAdapter::from_weights(&weights, 3, false, 262144, &self.device, tch::Kind::BFloat16)?
-            }
-            "gemma" => {
-                println!("🏗️ Initializing persistent Gemma model from cached weights");
-                Box::new(GemmaModel::from_weights(&weights, &self.device, tch::Kind::BFloat16)?)
-            }
-            unknown => {
-                return Err(anyhow!(
-                    "Unsupported model architecture: '{}'. Supported architectures: qwen3, qwen2, Qwen3ForCausalLM, gemma",
-                    unknown
-                ));
-            }
-        };
+        // Use the factory to create the model with proper configuration management
+        let model = ModelFactory::create(model_path, &self.device, tch::Kind::BFloat16)?;
         
         self.persistent_model = Some(Arc::new(Mutex::new(model)));
         println!("✅ Persistent model initialized successfully");
@@ -706,6 +495,8 @@ impl TorchEngine {
 
     /// Sample next token from logits with proper ordering
     fn sample_token(&self, logits: &[f32], temperature: f32, top_p: f32, top_k: Option<usize>, repeat_penalty: f32, previous_tokens: &[i64]) -> Result<usize> {
+        tracing::debug!("Sampling: logits_len={}, temp={}, top_p={}, top_k={:?}, repeat_penalty={}", 
+                      logits.len(), temperature, top_p, top_k, repeat_penalty);
         if logits.is_empty() {
             return Err(anyhow!("Empty logits"));
         }
