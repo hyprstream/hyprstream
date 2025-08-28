@@ -1,228 +1,151 @@
-# Hyprstream: VDB-First Adaptive ML Inference Engine 🚀
+# HyprStream: ML Inference & Training Engine with Dynamic LoRA Adaptation
 
 [![Rust](https://github.com/hyprstream/hyprstream/actions/workflows/rust.yml/badge.svg)](https://github.com/hyprstream/hyprstream/actions/workflows/rust.yml)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-⚠️ **ALPHA RELEASE**: This project is undergoing a major architectural shift from data processing to ML inference with VDB storage. Active development in progress. ⚠️
+## Overview
 
-## 🌟 Overview
+HyprStream is a PyTorch-based ML inference and training engine built in Rust, designed for real-time model adaptation through dynamic LoRA (Low-Rank Adaptation) layers. The system enables continuous learning during inference, allowing models to adapt to context and user patterns in real-time.
 
-Hyprstream is pioneering a new approach to ML inference through **99% sparse neural networks** with **VDB (OpenVDB) storage** and **temporal LoRA adaptation**. By storing model weights in hierarchical sparse formats and enabling real-time weight updates during inference, Hyprstream achieves unprecedented efficiency and adaptability.
+### Key Goals
 
-### 🎯 Core Innovation
+- **Inference & Training**: Unified engine for both inference and training workflows
+- **Dynamic LoRA Adaptation**: Real-time weight updates through LoRA layers during generation (planned)
+- **Multi-Model Support**: Qwen models (Llama and Gemma experimental)
+- **Production Ready**: Built on PyTorch's libtorch for stability and performance
+- **KV Caching**: Optimized sequential generation with key-value caching
 
-Traditional ML inference engines load dense models into memory. Hyprstream takes a radically different approach:
-- **Sparse by Default**: 99% of weights are zero and never loaded
-- **VDB Storage**: Hierarchical sparse grids for efficient weight access  
-- **Temporal Adaptation**: Weights evolve during inference based on context
-- **Zero-Copy Operations**: Memory-mapped weights with on-demand loading
-
-## ✨ Key Features
-
-### 🧠 Sparse Neural Networks
-- **99% Sparsity**: Extreme weight pruning without accuracy loss
-- **Structured Sparsity**: Prune entire channels/attention heads
-- **Dynamic Masks**: Adjust sparsity patterns during inference
-
-### 💾 VDB-First Storage
-- **OpenVDB Format**: Industry-standard volumetric data structure
-- **Hierarchical Grids**: Multi-level sparse representation
-- **Neural Compression**: 10-100x compression with custom codec
-- **Hardware Acceleration**: GPU-accelerated sparse operations
-
-### 🔄 Temporal LoRA
-- **Real-Time Updates**: Adapt weights during generation
-- **Gradient Streaming**: Continuous learning from context
-- **Checkpoint System**: Save/restore adapted model states
-- **Multi-Adapter**: X-LoRA routing between specialized adapters
-
-### ⚡ Performance
-- **Memory Efficient**: 10x reduction in memory usage
-- **Fast Inference**: Sparse operations skip zero weights
-- **Disk-Backed**: Unlimited model size with mmap
-- **Batched Updates**: Efficient sparse weight modifications
-
-## 🏗️ Architecture
-
-```
-┌─────────────────────────────────────────────┐
-│             CLI Interface                   │
-├─────────────────────────────────────────────┤
-│          Candle Runtime Engine              │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐ │
-│  │SafeTensor│→ │  Sparse  │→ │   VDB    │ │
-│  │  Loader  │  │Conversion│  │ Storage  │ │
-│  └──────────┘  └──────────┘  └──────────┘ │
-├─────────────────────────────────────────────┤
-│      Temporal Streaming Layer               │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐ │
-│  │ Gradient │→ │  Weight  │→ │Checkpoint│ │
-│  │  Stream  │  │  Update  │  │  System  │ │
-│  └──────────┘  └──────────┘  └──────────┘ │
-├─────────────────────────────────────────────┤
-│          OpenVDB Integration                │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐ │
-│  │  C++ FFI │  │  Sparse  │  │  Memory  │ │
-│  │  Bridge  │  │   Grids  │  │   Maps   │ │
-│  └──────────┘  └──────────┘  └──────────┘ │
-└─────────────────────────────────────────────┘
-```
-
-## 🚀 Quick Start
+## Installation
 
 ### Prerequisites
-- Rust 1.75+
-- OpenVDB 9.0+ (system package)
-- CUDA 12.0+ (optional, for GPU)
 
-### Installation
+- Rust 1.75+
+- libtorch (automatically downloaded or use existing installation)
+- 8GB+ RAM for running models
+
+### Building from Source
 
 ```bash
 # Clone repository
-git clone https://github.com/hyprstream/hyprstream.git
-cd hyprstream
+git clone https://github.com/hyprstream/hyprstream-torch.git
+cd hyprstream-torch
 
-# Build with OpenVDB support
+# Set libtorch path (if using existing installation)
+export LD_LIBRARY_PATH=$PWD/libtorch/lib:$LD_LIBRARY_PATH
+
+# Build
 cargo build --release
 
-# Verify OpenVDB integration
-cargo run -- --version
+# The binary will be at ./target/release/hyprstream
 ```
 
-### Basic Usage
+## Usage
+
+HyprStream provides a CLI for model operations:
+
+### Download Models
 
 ```bash
-# Start server
-hyprstream server --port 50051
-
-# Download model from HuggingFace
-hyprstream model download hf://mistralai/Mistral-7B-v0.1
-
-# Interactive chat
-hyprstream chat --model /path/to/model.safetensors
-
-# Chat with real-time training
-hyprstream chat --model /path/to/model.safetensors --train
+# Download from HuggingFace
+hyprstream pull Qwen/Qwen2.5-3B-Instruct
 ```
 
-## 🔧 Configuration
+### Run Inference
 
-### Storage Configuration
-```toml
-[storage]
-path = "./vdb_storage"
-neural_compression = true      # Enable 10-100x compression
-hardware_acceleration = true   # Use GPU if available
-cache_size_mb = 2048           # Hot adapter cache
-compaction_interval_secs = 300 # Background optimization
+```bash
+# Run inference with a prompt
+hyprstream infer ~/.cache/hyprstream/models/Qwen/Qwen2.5-3B-Instruct \
+    --prompt "What is the capital of France?" \
+    --max-tokens 100
 ```
 
-### Runtime Configuration
-```toml
-[runtime]
-use_gpu = true
-cpu_threads = 8
-context_length = 4096
-batch_size = 1
+### Model Information
+
+```bash
+# Show model details
+hyprstream model info ~/.cache/hyprstream/models/Qwen/Qwen2.5-3B-Instruct
 ```
 
-### Generation Configuration
-```toml
-[generation]
-max_tokens = 2048
-temperature = 0.7
-top_p = 0.9
-frequency_penalty = 0.0
-presence_penalty = 0.0
+### Generation Parameters
+
+Inference commands support these optional parameters:
+
+- `--temperature <float>` - Sampling temperature (default: 0.7)
+- `--top-p <float>` - Nucleus sampling threshold (default: 0.9)
+- `--top-k <int>` - Top-k sampling (default: 50)
+- `--repetition-penalty <float>` - Repetition penalty (default: 1.1)
+- `--max-tokens <int>` - Maximum tokens to generate (default: 2048)
+- `--seed <int>` - Random seed for reproducibility
+
+## Supported Models
+
+- **Qwen**: Full support for Qwen2/Qwen2.5 series
+- **Llama**: Experimental support
+- **Gemma**: Experimental support
+
+Models are automatically detected based on their architecture and configuration.
+
+## System Architecture
+
+```mermaid
+graph TD
+    CLI[CLI Interface] --> Engine[TorchEngine]
+    Engine --> Factory[ModelFactory]
+    Factory --> Models[Model Implementations]
+    
+    Models --> Qwen[Qwen Models]
+    Models --> Llama[Llama - Experimental]  
+    Models --> Gemma[Gemma - Experimental]
+    
+    Engine --> KVCache[KV Cache System]
+    Engine --> Sampling[Sampling Algorithms]
+    
+    Future[Future: Dynamic LoRA] -.-> Engine
+    Future -.-> Training[Real-time Training]
+    Future -.-> Adaptation[Context Adaptation]
 ```
 
-## 🧪 Current Status
+## Roadmap
 
-### ✅ Implemented
-- Candle ML framework integration
-- OpenVDB C++ bindings
-- VDB sparse storage layer
-- SafeTensors model loading
-- Tensor sparsification
-- CLI interface
-- Basic chat functionality
+### Current Features
+- ✅ PyTorch/libtorch integration
+- ✅ SafeTensors model loading
+- ✅ KV caching for fast generation
+- ✅ Qwen model support
+- ✅ CLI interface
+- ✅ Tokenizer integration
 
-### 🚧 In Progress
-- Temporal gradient streaming
-- Real-time weight updates
-- X-LoRA multi-adapter routing
-- Tokenizer integration
-- Generation with VDB weights
+### In Development
+- 🚧 REST/gRPC API layer
+- 🚧 Dynamic batching
+- 🚧 Model quantization
 
-### 📋 Planned
-- Distributed inference
-- Advanced quantization (Q4, Q8)
-- Web UI dashboard
-- Model fine-tuning
-- ONNX support
+### Planned Features
+- 📋 Dynamic LoRA adaptation during inference
+- 📋 Real-time training from context
+- 📋 Multi-adapter routing (X-LoRA)
+- 📋 Continuous learning pipelines
+- 📋 WebSocket streaming
+- 📋 Distributed inference
 
-## 🔬 Technical Deep Dive
+## Contributing
 
-### Sparsification Process
-1. **Load Model**: Read model weights from SafeTensors
-2. **Identify Sparse Tensors**: Select attention/FFN layers
-3. **Apply Pruning**: Remove weights below threshold
-4. **Create VDB Grid**: Store in hierarchical format
-5. **Build Index**: Create spatial acceleration structure
-
-### VDB Grid Structure
-```
-Root (Level 3) → 8³ branches
-  ├─ Internal (Level 2) → 4³ voxels  
-  │   ├─ Internal (Level 1) → 2³ voxels
-  │   │   └─ Leaf (Level 0) → Active values
-  │   └─ Tile → Constant region
-  └─ Background → Zero/pruned weights
-```
-
-### Temporal Adaptation Flow
-```
-Input → Tokenize → Forward Pass → Generate
-           ↓            ↓            ↓
-      [Gradients] ← [Weights] ← [Updates]
-           ↓            ↓            ↓
-      [Checkpoint] → [VDB Store] → [Persist]
-```
-
-## 🤝 Contributing
-
-We welcome contributions! Key areas:
+We welcome contributions, especially in:
+- Dynamic LoRA implementation
+- API layer development
+- Model architecture support
 - Performance optimizations
-- Model format support
-- Quantization methods
 - Documentation
-- Testing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+## License
 
-## 📚 References
+GNU Affero General Public License v3.0 - See [LICENSE](LICENSE) for details.
 
-### Papers
-- [Candle: Minimalist ML Framework](https://github.com/huggingface/candle)
-- [OpenVDB: Efficient Sparse Volumes](https://www.openvdb.org/documentation/)
-- [LoRA: Low-Rank Adaptation](https://arxiv.org/abs/2106.09685)
-
-### Related Projects
-- [vLLM](https://github.com/vllm-project/vllm) - High-throughput inference
-- [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) - NVIDIA optimization
-- [llama.cpp](https://github.com/ggerganov/llama.cpp) - CPU inference
-
-## 📄 License
-
-GNU AFFERO GENERAL PUBLIC LICENSE 3
-
-## 🙏 Acknowledgments
+## Acknowledgments
 
 Built with:
-- [Candle](https://github.com/huggingface/candle) - Rust ML framework
-- [OpenVDB](https://www.openvdb.org/) - Sparse volumetric data
+- [PyTorch](https://pytorch.org/) - Deep learning framework
+- [tch](https://github.com/LaurentMazare/tch) - Rust bindings for PyTorch
+- [SafeTensors](https://github.com/huggingface/safetensors) - Model format
+- [HuggingFace](https://huggingface.co/) - Model hub
 - [Tokio](https://tokio.rs/) - Async runtime
-- [Tonic](https://github.com/hyperium/tonic) - gRPC framework
-
----
-
-**Note**: This project has pivoted from its original data processing focus to become a specialized ML inference engine. The old Arrow Flight SQL functionality has been deprecated in favor of VDB-based model serving.
