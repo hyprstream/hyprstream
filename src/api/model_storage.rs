@@ -620,6 +620,162 @@ impl ModelStorage {
         // Placeholder for future metadata format migrations
         Ok(())
     }
+    
+    /// List all models in storage
+    pub async fn list_models(&self) -> Result<Vec<(ModelId, ModelMetadata)>> {
+        // First, load metadata from cache
+        let _ = self.load_metadata().await; // Refresh cache from disk
+        
+        let mut models = Vec::new();
+        let metadata = self.metadata_cache.read().await;
+        
+        tracing::info!("Listing models from directory: {:?}", self.base_dir);
+        tracing::info!("Found {} models in metadata cache", metadata.len());
+        
+        // Add models from metadata cache
+        for (id, meta) in metadata.iter() {
+            tracing::debug!("Model from cache: {} -> {}", id, meta.name);
+            models.push((id.clone(), meta.clone()));
+        }
+        
+        // Also scan the models directory for any models not in metadata
+        match tokio::fs::read_dir(&self.base_dir).await {
+            Ok(mut entries) => {
+                tracing::info!("Scanning models directory for additional models...");
+                let mut scanned_count = 0;
+                
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let path = entry.path();
+                    scanned_count += 1;
+                    
+                    if path.is_dir() {
+                        let dir_name = path.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown");
+                        
+                        tracing::debug!("Checking directory: {}", dir_name);
+                        
+                        // Check if this is a model directory (has model files)
+                        let has_model_files = Self::has_model_files(&path).await;
+                        if has_model_files {
+                            tracing::info!("Found model directory: {}", dir_name);
+                            
+                            // Check if we already have this in metadata
+                            let already_listed = models.iter().any(|(_, meta)| {
+                                meta.local_path.as_ref()
+                                    .and_then(|p| p.file_name())
+                                    .and_then(|n| n.to_str())
+                                    == Some(dir_name)
+                            });
+                            
+                            if !already_listed {
+                                // Create a basic metadata entry for this discovered model
+                                let model_id = ModelId(uuid::Uuid::new_v4());
+                                let now = chrono::Utc::now().timestamp();
+                                let metadata = ModelMetadata {
+                                    model_id: model_id.clone(),
+                                    name: dir_name.to_string(),
+                                    display_name: Some(dir_name.to_string()),
+                                    architecture: "unknown".to_string(),
+                                    parameters: None,
+                                    model_type: "unknown".to_string(),
+                                    tokenizer_type: None,
+                                    size_bytes: 0, // Could calculate if needed
+                                    files: vec![],
+                                    external_sources: vec![],
+                                    local_path: Some(path.clone()),
+                                    is_cached: true,
+                                    tags: vec![],
+                                    description: None,
+                                    license: None,
+                                    created_at: now,
+                                    last_accessed: now,
+                                    last_updated: now,
+                                };
+                                tracing::info!("Adding discovered model: {} with ID {}", dir_name, model_id);
+                                models.push((model_id, metadata));
+                            } else {
+                                tracing::debug!("Model {} already in list", dir_name);
+                            }
+                        } else {
+                            tracing::debug!("Directory {} does not contain model files", dir_name);
+                        }
+                    }
+                }
+                
+                tracing::info!("Scanned {} entries in models directory", scanned_count);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to read models directory {:?}: {}", self.base_dir, e);
+            }
+        }
+        
+        tracing::info!("Total models found: {}", models.len());
+        Ok(models)
+    }
+    
+    /// Check if a directory contains model files
+    async fn has_model_files(path: &Path) -> bool {
+        // Check for common model file patterns
+        let patterns = ["*.safetensors", "*.bin", "*.gguf", "*.ggml", "config.json", "tokenizer.json"];
+        
+        for pattern in &patterns {
+            if pattern.contains('*') {
+                // For wildcards, check if any file matches
+                if let Ok(mut entries) = tokio::fs::read_dir(path).await {
+                    while let Ok(Some(entry)) = entries.next_entry().await {
+                        let file_name = entry.file_name();
+                        let file_str = file_name.to_string_lossy();
+                        if pattern == &"*.safetensors" && file_str.ends_with(".safetensors") {
+                            return true;
+                        } else if pattern == &"*.bin" && file_str.ends_with(".bin") {
+                            return true;
+                        } else if pattern == &"*.gguf" && file_str.ends_with(".gguf") {
+                            return true;
+                        } else if pattern == &"*.ggml" && file_str.ends_with(".ggml") {
+                            return true;
+                        }
+                    }
+                }
+            } else {
+                // For exact filenames
+                let file_path = path.join(pattern);
+                if file_path.exists() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    
+    /// Download a model from a URI
+    pub async fn download_model(&self, uri: &ModelUri, name: Option<String>) -> Result<ModelId> {
+        // For now, just create a stub entry
+        let model_id = ModelId::new();
+        let metadata = ModelMetadata {
+            model_id: model_id.clone(),
+            name: name.unwrap_or_else(|| uri.uri.clone()),
+            display_name: None,
+            architecture: "unknown".to_string(),
+            parameters: None,
+            model_type: "safetensors".to_string(),
+            tokenizer_type: None,
+            size_bytes: 0,
+            files: vec![],
+            external_sources: vec![],
+            local_path: Some(self.base_dir.join(model_id.to_string())),
+            is_cached: false,
+            tags: vec![],
+            description: None,
+            license: None,
+            created_at: chrono::Utc::now().timestamp(),
+            last_accessed: chrono::Utc::now().timestamp(),
+            last_updated: chrono::Utc::now().timestamp(),
+        };
+        
+        self.metadata_cache.write().await.insert(model_id.clone(), metadata);
+        Ok(model_id)
+    }
 }
 
 /// Model file with additional metadata

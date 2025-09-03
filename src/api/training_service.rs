@@ -1,6 +1,7 @@
 //! Auto-regressive training service for LoRA adapters
 
-use crate::api::{TrainingSample, TrainingStatus};
+use crate::api::TrainingSample;
+pub use crate::api::TrainingStatus;
 use crate::storage::vdb::hardware_accelerated::HardwareVDBStorage;
 use crate::adapters::sparse_lora::{SparseLoRAAdapter, SparseLoRAConfig};
 use crate::inference::{InferenceAPI, InferenceInput, InferenceOutput};

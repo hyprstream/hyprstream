@@ -44,6 +44,10 @@ pub struct ServerConfig {
     /// Prefer server cipher order
     #[arg(long, env = "HYPRSTREAM_TLS_PREFER_SERVER_CIPHERS")]
     pub tls_prefer_server_ciphers: Option<bool>,
+    
+    /// Allow all headers in CORS (permissive mode for development - NOT recommended for production)
+    #[arg(long, env = "HYPRSTREAM_CORS_PERMISSIVE_HEADERS")]
+    pub cors_permissive_headers: Option<bool>,
 }
 
 impl Default for ServerConfig {
@@ -59,6 +63,7 @@ impl Default for ServerConfig {
             tls_min_version: Some("1.2".to_string()),
             tls_cipher_list: None,
             tls_prefer_server_ciphers: Some(true),
+            cors_permissive_headers: Some(false),
         }
     }
 }
@@ -133,6 +138,7 @@ impl ConfigSection for ServerConfig {
             tls_min_version: Option<String>,
             tls_cipher_list: Option<String>,
             tls_prefer_server_ciphers: Option<bool>,
+            cors_permissive_headers: Option<bool>,
         }
 
         let config = ServerConfigFile::deserialize(deserializer)?;
@@ -147,6 +153,7 @@ impl ConfigSection for ServerConfig {
             tls_min_version: config.tls_min_version.or(Some("1.2".to_string())),
             tls_cipher_list: config.tls_cipher_list,
             tls_prefer_server_ciphers: config.tls_prefer_server_ciphers.or(Some(true)),
+            cors_permissive_headers: config.cors_permissive_headers.or(Some(false)),
         })
     }
 }

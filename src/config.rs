@@ -275,6 +275,7 @@ pub enum FinishReason {
     StopToken(String),
     EndOfSequence,
     Error(String),
+    Stop,  // Generic stop reason
 }
 
 impl HyprConfig {

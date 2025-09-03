@@ -15,6 +15,7 @@ pub mod config;
 pub mod error;
 pub mod inference;
 pub mod runtime;
+pub mod server;
 pub mod storage;
 pub mod utils;
 

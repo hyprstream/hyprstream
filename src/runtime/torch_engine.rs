@@ -181,13 +181,9 @@ impl TorchEngine {
             }
         }
 
-        // Update model info with thread safety
-        let mut model_info_guard = self.handle_poison(self.model_info.lock())?;
-        model_info_guard.name = path.file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-
+        // Note: Model name is now set in load_model() based on the original path
+        // This ensures we use the directory name for models loaded from directories
+        
         Ok(())
     }
 
@@ -615,6 +611,9 @@ impl TorchEngine {
 #[async_trait]
 impl RuntimeEngine for TorchEngine {
     async fn load_model(&mut self, path: &Path) -> Result<()> {
+        // Store the original path for model naming
+        let original_path = path.to_path_buf();
+        
         // If path is a directory, find the model file inside it
         let model_file_path = if path.is_dir() {
             // First check for single file patterns
@@ -659,6 +658,29 @@ impl RuntimeEngine for TorchEngine {
 
         println!("📦 Loading model file: {}", model_file_path.display());
         self.load_model_file(&model_file_path).await?;
+        
+        // Set the model name based on the canonical path
+        // Use directory name if loading from directory, otherwise use filename
+        let model_name = if original_path.is_dir() {
+            // Get the last component of the directory path as the model name
+            original_path.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string()
+        } else {
+            // Use the file stem for single files
+            original_path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string()
+        };
+        
+        // Update model info with the correct name
+        {
+            let mut model_info_guard = self.handle_poison(self.model_info.lock())?;
+            model_info_guard.name = model_name;
+        }
+        
         self.load_tokenizer(path).await?;
         Ok(())
     }
@@ -930,6 +952,129 @@ impl TorchEngine {
         persistent_ready && context_ready
     }
 
+    /// Generate text with async streaming callback
+    pub async fn generate_streaming_async(
+        &self,
+        request: GenerationRequest,
+        mut callback: Box<dyn crate::runtime::streaming::StreamingCallback>,
+        context: crate::runtime::streaming::GenerationContext,
+    ) -> Result<GenerationResult> {
+        use crate::runtime::streaming::ContinueGeneration;
+        use tokio::time::timeout;
+        
+        let start_time = std::time::Instant::now();
+        
+        // Notify start
+        callback.on_start().await;
+        
+        // Tokenize input
+        let mut input_ids = self.tokenize(&request.prompt)?;
+        let mut generated_text = String::new();
+        let mut tokens_generated = 0;
+        let prompt_len = input_ids.len();
+        
+        tracing::info!("Starting async generation with prompt of {} tokens", prompt_len);
+        
+        // Create timeout future
+        let generation_future = async {
+            for i in 0..request.max_tokens {
+                // Check cancellation
+                if context.cancel_token.is_cancelled() {
+                    tracing::info!("Generation cancelled by client");
+                    break;
+                }
+                
+                // Forward pass
+                let logits = if i == 0 {
+                    self.forward(&input_ids)?
+                } else {
+                    self.forward_cached(&input_ids, prompt_len + i - 1, true)?
+                };
+                
+                // Sample next token
+                let next_token = self.sample_token(
+                    &logits,
+                    request.temperature,
+                    request.top_p,
+                    request.top_k,
+                    request.repeat_penalty,
+                    &input_ids,
+                )?;
+                
+                // Add to sequence
+                input_ids.push(next_token as i64);
+                tokens_generated += 1;
+                
+                // Decode token
+                let token_text = self.detokenize(&[next_token as i64])?;
+                generated_text.push_str(&token_text);
+                
+                // Stream token via callback
+                match callback.on_token(&token_text).await {
+                    Ok(ContinueGeneration::Continue) => {},
+                    Ok(ContinueGeneration::Stop) => {
+                        tracing::info!("Generation stopped by callback");
+                        break;
+                    },
+                    Ok(ContinueGeneration::Pause(duration)) => {
+                        tokio::time::sleep(duration).await;
+                    },
+                    Err(e) => {
+                        callback.on_error(anyhow::anyhow!("{}", e)).await;
+                        return Err(e);
+                    }
+                }
+                
+                // Check stop conditions
+                if request.stop_tokens.iter().any(|stop| generated_text.contains(stop)) {
+                    break;
+                }
+                
+                if self.is_eos_token(next_token) {
+                    tracing::info!("EOS token detected: {}", next_token);
+                    break;
+                }
+            }
+            
+            Ok::<_, anyhow::Error>(())
+        };
+        
+        // Apply timeout
+        match timeout(context.timeout, generation_future).await {
+            Ok(Ok(())) => {
+                // Success
+                let finish_reason = if tokens_generated >= request.max_tokens {
+                    FinishReason::MaxTokens
+                } else if self.is_eos_token(*input_ids.last().unwrap() as u32 as usize) {
+                    FinishReason::Stop
+                } else {
+                    FinishReason::Stop
+                };
+                
+                callback.on_complete(finish_reason.clone()).await;
+                
+                Ok(GenerationResult {
+                    text: generated_text,
+                    tokens_generated,
+                    finish_reason,
+                    generation_time_ms: start_time.elapsed().as_millis() as u64,
+                    tokens_per_second: tokens_generated as f32 / start_time.elapsed().as_secs_f32(),
+                })
+            }
+            Ok(Err(e)) => {
+                // Generation error
+                callback.on_error(anyhow::anyhow!("{}", e)).await;
+                Err(e)
+            }
+            Err(_) => {
+                // Timeout
+                let err = anyhow::anyhow!("Generation timeout after {:?}", context.timeout);
+                callback.on_error(anyhow::anyhow!("{}", err)).await;
+                Err(err)
+            }
+        }
+    }
+    
     /// Generate text with raw prompt (no chat formatting)
     pub async fn generate_raw(&self, prompt: &str, max_tokens: usize) -> Result<String> {
         let request = GenerationRequest {

@@ -15,7 +15,6 @@ use std::{
 use reqwest::Client;
 use serde_json::{json, Value};
 use tracing::{debug, error, info};
-use tonic::transport::{Server, Identity, ServerTlsConfig, Certificate};
 use crate::api::model_storage::{ModelStorage, ModelId};
 use crate::api::model_management::ModelUri;
 
@@ -131,85 +130,76 @@ pub async fn execute_sparse_query(
 pub async fn handle_server(
     config: Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let addr: SocketAddr = format!("{}:{}",
-        config.get_string("host").unwrap_or_else(|_| "127.0.0.1".to_string()),
-        config.get_string("port").unwrap_or_else(|_| "50051".to_string())
-    ).parse()?;
+    // Check environment variable first, then config, then default to 0.0.0.0
+    let host = std::env::var("HYPRSTREAM_SERVER_HOST")
+        .unwrap_or_else(|_| config.get_string("host")
+            .unwrap_or_else(|_| "0.0.0.0".to_string()));
     
-    // Initialize VDB sparse storage
-    let storage_config = SparseStorageConfig {
-        storage_path: PathBuf::from(
-            config.get_string("storage.path")
-                .unwrap_or_else(|_| "./vdb_storage".to_string())
-        ),
-        neural_compression: config.get_bool("storage.neural_compression").unwrap_or(true),
-        hardware_acceleration: config.get_bool("storage.hardware_acceleration").unwrap_or(true),
-        cache_size_mb: config.get_int("storage.cache_size_mb").unwrap_or(2048) as usize,
-        compaction_interval_secs: config.get_int("storage.compaction_interval_secs").unwrap_or(300) as u64,
-        streaming_updates: config.get_bool("storage.streaming_updates").unwrap_or(true),
-        update_batch_size: config.get_int("storage.update_batch_size").unwrap_or(1000) as usize,
-        layer_aware_mapping: config.get_bool("storage.layer_aware_mapping").unwrap_or(true),
-        sparsity_threshold: config.get_float("storage.sparsity_threshold").unwrap_or(1e-8) as f32,
-    };
-
-    let sparse_storage = Arc::new(VDBSparseStorage::new(storage_config).await?);
+    let port = std::env::var("HYPRSTREAM_SERVER_PORT")
+        .unwrap_or_else(|_| config.get_string("port")
+            .unwrap_or_else(|_| "50051".to_string()));
     
-    // Start background processing for streaming updates
-    sparse_storage.start_background_processing().await?;
-
-    // Create embedding-focused FlightSQL service
-    // FlightSQL service removed - using REST API only
+    let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
     
-    let mut server = Server::builder();
-
-    // Configure TLS if enabled
-    if config.get_bool("tls.enabled").unwrap_or(false) {
-        let cert = match config.get::<Vec<u8>>("tls.cert_data") {
-            Ok(data) => data,
-            Err(_) => {
-                let path = config.get_string("tls.cert_path")
-                    .map_err(|_| "TLS certificate not found")?;
-                std::fs::read(path)
-                    .map_err(|_| "Failed to read TLS certificate")?
-            }
-        };
-        let key = match config.get::<Vec<u8>>("tls.key_data") {
-            Ok(data) => data,
-            Err(_) => {
-                let path = config.get_string("tls.key_path")
-                    .map_err(|_| "TLS key not found")?;
-                std::fs::read(path)
-                    .map_err(|_| "Failed to read TLS key")?
-            }
-        };
-        let identity = Identity::from_pem(&cert, &key);
-
-        let mut tls_config = ServerTlsConfig::new().identity(identity);
-
-        if let Some(ca) = config.get::<Vec<u8>>("tls.ca_data").ok()
-            .or_else(|| config.get_string("tls.ca_path").ok()
-                .and_then(|p| if p.is_empty() { None } else { Some(p) })
-                .and_then(|p| std::fs::read(p).ok())) {
-            tls_config = tls_config.client_ca_root(Certificate::from_pem(&ca));
-        }
-
-        server = server.tls_config(tls_config)?;
+    // Create server configuration from environment variables and config file
+    let mut server_config = crate::server::state::ServerConfig::from_env();
+    
+    // Override with config file values if present
+    if let Ok(max_engines) = config.get_int("server.max_engines") {
+        server_config.max_engines = max_engines as usize;
     }
-
-    info!("🚀 Starting VDB-first adaptive ML inference server at {}", addr);
-    debug!("Server configuration - TLS: {}, Neural Compression: {}, Hardware Acceleration: {}", 
-        config.get_bool("tls.enabled").unwrap_or(false),
-        config.get_bool("storage.neural_compression").unwrap_or(true),
-        config.get_bool("storage.hardware_acceleration").unwrap_or(true)
-    );
+    if let Ok(default_model) = config.get_string("server.default_model") {
+        server_config.default_model = Some(default_model);
+    }
+    if let Ok(enable_logging) = config.get_bool("server.enable_logging") {
+        server_config.enable_logging = enable_logging;
+    }
+    if let Ok(enable_metrics) = config.get_bool("server.enable_metrics") {
+        server_config.enable_metrics = enable_metrics;
+    }
+    if let Ok(api_key) = config.get_string("server.api_key") {
+        server_config.api_key = Some(api_key);
+    }
+    if let Ok(max_tokens_limit) = config.get_int("server.max_tokens_limit") {
+        server_config.max_tokens_limit = max_tokens_limit as usize;
+    }
+    if let Ok(request_timeout_secs) = config.get_int("server.request_timeout_secs") {
+        server_config.request_timeout_secs = request_timeout_secs as u64;
+    }
     
-    // FlightSQL service removed - start REST API instead
-    println!("🚀 Starting REST API server at {}", addr);
-    println!("✅ VDB-first adaptive ML inference server ready");
+    // CORS permissive headers from config
+    if let Ok(permissive) = config.get_bool("server.cors_permissive_headers") {
+        server_config.cors.permissive_headers = permissive;
+    }
     
-    // TODO: Implement actual REST server
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
+    // Update CORS to include the actual server address if not using wildcard
+    if !server_config.cors.allowed_origins.contains(&"*".to_string()) {
+        // Add the actual listening address to allowed origins
+        server_config.cors.allowed_origins.push(format!("http://{}", addr));
+        // If listening on 0.0.0.0, also add localhost variants with the port
+        if host == "0.0.0.0" {
+            server_config.cors.allowed_origins.extend(vec![
+                format!("http://localhost:{}", port),
+                format!("http://127.0.0.1:{}", port),
+            ]);
+        }
+    }
+    
+    // Create server state
+    let server_state = crate::server::state::ServerState::new(server_config).await?;
+    
+    info!("Starting Hyprstream HTTP server on {}", addr);
+    info!("OpenAI-compatible API available at http://{}/oai/v1", addr);
+    
+    // Check for TLS configuration
+    if config.get_bool("tls.enabled").unwrap_or(false) {
+        let cert_path = config.get_string("tls.cert_path")?;
+        let key_path = config.get_string("tls.key_path")?;
+        crate::server::start_server_tls(addr, server_state, &cert_path, &key_path).await?;
+    } else {
+        crate::server::start_server(addr, server_state).await?;
+    }
+    
     Ok(())
 }
 

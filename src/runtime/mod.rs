@@ -28,6 +28,7 @@ pub mod rope;                // Rotary Position Embedding (RoPE) implementation
 pub mod kv_cache;            // Key-Value caching for efficient autoregressive generation
 pub mod model_config;        // Unified model configuration management
 pub mod model_factory;       // Single factory for model creation
+pub mod streaming;           // Async streaming support for token-by-token generation
 
 // Primary exports - use TorchEngine as default
 pub use torch_engine::TorchEngine;
