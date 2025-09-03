@@ -5,7 +5,7 @@ use axum::{
     routing::{get, post},
     extract::{State, Json},
     response::{IntoResponse, Response, Sse},
-    http::StatusCode,
+    http::{StatusCode, header},
 };
 use futures::stream::{Stream, StreamExt};
 use tokio::sync::mpsc;
@@ -187,14 +187,6 @@ async fn chat_completions(
                         "invalid_model"
                     )
                 ),
-                EnginePoolError::ModelLoading(model) => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    ErrorResponse::new(
-                        format!("Model '{}' is loading, please retry", model),
-                        "model_loading",
-                        "retry"
-                    )
-                ),
                 EnginePoolError::ModelLoadFailed(model, err) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ErrorResponse::new(
@@ -288,7 +280,17 @@ async fn chat_completions(
                 }),
             };
             
-            Json(response).into_response()
+            // Add no-cache headers to prevent client caching
+            let mut response = Json(response).into_response();
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                "no-cache, no-store, must-revalidate".parse().unwrap()
+            );
+            response.headers_mut().insert(
+                header::PRAGMA,
+                "no-cache".parse().unwrap()
+            );
+            response
         }
         Err(e) => {
             error!("Generation failed: {}", e);
@@ -336,9 +338,6 @@ async fn stream_chat(
             Ok(guard) => guard,
             Err(e) => {
                 let error_msg = match e {
-                    EnginePoolError::ModelLoading(_) => {
-                        format!("Model is loading, please retry")
-                    }
                     EnginePoolError::ModelNotFound(m) => {
                         format!("Model '{}' not found", m)
                     }
@@ -426,10 +425,26 @@ async fn stream_chat(
         }
     });
     
-    // Set up SSE response with keep-alive
-    Sse::new(stream)
+    // Set up SSE response with keep-alive and no-cache headers
+    let mut response = Sse::new(stream)
         .keep_alive(axum::response::sse::KeepAlive::new())
-        .into_response()
+        .into_response();
+    
+    // Add cache control headers to prevent caching
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        "no-cache, no-store, must-revalidate".parse().unwrap()
+    );
+    response.headers_mut().insert(
+        header::PRAGMA,
+        "no-cache".parse().unwrap()
+    );
+    response.headers_mut().insert(
+        header::EXPIRES,
+        "0".parse().unwrap()
+    );
+    
+    response
 }
 
 /// Handle text completion requests
@@ -456,16 +471,6 @@ async fn completions(
                             "message": format!("Model '{}' not found", model),
                             "type": "model_not_found",
                             "code": "invalid_model"
-                        }
-                    })
-                ),
-                EnginePoolError::ModelLoading(model) => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    serde_json::json!({
-                        "error": {
-                            "message": format!("Model '{}' is loading, please retry", model),
-                            "type": "model_loading",
-                            "code": "retry"
                         }
                     })
                 ),
@@ -539,7 +544,17 @@ async fn completions(
                 }),
             };
             
-            Json(response).into_response()
+            // Add no-cache headers to prevent client caching
+            let mut response = Json(response).into_response();
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                "no-cache, no-store, must-revalidate".parse().unwrap()
+            );
+            response.headers_mut().insert(
+                header::PRAGMA,
+                "no-cache".parse().unwrap()
+            );
+            response
         }
         Err(e) => {
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
@@ -633,10 +648,20 @@ async fn list_models(
         }
     }
     
-    Json(ListModelsResponse {
+    // Add no-cache headers to prevent client caching
+    let mut response = Json(ListModelsResponse {
         object: "list".to_string(),
         data: models,
-    }).into_response()
+    }).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        "no-cache, no-store, must-revalidate".parse().unwrap()
+    );
+    response.headers_mut().insert(
+        header::PRAGMA,
+        "no-cache".parse().unwrap()
+    );
+    response
 }
 
 /// Format chat messages into a prompt

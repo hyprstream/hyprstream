@@ -1,9 +1,9 @@
 //! Engine pool management for concurrent inference
 
 use anyhow::Result;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, Semaphore};
 use crate::runtime::{TorchEngine, RuntimeEngine, RuntimeConfig};
 use tracing::{info, warn, error};
 use thiserror::Error;
@@ -11,8 +11,6 @@ use thiserror::Error;
 /// Engine pool errors
 #[derive(Error, Debug)]
 pub enum EnginePoolError {
-    #[error("Model '{0}' is currently loading, please retry")]
-    ModelLoading(String),
     
     #[error("Model '{0}' not found")]
     ModelNotFound(String),
@@ -30,18 +28,6 @@ pub enum EnginePoolError {
     Internal(String),
 }
 
-/// Model loading state
-#[derive(Debug, Clone, PartialEq)]
-pub enum ModelLoadingState {
-    /// No model loaded
-    Unloaded,
-    /// Model is currently loading
-    Loading { model_name: String },
-    /// Model loaded and ready
-    Loaded { model_name: String },
-    /// Model loading failed
-    Failed { model_name: String, error: String },
-}
 
 /// Pool of inference engines
 pub struct EnginePool {
@@ -63,8 +49,6 @@ pub struct EnginePool {
     /// Model storage for resolving model names/UUIDs to paths
     model_storage: Arc<crate::api::model_storage::ModelStorage>,
     
-    /// Track loading state for each model
-    loading_states: Arc<RwLock<HashMap<String, ModelLoadingState>>>,
 }
 
 impl EnginePool {
@@ -81,7 +65,6 @@ impl EnginePool {
             current_size: Arc::new(Mutex::new(0)),
             default_model,
             model_storage,
-            loading_states: Arc::new(RwLock::new(HashMap::new())),
         };
         
         // Add initial engine if default model is specified
@@ -111,20 +94,6 @@ impl EnginePool {
                     info!("Loading model from: {:?}", model_path);
                     engine.load_model(&model_path).await?;
                     info!("Successfully loaded model and tokenizer into engine");
-                    
-                    // Mark the model as loaded in the loading states
-                    let actual_model_name = engine.model_info().name.clone();
-                    let mut states = self.loading_states.write().await;
-                    states.insert(model_identifier.clone(), ModelLoadingState::Loaded { 
-                        model_name: actual_model_name.clone() 
-                    });
-                    // Also store under the actual name if different
-                    if actual_model_name != *model_identifier {
-                        states.insert(actual_model_name.clone(), ModelLoadingState::Loaded { 
-                            model_name: actual_model_name.clone() 
-                        });
-                    }
-                    info!("Marked model as loaded: {} (actual: {})", model_identifier, actual_model_name);
                 }
                 Err(e) => {
                     warn!("Failed to resolve model '{}': {}", model_identifier, e);
@@ -179,30 +148,10 @@ impl EnginePool {
         })
     }
     
-    /// Acquire an engine with the specified model loaded (non-blocking)
-    /// Returns error if model is still loading, client should retry
+    /// Acquire an engine with the specified model loaded
+    /// This will load the model synchronously if not already loaded
     pub async fn acquire_model(&self, model_name: &str) -> Result<EngineGuard, EnginePoolError> {
-        // Check loading state first
-        {
-            let states = self.loading_states.read().await;
-            if let Some(state) = states.get(model_name) {
-                match state {
-                    ModelLoadingState::Loading { .. } => {
-                        return Err(EnginePoolError::ModelLoading(model_name.to_string()));
-                    }
-                    ModelLoadingState::Failed { error, .. } => {
-                        return Err(EnginePoolError::ModelLoadFailed(model_name.to_string(), error.clone()));
-                    }
-                    ModelLoadingState::Loaded { .. } => {
-                        // Model is loaded, continue to find the engine with it
-                    }
-                    _ => {}
-                }
-            }
-        }
-        
         // Try to find an engine that already has this model loaded
-        // Check all available engines first
         let matching_engine = {
             let mut available = self.available.lock().await;
             let mut found_index = None;
@@ -222,6 +171,7 @@ impl EnginePool {
         
         if let Some(engine) = matching_engine {
             // Found an engine with the model already loaded
+            info!("Found engine with model {} already loaded", model_name);
             return Ok(EngineGuard {
                 engine: Some(engine),
                 pool: Arc::clone(&self.available),
@@ -229,7 +179,8 @@ impl EnginePool {
         }
         
         // No engine has this model loaded, acquire any engine and load it
-        let mut engine_guard = self.acquire().await
+        info!("No engine has model {}, acquiring engine to load it", model_name);
+        let engine_guard = self.acquire().await
             .map_err(|e| EnginePoolError::Internal(e.to_string()))?;
         let engine = engine_guard.get();
         
@@ -239,112 +190,27 @@ impl EnginePool {
             let current_model = engine_locked.model_info();
             
             if engine_locked.is_loaded() && self.matches(&current_model.name, model_name) {
+                info!("Engine already has model {} loaded", model_name);
                 return Ok(engine_guard);
             }
         }
         
-        // Model needs loading - take the engine out of the guard for background loading
-        // We need to extract the engine from the guard without returning it to the pool
-        let engine_for_loading = engine_guard.take()
-            .ok_or_else(|| EnginePoolError::Internal("Engine guard has no engine".to_string()))?;
+        // Find the model path
+        let model_path = self.find_model(model_name).await
+            .map_err(|_| EnginePoolError::ModelNotFound(model_name.to_string()))?;
         
-        // Start async load with the extracted engine
-        self.start_model_loading(model_name.to_string(), engine_for_loading).await
-            .map_err(|e| EnginePoolError::Internal(e.to_string()))?;
-        
-        // The guard is now empty and won't return anything to the pool when dropped
-        drop(engine_guard);
-        
-        // Tell client to retry
-        Err(EnginePoolError::ModelLoading(model_name.to_string()))
-    }
-    
-    /// Start loading a model in the background
-    async fn start_model_loading(&self, model_name: String, engine: Arc<Mutex<TorchEngine>>) -> Result<()> {
-        // Check if already loading
+        // Load the model synchronously (within this request)
+        info!("Loading model {} from {:?}", model_name, model_path);
         {
-            let mut states = self.loading_states.write().await;
-            if let Some(ModelLoadingState::Loading { .. }) = states.get(&model_name) {
-                return Ok(()); // Already loading
-            }
-            states.insert(model_name.clone(), ModelLoadingState::Loading { model_name: model_name.clone() });
+            let mut engine_locked = engine.lock().await;
+            engine_locked.load_model(&model_path).await
+                .map_err(|e| EnginePoolError::ModelLoadFailed(model_name.to_string(), e.to_string()))?;
+            info!("Successfully loaded model {}", model_name);
         }
         
-        // Find model path
-        let model_path = match self.find_model(&model_name).await {
-            Ok(path) => path,
-            Err(_) => {
-                let mut states = self.loading_states.write().await;
-                let error_msg = format!("Model not found in storage");
-                states.insert(model_name.clone(), ModelLoadingState::Failed { 
-                    model_name: model_name.clone(), 
-                    error: error_msg.clone()
-                });
-                return Err(EnginePoolError::ModelNotFound(model_name).into());
-            }
-        };
-        
-        let loading_states = self.loading_states.clone();
-        let model_name_clone = model_name.clone();
-        
-        // Need a reference to the pool to return the engine after loading
-        let available_pool = self.available.clone();
-        
-        // Spawn background loading task
-        tokio::spawn(async move {
-            info!("Starting background load of model: {}", model_name_clone);
-            
-            let result = {
-                let mut engine_locked = engine.lock().await;
-                // Store the actual loaded model name
-                let load_result = engine_locked.load_model(&model_path).await;
-                if load_result.is_ok() {
-                    // Get the actual model name after loading
-                    let actual_name = engine_locked.model_info().name.clone();
-                    (load_result, actual_name)
-                } else {
-                    (load_result, model_name_clone.clone())
-                }
-            };
-            
-            // Update state based on result
-            let mut states = loading_states.write().await;
-            match result.0 {
-                Ok(_) => {
-                    info!("Successfully loaded model: {} (actual: {})", model_name_clone, result.1);
-                    // Mark as loaded and clear loading state
-                    states.insert(model_name_clone.clone(), ModelLoadingState::Loaded { 
-                        model_name: result.1.clone() 
-                    });
-                    // Also store under the actual name if different
-                    if result.1 != model_name_clone {
-                        states.insert(result.1.clone(), ModelLoadingState::Loaded { 
-                            model_name: result.1.clone() 
-                        });
-                    }
-                    
-                    // CRITICAL: Return the loaded engine to the pool!
-                    drop(states); // Release the lock first
-                    available_pool.lock().await.push_back(engine);
-                    info!("Returned engine with model {} to pool", result.1);
-                }
-                Err(e) => {
-                    error!("Failed to load model '{}': {}", model_name_clone, e);
-                    states.insert(model_name_clone.clone(), ModelLoadingState::Failed { 
-                        model_name: model_name_clone.clone(), 
-                        error: e.to_string() 
-                    });
-                    
-                    // Return the unloaded engine to the pool
-                    drop(states);
-                    available_pool.lock().await.push_back(engine);
-                }
-            }
-        });
-        
-        Ok(())
+        // Return the engine with the model loaded
+        Ok(engine_guard)
     }
-    
     /// Find model path from identifier using model storage
     async fn find_model(&self, model_name: &str) -> Result<std::path::PathBuf> {
         // First try to parse as UUID and resolve via model storage
@@ -430,15 +296,6 @@ impl EnginePool {
         current.contains(requested_name) || 
         current_normalized.contains(&normalize(requested_name))
     }
-    
-    /// Get model loading status
-    pub async fn model_status(&self, model_name: &str) -> ModelLoadingState {
-        let states = self.loading_states.read().await;
-        states.get(model_name)
-            .cloned()
-            .unwrap_or(ModelLoadingState::Unloaded)
-    }
-    
     /// Get pool statistics
     pub async fn stats(&self) -> EnginePoolStats {
         EnginePoolStats {
