@@ -417,7 +417,6 @@ impl InferenceEngine {
             // Convert sparse LoRA adapter to LoRAWeightsData format
             let lora_weights = self.convert_sparse_to_lora_weights_data(adapter).await?;
             
-            // TODO: Apply to Candle engine when RuntimeEngine trait is implemented
             tracing::warn!("Adapter application to engine not yet fully implemented in TorchEngine");
         }
         

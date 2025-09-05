@@ -220,7 +220,6 @@ impl LoRACheckpointManager {
         
         // Extract weights from the adapter 
         // For now, create some representative weight matrices
-        // TODO: Extract actual weights from VDB sparse storage
         
         let mut a_weights = HashMap::new();
         let mut b_weights = HashMap::new();

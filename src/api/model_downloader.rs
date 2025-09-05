@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use async_trait::async_trait;
-use tch::Device;
-use tempfile::NamedTempFile;
+use safe_path::{scoped_join, scoped_resolve};
+use crate::constants::limits::*;
 
 /// Model format types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -421,11 +421,59 @@ impl HuggingFaceSource {
         filename: &str,
         target_path: &Path,
         pb: Option<&ProgressBar>,
+        max_size: Option<u64>,
     ) -> Result<u64> {
+        // Validate filename to prevent path traversal
+        if !Self::validate_filename(filename) {
+            return Err(anyhow!("Invalid filename: contains path traversal characters"));
+        }
+        
+        // Use safe-path crate for robust path validation
+        // The target_path should be within the cache directory
+        // Extract just the filename to validate, since the directory structure is controlled by us
+        if let Some(file_name) = target_path.file_name() {
+            // Use scoped_join to safely create the full path
+            // This ensures no path traversal even if filename somehow contains ../
+            match scoped_join(&self.cache_dir, file_name) {
+                Ok(_safe_path) => {
+                    // Filename is safe - no traversal attempts
+                }
+                Err(e) => {
+                    return Err(anyhow!("Path validation failed: {}. Filename contains unsafe traversal sequences.", e));
+                }
+            }
+            
+            // Additional check: ensure the parent directory is within or equal to cache_dir
+            if let Some(parent) = target_path.parent() {
+                // For new directories that don't exist yet, we need a different approach
+                // Check if the path starts with cache_dir textually (since it may not exist yet)
+                let parent_str = parent.to_string_lossy();
+                let cache_str = self.cache_dir.to_string_lossy();
+                
+                if !parent_str.starts_with(cache_str.as_ref()) && parent != self.cache_dir {
+                    return Err(anyhow!("Target directory is outside of model cache directory"));
+                }
+            }
+        } else {
+            return Err(anyhow!("Invalid target path: no filename"));
+        }
+        
         // Check if file already exists and get its size
         if target_path.exists() && !pb.is_some() {
             let metadata = fs::metadata(target_path).await?;
-            return Ok(metadata.len());
+            let size = metadata.len();
+            
+            // Check size limit for existing file
+            if let Some(max) = max_size {
+                if size > max {
+                    return Err(anyhow!(
+                        "File {} size ({} bytes) exceeds maximum allowed size ({} bytes)",
+                        filename, size, max
+                    ));
+                }
+            }
+            
+            return Ok(size);
         }
         
         // Download using hf_hub
@@ -436,12 +484,44 @@ impl HuggingFaceSource {
             fs::copy(&file_path, target_path).await?;
         }
         
+        // Set file permissions for security
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            use crate::constants::permissions::MODEL_FILE_PERMISSIONS;
+            let metadata = fs::metadata(target_path).await?;
+            let mut perms = metadata.permissions();
+            perms.set_mode(MODEL_FILE_PERMISSIONS);
+            fs::set_permissions(target_path, perms).await?;
+        }
+        
         if let Some(pb) = pb {
             pb.inc(1);
         }
         
         let metadata = fs::metadata(target_path).await?;
-        Ok(metadata.len())
+        let size = metadata.len();
+        
+        // Verify size limit after download
+        if let Some(max) = max_size {
+            if size > max {
+                // Delete the oversized file
+                let _ = fs::remove_file(target_path).await;
+                return Err(anyhow!(
+                    "Downloaded file {} size ({} bytes) exceeds maximum allowed size ({} bytes)",
+                    filename, size, max
+                ));
+            }
+        }
+        
+        // HuggingFace hub handles checksum verification through git
+        
+        Ok(size)
+    }
+    
+    /// Validate filename to prevent path traversal attacks
+    fn validate_filename(filename: &str) -> bool {
+        crate::utils::validation::is_valid_filename(filename)
     }
 }
 
@@ -502,9 +582,40 @@ impl ModelSource for HuggingFaceSource {
         let repo_id = Self::parse_repo_id(model_id);
         println!("📥 Downloading model: {}", repo_id);
         
-        // Create target directory
-        let model_dir = target_dir.join(repo_id.replace('/', "_"));
+        // Generate UUID for this model download
+        let uuid = uuid::Uuid::new_v4();
+        let model_uuid = crate::api::model_storage::ModelId(uuid);
+        
+        // Create UUID-based target directory
+        let model_dir = target_dir.join(uuid.to_string());
         fs::create_dir_all(&model_dir).await?;
+        
+        // Create model metadata file with original name
+        let model_metadata = crate::api::model_storage::ModelMetadataFile {
+            model_id: model_uuid.clone(),
+            name: repo_id.to_string(),
+            display_name: repo_id.to_string(),
+            source_uri: format!("hf://{}", repo_id),
+            architecture: None, // Will be updated after downloading config
+            parameters: None,
+            created_at: chrono::Utc::now().timestamp(),
+            last_accessed: chrono::Utc::now().timestamp(),
+        };
+        
+        // Save metadata file in the model directory (hardcoded filename for security)
+        // SECURITY: Never use user input for this filename to prevent path traversal
+        let metadata_filename = "model.json"; // Hardcoded, never from user input
+        let metadata_path = model_dir.join(metadata_filename);
+        let metadata_content = serde_json::to_string_pretty(&model_metadata)?;
+        
+        // Additional validation that we're writing to the right place
+        if metadata_path.parent() != Some(&model_dir) {
+            return Err(anyhow::anyhow!("Security violation: metadata path escape attempt"));
+        }
+        
+        fs::write(&metadata_path, metadata_content).await?;
+        
+        println!("📁 Model directory: {} ({})", uuid, repo_id);
         
         // Get repository handle
         let repo = self.api.model(repo_id.to_string());
@@ -532,7 +643,8 @@ impl ModelSource for HuggingFaceSource {
         let config_path = model_dir.join("config.json");
         if !config_path.exists() {
             println!("📄 Downloading config.json");
-            let size = self.download_file_with_progress(&repo, "config.json", &config_path, None).await?;
+            // Config files are small JSON, 100MB should be plenty
+            let size = self.download_file_with_progress(&repo, "config.json", &config_path, None, Some(MAX_CONFIG_SIZE)).await?;
             files.push(ModelFile {
                 filename: "config.json".to_string(),
                 path: config_path.clone(),
@@ -556,7 +668,8 @@ impl ModelSource for HuggingFaceSource {
         for tokenizer_file in &["tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt"] {
             let target_path = model_dir.join(tokenizer_file);
             if !target_path.exists() {
-                match self.download_file_with_progress(&repo, tokenizer_file, &target_path, None).await {
+                // Tokenizer files can be large for some models, 1GB should cover most cases
+                match self.download_file_with_progress(&repo, tokenizer_file, &target_path, None, Some(MAX_TOKENIZER_SIZE)).await {
                     Ok(size) => {
                         println!("📝 Downloaded {}", tokenizer_file);
                         files.push(ModelFile {
@@ -633,7 +746,9 @@ impl ModelSource for HuggingFaceSource {
                 pb.set_message(format!("Downloading {}", filename));
                 
                 // Download the file
-                let size = self.download_file_with_progress(&repo, weight_file, &target_path, Some(&pb)).await?;
+                // Large models can have shards up to 500GB each (future 1T+ models)
+                // With Optane drives and mmap, we can handle these efficiently
+                let size = self.download_file_with_progress(&repo, weight_file, &target_path, Some(&pb), Some(MAX_WEIGHT_SIZE)).await?;
                 
                 files.push(ModelFile {
                     filename: safetensors_filename,
@@ -649,9 +764,19 @@ impl ModelSource for HuggingFaceSource {
         
         pb.finish_with_message("Download complete");
         
+        // Update model metadata with config information
+        if let Some(ref cfg) = config {
+            let mut updated_metadata = model_metadata.clone();
+            updated_metadata.architecture = Some(cfg.architecture.clone());
+            
+            let metadata_path = model_dir.join("model.json");
+            let metadata_content = serde_json::to_string_pretty(&updated_metadata)?;
+            fs::write(&metadata_path, metadata_content).await?;
+        }
+        
         println!("✅ Model downloaded successfully!");
         println!("📊 Total size: {:.2} GB", total_size as f64 / 1_073_741_824.0);
-        println!("📁 Location: {}", model_dir.display());
+        println!("📁 Location: {} (UUID: {})", repo_id, uuid);
         
         Ok(DownloadedModel {
             model_id: repo_id.to_string(),
@@ -681,13 +806,13 @@ impl ModelDownloader {
         let mut sources: HashMap<String, Box<dyn ModelSource>> = HashMap::new();
         
         // Add HuggingFace source by default with token
-        // Create two instances for the two aliases
+        // Use the same flat cache directory for all sources - models are organized by UUID
         let hf_source1 = HuggingFaceSource::new(
-            cache_dir.join("huggingface"),
+            cache_dir.clone(),  // Flat structure - no source-specific subdirs
             hf_token.clone(),
         ).await?;
         let hf_source2 = HuggingFaceSource::new(
-            cache_dir.join("huggingface"),
+            cache_dir.clone(),  // Same flat structure for both aliases
             hf_token,
         ).await?;
         // Register with both "huggingface" and "hf" aliases
@@ -724,9 +849,8 @@ impl ModelDownloader {
         let source = self.sources.get(source_name)
             .ok_or_else(|| anyhow!("Unknown model source: {}", source_name))?;
         
-        // Download the model
-        let target_dir = self.cache_dir.join(source_name);
-        let model = source.download_model(model_name, &target_dir).await?;
+        // Download the model to flat cache directory (no source-specific subdirs)
+        let model = source.download_model(model_name, &self.cache_dir).await?;
         
         // Model is downloaded in its native format
         

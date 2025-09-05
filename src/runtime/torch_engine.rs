@@ -71,13 +71,8 @@ pub struct TorchEngine {
     /// VarStore for native PyTorch weight management - not thread safe, requires external sync
     var_store: Arc<Mutex<Option<VarStore>>>,
     /// SafeTensors raw data for on-demand tensor creation - thread safe after initialization
-    // safetensors_data removed - no longer needed with ModelFactory
-    /// Cached converted tensors (for performance optimization) - thread safe after initialization
-    // cached_weights removed - ModelFactory handles weight loading
     /// Detected model architecture - thread safe after initialization
     model_architecture: Arc<Mutex<Option<String>>>,
-    /// Model config.json content if available
-    // model_config_json removed - ModelFactory handles config loading
     /// Persistent model instance to avoid recreation on every forward pass
     /// Using Arc<Mutex<>> for interior mutability since ModelOperations has mutable methods
     persistent_model: Option<Arc<Mutex<Box<dyn ModelOperations>>>>,
@@ -112,9 +107,6 @@ impl TorchEngine {
         }
     }
     
-    /// Convert SafeTensors data to tch Tensor with consistent BF16 dtype for Gemma
-    // NOTE: safetensors_to_tensor removed - all weight loading now handled by ModelFactory
-
     /// Create new PyTorch engine
     pub fn new(config: RuntimeConfig) -> Result<Self> {
         Self::new_sync(config)
@@ -138,10 +130,7 @@ impl TorchEngine {
 
         Ok(Self {
             var_store: Arc::new(Mutex::new(None)),
-            // safetensors_data removed - handled by ModelFactory
-            // cached_weights removed - handled by ModelFactory
             model_architecture: Arc::new(Mutex::new(None)),
-            // model_config_json removed - handled by ModelFactory
             persistent_model: None,
             context_state: Arc::new(Mutex::new(None)),
             tokenizer: Arc::new(Mutex::new(None)),
@@ -181,9 +170,6 @@ impl TorchEngine {
             }
         }
 
-        // Note: Model name is now set in load_model() based on the original path
-        // This ensures we use the directory name for models loaded from directories
-        
         Ok(())
     }
 
@@ -234,7 +220,6 @@ impl TorchEngine {
         }
         
         // Create dummy VarStore for backward compatibility
-        // This can be removed once we fully migrate away from VarStore
         {
             let vs = VarStore::new(self.device);
             let mut var_store_guard = self.handle_poison(self.var_store.lock())?;
@@ -406,7 +391,6 @@ impl TorchEngine {
                 .ok_or_else(|| anyhow!("Context state not initialized"))?;
         }
         
-        // Context initialization check moved to is_persistent_model_ready()
         if !self.is_persistent_model_ready() {
             return Err(anyhow!("Model not properly initialized"));
         }
@@ -936,10 +920,7 @@ impl TorchEngine {
     }
 
     /// Update context state for tracking generation progress
-    /// Note: This is currently a no-op since generation methods take &self
     fn update_context_state(&self, _sequence_length: usize) {
-        // TODO: Implement with interior mutability if needed
-        // Currently disabled to avoid borrowing conflicts
     }
 
     /// Check if persistent model is initialized - thread safe
@@ -1109,12 +1090,6 @@ impl TorchEngine {
         _expected_response: &str,
         _learning_rate: f32,
     ) -> Result<()> {
-        // TODO: Implement temporal LoRA training with Tch
-        // This is a placeholder to resolve compilation errors
         Ok(())
     }
 }
-
-// TorchEngine is now thread-safe through proper use of Arc<Mutex<T>> for all mutable state
-// No unsafe implementations needed - Send + Sync are automatically derived
-// All critical sections are protected by mutexes with poisoning recovery

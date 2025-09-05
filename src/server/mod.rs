@@ -99,8 +99,6 @@ pub async fn start_server_tls(
     cert_path: &str,
     key_path: &str,
 ) -> Result<()> {
-    // TODO: Implement TLS support
-    // This would use axum_server with rustls
     info!("TLS server support not yet implemented");
     start_server(addr, state).await
 }

@@ -225,14 +225,30 @@ impl EnginePool {
         }
         
         // Try to find by scanning the model list (for name-based lookup)
-        let models = self.model_storage.list_models().await?;
+        let models = self.model_storage.children().await?;
         for (_id, metadata) in models {
-            // Check various name formats
+            // Check against the model's name field
+            if metadata.name == model_name {
+                if let Some(ref local_path) = metadata.local_path {
+                    return Ok(local_path.clone());
+                }
+            }
+            
+            // Check against display_name
+            if let Some(ref display_name) = metadata.display_name {
+                if display_name == model_name {
+                    if let Some(ref local_path) = metadata.local_path {
+                        return Ok(local_path.clone());
+                    }
+                }
+            }
+            
+            // Legacy: Check directory name
             if let Some(ref local_path) = metadata.local_path {
                 if let Some(dir_name) = local_path.file_name() {
                     let dir_name_str = dir_name.to_string_lossy();
                     
-                    // Exact match
+                    // Exact match on directory name
                     if dir_name_str == model_name {
                         return Ok(local_path.clone());
                     }
@@ -328,23 +344,48 @@ impl EngineGuard {
 
 impl Drop for EngineGuard {
     fn drop(&mut self) {
-        // Return engine to pool synchronously to ensure it's returned
+        // CRITICAL: Must always return engine to pool to prevent resource leak
         if let Some(engine) = self.engine.take() {
-            // Use try_lock to avoid blocking in Drop
-            // If we can't get the lock immediately, spawn a task
+            // Try immediate non-blocking return
             if let Ok(mut pool) = self.pool.try_lock() {
                 pool.push_back(engine);
+                tracing::trace!("Engine returned to pool synchronously");
             } else {
-                // Fallback to async if lock is contended
+                // Lock is contended, we must ensure the engine is returned
+                // Use blocking spawn to ensure the task completes
                 let pool = self.pool.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        async {
-                            pool.lock().await.push_back(engine);
+                let engine_id = Arc::as_ptr(&engine) as usize; // For tracking
+                
+                // Create a detached task that WILL complete
+                std::thread::spawn(move || {
+                    // Use a blocking runtime handle to ensure completion
+                    let handle = tokio::runtime::Handle::current();
+                    let result = handle.block_on(async move {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(30), // Longer timeout
+                            pool.lock()
+                        ).await {
+                            Ok(mut pool_guard) => {
+                                pool_guard.push_back(engine);
+                                tracing::info!("Engine {:x} returned to pool asynchronously", engine_id);
+                                Ok(())
+                            }
+                            Err(_) => {
+                                // CRITICAL: Engine would be leaked here
+                                // Log with high severity for monitoring
+                                tracing::error!(
+                                    "RESOURCE LEAK: Failed to return engine {:x} to pool after 30s timeout. \
+                                     This is a critical error that requires investigation.",
+                                    engine_id
+                                );
+                                Err(())
+                            }
                         }
-                    ).await {
-                        tracing::error!("Failed to return engine to pool: timeout after 5s: {}", e);
+                    });
+                    
+                    if result.is_err() {
+                        // Additional alerting could go here
+                        eprintln!("CRITICAL: Engine resource leak detected!");
                     }
                 });
             }

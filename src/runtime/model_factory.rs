@@ -7,6 +7,7 @@ use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::path::Path;
 use tch::{Device, Tensor, Kind as DType};
+use crate::constants::limits::*;
 
 use super::model_config::{ModelConfig, ModelArchitecture};
 use super::architectures::{ModelOperations, llama::LlamaModel, gemma::GemmaModel};
@@ -24,13 +25,8 @@ impl ModelFactory {
     ) -> Result<Box<dyn ModelOperations>> {
         println!("🏭 ModelFactory: Loading model from {}", model_path.display());
         
-        // Step 1: Load weights
         let weights = Self::load_weights(model_path, device, dtype)?;
-        
-        // Step 2: Load unified configuration (config.json + weight detection)
         let config = ModelConfig::load(model_path, &weights)?;
-        
-        // Step 3: Create model based on architecture
         let model = Self::create_model_from_config(config, weights, device, dtype)?;
         
         println!("✅ ModelFactory: Model created successfully");
@@ -45,7 +41,6 @@ impl ModelFactory {
     ) -> Result<HashMap<String, Tensor>> {
         let mut all_weights = HashMap::new();
         
-        // Check for single safetensors file
         let single_file = model_path.join("model.safetensors");
         if single_file.exists() {
             println!("📦 Loading single safetensors file");
@@ -53,7 +48,7 @@ impl ModelFactory {
             return Ok(all_weights);
         }
         
-        // Check for sharded safetensors
+        // Look for sharded safetensors files (model-00001-of-00002.safetensors pattern)
         let entries = std::fs::read_dir(model_path)?;
         let mut shard_files = Vec::new();
         
@@ -80,19 +75,65 @@ impl ModelFactory {
     }
     
     /// Load a single safetensors file
+    /// Can optionally use memory mapping for large models on systems with
+    /// persistent memory (e.g., Optane drives)
     fn load_safetensors_file(
         path: &Path,
         weights: &mut HashMap<String, Tensor>,
         device: &Device,
         dtype: DType,
     ) -> Result<()> {
-        let buffer = std::fs::read(path)?;
-        let tensors = safetensors::SafeTensors::deserialize(&buffer)?;
+        // Check if mmap should be used (via environment variable for now)
+        let use_mmap = std::env::var("HYPRSTREAM_USE_MMAP").unwrap_or_default() == "true";
+        
+        let buffer: Vec<u8>;
+        let mmap_holder: Option<memmap2::Mmap>;
+        
+        let tensor_data = if use_mmap {
+            // Memory-mapped loading for Optane/persistent memory systems
+            let file = std::fs::File::open(path)?;
+            
+            // Validate file size
+            let metadata = file.metadata()?;
+            let file_size = metadata.len();
+            
+            if file_size > MAX_MODEL_FILE_SIZE {
+                return Err(anyhow!("Model file {} exceeds maximum size", path.display()));
+            }
+            
+            // Create memory map
+            let mmap = unsafe {
+                memmap2::MmapOptions::new()
+                    .populate() // Pre-populate pages for better performance
+                    .map(&file)?
+            };
+            
+            mmap_holder = Some(mmap);
+            // Get a reference to the mmap data
+            mmap_holder.as_ref().unwrap().as_ref()
+        } else {
+            // Standard loading into memory (default for most systems)
+            buffer = std::fs::read(path)?;
+            
+            // Validate file size
+            if buffer.len() as u64 > MAX_MODEL_FILE_SIZE {
+                return Err(anyhow!("Model file {} exceeds maximum size", path.display()));
+            }
+            
+            &buffer
+        };
+        
+        // Deserialize from either mmap or buffer
+        let tensors = safetensors::SafeTensors::deserialize(tensor_data)?;
         
         for (name, tensor_view) in tensors.tensors() {
-            // Convert to tch tensor
             let shape: Vec<i64> = tensor_view.shape().iter().map(|&x| x as i64).collect();
             let data = tensor_view.data();
+            
+            // Validate tensor size to prevent memory exhaustion
+            if data.len() as u64 > MAX_TENSOR_SIZE {
+                return Err(anyhow!("Tensor '{}' size {} exceeds maximum", name, data.len()));
+            }
             
             // Create tensor based on original dtype
             let tensor = match tensor_view.dtype() {
@@ -124,7 +165,6 @@ impl ModelFactory {
                 }
             };
             
-            // Move to device and convert to target dtype
             let tensor = tensor.to_device(*device).to_kind(dtype);
             weights.insert(name.to_string(), tensor);
         }
@@ -184,7 +224,7 @@ impl ModelFactory {
             vocab_size: config.vocab_size,
             num_hidden_layers: config.num_hidden_layers,
             rope_theta: config.rope_theta,
-            rope_scaling: None, // TODO: Convert rope_scaling
+            rope_scaling: None,
             hidden_activation: config.hidden_activation,
             query_pre_attn_scalar: config.query_pre_attn_scalar,
             use_qk_norm: config.use_qk_norm,

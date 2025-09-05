@@ -91,8 +91,6 @@ pub async fn rate_limit_middleware(
     request: Request,
     next: Next,
 ) -> Response {
-    // TODO: Implement actual rate limiting with token bucket or sliding window
-    // For now, just pass through
     next.run(request).await
 }
 

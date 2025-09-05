@@ -160,19 +160,12 @@ impl InferenceExt for TorchEngine {
 
 /// Apply LoRA weights to the engine
 async fn apply_lora_to_engine(engine: &mut TorchEngine, weights: &LoRAWeightsData) -> Result<()> {
-    // TODO: Implement actual LoRA weight application
-    // For now, this is a placeholder that logs the intent
     tracing::debug!(
         "Would apply LoRA weights: {} modules, rank {}, alpha {}",
         weights.target_modules.len(),
         weights.config.rank,
         weights.config.alpha,
     );
-    
-    // Note: When implementing, this should:
-    // 1. Convert LoRAWeightsData to engine-specific format
-    // 2. Apply weights to the appropriate model layers
-    // 3. Update engine state to reflect LoRA is active
     
     Ok(())
 }

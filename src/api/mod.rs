@@ -2,7 +2,6 @@
 
 use axum::{
     Router,
-    routing::{get, post},
     extract::{Path, State, Json},
     response::Json as JsonResponse,
     http::StatusCode,
@@ -13,7 +12,6 @@ use tokio::sync::RwLock;
 use serde::{Deserialize, Serialize};
 
 pub mod lora_registry;
-pub mod model_management;
 pub mod model_registry;
 pub mod model_storage;
 pub mod model_downloader;
@@ -139,30 +137,11 @@ pub struct CreateLoRAResponse {
 /// Create the main API router
 pub fn create_router(state: ApiState) -> Router {
     Router::new()
-        // TODO: Fix API handlers - temporarily commented out due to Handler trait issues
-        // LoRA management endpoints
-        //.route("/v1/lora/create", post(create_lora_layer))
-        //.route("/v1/lora/list", get(list_lora_layers))
-        //.route("/v1/lora/:lora_id/info", get(get_lora_info))
-        //.route("/v1/lora/:lora_id/delete", post(delete_lora_layer))
-        //.route("/v1/lora/:lora_id/train", post(trigger_training))
-        //.route("/v1/lora/:lora_id/stats", get(get_lora_stats))
-        
-        // OpenAI-compatible endpoints (dynamically registered per LoRA)
-        //.route("/v1/inference/:lora_id/chat/completions", post(openai_chat_completions))
-        //.route("/v1/inference/:lora_id/completions", post(openai_completions))
-        //.route("/v1/inference/:lora_id/embeddings", post(openai_embeddings))
-        //.route("/v1/inference/:lora_id/models", get(openai_list_models))
-        
-        // Training endpoints
-        //.route("/v1/training/:lora_id/start", post(start_auto_training))
-        //.route("/v1/training/:lora_id/stop", post(stop_auto_training))
-        //.route("/v1/training/:lora_id/status", get(training_status))
-        
         .with_state(state)
 }
 
 /// Create a new LoRA layer
+#[allow(dead_code)]
 async fn create_lora_layer(
     State(state): State<ApiState>,
     Json(request): Json<CreateLoRARequest>,
@@ -267,6 +246,7 @@ async fn create_lora_layer(
 }
 
 /// List all LoRA layers
+#[allow(dead_code)]
 async fn list_lora_layers(
     State(state): State<ApiState>,
 ) -> Result<JsonResponse<Vec<LoRALayer>>, StatusCode> {
@@ -276,6 +256,7 @@ async fn list_lora_layers(
 }
 
 /// Get information about a specific LoRA layer
+#[allow(dead_code)]
 async fn get_lora_info(
     State(state): State<ApiState>,
     Path(lora_id): Path<String>,
@@ -286,6 +267,7 @@ async fn get_lora_info(
 }
 
 /// Delete a LoRA layer
+#[allow(dead_code)]
 async fn delete_lora_layer(
     State(state): State<ApiState>,
     Path(lora_id): Path<String>,
@@ -319,6 +301,7 @@ async fn delete_lora_layer(
 }
 
 /// OpenAI-compatible chat completions endpoint
+#[allow(dead_code)]
 async fn openai_chat_completions(
     State(_state): State<ApiState>,
     Path(lora_id): Path<String>,
@@ -329,6 +312,7 @@ async fn openai_chat_completions(
 }
 
 /// OpenAI-compatible completions endpoint
+#[allow(dead_code)]
 async fn openai_completions(
     State(_state): State<ApiState>,
     Path(lora_id): Path<String>,
@@ -339,6 +323,7 @@ async fn openai_completions(
 }
 
 /// OpenAI-compatible embeddings endpoint
+#[allow(dead_code)]
 async fn openai_embeddings(
     State(_state): State<ApiState>,
     Path(lora_id): Path<String>,
@@ -349,6 +334,7 @@ async fn openai_embeddings(
 }
 
 /// List models (OpenAI-compatible)
+#[allow(dead_code)]
 async fn openai_list_models(
     State(state): State<ApiState>,
     Path(lora_id): Path<String>,
@@ -371,6 +357,7 @@ async fn openai_list_models(
 }
 
 /// Start auto-regressive training
+#[allow(dead_code)]
 async fn start_auto_training(
     State(state): State<ApiState>,
     Path(lora_id): Path<String>,
@@ -386,6 +373,7 @@ async fn start_auto_training(
 }
 
 /// Stop auto-regressive training
+#[allow(dead_code)]
 async fn stop_auto_training(
     State(state): State<ApiState>,
     Path(lora_id): Path<String>,
@@ -400,6 +388,7 @@ async fn stop_auto_training(
 }
 
 /// Get training status
+#[allow(dead_code)]
 async fn training_status(
     State(state): State<ApiState>,
     Path(lora_id): Path<String>,
@@ -410,6 +399,7 @@ async fn training_status(
 }
 
 /// Trigger manual training
+#[allow(dead_code)]
 async fn trigger_training(
     State(state): State<ApiState>,
     Path(lora_id): Path<String>,
@@ -427,6 +417,7 @@ async fn trigger_training(
 }
 
 /// Get LoRA statistics
+#[allow(dead_code)]
 async fn get_lora_stats(
     State(state): State<ApiState>,
     Path(lora_id): Path<String>,
@@ -467,6 +458,7 @@ pub struct LoRAStats {
 }
 
 
+#[allow(dead_code)]
 fn format_chat_messages(messages: &[openai_compat::ChatMessage]) -> String {
     messages.iter()
         .map(|m| format!("{}: {}", m.role, m.content.as_ref().unwrap_or(&String::new())))

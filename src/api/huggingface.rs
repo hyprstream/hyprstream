@@ -1,6 +1,8 @@
-//! Hugging Face Hub integration for model management
+//! Hugging Face Hub integration for model search and discovery
+//! 
+//! Download functionality has been moved to model_downloader.rs for consolidation
 
-use crate::api::model_management::ModelUri;
+use crate::api::model_storage::ModelUri;
 use crate::api::model_registry::{
     ModelRegistry, DownloadResult, SearchResult, RegistryModelInfo, ModelInfo,
     ModelFileInfo, RegistryConfig
@@ -13,8 +15,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use anyhow::Result;
 use reqwest::{Client, header};
-use tokio::fs;
-use tokio::io::AsyncWriteExt;
+// Removed unused imports - download functionality moved to model_downloader.rs
 
 /// Hugging Face API client
 pub struct HuggingFaceClient {
@@ -153,153 +154,22 @@ impl HuggingFaceClient {
                 self.config.base_url, org, name, rev, filename)
     }
     
-    /// Download a single file with progress tracking
-    async fn download_file(
-        &self,
-        url: &str,
-        local_path: &Path,
-        filename: &str,
-    ) -> Result<u64> {
-        println!("📥 Downloading: {}", filename);
-        
-        let response = self.client.get(url).send().await
-            .map_err(|e| anyhow::anyhow!("Request failed: {}", e))?;
-        
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!("Download failed: {}", response.status()));
-        }
-        
-        let total_size = response.content_length().unwrap_or(0);
-        let file_path = local_path.join(filename);
-        
-        // Create parent directories
-        if let Some(parent) = file_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        
-        let mut file = fs::File::create(&file_path).await?;
-        let mut downloaded = 0u64;
-        let mut stream = response.bytes_stream();
-        
-        use futures::StreamExt;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| anyhow::anyhow!("Stream error: {}", e))?;
-            file.write_all(&chunk).await?;
-            downloaded += chunk.len() as u64;
-            
-            // Progress reporting (every 1MB)
-            if downloaded % (1024 * 1024) == 0 || downloaded == total_size {
-                let progress = if total_size > 0 {
-                    (downloaded as f64 / total_size as f64) * 100.0
-                } else {
-                    0.0
-                };
-                print!("\r📥 {}: {:.1}% ({} MB)", 
-                       filename, progress, downloaded / (1024 * 1024));
-            }
-        }
-        
-        println!("\n✅ Downloaded: {} ({} bytes)", filename, downloaded);
-        Ok(downloaded)
-    }
+    // REMOVED: download_file - Download functionality moved to model_downloader.rs
 }
 
 #[async_trait]
 impl ModelRegistry for HuggingFaceClient {
     async fn download_model(
         &self,
-        model_uri: &ModelUri,
-        local_path: &Path,
-        files: Option<&[String]>,
+        _model_uri: &ModelUri,
+        _local_path: &Path,
+        _files: Option<&[String]>,
     ) -> Result<DownloadResult> {
-        println!("🤗 Downloading model from Hugging Face: {}/{}", 
-                 model_uri.org, model_uri.name);
-        
-        // First, get model info to determine what files to download
-        let model_info = self.get_model_info(&model_uri.org, &model_uri.name).await?;
-        let available_files = self.list_model_files(model_uri).await?;
-        
-        // Determine which files to download
-        let files_to_download = if let Some(specific_files) = files {
-            specific_files.to_vec()
-        } else {
-            // Default files for common model formats
-            let mut default_files = Vec::new();
-            
-            // Look for common model files
-            for file_info in &available_files {
-                let filename = &file_info.filename;
-                
-                // SafeTensors files (preferred)
-                if filename.ends_with(".safetensors") {
-                    default_files.push(filename.clone());
-                }
-                // PyTorch files (fallback)
-                else if filename.ends_with(".bin") && filename.contains("pytorch") {
-                    default_files.push(filename.clone());
-                }
-                // Configuration files
-                else if filename == "config.json" 
-                     || filename == "tokenizer.json"
-                     || filename == "tokenizer_config.json"
-                     || filename == "vocab.txt"
-                     || filename == "merges.txt"
-                     || filename == "special_tokens_map.json" {
-                    default_files.push(filename.clone());
-                }
-                // README and license
-                else if filename == "README.md" || filename.to_lowercase().contains("license") {
-                    default_files.push(filename.clone());
-                }
-            }
-            
-            if default_files.is_empty() {
-                // If no standard files found, download first few files
-                default_files = available_files.iter()
-                    .take(5)
-                    .map(|f| f.filename.clone())
-                    .collect();
-            }
-            
-            default_files
-        };
-        
-        // Download files
-        let mut total_size = 0u64;
-        let mut downloaded_files = Vec::new();
-        
-        for filename in &files_to_download {
-            let url = self.download_url(
-                &model_uri.org, 
-                &model_uri.name, 
-                filename, 
-                model_uri.revision.as_deref()
-            );
-            
-            match self.download_file(&url, local_path, filename).await {
-                Ok(size) => {
-                    total_size += size;
-                    downloaded_files.push(filename.clone());
-                }
-                Err(e) => {
-                    eprintln!("⚠️ Failed to download {}: {}", filename, e);
-                }
-            }
-        }
-        
-        if downloaded_files.is_empty() {
-            return Err(anyhow::anyhow!("No files were successfully downloaded"));
-        }
-        
-        Ok(DownloadResult {
-            size_bytes: total_size,
-            files: downloaded_files,
-            model_type: model_info.task.unwrap_or("text-generation".to_string()),
-            architecture: model_info.architecture,
-            parameters: None, // Not available in this ModelInfo struct
-            tokenizer_type: model_info.library_name,
-            tags: model_info.tags,
-        })
+        // Download functionality has been consolidated in ModelDownloader
+        Err(anyhow::anyhow!(
+            "Download functionality has been moved to ModelDownloader. \n\
+             Please use the ModelDownloader API for downloading models."
+        ))
     }
     
     async fn get_model_info(&self, model_uri: &ModelUri) -> Result<RegistryModelInfo> {
@@ -547,5 +417,4 @@ struct HuggingFaceFileInfo {
 }
 
 use chrono;
-use futures;
 use urlencoding;

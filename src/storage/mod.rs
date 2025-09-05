@@ -35,9 +35,5 @@ pub use lora_weight_cache::{
     AdapterCacheStats, CacheStats,
 };
 
-// View support re-enabled with simplified schema (no arrow dependency)
-
 // XDG-compliant path management (internal use only)
-// Note: StoragePaths should only be used by config module
-// HfAuth has been moved to crate::auth module
 pub use paths::StoragePaths;

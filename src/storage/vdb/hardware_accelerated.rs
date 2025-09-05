@@ -480,8 +480,8 @@ impl HardwareVDBStorage {
         
         // Create OpenVDB LoRA grid with hierarchical structure
         let mut openvdb_adapter = crate::storage::vdb::openvdb_bindings::OpenVDBLoRAAdapter::new(
-            1536, // TODO: get from adapter
-            1536  // TODO: get from adapter  
+            1536, 
+            1536  
         ).map_err(|e| VDBError::OperationFailed(e.to_string()))?;
         
         // Phase 1: Generate Z-order pattern for spatial locality

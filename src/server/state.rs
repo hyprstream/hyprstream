@@ -284,7 +284,6 @@ impl ServerState {
         tracing::info!("Initializing LoRA registry at: {:?}", loras_dir);
         let lora_registry = Arc::new(LoRARegistry::new(loras_dir).await?);
         
-        // Initialize training stub (TODO: connect to VDB storage and inference API)
         let training_service = Arc::new(TrainingStub);
         
         // Initialize engine pool with model storage

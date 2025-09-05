@@ -25,6 +25,7 @@ path = "src/bin/main.rs"
 [dependencies]
 # Arrow and DataFusion dependencies removed - focused on ML inference only
 bytes = "1.9.0"
+safe-path = "0.1"  # Safe path traversal prevention
 futures = { version = "0.3.31", features = ["alloc"] }
 futures-util = "0.3.31"
 pin-project-lite = "0.2"

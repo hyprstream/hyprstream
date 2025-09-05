@@ -1,6 +1,6 @@
 //! Model registry abstraction for different model sources
 
-use crate::api::model_management::ModelUri;
+use crate::api::model_storage::ModelUri;
 use crate::api::model_storage::ModelMetadata;
 
 use std::path::Path;

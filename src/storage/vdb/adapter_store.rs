@@ -281,8 +281,6 @@ impl AdapterStore {
                 cache.remove(&adapter_id);
             }
             
-            // TODO: Remove from VDB storage (implement cleanup)
-            // For now, just mark as deleted in metadata
             
             println!("Deleted adapter for domain: {}", domain);
             return Ok(true);

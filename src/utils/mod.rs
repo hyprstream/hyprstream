@@ -1,5 +1,7 @@
 use std::error::Error;
 
+pub mod validation;
+
 // /// Convert an Arrow RecordBatch to a JSON array of objects
 // pub fn record_batch_to_json(batch: &RecordBatch) -> Result<Vec<JsonValue>, Box<dyn Error>> {
 //     let mut json_rows = Vec::new();

@@ -1,15 +1,85 @@
 //! Local model storage and metadata management
 
-use crate::api::model_management::ModelUri;
-
+use anyhow::{Result, anyhow};
+use serde::{Deserialize, Serialize};
+use url::Url;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::fmt;
 use tokio::fs;
-use tokio::sync::RwLock;
-use serde::{Deserialize, Serialize};
-use anyhow::{Result, anyhow};
 use uuid::Uuid;
+
+/// Model URI representation for different registries
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ModelUri {
+    /// Registry type (hf, custom, etc.)
+    pub registry: String,
+    
+    /// Organization/namespace  
+    pub org: String,
+    
+    /// Model name
+    pub name: String,
+    
+    /// Optional revision/tag
+    pub revision: Option<String>,
+    
+    /// Full URI string
+    pub uri: String,
+}
+
+impl ModelUri {
+    /// Parse model URI from string
+    pub fn parse(uri: &str) -> Result<Self> {
+        let url = Url::parse(uri)
+            .map_err(|e| anyhow!("Invalid URI format: {}", e))?;
+        
+        let registry = url.scheme().to_string();
+        let host = url.host_str().unwrap_or("");
+        let path = url.path().trim_start_matches('/');
+        
+        let (org, name, revision) = match registry.as_str() {
+            "hf" => {
+                let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+                
+                let (org, name_part) = if parts.len() >= 2 {
+                    (parts[0], parts[1]) 
+                } else if !host.is_empty() && parts.len() >= 1 {
+                    (host, parts[0])
+                } else {
+                    return Err(anyhow!("HuggingFace URI must have org/name format"));
+                };
+                
+                let (name, revision) = if name_part.contains('@') {
+                    let parts: Vec<&str> = name_part.split('@').collect();
+                    (parts[0], Some(parts[1].to_string()))
+                } else {
+                    (name_part, None)
+                };
+                
+                (org.to_string(), name.to_string(), revision)
+            }
+            _ => {
+                return Err(anyhow!("Unsupported registry: {}", registry));
+            }
+        };
+        
+        Ok(ModelUri {
+            registry,
+            org,
+            name,
+            revision,
+            uri: uri.to_string(),
+        })
+    }
+    
+}
+
+impl fmt::Display for ModelUri {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.uri)
+    }
+}
 
 /// UUID-based model identifier
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -18,6 +88,20 @@ pub struct ModelId(pub Uuid);
 /// UUID-based composed model identifier (base model + LoRA stack)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ComposedModelId(pub Uuid);
+
+/// Model metadata file stored in each model directory
+/// This allows safe UUID-based storage with human-readable metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelMetadataFile {
+    pub model_id: ModelId,
+    pub name: String,
+    pub display_name: String,
+    pub source_uri: String,
+    pub architecture: Option<String>,
+    pub parameters: Option<u64>,
+    pub created_at: i64,
+    pub last_accessed: i64,
+}
 
 impl ModelId {
     pub fn new() -> Self {
@@ -96,24 +180,10 @@ pub enum SourceType {
     Custom(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelFile {
-    pub filename: String,
-    pub size_bytes: u64,
-    pub checksum: Option<String>,
-    pub file_type: FileType,
-}
+// Re-export ModelFile and FileType from model_downloader
+pub use crate::api::model_downloader::{ModelFile, FileType};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum FileType {
-    Model,
-    Tokenizer,
-    Config,
-    Readme,
-    Other,
-}
-
-/// Legacy model metadata (for backwards compatibility)
+/// Model metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LegacyModelMetadata {
     pub uri: ModelUri,
@@ -204,6 +274,59 @@ pub struct CleanupResult {
 }
 
 impl ModelStorage {
+    /// Get the path for a UUID-based model directory with validation
+    pub fn get_uuid_model_path(&self, model_id: &ModelId) -> PathBuf {
+        // SECURITY: Validate UUID format to prevent injection
+        let uuid_str = model_id.to_string();
+        
+        // UUID v4 format: 8-4-4-4-12 hex characters with hyphens
+        let uuid_regex = regex::Regex::new(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$").unwrap();
+        if !uuid_regex.is_match(&uuid_str) {
+            // Return a safe fallback path if validation fails
+            tracing::error!("Invalid UUID format detected: {}", uuid_str);
+            return self.base_dir.join("invalid_uuid");
+        }
+        
+        self.base_dir.join(uuid_str)
+    }
+    
+    /// Save model metadata file in the model directory
+    pub async fn save_model_metadata_file(&self, model_id: &ModelId, metadata: &ModelMetadataFile) -> Result<()> {
+        let model_path = self.get_uuid_model_path(model_id);
+        fs::create_dir_all(&model_path).await?;
+        
+        let metadata_file = model_path.join("model.json");
+        let content = serde_json::to_string_pretty(metadata)?;
+        fs::write(&metadata_file, content).await?;
+        
+        tracing::info!("Saved model metadata for {} to {:?}", model_id, metadata_file);
+        Ok(())
+    }
+    
+    /// Load model metadata file from a model directory with size limits
+    pub async fn load_model_metadata_file(&self, model_id: &ModelId) -> Result<ModelMetadataFile> {
+        let model_path = self.get_uuid_model_path(model_id);
+        let metadata_file = model_path.join("model.json");
+        
+        // SECURITY: Check file size before reading to prevent OOM
+        const MAX_METADATA_SIZE: u64 = 1024 * 1024; // 1MB max for metadata
+        let file_meta = fs::metadata(&metadata_file).await?;
+        if file_meta.len() > MAX_METADATA_SIZE {
+            return Err(anyhow::anyhow!("Metadata file too large: {} bytes", file_meta.len()));
+        }
+        
+        let content = fs::read_to_string(&metadata_file).await?;
+        let metadata: ModelMetadataFile = serde_json::from_str(&content)?;
+        
+        Ok(metadata)
+    }
+    
+    /// Check if a UUID-based model exists
+    pub fn uuid_model_exists(&self, model_id: &ModelId) -> bool {
+        let model_path = self.get_uuid_model_path(model_id);
+        model_path.join("model.json").exists()
+    }
+    
     /// Create new model storage manager
     pub async fn new(base_dir: PathBuf) -> Result<Self> {
         // Ensure base directory exists
@@ -393,8 +516,8 @@ impl ModelStorage {
                     let model_exists = if let Some(local_path) = &metadata.local_path {
                         local_path.exists()
                     } else {
-                        let model_path = uri.local_path(&self.base_dir);
-                        model_path.exists()
+                        // UUID models should have local_path set
+                        false
                     };
                     
                     if model_exists {
@@ -408,7 +531,7 @@ impl ModelStorage {
     }
     
     /// List all models by UUID (new primary interface)
-    pub async fn list_all_models(&self) -> Result<Vec<(ModelId, ModelMetadata)>> {
+    pub async fn list_all(&self) -> Result<Vec<(ModelId, ModelMetadata)>> {
         let cache = self.metadata_cache.read().await;
         let mut models = Vec::new();
         
@@ -497,10 +620,9 @@ impl ModelStorage {
                 break;
             }
             
-            // Remove model files
-            let model_path = uri.local_path(&self.base_dir);
-            if model_path.exists() {
-                match fs::remove_dir_all(&model_path).await {
+            // Remove model files from UUID directory if we have the metadata
+            if let Some(ref local_path) = metadata.local_path {
+                match fs::remove_dir_all(&local_path).await {
                     Ok(()) => {
                         bytes_freed += metadata.size_bytes;
                         models_removed += 1;
@@ -512,7 +634,7 @@ impl ModelStorage {
                                 uri.uri, metadata.size_bytes / (1024 * 1024));
                     }
                     Err(e) => {
-                        eprintln!("⚠️ Failed to remove {}: {}", model_path.display(), e);
+                        eprintln!("⚠️ Failed to remove model: {}", e);
                     }
                 }
             }
@@ -585,7 +707,10 @@ impl ModelStorage {
     /// Verify model integrity
     pub async fn verify_model(&self, model_uri: &ModelUri) -> Result<bool> {
         let metadata = self.get_metadata(model_uri).await?;
-        let model_path = model_uri.local_path(&self.base_dir);
+        
+        // Get the model path from metadata
+        let model_path = metadata.local_path
+            .ok_or_else(|| anyhow::anyhow!("Model does not have a local path"))?;
         
         if !model_path.exists() {
             return Ok(false);
@@ -621,8 +746,8 @@ impl ModelStorage {
         Ok(())
     }
     
-    /// List all models in storage
-    pub async fn list_models(&self) -> Result<Vec<(ModelId, ModelMetadata)>> {
+    /// List all models in storage (alias for list_local_models for API compatibility)
+    pub async fn children(&self) -> Result<Vec<(ModelId, ModelMetadata)>> {
         // First, load metadata from cache
         let _ = self.load_metadata().await; // Refresh cache from disk
         
@@ -655,51 +780,56 @@ impl ModelStorage {
                         
                         tracing::debug!("Checking directory: {}", dir_name);
                         
-                        // Check if this is a model directory (has model files)
-                        let has_model_files = Self::has_model_files(&path).await;
-                        if has_model_files {
-                            tracing::info!("Found model directory: {}", dir_name);
-                            
-                            // Check if we already have this in metadata
-                            let already_listed = models.iter().any(|(_, meta)| {
-                                meta.local_path.as_ref()
-                                    .and_then(|p| p.file_name())
-                                    .and_then(|n| n.to_str())
-                                    == Some(dir_name)
-                            });
-                            
-                            if !already_listed {
-                                // Create a basic metadata entry for this discovered model
-                                let model_id = ModelId(uuid::Uuid::new_v4());
-                                let now = chrono::Utc::now().timestamp();
-                                let metadata = ModelMetadata {
-                                    model_id: model_id.clone(),
-                                    name: dir_name.to_string(),
-                                    display_name: Some(dir_name.to_string()),
-                                    architecture: "unknown".to_string(),
-                                    parameters: None,
-                                    model_type: "unknown".to_string(),
-                                    tokenizer_type: None,
-                                    size_bytes: 0, // Could calculate if needed
-                                    files: vec![],
-                                    external_sources: vec![],
-                                    local_path: Some(path.clone()),
-                                    is_cached: true,
-                                    tags: vec![],
-                                    description: None,
-                                    license: None,
-                                    created_at: now,
-                                    last_accessed: now,
-                                    last_updated: now,
-                                };
-                                tracing::info!("Adding discovered model: {} with ID {}", dir_name, model_id);
-                                models.push((model_id, metadata));
-                            } else {
-                                tracing::debug!("Model {} already in list", dir_name);
+                        // First check if this is a UUID directory with model.json
+                        let model_json_path = path.join("model.json");
+                        if model_json_path.exists() {
+                            // SECURITY: Check file size before reading
+                            const MAX_METADATA_SIZE: u64 = 1024 * 1024; // 1MB max
+                            if let Ok(file_meta) = tokio::fs::metadata(&model_json_path).await {
+                                if file_meta.len() > MAX_METADATA_SIZE {
+                                    tracing::warn!("Skipping oversized metadata file: {:?}", model_json_path);
+                                    continue;
+                                }
                             }
-                        } else {
-                            tracing::debug!("Directory {} does not contain model files", dir_name);
+                            
+                            // Try to load the model metadata file
+                            if let Ok(content) = tokio::fs::read_to_string(&model_json_path).await {
+                                if let Ok(model_meta) = serde_json::from_str::<crate::api::model_storage::ModelMetadataFile>(&content) {
+                                    tracing::info!("Found UUID model: {} ({})", model_meta.model_id, model_meta.display_name);
+                                    
+                                    // Check if already listed
+                                    let already_listed = models.iter().any(|(id, _)| id == &model_meta.model_id);
+                                    
+                                    if !already_listed {
+                                        // Convert ModelMetadataFile to ModelMetadata
+                                        let metadata = ModelMetadata {
+                                            model_id: model_meta.model_id.clone(),
+                                            name: model_meta.name.clone(),
+                                            display_name: Some(model_meta.display_name.clone()),
+                                            architecture: model_meta.architecture.unwrap_or_else(|| "unknown".to_string()),
+                                            parameters: model_meta.parameters,
+                                            model_type: "language_model".to_string(),
+                                            tokenizer_type: None,
+                                            size_bytes: 0, // Could calculate if needed
+                                            files: vec![],
+                                            external_sources: vec![],
+                                            local_path: Some(path.clone()),
+                                            is_cached: true,
+                                            tags: vec![],
+                                            description: None,
+                                            license: None,
+                                            created_at: model_meta.created_at,
+                                            last_accessed: model_meta.last_accessed,
+                                            last_updated: model_meta.created_at,
+                                        };
+                                        
+                                        models.push((model_meta.model_id, metadata));
+                                    }
+                                    continue; // Skip legacy check for UUID models
+                                }
+                            }
                         }
+                        
                     }
                 }
                 
@@ -747,35 +877,6 @@ impl ModelStorage {
         }
         false
     }
-    
-    /// Download a model from a URI
-    pub async fn download_model(&self, uri: &ModelUri, name: Option<String>) -> Result<ModelId> {
-        // For now, just create a stub entry
-        let model_id = ModelId::new();
-        let metadata = ModelMetadata {
-            model_id: model_id.clone(),
-            name: name.unwrap_or_else(|| uri.uri.clone()),
-            display_name: None,
-            architecture: "unknown".to_string(),
-            parameters: None,
-            model_type: "safetensors".to_string(),
-            tokenizer_type: None,
-            size_bytes: 0,
-            files: vec![],
-            external_sources: vec![],
-            local_path: Some(self.base_dir.join(model_id.to_string())),
-            is_cached: false,
-            tags: vec![],
-            description: None,
-            license: None,
-            created_at: chrono::Utc::now().timestamp(),
-            last_accessed: chrono::Utc::now().timestamp(),
-            last_updated: chrono::Utc::now().timestamp(),
-        };
-        
-        self.metadata_cache.write().await.insert(model_id.clone(), metadata);
-        Ok(model_id)
-    }
 }
 
 /// Model file with additional metadata
@@ -804,240 +905,6 @@ pub struct SizeMismatch {
     pub actual_size: u64,
 }
 
-/// UUID-based model registry for managing model metadata
-pub struct ModelRegistry {
-    storage: Arc<ModelStorage>,
-    composed_models: Arc<RwLock<HashMap<ComposedModelId, ComposedModelMetadata>>>,
-    composed_file: PathBuf,
-}
 
-impl ModelRegistry {
-    /// Create new model registry
-    pub async fn new(base_dir: PathBuf) -> Result<Self> {
-        let storage = Arc::new(ModelStorage::new(base_dir.clone()).await?);
-        let composed_file = base_dir.join("composed_models.json");
-        
-        let registry = Self {
-            storage,
-            composed_models: Arc::new(RwLock::new(HashMap::new())),
-            composed_file,
-        };
-        
-        // Load composed models
-        registry.load_composed_models().await?;
-        
-        Ok(registry)
-    }
-    
-    /// Register a downloaded model and return its UUID
-    pub async fn register_model(
-        &self,
-        name: String,
-        architecture: String,
-        parameters: Option<u64>,
-        local_path: PathBuf,
-        external_sources: Vec<ExternalSource>,
-    ) -> Result<ModelId> {
-        // Create deterministic ModelId based on content
-        let model_id = ModelId::from_content_hash(&name, &architecture, parameters);
-        
-        let uri_string = format!("hf://{}", external_sources[0].identifier);
-        
-        let metadata = ModelMetadata {
-            model_id: model_id.clone(),
-            name: name.clone(),
-            display_name: Some(name),
-            architecture,
-            parameters,
-            model_type: "language_model".to_string(),
-            tokenizer_type: None,
-            size_bytes: self.calculate_directory_size(&local_path).await?,
-            files: self.scan_model_files(&local_path).await?,
-            external_sources,
-            local_path: Some(local_path),
-            is_cached: true,
-            tags: vec![],
-            description: None,
-            license: None,
-            created_at: chrono::Utc::now().timestamp(),
-            last_accessed: chrono::Utc::now().timestamp(),
-            last_updated: chrono::Utc::now().timestamp(),
-        };
-        
-        // Store in underlying storage
-        let model_uri = ModelUri::parse(&uri_string)?;
-        self.storage.store_metadata(&model_uri, metadata).await?;
-        
-        Ok(model_id)
-    }
-    
-    /// Get model metadata by UUID
-    pub async fn get_model(&self, model_id: &ModelId) -> Result<Option<ModelMetadata>> {
-        match self.storage.get_metadata_by_id(model_id).await {
-            Ok(metadata) => Ok(Some(metadata)),
-            Err(_) => Ok(None), // Model not found
-        }
-    }
-    
-    /// Create a composed model (base + LoRA stack)
-    pub async fn create_composed_model(
-        &self,
-        name: String,
-        base_model_id: ModelId,
-        lora_ids: Vec<String>,
-    ) -> Result<ComposedModelId> {
-        let composed_id = ComposedModelId::new();
-        
-        // Verify base model exists
-        if self.get_model(&base_model_id).await?.is_none() {
-            return Err(anyhow!("Base model not found: {}", base_model_id));
-        }
-        
-        let composed_metadata = ComposedModelMetadata {
-            composed_id: composed_id.clone(),
-            name,
-            base_model_id,
-            lora_stack: lora_ids,
-            created_at: chrono::Utc::now().timestamp(),
-            last_used: chrono::Utc::now().timestamp(),
-        };
-        
-        // Store composed model
-        {
-            let mut composed = self.composed_models.write().await;
-            composed.insert(composed_id.clone(), composed_metadata);
-        }
-        
-        // Save to disk
-        self.save_composed_models().await?;
-        
-        Ok(composed_id)
-    }
-    
-    /// Get composed model metadata
-    pub async fn get_composed_model(&self, composed_id: &ComposedModelId) -> Option<ComposedModelMetadata> {
-        let composed = self.composed_models.read().await;
-        composed.get(composed_id).cloned()
-    }
-    
-    /// List all models
-    pub async fn list_models(&self) -> Result<Vec<ModelId>> {
-        let models = self.storage.list_all_models().await?;
-        Ok(models.into_iter().map(|(id, _)| id).collect())
-    }
-    
-    /// List all composed models  
-    pub async fn list_composed_models(&self) -> Vec<ComposedModelId> {
-        let composed = self.composed_models.read().await;
-        composed.keys().cloned().collect()
-    }
-    
-    // Helper methods
-    fn calculate_directory_size<'a>(&'a self, path: &'a Path) -> std::pin::Pin<std::boxed::Box<dyn std::future::Future<Output = Result<u64>> + Send + 'a>> {
-        Box::pin(async move {
-            // Check if path is a file or directory
-            let metadata = fs::metadata(path).await?;
-            
-            if metadata.is_file() {
-                // If it's a file, just return its size
-                Ok(metadata.len())
-            } else {
-                // If it's a directory, calculate total size recursively
-                let mut total_size = 0;
-                let mut entries = fs::read_dir(path).await?;
-                
-                while let Some(entry) = entries.next_entry().await? {
-                    let metadata = entry.metadata().await?;
-                    if metadata.is_file() {
-                        total_size += metadata.len();
-                    } else if metadata.is_dir() {
-                        total_size += self.calculate_directory_size(&entry.path()).await?;
-                    }
-                }
-                
-                Ok(total_size)
-            }
-        })
-    }
-    
-    async fn scan_model_files(&self, path: &Path) -> Result<Vec<ModelFile>> {
-        let mut files = Vec::new();
-        
-        // Check if path is a file or directory
-        let metadata = fs::metadata(path).await?;
-        
-        if metadata.is_file() {
-            // If it's a single file, create a ModelFile entry for it
-            let filename = path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("model.safetensors")
-                .to_string();
-            let file_type = self.determine_file_type(&filename);
-            
-            files.push(ModelFile {
-                filename,
-                size_bytes: metadata.len(),
-                checksum: None,
-                file_type,
-            });
-        } else {
-            // If it's a directory, scan all files in it
-            let mut entries = fs::read_dir(path).await?;
-            
-            while let Some(entry) = entries.next_entry().await? {
-                let metadata = entry.metadata().await?;
-                if metadata.is_file() {
-                    let filename = entry.file_name().to_string_lossy().to_string();
-                    let file_type = self.determine_file_type(&filename);
-                    
-                    files.push(ModelFile {
-                        filename,
-                        size_bytes: metadata.len(),
-                        checksum: None,
-                        file_type,
-                    });
-                }
-            }
-        }
-        
-        Ok(files)
-    }
-    
-    fn determine_file_type(&self, filename: &str) -> FileType {
-        match filename {
-            f if f.ends_with(".safetensors") || f.ends_with(".bin") || f.ends_with(".pt") || f.ends_with(".pth") => FileType::Model,
-            f if f.contains("tokenizer") => FileType::Tokenizer,
-            f if f.ends_with(".json") => FileType::Config,
-            f if f.to_lowercase().contains("readme") => FileType::Readme,
-            _ => FileType::Other,
-        }
-    }
-    
-    async fn load_composed_models(&self) -> Result<()> {
-        if !self.composed_file.exists() {
-            return Ok(());
-        }
-        
-        let content = fs::read_to_string(&self.composed_file).await?;
-        if content.trim().is_empty() {
-            return Ok(());
-        }
-        
-        let composed_map: HashMap<ComposedModelId, ComposedModelMetadata> = 
-            serde_json::from_str(&content)?;
-        
-        let mut composed = self.composed_models.write().await;
-        *composed = composed_map;
-        
-        Ok(())
-    }
-    
-    async fn save_composed_models(&self) -> Result<()> {
-        let composed = self.composed_models.read().await;
-        let content = serde_json::to_string_pretty(&*composed)?;
-        fs::write(&self.composed_file, content).await?;
-        Ok(())
-    }
-}
 
 use chrono;

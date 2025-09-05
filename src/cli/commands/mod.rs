@@ -2,7 +2,6 @@ pub mod config;
 pub mod server;
 pub mod model;
 pub mod lora;
-pub mod download;
 pub mod auth;
 pub mod chat;
 

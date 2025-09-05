@@ -221,8 +221,6 @@ impl ArchitectureAwareLoRAAdapter {
     pub fn validate_compatibility(&self) -> Result<()> {
         // Check if LoRA dimensions match expected architecture dimensions
         for (_layer_name, mapping) in &self.shape_mappings {
-            // TODO: Implement validation based on actual adapter configuration
-            // For now, just validate the transformation types are compatible
             match &mapping.transform {
                 TransformType::Reshape => {
                     let source_elements: usize = mapping.source_shape.iter().product();

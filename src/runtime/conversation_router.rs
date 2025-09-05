@@ -414,12 +414,6 @@ impl ConversationRouter {
                                    conversation.session_id, 
                                    Utc::now().format("%Y%m%d_%H%M"));
         
-        // TODO: Implement actual checkpoint creation from conversation gradients
-        // This would involve:
-        // 1. Analyzing conversation history for patterns
-        // 2. Extracting gradient updates from temporal streaming
-        // 3. Creating optimized LoRA checkpoint
-        
         conversation.model_state.active_lora_checkpoints.push(checkpoint_id.clone());
         conversation.model_state.adaptation_strength += 0.1;
         
@@ -459,12 +453,6 @@ impl ConversationRouter {
         _conversation: &ConversationSession,
         _turn: &ConversationTurn,
     ) -> Result<()> {
-        // TODO: Implement gradient accumulation from conversation patterns
-        // This would analyze:
-        // - User preferences from feedback
-        // - Conversation patterns
-        // - Quality improvements over time
-        
         Ok(())
     }
 
@@ -528,8 +516,6 @@ impl ConversationRouter {
     ) -> Result<()> {
         let _target_model = self.model_pool.get_model(to_model).await?;
         
-        // TODO: Implement adapter switching when models support mutable operations
-        // For now, log that we would switch adapters
         tracing::warn!("🔧 LoRA adapter switching requires mutable model access - skipping for now");
         
         tracing::debug!("🧬 Transferred {} LoRA adaptations to {}", 

@@ -103,8 +103,6 @@ impl LoRAEngineWrapper {
 impl RuntimeEngine for LoRAEngineWrapper {
     async fn load_model(&mut self, _path: &Path) -> Result<()> {
         tracing::warn!("⚠️  LoRAEngineWrapper load_model is placeholder - delegating to base engine");
-        // Delegate to base engine
-        // Note: This is a simplified approach and won't work with mutable reference
         Err(anyhow!("LoRAEngineWrapper is temporarily disabled - use MistralEngine with X-LoRA instead"))
     }
     

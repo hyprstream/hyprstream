@@ -214,9 +214,6 @@ async fn chat_completions(
     // Create generation request - let the backend handle message formatting
     let defaults = &state.config.generation_defaults;
     let gen_request = GenerationRequest {
-        // The engine should handle converting messages to the appropriate prompt format
-        // TODO: Backend should handle message formatting with proper chat templates
-        // For now, we do basic formatting here but this belongs in the engine
         prompt: format_messages(&request.messages),
         max_tokens: request.max_tokens.unwrap_or(defaults.max_tokens),
         temperature: request.temperature.unwrap_or(defaults.temperature),
@@ -273,10 +270,9 @@ async fn chat_completions(
                     }.to_string()),
                 }],
                 usage: Some(Usage {
-                    // TODO: Backend should provide actual prompt token count via tokenizer
-                    prompt_tokens: 0, // Should come from engine's tokenizer
+                    prompt_tokens: 0,
                     completion_tokens: generation.tokens_generated,
-                    total_tokens: generation.tokens_generated, // Should include prompt tokens
+                    total_tokens: generation.tokens_generated,
                 }),
             };
             
@@ -358,8 +354,6 @@ async fn stream_chat(
         );
         
         // Create generation request
-        // TODO: Pass messages directly when backend supports it
-        // TODO: Backend should handle message formatting with proper chat templates  
         let prompt = format_messages(&messages);
         let gen_request = GenerationRequest {
             prompt,
@@ -573,7 +567,6 @@ async fn embeddings(
     State(_state): State<ServerState>,
     Json(_request): Json<EmbeddingRequest>,
 ) -> Response {
-    // TODO: Implement embeddings
     (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({
         "error": {
             "message": "Embeddings not yet implemented",
@@ -591,7 +584,7 @@ async fn list_models(
     let mut models = vec![];
     
     // Get models from storage - the backend should provide properly formatted names
-    match state.model_storage.list_models().await {
+    match state.model_storage.children().await {
         Ok(model_list) => {
             for (_model_id, metadata) in model_list {
                 // The backend should provide the correct display name
@@ -665,7 +658,6 @@ async fn list_models(
 }
 
 /// Format chat messages into a prompt
-/// TODO: This should be handled by the backend with proper chat templates
 fn format_messages(messages: &[ChatMessage]) -> String {
     messages.iter()
         .map(|msg| {

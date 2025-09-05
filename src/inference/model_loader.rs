@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use memmap2::Mmap;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use crate::constants::limits::*;
 
 /// Handle to a loaded base model
 #[derive(Debug, Clone)]
@@ -96,19 +97,11 @@ impl Clone for WeightMap {
 /// Information about a tensor in a weight file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TensorInfo {
-    /// Tensor name (e.g., "model.layers.0.self_attn.q_proj.weight")
     pub name: String,
-    
-    /// Data type (f32, f16, etc.)
     pub dtype: String,
-    
-    /// Tensor shape
     pub shape: Vec<usize>,
-    
-    /// Byte offset in the file
+    /// Byte offset where tensor data starts in the file
     pub offset: usize,
-    
-    /// Size in bytes
     pub size_bytes: usize,
 }
 
@@ -243,7 +236,6 @@ impl ModelLoader {
                         .to_string();
                     weight_maps.insert(file_name, weight_map);
                 }
-                // TODO: Add support for .bin files (PyTorch)
             }
         }
         
@@ -277,11 +269,21 @@ impl ModelLoader {
             return Err(anyhow::anyhow!("File too small to be a valid SafeTensors file"));
         }
         
+        // Validate file size first
+        if mmap.len() < MIN_SAFETENSORS_SIZE {
+            return Err(anyhow::anyhow!("File too small to be a valid SafeTensors file"));
+        }
+        
         // Read header length (first 8 bytes)
         let header_len = u64::from_le_bytes(
             mmap[0..8].try_into()
                 .map_err(|_| anyhow::anyhow!("Failed to read header length"))?
         ) as usize;
+        
+        // Validate header length
+        if header_len as u64 > MAX_HEADER_SIZE {
+            return Err(anyhow::anyhow!("Header size {} exceeds maximum allowed {}", header_len, MAX_HEADER_SIZE));
+        }
         
         if mmap.len() < 8 + header_len {
             return Err(anyhow::anyhow!("File too small for declared header size"));
@@ -304,6 +306,15 @@ impl ModelLoader {
             }
             
             let tensor_info = self.parse_tensor_info(name, info, data_offset)?;
+            
+            // Validate that tensor bounds are within file
+            if tensor_info.offset + tensor_info.size_bytes > mmap.len() {
+                return Err(anyhow::anyhow!(
+                    "Tensor '{}' extends beyond file bounds: offset {} + size {} > file size {}",
+                    name, tensor_info.offset, tensor_info.size_bytes, mmap.len()
+                ));
+            }
+            
             tensors.insert(name.clone(), tensor_info);
         }
         
@@ -343,13 +354,25 @@ impl ModelLoader {
         let end_offset = data_offsets[1].as_u64()
             .ok_or_else(|| anyhow::anyhow!("Invalid end offset"))? as usize;
         
+        // Validate offsets
+        if end_offset < start_offset {
+            return Err(anyhow::anyhow!("Invalid offsets: end ({}) < start ({})", end_offset, start_offset));
+        }
+        
         let size_bytes = end_offset - start_offset;
+        let final_offset = base_offset + start_offset;
+        
+        // Sanity check: Individual tensors shouldn't exceed 100GB
+        // (even the largest models have individual tensors under this)
+        if size_bytes as u64 > MAX_TENSOR_SIZE {
+            return Err(anyhow::anyhow!("Tensor size {} exceeds maximum allowed size of 100GB", size_bytes));
+        }
         
         Ok(TensorInfo {
             name: name.to_string(),
             dtype,
             shape,
-            offset: base_offset + start_offset,
+            offset: final_offset,
             size_bytes,
         })
     }

@@ -134,9 +134,6 @@ impl Default for StoragePaths {
     }
 }
 
-// NOTE: sanitize_filename has been moved to crate::utils
-// NOTE: HfAuth has been moved to crate::auth
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,5 +152,4 @@ mod tests {
         assert!(models_dir != loras_dir);
     }
 
-    // NOTE: test_sanitize_filename moved to crate::utils
 }

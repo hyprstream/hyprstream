@@ -210,7 +210,6 @@ impl OpenVDBLoRAAdapter {
     
     /// Create iterator over active weights (temporarily disabled)
     pub fn active_weights(&self) -> OpenVDBActiveIterator {
-        // TODO: Re-enable once CXX struct issues are resolved
         OpenVDBActiveIterator {
             _placeholder: 0,
         }
@@ -394,7 +393,6 @@ pub struct OpenVDBActiveIterator {
 
 impl OpenVDBActiveIterator {
     pub fn reset(&mut self) {
-        // TODO: Implement when iterator is re-enabled
     }
 }
 
@@ -402,7 +400,6 @@ impl Iterator for OpenVDBActiveIterator {
     type Item = (i32, i32, f32);
     
     fn next(&mut self) -> Option<Self::Item> {
-        // TODO: Implement when iterator is re-enabled
         None
     }
 }

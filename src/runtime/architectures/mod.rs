@@ -121,8 +121,6 @@ impl ModelArchitecture {
 }
 
 /// Core trait for architecture-specific model operations
-/// Note: Removed Sync bound because tch::Tensor is not Sync (contains raw pointers to C code).
-/// Thread safety is handled by Arc<Mutex<>> wrapper in the engine.
 pub trait ModelOperations: Send {
     /// Get the architecture type
     fn architecture(&self) -> ModelArchitecture;
@@ -155,9 +153,6 @@ pub trait ModelOperations: Send {
     /// Apply LoRA adapter with architecture-specific handling
     fn apply_lora(&mut self, adapter: &ArchitectureAwareLoRAAdapter) -> Result<()>;
 }
-
-// NOTE: ModelFactory has been moved to runtime/model_factory.rs with unified configuration management
-// The new factory provides a single, clean path for model creation instead of multiple conflicting paths
 
 /// Attention mechanism types
 #[derive(Debug, Clone, PartialEq)]

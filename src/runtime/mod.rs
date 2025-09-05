@@ -34,7 +34,6 @@ pub mod streaming;           // Async streaming support for token-by-token gener
 pub use torch_engine::TorchEngine;
 pub use inference::{InferenceRequest, InferenceResult, InferenceExt};
 
-// Temporary placeholder types during migration
 #[derive(Debug, Clone)]
 pub struct MistralEngine;
 

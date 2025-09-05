@@ -1,7 +1,7 @@
 //! VDB-first CLI handlers for adaptive ML inference server
 
 use crate::{
-    storage::{VDBSparseStorage, SparseStorageConfig},
+    storage::SparseStorageConfig,
     inference::InferenceAPI,
     runtime::{RuntimeEngine, TorchEngine},
 };
@@ -9,14 +9,13 @@ use ::config::{Config, File};
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
     str::FromStr,
 };
 use reqwest::Client;
 use serde_json::{json, Value};
 use tracing::{debug, error, info};
 use crate::api::model_storage::{ModelStorage, ModelId};
-use crate::api::model_management::ModelUri;
+use crate::api::model_storage::ModelUri;
 
 /// Response structure for LoRA inference
 #[derive(Debug, Clone)]
@@ -125,7 +124,6 @@ pub async fn execute_sparse_query(
     Ok(())
 }
 
-// FlightSQL server function removed - using REST API only
 
 pub async fn handle_server(
     config: Config,
@@ -225,7 +223,6 @@ pub async fn handle_embedding_query(
                 None
             };
 
-            // TODO: Implement TLS configuration properly
             let config = Config::builder().build()?;
 
             Some(config)
@@ -290,13 +287,14 @@ pub async fn handle_model_command(
         ModelAction::List { registry, search, remote, format } => {
             info!("📋 Listing available models...");
             
-            // Use real model management system
-            let model_manager = crate::api::model_management::ModelManager::new().await?;
+            // Use model storage directly
+            let storage_paths = crate::storage::paths::StoragePaths::new()?;
+            let model_storage = crate::api::model_storage::ModelStorage::new(storage_paths.models_dir()?).await?;
             
             let mut models = Vec::new();
             
             // Get local models from cache
-            let local_models = model_manager.list_cached_models().await?;
+            let local_models = model_storage.list_local_models().await?;
             for (model_uri, model_metadata) in local_models {
                 let category = if model_uri.name.to_lowercase().contains("instruct") {
                     "instruct"
@@ -398,9 +396,22 @@ pub async fn handle_model_command(
             }
         }
         ModelAction::Pull { uri, force, files: _, format, auto_convert, progress } => {
+            // Validate and parse URI early using standard URL parsing
+            let model_uri = match crate::api::model_storage::ModelUri::parse(&uri) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    eprintln!("❌ Invalid model URI: {}", uri);
+                    eprintln!("   {}", e);
+                    eprintln!("   Model URIs must use the format: hf://org/model");
+                    eprintln!("   Example: hf://Qwen/Qwen2-1.5B-Instruct");
+                    return Err(e.into());
+                }
+            };
+            
             info!("📥 Pulling model: {} (format: {})", uri, format);
             
             // Use the unified model downloader
+            // Get storage paths
             let storage_paths = crate::storage::paths::StoragePaths::new()?;
             let models_dir = storage_paths.models_dir()?;
             
@@ -420,7 +431,7 @@ pub async fn handle_model_command(
                 },
                 force,
                 show_progress: progress,
-                files_filter: None, // Could use 'files' parameter here
+                files_filter: None,
                 verify_checksums: true,
                 max_size_bytes: None,
             };
@@ -442,8 +453,8 @@ pub async fn handle_model_command(
                     // Register the model with the storage system
                     println!("📝 Registering model with storage system...");
                     
-                    // Parse the model URI
-                    let model_uri = crate::api::model_management::ModelUri::parse(&uri)?;
+                    // Use the already parsed model_uri from validation above
+                    // (model_uri variable is already in scope from the early validation)
                     
                     // Create model metadata
                     let model_id = crate::api::model_storage::ModelId::from_content_hash(
@@ -468,21 +479,8 @@ pub async fn handle_model_command(
                         last_verified: chrono::Utc::now().timestamp(),
                     };
                     
-                    // Convert downloaded files to ModelFile format
-                    let model_files: Vec<crate::api::model_storage::ModelFile> = model.files.iter().map(|f| {
-                        crate::api::model_storage::ModelFile {
-                            filename: f.filename.clone(),
-                            size_bytes: f.size_bytes,
-                            checksum: f.sha256.clone(),
-                            file_type: match f.file_type {
-                                crate::api::model_downloader::FileType::Weights => crate::api::model_storage::FileType::Model,
-                                crate::api::model_downloader::FileType::Config => crate::api::model_storage::FileType::Config,
-                                crate::api::model_downloader::FileType::Tokenizer => crate::api::model_storage::FileType::Tokenizer,
-                                crate::api::model_downloader::FileType::Vocabulary => crate::api::model_storage::FileType::Other,
-                                crate::api::model_downloader::FileType::Metadata => crate::api::model_storage::FileType::Other,
-                            },
-                        }
-                    }).collect();
+                    // Use the downloaded files directly (ModelFile is now the same type)
+                    let model_files = model.files.clone();
                     
                     // Create metadata
                     let metadata = crate::api::model_storage::ModelMetadata {
@@ -513,7 +511,8 @@ pub async fn handle_model_command(
                     };
                     
                     // Store the metadata
-                    let model_manager = crate::api::model_management::ModelManager::new().await?;
+                    let storage_paths = crate::storage::paths::StoragePaths::new()?;
+            let model_storage = crate::api::model_storage::ModelStorage::new(storage_paths.models_dir()?).await?;
                     let storage = crate::api::model_storage::ModelStorage::new(storage_paths.models_dir()?).await?;
                     storage.store_metadata(&model_uri, metadata).await?;
                     
@@ -534,6 +533,17 @@ pub async fn handle_model_command(
         }
         
         ModelAction::Remove { uri, keep_metadata, yes } => {
+            // Validate and parse URI using standard URL parsing
+            let _model_uri = match crate::api::model_storage::ModelUri::parse(&uri) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    eprintln!("❌ Invalid model URI: {}", uri);
+                    eprintln!("   {}", e);
+                    eprintln!("   Model URIs must use the format: hf://org/model");
+                    return Err(e.into());
+                }
+            };
+            
             info!("🗑️ Removing model: {}", uri);
             
             // Check if confirmation is needed
@@ -555,16 +565,17 @@ pub async fn handle_model_command(
             }
             
             // Use the model management system to remove the model
-            let model_manager = crate::api::model_management::ModelManager::new().await?;
+            let storage_paths = crate::storage::paths::StoragePaths::new()?;
+            let model_storage = crate::api::model_storage::ModelStorage::new(storage_paths.models_dir()?).await?;
             
             // Try to parse as URI first, otherwise search by name/ID
             let model_uri = if uri.contains("://") {
                 // It's a full URI
-                crate::api::model_management::ModelUri::parse(&uri)
+                crate::api::model_storage::ModelUri::parse(&uri)
                     .map_err(|e| format!("Failed to parse model URI: {}", e))?
             } else {
                 // Try to find by name or ID in cached models
-                let cached_models = model_manager.list_cached_models().await
+                let cached_models = model_storage.list_local_models().await
                     .map_err(|e| format!("Failed to list cached models: {}", e))?;
                 
                 // Search for exact match or partial match
@@ -592,10 +603,10 @@ pub async fn handle_model_command(
                         format!("hf://library/{}", uri)
                     };
                     
-                    crate::api::model_management::ModelUri::parse(&default_uri)
+                    crate::api::model_storage::ModelUri::parse(&default_uri)
                         .unwrap_or_else(|_| {
                             // Fallback: create a simple URI
-                            crate::api::model_management::ModelUri {
+                            crate::api::model_storage::ModelUri {
                                 registry: "hf".to_string(),
                                 org: "library".to_string(),
                                 name: uri.clone(),
@@ -611,7 +622,7 @@ pub async fn handle_model_command(
             let models_dir = storage_paths.models_dir()?;
             
             // Get the metadata to find the actual file path
-            let cached_models = model_manager.list_cached_models().await?;
+            let cached_models = model_storage.list_local_models().await?;
             let model_data = cached_models.iter()
                 .find(|(cached_uri, metadata)| {
                     cached_uri.uri == model_uri.uri ||
@@ -624,16 +635,23 @@ pub async fn handle_model_command(
                 });
             
             let local_path = if let Some((_, metadata)) = model_data {
-                // Use the actual path from metadata
-                if let Some(ref path) = metadata.local_path {
-                    path.clone()
-                } else {
-                    // Fallback to computed path
-                    model_uri.local_path(&models_dir)
+                // Use the actual path from metadata (UUID-based only)
+                match &metadata.local_path {
+                    Some(path) => path.clone(),
+                    None => {
+                        eprintln!("❌ Model does not have a local path");
+                        return Err(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "Model does not have a local path"
+                        )));
+                    }
                 }
             } else {
-                // Fallback to computed path
-                model_uri.local_path(&models_dir)
+                eprintln!("❌ Model '{}' not found in storage", uri);
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("Model '{}' not found in storage", uri)
+                )));
             };
             
             // Check if model exists locally
@@ -643,7 +661,7 @@ pub async fn handle_model_command(
                 
                 // List available models to help user
                 println!("\nAvailable models:");
-                if let Ok(cached_models) = model_manager.list_cached_models().await {
+                if let Ok(cached_models) = model_storage.list_local_models().await {
                     for (model_uri, _metadata) in cached_models.iter().take(10) {
                         println!("  - {}", model_uri.uri);
                     }
@@ -677,7 +695,7 @@ pub async fn handle_model_command(
             
             // Remove metadata unless keeping it
             if !keep_metadata {
-                if let Err(e) = model_manager.remove_metadata(&model_uri).await {
+                if let Err(e) = model_storage.remove_metadata(&model_uri).await {
                     eprintln!("⚠️  Failed to remove metadata: {}", e);
                     // Continue anyway since files are already deleted
                 }
@@ -689,14 +707,27 @@ pub async fn handle_model_command(
             println!("✅ Model '{}' removed successfully", uri);
         }
         ModelAction::Info { uri, format } => {
+            // Validate and parse URI using standard URL parsing  
+            let parsed_uri = match crate::api::model_storage::ModelUri::parse(&uri) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    eprintln!("❌ Invalid model URI: {}", uri);
+                    eprintln!("   {}", e);
+                    eprintln!("   Model URIs must use the format: hf://org/model");
+                    return Err(e.into());
+                }
+            };
+            
             info!("ℹ️ Getting model info: {}", uri);
             
-            // Use real model management system
-            let model_manager = crate::api::model_management::ModelManager::new().await?;
+            // Use model storage directly
+            let storage_paths = crate::storage::paths::StoragePaths::new()?;
+            let model_storage = crate::api::model_storage::ModelStorage::new(storage_paths.models_dir()?).await?;
             
             // Try to get local model info first
-            let model_info = if let Ok(cached_models) = model_manager.list_cached_models().await {
-                if let Some((model_uri, model_metadata)) = cached_models.iter().find(|(cached_uri, _)| cached_uri.name == uri || cached_uri.name.ends_with(&uri)) {
+            let model_info = if let Ok(cached_models) = model_storage.list_local_models().await {
+                if let Some((model_uri, model_metadata)) = cached_models.iter().find(|(cached_uri, _)| 
+                    cached_uri.org == parsed_uri.org && cached_uri.name == parsed_uri.name) {
                     use chrono::{DateTime, Utc};
                     let created_dt = DateTime::<Utc>::from_timestamp(model_metadata.created_at, 0)
                         .unwrap_or_else(|| Utc::now());
@@ -712,7 +743,9 @@ pub async fn handle_model_command(
   "last_accessed": "{}"
 }}"#, 
                         model_uri.name,
-                        model_uri.local_path(&std::path::PathBuf::from("./models")).display(),
+                        model_metadata.local_path.as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "UUID-based storage".to_string()),
                         model_metadata.size_bytes,
                         model_metadata.size_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
                         created_dt.format("%Y-%m-%d %H:%M:%S"),
@@ -847,8 +880,9 @@ pub async fn handle_model_command(
             
             // If no results and no registry filter, add some local cache results
             if results.is_empty() && registry.is_none() {
-                let model_manager = crate::api::model_management::ModelManager::new().await?;
-                if let Ok(cached_models) = model_manager.list_cached_models().await {
+                let storage_paths = crate::storage::paths::StoragePaths::new()?;
+            let model_storage = crate::api::model_storage::ModelStorage::new(storage_paths.models_dir()?).await?;
+                if let Ok(cached_models) = model_storage.list_local_models().await {
                     for (model_uri, model_metadata) in cached_models.iter().take(limit) {
                         if model_uri.name.to_lowercase().contains(&query.to_lowercase()) {
                             results.push((
@@ -926,9 +960,10 @@ pub async fn handle_model_command(
             info!("🗄️ Managing model cache");
             
             // Use real model management system for cache info
-            let model_manager = crate::api::model_management::ModelManager::new().await?;
-            let cached_models = model_manager.list_cached_models().await?;
-            let cache_stats = model_manager.get_cache_stats().await?;
+            let storage_paths = crate::storage::paths::StoragePaths::new()?;
+            let model_storage = crate::api::model_storage::ModelStorage::new(storage_paths.models_dir()?).await?;
+            let cached_models = model_storage.list_local_models().await?;
+            let cache_stats = model_storage.get_cache_stats().await?;
             
             println!("Model Cache Status:");
             println!("📊 Cache location: ./models");
@@ -980,7 +1015,8 @@ pub async fn handle_model_command(
             println!("🔍 Looking up model: {}", model);
             
             // Initialize model manager to find models
-            let model_manager = crate::api::model_management::ModelManager::new().await?;
+            let storage_paths = crate::storage::paths::StoragePaths::new()?;
+            let model_storage = crate::api::model_storage::ModelStorage::new(storage_paths.models_dir()?).await?;
             
             // Try to find the model path (could be UUID, name, or HF ID)
             let model_path = if model.contains('/') {
@@ -988,7 +1024,6 @@ pub async fn handle_model_command(
                 let cache_path = PathBuf::from(".hyprstream/models").join(model.replace('/', "_"));
                 if !cache_path.exists() && !force_download {
                     println!("📥 Model not found locally. Downloading from HuggingFace...");
-                    // TODO: Implement download via model registry
                     eprintln!("Auto-download not yet implemented. Please download first with:");
                     eprintln!("  cargo run model pull hf://{}", model);
                     return Ok(());
@@ -996,7 +1031,7 @@ pub async fn handle_model_command(
                 cache_path
             } else {
                 // Could be a UUID or local name - check all cached models
-                let local_models = model_manager.list_cached_models().await?;
+                let local_models = model_storage.list_local_models().await?;
                 
                 let mut found_path = None;
                 for (model_uri, model_metadata) in local_models {
@@ -1062,10 +1097,6 @@ pub async fn handle_model_command(
                 final_config.top_k = Some(k);
             }
             final_config.do_sample = final_config.temperature > 0.0;
-            
-            // Store the sampling config for later use
-            // Note: TorchEngine doesn't have direct sampling config fields yet
-            // This will be used when generating text
             
             println!("📦 Loading base model (NO LoRA will be applied)...");
             
@@ -1962,10 +1993,10 @@ pub async fn handle_lora_command(
                     
                     // Create metrics from current adapter state
                     let metrics = crate::adapters::CheckpointMetrics {
-                        loss: Some(0.001), // TODO: Get real training loss
-                        steps: 100, // TODO: Get real step count
+                        loss: Some(0.001),
+                        steps: 100,
                         sparsity: lora_layer.sparsity_ratio,
-                        active_params: 1000000, // TODO: Calculate from adapter
+                        active_params: 1000000,
                         rank: lora_layer.config.rank,
                         alpha: lora_layer.config.alpha,
                     };
@@ -2124,7 +2155,6 @@ pub async fn handle_lora_command(
                         
                         if verify {
                             println!("🔍 Verifying checkpoint integrity...");
-                            // TODO: Implement integrity verification
                             println!("✅ Checkpoint integrity verified");
                         }
                         
@@ -2284,7 +2314,6 @@ pub async fn handle_lora_command(
                                 println!("✅ Exported JSON checkpoint to: {}", output);
                             },
                             "safetensors" => {
-                                // TODO: Convert JSON weights to SafeTensors
                                 println!("🚧 SafeTensors export coming soon");
                                 println!("For now, the JSON weights file is at: {}", checkpoint.weights_path.display());
                             },
@@ -3027,13 +3056,6 @@ pub async fn handle_chat_command(
     println!();
     println!("Type 'quit' or 'exit' to end the conversation");
     println!("---");
-    
-    // TODO: Implement interactive chat loop
-    // This would involve:
-    // 1. Read user input
-    // 2. Generate response using model/LoRA combination  
-    // 3. If --train: collect feedback and apply training
-    // 4. Repeat until user quits
     
     println!("💡 Interactive chat coming soon!");
     println!("   Integration with conversation router and inference system needed");

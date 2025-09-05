@@ -56,7 +56,6 @@ impl QwenAdapter {
         // Handle MoE configurations if needed
         if is_moe {
             tracing::info!("Qwen MoE model detected - using dense layers only (MoE not yet implemented)");
-            // TODO: Implement proper MoE support
         }
         
         // Log the configuration being used
@@ -97,7 +96,6 @@ impl QwenAdapter {
         match version {
             3 => {
                 // Qwen3 specific configurations from official spec
-                // Note: Qwen3-4B-Instruct uses rope_theta=5M for extended context
                 // We'll preserve the model's configured value from config.json
                 // config.rope_theta is already set from config.json (typically 5M for Qwen3)
                 config.max_position_embeddings = context_length.min(32_768);  // Default 32K
@@ -138,7 +136,6 @@ impl QwenAdapter {
         // Handle MoE configurations if needed
         if is_moe {
             tracing::info!("Qwen MoE model detected - using dense layers only (MoE not yet implemented)");
-            // TODO: Implement proper MoE support
         }
         
         // Log the configuration being used  

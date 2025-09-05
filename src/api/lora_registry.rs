@@ -75,7 +75,6 @@ impl LoRALayer {
 pub struct LoRARegistry {
     layers: Arc<RwLock<HashMap<LoRAId, LoRALayer>>>,
     metrics: Arc<RwLock<HashMap<LoRAId, LayerMetrics>>>,
-    // Legacy mapping for backward compatibility
     name_to_id: Arc<RwLock<HashMap<String, LoRAId>>>,
     // Persistence
     base_dir: PathBuf,

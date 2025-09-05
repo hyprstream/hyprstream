@@ -6,7 +6,6 @@ use anyhow::{Result, anyhow};
 use tch::{Device, Kind as DType, Tensor};
 use crate::runtime::tensor_helpers::{ToIntList, clone_tensor, square_tensor, broadcast_mul, broadcast_add, broadcast_sub, scalar_tensor, dims3, dims4};
 use crate::runtime::rope::{RoPE, RoPEManager};
-// TODO: Replace candle_nn with tch equivalents
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -967,8 +966,6 @@ impl LlamaModel {
         }
         
         // Build attention
-        // Note: PyTorch/HuggingFace stores linear weights as [out_features, in_features]
-        // but we need [in_features, out_features] for matmul, so transpose them
         let (q_proj, k_proj, v_proj) = if has_separate_qkv {
             // Standard separate Q, K, V projections (Llama style)
             
@@ -1239,10 +1236,6 @@ impl ModelOperations for LlamaModel {
             let flat_input = input.flatten(0, -1);
             tracing::debug!("Flattened input shape: {:?}, dtype: {:?}", flat_input.size(), flat_input.kind());
             
-            // Try to print the actual token IDs if the tensor is small
-            if flat_input.numel() <= 10 {
-                // TODO: Implement tensor value extraction when tch supports it
-            }
             
             // Perform embedding lookup using index_select
             let embeddings = embed.index_select(0, &flat_input);

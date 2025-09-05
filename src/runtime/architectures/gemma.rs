@@ -933,7 +933,6 @@ impl ModelOperations for GemmaModel {
             let mut embeddings = embeddings.reshape(&[batch_size, seq_len, hidden_size]);
             
             // Apply embedding scaling for Gemma - scale by sqrt(hidden_size)
-            // Note: This is different from query_pre_attn_scalar which is used in attention
             let scale = (hidden_size as f32).sqrt();
             let scale_tensor = Tensor::from(scale).to_kind(embeddings.kind()).to_device(embeddings.device());
             embeddings = broadcast_mul(&embeddings, &scale_tensor)?;

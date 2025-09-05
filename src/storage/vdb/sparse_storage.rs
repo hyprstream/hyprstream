@@ -483,7 +483,6 @@ impl VDBSparseStorage {
         {
             let mut stats = self.stats.write().await;
             stats.total_adapters += 1; // Use available field
-            // Note: last_update_timestamp not available in StorageStats
         }
         
         tracing::trace!("✅ Applied weight delta {} at coordinate {:?}", delta, coord);
