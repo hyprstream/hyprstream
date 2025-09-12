@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use serde_json;
 use crate::config::{GenerationRequest, GenerationResult, ModelInfo, RuntimeConfig, FinishReason};
 use crate::runtime::RuntimeEngine;
+use crate::runtime::template_engine::{TemplateEngine, TemplateConfig, ChatMessage};
 
 /// Qwen2 special token IDs (based on official HuggingFace implementation)
 #[derive(Debug, Clone)]
@@ -80,6 +81,8 @@ pub struct TorchEngine {
     context_state: Arc<Mutex<Option<ContextState>>>,
     /// Tokenizer for text processing - thread safe after initialization
     tokenizer: Arc<Mutex<Option<Tokenizer>>>,
+    /// Template engine for chat formatting
+    template_engine: Arc<Mutex<Option<TemplateEngine>>>,
     /// Device for computation (CPU/CUDA/ROCm) - immutable after construction
     device: Device,
     /// Runtime configuration - immutable after construction
@@ -134,6 +137,7 @@ impl TorchEngine {
             persistent_model: None,
             context_state: Arc::new(Mutex::new(None)),
             tokenizer: Arc::new(Mutex::new(None)),
+            template_engine: Arc::new(Mutex::new(None)),
             device,
             config: config.clone(),
             model_info: Arc::new(Mutex::new(ModelInfo {
@@ -272,7 +276,7 @@ impl TorchEngine {
         Ok(())
     }
 
-    /// Load tokenizer - thread safe
+    /// Load tokenizer and template configuration - thread safe
     async fn load_tokenizer(&mut self, model_path: &Path) -> Result<()> {
         // Try to find tokenizer.json - if model_path is a directory, look inside it
         // If it's a file, look in the parent directory
@@ -283,6 +287,7 @@ impl TorchEngine {
         };
         
         let tokenizer_path = search_dir.join("tokenizer.json");
+        let tokenizer_config_path = search_dir.join("tokenizer_config.json");
 
         if tokenizer_path.exists() {
             println!("📝 Loading tokenizer: {}", tokenizer_path.display());
@@ -297,6 +302,27 @@ impl TorchEngine {
                 "Tokenizer not found at {}. A proper tokenizer.json file is required for inference.",
                 tokenizer_path.display()
             ));
+        }
+        
+        // Load template configuration if available
+        if tokenizer_config_path.exists() {
+            println!("📋 Loading tokenizer config: {}", tokenizer_config_path.display());
+            let config_content = tokio::fs::read_to_string(&tokenizer_config_path).await?;
+            let config_json: serde_json::Value = serde_json::from_str(&config_content)?;
+            
+            // Parse template configuration
+            let template_config = TemplateEngine::from_tokenizer_config(&config_json)?;
+            
+            // Create template engine
+            let template_engine = TemplateEngine::new(template_config)?;
+            
+            // Store template engine
+            let mut template_guard = self.handle_poison(self.template_engine.lock())?;
+            *template_guard = Some(template_engine);
+            
+            println!("✅ Template engine initialized");
+        } else {
+            println!("⚠️ No tokenizer_config.json found, using fallback templates");
         }
 
         Ok(())
@@ -320,8 +346,35 @@ impl TorchEngine {
         Ok(token_ids)
     }
 
-    /// Format text with Qwen2 chat template (basic implementation)
+    /// Format text with dynamic chat template
     fn format_chat_message(&self, system: Option<&str>, user: &str) -> String {
+        // Try to use template engine if available
+        if let Ok(template_guard) = self.template_engine.lock() {
+            if let Some(ref engine) = *template_guard {
+                let mut messages = Vec::new();
+                
+                // Add system message if provided
+                if let Some(system_msg) = system {
+                    messages.push(ChatMessage {
+                        role: "system".to_string(),
+                        content: system_msg.to_string(),
+                    });
+                }
+                
+                // Add user message
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: user.to_string(),
+                });
+                
+                // Apply template
+                if let Ok(formatted) = engine.apply_chat_template(&messages, Some(true)) {
+                    return formatted;
+                }
+            }
+        }
+        
+        // Fallback to hardcoded Qwen2 template if template engine not available
         let mut formatted = String::new();
         
         // Add system message if provided
@@ -785,6 +838,26 @@ impl RuntimeEngine for TorchEngine {
         let persistent_loaded = self.persistent_model.is_some();
         
         varstore_loaded || persistent_loaded
+    }
+    
+    fn apply_chat_template(&self, messages: &[ChatMessage], add_generation_prompt: bool) -> Result<String> {
+        // Use our template engine if available
+        let template_guard = self.handle_poison(self.template_engine.lock())?;
+        
+        if let Some(ref engine) = *template_guard {
+            // Use the template engine
+            engine.apply_chat_template(messages, Some(add_generation_prompt))
+        } else {
+            // Fallback to simple formatting
+            let mut formatted = String::new();
+            for msg in messages {
+                formatted.push_str(&format!("{}: {}\n", msg.role, msg.content));
+            }
+            if add_generation_prompt {
+                formatted.push_str("assistant: ");
+            }
+            Ok(formatted)
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 //! Test dynamic LoRA fusion implementation
 
-use hyprstream::inference::lora_fusion::{LoRAFusion, FusionStrategy};
-use hyprstream::adapters::sparse_lora::{SparseLoRAAdapter, SparseLoRAConfig};
+use hyprstream_core::inference::lora_fusion::{LoRAFusion, FusionStrategy};
+use hyprstream_core::adapters::sparse_lora::{SparseLoRAAdapter, SparseLoRAConfig};
 use std::collections::HashMap;
 
 #[tokio::test]

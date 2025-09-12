@@ -1,9 +1,9 @@
 //! Basic inference engine test without VDB features
 
-use hyprstream::inference::{
+use hyprstream_core::inference::{
     InferenceEngine, InferenceConfig, InferenceInput, FusedAdapterWeights, FusionMetadata
 };
-use hyprstream::inference::model_loader::ModelLoader;
+use hyprstream_core::inference::model_loader::ModelLoader;
 use std::collections::HashMap;
 use tokio;
 
