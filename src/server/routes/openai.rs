@@ -148,8 +148,17 @@ async fn chat_completions(
     State(state): State<ServerState>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Response {
+    // Debug log the incoming request
+    info!("Chat completion request - model: {}, stream: {:?}, messages: {} msgs", 
+        request.model, request.stream, request.messages.len());
+    
+    // Log if streaming is defaulting
+    let is_streaming = request.stream.unwrap_or(false);
+    info!("Streaming mode: {} (explicit: {:?})", is_streaming, request.stream);
+    
     // Validate request
     if let Err(e) = validate_chat_request(&request, &state.config) {
+        error!("Request validation failed: {}", e);
         return (StatusCode::BAD_REQUEST, Json(ErrorResponse::new(
             e,
             "invalid_request",
@@ -165,8 +174,10 @@ async fn chat_completions(
     
     // Check for streaming
     if request.stream.unwrap_or(false) {
+        info!("Handling streaming request");
         return stream_chat(state, request).await;
     }
+    info!("Handling non-streaming request");
     
     // Get engine from model cache
     let engine = match state.model_cache.get_or_load_by_name(&request.model).await {
@@ -207,8 +218,13 @@ async fn chat_completions(
     
     // Create generation request - use template-aware formatting
     let defaults = &state.config.generation_defaults;
+    info!("Formatting messages with template...");
     let formatted_prompt = match format_messages_with_template(&request.messages, &engine).await {
-        Ok(prompt) => prompt,
+        Ok(prompt) => {
+            info!("Template formatting successful, prompt preview: {}", 
+                &prompt.chars().take(200).collect::<String>());
+            prompt
+        },
         Err(e) => {
             error!("Template formatting failed: {}", e);
             state.metrics.active_requests.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -235,11 +251,13 @@ async fn chat_completions(
     };
     
     // Generate response
+    info!("Starting generation with prompt length: {}", gen_request.prompt.len());
     let result = {
-        let engine = engine.lock().await;
-        engine.generate_with_params(gen_request).await
+        let engine_guard = engine.lock().await;
+        engine_guard.generate_with_params(gen_request).await
     };
     
+    info!("Generation completed - success: {}", result.is_ok());
     state.metrics.active_requests.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     
     match result {
@@ -349,23 +367,29 @@ async fn stream_chat(
             }
         };
         
-        let engine = engine_arc.lock().await;
-        
-        // Create SSE streaming callback (clone tx for callback)
-        let tx_callback = tx.clone();
-        let callback = Box::new(
-            crate::runtime::streaming::SseStreamingCallback::new(tx_callback, model_name)
-        );
-        
-        // Create generation request with template-formatted messages
+        // Format messages BEFORE locking the engine to avoid deadlock
+        info!("Formatting messages for streaming...");
         let prompt = match format_messages_with_template(&messages, &engine_arc).await {
-            Ok(p) => p,
+            Ok(p) => {
+                info!("Streaming template formatting successful, prompt length: {}", p.len());
+                p
+            },
             Err(e) => {
                 error!("Template formatting failed in streaming: {}", e);
                 let _ = tx.send(Err(anyhow::anyhow!("Template formatting failed: {}", e))).await;
                 return;
             }
         };
+        
+        // NOW lock the engine for generation
+        let engine = engine_arc.lock().await;
+        
+        // Create SSE streaming callback (clone tx for callback)
+        let tx_callback = tx.clone();
+        let callback = Box::new(
+            crate::runtime::streaming::SseStreamingCallback::new(tx_callback, model_name.clone())
+        );
+        
         let gen_request = GenerationRequest {
             prompt,
             max_tokens,
@@ -388,8 +412,10 @@ async fn stream_chat(
         };
         
         // Generate with async streaming
+        info!("Starting streaming generation...");
         match engine.generate_streaming_async(gen_request, callback, context).await {
             Ok(result) => {
+                info!("Streaming generation completed with {} tokens", result.tokens_generated);
                 // Update metrics
                 state.metrics.total_tokens.fetch_add(
                     result.tokens_generated as u64,
@@ -680,6 +706,12 @@ async fn format_messages_with_template(
     messages: &[ChatMessage],
     engine: &Arc<Mutex<TorchEngine>>,
 ) -> Result<String, String> {
+    // Log messages for debugging
+    for (i, msg) in messages.iter().enumerate() {
+        info!("Message {}: role={}, content={:?}", i, msg.role, 
+            msg.content.as_ref().map(|c| &c[..c.len().min(100)]));
+    }
+    
     // Convert OpenAI messages to template engine format
     let template_messages: Vec<crate::runtime::template_engine::ChatMessage> = messages
         .iter()
@@ -689,9 +721,13 @@ async fn format_messages_with_template(
         })
         .collect();
     
+    info!("Acquiring engine lock for template formatting...");
     // Apply the engine's template formatting
     let engine_guard = engine.lock().await;
-    engine_guard.apply_chat_template(&template_messages, true)
-        .map_err(|e| format!("Failed to apply chat template: {}", e))
+    info!("Engine lock acquired, applying template...");
+    let result = engine_guard.apply_chat_template(&template_messages, true)
+        .map_err(|e| format!("Failed to apply chat template: {}", e));
+    info!("Template application complete: {:?}", result.is_ok());
+    result
 }
 

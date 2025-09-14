@@ -8,6 +8,7 @@ use tokenizers::Tokenizer;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use serde_json;
+use json_threat_protection as jtp;
 use crate::config::{GenerationRequest, GenerationResult, ModelInfo, RuntimeConfig, FinishReason};
 use crate::runtime::RuntimeEngine;
 use crate::runtime::template_engine::{TemplateEngine, TemplateConfig, ChatMessage};
@@ -68,6 +69,7 @@ pub struct ContextState {
 /// 
 /// Thread-safe implementation using proper synchronization primitives.
 /// All mutable state is protected by mutexes with poisoning recovery.
+#[derive(Clone)]
 pub struct TorchEngine {
     /// VarStore for native PyTorch weight management - not thread safe, requires external sync
     var_store: Arc<Mutex<Option<VarStore>>>,
@@ -308,6 +310,14 @@ impl TorchEngine {
         if tokenizer_config_path.exists() {
             println!("📋 Loading tokenizer config: {}", tokenizer_config_path.display());
             let config_content = tokio::fs::read_to_string(&tokenizer_config_path).await?;
+            
+            // Validate before parsing
+            jtp::from_str(&config_content)
+                .with_max_depth(10)
+                .with_max_string_length(50000)
+                .validate()
+                .map_err(|e| anyhow!("Invalid tokenizer config: {:?}", e))?;
+            
             let config_json: serde_json::Value = serde_json::from_str(&config_content)?;
             
             // Parse template configuration
@@ -749,75 +759,96 @@ impl RuntimeEngine for TorchEngine {
     }
 
     async fn generate_with_params(&self, request: GenerationRequest) -> Result<GenerationResult> {
-        // Ensure persistent model is ready
-        if !self.is_persistent_model_ready() {
-            return Err(anyhow!("Model not properly initialized - persistent model not ready"));
-        }
+        // Add timeout protection (default 120 seconds, configurable via HYPRSTREAM_GENERATION_TIMEOUT env var)
+        let timeout_secs = std::env::var("HYPRSTREAM_GENERATION_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(120);
+        let timeout_duration = std::time::Duration::from_secs(timeout_secs);
         
-        let start_time = std::time::Instant::now();
-
-        // Tokenize input
-        let mut input_ids = self.tokenize(&request.prompt)?;
-        let mut generated_text = String::new();
-        let mut tokens_generated = 0;
-        let prompt_len = input_ids.len();
-
-        for i in 0..request.max_tokens {
-            // Use KV cached forward pass after first iteration
-            let logits = if i == 0 {
-                // First pass: process entire prompt
-                self.forward(&input_ids)?
-            } else {
-                // Subsequent passes: only process new token with KV cache
-                self.forward_cached(&input_ids, prompt_len + i - 1, true)?
-            };
+        // Run the CPU-intensive generation in a blocking thread to avoid blocking the async runtime
+        let self_clone = self.clone();
+        let generation_future = tokio::task::spawn_blocking(move || {
+            // Ensure persistent model is ready
+            if !self_clone.is_persistent_model_ready() {
+                return Err(anyhow!("Model not properly initialized - persistent model not ready"));
+            }
             
-            // Sample next token with proper parameters
-            let next_token = self.sample_token(
-                &logits,
-                request.temperature,
-                request.top_p,
-                request.top_k,
-                request.repeat_penalty,
-                &input_ids,
-            )?;
-            
-            tracing::info!("Sampled token ID: {}", next_token);
+            let start_time = std::time::Instant::now();
 
-            // Add to sequence
-            input_ids.push(next_token as i64);
-            tokens_generated += 1;
+            // Tokenize input
+            let mut input_ids = self_clone.tokenize(&request.prompt)?;
+            let mut generated_text = String::new();
+            let mut tokens_generated = 0;
+            let prompt_len = input_ids.len();
 
-            // Decode token
-            let token_text = self.detokenize(&[next_token as i64])?;
-            tracing::info!("Token text: '{}'", token_text);
-            generated_text.push_str(&token_text);
+            for i in 0..request.max_tokens {
+                // Use KV cached forward pass after first iteration
+                let logits = if i == 0 {
+                    // First pass: process entire prompt
+                    self_clone.forward(&input_ids)?
+                } else {
+                    // Subsequent passes: only process new token with KV cache
+                    self_clone.forward_cached(&input_ids, prompt_len + i - 1, true)?
+                };
+                
+                // Sample next token with proper parameters
+                let next_token = self_clone.sample_token(
+                    &logits,
+                    request.temperature,
+                    request.top_p,
+                    request.top_k,
+                    request.repeat_penalty,
+                    &input_ids,
+                )?;
+                
+                tracing::info!("Sampled token ID: {}", next_token);
 
-            // Check stop tokens
-            if request.stop_tokens.iter().any(|stop| generated_text.contains(stop)) {
-                break;
+                // Add to sequence
+                input_ids.push(next_token as i64);
+                tokens_generated += 1;
+
+                // Decode token
+                let token_text = self_clone.detokenize(&[next_token as i64])?;
+                tracing::info!("Token text: '{}'", token_text);
+                generated_text.push_str(&token_text);
+
+                // Check stop tokens
+                if request.stop_tokens.iter().any(|stop| generated_text.contains(stop)) {
+                    break;
+                }
+
+                // Proper EOS check for Qwen2 (im_end or endoftext tokens)
+                if self_clone.is_eos_token(next_token) {
+                    tracing::info!("EOS token detected: {}", next_token);
+                    break;
+                }
             }
 
-            // Proper EOS check for Qwen2 (im_end or endoftext tokens)
-            if self.is_eos_token(next_token) {
-                tracing::info!("EOS token detected: {}", next_token);
-                break;
+            let generation_time = start_time.elapsed();
+
+            Ok(GenerationResult {
+                text: generated_text,
+                tokens_generated,
+                finish_reason: if tokens_generated >= request.max_tokens {
+                    FinishReason::MaxTokens
+                } else {
+                    FinishReason::EndOfSequence
+                },
+                generation_time_ms: generation_time.as_millis() as u64,
+                tokens_per_second: tokens_generated as f32 / generation_time.as_secs_f32(),
+            })
+        });
+        
+        // Apply timeout to prevent runaway generation
+        match tokio::time::timeout(timeout_duration, generation_future).await {
+            Ok(Ok(Ok(result))) => Ok(result),  // Unwrap nested Results: timeout -> JoinHandle -> generation
+            Ok(Ok(Err(e))) => Err(e),          // Generation error
+            Ok(Err(e)) => Err(anyhow!("Blocking task panicked: {}", e)), // Task panic
+            Err(_) => {
+                Err(anyhow!("Generation timed out after {:?}", timeout_duration))
             }
         }
-
-        let generation_time = start_time.elapsed();
-
-        Ok(GenerationResult {
-            text: generated_text,
-            tokens_generated,
-            finish_reason: if tokens_generated >= request.max_tokens {
-                FinishReason::MaxTokens
-            } else {
-                FinishReason::EndOfSequence
-            },
-            generation_time_ms: generation_time.as_millis() as u64,
-            tokens_per_second: tokens_generated as f32 / generation_time.as_secs_f32(),
-        })
     }
 
     fn model_info(&self) -> ModelInfo {

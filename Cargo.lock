@@ -1765,6 +1765,7 @@ dependencies = [
  "hex",
  "hf-hub",
  "indicatif",
+ "json-threat-protection",
  "lazy_static",
  "lru",
  "memmap2",
@@ -2132,6 +2133,15 @@ checksum = "1cfaf33c695fc6e08064efbc1f72ec937429614f25eef83af942d0e227c3a28f"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "json-threat-protection"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63f8e4bfdb487eeffe3209dec552ff5572215726c5063be65d582b8a5ccd94e7"
+dependencies = [
+ "thiserror 1.0.69",
 ]
 
 [[package]]

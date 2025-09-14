@@ -99,6 +99,17 @@ pub enum ModelAction {
         format: String,
     },
     
+    /// Repair model metadata and fix inconsistencies
+    Repair {
+        /// Perform automatic repairs without confirmation
+        #[arg(long)]
+        yes: bool,
+        
+        /// Show detailed repair information
+        #[arg(long)]
+        verbose: bool,
+    },
+    
     /// Show cache status and statistics
     Cache {
         #[command(subcommand)]

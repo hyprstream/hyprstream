@@ -66,15 +66,15 @@ impl ModelCache {
         // Model not in cache, load it
         info!("Model {} (UUID: {}) not in cache, loading...", model_name, model_uuid);
         
-        // Get model path from storage
+        // Get model path from storage with direct loading fallback
         let model_id = crate::api::model_storage::ModelId(model_uuid);
-        let metadata = match self.model_storage.get_metadata_by_id(&model_id).await {
+        let metadata = match self.model_storage.get_metadata_by_id_or_load(&model_id).await {
             Ok(meta) => meta,
             Err(e) => {
-                // UUID in name cache but not in storage - stale cache entry
-                warn!("Model metadata not found for UUID: {}. Removing from name cache.", model_uuid);
+                // UUID not found in storage at all
+                warn!("Model not found for UUID: {}. Error: {}", model_uuid, e);
                 self.invalidate_uuid_from_name_cache(model_uuid).await;
-                return Err(anyhow::anyhow!("Model metadata not found for UUID: {}", model_uuid));
+                return Err(anyhow::anyhow!("Model not found for UUID: {}", model_uuid));
             }
         };
         let model_path = metadata.local_path
@@ -136,10 +136,10 @@ impl ModelCache {
         info!("Name '{}' not in cache or stale, scanning disk for UUID mapping", model_name);
         let uuid = self.resolve_model_name_to_uuid(model_name).await?;
         
-        // Validate the UUID before caching
+        // Validate the UUID before caching (will also load from directory if needed)
         let model_id = crate::api::model_storage::ModelId(uuid);
-        if let Err(e) = self.model_storage.get_metadata_by_id(&model_id).await {
-            return Err(anyhow::anyhow!("Model '{}' resolved to UUID {} but metadata not found: {}", model_name, uuid, e));
+        if let Err(e) = self.model_storage.get_metadata_by_id_or_load(&model_id).await {
+            return Err(anyhow::anyhow!("Model '{}' resolved to UUID {} but not found: {}", model_name, uuid, e));
         }
         
         // Cache the name->UUID mapping for future requests
@@ -154,8 +154,7 @@ impl ModelCache {
 
     /// Resolve model name to UUID (scans disk - should be called rarely)
     async fn resolve_model_name_to_uuid(&self, model_name: &str) -> Result<Uuid> {
-        info!("Scanning disk to resolve model name '{}' to UUID", model_name);
-        // Try to find by scanning the model list
+        // Try to find model through storage API
         let models = self.model_storage.children().await?;
         
         for (id, metadata) in models {
@@ -280,17 +279,9 @@ impl ModelCache {
         let mut valid_uuids = std::collections::HashSet::new();
         
         for (id, metadata) in models {
-            // Validate that we can actually get this model's metadata
-            match self.model_storage.get_metadata_by_id(&id).await {
-                Ok(_) => {
-                    valid_uuids.insert(id.0);
-                    debug!("Model {} (UUID: {}) is valid", metadata.name, id.0);
-                }
-                Err(e) => {
-                    warn!("Model {} (UUID: {}) has inconsistent metadata: {}. Skipping.", metadata.name, id.0, e);
-                    continue;
-                }
-            }
+            // All models from children() are already validated
+            valid_uuids.insert(id.0);
+            debug!("Model {} (UUID: {}) is valid", metadata.name, id.0);
             
             // Cache by name field
             new_name_cache.insert(metadata.name.clone(), id.0);
