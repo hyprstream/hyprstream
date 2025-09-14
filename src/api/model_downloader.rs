@@ -13,6 +13,7 @@ use tokio::fs;
 use async_trait::async_trait;
 use safe_path::{scoped_join, scoped_resolve};
 use crate::constants::limits::*;
+use json_threat_protection as jtp;
 
 /// Model format types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -91,6 +92,7 @@ pub struct ModelInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadedModel {
     pub model_id: String,
+    pub uuid: uuid::Uuid,  // The actual UUID used for storage
     pub local_path: PathBuf,
     pub format: ModelFormat,
     pub files: Vec<ModelFile>,
@@ -295,7 +297,18 @@ impl HuggingFaceSource {
             return Err(anyhow!("Failed to get repository info: HTTP {}", response.status()));
         }
         
-        let json: serde_json::Value = response.json().await
+        let json_text = response.text().await
+            .map_err(|e| anyhow!("Failed to read repository response: {}", e))?;
+        
+        // Validate API response
+        jtp::from_str(&json_text)
+            .with_max_depth(10)
+            .with_max_string_length(1000000)
+            .with_max_array_entries(10000)
+            .validate()
+            .map_err(|e| anyhow!("Invalid JSON from API: {:?}", e))?;
+        
+        let json: serde_json::Value = serde_json::from_str(&json_text)
             .map_err(|e| anyhow!("Failed to parse repository response: {}", e))?;
         
         // Extract file list from siblings field
@@ -586,9 +599,11 @@ impl ModelSource for HuggingFaceSource {
         let uuid = uuid::Uuid::new_v4();
         let model_uuid = crate::api::model_storage::ModelId(uuid);
         
-        // Create UUID-based target directory
+        // Create UUID-based target directory and data subdirectory
         let model_dir = target_dir.join(uuid.to_string());
+        let data_dir = model_dir.join("data");
         fs::create_dir_all(&model_dir).await?;
+        fs::create_dir_all(&data_dir).await?;
         
         // Create model metadata file with original name
         let model_metadata = crate::api::model_storage::ModelMetadataFile {
@@ -606,7 +621,13 @@ impl ModelSource for HuggingFaceSource {
         // SECURITY: Never use user input for this filename to prevent path traversal
         let metadata_filename = "model.json"; // Hardcoded, never from user input
         let metadata_path = model_dir.join(metadata_filename);
+        // Serialize and validate with json_threat_protection
         let metadata_content = serde_json::to_string_pretty(&model_metadata)?;
+        // Validate before writing
+        jtp::from_str(&metadata_content)
+            .with_max_depth(10)
+            .with_max_string_length(10000)
+            .validate()?;
         
         // Additional validation that we're writing to the right place
         if metadata_path.parent() != Some(&model_dir) {
@@ -639,8 +660,8 @@ impl ModelSource for HuggingFaceSource {
         let mut files = Vec::new();
         let mut total_size = 0u64;
         
-        // Download configuration
-        let config_path = model_dir.join("config.json");
+        // Download configuration to data subdirectory
+        let config_path = data_dir.join("config.json");
         if !config_path.exists() {
             println!("📄 Downloading config.json");
             // Config files are small JSON, 100MB should be plenty
@@ -664,9 +685,9 @@ impl ModelSource for HuggingFaceSource {
             None
         };
         
-        // Download tokenizer files
+        // Download tokenizer files to data subdirectory
         for tokenizer_file in &["tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt"] {
-            let target_path = model_dir.join(tokenizer_file);
+            let target_path = data_dir.join(tokenizer_file);
             if !target_path.exists() {
                 // Tokenizer files can be large for some models, 1GB should cover most cases
                 match self.download_file_with_progress(&repo, tokenizer_file, &target_path, None, Some(MAX_TOKENIZER_SIZE)).await {
@@ -724,7 +745,7 @@ impl ModelSource for HuggingFaceSource {
                 filename.to_string()
             };
             
-            let target_path = model_dir.join(&safetensors_filename);
+            let target_path = data_dir.join(&safetensors_filename);
             
             if target_path.exists() {
                 let metadata = fs::metadata(&target_path).await?;
@@ -770,7 +791,15 @@ impl ModelSource for HuggingFaceSource {
             updated_metadata.architecture = Some(cfg.architecture.clone());
             
             let metadata_path = model_dir.join("model.json");
+            
+            // Serialize and validate
             let metadata_content = serde_json::to_string_pretty(&updated_metadata)?;
+            // Validate
+            jtp::from_str(&metadata_content)
+                .with_max_depth(10)
+                .with_max_string_length(10000)
+                .validate()?;
+            
             fs::write(&metadata_path, metadata_content).await?;
         }
         
@@ -780,7 +809,8 @@ impl ModelSource for HuggingFaceSource {
         
         Ok(DownloadedModel {
             model_id: repo_id.to_string(),
-            local_path: model_dir,
+            uuid,  // Include the actual UUID used for storage
+            local_path: data_dir,
             format: final_format,  // Always report SafeTensors if we converted
             files,
             config,
@@ -884,6 +914,14 @@ impl ModelDownloader {
 
 /// Parse model configuration from JSON
 fn parse_config(json_str: &str) -> Result<ModelConfig> {
+    // Validate before parsing
+    jtp::from_str(json_str)
+        .with_max_depth(20)
+        .with_max_string_length(100000)
+        .with_max_array_entries(10000)
+        .validate()
+        .map_err(|e| anyhow!("Invalid model config JSON: {:?}", e))?;
+    
     let json: serde_json::Value = serde_json::from_str(json_str)?;
     
     Ok(ModelConfig {
@@ -900,6 +938,13 @@ fn parse_config(json_str: &str) -> Result<ModelConfig> {
 
 /// Parse tokenizer information from JSON
 fn parse_tokenizer_info(json_str: &str) -> Result<TokenizerInfo> {
+    // Validate before parsing
+    jtp::from_str(json_str)
+        .with_max_depth(10)
+        .with_max_string_length(50000)
+        .validate()
+        .map_err(|e| anyhow!("Invalid tokenizer config JSON: {:?}", e))?;
+    
     let json: serde_json::Value = serde_json::from_str(json_str)?;
     
     Ok(TokenizerInfo {
@@ -908,4 +953,181 @@ fn parse_tokenizer_info(json_str: &str) -> Result<TokenizerInfo> {
         pad_token_id: json["pad_token_id"].as_u64().map(|n| n as u32),
         eos_token_id: json["eos_token_id"].as_u64().map(|n| n as u32),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_parse_config_with_valid_json() {
+        let json = r#"{
+            "architectures": ["TransformerModel"],
+            "hidden_size": 768,
+            "num_attention_heads": 12,
+            "num_hidden_layers": 12,
+            "vocab_size": 50265,
+            "max_position_embeddings": 512
+        }"#;
+
+        let config = parse_config(json).expect("Failed to parse valid config");
+        assert_eq!(config.architecture, "TransformerModel");
+        assert_eq!(config.hidden_size, 768);
+        assert_eq!(config.num_attention_heads, 12);
+        assert_eq!(config.num_hidden_layers, 12);
+    }
+
+    #[test]
+    fn test_parse_config_rejects_deeply_nested_json() {
+        // Create deeply nested JSON
+        let mut deep_json = String::from(r#"{"architectures": ["Model"], "nested": "#);
+        for _ in 0..25 {
+            deep_json.push_str(r#"{"level": "#);
+        }
+        deep_json.push_str("\"deep\"");
+        for _ in 0..25 {
+            deep_json.push_str("}");
+        }
+        deep_json.push_str("}");
+
+        let result = parse_config(&deep_json);
+        assert!(result.is_err(), "Should reject deeply nested JSON");
+    }
+
+    #[test]
+    fn test_parse_config_rejects_oversized_strings() {
+        let huge_string = "x".repeat(200_000);
+        let json = format!(
+            r#"{{"architectures": ["{}"], "hidden_size": 768}}"#, 
+            huge_string
+        );
+
+        let result = parse_config(&json);
+        assert!(result.is_err(), "Should reject JSON with oversized strings");
+    }
+
+    #[test]
+    fn test_parse_tokenizer_info_with_valid_json() {
+        let json = r#"{
+            "tokenizer_class": "GPT2Tokenizer",
+            "vocab_size": 50257,
+            "pad_token_id": 50256,
+            "eos_token_id": 50256
+        }"#;
+
+        let info = parse_tokenizer_info(json).expect("Failed to parse valid tokenizer info");
+        assert_eq!(info.tokenizer_class, Some("GPT2Tokenizer".to_string()));
+        assert_eq!(info.vocab_size, 50257);
+        assert_eq!(info.pad_token_id, Some(50256));
+        assert_eq!(info.eos_token_id, Some(50256));
+    }
+
+    #[test]
+    fn test_parse_tokenizer_info_rejects_invalid_json() {
+        let mut json = r#"{
+            "tokenizer_class": "GPT2Tokenizer",
+            "huge_array": ["#.to_string();
+        
+        // Add huge array
+        for i in 0..20000 {
+            json.push_str(&format!("\"{}\",", i));
+        }
+        
+        let result = parse_tokenizer_info(&json);
+        assert!(result.is_err(), "Should reject malformed JSON");
+    }
+
+    #[test]
+    fn test_model_format_serialization() {
+        let format = ModelFormat::SafeTensors;
+        let serialized = serde_json::to_string(&format).unwrap();
+        let deserialized: ModelFormat = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(format, deserialized);
+
+        let format = ModelFormat::PyTorch;
+        let serialized = serde_json::to_string(&format).unwrap();
+        let deserialized: ModelFormat = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(format, deserialized);
+    }
+
+    #[test]
+    fn test_file_type_classification() {
+        assert_eq!(
+            FileType::Weights,
+            FileType::Weights
+        );
+        assert_eq!(
+            FileType::Config,
+            FileType::Config
+        );
+        assert_eq!(
+            FileType::Tokenizer,
+            FileType::Tokenizer
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hf_source_parse_repo_id() {
+        assert_eq!(
+            HuggingFaceSource::parse_repo_id("microsoft/phi-2"),
+            "microsoft/phi-2"
+        );
+        assert_eq!(
+            HuggingFaceSource::parse_repo_id("hf://microsoft/phi-2"),
+            "microsoft/phi-2"
+        );
+        assert_eq!(
+            HuggingFaceSource::parse_repo_id("huggingface://microsoft/phi-2"),
+            "microsoft/phi-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metadata_json_protection() {
+        let temp_dir = TempDir::new().unwrap();
+        let model_dir = temp_dir.path().join("test-uuid");
+        tokio::fs::create_dir_all(&model_dir).await.unwrap();
+
+        let metadata = crate::api::model_storage::ModelMetadataFile {
+            model_id: crate::api::model_storage::ModelId::new(),
+            name: "test-model".to_string(),
+            display_name: "Test Model".to_string(),
+            source_uri: "hf://test/model".to_string(),
+            architecture: Some("test".to_string()),
+            parameters: Some(1000),
+            created_at: 0,
+            last_accessed: 0,
+        };
+
+        // Serialize and validate
+        let content = serde_json::to_string_pretty(&metadata).unwrap();
+        
+        // Should pass validation
+        let result = jtp::from_str(&content)
+            .with_max_depth(10)
+            .with_max_string_length(10000)
+            .validate();
+        
+        assert!(result.is_ok(), "Valid metadata should pass validation");
+    }
+
+    #[test]
+    fn test_download_options_defaults() {
+        let options = DownloadOptions {
+            preferred_format: ModelFormat::SafeTensors,
+            force: false,
+            show_progress: true,
+            files_filter: None,
+            verify_checksums: true,
+            max_size_bytes: None,
+        };
+
+        assert_eq!(options.preferred_format, ModelFormat::SafeTensors);
+        assert!(!options.force);
+        assert!(options.show_progress);
+        assert!(options.files_filter.is_none());
+        assert!(options.verify_checksums);
+        assert!(options.max_size_bytes.is_none());
+    }
 }

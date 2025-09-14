@@ -3,12 +3,12 @@
 //! This example demonstrates how to integrate NeuralVDB methods with our
 //! sparse adaptive layer mechanism for 10-100x compression ratios.
 
-use hyprstream::storage::vdb::{
+use hyprstream_core::storage::vdb::{
     HardwareVDBStorage, NeuralVDBCodec, VDBConfig,
     CompressionStats, HierarchyLevel
 };
-use hyprstream::adapters::sparse_lora::{SparseLoRAAdapter, SparseLoRAConfig};
-use hyprstream::adapters::qwen3::{Qwen3Config};
+use hyprstream_core::adapters::sparse_lora::{SparseLoRAAdapter, SparseLoRAConfig};
+use hyprstream_core::adapters::qwen3::{Qwen3Config};
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -239,7 +239,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Create temporal perturbations for animation demo
 fn create_temporal_perturbations(time: f32) -> HashMap<Coordinate3D, f32> {
-    use hyprstream::storage::vdb::Coordinate3D;
+    use hyprstream_core::storage::vdb::Coordinate3D;
     
     let mut perturbations = HashMap::new();
     
@@ -258,7 +258,7 @@ fn create_temporal_perturbations(time: f32) -> HashMap<Coordinate3D, f32> {
 
 /// Create streaming weight updates for real-time demo
 fn create_streaming_updates(batch: usize) -> HashMap<Coordinate3D, f32> {
-    use hyprstream::storage::vdb::Coordinate3D;
+    use hyprstream_core::storage::vdb::Coordinate3D;
     
     let mut updates = HashMap::new();
     

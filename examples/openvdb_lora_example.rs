@@ -3,7 +3,7 @@
 //! This shows how to use OpenVDB for efficient storage and manipulation
 //! of 99% sparse LoRA adapter weights with real-time updates.
 
-use hyprstream::storage::vdb::{OpenVDBLoRAAdapter, OpenVDBBatchOps};
+use hyprstream_core::storage::vdb::{OpenVDBLoRAAdapter, OpenVDBBatchOps};
 use std::collections::HashMap;
 use anyhow::Result;
 use rand;

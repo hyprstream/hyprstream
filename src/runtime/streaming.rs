@@ -63,7 +63,7 @@ impl SseStreamingCallback {
         Self {
             sender,
             buffer: String::new(),
-            chunk_size: 3, // Send every 3 tokens for balance between latency and efficiency
+            chunk_size: 1, // Send every token immediately for minimal latency
             model,
             stream_id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
             tokens_sent: 0,

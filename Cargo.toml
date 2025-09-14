@@ -42,6 +42,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_derive = "1.0"
 lazy_static = "1.4"
 serde_json = "1.0"
+json-threat-protection = "0.1.1"
 nix = "0.27"
 users = "0.11"
 rlimit = "0.10"
@@ -87,6 +88,7 @@ tch = { version = "0.20", features = ["download-libtorch"] }
 tokenizers = { version = "0.20", features = ["onig"] }
 safetensors = "0.4"
 regex = "1.11"
+minijinja = { version = "2.12.0", features = ["builtins"] }
 
 # Runtime Integration Dependencies
 # llama-cpp-2 = "0.1.67"          # REMOVED: Replaced by Tch (PyTorch) inference
@@ -96,6 +98,7 @@ regex = "1.11"
 hf-hub = { version = "0.4.3", features = ["tokio"] }  # HuggingFace model downloads
 uuid = { version = "1.0", features = ["v4", "serde"] }
 reqwest = { version = "0.11", features = ["json", "stream"] }
+lru = "0.16.1"  # LRU cache for model caching
 indicatif = "0.17"              # Progress bars
 fastrand = "2.0"                # Fast random number generation for sampling
 xdg = "2.5"                     # XDG Base Directory specification

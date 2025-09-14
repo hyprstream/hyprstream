@@ -25,10 +25,9 @@ use crate::{
         ListModelsResponse, Model, Usage,
         OpenAIStreamResponse, StreamChoice, Delta,
     },
-    runtime::{RuntimeEngine, GenerationRequest, FinishReason},
+    runtime::{RuntimeEngine, GenerationRequest, FinishReason, TorchEngine},
     server::{
         state::{ServerState, ServerConfig},
-        engine_pool::EnginePoolError,
     },
 };
 
@@ -85,7 +84,7 @@ impl ErrorResponse {
     }
     
     fn service_unavailable(message: impl Into<String>) -> Self {
-        Self::new(message, "service_unavailable", "engine_pool_exhausted")
+        Self::new(message, "service_unavailable", "model_cache_exhausted")
     }
     
     #[allow(dead_code)]
@@ -149,8 +148,17 @@ async fn chat_completions(
     State(state): State<ServerState>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Response {
+    // Debug log the incoming request
+    info!("Chat completion request - model: {}, stream: {:?}, messages: {} msgs", 
+        request.model, request.stream, request.messages.len());
+    
+    // Log if streaming is defaulting
+    let is_streaming = request.stream.unwrap_or(false);
+    info!("Streaming mode: {} (explicit: {:?})", is_streaming, request.stream);
+    
     // Validate request
     if let Err(e) = validate_chat_request(&request, &state.config) {
+        error!("Request validation failed: {}", e);
         return (StatusCode::BAD_REQUEST, Json(ErrorResponse::new(
             e,
             "invalid_request",
@@ -166,55 +174,69 @@ async fn chat_completions(
     
     // Check for streaming
     if request.stream.unwrap_or(false) {
+        info!("Handling streaming request");
         return stream_chat(state, request).await;
     }
+    info!("Handling non-streaming request");
     
-    // Acquire engine from pool - let the pool handle model loading
-    // The API layer should not be concerned with HOW models are loaded
-    let engine_guard = match state.engine_pool.read().await.acquire_model(&request.model).await {
-        Ok(guard) => guard,
+    // Get engine from model cache
+    let engine = match state.model_cache.get_or_load_by_name(&request.model).await {
+        Ok(engine) => engine,
         Err(e) => {
-            error!("Failed to acquire engine for model '{}': {}", request.model, e);
+            error!("Failed to load model '{}': {}", request.model, e);
             state.metrics.active_requests.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             
-            // Determine appropriate error response based on error type
-            let (status, error_response) = match e {
-                EnginePoolError::ModelNotFound(model) => (
+            // Determine appropriate error response
+            let (status, error_response) = if e.to_string().contains("not found") {
+                (
                     StatusCode::NOT_FOUND,
                     ErrorResponse::new(
-                        format!("Model '{}' not found", model),
+                        format!("Model '{}' not found", request.model),
                         "model_not_found",
                         "invalid_model"
                     )
-                ),
-                EnginePoolError::ModelLoadFailed(model, err) => (
+                )
+            } else if e.to_string().contains("failed to load") {
+                (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ErrorResponse::new(
-                        format!("Model '{}' failed to load: {}", model, err),
+                        format!("Model '{}' failed to load: {}", request.model, e),
                         "model_load_error",
                         "internal_error"
                     )
-                ),
-                EnginePoolError::NoEnginesAvailable | EnginePoolError::PoolExhausted => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    ErrorResponse::service_unavailable("No engines available")
-                ),
-                EnginePoolError::Internal(err) => (
+                )
+            } else {
+                (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorResponse::internal_error(&err)
-                ),
+                    ErrorResponse::internal_error(&e.to_string())
+                )
             };
             
             return (status, Json(error_response)).into_response();
         }
     };
     
-    let engine = engine_guard.get();
-    
-    // Create generation request - let the backend handle message formatting
+    // Create generation request - use template-aware formatting
     let defaults = &state.config.generation_defaults;
+    info!("Formatting messages with template...");
+    let formatted_prompt = match format_messages_with_template(&request.messages, &engine).await {
+        Ok(prompt) => {
+            info!("Template formatting successful, prompt preview: {}", 
+                &prompt.chars().take(200).collect::<String>());
+            prompt
+        },
+        Err(e) => {
+            error!("Template formatting failed: {}", e);
+            state.metrics.active_requests.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new(
+                e,
+                "template_error",
+                "template_formatting_failed"
+            ))).into_response();
+        }
+    };
     let gen_request = GenerationRequest {
-        prompt: format_messages(&request.messages),
+        prompt: formatted_prompt,
         max_tokens: request.max_tokens.unwrap_or(defaults.max_tokens),
         temperature: request.temperature.unwrap_or(defaults.temperature),
         top_p: request.top_p.unwrap_or(defaults.top_p),
@@ -229,11 +251,13 @@ async fn chat_completions(
     };
     
     // Generate response
+    info!("Starting generation with prompt length: {}", gen_request.prompt.len());
     let result = {
-        let engine = engine.lock().await;
-        engine.generate_with_params(gen_request).await
+        let engine_guard = engine.lock().await;
+        engine_guard.generate_with_params(gen_request).await
     };
     
+    info!("Generation completed - success: {}", result.is_ok());
     state.metrics.active_requests.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     
     match result {
@@ -329,32 +353,43 @@ async fn stream_chat(
     tokio::spawn(async move {
         // Ensure metrics are decremented on all exit paths
         let _metrics_guard = MetricsGuard::new(&state.metrics);
-        // Acquire engine with the requested model
-        let engine_guard = match state.engine_pool.read().await.acquire_model(&model_name).await {
-            Ok(guard) => guard,
+        // Get engine from model cache
+        let engine_arc = match state.model_cache.get_or_load_by_name(&model_name).await {
+            Ok(engine) => engine,
             Err(e) => {
-                let error_msg = match e {
-                    EnginePoolError::ModelNotFound(m) => {
-                        format!("Model '{}' not found", m)
-                    }
-                    _ => e.to_string()
+                let error_msg = if e.to_string().contains("not found") {
+                    format!("Model '{}' not found", model_name)
+                } else {
+                    e.to_string()
                 };
                 let _ = tx.send(Err(anyhow::anyhow!(error_msg))).await;
                 return;
             }
         };
         
-        let engine_arc = engine_guard.get();
+        // Format messages BEFORE locking the engine to avoid deadlock
+        info!("Formatting messages for streaming...");
+        let prompt = match format_messages_with_template(&messages, &engine_arc).await {
+            Ok(p) => {
+                info!("Streaming template formatting successful, prompt length: {}", p.len());
+                p
+            },
+            Err(e) => {
+                error!("Template formatting failed in streaming: {}", e);
+                let _ = tx.send(Err(anyhow::anyhow!("Template formatting failed: {}", e))).await;
+                return;
+            }
+        };
+        
+        // NOW lock the engine for generation
         let engine = engine_arc.lock().await;
         
         // Create SSE streaming callback (clone tx for callback)
         let tx_callback = tx.clone();
         let callback = Box::new(
-            crate::runtime::streaming::SseStreamingCallback::new(tx_callback, model_name)
+            crate::runtime::streaming::SseStreamingCallback::new(tx_callback, model_name.clone())
         );
         
-        // Create generation request
-        let prompt = format_messages(&messages);
         let gen_request = GenerationRequest {
             prompt,
             max_tokens,
@@ -377,8 +412,10 @@ async fn stream_chat(
         };
         
         // Generate with async streaming
+        info!("Starting streaming generation...");
         match engine.generate_streaming_async(gen_request, callback, context).await {
             Ok(result) => {
+                info!("Streaming generation completed with {} tokens", result.tokens_generated);
                 // Update metrics
                 state.metrics.total_tokens.fetch_add(
                     result.tokens_generated as u64,
@@ -450,39 +487,30 @@ async fn completions(
     state.metrics.active_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     state.metrics.total_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     
-    // Acquire engine with the requested model - let the pool handle everything
-    let engine_guard = match state.engine_pool.read().await.acquire_model(&request.model).await {
-        Ok(guard) => guard,
+    // Get engine from model cache
+    let engine = match state.model_cache.get_or_load_by_name(&request.model).await {
+        Ok(engine) => engine,
         Err(e) => {
             state.metrics.active_requests.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             
-            // Use proper error matching
-            let (status, error_json) = match e {
-                EnginePoolError::ModelNotFound(model) => (
+            // Determine error type
+            let (status, error_json) = if e.to_string().contains("not found") {
+                (
                     StatusCode::NOT_FOUND,
                     serde_json::json!({
                         "error": {
-                            "message": format!("Model '{}' not found", model),
+                            "message": format!("Model '{}' not found", request.model),
                             "type": "model_not_found",
                             "code": "invalid_model"
                         }
                     })
-                ),
-                EnginePoolError::NoEnginesAvailable | EnginePoolError::PoolExhausted => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    serde_json::json!({
-                        "error": {
-                            "message": "No engines available",
-                            "type": "service_unavailable",
-                            "code": "engine_pool_exhausted"
-                        }
-                    })
-                ),
-                _ => (
+                )
+            } else {
+                (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     serde_json::json!({
                         "error": {
-                            "message": format!("Failed to acquire engine: {}", e),
+                            "message": format!("Failed to load model: {}", e),
                             "type": "internal_error",
                             "code": "engine_error"
                         }
@@ -494,10 +522,31 @@ async fn completions(
         }
     };
     
-    let engine = engine_guard.get();
+    // Convert raw prompt to chat format and apply template
+    // The completions endpoint expects raw text, but modern models need templated input
+    let messages = vec![ChatMessage {
+        role: "user".to_string(),
+        content: Some(request.prompt.clone()),
+        function_call: None,
+    }];
+    
+    let formatted_prompt = match format_messages_with_template(&messages, &engine).await {
+        Ok(prompt) => prompt,
+        Err(e) => {
+            error!("Template formatting failed for completions endpoint: {}", e);
+            state.metrics.active_requests.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": {
+                    "message": format!("Template formatting failed: {}", e),
+                    "type": "template_error",
+                    "code": "template_formatting_failed"
+                }
+            }))).into_response();
+        }
+    };
     
     let gen_request = GenerationRequest {
-        prompt: request.prompt.clone(),
+        prompt: formatted_prompt,
         max_tokens: request.max_tokens.unwrap_or(2048),
         temperature: request.temperature.unwrap_or(1.0),
         top_p: request.top_p.unwrap_or(1.0),
@@ -611,21 +660,16 @@ async fn list_models(
         }
     }
     
-    // Add currently loaded model if available and not in list
-    if let Some(ref default_model) = state.config.default_model {
-        // Check if this model is already in the list
-        let model_name = std::path::Path::new(default_model)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(default_model);
-        
-        if !models.iter().any(|m| m.id == model_name) {
-            models.push(Model {
-                id: model_name.to_string(),
-                object: "model".to_string(),
-                created: chrono::Utc::now().timestamp(),
-                owned_by: "system".to_string(),
-            });
+    // Add cached models with a special indicator
+    // This helps users know which models are already loaded and will be fast
+    let cache_stats = state.model_cache.stats().await;
+    if cache_stats.cached_models > 0 {
+        // Mark cached models in the list
+        for model in models.iter_mut() {
+            if state.model_cache.is_cached_by_name(&model.id).await {
+                // Append indicator that model is cached
+                model.owned_by = format!("{} (cached)", model.owned_by);
+            }
         }
     }
     
@@ -657,16 +701,33 @@ async fn list_models(
     response
 }
 
-/// Format chat messages into a prompt
-fn format_messages(messages: &[ChatMessage]) -> String {
-    messages.iter()
-        .map(|msg| {
-            format!("{}: {}", 
-                msg.role, 
-                msg.content.as_ref().unwrap_or(&String::new())
-            )
+/// Format chat messages into a prompt using template engine
+async fn format_messages_with_template(
+    messages: &[ChatMessage],
+    engine: &Arc<Mutex<TorchEngine>>,
+) -> Result<String, String> {
+    // Log messages for debugging
+    for (i, msg) in messages.iter().enumerate() {
+        info!("Message {}: role={}, content={:?}", i, msg.role, 
+            msg.content.as_ref().map(|c| &c[..c.len().min(100)]));
+    }
+    
+    // Convert OpenAI messages to template engine format
+    let template_messages: Vec<crate::runtime::template_engine::ChatMessage> = messages
+        .iter()
+        .map(|msg| crate::runtime::template_engine::ChatMessage {
+            role: msg.role.clone(),
+            content: msg.content.as_ref().unwrap_or(&String::new()).clone(),
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    
+    info!("Acquiring engine lock for template formatting...");
+    // Apply the engine's template formatting
+    let engine_guard = engine.lock().await;
+    info!("Engine lock acquired, applying template...");
+    let result = engine_guard.apply_chat_template(&template_messages, true)
+        .map_err(|e| format!("Failed to apply chat template: {}", e));
+    info!("Template application complete: {:?}", result.is_ok());
+    result
 }
 

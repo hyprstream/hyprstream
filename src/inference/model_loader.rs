@@ -105,7 +105,7 @@ pub struct TensorInfo {
     pub size_bytes: usize,
 }
 
-/// Tokenizer handle
+/// Tokenizer handle with template support
 #[derive(Debug, Clone)]
 pub struct TokenizerHandle {
     pub vocab_size: usize,
@@ -113,6 +113,14 @@ pub struct TokenizerHandle {
     pub bos_token_id: Option<u32>,
     pub eos_token_id: Option<u32>,
     pub unk_token_id: Option<u32>,
+    /// Chat template from tokenizer_config.json
+    pub chat_template: Option<String>,
+    /// Special tokens mapping
+    pub special_tokens: std::collections::HashMap<String, String>,
+    /// Whether to add generation prompt
+    pub add_generation_prompt: bool,
+    /// Model type for fallback templates
+    pub model_type: Option<String>,
 }
 
 /// Model metadata
@@ -377,7 +385,7 @@ impl ModelLoader {
         })
     }
     
-    /// Load tokenizer configuration
+    /// Load tokenizer configuration with template support
     async fn load_tokenizer(&self, model_path: &Path) -> Result<TokenizerHandle> {
         let tokenizer_config_path = model_path.join("tokenizer_config.json");
         
@@ -408,12 +416,65 @@ impl ModelLoader {
             .and_then(|v| v.as_u64())
             .map(|n| n as u32);
         
+        // Parse chat template
+        let chat_template = config.get("chat_template")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        
+        // Parse special tokens
+        let mut special_tokens = std::collections::HashMap::new();
+        
+        // Helper function to extract token value (handles both string and object formats)
+        let extract_token = |value: &serde_json::Value| -> Option<String> {
+            if let Some(s) = value.as_str() {
+                Some(s.to_string())
+            } else if let Some(obj) = value.as_object() {
+                obj.get("content").and_then(|v| v.as_str()).map(|s| s.to_string())
+            } else {
+                None
+            }
+        };
+        
+        // Extract all special tokens
+        if let Some(bos) = config.get("bos_token").and_then(extract_token) {
+            special_tokens.insert("bos_token".to_string(), bos);
+        }
+        if let Some(eos) = config.get("eos_token").and_then(extract_token) {
+            special_tokens.insert("eos_token".to_string(), eos);
+        }
+        if let Some(pad) = config.get("pad_token").and_then(extract_token) {
+            special_tokens.insert("pad_token".to_string(), pad);
+        }
+        if let Some(unk) = config.get("unk_token").and_then(extract_token) {
+            special_tokens.insert("unk_token".to_string(), unk);
+        }
+        if let Some(sep) = config.get("sep_token").and_then(extract_token) {
+            special_tokens.insert("sep_token".to_string(), sep);
+        }
+        if let Some(cls) = config.get("cls_token").and_then(extract_token) {
+            special_tokens.insert("cls_token".to_string(), cls);
+        }
+        
+        // Parse add_generation_prompt setting
+        let add_generation_prompt = config.get("add_generation_prompt")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        
+        // Try to determine model type from config
+        let model_type = config.get("model_type")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        
         Ok(TokenizerHandle {
             vocab_size,
             pad_token_id,
             bos_token_id,
             eos_token_id,
             unk_token_id,
+            chat_template,
+            special_tokens,
+            add_generation_prompt,
+            model_type,
         })
     }
     

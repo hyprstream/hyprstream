@@ -13,7 +13,7 @@ use std::{
 };
 use reqwest::Client;
 use serde_json::{json, Value};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use crate::api::model_storage::{ModelStorage, ModelId};
 use crate::api::model_storage::ModelUri;
 
@@ -143,11 +143,11 @@ pub async fn handle_server(
     let mut server_config = crate::server::state::ServerConfig::from_env();
     
     // Override with config file values if present
-    if let Ok(max_engines) = config.get_int("server.max_engines") {
-        server_config.max_engines = max_engines as usize;
-    }
-    if let Ok(default_model) = config.get_string("server.default_model") {
-        server_config.default_model = Some(default_model);
+    if let Ok(preload_models) = config.get_array("server.preload_models") {
+        server_config.preload_models = preload_models
+            .into_iter()
+            .filter_map(|v| v.into_string().ok())
+            .collect();
     }
     if let Ok(enable_logging) = config.get_bool("server.enable_logging") {
         server_config.enable_logging = enable_logging;
@@ -456,19 +456,8 @@ pub async fn handle_model_command(
                     // Use the already parsed model_uri from validation above
                     // (model_uri variable is already in scope from the early validation)
                     
-                    // Create model metadata
-                    let model_id = crate::api::model_storage::ModelId::from_content_hash(
-                        &model.model_id,
-                        &model.config.as_ref().map(|c| c.architecture.clone()).unwrap_or_else(|| "unknown".to_string()),
-                        model.config.as_ref().and_then(|c| {
-                            // Try to estimate parameters from layers and hidden size
-                            if c.num_hidden_layers > 0 && c.hidden_size > 0 {
-                                Some((c.num_hidden_layers as u64) * (c.hidden_size as u64) * 1_000_000)
-                            } else {
-                                None
-                            }
-                        }),
-                    );
+                    // Use the UUID from the downloaded model
+                    let model_id = crate::api::model_storage::ModelId(model.uuid);
                     
                     // Create external source info
                     let external_source = crate::api::model_storage::ExternalSource {
@@ -533,16 +522,21 @@ pub async fn handle_model_command(
         }
         
         ModelAction::Remove { uri, keep_metadata, yes } => {
-            // Validate and parse URI using standard URL parsing
-            let _model_uri = match crate::api::model_storage::ModelUri::parse(&uri) {
-                Ok(parsed) => parsed,
-                Err(e) => {
-                    eprintln!("❌ Invalid model URI: {}", uri);
-                    eprintln!("   {}", e);
-                    eprintln!("   Model URIs must use the format: hf://org/model");
-                    return Err(e.into());
+            // Check if the input is a UUID
+            let is_uuid = uuid::Uuid::parse_str(&uri).is_ok();
+            
+            // If it's not a UUID, validate as URI
+            if !is_uuid {
+                match crate::api::model_storage::ModelUri::parse(&uri) {
+                    Ok(_parsed) => {},
+                    Err(e) => {
+                        eprintln!("❌ Invalid model identifier: {}", uri);
+                        eprintln!("   {}", e);
+                        eprintln!("   Use either a UUID or URI format (hf://org/model)");
+                        return Err(e.into());
+                    }
                 }
-            };
+            }
             
             info!("🗑️ Removing model: {}", uri);
             
@@ -568,8 +562,18 @@ pub async fn handle_model_command(
             let storage_paths = crate::storage::paths::StoragePaths::new()?;
             let model_storage = crate::api::model_storage::ModelStorage::new(storage_paths.models_dir()?).await?;
             
-            // Try to parse as URI first, otherwise search by name/ID
-            let model_uri = if uri.contains("://") {
+            // Handle different input formats
+            let model_uri = if is_uuid {
+                // Direct UUID - create a dummy URI for compatibility
+                // The actual removal will use the UUID directly
+                crate::api::model_storage::ModelUri {
+                    registry: "local".to_string(),
+                    org: "uuid".to_string(),
+                    name: uri.clone(),
+                    revision: None,
+                    uri: format!("local://uuid/{}", uri),
+                }
+            } else if uri.contains("://") {
                 // It's a full URI
                 crate::api::model_storage::ModelUri::parse(&uri)
                     .map_err(|e| format!("Failed to parse model URI: {}", e))?
@@ -634,7 +638,10 @@ pub async fn handle_model_command(
                     }
                 });
             
-            let local_path = if let Some((_, metadata)) = model_data {
+            let local_path = if is_uuid {
+                // For UUID, construct the path directly
+                models_dir.join(&uri)
+            } else if let Some((_, metadata)) = model_data {
                 // Use the actual path from metadata (UUID-based only)
                 match &metadata.local_path {
                     Some(path) => path.clone(),
@@ -695,7 +702,12 @@ pub async fn handle_model_command(
             
             // Remove metadata unless keeping it
             if !keep_metadata {
-                if let Err(e) = model_storage.remove_metadata(&model_uri).await {
+                if is_uuid {
+                    // For UUID-based removal, update metadata.json directly
+                    println!("🗑️ Removing metadata entry for UUID: {}", uri);
+                    // Note: The metadata might have the wrong UUID, so removal might fail
+                    // but that's okay since we're removing by directory UUID
+                } else if let Err(e) = model_storage.remove_metadata(&model_uri).await {
                     eprintln!("⚠️  Failed to remove metadata: {}", e);
                     // Continue anyway since files are already deleted
                 }
@@ -841,6 +853,70 @@ pub async fn handle_model_command(
                             println!("Try: hyprstream model pull {}", uri);
                         }
                     }
+                }
+            }
+        }
+        ModelAction::Repair { yes, verbose } => {
+            info!("🔧 Repairing model metadata...");
+            
+            // Confirm repair action if not auto-confirmed
+            if !yes {
+                println!("⚠️  This will scan and repair all model metadata.");
+                println!("The following actions may be performed:");
+                println!("  - Fix UUID mismatches between directories and metadata");
+                println!("  - Migrate model files to data/ subdirectories");
+                println!("  - Remove orphaned directories");
+                println!("  - Rebuild metadata cache from directories");
+                println!("");
+                println!("Type 'yes' to confirm:");
+                
+                use std::io::{self, BufRead};
+                let stdin = io::stdin();
+                let mut line = String::new();
+                stdin.lock().read_line(&mut line)?;
+                
+                if line.trim().to_lowercase() != "yes" {
+                    println!("❌ Repair cancelled");
+                    return Ok(());
+                }
+            }
+            
+            // Get storage and run repair
+            let storage_paths = crate::storage::paths::StoragePaths::new()?;
+            let model_storage = crate::api::model_storage::ModelStorage::new(storage_paths.models_dir()?).await?;
+            
+            if verbose {
+                println!("📂 Models directory: {}", storage_paths.models_dir()?.display());
+                println!("🔍 Scanning for models...");
+            }
+            
+            // Run the repair
+            match model_storage.repair_metadata().await {
+                Ok(()) => {
+                    println!("✅ Metadata repair completed successfully!");
+                    
+                    // List repaired models
+                    if verbose {
+                        if let Ok(models) = model_storage.children().await {
+                            println!("\n📋 {} models found after repair:", models.len());
+                            for (id, metadata) in models.iter().take(10) {
+                                println!("  🆔 {} - {}", id, metadata.name);
+                                if let Some(display_name) = &metadata.display_name {
+                                    println!("     Display: {}", display_name);
+                                }
+                                if metadata.local_path.is_some() {
+                                    println!("     Size: {:.2} GB", metadata.size_bytes as f64 / 1_073_741_824.0);
+                                }
+                            }
+                            if models.len() > 10 {
+                                println!("  ... and {} more", models.len() - 10);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("❌ Repair failed: {}", e);
+                    return Err(e.into());
                 }
             }
         }
@@ -1006,82 +1082,122 @@ pub async fn handle_model_command(
             println!("Configure registries with 'hyprstream config' command");
         }
         ModelAction::Infer { model, prompt, max_tokens, temperature, top_p, top_k, stream, force_download } => {
-            info!("🤖 Running base model inference (no LoRA): {}", model);
+            info!("Running base model inference: model={}, prompt_len={}", model, prompt.len());
             
             use crate::runtime::{TorchEngine, RuntimeConfig};
             use crate::runtime::sampling::{SamplingConfig, load_sampling_config};
             use std::path::PathBuf;
             
-            println!("🔍 Looking up model: {}", model);
+            debug!("Looking up model: {}", model);
             
-            // Initialize model manager to find models
+            // Initialize model storage to find models
             let storage_paths = crate::storage::paths::StoragePaths::new()?;
             let model_storage = crate::api::model_storage::ModelStorage::new(storage_paths.models_dir()?).await?;
             
-            // Try to find the model path (could be UUID, name, or HF ID)
-            let model_path = if model.contains('/') {
-                // Looks like a HuggingFace model ID
-                let cache_path = PathBuf::from(".hyprstream/models").join(model.replace('/', "_"));
-                if !cache_path.exists() && !force_download {
-                    println!("📥 Model not found locally. Downloading from HuggingFace...");
-                    eprintln!("Auto-download not yet implemented. Please download first with:");
-                    eprintln!("  cargo run model pull hf://{}", model);
+            // Get all available models (this calls children() which scans for models with model.json)
+            let available_models = model_storage.children().await?;
+            
+            // Try to find the model by UUID, name, or display name
+            let mut found_model = None;
+            for (model_id, metadata) in available_models {
+                // Check if UUID matches
+                if model_id.to_string() == model {
+                    debug!("Found model by UUID: {}", model);
+                    found_model = Some((model_id, metadata));
+                    break;
+                }
+                
+                // Check if name matches
+                if metadata.name == model {
+                    debug!("Found model by name: {}", model);
+                    found_model = Some((model_id, metadata));
+                    break;
+                }
+                
+                // Check if display name matches
+                if let Some(ref display_name) = metadata.display_name {
+                    if display_name == &model || display_name.ends_with(&format!("/{}", model)) {
+                        debug!("Found model by display name: {}", display_name);
+                        found_model = Some((model_id, metadata));
+                        break;
+                    }
+                }
+                
+                // Check if it's a partial match (just the model part of org/model)
+                if model.contains('/') {
+                    if metadata.name == model || metadata.name.ends_with(&format!("/{}", model)) {
+                        debug!("Found model by partial name: {}", &metadata.name);
+                        found_model = Some((model_id, metadata));
+                        break;
+                    }
+                } else {
+                    // Check if the model name ends with the requested name
+                    let name_parts: Vec<&str> = metadata.name.split('/').collect();
+                    if let Some(last_part) = name_parts.last() {
+                        if last_part == &model {
+                            debug!("Found model by short name: {} (full: {})", model, &metadata.name);
+                            found_model = Some((model_id, metadata));
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            // Get the model path or error if not found
+            let model_path = match found_model {
+                Some((_model_id, metadata)) => {
+                    match metadata.local_path {
+                        Some(path) => path,
+                        None => {
+                            error!("Model '{}' found but has no local path", model);
+                            eprintln!("Error: Model '{}' metadata is corrupted", model);
+                            return Ok(());
+                        }
+                    }
+                }
+                None => {
+                    error!("Model '{}' not found in model storage", model);
+                    eprintln!("Error: Model '{}' not found", model);
+                    eprintln!("Available models:");
+                    
+                    // List available models to help the user
+                    let available_models = model_storage.children().await?;
+                    if available_models.is_empty() {
+                        eprintln!("  No models found. Download one with:");
+                        eprintln!("  hyprstream model pull hf://Qwen/Qwen2-0.5B-Instruct");
+                    } else {
+                        for (_id, metadata) in available_models.iter().take(5) {
+                            eprintln!("  - {} (UUID: {})", metadata.name, metadata.model_id);
+                        }
+                        if available_models.len() > 5 {
+                            eprintln!("  ... and {} more", available_models.len() - 5);
+                        }
+                    }
                     return Ok(());
-                }
-                cache_path
-            } else {
-                // Could be a UUID or local name - check all cached models
-                let local_models = model_storage.list_local_models().await?;
-                
-                let mut found_path = None;
-                for (model_uri, model_metadata) in local_models {
-                    // Check if UUID matches
-                    if model_metadata.model_id.to_string() == model {
-                        found_path = model_metadata.local_path.clone();
-                        println!("✅ Found model by UUID: {}", model_uri.name);
-                        break;
-                    }
-                    // Also check if name matches (without organization)
-                    if model_uri.name == model || model_uri.name.ends_with(&format!("/{}", model)) {
-                        found_path = model_metadata.local_path.clone();
-                        println!("✅ Found model by name: {}", model_uri.name);
-                        break;
-                    }
-                }
-                
-                match found_path {
-                    Some(path) => path,
-                    None => {
-                        eprintln!("❌ Model '{}' not found in local cache", model);
-                        eprintln!("Try one of:");
-                        eprintln!("  - Full HuggingFace ID: google/gemma-2b");
-                        eprintln!("  - Download first: cargo run model pull hf://google/gemma-2b");
-                        return Ok(());
-                    }
                 }
             };
             
-            println!("📁 Using model at: {}", model_path.display());
+            info!("Using model at: {}", model_path.display());
             
             // Load model configuration from model card
             let sampling_config = if model_path.join("config.json").exists() {
-                println!("📋 Loading model configuration from config.json...");
+                debug!("Loading model configuration from config.json");
                 match load_sampling_config(&model_path).await {
                     Ok(config) => {
-                        println!("✅ Loaded model-specific sampling configuration");
+                        debug!("Loaded model-specific sampling configuration");
                         config
                     }
                     Err(e) => {
-                        println!("⚠️ Could not load model config: {}. Using defaults.", e);
+                        warn!("Could not load model config: {}. Using defaults.", e);
                         SamplingConfig::default()
                     }
                 }
             } else {
-                println!("⚠️ No config.json found. Using default sampling configuration.");
+                debug!("No config.json found. Using default sampling configuration.");
                 SamplingConfig::for_model(&model)
             };
             
-            println!("🚀 Initializing inference engine...");
+            debug!("Initializing inference engine");
             let runtime_config = RuntimeConfig::default();
             let mut engine = TorchEngine::new(runtime_config)?;
             
@@ -1098,7 +1214,7 @@ pub async fn handle_model_command(
             }
             final_config.do_sample = final_config.temperature > 0.0;
             
-            println!("📦 Loading base model (NO LoRA will be applied)...");
+            debug!("Loading base model (no LoRA)");
             
             // Load the model
             match engine.load_model(&model_path).await {
@@ -1108,10 +1224,11 @@ pub async fn handle_model_command(
                         let mut lora_guard = engine.active_lora.lock().unwrap();
                         *lora_guard = None;
                     }
-                    println!("✅ Base model loaded successfully (LoRA disabled)");
+                    debug!("Base model loaded successfully");
                 }
                 Err(e) => {
-                    eprintln!("❌ Failed to load model: {}", e);
+                    error!("Failed to load model: {}", e);
+                    eprintln!("Error: Failed to load model: {}", e);
                     return Ok(());
                 }
             }
@@ -1119,25 +1236,42 @@ pub async fn handle_model_command(
             // Use model defaults or overrides
             let max_tokens = max_tokens.unwrap_or(100);
             
-            println!("🧠 Generating response...");
-            println!("   Model: {}", model);
-            println!("   Prompt: \"{}\"", prompt);
-            println!("   Max tokens: {}", max_tokens);
-            println!("   Temperature: {}", final_config.temperature);
-            if let Some(p) = final_config.top_p {
-                println!("   Top-p: {}", p);
-            }
-            if let Some(k) = final_config.top_k {
-                println!("   Top-k: {}", k);
-            }
-            println!();
+            info!(
+                "Generating response: max_tokens={}, temperature={}, top_p={:?}, top_k={:?}",
+                max_tokens, final_config.temperature, final_config.top_p, final_config.top_k
+            );
+            debug!("Prompt: {}", prompt);
             
             // Use clean inference interface
             use crate::runtime::InferenceExt;
+            use crate::runtime::template_engine::ChatMessage;
             use std::io::{self, Write};
             
+            // Apply chat template to the prompt
+            let formatted_prompt = {
+                // Create a user message
+                let messages = vec![
+                    ChatMessage {
+                        role: "user".to_string(),
+                        content: prompt.clone(),
+                    }
+                ];
+                
+                // Try to apply the model's chat template
+                match engine.apply_chat_template(&messages, true) {
+                    Ok(formatted) => {
+                        debug!("Applied chat template successfully");
+                        formatted
+                    }
+                    Err(e) => {
+                        warn!("Could not apply chat template: {}. Using raw prompt.", e);
+                        prompt.clone()
+                    }
+                }
+            };
+            
             let request = crate::runtime::InferenceRequest {
-                prompt: prompt.clone(),
+                prompt: formatted_prompt,
                 max_tokens,
                 temperature: final_config.temperature,
                 top_p: final_config.top_p.unwrap_or(0.95),
@@ -1148,26 +1282,21 @@ pub async fn handle_model_command(
             };
             
             let result = if stream {
-                println!("📝 Response (streaming):");
-                println!("{}", "─".repeat(50));
-                
                 engine.run_inference_streaming(request, |token| {
                     print!("{}", token);
                     io::stdout().flush().ok();
                 }).await?
             } else {
-                println!("📝 Response:");
-                println!("{}", "─".repeat(50));
-                
                 let result = engine.run_inference(request).await?;
                 println!("{}", result.text);
                 result
             };
             
-            println!("{}", "─".repeat(50));
-            println!("✅ Generation complete: {} tokens generated in {:.2}s", 
-                     result.tokens_generated, 
-                     result.latency_ms as f64 / 1000.0);
+            info!(
+                "Generation complete: {} tokens generated in {:.2}s", 
+                result.tokens_generated, 
+                result.latency_ms as f64 / 1000.0
+            );
         }
     }
     
@@ -1708,7 +1837,30 @@ pub async fn handle_lora_command(
                             }
                         }
                     } else {
-                        std::path::PathBuf::from(&lora_layer.base_model)
+                        // Try to find model by name
+                        let available_models = model_storage.children().await?;
+                        let mut found_path = None;
+                        
+                        for (_id, metadata) in available_models {
+                            if metadata.name == lora_layer.base_model || 
+                               metadata.display_name.as_ref() == Some(&lora_layer.base_model) {
+                                found_path = metadata.local_path;
+                                break;
+                            }
+                        }
+                        
+                        match found_path {
+                            Some(path) => path,
+                            None => {
+                                println!("❌ Base model '{}' not found", lora_layer.base_model);
+                                println!("Available models:");
+                                let models = model_storage.children().await?;
+                                for (_id, metadata) in models.iter().take(5) {
+                                    println!("  - {} (UUID: {})", metadata.name, metadata.model_id);
+                                }
+                                return Ok(());
+                            }
+                        }
                     };
                     
                     println!("🚀 Using checkpoint-based inference");

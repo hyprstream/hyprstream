@@ -27,6 +27,8 @@ pub fn create_router() -> Router<ServerState> {
         .route("/download", post(download_model))
         .route("/:id/load", post(load_model))
         .route("/:id/unload", post(unload_model))
+        .route("/cache/refresh", post(refresh_cache))
+        .route("/cache/stats", get(cache_stats))
 }
 
 /// Request to download a model
@@ -271,5 +273,37 @@ async fn unload_model(
     Json(serde_json::json!({
         "status": "unloaded",
         "id": id
+    })).into_response()
+}
+
+/// Refresh the model cache (rescans disk for models)
+async fn refresh_cache(
+    State(state): State<ServerState>,
+) -> impl IntoResponse {
+    match state.model_cache.refresh_name_cache().await {
+        Ok(_) => {
+            Json(serde_json::json!({
+                "status": "success",
+                "message": "Model cache refreshed successfully"
+            })).into_response()
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Failed to refresh cache: {}", e)
+            }))).into_response()
+        }
+    }
+}
+
+/// Get cache statistics
+async fn cache_stats(
+    State(state): State<ServerState>,
+) -> impl IntoResponse {
+    let stats = state.model_cache.stats().await;
+    Json(serde_json::json!({
+        "cached_models": stats.cached_models,
+        "cached_names": stats.cached_names,
+        "max_size": stats.max_size
     })).into_response()
 }

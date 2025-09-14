@@ -18,6 +18,8 @@ fn create_test_config() -> SparseStorageConfig {
         compaction_interval_secs: 60,
         streaming_updates: true,
         update_batch_size: 10,
+        layer_aware_mapping: false,  // Add missing field
+        sparsity_threshold: 0.01,    // Add missing field
     }
 }
 

@@ -8,7 +8,7 @@ use crate::{
         model_storage::ModelStorage,
     },
 };
-use super::engine_pool::EnginePool;
+use super::model_cache::ModelCache;
 
 /// Training service stub - placeholder until VDB storage integration
 pub struct TrainingStub;
@@ -34,8 +34,8 @@ impl TrainingStub {
 /// Shared server state
 #[derive(Clone)]
 pub struct ServerState {
-    /// Pool of inference engines for concurrent requests
-    pub engine_pool: Arc<RwLock<EnginePool>>,
+    /// Model cache for UUID-based model caching with LRU eviction
+    pub model_cache: Arc<ModelCache>,
     
     /// Registry of LoRA adapters
     pub lora_registry: Arc<LoRARegistry>,
@@ -124,11 +124,11 @@ impl Default for GenerationDefaults {
 /// Server configuration
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    /// Maximum number of engines in pool
-    pub max_engines: usize,
+    /// Maximum number of models to cache in memory
+    pub max_cached_models: usize,
     
-    /// Default model to load
-    pub default_model: Option<String>,
+    /// Models to preload at startup for faster first request
+    pub preload_models: Vec<String>,
     
     /// Enable request logging
     pub enable_logging: bool,
@@ -155,8 +155,8 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            max_engines: 4,
-            default_model: None,
+            max_cached_models: 5,
+            preload_models: Vec::new(),
             enable_logging: true,
             enable_metrics: true,
             api_key: None,
@@ -182,14 +182,19 @@ impl ServerConfig {
         // Use port-aware CORS config
         config.cors = CorsConfig::with_port(port);
         
-        if let Ok(max_engines) = std::env::var("HYPRSTREAM_MAX_ENGINES") {
-            if let Ok(n) = max_engines.parse() {
-                config.max_engines = n;
+        if let Ok(max_cached) = std::env::var("HYPRSTREAM_MAX_CACHED_MODELS") {
+            if let Ok(n) = max_cached.parse() {
+                config.max_cached_models = n;
             }
         }
         
-        if let Ok(model) = std::env::var("HYPRSTREAM_DEFAULT_MODEL") {
-            config.default_model = Some(model);
+        // Parse comma-separated list of models to preload
+        if let Ok(models) = std::env::var("HYPRSTREAM_PRELOAD_MODELS") {
+            config.preload_models = models
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
         }
         
         if let Ok(api_key) = std::env::var("HYPRSTREAM_API_KEY") {
@@ -286,20 +291,45 @@ impl ServerState {
         
         let training_service = Arc::new(TrainingStub);
         
-        // Initialize engine pool with model storage
-        let engine_pool = Arc::new(RwLock::new(
-            EnginePool::new(
-                config.max_engines, 
-                config.default_model.clone(),
-                Arc::clone(&model_storage)
-            ).await?
+        // Initialize model cache
+        let model_cache = Arc::new(ModelCache::new(
+            config.max_cached_models,
+            Arc::clone(&model_storage),
         ));
+        
+        // Pre-populate name cache to avoid disk scanning on first requests
+        if let Err(e) = model_cache.warm_name_cache().await {
+            tracing::warn!("Failed to warm name cache: {}. First requests may be slower.", e);
+        }
+        
+        // Preload models for faster first request
+        if !config.preload_models.is_empty() {
+            tracing::info!("Preloading {} models into cache...", config.preload_models.len());
+            for model_name in &config.preload_models {
+                tracing::info!("Preloading model: {}", model_name);
+                match model_cache.get_or_load_by_name(model_name).await {
+                    Ok(_) => tracing::info!("Successfully preloaded model: {}", model_name),
+                    Err(e) => tracing::warn!("Failed to preload model '{}': {}", model_name, e),
+                }
+            }
+        }
+        
+        // Start cache refresher if enabled
+        let refresher_config = super::cache_refresher::CacheRefresherConfig::from_env();
+        if refresher_config.enabled {
+            let refresher = super::cache_refresher::CacheRefresher::new(
+                Arc::clone(&model_cache),
+                refresher_config.interval_secs,
+            );
+            let _handle = refresher.start();
+            tracing::info!("Started background cache refresher");
+        }
         
         // Initialize metrics
         let metrics = Arc::new(Metrics::default());
         
         Ok(Self {
-            engine_pool,
+            model_cache,
             lora_registry,
             model_storage,
             training_service,

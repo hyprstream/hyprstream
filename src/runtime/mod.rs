@@ -29,6 +29,7 @@ pub mod kv_cache;            // Key-Value caching for efficient autoregressive g
 pub mod model_config;        // Unified model configuration management
 pub mod model_factory;       // Single factory for model creation
 pub mod streaming;           // Async streaming support for token-by-token generation
+pub mod template_engine;     // Jinja2 template engine for chat templates
 
 // Primary exports - use TorchEngine as default
 pub use torch_engine::TorchEngine;
@@ -91,6 +92,19 @@ pub trait RuntimeEngine: Send + Sync {
     
     /// Check if model is loaded and ready
     fn is_loaded(&self) -> bool;
+    
+    /// Apply chat template to messages (for template support)
+    fn apply_chat_template(&self, messages: &[template_engine::ChatMessage], add_generation_prompt: bool) -> Result<String> {
+        // Default implementation with simple formatting
+        let mut formatted = String::new();
+        for msg in messages {
+            formatted.push_str(&format!("{}: {}\n", msg.role, msg.content));
+        }
+        if add_generation_prompt {
+            formatted.push_str("assistant: ");
+        }
+        Ok(formatted)
+    }
     
     // NEW: X-LoRA and real-time adaptation capabilities (default implementations for backward compatibility)
     
