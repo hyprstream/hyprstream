@@ -1215,7 +1215,7 @@ impl ModelOperations for LlamaModel {
     }
     
     fn forward_with_cache(&self, input: &Tensor, start_pos: usize) -> Result<Tensor> {
-        tracing::info!("LlamaModel forward_with_cache: input shape={:?}, start_pos={}, config: hidden_size={}, num_layers={}", 
+        tracing::debug!("LlamaModel forward_with_cache: input shape={:?}, start_pos={}, config: hidden_size={}, num_layers={}", 
                      input.size(), start_pos, self.config.hidden_size, self.layers.len());
         
         // Input should be token IDs with shape [batch_size, seq_len]
@@ -1332,12 +1332,12 @@ impl ModelOperations for LlamaModel {
         }
         
         // LM head
-        tracing::info!("Before LM head: hidden_states shape={:?}", hidden_states.size());
+        tracing::debug!("Before LM head: hidden_states shape={:?}", hidden_states.size());
         if let Some(lm_head) = &self.lm_head {
             // LM head weight also needs to be transposed
-            tracing::info!("Using LM head: shape={:?}", lm_head.size());
+            tracing::debug!("Using LM head: shape={:?}", lm_head.size());
             hidden_states = hidden_states.matmul(lm_head);
-            tracing::info!("After LM head: logits shape={:?}", hidden_states.size());
+            tracing::debug!("After LM head: logits shape={:?}", hidden_states.size());
         } else if let Some(embed) = &self.embed_tokens {
             // Gemma and some other models tie weights: lm_head = embed_tokens.T
             // The embedding matrix is [vocab_size, hidden_size]
