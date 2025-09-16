@@ -102,18 +102,11 @@ impl TemplateEngine {
         let template_str = self.config.chat_template.as_ref()
             .ok_or_else(|| anyhow!("No chat template configured"))?;
         
-        // If the template uses Python-style method calls, we need to transform it
-        // This is necessary because HuggingFace templates use Python/Jinja2 syntax
-        // but minijinja doesn't support method calls on strings
-        let transformed = if template_str.contains(".startswith(") || template_str.contains(".endswith(") {
-            // Transform Python method calls to minijinja test syntax
-            // This is the least brittle approach - we only touch specific patterns
-            template_str
-                .replace(".startswith(", " is startswith(")
-                .replace(".endswith(", " is endswith(")
-        } else {
-            template_str.to_string()
-        };
+        // Transform Python-style method calls to minijinja syntax if needed
+        // HuggingFace templates use Python/Jinja2 syntax but minijinja uses test syntax
+        let transformed = template_str
+            .replace(".startswith(", " is startswith(")
+            .replace(".endswith(", " is endswith(");
         
         // Compile the template
         let tmpl = self.env.template_from_str(&transformed)

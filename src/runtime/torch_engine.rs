@@ -309,7 +309,7 @@ impl TorchEngine {
 
         if tokenizer_path.exists() {
             println!("📝 Loading tokenizer: {}", tokenizer_path.display());
-            let tokenizer = Tokenizer::from_file(&tokenizer_path)
+            let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
                 .map_err(|e| anyhow!("Failed to load tokenizer: {}", e))?;
             
             // Thread safe assignment
@@ -440,10 +440,21 @@ impl TorchEngine {
         }
         
         let ids_u32: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
-        let decoded_text = tokenizer.decode(&ids_u32, false)
+        
+        // Debug tokenizer state
+        tracing::debug!("Detokenizing token IDs: {:?}", ids_u32);
+        
+        // Decode tokens - skip special tokens for clean output
+        // The tokenizer is already configured with NFC Unicode normalization
+        let decoded_text = tokenizer.decode(&ids_u32, true)
             .map_err(|e| anyhow!("Detokenization failed for token IDs {:?}: {}", ids, e))?;
         
-        tracing::debug!("Detokenized {:?} -> '{}'", ids, decoded_text);
+        // Log any Unicode replacement characters for debugging
+        if decoded_text.contains('\u{FFFD}') {
+            tracing::warn!("Unicode replacement characters detected in token IDs {:?}", ids_u32);
+        }
+        
+        tracing::debug!("Detokenized {:?} -> '{}'", ids_u32, decoded_text);
         Ok(decoded_text)
     }
 
@@ -818,6 +829,12 @@ impl RuntimeEngine for TorchEngine {
                 
                 tracing::debug!("Sampled token ID: {}", next_token);
 
+                // Check EOS BEFORE decoding or adding to sequence
+                if self_clone.is_eos_token(next_token) {
+                    tracing::debug!("EOS token detected: {}", next_token);
+                    break;
+                }
+
                 // Add to sequence
                 input_ids.push(next_token as i64);
                 tokens_generated += 1;
@@ -829,12 +846,6 @@ impl RuntimeEngine for TorchEngine {
 
                 // Check stop tokens
                 if request.stop_tokens.iter().any(|stop| generated_text.contains(stop)) {
-                    break;
-                }
-
-                // Proper EOS check for Qwen2 (im_end or endoftext tokens)
-                if self_clone.is_eos_token(next_token) {
-                    tracing::debug!("EOS token detected: {}", next_token);
                     break;
                 }
             }
@@ -1008,6 +1019,12 @@ impl TorchEngine {
                 &input_ids,
             )?;
 
+            // Check EOS BEFORE decoding or adding to sequence
+            if self.is_eos_token(next_token) {
+                tracing::debug!("EOS token detected: {}", next_token);
+                break;
+            }
+
             // Add to sequence
             input_ids.push(next_token as i64);
             tokens_generated += 1;
@@ -1024,12 +1041,6 @@ impl TorchEngine {
 
             // Check stop tokens
             if request.stop_tokens.iter().any(|stop| generated_text.contains(stop)) {
-                break;
-            }
-
-            // Proper EOS check for Qwen2 (im_end or endoftext tokens)
-            if self.is_eos_token(next_token) {
-                tracing::info!("EOS token detected: {}", next_token);
                 break;
             }
         }
@@ -1100,6 +1111,12 @@ impl TorchEngine {
                     &input_ids,
                 )?;
                 
+                // Check EOS BEFORE decoding or adding to sequence
+                if self.is_eos_token(next_token) {
+                    tracing::debug!("EOS token detected: {}", next_token);
+                    break;
+                }
+
                 // Add to sequence
                 input_ids.push(next_token as i64);
                 tokens_generated += 1;
@@ -1126,11 +1143,6 @@ impl TorchEngine {
                 
                 // Check stop conditions
                 if request.stop_tokens.iter().any(|stop| generated_text.contains(stop)) {
-                    break;
-                }
-                
-                if self.is_eos_token(next_token) {
-                    tracing::debug!("EOS token detected: {}", next_token);
                     break;
                 }
             }
