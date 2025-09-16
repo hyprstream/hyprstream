@@ -4384,6 +4384,7 @@ checksum = "c1bbb9f3c5c463a01705937a24fdabc5047929ac764b2d5b9cf681c1f5041ed5"
 [[package]]
 name = "tch"
 version = "0.21.0"
+source = "git+https://github.com/hyprstream/tch-rs?branch=hip#e8453bc37c5f3cd5815627cb897a0165ce430a40"
 dependencies = [
  "half",
  "lazy_static",
@@ -4714,6 +4715,7 @@ dependencies = [
 [[package]]
 name = "torch-sys"
 version = "0.21.0"
+source = "git+https://github.com/hyprstream/tch-rs?branch=hip#e8453bc37c5f3cd5815627cb897a0165ce430a40"
 dependencies = [
  "anyhow",
  "cc",

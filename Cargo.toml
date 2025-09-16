@@ -129,8 +129,7 @@ tempfile = "3.9.0"
 tokio-stream = "0.1.14"
 
 [patch.crates-io]
-tch = { path = "/mnt/hyprstream/tch-rs" }
-torch-sys = { path = "/mnt/hyprstream/tch-rs/torch-sys" }
+tch = { git = "https://github.com/hyprstream/tch-rs", branch = "hip" }
 
 
 
