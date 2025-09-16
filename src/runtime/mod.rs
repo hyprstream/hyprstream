@@ -26,6 +26,7 @@ pub mod sampling;            // Token sampling strategies with model-specific co
 pub mod inference;           // Clean inference interface with request/response patterns
 pub mod rope;                // Rotary Position Embedding (RoPE) implementation
 pub mod kv_cache;            // Key-Value caching for efficient autoregressive generation
+pub mod gpu_sampling;        // GPU-based sampling to eliminate CPU transfer bottlenecks
 pub mod model_config;        // Unified model configuration management
 pub mod model_factory;       // Single factory for model creation
 pub mod streaming;           // Async streaming support for token-by-token generation

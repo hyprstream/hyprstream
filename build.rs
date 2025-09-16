@@ -17,12 +17,14 @@ fn main() {
     configure_llama_cpp();
 
     // Check if CUDA is available
-    let _cuda_available = check_cuda_availability();
+    let cuda_available = check_cuda_availability();
     
-    // For now, always build CPU-only version to ensure compatibility
-    // Full CUDA integration requires more complex toolchain setup
-    println!("cargo:warning=Building CPU-only version (CUDA integration in progress)");
-    build_cpu_only();
+    // Note: This is only for OpenVDB C++ code, not PyTorch
+    // PyTorch GPU support is handled by libtorch/tch-rs
+    if cuda_available {
+        println!("cargo:warning=CUDA toolkit found for OpenVDB");
+    }
+    build_cpu_only();  // OpenVDB builds CPU-only for now
 }
 
 fn check_cuda_availability() -> bool {

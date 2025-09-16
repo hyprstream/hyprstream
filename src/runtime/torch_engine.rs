@@ -12,6 +12,7 @@ use json_threat_protection as jtp;
 use crate::config::{GenerationRequest, GenerationResult, ModelInfo, RuntimeConfig, FinishReason};
 use crate::runtime::RuntimeEngine;
 use crate::runtime::template_engine::{TemplateEngine, TemplateConfig, ChatMessage};
+use crate::runtime::gpu_sampling::GpuSampler;
 
 /// Qwen2 special token IDs (based on official HuggingFace implementation)
 #[derive(Debug, Clone)]
@@ -95,6 +96,8 @@ pub struct TorchEngine {
     pub active_lora: Arc<Mutex<Option<String>>>,
     /// Sampling configuration - immutable after construction
     sampling_config: RuntimeConfig,
+    /// GPU sampler for efficient token sampling - thread safe after initialization
+    gpu_sampler: GpuSampler,
     /// Qwen special tokens for proper conversation handling - immutable after construction
     special_tokens: QwenSpecialTokens,
 }
@@ -125,9 +128,21 @@ impl TorchEngine {
     /// Internal sync constructor
     fn new_sync(config: RuntimeConfig) -> Result<Self> {
         // Determine device based on configuration
-        let device = if config.use_gpu && Device::cuda_if_available() != Device::Cpu {
-            println!("🚀 Using CUDA GPU acceleration");
-            Device::cuda_if_available()
+        let device = if config.use_gpu {
+            let gpu_device = Device::cuda_if_available();
+            if gpu_device != Device::Cpu {
+                // Check if this is actually ROCm/HIP
+                if std::env::var("HIP_VISIBLE_DEVICES").is_ok() || 
+                   std::path::Path::new("../libtorch/lib/libtorch_hip.so").exists() {
+                    println!("🚀 Using ROCm/HIP GPU acceleration");
+                } else {
+                    println!("🚀 Using CUDA GPU acceleration");
+                }
+                gpu_device
+            } else {
+                println!("⚠️  GPU requested but not available, falling back to CPU");
+                Device::Cpu
+            }
         } else {
             println!("💻 Using CPU inference");
             Device::Cpu
@@ -152,6 +167,7 @@ impl TorchEngine {
             })),
             active_lora: Arc::new(Mutex::new(None)),
             sampling_config: config,
+            gpu_sampler: GpuSampler::new(device),
             special_tokens: QwenSpecialTokens::default(),
         })
     }
@@ -432,7 +448,7 @@ impl TorchEngine {
     }
 
     /// Run inference on the model (supports both TorchScript and VarStore models) - thread safe
-    fn forward(&self, input_ids: &[i64]) -> Result<Vec<f32>> {
+    fn forward(&self, input_ids: &[i64]) -> Result<Tensor> {
         // Try VarStore-based inference first (preferred for SafeTensors models)
         if self.has_varstore() {
             return self.forward_varstore(input_ids);
@@ -442,7 +458,7 @@ impl TorchEngine {
     }
 
     /// Run inference using VarStore (SafeTensors models) with persistent model - thread safe
-    fn forward_varstore(&self, input_ids: &[i64]) -> Result<Vec<f32>> {
+    fn forward_varstore(&self, input_ids: &[i64]) -> Result<Tensor> {
         // Use the persistent model instance - NO recreation!
         let model_arc = self.persistent_model.as_ref()
             .ok_or_else(|| anyhow!("Persistent model not initialized - call load_model() first"))?;
@@ -476,18 +492,11 @@ impl TorchEngine {
         // Get logits for last token: [batch=1, last_seq_pos, vocab_size]
         let last_token_logits = logits.narrow(1, seq_len - 1, 1).squeeze_dim(1); // [1, vocab_size]
         
-        // Convert to Vec<f32>
-        let mut logits_vec = Vec::with_capacity(vocab_size);
-        for i in 0..vocab_size {
-            let val = last_token_logits.double_value(&[0, i as i64]);
-            logits_vec.push(val as f32);
-        }
-        
-        Ok(logits_vec)
+        Ok(last_token_logits)
     }
     
     /// Run optimized inference with KV caching - only process new tokens
-    fn forward_cached(&self, input_ids: &[i64], start_pos: usize, use_cache: bool) -> Result<Vec<f32>> {
+    fn forward_cached(&self, input_ids: &[i64], start_pos: usize, use_cache: bool) -> Result<Tensor> {
         // Use the persistent model instance
         let model_arc = self.persistent_model.as_ref()
             .ok_or_else(|| anyhow!("Persistent model not initialized"))?;
@@ -525,18 +534,23 @@ impl TorchEngine {
         // Get logits for last token
         let last_token_logits = logits.narrow(1, seq_len - 1, 1).squeeze_dim(1);
         
-        // Convert to Vec<f32>
-        let mut logits_vec = Vec::with_capacity(vocab_size);
-        for i in 0..vocab_size {
-            let val = last_token_logits.double_value(&[0, i as i64]);
-            logits_vec.push(val as f32);
-        }
-        
-        Ok(logits_vec)
+        Ok(last_token_logits)
     }
 
 
-    /// Sample next token from logits with proper ordering
+    /// Sample next token from GPU logits tensor
+    fn sample_token_gpu(&self, logits_tensor: &Tensor, temperature: f32, top_p: f32, top_k: Option<usize>, repeat_penalty: f32, previous_tokens: &[i64]) -> Result<usize> {
+        self.gpu_sampler.sample_token(
+            logits_tensor,
+            temperature,
+            top_p,
+            top_k,
+            repeat_penalty,
+            previous_tokens,
+        )
+    }
+
+    /// Sample next token from logits with proper ordering (DEPRECATED - use sample_token_gpu)
     fn sample_token(&self, logits: &[f32], temperature: f32, top_p: f32, top_k: Option<usize>, repeat_penalty: f32, previous_tokens: &[i64]) -> Result<usize> {
         tracing::debug!("Sampling: logits_len={}, temp={}, top_p={}, top_k={:?}, repeat_penalty={}", 
                       logits.len(), temperature, top_p, top_k, repeat_penalty);
@@ -793,7 +807,7 @@ impl RuntimeEngine for TorchEngine {
                 };
                 
                 // Sample next token with proper parameters
-                let next_token = self_clone.sample_token(
+                let next_token = self_clone.sample_token_gpu(
                     &logits,
                     request.temperature,
                     request.top_p,
@@ -802,7 +816,7 @@ impl RuntimeEngine for TorchEngine {
                     &input_ids,
                 )?;
                 
-                tracing::info!("Sampled token ID: {}", next_token);
+                tracing::debug!("Sampled token ID: {}", next_token);
 
                 // Add to sequence
                 input_ids.push(next_token as i64);
@@ -810,7 +824,7 @@ impl RuntimeEngine for TorchEngine {
 
                 // Decode token
                 let token_text = self_clone.detokenize(&[next_token as i64])?;
-                tracing::info!("Token text: '{}'", token_text);
+                tracing::debug!("Token text: '{}'", token_text);
                 generated_text.push_str(&token_text);
 
                 // Check stop tokens
@@ -820,7 +834,7 @@ impl RuntimeEngine for TorchEngine {
 
                 // Proper EOS check for Qwen2 (im_end or endoftext tokens)
                 if self_clone.is_eos_token(next_token) {
-                    tracing::info!("EOS token detected: {}", next_token);
+                    tracing::debug!("EOS token detected: {}", next_token);
                     break;
                 }
             }
@@ -985,7 +999,7 @@ impl TorchEngine {
             };
             
             // Sample next token
-            let next_token = self.sample_token(
+            let next_token = self.sample_token_gpu(
                 &logits,
                 temperature,
                 top_p,
@@ -1077,7 +1091,7 @@ impl TorchEngine {
                 };
                 
                 // Sample next token
-                let next_token = self.sample_token(
+                let next_token = self.sample_token_gpu(
                     &logits,
                     request.temperature,
                     request.top_p,
@@ -1116,7 +1130,7 @@ impl TorchEngine {
                 }
                 
                 if self.is_eos_token(next_token) {
-                    tracing::info!("EOS token detected: {}", next_token);
+                    tracing::debug!("EOS token detected: {}", next_token);
                     break;
                 }
             }

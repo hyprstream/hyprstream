@@ -709,7 +709,17 @@ async fn format_messages_with_template(
     // Log messages for debugging
     for (i, msg) in messages.iter().enumerate() {
         info!("Message {}: role={}, content={:?}", i, msg.role, 
-            msg.content.as_ref().map(|c| &c[..c.len().min(100)]));
+            msg.content.as_ref().map(|c| {
+                if c.len() <= 100 {
+                    c.as_str()
+                } else {
+                    // Find the last character boundary before or at position 100
+                    match c.char_indices().nth(99) {
+                        Some((idx, _)) => &c[..idx],
+                        None => c.as_str(), // Less than 100 characters
+                    }
+                }
+            }));
     }
     
     // Convert OpenAI messages to template engine format

@@ -42,6 +42,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     info!("Hyprstream v{} starting up", env!("CARGO_PKG_VERSION"));
     
+    // Quick GPU check
+    let device = tch::Device::cuda_if_available();
+    info!("Device: {:?}", if device == tch::Device::Cpu { "CPU" } else { "GPU" });
+    
     // Handle commands
     match cli.command {
         Commands::Server(cmd) => {

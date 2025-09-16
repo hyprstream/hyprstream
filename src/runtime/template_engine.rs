@@ -280,7 +280,8 @@ fn length_filter(value: &Value) -> Result<Value, minijinja::Error> {
     if let Ok(iter) = value.try_iter() {
         Ok(Value::from(iter.count()))
     } else if let Some(s) = value.as_str() {
-        Ok(Value::from(s.len()))
+        // Use char count instead of byte length for proper Unicode support
+        Ok(Value::from(s.chars().count()))
     } else {
         Ok(Value::from(0))
     }

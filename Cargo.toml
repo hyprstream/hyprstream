@@ -78,7 +78,7 @@ thiserror = "1.0"
 memmap2 = "0.9"
 rand = "0.8"
 # PyTorch Rust bindings - replaces Candle  
-tch = { version = "0.20", features = ["download-libtorch"] }
+tch = { version = "0.21" }
 
 # Candle ML Framework - REMOVED: Fully migrated to Tch (PyTorch Rust bindings)
 # candle-core = "0.9.1"
@@ -127,6 +127,9 @@ pkg-config = "0.3"
 criterion = "0.5.1"
 tempfile = "3.9.0"
 tokio-stream = "0.1.14"
+
+[patch.crates-io]
+tch = { git = "https://github.com/hyprstream/tch-rs", branch = "hip" }
 
 
 
