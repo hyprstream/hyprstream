@@ -3,7 +3,8 @@
 use crate::api::TrainingSample;
 pub use crate::api::TrainingStatus;
 use crate::storage::vdb::hardware_accelerated::HardwareVDBStorage;
-use crate::adapters::sparse_lora::{SparseLoRAAdapter, SparseLoRAConfig};
+// TODO: Remove sparse reference
+// use crate::lora::sparse::{SparseLoRAAdapter, SparseConfig};
 use crate::inference::{InferenceAPI, InferenceInput, InferenceOutput};
 
 use std::collections::HashMap;

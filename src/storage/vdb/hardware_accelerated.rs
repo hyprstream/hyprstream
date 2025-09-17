@@ -20,7 +20,8 @@ pub enum VDBError {
 }
 use crate::storage::vdb::grid::{Coordinate3D};
 use crate::storage::vdb::neuralvdb_codec::{NeuralVDBCodec, CompressedAdapter, CompressionStats};
-use crate::adapters::sparse_lora::{SparseLoRAAdapter, SparseLoRAConfig};
+// TODO: Remove sparse reference
+// use crate::lora::sparse::{PhantomData<()> // Was: SparseLoRAAdapter, PhantomData<()> // Was: SparseConfig};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -121,7 +122,7 @@ pub struct HierarchicalQuantizedData {
 
 impl MultiScaleQuantizer {
     /// Encode LoRA adapter with hierarchical quantization (OctGPT-inspired)
-    pub async fn encode_hierarchical(&self, adapter: &SparseLoRAAdapter) -> Result<HierarchicalQuantizedData, VDBError> {
+    pub async fn encode_hierarchical(&self, adapter: &PhantomData<()> // Was: SparseLoRAAdapter) -> Result<HierarchicalQuantizedData, VDBError> {
         let _start = std::time::Instant::now();
         
         // Get LoRA matrices
@@ -474,7 +475,7 @@ impl HardwareVDBStorage {
     pub async fn store_adapter_hierarchical(
         &self,
         adapter_id: &str,
-        adapter: &SparseLoRAAdapter,
+        adapter: &PhantomData<()> // Was: SparseLoRAAdapter,
     ) -> Result<(), VDBError> {
         let start = Instant::now();
         
@@ -530,7 +531,7 @@ impl HardwareVDBStorage {
     pub async fn store_adapter_accelerated(
         &self,
         adapter_id: &str, 
-        adapter: &SparseLoRAAdapter,
+        adapter: &PhantomData<()> // Was: SparseLoRAAdapter,
     ) -> Result<(), VDBError> {
         self.store_adapter_hierarchical(adapter_id, adapter).await
     }
@@ -539,7 +540,7 @@ impl HardwareVDBStorage {
     pub async fn store_adapter_neural_compressed(
         &self,
         adapter_id: &str,
-        adapter: &SparseLoRAAdapter,
+        adapter: &PhantomData<()> // Was: SparseLoRAAdapter,
     ) -> Result<(), VDBError> {
         if !self.neural_compression_enabled {
             return self.store_adapter_accelerated(adapter_id, adapter).await;
@@ -580,8 +581,8 @@ impl HardwareVDBStorage {
     pub async fn load_adapter_neural_compressed(
         &self,
         adapter_id: &str,
-        config: SparseLoRAConfig,
-    ) -> Result<SparseLoRAAdapter, VDBError> {
+        config: PhantomData<()> // Was: SparseConfig,
+    ) -> Result<PhantomData<()> // Was: SparseLoRAAdapter, VDBError> {
         if !self.neural_compression_enabled {
             return self.load_adapter_accelerated(adapter_id, config).await;
         }
@@ -614,7 +615,7 @@ impl HardwareVDBStorage {
     pub async fn store_adapter_hybrid(
         &self,
         adapter_id: &str,
-        adapter: &SparseLoRAAdapter,
+        adapter: &PhantomData<()> // Was: SparseLoRAAdapter,
     ) -> Result<(), VDBError> {
         // Store regular version for fast access
         self.store_adapter_accelerated(adapter_id, adapter).await?;
@@ -632,8 +633,8 @@ impl HardwareVDBStorage {
     pub async fn load_adapter_accelerated(
         &self,
         adapter_id: &str,
-        config: SparseLoRAConfig,
-    ) -> Result<SparseLoRAAdapter, VDBError> {
+        config: PhantomData<()> // Was: SparseConfig,
+    ) -> Result<PhantomData<()> // Was: SparseLoRAAdapter, VDBError> {
         let start = Instant::now();
         
         let weights = {
@@ -646,7 +647,7 @@ impl HardwareVDBStorage {
         };
         
         // Create adapter and load weights
-        let adapter = SparseLoRAAdapter::new(config);
+        let adapter = PhantomData<()> // Was: SparseLoRAAdapter::new(config);
         adapter.load_sparse_weights(&weights).await;
 
         // Update cache statistics
@@ -881,7 +882,7 @@ impl HardwareVDBStorage {
     }
     
     /// Generate Z-order pattern for spatial locality (OctGPT-inspired)
-    async fn generate_z_order_pattern(&self, adapter: &SparseLoRAAdapter) -> Result<ZOrderPattern, VDBError> {
+    async fn generate_z_order_pattern(&self, adapter: &PhantomData<()> // Was: SparseLoRAAdapter) -> Result<ZOrderPattern, VDBError> {
         // For LoRA matrices, create Z-order curve through weight space
         let config = adapter.get_config();
         let total_weights = config.in_features * config.rank + config.rank * config.out_features;
@@ -979,7 +980,7 @@ impl HardwareVDBStorage {
     }
     
     /// Compute hierarchical level based on weight characteristics
-    fn compute_hierarchical_level(&self, index: usize, config: &SparseLoRAConfig) -> u8 {
+    fn compute_hierarchical_level(&self, index: usize, config: &PhantomData<()> // Was: SparseConfig) -> u8 {
         // Simple heuristic: level based on position in rank structure
         if index < config.rank * config.rank {
             0 // Core rank structure
@@ -1062,8 +1063,8 @@ mod tests {
         let storage = HardwareVDBStorage::new().await.expect("Failed to create storage");
         
         // Create sparse LoRA adapter
-        let config = SparseLoRAConfig::default();
-        let adapter = SparseLoRAAdapter::new(config.clone());
+        let config = PhantomData<()> // Was: SparseConfig::default();
+        let adapter = PhantomData<()> // Was: SparseLoRAAdapter::new(config.clone());
         adapter.initialize_random().await;
         
         // Store adapter
@@ -1093,8 +1094,8 @@ mod tests {
         
         // Store multiple adapters
         for i in 0..3 {
-            let config = SparseLoRAConfig::default();
-            let adapter = SparseLoRAAdapter::new(config);
+            let config = PhantomData<()> // Was: SparseConfig::default();
+            let adapter = PhantomData<()> // Was: SparseLoRAAdapter::new(config);
             adapter.initialize_random().await;
             
             storage.store_adapter_accelerated(&format!("adapter_{}", i), &adapter).await

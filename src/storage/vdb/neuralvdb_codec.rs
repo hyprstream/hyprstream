@@ -4,7 +4,8 @@
 //! and value regression, enabling 10-100x compression ratios with minimal quality loss.
 
 use crate::storage::vdb::grid::{SparseWeights};
-use crate::adapters::sparse_lora::{SparseLoRAAdapter, SparseLoRAConfig};
+// TODO: Remove sparse reference
+// use crate::lora::sparse::{PhantomData<()> // Was: SparseLoRAAdapter, PhantomData<()> // Was: SparseConfig};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -255,7 +256,7 @@ impl NeuralVDBCodec {
     pub async fn encode_adapter(
         &self,
         adapter_id: &str,
-        adapter: &SparseLoRAAdapter,
+        adapter: &PhantomData<()> // Was: SparseLoRAAdapter,
     ) -> Result<CompressedAdapter, Box<dyn std::error::Error>> {
         let start = Instant::now();
         
@@ -300,8 +301,8 @@ impl NeuralVDBCodec {
     pub async fn decode_adapter(
         &self,
         compressed: &CompressedAdapter,
-        config: SparseLoRAConfig,
-    ) -> Result<SparseLoRAAdapter, Box<dyn std::error::Error>> {
+        config: PhantomData<()> // Was: SparseConfig,
+    ) -> Result<PhantomData<()> // Was: SparseLoRAAdapter, Box<dyn std::error::Error>> {
         let start = Instant::now();
         
         // Step 1: Decode topology using hierarchical classifier
@@ -314,7 +315,7 @@ impl NeuralVDBCodec {
         let reconstructed_weights = self.reconstruct_sparse_weights(&decoded_topology, &decoded_values);
         
         // Step 4: Create LoRA adapter and load reconstructed weights
-        let adapter = SparseLoRAAdapter::new(config);
+        let adapter = PhantomData<()> // Was: SparseLoRAAdapter::new(config);
         adapter.from_vdb_weights(&reconstructed_weights).await;
         
         println!("🧠 NeuralVDB decoded '{}' in {:.2}ms", compressed.id, start.elapsed().as_millis());

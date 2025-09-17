@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use serde::{Deserialize, Serialize};
 
-pub mod lora_registry;
+pub mod lora_registry; // For storage/cache management only
 pub mod model_registry;
 pub mod model_storage;
 pub mod model_downloader;
@@ -19,7 +19,7 @@ pub mod huggingface;
 pub mod openai_compat;
 pub mod training_service;
 
-use lora_registry::{LoRARegistry, LoRALayer, LoRAId};
+use lora_registry::{LoRARegistry, LoRALayer, LoRAId}; // For storage/cache only
 use training_service::{TrainingService, TrainingConfig};
 
 /// Main API server state

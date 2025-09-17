@@ -18,7 +18,8 @@ use super::{
     VDBSparseStorage, SparseWeightUpdate, Coordinate3D,
     SparseStorage,
 };
-use crate::adapters::sparse_lora::SparseLoRAAdapter;
+// TODO: Remove sparse reference
+// use crate::lora::sparse::PhantomData<()> // Was: SparseLoRAAdapter;
 
 /// Configuration for temporal streaming
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -352,8 +353,8 @@ impl TemporalStreamingLayer {
     pub async fn accumulate_temporal_gradients(
         &self,
         layer_name: &str,
-        input: &SparseLoRAAdapter,
-        target: &SparseLoRAAdapter,
+        input: &PhantomData<()> // Was: SparseLoRAAdapter,
+        target: &PhantomData<()> // Was: SparseLoRAAdapter,
         timestamp: Option<DateTime<Utc>>,
     ) -> Result<TemporalGradient> {
         let timestamp = timestamp.unwrap_or_else(Utc::now);
@@ -393,8 +394,8 @@ impl TemporalStreamingLayer {
     /// Compute sparse gradient difference between adapters
     async fn compute_gradient_difference(
         &self,
-        input: &SparseLoRAAdapter,
-        target: &SparseLoRAAdapter,
+        input: &PhantomData<()> // Was: SparseLoRAAdapter,
+        target: &PhantomData<()> // Was: SparseLoRAAdapter,
     ) -> Result<HashMap<Coordinate3D, f32>> {
         let input_weights = input.to_vdb_weights().await;
         let target_weights = target.to_vdb_weights().await;
@@ -480,8 +481,8 @@ impl TemporalStreamingLayer {
     pub async fn select_temporal_lora(
         &self,
         layer_name: &str,
-        input: &SparseLoRAAdapter,
-        target: Option<&SparseLoRAAdapter>,
+        input: &PhantomData<()> // Was: SparseLoRAAdapter,
+        target: Option<&PhantomData<()> // Was: SparseLoRAAdapter>,
         window: chrono::Duration,
     ) -> Result<TemporalSelection> {
         // Get recent gradients for analysis
@@ -680,7 +681,7 @@ impl Stream for TemporalWeightStream {
 mod tests {
     use super::*;
     use crate::storage::vdb::{SparseStorageConfig, VDBSparseStorage};
-    use crate::adapters::sparse_lora::{SparseLoRAAdapter, SparseLoRAConfig};
+    use crate::lora::sparse::{PhantomData<()> // Was: SparseLoRAAdapter, PhantomData<()> // Was: SparseConfig};
 
     #[tokio::test]
     async fn test_temporal_streaming_layer_creation() -> Result<()> {
@@ -703,9 +704,9 @@ mod tests {
         let temporal_layer = TemporalStreamingLayer::new(vdb_storage, streaming_config).await?;
 
         // Create mock adapters
-        let input_config = SparseLoRAConfig::default();
-        let input_adapter = SparseLoRAAdapter::new(input_config, (1536, 1536)).await?;
-        let target_adapter = SparseLoRAAdapter::new(input_config, (1536, 1536)).await?;
+        let input_config = PhantomData<()> // Was: SparseConfig::default();
+        let input_adapter = PhantomData<()> // Was: SparseLoRAAdapter::new(input_config, (1536, 1536)).await?;
+        let target_adapter = PhantomData<()> // Was: SparseLoRAAdapter::new(input_config, (1536, 1536)).await?;
 
         // Test gradient accumulation
         let gradient = temporal_layer.accumulate_temporal_gradients(

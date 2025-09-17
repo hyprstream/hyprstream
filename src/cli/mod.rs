@@ -8,5 +8,7 @@
 
 pub mod commands;
 pub mod handlers;
+pub mod pytorch_lora_handler;
 
-pub use handlers::{handle_config, handle_server, handle_model_command, handle_lora_command, handle_chat_command};
+pub use handlers::{handle_config, handle_server, handle_model_command, handle_chat_command};
+pub use pytorch_lora_handler::handle_pytorch_lora_command;

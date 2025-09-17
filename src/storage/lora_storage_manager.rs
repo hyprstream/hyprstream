@@ -12,7 +12,8 @@ use anyhow::Result;
 use crate::api::lora_registry::{LoRARegistry, LoRAId, LoRALayer};
 use crate::storage::vdb::adapter_store::{AdapterStore, AdapterMetadata};
 use crate::storage::vdb::grid::{SparseWeights, Coordinate3D};
-use crate::adapters::sparse_lora::{SparseLoRAAdapter, SparseLoRAConfig};
+// TODO: Remove sparse reference
+// use crate::lora::sparse::{SparseLoRAAdapter, SparseConfig};
 
 /// Unified LoRA storage manager that bridges registry and VDB storage
 pub struct LoRAStorageManager {
@@ -170,7 +171,7 @@ impl LoRAStorageManager {
         let layer = self.registry.get(lora_id).await?;
         
         // Convert to sparse LoRA config
-        let sparse_config = SparseLoRAConfig {
+        let sparse_config = SparseConfig {
             in_features: 1536,  // Model hidden dimension
             out_features: 1536,
             rank: layer.config.rank,

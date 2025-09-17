@@ -6,9 +6,10 @@ use clap::Parser;
 use config::Config;
 use hyprstream_core::cli::commands::Commands;
 use hyprstream_core::cli::handlers::{
-    handle_server, handle_model_command, handle_lora_command, 
+    handle_server, handle_model_command, 
     handle_auth_command, handle_chat_command
 };
+use hyprstream_core::cli::handle_pytorch_lora_command;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -67,9 +68,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             handle_model_command(cmd, server_url).await
         }
         Commands::Lora(cmd) => {
-            // LoRA commands need a server URL (default to local)
-            let server_url = "http://127.0.0.1:50051".to_string();
-            handle_lora_command(cmd, server_url).await
+            // Use PyTorch-native LoRA with autograd support
+            info!("Using PyTorch LoRA implementation");
+            handle_pytorch_lora_command(cmd).await
         }
         Commands::Auth(cmd) => {
             handle_auth_command(cmd).await

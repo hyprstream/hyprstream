@@ -44,7 +44,7 @@ fn build_openvdb() -> Result<(), Box<dyn std::error::Error>> {
         .probe("openvdb");
         
     let (include_paths, link_paths, libs) = match openvdb_result {
-        Ok(openvdb) => (openvdb.include_paths, openvdb.link_paths, openvdb.libs)
+        Ok(openvdb) => (openvdb.include_paths, openvdb.link_paths, openvdb.libs),
         Err(_) => {
             println!("cargo:warning=pkg-config failed, trying system OpenVDB installation...");
             

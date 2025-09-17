@@ -15,6 +15,7 @@ pub mod config;
 pub mod constants;
 pub mod error;
 pub mod inference;
+pub mod lora;
 pub mod runtime;
 pub mod server;
 pub mod storage;
@@ -25,7 +26,7 @@ pub use storage::{
     SparseWeightUpdate, EmbeddingMatch, SparseStorageError
 };
 pub use runtime::{
-    RuntimeEngine, TorchEngine, LoRAEngineWrapper, SparseLoRAAdapter, LoRAConfig,
+    RuntimeEngine, TorchEngine, LoRAEngineWrapper, SparseLoRAAdapter,
     ModelInfo, GenerationRequest, GenerationResult, FinishReason, RuntimeConfig,
     XLoRAAdapter, AdaptationMode, UserFeedback, XLoRARoutingStrategy, AdapterMetrics,
     // Model Evolution System exports
