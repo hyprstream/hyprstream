@@ -1,6 +1,7 @@
 //! LoRA adapter fusion for combining multiple adapters
 
-use crate::adapters::sparse_lora::SparseLoRAAdapter;
+// TODO: Remove sparse reference
+// use crate::lora::sparse::SparseLoRAAdapter;
 use crate::inference::FusedAdapterWeights;
 
 use std::collections::HashMap;

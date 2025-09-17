@@ -14,7 +14,8 @@ use crate::storage::vdb::{
 use crate::storage::vdb::HardwareVDBStorage;
 use crate::storage::vdb::compression::CompressionStats;
 use crate::storage::vdb::adapter_store::{AdapterInfo, AdapterMetadata};
-use crate::adapters::sparse_lora::{SparseLoRAAdapter, SparseLoRAConfig};
+// TODO: Remove sparse reference
+// use crate::lora::sparse::{PhantomData<()> // Was: SparseLoRAAdapter, PhantomData<()> // Was: SparseConfig};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -128,15 +129,15 @@ pub trait SparseStorage: Send + Sync + 'static {
     async fn store_adapter(
         &self, 
         id: &str, 
-        adapter: &SparseLoRAAdapter
+        adapter: &PhantomData<()> // Was: SparseLoRAAdapter
     ) -> Result<(), SparseStorageError>;
     
     /// Load sparse adapter from VDB storage
     async fn load_adapter(
         &self, 
         id: &str, 
-        config: SparseLoRAConfig
-    ) -> Result<SparseLoRAAdapter, SparseStorageError>;
+        config: PhantomData<()> // Was: SparseConfig
+    ) -> Result<PhantomData<()> // Was: SparseLoRAAdapter, SparseStorageError>;
     
     /// Apply dynamic sparse weight updates in real-time
     async fn update_sparse_weights(
@@ -301,7 +302,7 @@ pub struct VDBSparseStorage {
     neural_codec: Arc<NeuralVDBCodec>,
     
     /// Active adapters cache
-    adapter_cache: Arc<RwLock<HashMap<String, Arc<SparseLoRAAdapter>>>>,
+    adapter_cache: Arc<RwLock<HashMap<String, Arc<PhantomData<()> // Was: SparseLoRAAdapter>>>>,
     
     /// Streaming update queue
     update_queue: Arc<RwLock<Vec<SparseWeightUpdate>>>,
@@ -454,7 +455,7 @@ impl VDBSparseStorage {
         
         if let Some(_adapter) = adapter_cache.get_mut(adapter_id) {
             // Apply updates to cached adapter
-            // This would require implementing update methods on SparseLoRAAdapter
+            // This would require implementing update methods on PhantomData<()> // Was: SparseLoRAAdapter
             // For now, we'll mark this as a TODO for the adapter implementation
             println!("Applying {} CPU sparse updates to {}", updates.len(), adapter_id);
         } else {
@@ -554,7 +555,7 @@ impl SparseStorage for VDBSparseStorage {
     async fn store_adapter(
         &self, 
         id: &str, 
-        adapter: &SparseLoRAAdapter
+        adapter: &PhantomData<()> // Was: SparseLoRAAdapter
     ) -> Result<(), SparseStorageError> {
         // Store using hardware-accelerated VDB storage
         if self.config.neural_compression {
@@ -593,8 +594,8 @@ impl SparseStorage for VDBSparseStorage {
     async fn load_adapter(
         &self, 
         id: &str, 
-        config: SparseLoRAConfig
-    ) -> Result<SparseLoRAAdapter, SparseStorageError> {
+        config: PhantomData<()> // Was: SparseConfig
+    ) -> Result<PhantomData<()> // Was: SparseLoRAAdapter, SparseStorageError> {
         // Check cache first
         {
             let cache = self.adapter_cache.read().await;
@@ -726,7 +727,7 @@ impl SparseStorage for VDBSparseStorage {
         // For each adapter, compute embedding similarity
         for adapter_id in adapter_ids {
             // Load adapter and compute its embedding representation
-            if let Ok(adapter) = self.load_adapter(&adapter_id, SparseLoRAConfig::default()).await {
+            if let Ok(adapter) = self.load_adapter(&adapter_id, PhantomData<()> // Was: SparseConfig::default()).await {
                 // Compute embedding from sparse weights (simplified)
                 let embedding = self.compute_adapter_embedding(&adapter).await;
                 
@@ -762,7 +763,7 @@ impl SparseStorage for VDBSparseStorage {
         coordinates: &[Coordinate3D]
     ) -> Result<HashMap<Coordinate3D, f32>, SparseStorageError> {
         // Load adapter
-        let adapter = self.load_adapter(adapter_id, SparseLoRAConfig::default()).await?;
+        let adapter = self.load_adapter(adapter_id, PhantomData<()> // Was: SparseConfig::default()).await?;
         
         // Convert to VDB weights and query coordinates
         let vdb_weights = adapter.to_vdb_weights().await;
@@ -818,7 +819,7 @@ impl SparseStorage for VDBSparseStorage {
     
     /// Get adapter statistics and health metrics
     async fn get_adapter_stats(&self, id: &str) -> Result<AdapterStats, SparseStorageError> {
-        let adapter = self.load_adapter(id, SparseLoRAConfig::default()).await?;
+        let adapter = self.load_adapter(id, PhantomData<()> // Was: SparseConfig::default()).await?;
         let stats = adapter.get_stats().await;
         let memory_usage = adapter.memory_usage().await;
         
@@ -878,8 +879,8 @@ impl SparseStorage for VDBSparseStorage {
         temporal_window_secs: u64,
     ) -> Result<TemporalDependency, SparseStorageError> {
         // Load both adapters
-        let source_adapter = self.load_adapter(source_adapter_id, SparseLoRAConfig::default()).await?;
-        let target_adapter = self.load_adapter(target_adapter_id, SparseLoRAConfig::default()).await?;
+        let source_adapter = self.load_adapter(source_adapter_id, PhantomData<()> // Was: SparseConfig::default()).await?;
+        let target_adapter = self.load_adapter(target_adapter_id, PhantomData<()> // Was: SparseConfig::default()).await?;
         
         // Compute gradient difference between adapters
         let source_weights = source_adapter.to_vdb_weights().await;
@@ -1078,7 +1079,7 @@ impl SparseStorage for VDBSparseStorage {
 
 impl VDBSparseStorage {
     /// Compute embedding representation from sparse adapter
-    async fn compute_adapter_embedding(&self, adapter: &SparseLoRAAdapter) -> Vec<f32> {
+    async fn compute_adapter_embedding(&self, adapter: &PhantomData<()> // Was: SparseLoRAAdapter) -> Vec<f32> {
         // Convert sparse weights to embedding vector
         // This is a simplified implementation - in practice you might:
         // 1. Use the mean of active weights

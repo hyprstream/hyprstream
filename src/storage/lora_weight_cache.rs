@@ -10,14 +10,17 @@ use tokio::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::api::lora_registry::LoRAId;
-use crate::adapters::sparse_lora::SparseLoRAAdapter;
+// TODO: Replace with generic LoRAAdapter after sparse removal
+// use crate::lora::sparse::SparseLoRAAdapter;
+use std::marker::PhantomData;
 use crate::storage::lora_storage_manager::LoRAStorageManager;
 
 /// Cached LoRA adapter with usage tracking
 #[derive(Clone)]
 pub struct CachedLoRAAdapter {
     /// The actual adapter
-    pub adapter: Arc<SparseLoRAAdapter>,
+    // TODO: Make this generic over LoRAAdapter trait
+    pub adapter: Arc<PhantomData<()>>, // Placeholder after sparse removal
     
     /// Last access time for LRU eviction
     pub last_accessed: Instant,
@@ -139,7 +142,8 @@ impl LoRAWeightCache {
     }
     
     /// Get adapter from cache or load from VDB
-    pub async fn get_adapter(&self, lora_id: &LoRAId) -> Result<Arc<SparseLoRAAdapter>> {
+    // TODO: Fix return type after sparse removal
+    pub async fn get_adapter(&self, lora_id: &LoRAId) -> Result<Arc<PhantomData<()>>> {
         let start_time = Instant::now();
         
         // Try cache first
@@ -275,7 +279,7 @@ impl LoRAWeightCache {
     
     /// Flush all dirty adapters to VDB storage
     pub async fn flush_all_dirty(&self) -> Result<()> {
-        let dirty_adapters: Vec<(LoRAId, Arc<SparseLoRAAdapter>)>;
+        let dirty_adapters: Vec<(LoRAId, Arc<PhantomData<()>>)>; // TODO: Fix after sparse removal
         
         // Collect dirty adapters
         {
@@ -478,7 +482,7 @@ impl LoRAWeightCache {
     
     /// Auto-save adapters that have been dirty for too long
     async fn auto_save_dirty_adapters(&self) -> Result<()> {
-        let dirty_adapters: Vec<(LoRAId, Arc<SparseLoRAAdapter>)>;
+        let dirty_adapters: Vec<(LoRAId, Arc<PhantomData<()>>)>; // TODO: Fix after sparse removal
         
         // Find adapters that need saving
         {

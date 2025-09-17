@@ -150,7 +150,7 @@ pub trait ModelOperations: Send {
     /// Get attention mask for the architecture
     fn get_attention_mask(&self, seq_len: usize, past_kv_len: usize) -> Result<Tensor>;
     
-    /// Apply LoRA adapter with architecture-specific handling
+    /// Apply LoRA adapter with architecture-specific handling (for cache/storage only)
     fn apply_lora(&mut self, adapter: &ArchitectureAwareLoRAAdapter) -> Result<()>;
 }
 

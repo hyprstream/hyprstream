@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use uuid::Uuid;
 
-use crate::adapters::sparse_lora::SparseLoRAAdapter;
+// TODO: Remove sparse reference
+// use crate::lora::sparse::SparseLoRAAdapter;
 use crate::storage::StoragePaths;
 
 /// Metadata for a LoRA checkpoint

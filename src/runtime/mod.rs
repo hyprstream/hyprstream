@@ -74,7 +74,7 @@ pub use conversation_router::{
 
 // LoRA and adapter exports
 pub use lora_wrapper::{LoRAEngineWrapper, RuntimeLoRAAdapter};
-pub use crate::adapters::sparse_lora::SparseLoRAAdapter;
+pub use crate::lora::sparse::SparseLoRAAdapter;
 
 /// Core runtime engine trait - all engines implement this
 #[async_trait]

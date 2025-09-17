@@ -1,6 +1,7 @@
 //! Inference API for applying LoRA adapters to base models
 
-use crate::adapters::sparse_lora::SparseLoRAAdapter;
+// TODO: Remove sparse reference
+// use crate::lora::sparse::SparseLoRAAdapter;
 use crate::storage::vdb::hardware_accelerated::HardwareVDBStorage;
 
 use std::collections::HashMap;

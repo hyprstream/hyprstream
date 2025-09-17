@@ -182,6 +182,10 @@ pub struct ModelInfo {
     pub parameters: u64,
     pub context_length: usize,
     pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub intermediate_size: Option<usize>,
+    pub num_attention_heads: Option<usize>,
+    pub num_hidden_layers: Option<usize>,
     pub architecture: String,
     pub quantization: Option<String>,
 }

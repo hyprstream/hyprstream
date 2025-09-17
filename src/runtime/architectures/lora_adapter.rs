@@ -1,7 +1,7 @@
 //! LoRA adapter compatibility layer for different architectures
 
 use super::ModelArchitecture;
-use crate::adapters::sparse_lora::SparseLoRAAdapter;
+use crate::lora::sparse::SparseLoRAAdapter;
 use anyhow::{Result, anyhow};
 use tch::{Device, Kind as DType, Tensor};
 use std::collections::HashMap;
@@ -253,9 +253,10 @@ impl LoRAAdapterFactory {
         alpha: f32,
         _device: &Device,
     ) -> Result<ArchitectureAwareLoRAAdapter> {
-        use crate::adapters::sparse_lora::SparseLoRAConfig;
+        // TODO: Remove sparse reference
+// use crate::lora::sparse::SparseConfig;
         
-        let config = SparseLoRAConfig {
+        let config = SparseConfig {
             rank,
             alpha,
             dropout: 0.1,
@@ -277,9 +278,10 @@ impl LoRAAdapterFactory {
         context_length: usize,
         _device: &Device,
     ) -> Result<ArchitectureAwareLoRAAdapter> {
-        use crate::adapters::sparse_lora::SparseLoRAConfig;
+        // TODO: Remove sparse reference
+// use crate::lora::sparse::SparseConfig;
         
-        let config = SparseLoRAConfig {
+        let config = SparseConfig {
             rank,
             alpha,
             dropout: 0.1,
@@ -300,9 +302,10 @@ impl LoRAAdapterFactory {
         total_params_b: u16,
         _device: &Device,
     ) -> Result<ArchitectureAwareLoRAAdapter> {
-        use crate::adapters::sparse_lora::SparseLoRAConfig;
+        // TODO: Remove sparse reference
+// use crate::lora::sparse::SparseConfig;
         
-        let config = SparseLoRAConfig {
+        let config = SparseConfig {
             rank,
             alpha,
             dropout: 0.1,
