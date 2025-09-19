@@ -68,17 +68,21 @@ async fn list_models(
             // Transform the raw model data into a cleaner response format
             let model_list: Vec<ModelListItem> = models
                 .into_iter()
-                .map(|(id, metadata)| ModelListItem {
-                    id: id.to_string(),
-                    name: metadata.display_name.clone()
-                        .unwrap_or_else(|| metadata.name.clone()),
-                    display_name: metadata.display_name,
-                    architecture: metadata.architecture,
-                    size_bytes: metadata.size_bytes,
-                    is_cached: metadata.is_cached,
-                    local_path: metadata.local_path.as_ref()
-                        .and_then(|p| p.to_str())
-                        .map(|s| s.to_string()),
+                .map(|(id, metadata)| {
+                    let local_path = state.model_storage.get_uuid_model_path(&id)
+                        .to_str()
+                        .map(|s| s.to_string());
+
+                    ModelListItem {
+                        id: id.to_string(),
+                        name: metadata.display_name.clone()
+                            .unwrap_or_else(|| metadata.name.clone()),
+                        display_name: metadata.display_name,
+                        architecture: metadata.architecture,
+                        size_bytes: metadata.size_bytes,
+                        is_cached: metadata.is_cached,
+                        local_path,
+                    }
                 })
                 .collect();
             
@@ -130,8 +134,8 @@ async fn download_model(
         Err(e) => {
             return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
                 "error": format!("Invalid model URI '{}': {}", request.uri, e),
-                "details": "Model URIs must use the format: hf://org/model",
-                "example": "hf://Qwen/Qwen2-1.5B-Instruct"
+                "details": "Model URIs must be valid Git repository URLs",
+                "example": "https://huggingface.co/Qwen/Qwen2-1.5B-Instruct"
             }))).into_response();
         }
     };
@@ -159,7 +163,7 @@ async fn download_model(
         .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok());
     
     // Create downloader - same as CLI does
-    let downloader = match ModelDownloader::new(models_dir, hf_token).await {
+    let downloader = match ModelDownloader::new(models_dir).await {
         Ok(d) => d,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
@@ -206,8 +210,7 @@ async fn download_model(
                         .and_then(|t| t.tokenizer_class.clone()),
                     size_bytes: downloaded_model.total_size_bytes,
                     files: downloaded_model.files.clone(),
-                    external_sources: vec![],
-                    local_path: Some(downloaded_model.local_path.clone()),
+                    git_source: Some(request.uri.clone()),
                     is_cached: true,
                     tags: vec![],
                     description: None,
@@ -244,7 +247,7 @@ async fn load_model(
     let model_path = if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
         let model_id = crate::api::model_storage::ModelId(uuid);
         match state.model_storage.get_metadata_by_id(&model_id).await {
-            Ok(metadata) => metadata.local_path.unwrap_or_else(|| std::path::PathBuf::from(".")),
+            Ok(_metadata) => state.model_storage.get_uuid_model_path(&model_id),
             Err(e) => {
                 return (StatusCode::NOT_FOUND, Json(serde_json::json!({
                     "error": format!("Model not found: {}", e)

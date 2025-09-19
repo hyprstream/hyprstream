@@ -4,7 +4,7 @@ use crate::inference::{InferenceInput, InferenceOutput, InferenceToken, FusedAda
 use crate::inference::model_loader::ModelLoader;
 use crate::runtime::{RuntimeEngine, TorchEngine};
 use crate::config::{HyprConfig};
-use crate::storage::vdb::hardware_accelerated::HardwareVDBStorage;
+// use crate::storage::vdb::hardware_accelerated::HardwareVDBStorage;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -211,7 +211,7 @@ impl InferenceEngine {
     pub async fn stream_infer_with_updates(
         &self,
         _model_loader: &ModelLoader,
-        _vdb_storage: &HardwareVDBStorage,
+        _vdb_storage: &(), // HardwareVDBStorage removed
         session: crate::inference::InferenceSession,
         input: InferenceInput,
         mut _update_channel: mpsc::Receiver<crate::inference::SparseWeightUpdate>,
@@ -386,7 +386,7 @@ impl InferenceEngine {
         
         Err(anyhow::anyhow!(
             "No model files found. Please download a model first:\n\
-             hyprstream model pull hf://model-name"
+             hyprstream model pull https://huggingface.co/<org>/<model-name>"
         ))
     }
     
@@ -414,8 +414,6 @@ impl InferenceEngine {
         for (adapter_id, adapter) in &fused_weights.weights {
             println!("   📎 Applying adapter: {}", adapter_id);
             
-            // Convert sparse LoRA adapter to LoRAWeightsData format
-            let lora_weights = self.convert_sparse_to_lora_weights_data(adapter).await?;
             
             tracing::warn!("Adapter application to engine not yet fully implemented in TorchEngine");
         }
@@ -427,6 +425,7 @@ impl InferenceEngine {
         Ok(())
     }
     
+    /* Commented out - SparseLoRAAdapter removed
     /// Convert sparse LoRA adapter to LoRAWeightsData format for Candle
     async fn convert_sparse_to_lora_weights_data(
         &self,
@@ -461,6 +460,9 @@ impl InferenceEngine {
         })
     }
     
+    */
+
+    /* Commented out - SparseLoRAAdapter removed
     /// Convert sparse LoRA adapter to HashMap format (legacy)
     async fn convert_sparse_to_lora_weights(
         &self,
@@ -503,6 +505,7 @@ impl InferenceEngine {
         
         Ok(lora_weights)
     }
+    */
 }
 
 /// Memory usage information

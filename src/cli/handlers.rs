@@ -1,8 +1,7 @@
-//! VDB-first CLI handlers for adaptive ML inference server
+//! CLI handlers for adaptive ML inference server
 
 use crate::{
-    storage::SparseStorageConfig,
-    inference::InferenceAPI,
+    // storage::SparseStorageConfig,  // VDB removed
     runtime::{RuntimeEngine, TorchEngine},
 };
 use ::config::{Config, File};
@@ -256,7 +255,7 @@ pub fn handle_config(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::er
     let mut builder = Config::builder()
         .set_default("host", "127.0.0.1")?
         .set_default("port", "50051")?
-        .set_default("storage.path", "./vdb_storage")?
+        .set_default("storage.path", "./storage")?
         .set_default("storage.neural_compression", true)?
         .set_default("storage.hardware_acceleration", true)?
         .set_default("storage.cache_size_mb", 2048)?
@@ -270,8 +269,8 @@ pub fn handle_config(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::er
     }
 
     let settings = builder.build()?;
-    info!("📁 VDB configuration loaded successfully");
-    debug!(settings = ?settings, "Current VDB configuration settings");
+    info!("📁 Configuration loaded successfully");
+    debug!(settings = ?settings, "Current configuration settings");
     Ok(())
 }
 
@@ -317,35 +316,13 @@ pub async fn handle_model_command(
             
             // Get remote models if requested
             if remote {
-                if let Some(reg_filter) = &registry {
-                    let config = crate::api::model_registry::RegistryConfig {
-                        token: None,
-                        base_url: "https://huggingface.co".to_string(),
-                        timeout_secs: 30,
-                        max_retries: 3,
-                        user_agent: "hyprstream/0.1.0".to_string(),
-                    };
-                    let hf_client = crate::api::huggingface::HuggingFaceClient::new(config)?;
-                    let search_query = search.clone().unwrap_or_else(|| reg_filter.clone());
-                    let search_results = hf_client.search_models(&search_query, Some(10)).await?;
-                    
-                    for model in search_results {
-                        let category = if model.task == Some("text-generation".to_string()) {
-                            "text-generation"
-                        } else if model.task == Some("text2text-generation".to_string()) {
-                            "text2text-generation"
-                        } else {
-                            "other"
-                        };
-                        
-                        models.push((
-                            model.id.clone(),
-                            "remote".to_string(),
-                            format!("{:.1}MB", model.downloads.unwrap_or(0) / 1000), // Approximate size from downloads
-                            category.to_string(),
-                            "N/A".to_string(), // Remote models don't have UUIDs yet
-                        ));
-                    }
+                if let Some(_reg_filter) = &registry {
+                    // Remote search functionality has been deprecated
+                    // Models should be pulled directly using git URLs
+                    eprintln!("⚠️  Remote model search is no longer supported");
+                    eprintln!("   Use 'hyprstream model pull' with a git URL instead:");
+                    eprintln!("   • hyprstream model pull https://huggingface.co/Qwen/Qwen2-0.5B-Instruct");
+                    eprintln!("   • hyprstream model pull git@github.com:user/model.git");
                 }
             }
             
@@ -390,129 +367,94 @@ pub async fn handle_model_command(
                     }
                     if models.is_empty() {
                         println!("No models found matching your criteria.");
-                        println!("Try: hyprstream model pull hf://Qwen/Qwen2-1.5B-Instruct");
+                        println!("Try: hyprstream model pull https://huggingface.co/Qwen/Qwen2-1.5B-Instruct");
                     }
                 }
             }
         }
-        ModelAction::Pull { uri, force, files: _, format, auto_convert, progress } => {
-            // Validate and parse URI early using standard URL parsing
-            let model_uri = match crate::api::model_storage::ModelUri::parse(&uri) {
-                Ok(parsed) => parsed,
-                Err(e) => {
-                    eprintln!("❌ Invalid model URI: {}", uri);
-                    eprintln!("   {}", e);
-                    eprintln!("   Model URIs must use the format: hf://org/model");
-                    eprintln!("   Example: hf://Qwen/Qwen2-1.5B-Instruct");
-                    return Err(e.into());
-                }
+        ModelAction::Clone { repo_url, git_ref, model_id: _ } => {
+            info!("📦 Cloning model from Git repository...");
+
+            // Get storage paths
+            let storage_paths = crate::storage::paths::StoragePaths::new()?;
+            let models_dir = storage_paths.models_dir()?;
+
+            let git_source = crate::api::git_downloader::GitModelSource::new(models_dir);
+            let (model_id, model_path) = if let Some(ref_str) = git_ref {
+                git_source.clone_ref(&repo_url, &ref_str)?
+            } else {
+                git_source.clone_model(&repo_url)?
             };
             
-            info!("📥 Pulling model: {} (format: {})", uri, format);
+            let storage_paths = crate::storage::paths::StoragePaths::new()?;
+            let models_dir = storage_paths.models_dir()?;
+            let model_storage = crate::api::model_storage::ModelStorage::new(models_dir).await?;
+            let model_name = repo_url.split('/').last()
+                .unwrap_or("unknown")
+                .trim_end_matches(".git");
             
-            // Use the unified model downloader
+            if let Err(e) = model_storage.register_with_git_registry(
+                &model_id,
+                model_name,
+                Some(repo_url.clone())
+            ).await {
+                tracing::warn!("Failed to register with Git registry: {}", e);
+            }
+            
+            println!();
+            println!("✅ Model cloned successfully!");
+            println!("   Model ID: {}", model_id);
+            println!("   Name: {}", model_name);
+            println!("   Location: {}", model_path.display());
+            println!();
+            println!("📚 Next steps:");
+            println!("   • Create adapter: hyprstream lora create --base-model {}", model_id);
+            println!("   • Run inference: hyprstream model infer {} --prompt \"...\"", model_id);
+        }
+        ModelAction::Pull { uri, force, .. } => {
+            info!("📥 Pulling model: {}", uri);
+            
             // Get storage paths
             let storage_paths = crate::storage::paths::StoragePaths::new()?;
             let models_dir = storage_paths.models_dir()?;
             
-            // Get HuggingFace token if available
-            let hf_auth = crate::auth::HfAuth::new()?;
-            let hf_token = hf_auth.get_token().await?;
-            
-            // Create downloader with token
-            let downloader = crate::api::model_downloader::ModelDownloader::new(models_dir, hf_token).await?;
-            
-            // Set up download options
-            let options = crate::api::model_downloader::DownloadOptions {
-                preferred_format: match format.as_str() {
-                    "safetensors" => crate::api::model_downloader::ModelFormat::SafeTensors,
-                    "pytorch" => crate::api::model_downloader::ModelFormat::PyTorch,
-                    _ => crate::api::model_downloader::ModelFormat::SafeTensors,
-                },
-                force,
-                show_progress: progress,
-                files_filter: None,
-                verify_checksums: true,
-                max_size_bytes: None,
-            };
-            
-            // Download the model
-            match downloader.download(&uri, options).await {
-                Ok(model) => {
+            let git_source = crate::api::git_downloader::GitModelSource::new(models_dir.clone());
+            match git_source.clone_model(&uri) {
+                Ok((model_id, model_path)) => {
+                    println!();
                     println!("✅ Model downloaded successfully!");
-                    println!("📦 Format: {:?}", model.format);
-                    println!("📊 Size: {:.2} GB", model.total_size_bytes as f64 / 1_073_741_824.0);
-                    println!("📁 Location: {}", model.local_path.display());
+                    println!("   Model ID: {}", model_id);
+                    println!("   Location: {}", model_path.display());
                     
-                    if let Some(config) = &model.config {
-                        println!("🏗️ Architecture: {}", config.architecture);
-                        println!("🔢 Parameters: {} layers, {} hidden size", 
-                            config.num_hidden_layers, config.hidden_size);
-                    }
-                    
-                    // Register the model with the storage system
-                    println!("📝 Registering model with storage system...");
-                    
-                    // Use the already parsed model_uri from validation above
-                    // (model_uri variable is already in scope from the early validation)
-                    
-                    // Use the UUID from the downloaded model
-                    let model_id = crate::api::model_storage::ModelId(model.uuid);
-                    
-                    // Create external source info
-                    let external_source = crate::api::model_storage::ExternalSource {
-                        source_type: crate::api::model_storage::SourceType::HuggingFace,
-                        identifier: format!("{}/{}", model_uri.org, model_uri.name),
-                        revision: model_uri.revision.clone(),
-                        download_url: None,
-                        last_verified: chrono::Utc::now().timestamp(),
-                    };
-                    
-                    // Use the downloaded files directly (ModelFile is now the same type)
-                    let model_files = model.files.clone();
-                    
-                    // Create metadata
-                    let metadata = crate::api::model_storage::ModelMetadata {
+                    // Save metadata
+                    let model_storage = crate::api::model_storage::ModelStorage::new(models_dir).await?;
+                    let metadata = crate::api::model_storage::ModelMetadataFile {
                         model_id: model_id.clone(),
-                        name: model_uri.name.clone(),
-                        display_name: Some(model.model_id.clone()),
-                        architecture: model.config.as_ref().map(|c| c.architecture.clone()).unwrap_or_else(|| "unknown".to_string()),
-                        parameters: model.config.as_ref().and_then(|c| {
-                            if c.num_hidden_layers > 0 && c.hidden_size > 0 {
-                                Some((c.num_hidden_layers as u64) * (c.hidden_size as u64) * 1_000_000)
-                            } else {
-                                None
-                            }
-                        }),
-                        model_type: format!("{:?}", model.format).to_lowercase(),
-                        tokenizer_type: model.tokenizer.as_ref().and_then(|t| t.tokenizer_class.clone()),
-                        size_bytes: model.total_size_bytes,
-                        files: model_files,
-                        external_sources: vec![external_source],
-                        local_path: Some(model.local_path.clone()),
-                        is_cached: true,
-                        tags: vec![],
-                        description: None,
-                        license: None,
+                        name: uri.clone(),
+                        display_name: uri.clone(),
+                        source_uri: uri.clone(),
+                        architecture: None,
+                        parameters: None,
                         created_at: chrono::Utc::now().timestamp(),
                         last_accessed: chrono::Utc::now().timestamp(),
-                        last_updated: chrono::Utc::now().timestamp(),
                     };
+                    model_storage.save_model_metadata_file(&model_id, &metadata).await?;
                     
-                    // Store the metadata
-                    let storage_paths = crate::storage::paths::StoragePaths::new()?;
-            let model_storage = crate::api::model_storage::ModelStorage::new(storage_paths.models_dir()?).await?;
-                    let storage = crate::api::model_storage::ModelStorage::new(storage_paths.models_dir()?).await?;
-                    storage.store_metadata(&model_uri, metadata).await?;
-                    
-                    println!("✅ Model registered with ID: {}", model_id);
-                    
-                    // SafeTensors is the preferred format
-                    if model.format == crate::api::model_downloader::ModelFormat::PyTorch {
-                        println!("ℹ️ Note: PyTorch format detected.");
-                        println!("   SafeTensors format is preferred for better security and performance.");
-                        println!("   Try: hyprstream model pull hf://<model-name> --format safetensors");
+                    // Register with Git registry (if available)
+                    // Extract a friendly name from the URI
+                    let model_name = uri.split('/').last().unwrap_or(&uri);
+                    if let Err(e) = model_storage.register_with_git_registry(
+                        &model_id, 
+                        model_name,
+                        Some(uri.clone())
+                    ).await {
+                        tracing::warn!("Failed to register with Git registry: {}", e);
                     }
+                    
+                    println!();
+                    println!("📚 Next steps:");
+                    println!("   • Create adapter: hyprstream lora create --base-model {}", model_id);
+                    println!("   • Run inference: hyprstream model infer {} --prompt \"...\"", model_id);
                 }
                 Err(e) => {
                     eprintln!("❌ Download failed: {}", e);
@@ -521,193 +463,129 @@ pub async fn handle_model_command(
             }
         }
         
-        ModelAction::Remove { uri, keep_metadata, yes } => {
-            // Check if the input is a UUID
-            let is_uuid = uuid::Uuid::parse_str(&uri).is_ok();
+        ModelAction::Share { model_name, include_metrics, push_to } => {
+            info!("📤 Sharing model: {}", model_name);
             
-            // If it's not a UUID, validate as URI
-            if !is_uuid {
-                match crate::api::model_storage::ModelUri::parse(&uri) {
-                    Ok(_parsed) => {},
-                    Err(e) => {
-                        eprintln!("❌ Invalid model identifier: {}", uri);
-                        eprintln!("   {}", e);
-                        eprintln!("   Use either a UUID or URI format (hf://org/model)");
-                        return Err(e.into());
-                    }
+            let storage_paths = crate::storage::paths::StoragePaths::new()?;
+            let models_dir = storage_paths.models_dir()?;
+            
+            let mut sharing = crate::api::model_sharing::ModelSharing::new(models_dir).await?;
+            
+            // Create shareable reference
+            let share_ref = sharing.create_share_ref(&model_name, include_metrics).await?;
+            
+            println!("📋 Shareable Model Reference:");
+            println!("   Name: {}", share_ref.name);
+            println!("   Type: {:?}", share_ref.model_type);
+            println!("   Commit: {}", share_ref.commit);
+            println!("   Size: {:.2} GB", share_ref.size_bytes as f64 / 1_073_741_824.0);
+            
+            if let Some(metrics) = &share_ref.metrics {
+                println!("   Performance:");
+                println!("     Loss: {:.4}", metrics.loss);
+                if let Some(acc) = metrics.accuracy {
+                    println!("     Accuracy: {:.2}%", acc * 100.0);
                 }
+                println!("     Training Steps: {}", metrics.training_steps);
             }
             
-            info!("🗑️ Removing model: {}", uri);
+            // Optionally push to remote
+            if let Some(remote_url) = push_to {
+                println!();
+                println!("📤 Pushing to remote: {}", remote_url);
+                sharing.push_to_remote(&model_name, &remote_url, None).await?;
+            }
             
+            // Output as JSON for easy sharing
+            println!();
+            println!("📦 Share this with peers:");
+            println!("{}", serde_json::to_string_pretty(&share_ref)?);
+        }
+        
+        ModelAction::Import { git_url, name, verify: _ } => {
+            info!("📥 Importing shared model from: {}", git_url);
+            
+            let storage_paths = crate::storage::paths::StoragePaths::new()?;
+            let models_dir = storage_paths.models_dir()?;
+            
+            let mut sharing = crate::api::model_sharing::ModelSharing::new(models_dir).await?;
+            
+            // Parse share reference if provided as JSON
+            let share_ref = if git_url.starts_with('{') {
+                // Assume it's JSON share reference
+                serde_json::from_str(&git_url)?
+            } else {
+                // Create minimal share ref
+                crate::api::model_sharing::ShareableModelRef {
+                    name: name.clone().unwrap_or_else(|| "imported-model".to_string()),
+                    model_type: crate::api::model_sharing::ModelType::Base,
+                    git_url: Some(git_url.clone()),
+                    commit: "HEAD".to_string(),
+                    size_bytes: 0,
+                    metrics: None,
+                    signature: None,
+                }
+            };
+            
+            // Import the model
+            let model_id = sharing.import_shared_model(share_ref, &git_url, name).await?;
+            
+            println!();
+            println!("✅ Model imported successfully!");
+            println!("   Model ID: {}", model_id);
+        }
+        
+        ModelAction::Remove { uri, keep_metadata, yes } => {
+            // Parse as UUID only - no fallbacks
+            let model_id = crate::api::model_storage::ModelId::from_str(&uri)
+                .map_err(|_| anyhow::anyhow!("Invalid UUID: '{}'. Use 'hyprstream model list' to see model UUIDs", uri))?;
+
+            info!("🗑️ Removing model: {}", model_id);
+
             // Check if confirmation is needed
             if !yes {
-                println!("⚠️  Are you sure you want to remove model '{}'?", uri);
+                println!("⚠️  Are you sure you want to remove model '{}'?", model_id);
                 println!("This action cannot be undone.");
                 println!("");
                 println!("Type 'yes' to confirm, or use --yes flag to skip confirmation:");
-                
+
                 use std::io::{self, BufRead};
                 let stdin = io::stdin();
                 let mut line = String::new();
                 stdin.lock().read_line(&mut line)?;
-                
+
                 if line.trim().to_lowercase() != "yes" {
                     println!("❌ Removal cancelled");
                     return Ok(());
                 }
             }
-            
-            // Use the model management system to remove the model
-            let storage_paths = crate::storage::paths::StoragePaths::new()?;
-            let model_storage = crate::api::model_storage::ModelStorage::new(storage_paths.models_dir()?).await?;
-            
-            // Handle different input formats
-            let model_uri = if is_uuid {
-                // Direct UUID - create a dummy URI for compatibility
-                // The actual removal will use the UUID directly
-                crate::api::model_storage::ModelUri {
-                    registry: "local".to_string(),
-                    org: "uuid".to_string(),
-                    name: uri.clone(),
-                    revision: None,
-                    uri: format!("local://uuid/{}", uri),
-                }
-            } else if uri.contains("://") {
-                // It's a full URI
-                crate::api::model_storage::ModelUri::parse(&uri)
-                    .map_err(|e| format!("Failed to parse model URI: {}", e))?
-            } else {
-                // Try to find by name or ID in cached models
-                let cached_models = model_storage.list_local_models().await
-                    .map_err(|e| format!("Failed to list cached models: {}", e))?;
-                
-                // Search for exact match or partial match
-                let found = cached_models.iter()
-                    .find(|(cached_uri, metadata)| {
-                        cached_uri.name == uri || 
-                        cached_uri.uri == uri ||
-                        cached_uri.uri.ends_with(&uri) ||
-                        // Also check if it matches a model ID (UUID)
-                        if let Ok(model_id) = crate::api::model_storage::ModelId::from_str(&uri) {
-                            metadata.model_id == model_id
-                        } else {
-                            false
-                        }
-                    });
-                
-                if let Some((model_uri, _)) = found {
-                    model_uri.clone()
-                } else {
-                    // Try to construct a default HF URI
-                    let default_uri = if uri.contains('/') {
-                        format!("hf://{}", uri)
-                    } else {
-                        // Single name, might need org prefix
-                        format!("hf://library/{}", uri)
-                    };
-                    
-                    crate::api::model_storage::ModelUri::parse(&default_uri)
-                        .unwrap_or_else(|_| {
-                            // Fallback: create a simple URI
-                            crate::api::model_storage::ModelUri {
-                                registry: "hf".to_string(),
-                                org: "library".to_string(),
-                                name: uri.clone(),
-                                revision: None,
-                                uri: format!("hf://library/{}", uri),
-                            }
-                        })
-                }
-            };
-            
-            // Get the actual local path from metadata
+
+            // Get storage paths
             let storage_paths = crate::storage::paths::StoragePaths::new()?;
             let models_dir = storage_paths.models_dir()?;
-            
-            // Get the metadata to find the actual file path
-            let cached_models = model_storage.list_local_models().await?;
-            let model_data = cached_models.iter()
-                .find(|(cached_uri, metadata)| {
-                    cached_uri.uri == model_uri.uri ||
-                    // Also check if it matches a model ID (UUID)
-                    if let Ok(model_id) = crate::api::model_storage::ModelId::from_str(&uri) {
-                        metadata.model_id == model_id
-                    } else {
-                        false
-                    }
-                });
-            
-            let local_path = if is_uuid {
-                // For UUID, construct the path directly
-                models_dir.join(&uri)
-            } else if let Some((_, metadata)) = model_data {
-                // Use the actual path from metadata (UUID-based only)
-                match &metadata.local_path {
-                    Some(path) => path.clone(),
-                    None => {
-                        eprintln!("❌ Model does not have a local path");
-                        return Err(Box::new(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            "Model does not have a local path"
-                        )));
-                    }
-                }
-            } else {
-                eprintln!("❌ Model '{}' not found in storage", uri);
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("Model '{}' not found in storage", uri)
-                )));
-            };
-            
-            // Check if model exists locally
-            if !local_path.exists() {
-                eprintln!("❌ Model '{}' not found in local storage", uri);
-                eprintln!("   Path checked: {}", local_path.display());
-                
-                // List available models to help user
-                println!("\nAvailable models:");
-                if let Ok(cached_models) = model_storage.list_local_models().await {
-                    for (model_uri, _metadata) in cached_models.iter().take(10) {
-                        println!("  - {}", model_uri.uri);
-                    }
-                    if cached_models.len() > 10 {
-                        println!("  ... and {} more", cached_models.len() - 10);
-                    }
-                } else {
-                    println!("  (unable to list models)");
-                }
-                return Ok(());
+
+            // Direct UUID path - no fallbacks
+            let model_path = models_dir.join(model_id.to_string());
+
+            // Check if model exists
+            if !model_path.exists() {
+                eprintln!("❌ Model {} not found", model_id);
+                eprintln!("   Use 'hyprstream model list' to see available models");
+                return Err(anyhow::anyhow!("Model {} not found", model_id).into());
             }
-            
-            // Remove the model files (check if it's a file or directory)
-            println!("🗑️ Removing model files from: {}", local_path.display());
-            let metadata = tokio::fs::metadata(&local_path).await?;
-            if metadata.is_file() {
-                // Remove single file
-                if let Err(e) = tokio::fs::remove_file(&local_path).await {
-                    eprintln!("❌ Failed to remove model file: {}", e);
-                    eprintln!("   You may need to manually remove: {}", local_path.display());
-                    return Err(e.into());
-                }
-            } else if metadata.is_dir() {
-                // Remove directory
-                if let Err(e) = tokio::fs::remove_dir_all(&local_path).await {
-                    eprintln!("❌ Failed to remove model directory: {}", e);
-                    eprintln!("   You may need to manually remove: {}", local_path.display());
-                    return Err(e.into());
-                }
+
+            // Remove the model directory
+            println!("🗑️ Removing model files from: {}", model_path.display());
+            if let Err(e) = tokio::fs::remove_dir_all(&model_path).await {
+                eprintln!("❌ Failed to remove model directory: {}", e);
+                eprintln!("   You may need to manually remove: {}", model_path.display());
+                return Err(e.into());
             }
-            
+
             // Remove metadata unless keeping it
             if !keep_metadata {
-                if is_uuid {
-                    // For UUID-based removal, update metadata.json directly
-                    println!("🗑️ Removing metadata entry for UUID: {}", uri);
-                    // Note: The metadata might have the wrong UUID, so removal might fail
-                    // but that's okay since we're removing by directory UUID
-                } else if let Err(e) = model_storage.remove_metadata(&model_uri).await {
+                let model_storage = crate::api::model_storage::ModelStorage::new(models_dir).await?;
+                if let Err(e) = model_storage.remove_metadata_by_id(&model_id).await {
                     eprintln!("⚠️  Failed to remove metadata: {}", e);
                     // Continue anyway since files are already deleted
                 }
@@ -715,144 +593,61 @@ pub async fn handle_model_command(
             } else {
                 println!("📋 Model metadata preserved");
             }
-            
-            println!("✅ Model '{}' removed successfully", uri);
+
+            println!("✅ Model {} removed successfully", model_id);
         }
         ModelAction::Info { uri, format } => {
-            // Validate and parse URI using standard URL parsing  
-            let parsed_uri = match crate::api::model_storage::ModelUri::parse(&uri) {
-                Ok(parsed) => parsed,
-                Err(e) => {
-                    eprintln!("❌ Invalid model URI: {}", uri);
-                    eprintln!("   {}", e);
-                    eprintln!("   Model URIs must use the format: hf://org/model");
-                    return Err(e.into());
-                }
-            };
-            
-            info!("ℹ️ Getting model info: {}", uri);
-            
-            // Use model storage directly
+            // Parse as UUID only for local models
+            let model_id = crate::api::model_storage::ModelId::from_str(&uri)
+                .map_err(|_| anyhow::anyhow!("Invalid UUID: '{}'. For remote model info, use 'hyprstream model search'", uri))?;
+
+            info!("ℹ️ Getting model info: {}", model_id);
+
+            // Get storage and retrieve metadata
             let storage_paths = crate::storage::paths::StoragePaths::new()?;
             let model_storage = crate::api::model_storage::ModelStorage::new(storage_paths.models_dir()?).await?;
-            
-            // Try to get local model info first
-            let model_info = if let Ok(cached_models) = model_storage.list_local_models().await {
-                if let Some((model_uri, model_metadata)) = cached_models.iter().find(|(cached_uri, _)| 
-                    cached_uri.org == parsed_uri.org && cached_uri.name == parsed_uri.name) {
-                    use chrono::{DateTime, Utc};
-                    let created_dt = DateTime::<Utc>::from_timestamp(model_metadata.created_at, 0)
-                        .unwrap_or_else(|| Utc::now());
-                    let accessed_dt = DateTime::<Utc>::from_timestamp(model_metadata.last_accessed, 0)
-                        .unwrap_or_else(|| Utc::now());
-                    Ok(format!(r#"{{
-  "name": "{}",
-  "path": "{}",
-  "size_bytes": {},
-  "file_size": "{:.1}GB",
-  "status": "cached_local",
-  "created_at": "{}",
-  "last_accessed": "{}"
-}}"#, 
-                        model_uri.name,
-                        model_metadata.local_path.as_ref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "UUID-based storage".to_string()),
-                        model_metadata.size_bytes,
-                        model_metadata.size_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                        created_dt.format("%Y-%m-%d %H:%M:%S"),
-                        accessed_dt.format("%Y-%m-%d %H:%M:%S")
-                    ))
-                } else {
-                    // Try to get remote model info from HuggingFace
-                    let config = crate::api::model_registry::RegistryConfig {
-                        token: None,
-                        base_url: "https://huggingface.co".to_string(),
-                        timeout_secs: 30,
-                        max_retries: 3,
-                        user_agent: "hyprstream/0.1.0".to_string(),
-                    };
-                    let hf_client = crate::api::huggingface::HuggingFaceClient::new(config)?;
-                    let model_id = if uri.starts_with("hf://") {
-                        uri.strip_prefix("hf://").unwrap_or(&uri)
-                    } else {
-                        &uri
-                    };
-                    
-                    let parts: Vec<&str> = model_id.split('/').collect();
-                    let (org, name) = if parts.len() >= 2 {
-                        (parts[0], parts[1..].join("/"))
-                    } else {
-                        ("", model_id.to_string())
-                    };
-                    match hf_client.get_model_info(&org, &name).await {
-                        Ok(model_info) => Ok(format!(r#"{{
-  "name": "{}",
-  "id": "{}",
-  "downloads": {},
-  "likes": {},
-  "created_at": "{}",
-  "last_modified": "{}",
-  "status": "available_remote",
-  "task": "{}",
-  "library_name": "{}"
-}}"#,
-                            model_info.id,
-                            model_info.id,
-                            model_info.downloads.unwrap_or(0),
-                            model_info.likes.unwrap_or(0),
-                            model_info.created_at,
-                            model_info.last_modified.unwrap_or_default(),
-                            model_info.task.unwrap_or_default(),
-                            model_info.library_name.unwrap_or_default()
-                        )),
-                        Err(_) => Err(format!(r#"{{
-  "name": "{}",
-  "status": "not_found",
-  "error": "Model not found in local cache or remote registry"
-}}"#, uri))
-                    }
-                }
-            } else {
-                Err(format!(r#"{{
-  "name": "{}",
-  "status": "error",
-  "error": "Failed to access model management system"
-}}"#, uri))
-            };
-            
+            let metadata = model_storage.get_metadata_by_id(&model_id).await?;
+
+            // Display metadata
             match format.as_str() {
                 "json" => {
-                    match model_info {
-                        Ok(info) => println!("{}", info),
-                        Err(err) => println!("{}", err),
-                    }
-                },
+                    let json_output = serde_json::json!({
+                        "model_id": metadata.model_id.to_string(),
+                        "name": metadata.name,
+                        "display_name": metadata.display_name,
+                        "architecture": metadata.architecture,
+                        "parameters": metadata.parameters,
+                        "size_bytes": metadata.size_bytes,
+                        "size_gb": format!("{:.2}", metadata.size_bytes as f64 / 1_073_741_824.0),
+                        "created_at": metadata.created_at,
+                        "last_accessed": metadata.last_accessed,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&json_output)?);
+                }
                 "yaml" => {
-                    match model_info {
-                        Ok(_) => {
-                            println!("name: {}", uri);
-                            println!("status: available");
-                        },
-                        Err(_) => {
-                            println!("name: {}", uri);
-                            println!("status: not_found");
-                        }
+                    println!("model_id: {}", metadata.model_id);
+                    println!("name: {}", metadata.name);
+                    if let Some(display_name) = &metadata.display_name {
+                        println!("display_name: {}", display_name);
                     }
-                },
+                    println!("architecture: {}", metadata.architecture);
+                    if let Some(params) = metadata.parameters {
+                        println!("parameters: {}", params);
+                    }
+                    println!("size_gb: {:.2}", metadata.size_bytes as f64 / 1_073_741_824.0);
+                }
                 _ => {
-                    match model_info {
-                        Ok(_) => {
-                            println!("Model: {}", uri);
-                            println!("Status: ✅ Available");
-                            println!("Use --format json for detailed information");
-                        },
-                        Err(_) => {
-                            println!("Model: {}", uri);
-                            println!("Status: ❌ Not found");
-                            println!("Try: hyprstream model pull {}", uri);
-                        }
+                    println!("Model: {}", metadata.name);
+                    println!("UUID: {}", metadata.model_id);
+                    if let Some(display_name) = &metadata.display_name {
+                        println!("Display Name: {}", display_name);
                     }
+                    println!("Architecture: {}", metadata.architecture);
+                    if let Some(params) = metadata.parameters {
+                        println!("Parameters: {}", params);
+                    }
+                    println!("Size: {:.2} GB", metadata.size_bytes as f64 / 1_073_741_824.0);
+                    println!("Status: ✅ Available");
                 }
             }
         }
@@ -904,9 +699,7 @@ pub async fn handle_model_command(
                                 if let Some(display_name) = &metadata.display_name {
                                     println!("     Display: {}", display_name);
                                 }
-                                if metadata.local_path.is_some() {
-                                    println!("     Size: {:.2} GB", metadata.size_bytes as f64 / 1_073_741_824.0);
-                                }
+                                println!("     Size: {:.2} GB", metadata.size_bytes as f64 / 1_073_741_824.0);
                             }
                             if models.len() > 10 {
                                 println!("  ... and {} more", models.len() - 10);
@@ -920,76 +713,11 @@ pub async fn handle_model_command(
                 }
             }
         }
-        ModelAction::Search { query, registry, limit, format } => {
-            info!("🔍 Searching models: {}", query);
-            
-            // Use real HuggingFace search API
-            let config = crate::api::model_registry::RegistryConfig {
-                token: None,
-                base_url: "https://huggingface.co".to_string(),
-                timeout_secs: 30,
-                max_retries: 3,
-                user_agent: "hyprstream/0.1.0".to_string(),
-            };
-            let hf_client = crate::api::huggingface::HuggingFaceClient::new(config)?;
-            let search_results = hf_client.search_models(&query, Some(limit)).await?;
-            
-            let mut results = Vec::new();
-            
-            for model in search_results {
-                // Apply registry filter
-                if let Some(reg) = &registry {
-                    if !model.id.starts_with(reg) {
-                        continue;
-                    }
-                }
-                
-                let description = format!(
-                    "{} | Downloads: {} | Likes: {}", 
-                    model.task.unwrap_or("general".to_string()),
-                    model.downloads.unwrap_or(0),
-                    model.likes.unwrap_or(0)
-                );
-                
-                results.push((model.id, description));
-            }
-            
-            // If no results and no registry filter, add some local cache results
-            if results.is_empty() && registry.is_none() {
-                let storage_paths = crate::storage::paths::StoragePaths::new()?;
-            let model_storage = crate::api::model_storage::ModelStorage::new(storage_paths.models_dir()?).await?;
-                if let Ok(cached_models) = model_storage.list_local_models().await {
-                    for (model_uri, model_metadata) in cached_models.iter().take(limit) {
-                        if model_uri.name.to_lowercase().contains(&query.to_lowercase()) {
-                            results.push((
-                                model_uri.name.clone(),
-                                format!("Local cached model | Size: {:.1}GB", 
-                                    model_metadata.size_bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-                            ));
-                        }
-                    }
-                }
-            }
-            
-            match format.as_str() {
-                "json" => {
-                    println!("{{");
-                    println!("  \"query\": \"{}\",", query);
-                    println!("  \"results\": [");
-                    for (i, (name, desc)) in results.iter().enumerate() {
-                        let comma = if i < results.len() - 1 { "," } else { "" };
-                        println!("    {{\"name\": \"{}\", \"description\": \"{}\"}}{}", name, desc, comma);
-                    }
-                    println!("  ]");
-                    println!("}}");
-                },
-                _ => {
-                    println!("Search results for '{}' (showing {} results):", query, results.len());
-                    for (name, desc) in &results {
-                        println!("  📦 {} - {}", name, desc);
-                    }
-                }
-            }
+        ModelAction::Search { .. } => {
+            eprintln!("❌ Model search has been removed.");
+            eprintln!("   Use 'hyprstream model list' to see local models");
+            eprintln!("   Use 'hyprstream model pull <uri>' to download models");
+            return Err(anyhow::anyhow!("Model search feature has been removed").into());
         }
         ModelAction::Convert { source, to, output, precision, verify } => {
             info!("🔄 Converting model from {} to {}", source, to);
@@ -1030,7 +758,7 @@ pub async fn handle_model_command(
             eprintln!("   Model format conversion is not supported.");
             eprintln!("   Please download models directly in SafeTensors format.");
             eprintln!("");
-            eprintln!("   Try: hyprstream model pull hf://<model-name> --format safetensors");
+            eprintln!("   Try: hyprstream model pull https://huggingface.co/<org>/<model-name>");
         }
         ModelAction::Cache { action: _ } => {
             info!("🗄️ Managing model cache");
@@ -1145,15 +873,9 @@ pub async fn handle_model_command(
             
             // Get the model path or error if not found
             let model_path = match found_model {
-                Some((_model_id, metadata)) => {
-                    match metadata.local_path {
-                        Some(path) => path,
-                        None => {
-                            error!("Model '{}' found but has no local path", model);
-                            eprintln!("Error: Model '{}' metadata is corrupted", model);
-                            return Ok(());
-                        }
-                    }
+                Some((model_id, _metadata)) => {
+                    // Use UUID-based path
+                    storage_paths.models_dir()?.join(model_id.to_string())
                 }
                 None => {
                     error!("Model '{}' not found in model storage", model);
@@ -1164,7 +886,7 @@ pub async fn handle_model_command(
                     let available_models = model_storage.children().await?;
                     if available_models.is_empty() {
                         eprintln!("  No models found. Download one with:");
-                        eprintln!("  hyprstream model pull hf://Qwen/Qwen2-0.5B-Instruct");
+                        eprintln!("  hyprstream model pull https://huggingface.co/Qwen/Qwen2-0.5B-Instruct");
                     } else {
                         for (_id, metadata) in available_models.iter().take(5) {
                             eprintln!("  - {} (UUID: {})", metadata.name, metadata.model_id);
@@ -1303,257 +1025,8 @@ pub async fn handle_model_command(
     Ok(())
 }
 
-pub async fn handle_auth_command(cmd: crate::cli::commands::AuthCommand) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::cli::commands::auth::AuthAction;
-    use crate::auth::HfAuth;
-    use std::io::{self, Write};
-    
-    let auth = HfAuth::new()?;
-    
-    match cmd.action {
-        AuthAction::Login { provider, token, stdin } => {
-            match provider.as_str() {
-                "huggingface" | "hf" => {
-                    let auth_token = if stdin {
-                        println!("Reading token from stdin...");
-                        let mut buffer = String::new();
-                        io::stdin().read_line(&mut buffer)?;
-                        buffer.trim().to_string()
-                    } else if let Some(t) = token {
-                        t
-                    } else {
-                        print!("Enter your HuggingFace token: ");
-                        io::stdout().flush()?;
-                        let mut buffer = String::new();
-                        io::stdin().read_line(&mut buffer)?;
-                        buffer.trim().to_string()
-                    };
-                    
-                    if auth_token.is_empty() {
-                        println!("❌ Token cannot be empty");
-                        return Ok(());
-                    }
-                    
-                    // Validate token format (HuggingFace tokens start with hf_)
-                    if !auth_token.starts_with("hf_") {
-                        println!("⚠️  Warning: HuggingFace tokens usually start with 'hf_'");
-                        print!("Continue anyway? (y/N): ");
-                        io::stdout().flush()?;
-                        let mut buffer = String::new();
-                        io::stdin().read_line(&mut buffer)?;
-                        if !buffer.trim().to_lowercase().starts_with('y') {
-                            println!("❌ Login cancelled");
-                            return Ok(());
-                        }
-                    }
-                    
-                    auth.set_token(&auth_token).await?;
-                    println!("✅ Successfully logged in to HuggingFace");
-                }
-                _ => {
-                    println!("❌ Unsupported provider: {}", provider);
-                    println!("Supported providers: huggingface");
-                }
-            }
-        }
-        AuthAction::Status { provider } => {
-            match provider.as_str() {
-                "huggingface" | "hf" => {
-                    if auth.is_authenticated().await {
-                        if let Some(token) = auth.get_token().await? {
-                            let masked_token = mask_token(&token);
-                            println!("✅ Authenticated to HuggingFace");
-                            println!("   Token: {}", masked_token);
-                        }
-                    } else {
-                        println!("❌ Not authenticated to HuggingFace");
-                        println!("   Use 'hyprstream auth login' to login");
-                    }
-                }
-                _ => {
-                    println!("❌ Unsupported provider: {}", provider);
-                    println!("Supported providers: huggingface");
-                }
-            }
-        }
-        AuthAction::Logout { provider } => {
-            match provider.as_str() {
-                "huggingface" | "hf" => {
-                    auth.logout().await?;
-                }
-                _ => {
-                    println!("❌ Unsupported provider: {}", provider);
-                    println!("Supported providers: huggingface");
-                }
-            }
-        }
-        AuthAction::Providers => {
-            println!("Supported Authentication Providers:");
-            println!("════════════════════════════════════");
-            println!();
-            println!("🤗 huggingface (aliases: hf)");
-            println!("   • Required for downloading gated models");
-            println!("   • Get your token from: https://huggingface.co/settings/tokens");
-            println!("   • Usage: hyprstream auth login --provider huggingface");
-            println!();
-            println!("More providers coming soon!");
-        }
-    }
-    
-    Ok(())
-}
 
-/// Mask a token for display, showing only first and last few characters
-fn mask_token(token: &str) -> String {
-    if token.len() <= 8 {
-        "*".repeat(token.len())
-    } else {
-        format!("{}***{}", &token[..4], &token[token.len()-4..])
-    }
-}
 
-/// Run LoRA inference using VDB storage and InferenceAPI
-async fn run_lora_inference_with_vdb(
-    model_path: &Path,
-    lora_layer: &crate::api::lora_registry::LoRALayer,
-    input_text: &str,
-    max_tokens: usize,
-    _temperature: f32,
-    _top_p: f32,
-    _stream: bool,
-) -> anyhow::Result<InferenceResponse> {
-    use std::sync::Arc;
-    
-    // Validate model exists
-    if !model_path.exists() {
-        return Err(anyhow::anyhow!(
-            "Model file not found: {}. Please download a model first.",
-            model_path.display()
-        ));
-    }
-    
-    // Initialize VDB-backed LoRA storage system
-    let storage_paths = crate::storage::paths::StoragePaths::new()?;
-    
-    // Create LoRA storage manager
-    let storage_manager = Arc::new(
-        crate::storage::LoRAStorageManager::new(
-            storage_paths.loras_dir()?,
-            storage_paths.cache_dir()?.join("vdb_lora"),
-            None, // Use default config
-        ).await?
-    );
-    
-    // Create weight cache with optimized settings for inference
-    let cache_config = crate::storage::LoRAWeightCacheConfig {
-        max_memory_bytes: 1024 * 1024 * 1024, // 1GB for inference
-        max_adapters: 10, // Keep small number for inference
-        auto_save_threshold: 1000000, // Don't auto-save during inference
-        enable_background_cleanup: false, // Disable background tasks during inference
-        enable_preloading: true, // Enable preloading for better performance
-        ..Default::default()
-    };
-    
-    let weight_cache = crate::storage::LoRAWeightCache::new(
-        Arc::clone(&storage_manager),
-        Some(cache_config),
-    ).await?;
-    
-    // Load LoRA adapter from VDB storage via cache
-    println!("📚 Loading LoRA adapter weights from VDB storage...");
-    let lora_adapter = weight_cache.get_adapter(&lora_layer.id).await?;
-    
-    println!("✅ LoRA adapter loaded successfully");
-    println!("   📊 Memory usage: {:.1}MB", lora_adapter.memory_usage().await as f64 / (1024.0 * 1024.0));
-    println!("   🎯 Sparsity: {:.1}%", lora_adapter.get_config().sparsity * 100.0);
-    
-    // Create VDB storage backend for inference API
-    let vdb_storage = {
-        let _storage_config = SparseStorageConfig {
-            storage_path: storage_paths.cache_dir()?.join("vdb_storage"),
-            neural_compression: true,
-            hardware_acceleration: true,
-            cache_size_mb: 1024,
-            compaction_interval_secs: 300,
-            streaming_updates: false,
-            update_batch_size: 100,
-            layer_aware_mapping: true,
-            sparsity_threshold: 1e-8,
-        };
-        Arc::new(crate::storage::vdb::hardware_accelerated::HardwareVDBStorage::new().await?)
-    };
-    
-    // Create a config optimized for LoRA inference
-    let mut temp_config = crate::config::HyprConfig::default_for_model(model_path)?;
-    temp_config.lora.enabled = true;
-    temp_config.lora.max_adapters = 1;
-    temp_config.lora.alpha = lora_layer.config.alpha;
-    temp_config.lora.sparsity = lora_layer.config.sparsity_ratio;
-    
-    let inference_api = Arc::new(InferenceAPI::new(
-        model_path,
-        vdb_storage,
-        temp_config,
-    ).await?);
-    
-    // Load the base model into the inference engine
-    println!("📥 Loading base model into inference engine...");
-    if let Err(e) = inference_api.load_model(model_path).await {
-        return Err(anyhow::anyhow!("Failed to load base model: {}", e));
-    }
-    println!("✅ Base model loaded successfully");
-    
-    // Convert VDB-loaded adapter to the format needed for direct inference
-    println!("🧠 Converting VDB adapter to inference format...");
-    
-    println!("🚀 Starting direct LoRA-enhanced inference...");
-    let start_time = std::time::Instant::now();
-    
-    // Show adapter stats before inference
-    let adapter_stats = lora_adapter.get_stats().await;
-    println!("   ⚡ Adapter forward passes: {}", adapter_stats.forward_passes);
-    println!("   🔄 Adapter updates applied: {}", adapter_stats.updates_applied);
-    println!("   🎯 Average sparsity: {:.3}%", adapter_stats.avg_sparsity * 100.0);
-    
-    // Perform inference directly through the inference engine
-    // Use the new public method to generate text with the LoRA-influenced base model
-    let output = match inference_api.generate_text_direct(input_text, max_tokens).await {
-        Ok(generated_text) => {
-            println!("✅ Generated text using LoRA-influenced base model!");
-            
-            // Create proper InferenceOutput
-            crate::inference::InferenceOutput {
-                text: generated_text,
-                tokens: vec![], // Empty for now
-                tokens_generated: input_text.split_whitespace().count() + 15, // Estimate
-                latency_ms: start_time.elapsed().as_millis() as f64,
-                adapter_contribution: {
-                    let mut contrib = std::collections::HashMap::new();
-                    contrib.insert(lora_layer.id.to_string(), 1.0);
-                    contrib
-                },
-            }
-        }
-        Err(e) => {
-            return Err(anyhow::anyhow!("Direct inference failed: {}", e));
-        }
-    };
-    
-    // Calculate total processing time
-    let total_processing_time = start_time.elapsed();
-    
-    // Release adapter from cache (reduce reference count)
-    weight_cache.release_adapter(&lora_layer.id).await?;
-    
-    // Convert to API response format
-    Ok(InferenceResponse {
-        lora_id: lora_layer.id.to_string(),
-        output: output.text,
-        tokens_generated: output.tokens_generated,
-        latency_ms: total_processing_time.as_millis() as f64,
-        finish_reason: "completed".to_string(),
-    })
-}
 
 /// Create HTTP client for REST API communication
 pub fn create_http_client() -> Client {

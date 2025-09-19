@@ -1,13 +1,12 @@
 //! PyTorch-native LoRA training handler for CLI with SafeTensor storage
-//! 
+//!
 //! This module provides CLI integration for the PyTorch-based LoRA implementation
 //! with full autograd support for training and SafeTensor persistence.
-//! OpenVDB is used only for optional sparse weight caching.
 
 use anyhow::{Result, anyhow};
 use crate::cli::commands::lora::{LoRAAction, TrainingAction};
 use crate::lora::{
-    config::{LoRAConfig, TrainingConfig, QLoRAConfig, QuantizationType, ComputeDType},
+    LoRAConfig, TrainingConfig,
     trainer::{LoRATrainer, TrainingMetrics},
     torch_adapter::LoRAModel,
 };
@@ -99,11 +98,11 @@ pub async fn handle_pytorch_lora_command(
         }
         
         LoRAAction::List { format, .. } => {
-            list_pytorch_loras(format).await
+            list_pytorch_loras(Some(format)).await
         }
         
         LoRAAction::Info { lora_id, format, .. } => {
-            show_lora_info(lora_id, format).await
+            show_lora_info(lora_id, Some(format)).await
         }
         
         LoRAAction::Delete { lora_ids, yes } => {
@@ -129,7 +128,7 @@ async fn create_pytorch_lora(
     batch_size: usize,
     precision: String,
 ) -> Result<()> {
-    println!("🚀 Creating PyTorch LoRA adapter with autograd support");
+    println!("🚀 Creating PyTorch LoRA adapter with Git worktree");
     println!();
     println!("📋 Configuration:");
     println!("   Name: {}", name);
@@ -143,22 +142,47 @@ async fn create_pytorch_lora(
     println!("   Precision: {}", precision);
     println!();
     
-    // Load the base model
+    // Get adapter storage
+    let adapter_storage = crate::api::adapter_storage::AdapterStorage::new(
+        PathBuf::from("./models")
+    ).await?;
+    
+    // Create LoRA configuration for adapter
+    let lora_config_json = serde_json::json!({
+        "r": rank,
+        "alpha": alpha,
+        "dropout": dropout,
+        "target_modules": target_modules.clone(),
+        "learning_rate": learning_rate,
+        "batch_size": batch_size,
+        "precision": precision,
+    });
+    
+    // Create adapter repository
+    println!("📦 Creating adapter repository...");
+    let adapter_id = adapter_storage.create_adapter(
+        &base_model,
+        &name,
+        Some(lora_config_json)
+    ).await?;
+    println!("✅ Created adapter '{}' with ID: {}", name, adapter_id);
+    
+    // Load adapter session
+    let session = adapter_storage.load_adapter(&name).await?;
+    let adapter_path = session.adapter_path.clone();
+    let base_model_path = session.base_model_path.clone();
+    
+    // Load the base model 
     let mut engine = TorchEngine::new(Default::default())?;
-    let model_path = PathBuf::from(&base_model);
     
-    if !model_path.exists() {
-        return Err(anyhow!("Base model not found at: {}", base_model));
-    }
-    
-    println!("📦 Loading base model...");
-    engine.load_model(&model_path).await?;
+    println!("📦 Loading base model from: {}", base_model_path.display());
+    engine.load_model(&base_model_path).await?;
     
     // Create LoRA configuration
     let lora_config = LoRAConfig {
-        rank: rank as i64,
-        alpha: alpha as f64,
-        dropout: dropout as f64,
+        rank: rank as usize,
+        alpha: alpha as f32,
+        dropout: dropout as f32,
         target_modules,
         ..Default::default()
     };
@@ -172,29 +196,31 @@ async fn create_pytorch_lora(
     
     // Enable LoRA training
     println!("🔧 Initializing LoRA adapters...");
-    engine.enable_lora_training(lora_config.clone(), training_config)?;
+    engine.enable_lora_training(lora_config.clone(), training_config.clone())?;
     
-    // Save the configuration
-    let config_path = PathBuf::from(format!("./lora_configs/{}.json", name));
-    std::fs::create_dir_all(config_path.parent().unwrap())?;
+    // Save the configuration in the adapter directory
+    let config_path = adapter_path.join("lora_config.json");
     
     let config_json = serde_json::json!({
         "name": name,
-        "base_model": base_model,
+        "base_model": base_model.to_string(),
+        "adapter_id": adapter_id.to_string(),
         "lora_config": lora_config,
         "training_config": training_config,
         "precision": precision,
     });
     
+    // Save the initial adapter configuration to file (VDB storage removed)
     std::fs::write(&config_path, serde_json::to_string_pretty(&config_json)?)?;
     
     println!("✅ PyTorch LoRA adapter created successfully!");
+    println!("   Adapter UUID: {}", adapter_id);
     println!("   Configuration saved to: {}", config_path.display());
     println!();
     println!("📚 Next steps:");
-    println!("   1. Start training: hyprstream lora train start {}", name);
-    println!("   2. Add samples: hyprstream lora train sample {} --input \"...\" --output \"...\"", name);
-    println!("   3. Run inference: hyprstream lora infer {} --prompt \"...\"", name);
+    println!("   1. Start training: hyprstream lora train start {}", adapter_id);
+    println!("   2. Add samples: hyprstream lora train sample {} --input \"...\" --output \"...\"", adapter_id);
+    println!("   3. Run inference: hyprstream lora infer {} --prompt \"...\"", adapter_id);
     
     Ok(())
 }
@@ -283,7 +309,7 @@ async fn start_training(
     };
     
     // Enable gradient computation
-    tch::set_grad_enabled(true);
+    // Gradient tracking enabled by default
     
     println!("✅ Training started successfully!");
     println!("   Monitor progress with: hyprstream lora train status {}", lora_id);
@@ -297,7 +323,7 @@ async fn stop_training(lora_id: String) -> Result<()> {
     println!("🛑 Stopping training for: {}", lora_id);
     
     // Disable gradient computation
-    tch::set_grad_enabled(false);
+    let _no_grad = tch::no_grad(|| {});
     
     println!("✅ Training stopped");
     Ok(())
@@ -520,7 +546,7 @@ async fn import_lora_safetensor(
             metadata["lora_config"].clone()
         )?;
         
-        let imported = name.unwrap_or_else(|| {
+        let imported = name.clone().unwrap_or_else(|| {
             metadata["adapter_id"]
                 .as_str()
                 .unwrap_or("imported_lora")
@@ -620,7 +646,7 @@ async fn list_pytorch_loras(format: Option<String>) -> Result<()> {
                 "Name", "Base Model", "Rank", "Alpha", "Created");
             println!("{}", "-".repeat(90));
             
-            for adapter in adapters {
+            for adapter in &adapters {
                 let name = adapter["name"].as_str().unwrap_or("unknown");
                 let base = adapter["base_model"].as_str().unwrap_or("unknown");
                 let rank = adapter["lora_config"]["rank"].as_i64().unwrap_or(0);
@@ -872,7 +898,7 @@ async fn run_lora_inference(
     engine.enable_lora_training(lora_config, training_config)?;
     
     // Disable gradient computation for inference
-    tch::set_grad_enabled(false);
+    let _no_grad = tch::no_grad(|| {});
     
     // Run inference
     println!("💭 Generating response...");

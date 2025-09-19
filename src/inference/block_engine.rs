@@ -1,4 +1,4 @@
-//! Block-based memory management engine with VDB integration
+//! Block-based memory management engine
 //! 
 //! Manages allocation and tracking of KV cache blocks for sequences
 
@@ -7,7 +7,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::storage::vdb::{VDBSparseStorage, Coordinate3D};
 
 /// Block allocation status
 #[derive(Debug, Clone, PartialEq)]
@@ -27,8 +26,6 @@ pub enum BlockLocation {
     GPU(usize),
     /// Block is on CPU
     CPU(usize),
-    /// Block is in VDB sparse storage
-    VDB(Vec<Coordinate3D>),
 }
 
 /// Block table mapping logical to physical blocks
@@ -110,90 +107,27 @@ impl DeviceAllocator {
     }
 }
 
-/// VDB-enhanced block engine for memory management
-pub struct VDBBlockEngine {
+/// Block engine for memory management
+pub struct BlockEngine {
     /// Block size in tokens
     block_size: usize,
     /// GPU block allocator
     gpu_allocator: Arc<RwLock<DeviceAllocator>>,
     /// CPU block allocator
     cpu_allocator: Arc<RwLock<DeviceAllocator>>,
-    /// VDB sparse storage for overflow blocks
-    vdb_storage: Option<Arc<VDBSparseStorage>>,
     /// Sequence to block table mapping
     seq_block_tables: Arc<RwLock<HashMap<usize, BlockTable>>>,
     /// Block reference counts for copy-on-write
     block_ref_counts: Arc<RwLock<HashMap<BlockLocation, usize>>>,
-    /// VDB coordinate allocator
-    vdb_coord_allocator: Arc<RwLock<VDBCoordinateAllocator>>,
 }
 
-/// Allocator for VDB sparse coordinates
-struct VDBCoordinateAllocator {
-    /// Next available coordinate
-    next_coord: Coordinate3D,
-    /// Block size for coordinate allocation
-    block_size: usize,
-    /// Free coordinates available for reuse
-    free_coords: Vec<Vec<Coordinate3D>>,
-}
 
-impl VDBCoordinateAllocator {
-    fn new(block_size: usize) -> Self {
-        Self {
-            next_coord: Coordinate3D::new(0, 0, 0),
-            block_size,
-            free_coords: Vec::new(),
-        }
-    }
-    
-    fn allocate(&mut self) -> Vec<Coordinate3D> {
-        // Try to reuse free coordinates first
-        if let Some(coords) = self.free_coords.pop() {
-            return coords;
-        }
-        
-        // Allocate new coordinates in a cube pattern
-        let mut coords = Vec::new();
-        let cube_size = (self.block_size as f32).cbrt().ceil() as i32;
-        
-        for i in 0..cube_size {
-            for j in 0..cube_size {
-                for k in 0..cube_size {
-                    if coords.len() >= self.block_size {
-                        break;
-                    }
-                    coords.push(Coordinate3D::new(
-                        self.next_coord.x() + i,
-                        self.next_coord.y() + j,
-                        self.next_coord.z() + k,
-                    ));
-                }
-            }
-        }
-        
-        // Update next coordinate
-        self.next_coord = Coordinate3D::new(
-            self.next_coord.x() + cube_size,
-            self.next_coord.y(),
-            self.next_coord.z(),
-        );
-        
-        coords
-    }
-    
-    fn free(&mut self, coords: Vec<Coordinate3D>) {
-        self.free_coords.push(coords);
-    }
-}
-
-impl VDBBlockEngine {
-    /// Create new VDB-enhanced block engine
+impl BlockEngine {
+    /// Create new block engine
     pub async fn new(
         block_size: usize,
         num_gpu_blocks: usize,
         num_cpu_blocks: usize,
-        vdb_storage: Option<Arc<VDBSparseStorage>>,
     ) -> Result<Self> {
         Ok(Self {
             block_size,
@@ -203,12 +137,8 @@ impl VDBBlockEngine {
             cpu_allocator: Arc::new(RwLock::new(
                 DeviceAllocator::new("CPU".to_string(), num_cpu_blocks)
             )),
-            vdb_storage,
             seq_block_tables: Arc::new(RwLock::new(HashMap::new())),
             block_ref_counts: Arc::new(RwLock::new(HashMap::new())),
-            vdb_coord_allocator: Arc::new(RwLock::new(
-                VDBCoordinateAllocator::new(block_size)
-            )),
         })
     }
     
@@ -234,10 +164,6 @@ impl VDBBlockEngine {
             return AllocStatus::Later; // Need to swap some blocks
         }
         
-        // Check if VDB can handle overflow
-        if self.vdb_storage.is_some() {
-            return AllocStatus::Later; // VDB has "unlimited" capacity
-        }
         
         AllocStatus::Impossible
     }
@@ -276,16 +202,9 @@ impl VDBBlockEngine {
             }
         }
         
-        // Use VDB for any remaining blocks
-        let remaining = num_blocks - allocated_blocks.len();
-        if remaining > 0 && self.vdb_storage.is_some() {
-            let mut vdb_alloc = self.vdb_coord_allocator.write().await;
-            for i in allocated_blocks.len()..num_blocks {
-                let coords = vdb_alloc.allocate();
-                let location = BlockLocation::VDB(coords);
-                block_table.allocate(i, location.clone());
-                allocated_blocks.push(location);
-            }
+        // If we can't allocate enough blocks, fail
+        if allocated_blocks.len() < num_blocks {
+            return Err(anyhow!("Cannot allocate {} blocks, only {} available", num_blocks, allocated_blocks.len()));
         }
         
         // Update reference counts
@@ -352,10 +271,6 @@ impl VDBBlockEngine {
                 BlockLocation::CPU(block_id) => {
                     let mut cpu_alloc = self.cpu_allocator.write().await;
                     cpu_alloc.free(block_id);
-                }
-                BlockLocation::VDB(coords) => {
-                    let mut vdb_alloc = self.vdb_coord_allocator.write().await;
-                    vdb_alloc.free(coords);
                 }
             }
         }
@@ -482,7 +397,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_block_allocation() {
-        let engine = VDBBlockEngine::new(16, 10, 10, None).await.unwrap();
+        let engine = BlockEngine::new(16, 10, 10).await.unwrap();
         
         // Test allocation
         let status = engine.can_allocate(0, 5).await;
@@ -505,7 +420,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_block_overflow_to_cpu() {
-        let engine = VDBBlockEngine::new(16, 3, 5, None).await.unwrap();
+        let engine = BlockEngine::new(16, 3, 5).await.unwrap();
         
         // Allocate more than GPU capacity
         engine.allocate(0, 5).await.unwrap();

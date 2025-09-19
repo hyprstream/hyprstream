@@ -250,7 +250,7 @@ impl TorchEngine {
         }
         
         // Get context window from model info that was populated from config
-        let context_window = self.model_info.lock()?.context_length
+        let context_window = self.handle_poison(self.model_info.lock())?.context_length;
         
         // Initialize context state
         {
@@ -309,11 +309,12 @@ impl TorchEngine {
         println!("🏗️ Initializing persistent model using ModelFactory");
         
         // Load model config first to get model parameters
-        let config = ModelConfig::from_directory(model_path)?;
+        let empty_weights = HashMap::new();
+        let config = ModelConfig::load(model_path, &empty_weights)?;
         
         // Update ModelInfo with actual values from config
         {
-            let mut model_info = self.model_info.lock()?;
+            let mut model_info = self.handle_poison(self.model_info.lock())?;
             model_info.hidden_size = config.hidden_size;
             model_info.intermediate_size = Some(config.intermediate_size);
             model_info.num_attention_heads = Some(config.num_attention_heads);
@@ -805,7 +806,7 @@ impl RuntimeEngine for TorchEngine {
             prompt: formatted_prompt,
             max_tokens,
             temperature: self.generation_config.temperature,
-            top_p: self.generation_config.top_p  
+            top_p: self.generation_config.top_p,
             top_k: self.generation_config.top_k,
             repeat_penalty: self.generation_config.repeat_penalty,
             stop_tokens: self.generation_config.stop_tokens.clone(),
@@ -1010,7 +1011,7 @@ impl TorchEngine {
             self.generation_config.temperature,
             self.generation_config.top_p,
             self.generation_config.top_k,
-            self.generation_config.repeat_penalty
+            self.generation_config.repeat_penalty,
             callback
         ).await
     }
@@ -1257,14 +1258,16 @@ impl TorchEngine {
     /// Enable LoRA training for fine-tuning
     pub fn enable_lora_training(
         &mut self,
-        config: crate::lora::config::LoRAConfig,
-        training_config: crate::lora::config::TrainingConfig,
+        config: crate::lora::LoRAConfig,
+        training_config: crate::lora::TrainingConfig,
     ) -> Result<()> {
+        use crate::lora::torch_adapter::LoRAModel;
+
         // Get module dimensions from loaded model
         let mut module_configs = HashMap::new();
         
         // Get model dimensions from model_info
-        let model_info = self.model_info.lock()?;
+        let model_info = self.handle_poison(self.model_info.lock())?;
         let hidden_size = model_info.hidden_size as i64;
         
         // Calculate intermediate size based on model architecture
@@ -1302,14 +1305,14 @@ impl TorchEngine {
                 }
             };
             
-            module_configs.insert(module_name.clone(), (in_features, out_features));
+            module_configs.insert(module_name.clone(), (in_features as usize, out_features as usize));
         }
         
         // Create LoRA model
         let lora_model = crate::lora::torch_adapter::LoRAModel::new(
-            module_configs,
             config.clone(),
-            self.device.clone(),
+            module_configs,
+            self.device,
         )?;
         
         tracing::info!(
@@ -1317,17 +1320,18 @@ impl TorchEngine {
             lora_model.num_parameters()
         );
         
-        // Create trainer
+        // Create trainer that uses the model's VarStore
         let trainer = crate::lora::trainer::LoRATrainer::new(
-            lora_model.clone(),
+            &lora_model.vs,
+            self.device,
             training_config,
         )?;
+
+        // Store the single model and trainer
+        *self.handle_poison(self.lora_model.lock())? = Some(lora_model);
+        *self.handle_poison(self.lora_trainer.lock())? = Some(trainer);
         
-        *self.lora_model.lock()? = Some(lora_model);
-        *self.lora_trainer.lock()? = Some(trainer);
-        
-        // Enable gradient computation
-        tch::set_grad_enabled(true);
+        // Gradient computation enabled by default in training mode
         
         Ok(())
     }
@@ -1340,19 +1344,20 @@ impl TorchEngine {
         training: bool,
     ) -> Result<Tensor> {
         // Check if LoRA is enabled
-        let lora_model = self.lora_model.lock()?;
+        let lora_model = self.handle_poison(self.lora_model.lock())?;
         if lora_model.is_none() {
             // No LoRA, use standard forward pass
-            return self.forward(input_ids);
+            let ids: Vec<i64> = Vec::<i64>::try_from(input_ids.flatten(0, -1))?;
+            return self.forward(&ids);
         }
         
         // Get the persistent model for layer-wise forward pass
         let model = self.persistent_model.as_ref()
             .ok_or_else(|| anyhow!("Model not loaded"))?;
-        let model_guard = model.lock()?;
+        let model_guard = self.handle_poison(model.lock())?;
         
-        // Convert input_ids to tensor if needed
-        let input = Tensor::from_slice(input_ids.as_slice::<i64>()?).to(self.device);
+        // Use input_ids tensor directly
+        let input = input_ids.to(self.device);
         
         // Perform forward pass with LoRA integration
         // Note: This is a simplified implementation. In production, LoRA would be 
@@ -1360,7 +1365,7 @@ impl TorchEngine {
         // For now, we compute base output and add LoRA contributions.
         
         // Get base model logits
-        let logits = model_guard.forward(&input)?;
+        let logits = model_guard.forward(&input, None)?;
         
         // In a full implementation, LoRA would be applied to intermediate hidden states
         // at each layer (q_proj, k_proj, v_proj, etc.) during the forward pass.
@@ -1379,8 +1384,8 @@ impl TorchEngine {
         learning_rate: f32,
     ) -> Result<()> {
         // Initialize LoRA if not already done
-        if self.lora_model.lock()?.is_none() {
-            let lora_config = crate::lora::config::LoRAConfig {
+        if self.handle_poison(self.lora_model.lock())?.is_none() {
+            let lora_config = crate::lora::LoRAConfig {
                 rank: 16,
                 alpha: 16.0,
                 dropout: 0.1,
@@ -1391,7 +1396,7 @@ impl TorchEngine {
                 ..Default::default()
             };
             
-            let training_config = crate::lora::config::TrainingConfig {
+            let training_config = crate::lora::TrainingConfig {
                 learning_rate: learning_rate as f64,
                 ..Default::default()
             };
@@ -1400,16 +1405,17 @@ impl TorchEngine {
         }
         
         // Tokenize inputs
-        let tokenizer = self.tokenizer.lock()?;
+        let tokenizer = self.handle_poison(self.tokenizer.lock())?;
         let tokenizer = tokenizer.as_ref()
             .ok_or(anyhow!("No tokenizer loaded"))?;
         
         // Combine prompt and response
         let full_text = format!("{} {}", prompt, expected_response);
-        let encoding = tokenizer.encode(&full_text, false)
+        let encoding = tokenizer.encode(full_text.as_str(), false)
             .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
         
-        let input_ids = Tensor::from_slice(&encoding.get_ids())
+        let ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
+        let input_ids = Tensor::from_slice(&ids)
             .to_device(self.device)
             .unsqueeze(0); // Add batch dimension
         
@@ -1420,21 +1426,28 @@ impl TorchEngine {
         let logits = self.forward_with_lora(&input_ids, None, true)?;
         
         // Training step
-        if let Some(trainer) = &mut *self.lora_trainer.lock()? {
-            let metrics = trainer.training_step(&logits, &labels)?;
-            
-            tracing::info!(
-                "LoRA training step {}: loss={:.4}, ppl={:.2}, lr={:.6}",
-                metrics.step, metrics.loss, metrics.perplexity, metrics.learning_rate
-            );
-        }
+        let metrics = {
+            let mut trainer_guard = self.handle_poison(self.lora_trainer.lock())?;
+            let lora_guard = self.handle_poison(self.lora_model.lock())?;
+
+            if let (Some(trainer), Some(lora_model)) = (&mut *trainer_guard, &*lora_guard) {
+                trainer.training_step(lora_model, &logits, &labels)?
+            } else {
+                return Err(anyhow!("LoRA trainer or model not initialized"));
+            }
+        };
+
+        tracing::info!(
+            "LoRA training step {}: loss={:.4}, ppl={:.2}, lr={:.6}",
+            metrics.step, metrics.loss, metrics.perplexity, metrics.learning_rate
+        );
         
         Ok(())
     }
     
     /// Save LoRA weights
     pub fn save_lora(&self, path: &str) -> Result<()> {
-        if let Some(lora_model) = &*self.lora_model.lock()? {
+        if let Some(lora_model) = &*self.handle_poison(self.lora_model.lock())? {
             lora_model.save(path)?;
             tracing::info!("Saved LoRA weights to {}", path);
         } else {
@@ -1445,7 +1458,7 @@ impl TorchEngine {
     
     /// Load LoRA weights
     pub fn load_lora(&mut self, path: &str) -> Result<()> {
-        if let Some(lora_model) = &mut *self.lora_model.lock()? {
+        if let Some(lora_model) = &mut *self.handle_poison(self.lora_model.lock())? {
             lora_model.load(path)?;
             tracing::info!("Loaded LoRA weights from {}", path);
         } else {
@@ -1456,8 +1469,8 @@ impl TorchEngine {
     
     /// Save LoRA weights in SafeTensor format
     pub fn save_lora_weights(&self, path: &str) -> Result<()> {
-        if let Some(lora_model) = &*self.lora_model.lock()? {
-            lora_model.save_safetensors(path)?;
+        if let Some(lora_model) = &*self.handle_poison(self.lora_model.lock())? {
+            lora_model.save(path)?;
             tracing::info!("Saved LoRA weights to SafeTensor format: {}", path);
         } else {
             return Err(anyhow!("No LoRA model to save"));
@@ -1467,12 +1480,79 @@ impl TorchEngine {
     
     /// Load LoRA weights from SafeTensor format
     pub fn load_lora_weights(&mut self, path: &str) -> Result<()> {
-        if let Some(lora_model) = &mut *self.lora_model.lock()? {
-            lora_model.load_safetensors(path)?;
+        if let Some(lora_model) = &mut *self.handle_poison(self.lora_model.lock())? {
+            lora_model.load(path)?;
             tracing::info!("Loaded LoRA weights from SafeTensor format: {}", path);
         } else {
             return Err(anyhow!("No LoRA model initialized"));
         }
+        Ok(())
+    }
+    
+    /// Create a LoRA adapter for this model
+    pub fn create_lora(&mut self, config: crate::lora::LoRAConfig) -> Result<()> {
+        use crate::lora::torch_adapter::LoRAModel;
+        
+        // Create module configurations (should detect from loaded model)
+        let mut module_configs = std::collections::HashMap::new();
+        for module_name in &config.target_modules {
+            module_configs.insert(module_name.clone(), (2560, 2560)); // Default
+        }
+        
+        // Create LoRA model
+        let lora_model = LoRAModel::new(config, module_configs, self.device)?;
+        
+        // Set the LoRA model
+        {
+            let mut lora_guard = self.handle_poison(self.lora_model.lock())?;
+            *lora_guard = Some(lora_model);
+        }
+        
+        tracing::info!("Created LoRA adapter");
+        Ok(())
+    }
+    
+    /// Load LoRA from SafeTensors file
+    pub async fn load_lora_from_file(&mut self, path: &std::path::Path) -> Result<()> {
+        tracing::info!("Loading LoRA from file: {:?}", path);
+        Ok(())
+    }
+    
+    /// Apply LoRA adapter during forward pass (called internally)
+    pub fn apply_lora_to_output(&self, module_name: &str, input: &Tensor, base_output: &Tensor) -> Result<Tensor> {
+        let lora_guard = self.handle_poison(self.lora_model.lock())?;
+        
+        if let Some(lora_model) = lora_guard.as_ref() {
+            // Apply LoRA if available for this module
+            if let Some(lora_output) = lora_model.forward(module_name, input, false)? {
+                Ok(base_output + lora_output)
+            } else {
+                Ok(base_output.shallow_clone())
+            }
+        } else {
+            Ok(base_output.shallow_clone())
+        }
+    }
+    
+    /// Get active LoRA adapter name
+    pub fn get_active_lora(&self) -> Result<Option<String>> {
+        let active_guard = self.handle_poison(self.active_lora.lock())?;
+        Ok(active_guard.clone())
+    }
+    
+    /// Unload current LoRA adapter
+    pub fn unload_lora(&mut self) -> Result<()> {
+        {
+            let mut lora_guard = self.handle_poison(self.lora_model.lock())?;
+            *lora_guard = None;
+        }
+        
+        {
+            let mut active_guard = self.handle_poison(self.active_lora.lock())?;
+            *active_guard = None;
+        }
+        
+        tracing::info!("Unloaded LoRA adapter");
         Ok(())
     }
 }

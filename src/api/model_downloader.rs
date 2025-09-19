@@ -4,37 +4,29 @@
 //! prioritizing SafeTensors format for security and compatibility.
 
 use anyhow::{anyhow, Result};
-use hf_hub::api::tokio::{Api, ApiBuilder, ApiRepo};
-use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use async_trait::async_trait;
-use safe_path::{scoped_join, scoped_resolve};
-use crate::constants::limits::*;
 use json_threat_protection as jtp;
+use glob;
 
-/// Model format types
+/// Model format - SafeTensors only for security and efficiency
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ModelFormat {
     SafeTensors,
-    PyTorch,
 }
 
 impl ModelFormat {
-    /// Get file extensions for this format
-    pub fn extensions(&self) -> Vec<&'static str> {
-        match self {
-            ModelFormat::SafeTensors => vec!["safetensors"],
-            ModelFormat::PyTorch => vec!["bin", "pt", "pth"],
-        }
+    /// Get file extension for SafeTensors
+    pub fn extension(&self) -> &'static str {
+        "safetensors"
     }
     
-    /// Check if a filename matches this format
+    /// Check if a filename is a SafeTensors file
     pub fn matches(&self, filename: &str) -> bool {
-        let lower = filename.to_lowercase();
-        self.extensions().iter().any(|ext| lower.ends_with(ext))
+        filename.to_lowercase().ends_with(".safetensors")
     }
 }
 
@@ -153,464 +145,67 @@ impl Default for DownloadOptions {
     }
 }
 
-/// HuggingFace model source
-pub struct HuggingFaceSource {
-    api: Api,
+/// Git-based model source
+pub struct GitSource {
+    git_source: crate::api::git_downloader::GitModelSource,
     cache_dir: PathBuf,
 }
 
-impl HuggingFaceSource {
-    /// Create a new HuggingFace source
-    pub async fn new(cache_dir: PathBuf, token: Option<String>) -> Result<Self> {
+impl GitSource {
+    /// Create a new Git model source
+    pub async fn new(cache_dir: PathBuf) -> Result<Self> {
         fs::create_dir_all(&cache_dir).await?;
         
-        let api = if let Some(token) = token {
-            ApiBuilder::new()
-                .with_token(Some(token))
-                .build()?
-        } else {
-            ApiBuilder::new().build()?
-        };
+        let git_source = crate::api::git_downloader::GitModelSource::new(cache_dir.clone());
         
-        Ok(Self { api, cache_dir })
-    }
-    
-    /// Parse repository ID (e.g., "microsoft/phi-2" or "hf://microsoft/phi-2")
-    fn parse_repo_id(model_id: &str) -> &str {
-        model_id.strip_prefix("hf://").unwrap_or(model_id)
-    }
-    
-    /// Determine the best format available for a model
-    async fn determine_best_format(&self, repo: &ApiRepo) -> Result<(ModelFormat, Vec<String>)> {
-        // List files in the repository
-        let files = self.list_repo_files(repo).await?;
-        
-        // Categorize files by format
-        let mut formats: HashMap<ModelFormat, Vec<String>> = HashMap::new();
-        
-        for file in files {
-            let filename = file.as_str();
-            
-            // Check for model weight files (including sharded models)
-            if filename.ends_with(".safetensors") || 
-               (filename.contains("model") && filename.contains(".safetensors")) {
-                formats.entry(ModelFormat::SafeTensors)
-                    .or_default()
-                    .push(file);
-            } else if filename.ends_with(".bin") || filename.ends_with(".pth") || filename.ends_with(".pt") ||
-                      (filename.starts_with("pytorch_model") && filename.ends_with(".bin")) {
-                formats.entry(ModelFormat::PyTorch)
-                    .or_default()
-                    .push(file);
-            }
-        }
-        
-        // Filter to only include actual model weight files (not just any .bin file)
-        if let Some(files) = formats.get_mut(&ModelFormat::SafeTensors) {
-            files.retain(|f| f.contains("model") || f == "model.safetensors");
-        }
-        if let Some(files) = formats.get_mut(&ModelFormat::PyTorch) {
-            files.retain(|f| f.contains("model") || f.contains("pytorch"));
-        }
-        
-        // Choose the best format (SafeTensors > PyTorch)
-        if let Some(files) = formats.get(&ModelFormat::SafeTensors) {
-            if !files.is_empty() {
-                Ok((ModelFormat::SafeTensors, files.clone()))
-            } else {
-                formats.remove(&ModelFormat::SafeTensors);
-                self.choose_next_best_format(formats)
-            }
-        } else if let Some(files) = formats.get(&ModelFormat::PyTorch) {
-            if !files.is_empty() {
-                Ok((ModelFormat::PyTorch, files.clone()))
-            } else {
-                formats.remove(&ModelFormat::PyTorch);
-                self.choose_next_best_format(formats)
-            }
-        } else {
-            Err(anyhow!("No supported model format found"))
-        }
-    }
-    
-    fn choose_next_best_format(&self, formats: HashMap<ModelFormat, Vec<String>>) -> Result<(ModelFormat, Vec<String>)> {
-        if let Some(files) = formats.get(&ModelFormat::PyTorch) {
-            if !files.is_empty() {
-                return Ok((ModelFormat::PyTorch, files.clone()));
-            }
-        }
-        Err(anyhow!("No supported model format found"))
-    }
-    
-    /// Determine best format from a list of files
-    fn determine_best_format_from_files(&self, files: &[String]) -> Result<(ModelFormat, Vec<String>)> {
-        let mut formats: HashMap<ModelFormat, Vec<String>> = HashMap::new();
-        
-        for file in files {
-            let filename = file.as_str();
-            
-            // Check for model weight files (including sharded models)
-            if filename.ends_with(".safetensors") && 
-               (filename.contains("model") || filename == "model.safetensors") {
-                formats.entry(ModelFormat::SafeTensors)
-                    .or_default()
-                    .push(file.clone());
-            } else if (filename.ends_with(".bin") && 
-                      (filename.contains("pytorch_model") || filename.contains("model"))) ||
-                      filename.ends_with(".pth") || filename.ends_with(".pt") {
-                formats.entry(ModelFormat::PyTorch)
-                    .or_default()
-                    .push(file.clone());
-            }
-        }
-        
-        // Choose the best format (SafeTensors > PyTorch)
-        if let Some(files) = formats.get(&ModelFormat::SafeTensors) {
-            if !files.is_empty() {
-                Ok((ModelFormat::SafeTensors, files.clone()))
-            } else {
-                self.choose_next_best_format(formats)
-            }
-        } else if let Some(files) = formats.get(&ModelFormat::PyTorch) {
-            if !files.is_empty() {
-                Ok((ModelFormat::PyTorch, files.clone()))
-            } else {
-                self.choose_next_best_format(formats)
-            }
-        } else {
-            Err(anyhow!("No supported model format found in files: {:?}", files))
-        }
-    }
-    
-    /// Get repository files using HuggingFace API directly
-    async fn get_repo_files_from_api(&self, repo_id: &str) -> Result<Vec<String>> {
-        // Use the HuggingFace REST API to get actual file list
-        let url = format!("https://huggingface.co/api/models/{}", repo_id);
-        let client = reqwest::Client::new();
-        
-        let response = client.get(&url)
-            .send()
-            .await
-            .map_err(|e| anyhow!("Failed to query HuggingFace API: {}", e))?;
-        
-        if !response.status().is_success() {
-            return Err(anyhow!("Failed to get repository info: HTTP {}", response.status()));
-        }
-        
-        let json_text = response.text().await
-            .map_err(|e| anyhow!("Failed to read repository response: {}", e))?;
-        
-        // Validate API response
-        jtp::from_str(&json_text)
-            .with_max_depth(10)
-            .with_max_string_length(1000000)
-            .with_max_array_entries(10000)
-            .validate()
-            .map_err(|e| anyhow!("Invalid JSON from API: {:?}", e))?;
-        
-        let json: serde_json::Value = serde_json::from_str(&json_text)
-            .map_err(|e| anyhow!("Failed to parse repository response: {}", e))?;
-        
-        // Extract file list from siblings field
-        if let Some(siblings) = json.get("siblings").and_then(|s| s.as_array()) {
-            let files: Vec<String> = siblings.iter()
-                .filter_map(|sibling| {
-                    sibling.get("rfilename")
-                        .and_then(|name| name.as_str())
-                        .map(|s| s.to_string())
-                })
-                .collect();
-            
-            if !files.is_empty() {
-                return Ok(files);
-            }
-        }
-        
-        // Fallback to default files
-        Ok(vec![
-            "config.json".to_string(),
-            "model.safetensors".to_string(),
-            "tokenizer.json".to_string(),
-            "tokenizer_config.json".to_string(),
-        ])
-    }
-    
-    /// List files in a repository
-    async fn list_repo_files(&self, repo: &ApiRepo) -> Result<Vec<String>> {
-        // Try to use the hf-hub API first
-        match repo.info().await {
-            Ok(_info) => {
-                // The hf-hub crate doesn't expose file listing directly
-                // We need to use a different approach - try to query known patterns
-                // or use the REST API directly
-                
-                // For now, try to detect which files exist by attempting to get them
-                let mut files = Vec::new();
-                
-                // Common config files
-                let common_files = vec![
-                    "config.json",
-                    "tokenizer.json", 
-                    "tokenizer_config.json",
-                    "vocab.json",
-                    "merges.txt",
-                    "special_tokens_map.json",
-                ];
-                
-                for file in common_files {
-                    // Try to check if file exists (this is a workaround)
-                    if repo.get(file).await.is_ok() {
-                        files.push(file.to_string());
-                    }
-                }
-                
-                // Try common model file patterns
-                // Single file models
-                if repo.get("model.safetensors").await.is_ok() {
-                    files.push("model.safetensors".to_string());
-                } else {
-                    // Check for sharded models (up to 10 shards for now)
-                    for i in 1..=10 {
-                        let filename = format!("model-{:05}-of-{:05}.safetensors", i, 10);
-                        if repo.get(&filename).await.is_ok() {
-                            files.push(filename);
-                        } else {
-                            // Also check the more common pattern
-                            let filename = format!("model-{:05}-of-00002.safetensors", i);
-                            if repo.get(&filename).await.is_ok() {
-                                files.push(filename);
-                            } else if i > 2 {
-                                break; // Stop checking if we haven't found files after 2
-                            }
-                        }
-                    }
-                }
-                
-                // Check for PyTorch files
-                if files.iter().filter(|f| f.contains("model")).count() == 0 {
-                    if repo.get("pytorch_model.bin").await.is_ok() {
-                        files.push("pytorch_model.bin".to_string());
-                    } else {
-                        // Check for sharded PyTorch models
-                        for i in 1..=10 {
-                            let filename = format!("pytorch_model-{:05}-of-{:05}.bin", i, 10);
-                            if repo.get(&filename).await.is_ok() {
-                                files.push(filename);
-                            } else if i > 2 {
-                                break;
-                            }
-                        }
-                    }
-                }
-                
-                if files.is_empty() {
-                    // Last resort: return common patterns
-                    Ok(vec![
-                        "config.json".to_string(),
-                        "model.safetensors".to_string(),
-                        "tokenizer.json".to_string(),
-                        "tokenizer_config.json".to_string(),
-                    ])
-                } else {
-                    Ok(files)
-                }
-            }
-            Err(_) => {
-                // Fallback to common patterns
-                Ok(vec![
-                    "config.json".to_string(),
-                    "model.safetensors".to_string(),
-                    "tokenizer.json".to_string(),
-                    "tokenizer_config.json".to_string(),
-                ])
-            }
-        }
-    }
-    
-    /// Download a file with progress
-    async fn download_file_with_progress(
-        &self,
-        repo: &ApiRepo,
-        filename: &str,
-        target_path: &Path,
-        pb: Option<&ProgressBar>,
-        max_size: Option<u64>,
-    ) -> Result<u64> {
-        // Validate filename to prevent path traversal
-        if !Self::validate_filename(filename) {
-            return Err(anyhow!("Invalid filename: contains path traversal characters"));
-        }
-        
-        // Use safe-path crate for robust path validation
-        // The target_path should be within the cache directory
-        // Extract just the filename to validate, since the directory structure is controlled by us
-        if let Some(file_name) = target_path.file_name() {
-            // Use scoped_join to safely create the full path
-            // This ensures no path traversal even if filename somehow contains ../
-            match scoped_join(&self.cache_dir, file_name) {
-                Ok(_safe_path) => {
-                    // Filename is safe - no traversal attempts
-                }
-                Err(e) => {
-                    return Err(anyhow!("Path validation failed: {}. Filename contains unsafe traversal sequences.", e));
-                }
-            }
-            
-            // Additional check: ensure the parent directory is within or equal to cache_dir
-            if let Some(parent) = target_path.parent() {
-                // For new directories that don't exist yet, we need a different approach
-                // Check if the path starts with cache_dir textually (since it may not exist yet)
-                let parent_str = parent.to_string_lossy();
-                let cache_str = self.cache_dir.to_string_lossy();
-                
-                if !parent_str.starts_with(cache_str.as_ref()) && parent != self.cache_dir {
-                    return Err(anyhow!("Target directory is outside of model cache directory"));
-                }
-            }
-        } else {
-            return Err(anyhow!("Invalid target path: no filename"));
-        }
-        
-        // Check if file already exists and get its size
-        if target_path.exists() && !pb.is_some() {
-            let metadata = fs::metadata(target_path).await?;
-            let size = metadata.len();
-            
-            // Check size limit for existing file
-            if let Some(max) = max_size {
-                if size > max {
-                    return Err(anyhow!(
-                        "File {} size ({} bytes) exceeds maximum allowed size ({} bytes)",
-                        filename, size, max
-                    ));
-                }
-            }
-            
-            return Ok(size);
-        }
-        
-        // Download using hf_hub
-        let file_path = repo.get(filename).await?;
-        
-        // Copy to target location
-        if file_path != target_path {
-            fs::copy(&file_path, target_path).await?;
-        }
-        
-        // Set file permissions for security
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            use crate::constants::permissions::MODEL_FILE_PERMISSIONS;
-            let metadata = fs::metadata(target_path).await?;
-            let mut perms = metadata.permissions();
-            perms.set_mode(MODEL_FILE_PERMISSIONS);
-            fs::set_permissions(target_path, perms).await?;
-        }
-        
-        if let Some(pb) = pb {
-            pb.inc(1);
-        }
-        
-        let metadata = fs::metadata(target_path).await?;
-        let size = metadata.len();
-        
-        // Verify size limit after download
-        if let Some(max) = max_size {
-            if size > max {
-                // Delete the oversized file
-                let _ = fs::remove_file(target_path).await;
-                return Err(anyhow!(
-                    "Downloaded file {} size ({} bytes) exceeds maximum allowed size ({} bytes)",
-                    filename, size, max
-                ));
-            }
-        }
-        
-        // HuggingFace hub handles checksum verification through git
-        
-        Ok(size)
-    }
-    
-    /// Validate filename to prevent path traversal attacks
-    fn validate_filename(filename: &str) -> bool {
-        crate::utils::validation::is_valid_filename(filename)
+        Ok(Self {
+            git_source,
+            cache_dir,
+        })
     }
 }
 
 #[async_trait]
-impl ModelSource for HuggingFaceSource {
-    async fn list_models(&self, query: Option<&str>) -> Result<Vec<ModelInfo>> {
-        // This would use the HF API to search models
-        // For now, return some examples
-        let models = vec![
-            ModelInfo {
-                id: "microsoft/phi-2".to_string(),
-                name: "Phi-2".to_string(),
-                description: Some("Small but capable model".to_string()),
-                author: Some("Microsoft".to_string()),
-                size_bytes: Some(5_000_000_000),
-                format: ModelFormat::SafeTensors,
-                architecture: Some("PhiForCausalLM".to_string()),
-                tags: vec!["text-generation".to_string()],
-                created_at: None,
-                updated_at: None,
-            },
-        ];
-        
-        Ok(if let Some(q) = query {
-            models.into_iter()
-                .filter(|m| m.name.to_lowercase().contains(&q.to_lowercase()))
-                .collect()
-        } else {
-            models
-        })
+impl ModelSource for GitSource {
+    async fn list_models(&self, _query: Option<&str>) -> Result<Vec<ModelInfo>> {
+        // Git repos don't have a central listing service
+        // This could be extended to read from a configured list of repos
+        Ok(vec![])
     }
     
     async fn get_model_info(&self, model_id: &str) -> Result<ModelInfo> {
-        let repo_id = Self::parse_repo_id(model_id);
-        let repo = self.api.model(repo_id.to_string());
-        
-        // Get repository info
-        let info = repo.info().await?;
-        
-        // Determine format
-        let (format, _) = self.determine_best_format(&repo).await?;
-        
+        // Return basic info from the Git URL
         Ok(ModelInfo {
-            id: repo_id.to_string(),
-            name: repo_id.split('/').last().unwrap_or(repo_id).to_string(),
-            description: None, // Would parse from README
-            author: repo_id.split('/').next().map(|s| s.to_string()),
-            size_bytes: None, // Would calculate from files
-            format,
-            architecture: None, // Would parse from config.json
+            id: model_id.to_string(),
+            name: model_id.split('/').last().unwrap_or(model_id).to_string(),
+            description: None,
+            author: None,
+            size_bytes: None,
+            format: ModelFormat::SafeTensors,
+            architecture: None,
             tags: vec![],
             created_at: None,
             updated_at: None,
         })
     }
     
-    async fn download_model(&self, model_id: &str, target_dir: &Path) -> Result<DownloadedModel> {
-        let repo_id = Self::parse_repo_id(model_id);
-        println!("📥 Downloading model: {}", repo_id);
+    async fn download_model(&self, model_id: &str, _target_dir: &Path) -> Result<DownloadedModel> {
+        // Pass the URL directly to git2 - it will handle validation
+        let git_url = model_id.to_string();
+        println!("📥 Cloning model from: {}", git_url);
+        let (model_uuid, model_path) = self.git_source.clone_model(&git_url)?;
+        let uuid = model_uuid.0;
         
-        // Generate UUID for this model download
-        let uuid = uuid::Uuid::new_v4();
-        let model_uuid = crate::api::model_storage::ModelId(uuid);
+        // Model is already cloned to model_path
+        let model_dir = model_path.clone();
+        let data_dir = model_dir.clone(); // Git clone includes everything
         
-        // Create UUID-based target directory and data subdirectory
-        let model_dir = target_dir.join(uuid.to_string());
-        let data_dir = model_dir.join("data");
-        fs::create_dir_all(&model_dir).await?;
-        fs::create_dir_all(&data_dir).await?;
-        
-        // Create model metadata file with original name
+        // Create model metadata file
         let model_metadata = crate::api::model_storage::ModelMetadataFile {
             model_id: model_uuid.clone(),
-            name: repo_id.to_string(),
-            display_name: repo_id.to_string(),
-            source_uri: format!("hf://{}", repo_id),
+            name: model_id.to_string(),
+            display_name: model_id.split('/').last().unwrap_or(model_id).to_string(),
+            source_uri: model_id.to_string(),
             architecture: None, // Will be updated after downloading config
             parameters: None,
             created_at: chrono::Utc::now().timestamp(),
@@ -636,45 +231,25 @@ impl ModelSource for HuggingFaceSource {
         
         fs::write(&metadata_path, metadata_content).await?;
         
-        println!("📁 Model directory: {} ({})", uuid, repo_id);
+        println!("📁 Model directory: {} ({})", uuid, model_id);
         
-        // Get repository handle
-        let repo = self.api.model(repo_id.to_string());
-        
-        // First, get the actual file list from the API
-        let actual_files = self.get_repo_files_from_api(repo_id).await
-            .unwrap_or_else(|e| {
-                eprintln!("Warning: Failed to get file list from API: {}", e);
-                eprintln!("Falling back to file probing...");
-                vec![]
-            });
-        
-        // Determine best format using actual files if available
-        let (format, weight_files) = if !actual_files.is_empty() {
-            self.determine_best_format_from_files(&actual_files)?
-        } else {
-            self.determine_best_format(&repo).await?
-        };
-        println!("📦 Format: {:?} ({} files)", format, weight_files.len());
-        
+        // Git clone already downloaded everything, now just find what we have
         let mut files = Vec::new();
         let mut total_size = 0u64;
         
-        // Download configuration to data subdirectory
+        // Check for configuration file
         let config_path = data_dir.join("config.json");
-        if !config_path.exists() {
-            println!("📄 Downloading config.json");
-            // Config files are small JSON, 100MB should be plenty
-            let size = self.download_file_with_progress(&repo, "config.json", &config_path, None, Some(MAX_CONFIG_SIZE)).await?;
+        if config_path.exists() {
+            let metadata = fs::metadata(&config_path).await?;
             files.push(ModelFile {
                 filename: "config.json".to_string(),
                 path: config_path.clone(),
-                size_bytes: size,
+                size_bytes: metadata.len(),
                 format: ModelFormat::SafeTensors,
                 file_type: FileType::Config,
                 sha256: None,
             });
-            total_size += size;
+            total_size += metadata.len();
         }
         
         // Parse config
@@ -685,28 +260,21 @@ impl ModelSource for HuggingFaceSource {
             None
         };
         
-        // Download tokenizer files to data subdirectory
+        // Check for tokenizer files (already cloned by Git)
         for tokenizer_file in &["tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt"] {
             let target_path = data_dir.join(tokenizer_file);
-            if !target_path.exists() {
-                // Tokenizer files can be large for some models, 1GB should cover most cases
-                match self.download_file_with_progress(&repo, tokenizer_file, &target_path, None, Some(MAX_TOKENIZER_SIZE)).await {
-                    Ok(size) => {
-                        println!("📝 Downloaded {}", tokenizer_file);
-                        files.push(ModelFile {
-                            filename: tokenizer_file.to_string(),
-                            path: target_path,
-                            size_bytes: size,
-                            format: ModelFormat::SafeTensors,
-                            file_type: FileType::Tokenizer,
-                            sha256: None,
-                        });
-                        total_size += size;
-                    }
-                    Err(_) => {
-                        // Tokenizer file might not exist, that's okay
-                    }
-                }
+            if target_path.exists() {
+                let metadata = fs::metadata(&target_path).await?;
+                println!("📝 Found {}", tokenizer_file);
+                files.push(ModelFile {
+                    filename: tokenizer_file.to_string(),
+                    path: target_path,
+                    size_bytes: metadata.len(),
+                    format: ModelFormat::SafeTensors,
+                    file_type: FileType::Tokenizer,
+                    sha256: None,
+                });
+                total_size += metadata.len();
             }
         }
         
@@ -721,69 +289,49 @@ impl ModelSource for HuggingFaceSource {
             }
         };
         
-        // Download weight files
-        let pb = ProgressBar::new(weight_files.len() as u64);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
-                .unwrap()
-                .progress_chars("#>-")
-        );
+        // Find SafeTensors weight files (already cloned by Git)
+        let patterns = vec![
+            "*.safetensors",
+            "model-*.safetensors",
+        ];
         
-        // Use the detected format
-        let final_format = format;
-        
-        for weight_file in &weight_files {
-            let filename = Path::new(weight_file).file_name().unwrap().to_str().unwrap();
-            
-            // Convert PyTorch to SafeTensors if needed
-            let safetensors_filename = if filename.ends_with(".bin") || filename.ends_with(".pth") {
-                // PyTorch files also get converted
-                let base = Path::new(filename).file_stem().unwrap().to_str().unwrap();
-                format!("{}.safetensors", base)
-            } else {
-                filename.to_string()
-            };
-            
-            let target_path = data_dir.join(&safetensors_filename);
-            
-            if target_path.exists() {
-                let metadata = fs::metadata(&target_path).await?;
-                println!("✓ {} already exists ({:.2} GB)", 
-                    safetensors_filename,
-                    metadata.len() as f64 / 1_073_741_824.0
-                );
-                files.push(ModelFile {
-                    filename: safetensors_filename.clone(),
-                    path: target_path,
-                    size_bytes: metadata.len(),
-                    format: ModelFormat::SafeTensors,
-                    file_type: FileType::Weights,
-                    sha256: None,
-                });
-                total_size += metadata.len();
-                pb.inc(1);
-            } else {
-                pb.set_message(format!("Downloading {}", filename));
-                
-                // Download the file
-                // Large models can have shards up to 500GB each (future 1T+ models)
-                // With Optane drives and mmap, we can handle these efficiently
-                let size = self.download_file_with_progress(&repo, weight_file, &target_path, Some(&pb), Some(MAX_WEIGHT_SIZE)).await?;
-                
-                files.push(ModelFile {
-                    filename: safetensors_filename,
-                    path: target_path,
-                    size_bytes: size,
-                    format: final_format,
-                    file_type: FileType::Weights,
-                    sha256: None,
-                });
-                total_size += size;
+        let mut weight_files: Vec<String> = Vec::new();
+        for pattern in patterns {
+            let glob_pattern = data_dir.join(pattern).to_string_lossy().to_string();
+            if let Ok(entries) = glob::glob(&glob_pattern) {
+                for entry in entries {
+                    if let Ok(path) = entry {
+                        weight_files.push(path.to_string_lossy().to_string());
+                    }
+                }
             }
         }
         
-        pb.finish_with_message("Download complete");
+        if weight_files.is_empty() {
+            return Err(anyhow!("No SafeTensors model files found in repository"));
+        }
+        
+        let final_format = ModelFormat::SafeTensors;
+        
+        println!("📦 Found {} weight files", weight_files.len());
+        
+        for weight_path in &weight_files {
+            let metadata = fs::metadata(&weight_path).await?;
+            let filename = Path::new(weight_path).file_name().unwrap().to_str().unwrap().to_string();
+            println!("✓ {} ({:.2} GB)", 
+                filename,
+                metadata.len() as f64 / 1_073_741_824.0
+            );
+            files.push(ModelFile {
+                filename: filename.clone(),
+                path: PathBuf::from(weight_path.clone()),
+                size_bytes: metadata.len(),
+                format: final_format,
+                file_type: FileType::Weights,
+                sha256: None,
+            });
+            total_size += metadata.len();
+        }
         
         // Update model metadata with config information
         if let Some(ref cfg) = config {
@@ -805,13 +353,13 @@ impl ModelSource for HuggingFaceSource {
         
         println!("✅ Model downloaded successfully!");
         println!("📊 Total size: {:.2} GB", total_size as f64 / 1_073_741_824.0);
-        println!("📁 Location: {} (UUID: {})", repo_id, uuid);
+        println!("📁 Location: {} (UUID: {})", model_id, uuid);
         
         Ok(DownloadedModel {
-            model_id: repo_id.to_string(),
+            model_id: model_id.to_string(),
             uuid,  // Include the actual UUID used for storage
             local_path: data_dir,
-            format: final_format,  // Always report SafeTensors if we converted
+            format: ModelFormat::SafeTensors,
             files,
             config,
             tokenizer,
@@ -823,92 +371,36 @@ impl ModelSource for HuggingFaceSource {
 
 /// Unified model downloader
 pub struct ModelDownloader {
-    sources: HashMap<String, Box<dyn ModelSource>>,
+    git_source: GitSource,
     cache_dir: PathBuf,
-    default_source: String,
 }
 
 impl ModelDownloader {
-    /// Create a new model downloader with optional HuggingFace token
-    pub async fn new(cache_dir: PathBuf, hf_token: Option<String>) -> Result<Self> {
+    /// Create a new model downloader
+    pub async fn new(cache_dir: PathBuf) -> Result<Self> {
         fs::create_dir_all(&cache_dir).await?;
         
-        let mut sources: HashMap<String, Box<dyn ModelSource>> = HashMap::new();
-        
-        // Add HuggingFace source by default with token
-        // Use the same flat cache directory for all sources - models are organized by UUID
-        let hf_source1 = HuggingFaceSource::new(
-            cache_dir.clone(),  // Flat structure - no source-specific subdirs
-            hf_token.clone(),
-        ).await?;
-        let hf_source2 = HuggingFaceSource::new(
-            cache_dir.clone(),  // Same flat structure for both aliases
-            hf_token,
-        ).await?;
-        // Register with both "huggingface" and "hf" aliases
-        sources.insert("huggingface".to_string(), Box::new(hf_source1));
-        sources.insert("hf".to_string(), Box::new(hf_source2));
+        let git_source = GitSource::new(cache_dir.clone()).await?;
         
         Ok(Self {
-            sources,
+            git_source,
             cache_dir,
-            default_source: "huggingface".to_string(),
         })
     }
     
-    /// Add a model source
-    pub fn add_source(&mut self, name: String, source: Box<dyn ModelSource>) {
-        self.sources.insert(name, source);
-    }
-    
-    /// Download a model with options
+    /// Download a model from a Git repository
     pub async fn download(
         &self,
-        model_id: &str,
-        options: DownloadOptions,
+        git_url: &str,
+        _options: DownloadOptions,
     ) -> Result<DownloadedModel> {
-        // Parse source from model_id (e.g., "hf://model" or just "model")
-        let (source_name, model_name) = if model_id.contains("://") {
-            let parts: Vec<&str> = model_id.splitn(2, "://").collect();
-            (parts[0], parts[1])
-        } else {
-            (self.default_source.as_str(), model_id)
-        };
-        
-        // Get the source
-        let source = self.sources.get(source_name)
-            .ok_or_else(|| anyhow!("Unknown model source: {}", source_name))?;
-        
-        // Download the model to flat cache directory (no source-specific subdirs)
-        let model = source.download_model(model_name, &self.cache_dir).await?;
-        
-        // Model is downloaded in its native format
-        
-        Ok(model)
-    }
-    
-    /// List available models
-    pub async fn list_models(&self, source: Option<&str>, query: Option<&str>) -> Result<Vec<ModelInfo>> {
-        let source_name = source.unwrap_or(&self.default_source);
-        let source = self.sources.get(source_name)
-            .ok_or_else(|| anyhow!("Unknown model source: {}", source_name))?;
-        
-        source.list_models(query).await
+        // Download the model using Git
+        self.git_source.download_model(git_url, &self.cache_dir).await
     }
     
     /// Get model information
     pub async fn get_model_info(&self, model_id: &str) -> Result<ModelInfo> {
-        let (source_name, model_name) = if model_id.contains("://") {
-            let parts: Vec<&str> = model_id.splitn(2, "://").collect();
-            (parts[0], parts[1])
-        } else {
-            (self.default_source.as_str(), model_id)
-        };
-        
-        let source = self.sources.get(source_name)
-            .ok_or_else(|| anyhow!("Unknown model source: {}", source_name))?;
-        
-        source.get_model_info(model_name).await
+        self.git_source.get_model_info(model_id).await
     }
 }
 
@@ -1067,21 +559,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_hf_source_parse_repo_id() {
-        assert_eq!(
-            HuggingFaceSource::parse_repo_id("microsoft/phi-2"),
-            "microsoft/phi-2"
-        );
-        assert_eq!(
-            HuggingFaceSource::parse_repo_id("hf://microsoft/phi-2"),
-            "microsoft/phi-2"
-        );
-        assert_eq!(
-            HuggingFaceSource::parse_repo_id("huggingface://microsoft/phi-2"),
-            "microsoft/phi-2"
-        );
-    }
+    // HuggingFace URL parsing tests removed - only direct Git URLs supported now
 
     #[tokio::test]
     async fn test_metadata_json_protection() {
@@ -1093,7 +571,7 @@ mod tests {
             model_id: crate::api::model_storage::ModelId::new(),
             name: "test-model".to_string(),
             display_name: "Test Model".to_string(),
-            source_uri: "hf://test/model".to_string(),
+            source_uri: "https://github.com/test/model".to_string(),
             architecture: Some("test".to_string()),
             parameters: Some(1000),
             created_at: 0,

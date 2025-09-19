@@ -1,4 +1,4 @@
-//! Hyprstream binary - ML inference server with VDB storage
+//! Hyprstream binary - ML inference server
 //!
 //! This binary provides the main entry point for the Hyprstream service.
 
@@ -6,8 +6,8 @@ use clap::Parser;
 use config::Config;
 use hyprstream_core::cli::commands::Commands;
 use hyprstream_core::cli::handlers::{
-    handle_server, handle_model_command, 
-    handle_auth_command, handle_chat_command
+    handle_server, handle_model_command,
+    handle_chat_command
 };
 use hyprstream_core::cli::handle_pytorch_lora_command;
 use tracing::info;
@@ -54,31 +54,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let config = Config::builder()
                 .set_default("host", "127.0.0.1")?
                 .set_default("port", "50051")?
-                .set_default("storage.path", "./vdb_storage")?
+                .set_default("storage.path", "./storage")?
                 .set_default("storage.neural_compression", true)?
                 .set_default("storage.hardware_acceleration", true)?
                 .set_default("storage.cache_size_mb", 2048)?
                 .build()?;
                 
-            handle_server(config).await
+            handle_server(config).await?
         }
         Commands::Model(cmd) => {
             // Model commands need a server URL (default to local)
             let server_url = "http://127.0.0.1:50051".to_string();
-            handle_model_command(cmd, server_url).await
+            handle_model_command(cmd, server_url).await?
         }
         Commands::Lora(cmd) => {
             // Use PyTorch-native LoRA with autograd support
             info!("Using PyTorch LoRA implementation");
-            handle_pytorch_lora_command(cmd).await
-        }
-        Commands::Auth(cmd) => {
-            handle_auth_command(cmd).await
+            handle_pytorch_lora_command(cmd).await?
         }
         Commands::Chat(cmd) => {
             // Chat commands need a server URL (default to local)
             let server_url = "http://127.0.0.1:50051".to_string();
-            handle_chat_command(cmd, server_url).await
+            handle_chat_command(cmd, server_url).await?
         }
-    }
+    };
+
+    Ok(())
 }

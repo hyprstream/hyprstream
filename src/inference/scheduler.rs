@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 use chrono::{DateTime, Utc};
 
-use crate::inference::block_engine::{VDBBlockEngine, AllocStatus};
+use crate::inference::block_engine::{BlockEngine, AllocStatus};
 use crate::runtime::conversation_router::ConversationRouter;
 use crate::config::GenerationRequest;
 
@@ -265,7 +265,7 @@ pub struct HyprScheduler {
     /// Configuration
     config: SchedulerConfig,
     /// Block engine for memory management
-    block_engine: Arc<VDBBlockEngine>,
+    block_engine: Arc<BlockEngine>,
     /// Conversation router for LoRA selection
     conversation_router: Arc<ConversationRouter>,
     /// Waiting queue
@@ -284,7 +284,7 @@ impl HyprScheduler {
     /// Create new scheduler
     pub async fn new(
         config: SchedulerConfig,
-        block_engine: Arc<VDBBlockEngine>,
+        block_engine: Arc<BlockEngine>,
         conversation_router: Arc<ConversationRouter>,
     ) -> Result<Self> {
         Ok(Self {
@@ -565,24 +565,28 @@ pub struct SchedulerStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::vdb::{VDBSparseStorage, SparseStorageConfig};
+    // use crate::storage::vdb::{VDBSparseStorage, SparseStorageConfig};
     
     #[tokio::test]
     async fn test_scheduler_creation() {
         let block_engine = Arc::new(
-            VDBBlockEngine::new(16, 100, 100, None).await.unwrap()
+            BlockEngine::new(16, 100, 100).await.unwrap()
         );
         
-        let storage_config = SparseStorageConfig::default();
-        let vdb_storage = Arc::new(VDBSparseStorage::new(storage_config).await.unwrap());
-        let temporal_layer = Arc::new(
-            crate::storage::vdb::TemporalStreamingLayer::new(
-                vdb_storage,
-                Default::default()
-            ).await.unwrap()
-        );
-        
-        let router = Arc::new(ConversationRouter::new(temporal_layer).await);
+        // Commented out - VDB removed
+        // let storage_config = SparseStorageConfig::default();
+        // let vdb_storage = Arc::new(VDBSparseStorage::new(storage_config).await.unwrap());
+        // let temporal_layer = Arc::new(
+        //     crate::storage::vdb::TemporalStreamingLayer::new(
+        //         vdb_storage,
+        //         Default::default()
+        //     ).await.unwrap()
+        // );
+        //
+        // let router = Arc::new(ConversationRouter::new(temporal_layer).await);
+
+        // Create a dummy router for testing
+        let router = Arc::new(ConversationRouter::default());
         
         let scheduler = HyprScheduler::new(
             SchedulerConfig::default(),

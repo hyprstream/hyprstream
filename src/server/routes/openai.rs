@@ -639,12 +639,6 @@ async fn list_models(
                 // The backend should provide the correct display name
                 // API layer should not be determining how to name models
                 let model_name = metadata.display_name
-                    .or_else(|| {
-                        metadata.local_path.as_ref()
-                            .and_then(|p| p.file_name())
-                            .and_then(|n| n.to_str())
-                            .map(|s| s.to_string())
-                    })
                     .unwrap_or(metadata.name);
                 
                 models.push(Model {
@@ -674,12 +668,12 @@ async fn list_models(
     }
     
     // Add LoRA adapters as fine-tuned models
-    if let Ok(loras) = state.lora_registry.list_all().await {
-        for lora in loras {
+    if let Ok(loras) = state.adapter_storage.list_adapters().await {
+        for (adapter_id, adapter_config) in loras {
             models.push(Model {
-                id: format!("lora-{}", lora.id),
+                id: format!("lora-{}", adapter_id),
                 object: "model".to_string(),
-                created: lora.created_at,
+                created: adapter_config.created_at.timestamp(),
                 owned_by: "user".to_string(),
             });
         }

@@ -68,7 +68,7 @@ impl ModelCache {
         
         // Get model path from storage with direct loading fallback
         let model_id = crate::api::model_storage::ModelId(model_uuid);
-        let metadata = match self.model_storage.get_metadata_by_id_or_load(&model_id).await {
+        let metadata = match self.model_storage.get_metadata_by_id(&model_id).await {
             Ok(meta) => meta,
             Err(e) => {
                 // UUID not found in storage at all
@@ -77,8 +77,8 @@ impl ModelCache {
                 return Err(anyhow::anyhow!("Model not found for UUID: {}", model_uuid));
             }
         };
-        let model_path = metadata.local_path
-            .ok_or_else(|| anyhow::anyhow!("Model {} not cached locally", model_name))?;
+        // Use UUID-based path
+        let model_path = self.model_storage.get_models_dir().join(model_id.to_string());
 
         // Create new engine and load model
         let config = RuntimeConfig::default();
@@ -138,7 +138,7 @@ impl ModelCache {
         
         // Validate the UUID before caching (will also load from directory if needed)
         let model_id = crate::api::model_storage::ModelId(uuid);
-        if let Err(e) = self.model_storage.get_metadata_by_id_or_load(&model_id).await {
+        if let Err(e) = self.model_storage.get_metadata_by_id(&model_id).await {
             return Err(anyhow::anyhow!("Model '{}' resolved to UUID {} but not found: {}", model_name, uuid, e));
         }
         
@@ -170,23 +170,12 @@ impl ModelCache {
                 }
             }
             
-            // Check directory name
-            if let Some(ref local_path) = metadata.local_path {
-                if let Some(dir_name) = local_path.file_name() {
-                    let dir_name_str = dir_name.to_string_lossy();
-                    
-                    // Exact match on directory name
-                    if dir_name_str == model_name {
-                        return Ok(id.0);
-                    }
-                    
-                    // Handle "org/model" format
-                    if model_name.contains('/') {
-                        let model_part = model_name.split('/').last().unwrap_or("");
-                        if dir_name_str.to_lowercase().contains(&model_part.to_lowercase()) {
-                            return Ok(id.0);
-                        }
-                    }
+            // Check directory name (UUID-based path) - exact match only
+            let model_path = self.model_storage.get_uuid_model_path(&id);
+            if let Some(dir_name) = model_path.file_name() {
+                let dir_name_str = dir_name.to_string_lossy();
+                if dir_name_str == model_name {
+                    return Ok(id.0);
                 }
             }
         }
@@ -293,23 +282,12 @@ impl ModelCache {
                 debug!("Cached display_name '{}' -> {}", display_name, id.0);
             }
             
-            // Cache by directory name
-            if let Some(ref local_path) = metadata.local_path {
-                if let Some(dir_name) = local_path.file_name() {
-                    let dir_name_str = dir_name.to_string_lossy().to_string();
-                    
-                    // Also cache without organization prefix for "org/model" format
-                    if let Some(model_part) = dir_name_str.split('/').last() {
-                        if model_part != &dir_name_str {
-                            new_name_cache.insert(model_part.to_string(), id.0);
-                            debug!("Cached model part '{}' -> {}", model_part, id.0);
-                        }
-                    }
-                    
-                    // Insert the full directory name last (clone to avoid move)
-                    debug!("Cached dir name '{}' -> {}", dir_name_str, id.0);
-                    new_name_cache.insert(dir_name_str, id.0);
-                }
+            // Cache by directory name (UUID-based path) - UUID only
+            let model_path = self.model_storage.get_uuid_model_path(&id);
+            if let Some(dir_name) = model_path.file_name() {
+                let dir_name_str = dir_name.to_string_lossy().to_string();
+                debug!("Cached UUID dir name '{}' -> {}", dir_name_str, id.0);
+                new_name_cache.insert(dir_name_str, id.0);
             }
         }
         

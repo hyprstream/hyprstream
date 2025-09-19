@@ -31,8 +31,6 @@ pub struct StorageConfig {
     pub cache_dir: PathBuf,
     /// Config directory path
     pub config_dir: PathBuf,
-    /// VDB storage directory path
-    pub vdb_storage_dir: PathBuf,
 }
 
 /// Model loading and identification
@@ -127,9 +125,6 @@ impl Default for StorageConfig {
             loras_dir: storage_paths.loras_dir().unwrap_or_else(|_| PathBuf::from("./loras")),
             cache_dir: storage_paths.cache_dir().unwrap_or_else(|_| PathBuf::from("./cache")),
             config_dir: storage_paths.config_dir().unwrap_or_else(|_| PathBuf::from("./config")),
-            vdb_storage_dir: storage_paths.cache_dir()
-                .unwrap_or_else(|_| PathBuf::from("./cache"))
-                .join("vdb_storage"),
         }
     }
 }
@@ -395,10 +390,7 @@ impl HyprConfig {
         &self.storage.config_dir
     }
     
-    /// Get the VDB storage directory path
-    pub fn vdb_storage_dir(&self) -> &PathBuf {
-        &self.storage.vdb_storage_dir
-    }
+    /// Get the storage directory path
     
     /// Get a specific model path by name
     pub fn model_path(&self, model_name: &str) -> PathBuf {
@@ -420,7 +412,6 @@ impl HyprConfig {
         std::fs::create_dir_all(&self.storage.loras_dir)?;
         std::fs::create_dir_all(&self.storage.cache_dir)?;
         std::fs::create_dir_all(&self.storage.config_dir)?;
-        std::fs::create_dir_all(&self.storage.vdb_storage_dir)?;
         Ok(())
     }
     
@@ -442,7 +433,6 @@ impl HyprConfig {
             loras_dir: storage_paths.loras_dir()?,
             cache_dir: storage_paths.cache_dir()?,
             config_dir: storage_paths.config_dir()?,
-            vdb_storage_dir: storage_paths.cache_dir()?.join("vdb_storage"),
         };
         
         Ok(config)

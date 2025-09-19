@@ -18,7 +18,7 @@ pub enum LoRAAction {
         #[arg(long)]
         name: Option<String>,
         
-        /// Base model URI (e.g., hf://microsoft/DialoGPT-medium) or UUID
+        /// Base model Git URL (e.g., https://huggingface.co/microsoft/DialoGPT-medium) or UUID
         #[arg(long)]
         base_model: String,
         
@@ -38,7 +38,7 @@ pub enum LoRAAction {
         #[arg(long, value_delimiter = ',', default_values = &["q_proj", "v_proj"])]
         target_modules: Vec<String>,
         
-        /// Sparsity ratio (0.99 = 99% sparse)
+        /// Sparsity ratio (0.0 to 1.0)
         #[arg(long, default_value = "0.99")]
         sparsity: f32,
         

@@ -13,11 +13,11 @@ pub mod llama;
 pub mod gemma;
 pub mod qwen;
 pub mod config;
-pub mod lora_adapter;
+// LoRA adapter moved to lora module
 
 pub use detector::ArchitectureDetector;
 pub use config::{ArchitectureConfig, AttentionConfig};
-pub use lora_adapter::ArchitectureAwareLoRAAdapter;
+// pub use lora_adapter::ArchitectureAwareLoRAAdapter; // Module removed
 
 /// Supported model architectures
 #[derive(Debug, Clone, PartialEq)]
@@ -151,7 +151,7 @@ pub trait ModelOperations: Send {
     fn get_attention_mask(&self, seq_len: usize, past_kv_len: usize) -> Result<Tensor>;
     
     /// Apply LoRA adapter with architecture-specific handling (for cache/storage only)
-    fn apply_lora(&mut self, adapter: &ArchitectureAwareLoRAAdapter) -> Result<()>;
+    fn apply_lora(&mut self, adapter: &crate::lora::torch_adapter::LoRAModel) -> Result<()>;
 }
 
 /// Attention mechanism types

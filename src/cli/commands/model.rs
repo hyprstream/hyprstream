@@ -14,7 +14,7 @@ pub struct ModelCommand {
 pub enum ModelAction {
     /// Pull a model from a registry
     Pull {
-        /// Model URI (e.g., hf://microsoft/DialoGPT-medium)
+        /// Git repository URL (e.g., https://huggingface.co/microsoft/DialoGPT-medium)
         uri: String,
         
         /// Force re-download even if cached
@@ -36,6 +36,20 @@ pub enum ModelAction {
         /// Show download progress
         #[arg(long, default_value = "true")]
         progress: bool,
+    },
+    
+    /// Clone a model using Git
+    Clone {
+        /// Git repository URL (supports all Git URL formats)
+        repo_url: String,
+        
+        /// Git ref (branch, tag, commit) to clone
+        #[arg(long)]
+        git_ref: Option<String>,
+        
+        /// Model ID to use (auto-generated if not provided)
+        #[arg(long)]
+        model_id: Option<String>,
     },
     
     /// List available models
@@ -65,6 +79,34 @@ pub enum ModelAction {
         /// Output format (json, yaml)
         #[arg(long, default_value = "json")]
         format: String,
+    },
+    
+    /// Share a model with the network
+    Share {
+        /// Model name to share
+        model_name: String,
+        
+        /// Include performance metrics
+        #[arg(long)]
+        include_metrics: bool,
+        
+        /// Push to remote repository
+        #[arg(long)]
+        push_to: Option<String>,
+    },
+    
+    /// Import a shared model from peer
+    Import {
+        /// Git URL of the shared model
+        git_url: String,
+        
+        /// Local name for the imported model
+        #[arg(long)]
+        name: Option<String>,
+        
+        /// Verify signature
+        #[arg(long)]
+        verify: bool,
     },
     
     /// Remove a model from local cache

@@ -1,150 +1,66 @@
-//! LoRA (Low-Rank Adaptation) implementation with multiple backends
-//! 
-//! This module provides a unified interface for LoRA with support for:
-//! - PyTorch backend with full autograd support for training
-//! - Sparse backend for efficient inference
-//! - OpenVDB backend for caching and persistence
-
-use anyhow::{Result, anyhow};
-use async_trait::async_trait;
-use serde::{Serialize, Deserialize};
-use std::path::Path;
-use std::collections::HashMap;
-use tch::Device;
+//! Clean LoRA implementation for transformer models
+//!
+//! Single source of truth for LoRA adapters with git-based storage.
 
 pub mod torch_adapter;
 pub mod trainer;
-pub mod config;
-pub mod checkpoint;
-pub mod merge;
-pub mod openvdb;
-pub mod utils;
-pub mod error;
 
-// Re-export implementations
-pub use torch_adapter::{TorchLoRALayer, LoRALayerConfig, LoRAModel, LoRAModel as PyTorchLoRA};
-pub use trainer::{LoRATrainer, TrainingMetrics};
-pub use config::{TrainingConfig, QuantizationConfig, QuantizationType};
-pub use checkpoint::{
-    CheckpointManager, CheckpointInfo, find_best_checkpoint,
-};
-pub use merge::{LoRAMerger, MergeStrategy};
-pub use error::{LoRAError, LoRAResult};
-pub use utils::{
-    lora_forward, validate_lora_config,
-    InitStrategy, initialize_lora_weights,
-};
+use anyhow::Result;
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::Path;
+use tch::{Device, Tensor};
 
-// ============================================================================
-// Common Types - Single source of truth for all LoRA implementations
-// ============================================================================
-
-/// Unified LoRA configuration used by all backends
+/// Single LoRA configuration - only source of truth
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoRAConfig {
     /// Low-rank dimension (r in the paper)
     pub rank: usize,
-    
-    /// Scaling factor (alpha in the paper, typically = rank)
+    /// Scaling factor (alpha in the paper)
     pub alpha: f32,
-    
     /// Dropout probability for training
     pub dropout: f32,
-    
-    /// Module names to apply LoRA to (e.g., ["q_proj", "v_proj"])
+    /// Module names to apply LoRA to
     pub target_modules: Vec<String>,
-    
-    /// Learning rate (if training)
+    /// Learning rate for training
     pub learning_rate: f32,
-    
-    /// Optional backend-specific settings
-    #[serde(default)]
-    pub backend: LoRABackend,
 }
 
 impl Default for LoRAConfig {
     fn default() -> Self {
         Self {
-            rank: 16,
+            rank: 8,
             alpha: 16.0,
             dropout: 0.1,
             target_modules: vec![
                 "q_proj".to_string(),
                 "v_proj".to_string(),
-                "k_proj".to_string(),
-                "o_proj".to_string(),
             ],
             learning_rate: 1e-4,
-            backend: LoRABackend::default(),
         }
     }
 }
 
-/// Backend implementation choice
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub enum LoRABackend {
-    /// PyTorch with autograd (default, best for training)
-    #[default]
-    PyTorch,
-    
-    /// OpenVDB (for caching/persistence only)
-    OpenVDB,
-}
-
-
-// ============================================================================
-// Core Trait - All LoRA implementations must satisfy this interface
-// ============================================================================
-
-/// Common interface for all LoRA adapter implementations
+/// LoRA adapter trait - single interface
 #[async_trait]
-pub trait LoRAAdapter: Send + Sync {
+pub trait LoRAAdapter: Send {
     /// Get adapter configuration
     fn config(&self) -> &LoRAConfig;
     
-    /// Save weights to disk
+    /// Save weights to SafeTensors
     async fn save(&self, path: &Path) -> Result<()>;
     
-    /// Load weights from disk
+    /// Load weights from SafeTensors
     async fn load(&mut self, path: &Path) -> Result<()>;
     
-    /// Export weights to PyTorch tensors for GPU transfer
-    /// Returns (lora_a, lora_b) tensors for each target module
-    /// Note: Implementations that don't use PyTorch internally will create new tensors
-    fn to_tensors(&self, device: tch::Device) -> Result<HashMap<String, (tch::Tensor, tch::Tensor)>>;
+    /// Forward pass for a module
+    fn forward(&self, module_name: &str, input: &Tensor) -> Result<Option<Tensor>>;
     
-    /// Import weights from PyTorch tensors (e.g., from GPU)
-    /// Takes (lora_a, lora_b) tensors for each target module
-    fn from_tensors(&mut self, tensors: HashMap<String, (tch::Tensor, tch::Tensor)>) -> Result<()>;
+    /// Get number of parameters
+    fn num_parameters(&self) -> i64;
 }
 
-// ============================================================================
-// Factory for creating adapters with appropriate backend
-// ============================================================================
-
-/// Create a LoRA adapter with the specified configuration
-pub fn create_adapter(
-    config: LoRAConfig,
-    module_configs: HashMap<String, (usize, usize)>,
-) -> Result<Box<dyn LoRAAdapter>> {
-    match config.backend {
-        LoRABackend::PyTorch => {
-            let device = Device::cuda_if_available();
-            let adapter = LoRAModel::new(
-                config,
-                module_configs,
-                device,
-            )?;
-            Ok(Box::new(adapter))
-        }
-        LoRABackend::OpenVDB => {
-            let vdb_config = openvdb::OpenVDBConfig::default();
-            let adapter = openvdb::OpenVDBLoRAAdapter::new(
-                "default".to_string(),
-                config,
-                vdb_config,
-            )?;
-            Ok(Box::new(adapter))
-        }
-    }
-}
+// Re-export the torch implementation
+pub use torch_adapter::{LoRAModel, TorchLoRALayer, LoRALayerConfig};
+pub use trainer::{LoRATrainer, TrainingConfig, CheckpointMetrics};

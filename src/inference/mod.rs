@@ -1,8 +1,5 @@
 //! Inference API for applying LoRA adapters to base models
 
-// TODO: Remove sparse reference
-// use crate::lora::sparse::SparseLoRAAdapter;
-use crate::storage::vdb::hardware_accelerated::HardwareVDBStorage;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -13,8 +10,7 @@ use anyhow::Result;
 
 pub mod model_loader;
 pub mod inference_engine;
-pub mod lora_fusion;
-pub mod paged_attention;
+// LoRA fusion moved to lora module
 pub mod block_engine;
 pub mod scheduler;
 
@@ -23,9 +19,8 @@ pub use crate::config::{HyprConfig, GenerationRequest, GenerationResult, ModelIn
 
 pub use model_loader::{ModelLoader, BaseModelHandle};
 pub use inference_engine::{InferenceEngine, InferenceEngineStats};
-pub use lora_fusion::{LoRAFusion, FusionStrategy};
-pub use paged_attention::{VDBPagedAttention, PagedAttentionConfig, InputMetadata};
-pub use block_engine::{VDBBlockEngine, BlockEngineStats, AllocStatus};
+// pub use lora_fusion::{LoRAFusion, FusionStrategy}; // Module removed
+pub use block_engine::{BlockEngine, BlockEngineStats, AllocStatus};
 pub use scheduler::{HyprScheduler, SchedulerConfig, SchedulerOutput, SchedulerStats};
 
 /// Inference session with active LoRA adapters
@@ -52,7 +47,8 @@ pub struct InferenceStats {
     pub memory_usage_mb: u64,
 }
 
-/// Main inference API
+/// Main inference API (VDB-based - currently disabled)
+/*
 pub struct InferenceAPI {
     /// Base model storage (mmap'd weights)
     model_loader: Arc<ModelLoader>,
@@ -287,34 +283,8 @@ impl InferenceAPI {
         
         Ok(())
     }
-    
-    fn convert_to_sparse_updates(
-        &self,
-        updates: HashMap<String, Vec<f32>>,
-    ) -> Result<HashMap<crate::storage::vdb::grid::Coordinate3D, f32>> {
-        // Convert dense updates to sparse format
-        let mut sparse = HashMap::new();
-        
-        for (key, values) in updates {
-            // Parse layer and position from key
-            // Example: "layer.0.self_attn.q_proj.weight[100,200]"
-            if let Some((layer, coords)) = parse_weight_key(&key) {
-                for (idx, value) in values.iter().enumerate() {
-                    if value.abs() > 1e-6 { // Only non-zero values
-                        let coord = crate::storage::vdb::grid::Coordinate3D::new(
-                            coords.0 + idx as i32,
-                            coords.1,
-                            layer as i32,
-                        );
-                        sparse.insert(coord, *value);
-                    }
-                }
-            }
-        }
-        
-        Ok(sparse)
-    }
 }
+*/
 
 /// Input for inference
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,9 +316,9 @@ pub struct InferenceToken {
     pub timestamp_ms: i64,
 }
 
-/// Fused adapter weights
+// Placeholder for removed VDB-based FusedAdapterWeights
 pub struct FusedAdapterWeights {
-    pub weights: HashMap<String, SparseLoRAAdapter>,
+    pub weights: std::collections::HashMap<String, ()>, // Placeholder
     pub fusion_metadata: FusionMetadata,
 }
 

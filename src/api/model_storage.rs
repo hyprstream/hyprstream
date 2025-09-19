@@ -163,23 +163,6 @@ impl std::str::FromStr for ComposedModelId {
     }
 }
 
-/// External source reference
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExternalSource {
-    pub source_type: SourceType,
-    pub identifier: String,
-    pub revision: Option<String>,
-    pub download_url: Option<String>,
-    pub last_verified: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SourceType {
-    HuggingFace,
-    LocalPath,
-    HttpUrl,
-    Custom(String),
-}
 
 // Re-export ModelFile and FileType from model_downloader
 pub use crate::api::model_downloader::{ModelFile, FileType};
@@ -214,11 +197,10 @@ pub struct ModelMetadata {
     pub size_bytes: u64,
     pub files: Vec<ModelFile>,
     
-    // Multiple external sources for same model
-    pub external_sources: Vec<ExternalSource>,
+    // Git source URL (stored in git config, kept here for reference)
+    pub git_source: Option<String>,
     
     // Storage information
-    pub local_path: Option<PathBuf>,
     pub is_cached: bool,
     
     // Metadata
@@ -256,6 +238,8 @@ pub struct ModelStorage {
     
     /// URI to UUID mapping cache (for backward compatibility)
     uri_to_uuid: tokio::sync::RwLock<HashMap<String, ModelId>>,
+    
+    git_registry: tokio::sync::RwLock<Option<crate::git::GitModelRegistry>>,
 }
 
 /// Cache statistics
@@ -293,6 +277,12 @@ impl ModelStorage {
     pub fn get_uuid_model_data_path(&self, model_id: &ModelId) -> PathBuf {
         self.get_uuid_model_path(model_id).join("data")
     }
+
+    /// Get the models directory
+    pub fn get_models_dir(&self) -> &Path {
+        &self.base_dir
+    }
+
     
     /// Save model metadata file in the model directory
     pub async fn save_model_metadata_file(&self, model_id: &ModelId, metadata: &ModelMetadataFile) -> Result<()> {
@@ -351,12 +341,24 @@ impl ModelStorage {
         // Ensure base directory exists
         fs::create_dir_all(&base_dir).await?;
         
+        let git_registry = match crate::git::GitModelRegistry::init(base_dir.clone()).await {
+            Ok(registry) => {
+                tracing::info!("Initialized Git model registry");
+                Some(registry)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to initialize Git registry, falling back to directory scanning: {}", e);
+                None
+            }
+        };
+        
         let metadata_file = base_dir.join("metadata.json");
         let storage = Self {
             base_dir,
             metadata_file,
             metadata_cache: tokio::sync::RwLock::new(HashMap::new()),
             uri_to_uuid: tokio::sync::RwLock::new(HashMap::new()),
+            git_registry: tokio::sync::RwLock::new(git_registry),
         };
         
         // Load existing metadata
@@ -399,16 +401,9 @@ impl ModelStorage {
                             // Valid entry, add to cache
                             cache.insert(model_id.clone(), metadata.clone());
                             
-                            // Build URI mapping
-                            if let Some(external_source) = metadata.external_sources.first() {
-                                let uri_key = match external_source.source_type {
-                                    SourceType::HuggingFace => format!("hf://{}", external_source.identifier),
-                                    SourceType::LocalPath => format!("local://{}", external_source.identifier),
-                                    SourceType::HttpUrl => external_source.identifier.clone(),
-                                    SourceType::Custom(ref name) => format!("{}://{}", name, external_source.identifier),
-                                };
-                                uri_map.insert(uri_key, model_id.clone());
-                            }
+                            // Simple URI mapping using model name
+                            let uri_key = format!("git://local/{}", metadata.name);
+                            uri_map.insert(uri_key, model_id.clone());
                         } else {
                             tracing::warn!("UUID mismatch in cache for {}, skipping", model_id);
                         }
@@ -475,14 +470,6 @@ impl ModelStorage {
             .ok_or_else(|| anyhow::anyhow!("Model metadata not found for UUID: {}", model_id))
     }
     
-    /// Get metadata for a model by UUID
-    pub async fn get_metadata_by_id(&self, model_id: &ModelId) -> Result<ModelMetadata> {
-        let cache = self.metadata_cache.read().await;
-        cache.get(model_id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Model metadata not found for UUID: {}", model_id))
-    }
-    
     /// Remove metadata for a model by URI
     pub async fn remove_metadata(&self, model_uri: &ModelUri) -> Result<()> {
         let mut uri_map = self.uri_to_uuid.write().await;
@@ -522,154 +509,41 @@ impl ModelStorage {
         Ok(())
     }
     
-    /// Get metadata by ID with direct directory loading fallback
-    pub async fn get_metadata_by_id_or_load(&self, model_id: &ModelId) -> Result<ModelMetadata> {
-        // First try cache
-        {
-            let cache = self.metadata_cache.read().await;
-            if let Some(metadata) = cache.get(model_id) {
-                return Ok(metadata.clone());
-            }
-        }
-        
-        // Not in cache, try to load from directory
-        let model_path = self.get_uuid_model_path(model_id);
-        let model_json_path = model_path.join("model.json");
-        
-        if !model_json_path.exists() {
-            return Err(anyhow!("Model {} not found", model_id));
-        }
-        
-        // Load metadata file
-        let metadata_file = self.load_model_metadata_file(model_id).await?;
-        
-        // Validate UUID matches
-        if metadata_file.model_id != *model_id {
-            return Err(anyhow!(
-                "UUID mismatch: expected {}, found {} in model.json",
-                model_id, metadata_file.model_id
-            ));
-        }
-        
-        // Build full metadata
-        let data_path = model_path.join("data");
-        let size_bytes = if data_path.exists() {
-            self.calculate_model_size(&data_path).await.unwrap_or(0)
-        } else {
-            0
-        };
-        
-        let metadata = ModelMetadata {
-            model_id: model_id.clone(),
-            name: metadata_file.name.clone(),
-            display_name: Some(metadata_file.display_name.clone()),
-            architecture: metadata_file.architecture.unwrap_or_else(|| "unknown".to_string()),
-            parameters: metadata_file.parameters,
-            model_type: "language_model".to_string(),
-            tokenizer_type: None,
-            size_bytes,
-            files: vec![],
-            external_sources: if metadata_file.source_uri.starts_with("hf://") {
-                vec![ExternalSource {
-                    source_type: SourceType::HuggingFace,
-                    identifier: metadata_file.source_uri.trim_start_matches("hf://").to_string(),
-                    revision: None,
-                    download_url: None,
-                    last_verified: metadata_file.created_at,
-                }]
-            } else {
-                vec![]
-            },
-            local_path: Some(data_path),
-            is_cached: true,
-            tags: vec![],
-            description: None,
-            license: None,
-            created_at: metadata_file.created_at,
-            last_accessed: metadata_file.last_accessed,
-            last_updated: metadata_file.created_at,
-        };
-        
-        // Update cache
-        {
-            let mut cache = self.metadata_cache.write().await;
-            cache.insert(model_id.clone(), metadata.clone());
-        }
-        
-        Ok(metadata)
+    /// Get metadata by ID - strict lookup, no fallbacks
+    pub async fn get_metadata_by_id(&self, model_id: &ModelId) -> Result<ModelMetadata> {
+        // Check cache only
+        let cache = self.metadata_cache.read().await;
+        cache.get(model_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Model {} not found. Use 'hyprstream model list' to see available models", model_id))
     }
     
     /// List all locally cached models
     pub async fn list_local_models(&self) -> Result<Vec<(ModelUri, ModelMetadata)>> {
-        let cache = self.metadata_cache.read().await;
-        let mut models = Vec::new();
-        
-        for (_model_id, metadata) in cache.iter() {
-            // Generate ModelUri from external sources for backward compatibility
-            if let Some(external_source) = metadata.external_sources.first() {
-                let uri_str = match &external_source.source_type {
-                    SourceType::HuggingFace => format!(
-                        "hf://{}", 
-                        external_source.identifier
-                    ),
-                    SourceType::LocalPath => format!(
-                        "local://{}", 
-                        external_source.identifier
-                    ),
-                    SourceType::HttpUrl => external_source.identifier.clone(),
-                    SourceType::Custom(name) => format!(
-                        "{}://{}", 
-                        name, 
-                        external_source.identifier
-                    ),
-                };
-                
-                if let Ok(uri) = ModelUri::parse(&uri_str) {
-                    // Check if model files still exist
-                    let model_exists = if let Some(local_path) = &metadata.local_path {
-                        local_path.exists()
-                    } else {
-                        // UUID models should have local_path set
-                        false
-                    };
-                    
-                    if model_exists {
-                        models.push((uri, metadata.clone()));
-                    }
-                }
-            }
+        // Get models from git registry
+        let models = self.list_models().await?;
+
+        let mut result = Vec::new();
+        for (model_id, metadata) in models {
+            // Create a simple URI from the model name and ID
+            // The actual git source URL is stored in the git config
+            let uri = ModelUri {
+                registry: "git".to_string(),
+                org: "local".to_string(),
+                name: metadata.name.clone(),
+                revision: None,
+                uri: format!("git://local/{}/{}", metadata.name, model_id),
+            };
+            result.push((uri, metadata));
         }
-        
-        Ok(models)
+
+        Ok(result)
     }
     
     /// List all models by UUID (new primary interface)
     pub async fn list_all(&self) -> Result<Vec<(ModelId, ModelMetadata)>> {
-        let cache = self.metadata_cache.read().await;
-        let mut models = Vec::new();
-        
-        for (model_id, metadata) in cache.iter() {
-            // Check if model files still exist
-            let model_exists = if let Some(local_path) = &metadata.local_path {
-                local_path.exists()
-            } else if let Some(external_source) = metadata.external_sources.first() {
-                // Try to construct path from external source
-                match &external_source.source_type {
-                    SourceType::LocalPath => {
-                        std::path::Path::new(&external_source.identifier).exists()
-                    },
-                    _ => true, // For remote sources, assume they exist
-                }
-            } else {
-                false
-            };
-            
-            if model_exists {
-                models.push((model_id.clone(), metadata.clone()));
-            }
-        }
-        
-        Ok(models)
+        // Just use the git registry listing
+        self.list_models().await
     }
     
     /// Get cache statistics
@@ -680,24 +554,13 @@ impl ModelStorage {
         
         for (_model_id, metadata) in cache.iter() {
             // Check if files still exist
-            let model_exists = if let Some(local_path) = &metadata.local_path {
-                local_path.exists()
-            } else {
-                false
-            };
+            let model_path = self.base_dir.join(metadata.model_id.to_string());
+            let model_exists = model_path.exists();
             
             if model_exists {
                 total_size += metadata.size_bytes;
-                // Extract registry from external sources
-                if let Some(external_source) = metadata.external_sources.first() {
-                    let registry = match &external_source.source_type {
-                        SourceType::HuggingFace => "hf".to_string(),
-                        SourceType::LocalPath => "local".to_string(),
-                        SourceType::HttpUrl => "http".to_string(),
-                        SourceType::Custom(name) => name.clone(),
-                    };
-                    *registry_counts.entry(registry).or_insert(0) += 1;
-                }
+                // All models are git-based now
+                *registry_counts.entry("git".to_string()).or_insert(0) += 1;
             }
         }
         
@@ -734,8 +597,9 @@ impl ModelStorage {
             }
             
             // Remove model files from UUID directory if we have the metadata
-            if let Some(ref local_path) = metadata.local_path {
-                match fs::remove_dir_all(&local_path).await {
+            let model_path = self.base_dir.join(metadata.model_id.to_string());
+            if model_path.exists() {
+                match fs::remove_dir_all(&model_path).await {
                     Ok(()) => {
                         bytes_freed += metadata.size_bytes;
                         models_removed += 1;
@@ -822,8 +686,7 @@ impl ModelStorage {
         let metadata = self.get_metadata(model_uri).await?;
         
         // Get the model path from metadata
-        let model_path = metadata.local_path
-            .ok_or_else(|| anyhow::anyhow!("Model does not have a local path"))?;
+        let model_path = self.base_dir.join(metadata.model_id.to_string());
         
         if !model_path.exists() {
             return Ok(false);
@@ -900,58 +763,8 @@ impl ModelStorage {
                                         tracing::info!("Repaired metadata for model {}", dir_uuid);
                                         repaired_count += 1;
                                     }
-                                    
-                                    // Check for data directory and migrate if needed
-                                    let data_path = path.join("data");
-                                    if !data_path.exists() {
-                                        // Look for model files in the root directory
-                                        let has_model_files = Self::has_model_files(&path).await;
-                                        
-                                        if has_model_files {
-                                            tracing::info!("Migrating model files to data/ subdirectory for {}", dir_uuid);
-                                            
-                                            // Create data directory
-                                            fs::create_dir_all(&data_path).await?;
-                                            
-                                            // Move model files to data directory
-                                            let mut dir_entries = fs::read_dir(&path).await?;
-                                            while let Some(entry) = dir_entries.next_entry().await? {
-                                                let file_name = entry.file_name();
-                                                let file_str = file_name.to_string_lossy();
-                                                
-                                                // Skip model.json and directories
-                                                if file_str == "model.json" || entry.file_type().await?.is_dir() {
-                                                    continue;
-                                                }
-                                                
-                                                // Move model files (safetensors, bin, gguf, config.json, etc.)
-                                                if file_str.ends_with(".safetensors") ||
-                                                   file_str.ends_with(".bin") ||
-                                                   file_str.ends_with(".gguf") ||
-                                                   file_str.ends_with(".ggml") ||
-                                                   file_str == "config.json" ||
-                                                   file_str == "tokenizer.json" ||
-                                                   file_str == "tokenizer_config.json" ||
-                                                   file_str == "special_tokens_map.json" ||
-                                                   file_str == "vocab.json" ||
-                                                   file_str == "merges.txt" {
-                                                    let src = entry.path();
-                                                    let dst = data_path.join(&file_name);
-                                                    
-                                                    match fs::rename(&src, &dst).await {
-                                                        Ok(_) => {
-                                                            tracing::debug!("Moved {} to data/", file_str);
-                                                        }
-                                                        Err(e) => {
-                                                            tracing::error!("Failed to move {}: {}", file_str, e);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            
-                                            repaired_count += 1;
-                                        }
-                                    }
+
+                                    // Legacy migration code removed - git handles model structure
                                 }
                                 Err(e) => {
                                     tracing::error!("Failed to load model.json for {}: {}", dir_uuid, e);
@@ -962,13 +775,9 @@ impl ModelStorage {
                             tracing::warn!("Directory {} has no model.json, might be orphaned", dir_uuid);
                             
                             // Check if it has any model files
-                            if !Self::has_model_files(&path).await {
-                                tracing::info!("Removing empty directory {}", dir_uuid);
-                                match fs::remove_dir_all(&path).await {
-                                    Ok(_) => removed_count += 1,
-                                    Err(e) => tracing::error!("Failed to remove directory: {}", e),
-                                }
-                            }
+                            // Legacy cleanup removed - git manages directory structure
+                            // Don't auto-remove directories, let git handle it
+                            tracing::debug!("Directory {} has no metadata but keeping for git", dir_uuid);
                         }
                     }
                 }
@@ -989,156 +798,200 @@ impl ModelStorage {
         Ok(())
     }
     
-    /// List all models in storage (directories are the source of truth)
+    /// List all models from git registry
+    pub async fn list_models(&self) -> Result<Vec<(ModelId, ModelMetadata)>> {
+        let registry_lock = self.git_registry.read().await;
+        match registry_lock.as_ref() {
+            Some(registry) => {
+                tracing::info!("Listing models from Git registry");
+                self.get_models_from_registry(registry).await
+            }
+            None => {
+                tracing::warn!("Git registry not available");
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Compatibility alias for list_models
     pub async fn children(&self) -> Result<Vec<(ModelId, ModelMetadata)>> {
+        self.list_models().await
+    }
+    
+    
+    /// List models from the Git registry
+    async fn get_models_from_registry(&self, registry: &crate::git::GitModelRegistry) -> Result<Vec<(ModelId, ModelMetadata)>> {
         let mut models = Vec::new();
-        let mut found_uuids = std::collections::HashSet::new();
         
-        tracing::info!("Listing models from directory: {:?}", self.base_dir);
-        
-        // Scan the models directory - this is our single source of truth
-        match tokio::fs::read_dir(&self.base_dir).await {
-            Ok(mut entries) => {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let path = entry.path();
-                    
-                    if !path.is_dir() {
-                        continue;
-                    }
-                    
-                    let dir_name = path.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown");
-                    
-                    // Skip non-UUID directories
-                    if let Ok(dir_uuid) = Uuid::parse_str(dir_name) {
-                        let model_id = ModelId(dir_uuid);
-                        let model_json_path = path.join("model.json");
-                        
-                        // Check if this is a valid model directory
-                        if model_json_path.exists() {
-                            // Load model metadata from model.json
-                            if let Ok(metadata_file) = self.load_model_metadata_file(&model_id).await {
-                                // Validate that the UUID in metadata matches the directory name
-                                if metadata_file.model_id.0 != dir_uuid {
-                                    tracing::warn!(
-                                        "UUID mismatch: directory {} contains metadata for model {}",
-                                        dir_uuid, metadata_file.model_id
-                                    );
-                                    // Skip this corrupted entry
-                                    continue;
-                                }
-                                
-                                // Check if data directory exists
-                                let data_path = path.join("data");
-                                let has_data = data_path.exists();
-                                
-                                // Calculate actual size if data exists
-                                let size_bytes = if has_data {
-                                    self.calculate_model_size(&data_path).await.unwrap_or(0)
-                                } else {
-                                    0
-                                };
-                                
-                                // Convert to full metadata
-                                let metadata = ModelMetadata {
-                                    model_id: model_id.clone(),
-                                    name: metadata_file.name.clone(),
-                                    display_name: Some(metadata_file.display_name.clone()),
-                                    architecture: metadata_file.architecture.unwrap_or_else(|| "unknown".to_string()),
-                                    parameters: metadata_file.parameters,
-                                    model_type: "language_model".to_string(),
-                                    tokenizer_type: None,
-                                    size_bytes,
-                                    files: vec![], // Will be populated from data directory if needed
-                                    external_sources: if metadata_file.source_uri.starts_with("hf://") {
-                                        vec![ExternalSource {
-                                            source_type: SourceType::HuggingFace,
-                                            identifier: metadata_file.source_uri.trim_start_matches("hf://").to_string(),
-                                            revision: None,
-                                            download_url: None,
-                                            last_verified: metadata_file.created_at,
-                                        }]
-                                    } else {
-                                        vec![]
-                                    },
-                                    local_path: Some(data_path),
-                                    is_cached: has_data,
-                                    tags: vec![],
-                                    description: None,
-                                    license: None,
-                                    created_at: metadata_file.created_at,
-                                    last_accessed: metadata_file.last_accessed,
-                                    last_updated: metadata_file.created_at,
-                                };
-                                
-                                models.push((model_id, metadata));
-                                found_uuids.insert(dir_uuid);
-                                
-                                tracing::debug!("Found valid model: {} ({})", dir_uuid, metadata_file.display_name);
-                            } else {
-                                tracing::warn!("Failed to load model.json for directory: {}", dir_uuid);
-                            }
+        for (name, reg_model) in registry.list_models()? {
+            let model_id = ModelId(reg_model.uuid);
+            let model_path = self.base_dir.join(reg_model.uuid.to_string());
+            
+            // Read HuggingFace config.json for model details
+            let config_path = model_path.join("config.json");
+            let architecture = if config_path.exists() {
+                match fs::read_to_string(&config_path).await {
+                    Ok(content) => {
+                        // Parse just the architecture field
+                        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
+                            config.get("architectures")
+                                .and_then(|a| a.as_array())
+                                .and_then(|arr| arr.first())
+                                .and_then(|v| v.as_str())
+                                .map(String::from)
+                                .unwrap_or_else(|| "unknown".to_string())
                         } else {
-                            tracing::debug!("Directory {} has no model.json, skipping", dir_uuid);
+                            "unknown".to_string()
                         }
                     }
+                    Err(_) => "unknown".to_string()
                 }
-            }
-            Err(e) => {
-                tracing::error!("Failed to read models directory {:?}: {}", self.base_dir, e);
-                return Err(anyhow!("Failed to list models: {}", e));
-            }
+            } else {
+                "unknown".to_string()
+            };
+            
+            // Build metadata from registry info + config.json
+            let metadata = ModelMetadata {
+                model_id: model_id.clone(),
+                name: name.clone(),
+                display_name: Some(name.clone()),
+                architecture,
+                parameters: None, // Could parse from config.json if needed
+                model_type: match reg_model.model_type {
+                    crate::git::RegistryModelType::Base => "base".to_string(),
+                    crate::git::RegistryModelType::Adapter => "adapter".to_string(),
+                },
+                tokenizer_type: None,
+                size_bytes: 0, // Would need to calculate
+                files: Vec::new(), // Would need to scan
+                git_source: reg_model.source,
+                is_cached: true,
+                tags: Vec::new(),
+                description: None,
+                license: None,
+                created_at: reg_model.registered_at,
+                last_accessed: chrono::Utc::now().timestamp(),
+                last_updated: reg_model.registered_at,
+            };
+            
+            models.push((model_id, metadata));
         }
         
-        // Update the metadata cache with what we found (cache-only, not authoritative)
-        {
-            let mut cache = self.metadata_cache.write().await;
-            cache.clear();
-            for (id, metadata) in &models {
-                cache.insert(id.clone(), metadata.clone());
-            }
-        }
-        
-        // Save the updated cache
-        self.save_metadata().await?;
-        
-        tracing::info!("Found {} valid models", models.len());
         Ok(models)
     }
     
-    /// Check if a directory contains model files
-    async fn has_model_files(path: &Path) -> bool {
-        // Check for common model file patterns
-        let patterns = ["*.safetensors", "*.bin", "*.gguf", "*.ggml", "config.json", "tokenizer.json"];
-        
-        for pattern in &patterns {
-            if pattern.contains('*') {
-                // For wildcards, check if any file matches
-                if let Ok(mut entries) = tokio::fs::read_dir(path).await {
-                    while let Ok(Some(entry)) = entries.next_entry().await {
-                        let file_name = entry.file_name();
-                        let file_str = file_name.to_string_lossy();
-                        if pattern == &"*.safetensors" && file_str.ends_with(".safetensors") {
-                            return true;
-                        } else if pattern == &"*.bin" && file_str.ends_with(".bin") {
-                            return true;
-                        } else if pattern == &"*.gguf" && file_str.ends_with(".gguf") {
-                            return true;
-                        } else if pattern == &"*.ggml" && file_str.ends_with(".ggml") {
-                            return true;
-                        }
-                    }
-                }
-            } else {
-                // For exact filenames
-                let file_path = path.join(pattern);
-                if file_path.exists() {
-                    return true;
-                }
-            }
+    /// Register a model with the Git registry (if available)
+    pub async fn register_with_git_registry(
+        &self,
+        model_id: &ModelId,
+        name: &str,
+        source: Option<String>,
+    ) -> Result<()> {
+        let mut registry_lock = self.git_registry.write().await;
+        if let Some(registry) = registry_lock.as_mut() {
+            registry.register_model(model_id, name, source).await?;
+            tracing::info!("Registered model '{}' with Git registry", name);
+        } else {
+            tracing::debug!("Git registry not available, skipping registration");
         }
-        false
+        Ok(())
+    }
+    
+    /// Create a LoRA adapter using Git worktree
+    pub async fn create_adapter(
+        &self,
+        base_model_id: &ModelId,
+        adapter_name: &str,
+    ) -> Result<ModelId> {
+        // Generate UUID for adapter
+        let adapter_id = ModelId::new();
+        
+        // Get paths
+        let base_model_path = self.get_uuid_model_path(base_model_id);
+        let adapter_path = self.get_uuid_model_path(&adapter_id);
+        
+        // Verify base model exists
+        if !base_model_path.exists() {
+            return Err(anyhow::anyhow!("Base model {} not found", base_model_id));
+        }
+        
+        // Create worktree using Git
+        let git_ops = crate::git::GitOps::new(self.base_dir.clone());
+        let branch_name = format!("adapter-{}", adapter_name);
+        
+        git_ops.create_worktree(
+            &base_model_path,
+            &adapter_path,
+            &branch_name,
+        )?;
+        
+        // Create adapter metadata
+        let adapter_metadata = ModelMetadataFile {
+            model_id: adapter_id.clone(),
+            name: adapter_name.to_string(),
+            display_name: format!("{} (adapter)", adapter_name),
+            source_uri: format!("adapter://{}/{}", base_model_id, adapter_name),
+            architecture: None, // Will inherit from base
+            parameters: None,
+            created_at: chrono::Utc::now().timestamp(),
+            last_accessed: chrono::Utc::now().timestamp(),
+        };
+        
+        // Save adapter metadata
+        self.save_model_metadata_file(&adapter_id, &adapter_metadata).await?;
+        
+        tracing::info!("Created adapter {} as worktree of base model {}", adapter_id, base_model_id);
+        
+        Ok(adapter_id)
+    }
+    
+    /// Commit changes to an adapter
+    pub async fn commit_adapter(
+        &self,
+        adapter_id: &ModelId,
+        message: &str,
+    ) -> Result<()> {
+        let adapter_path = self.get_uuid_model_path(adapter_id);
+        
+        // Verify adapter exists
+        if !adapter_path.exists() {
+            return Err(anyhow::anyhow!("Adapter {} not found", adapter_id));
+        }
+        
+        let git_ops = crate::git::GitOps::new(self.base_dir.clone());
+        let repo = git_ops.open(&adapter_path)?;
+        
+        // Commit changes
+        git_ops.commit(&repo, message)?;
+        
+        tracing::info!("Committed changes to adapter {}: {}", adapter_id, message);
+        
+        Ok(())
+    }
+    
+    /// Remove an adapter worktree
+    pub async fn remove_adapter(
+        &self,
+        base_model_id: &ModelId,
+        adapter_id: &ModelId,
+    ) -> Result<()> {
+        let base_model_path = self.get_uuid_model_path(base_model_id);
+        let adapter_path = self.get_uuid_model_path(adapter_id);
+        
+        let git_ops = crate::git::GitOps::new(self.base_dir.clone());
+        
+        // Remove worktree (use adapter ID as worktree name)
+        let worktree_name = format!("adapter-{}", adapter_id.0);
+        git_ops.remove_worktree(&base_model_path, &worktree_name)?;
+        
+        // Clean up adapter directory if it still exists
+        if adapter_path.exists() {
+            fs::remove_dir_all(&adapter_path).await?;
+        }
+        
+        tracing::info!("Removed adapter {} worktree", adapter_id);
+        
+        Ok(())
     }
 }
 
@@ -1193,7 +1046,7 @@ mod tests {
             model_id: ModelId::new(),
             name: "test-model".to_string(),
             display_name: "Test Model".to_string(),
-            source_uri: "hf://test/model".to_string(),
+            source_uri: "https://github.com/test/model".to_string(),
             architecture: Some("transformer".to_string()),
             parameters: Some(1_000_000),
             created_at: chrono::Utc::now().timestamp(),
@@ -1315,7 +1168,7 @@ mod tests {
             model_id: model_id.clone(),
             name: "test-model".to_string(),
             display_name: "Test Model".to_string(),
-            source_uri: "hf://test/model".to_string(),
+            source_uri: "https://github.com/test/model".to_string(),
             architecture: Some("transformer".to_string()),
             parameters: Some(1_000_000),
             created_at: chrono::Utc::now().timestamp(),
@@ -1349,7 +1202,7 @@ mod tests {
             model_id: wrong_uuid, // Wrong UUID!
             name: "test-model".to_string(),
             display_name: "Test Model".to_string(),
-            source_uri: "hf://test/model".to_string(),
+            source_uri: "https://github.com/test/model".to_string(),
             architecture: Some("transformer".to_string()),
             parameters: Some(1_000_000),
             created_at: chrono::Utc::now().timestamp(),
@@ -1392,7 +1245,7 @@ mod tests {
             model_id: wrong_uuid,
             name: "test-model".to_string(),
             display_name: "Test Model".to_string(),
-            source_uri: "hf://test/model".to_string(),
+            source_uri: "https://github.com/test/model".to_string(),
             architecture: Some("transformer".to_string()),
             parameters: Some(1_000_000),
             created_at: chrono::Utc::now().timestamp(),
@@ -1426,7 +1279,7 @@ mod tests {
             model_id: model_id.clone(),
             name: "test-model".to_string(),
             display_name: "Test Model".to_string(),
-            source_uri: "hf://test/model".to_string(),
+            source_uri: "https://github.com/test/model".to_string(),
             architecture: Some("transformer".to_string()),
             parameters: Some(1_000_000),
             created_at: chrono::Utc::now().timestamp(),
@@ -1438,7 +1291,7 @@ mod tests {
         tokio::fs::write(&model_json_path, content).await.unwrap();
         
         // Load directly without going through cache
-        let loaded = storage.get_metadata_by_id_or_load(&model_id).await.unwrap();
+        let loaded = storage.get_metadata_by_id(&model_id).await.unwrap();
         assert_eq!(loaded.model_id, model_id);
         assert_eq!(loaded.name, "test-model");
     }

@@ -5,26 +5,29 @@ use tch::{nn, Device, Kind, Tensor};
 use std::collections::HashMap;
 use std::path::Path;
 use async_trait::async_trait;
-use super::{LoRAConfig, LoRAAdapter};  // Now from mod.rs
-use std::path::Path;
+use super::{LoRAConfig, LoRAAdapter};
 
 /// A single LoRA layer with automatic differentiation support
 pub struct TorchLoRALayer {
-    /// Variable store for parameters
-    pub vs: nn::VarStore,
-    
     /// LoRA A matrix [in_features, rank] - trainable
     pub lora_a: Tensor,
-    
+
     /// LoRA B matrix [rank, out_features] - trainable
     pub lora_b: Tensor,
-    
+
     /// Scaling factor (alpha / rank)
     pub scaling: f64,
-    
+
     /// Configuration
     pub config: LoRALayerConfig,
 }
+
+// SAFETY: TorchLoRALayer can be safely sent between threads because:
+// 1. PyTorch tensors are internally thread-safe for their operations
+// 2. VarStore operations are protected by internal synchronization
+// 3. All mutations happen under mutex protection in the containing engine
+unsafe impl Send for TorchLoRALayer {}
+unsafe impl Sync for TorchLoRALayer {}
 
 #[derive(Debug, Clone)]
 pub struct LoRALayerConfig {
@@ -38,8 +41,7 @@ pub struct LoRALayerConfig {
 
 impl TorchLoRALayer {
     /// Create a new LoRA layer with proper initialization
-    pub fn new(config: LoRALayerConfig) -> Result<Self> {
-        let mut vs = nn::VarStore::new(config.device);
+    pub fn new(vs: &nn::VarStore, config: LoRALayerConfig) -> Result<Self> {
         let root = vs.root();
         
         // Initialize LoRA A with Kaiming uniform (good for ReLU-like activations)
@@ -67,9 +69,8 @@ impl TorchLoRALayer {
         );
         
         let scaling = config.alpha / config.rank as f64;
-        
+
         Ok(Self {
-            vs,
             lora_a,
             lora_b,
             scaling,
@@ -112,33 +113,30 @@ impl TorchLoRALayer {
         a_params + b_params
     }
     
-    /// Save LoRA weights to file
-    pub fn save(&self, path: &str) -> Result<()> {
-        self.vs.save(path)?;
-        Ok(())
-    }
-    
-    /// Load LoRA weights from file
-    pub fn load(&mut self, path: &str) -> Result<()> {
-        self.vs.load(path)?;
-        Ok(())
-    }
 }
 
 /// Collection of LoRA layers for a model
 pub struct LoRAModel {
     /// Map of module name to LoRA layer
     pub layers: HashMap<String, TorchLoRALayer>,
-    
+
     /// Combined variable store for all layers
     pub vs: nn::VarStore,
-    
+
     /// Configuration
     pub config: LoRAConfig,
-    
+
     /// Device
     pub device: Device,
 }
+
+// SAFETY: LoRAModel can be safely sent between threads because:
+// 1. It contains TorchLoRALayer which is Send + Sync
+// 2. HashMap<String, TorchLoRALayer> is Send + Sync when TorchLoRALayer is
+// 3. VarStore is thread-safe for concurrent access
+// 4. Device and config are plain data types that are Send + Sync
+unsafe impl Send for LoRAModel {}
+unsafe impl Sync for LoRAModel {}
 
 impl LoRAModel {
     /// Create LoRA adapters for specified modules
@@ -165,20 +163,15 @@ impl LoRAModel {
                 device,
             };
             
-            let mut layer = TorchLoRALayer::new(layer_config)?;
-            
-            // Move layer's variables to the combined VarStore
-            // This allows a single optimizer to update all LoRA parameters
-            vs.variables_mut().extend(layer.vs.variables());
-            layer.vs = vs.clone();
-            
+            let layer = TorchLoRALayer::new(&vs, layer_config)?;
             layers.insert(module_name, layer);
         }
         
+        let total_params: i64 = layers.values().map(|layer| layer.num_parameters()).sum();
         tracing::info!(
             "Created LoRA model with {} layers, {} total parameters",
             layers.len(),
-            vs.variables().count_parameters()
+            total_params
         );
         
         Ok(Self {
@@ -212,7 +205,7 @@ impl LoRAModel {
     
     /// Get total number of trainable parameters
     pub fn num_parameters(&self) -> i64 {
-        self.vs.variables().count_parameters()
+        self.layers.values().map(|layer| layer.num_parameters()).sum()
     }
     
     
@@ -244,32 +237,20 @@ impl LoRAAdapter for LoRAModel {
         self.vs.load(path)?;
         Ok(())
     }
-    
-    fn to_tensors(&self, device: Device) -> Result<HashMap<String, (Tensor, Tensor)>> {
-        let mut tensors = HashMap::new();
-        for (name, layer) in &self.layers {
-            let lora_a = if layer.lora_a.device() != device {
-                layer.lora_a.to_device(device)
-            } else {
-                layer.lora_a.shallow_clone()
-            };
-            let lora_b = if layer.lora_b.device() != device {
-                layer.lora_b.to_device(device)
-            } else {
-                layer.lora_b.shallow_clone()
-            };
-            tensors.insert(name.clone(), (lora_a, lora_b));
+
+    fn forward(&self, module_name: &str, input: &Tensor) -> Result<Option<Tensor>> {
+        // Look up the layer by module name
+        if let Some(layer) = self.layers.get(module_name) {
+            Ok(Some(layer.forward(input, false)?)) // Use inference mode by default
+        } else {
+            Ok(None)
         }
-        Ok(tensors)
     }
-    
-    fn from_tensors(&mut self, tensors: HashMap<String, (Tensor, Tensor)>) -> Result<()> {
-        for (name, (lora_a, lora_b)) in tensors {
-            if let Some(layer) = self.layers.get_mut(&name) {
-                layer.lora_a = lora_a.to_device(self.device);
-                layer.lora_b = lora_b.to_device(self.device);
-            }
-        }
-        Ok(())
+
+    fn num_parameters(&self) -> i64 {
+        self.layers.values()
+            .map(|layer| layer.lora_a.size().iter().product::<i64>() +
+                        layer.lora_b.size().iter().product::<i64>())
+            .sum()
     }
 }

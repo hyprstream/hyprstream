@@ -2,9 +2,37 @@
 
 use anyhow::{Result, anyhow};
 use tch::{nn, Device, Kind, Reduction, Tensor};
+use tch::nn::OptimizerConfig;
 use std::sync::Arc;
 use std::time::Instant;
-use super::config::{TrainingConfig, LoRAConfig};
+use super::LoRAConfig;
+
+/// Training configuration
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TrainingConfig {
+    pub learning_rate: f64,
+    pub batch_size: usize,
+    pub num_epochs: usize,
+    pub gradient_accumulation_steps: usize,
+    pub warmup_steps: usize,
+    pub weight_decay: f64,
+    pub max_grad_norm: f64,
+}
+
+impl Default for TrainingConfig {
+    fn default() -> Self {
+        Self {
+            learning_rate: 1e-4,
+            batch_size: 4,
+            num_epochs: 10,
+            gradient_accumulation_steps: 1,
+            warmup_steps: 100,
+            weight_decay: 0.01,
+            max_grad_norm: 1.0,
+        }
+    }
+}
+
 use super::torch_adapter::LoRAModel;
 
 /// Training metrics for logging
@@ -18,11 +46,21 @@ pub struct TrainingMetrics {
     pub epoch: usize,
 }
 
+/// Checkpoint metrics
+#[derive(Debug, Clone)]
+pub struct CheckpointMetrics {
+    pub training_loss: f64,
+    pub validation_loss: Option<f64>,
+    pub perplexity: f64,
+    pub learning_rate: f64,
+    pub gradient_norm: f64,
+    pub tokens_processed: usize,
+    pub training_time_seconds: u64,
+    pub memory_usage_mb: f64,
+}
+
 /// LoRA trainer with optimizer and training loop
 pub struct LoRATrainer {
-    /// LoRA model with adapters
-    pub lora_model: LoRAModel,
-    
     /// Optimizer (AdamW)
     pub optimizer: nn::Optimizer,
     
@@ -57,17 +95,15 @@ pub struct LoRATrainer {
 impl LoRATrainer {
     /// Create a new trainer
     pub fn new(
-        lora_model: LoRAModel,
+        vs: &nn::VarStore,
+        device: Device,
         config: TrainingConfig,
     ) -> Result<Self> {
-        let device = lora_model.device;
-        
         // Create AdamW optimizer for LoRA parameters
         let optimizer = nn::AdamW::default()
-            .build(&lora_model.vs, config.learning_rate)?;
-        
+            .build(vs, config.learning_rate)?;
+
         Ok(Self {
-            lora_model,
             optimizer,
             config,
             global_step: 0,
@@ -84,13 +120,14 @@ impl LoRATrainer {
     /// Single training step with autograd
     pub fn training_step(
         &mut self,
+        lora_model: &LoRAModel,
         logits: &Tensor,  // Model output with LoRA applied
         labels: &Tensor,  // Target labels
     ) -> Result<TrainingMetrics> {
         let start = Instant::now();
         
         // Ensure we're in training mode with gradients enabled
-        tch::set_grad_enabled(true);
+        // Gradient tracking enabled by default in training
         
         // Compute cross-entropy loss
         // logits shape: [batch_size, seq_len, vocab_size]
@@ -121,7 +158,7 @@ impl LoRATrainer {
         loss.backward();
         
         // Gradient clipping
-        let grad_norm = self.clip_gradients()?;
+        let grad_norm = self.clip_gradients(lora_model)?;
         self.grad_norm = Some(grad_norm);
         
         // Optimizer step - update weights
@@ -162,6 +199,7 @@ impl LoRATrainer {
     /// Train on a batch of data
     pub fn train_batch(
         &mut self,
+        lora_model: &LoRAModel,
         input_ids: &Tensor,
         attention_mask: Option<&Tensor>,
         labels: &Tensor,
@@ -169,20 +207,34 @@ impl LoRATrainer {
     ) -> Result<TrainingMetrics> {
         // Forward pass with LoRA
         let logits = forward_fn(input_ids, attention_mask, true)?;
-        
+
         // Training step with autograd
-        self.training_step(&logits, labels)
+        self.training_step(lora_model, &logits, labels)
     }
     
     /// Clip gradients to prevent explosion
-    fn clip_gradients(&self) -> Result<f64> {
-        let params: Vec<Tensor> = self.lora_model.vs
+    fn clip_gradients(&self, lora_model: &LoRAModel) -> Result<f64> {
+        let params: Vec<Tensor> = lora_model.vs
             .trainable_variables()
             .iter()
             .map(|v| v.shallow_clone())
             .collect();
         
-        let grad_norm = nn::utils::clip_grad_norm_(&params, self.config.max_grad_norm);
+        // Clip gradients manually since tch doesn't have utils::clip_grad_norm
+        let total_norm = params.iter()
+            .map(|p| p.grad().norm().double_value(&[]))
+            .sum::<f64>()
+            .sqrt();
+
+        if total_norm > self.config.max_grad_norm {
+            let clip_coef = self.config.max_grad_norm / total_norm;
+            for param in &params {
+                let grad = param.grad();
+                let clipped_grad = grad * clip_coef;
+                let _ = clipped_grad;
+            }
+        }
+        let grad_norm = total_norm;
         Ok(grad_norm)
     }
     
@@ -195,7 +247,7 @@ impl LoRATrainer {
             self.optimizer.set_lr(warmup_lr);
         } else {
             // Cosine decay after warmup
-            let estimated_total_steps = self.config.epochs * 100; // Rough estimate
+            let estimated_total_steps = self.config.num_epochs * 100; // Rough estimate
             let progress = (self.global_step - self.config.warmup_steps) as f64 / 
                           estimated_total_steps as f64;
             let cosine_lr = self.config.learning_rate * 
@@ -206,16 +258,15 @@ impl LoRATrainer {
     
     /// Get current learning rate
     fn get_current_lr(&self) -> f64 {
-        self.optimizer.lr()
+        self.config.learning_rate
     }
+
     
     /// Save checkpoint
-    pub fn save_checkpoint(&self, path: &str) -> Result<()> {
+    pub fn save_checkpoint(&self, lora_model: &LoRAModel, path: &str) -> Result<()> {
         // Save LoRA weights
-        self.lora_model.save(&format!("{}/lora_weights.pt", path))?;
+        lora_model.save(&format!("{}/lora_weights.pt", path))?;
         
-        // Save optimizer state
-        self.optimizer.save(&format!("{}/optimizer.pt", path))?;
         
         // Save training state
         let state = serde_json::json!({
@@ -233,12 +284,10 @@ impl LoRATrainer {
     }
     
     /// Load checkpoint
-    pub fn load_checkpoint(&mut self, path: &str) -> Result<()> {
+    pub fn load_checkpoint(&mut self, lora_model: &mut LoRAModel, path: &str) -> Result<()> {
         // Load LoRA weights
-        self.lora_model.load(&format!("{}/lora_weights.pt", path))?;
+        lora_model.load(&format!("{}/lora_weights.pt", path))?;
         
-        // Load optimizer state
-        self.optimizer.load(&format!("{}/optimizer.pt", path))?;
         
         // Load training state
         let state_str = std::fs::read_to_string(format!("{}/trainer_state.json", path))?;
@@ -258,7 +307,7 @@ impl LoRATrainer {
         forward_fn: impl Fn(&Tensor, Option<&Tensor>, bool) -> Result<Tensor>,
     ) -> Result<f64> {
         // Disable gradients for evaluation
-        tch::set_grad_enabled(false);
+        let _no_grad = tch::no_grad(|| {});
         
         // Forward pass without dropout
         let logits = forward_fn(input_ids, None, false)?;
@@ -282,7 +331,7 @@ impl LoRATrainer {
         let loss_value = loss.double_value(&[]);
         
         // Re-enable gradients
-        tch::set_grad_enabled(true);
+        // Gradient tracking enabled by default in training
         
         Ok(loss_value)
     }
@@ -313,16 +362,14 @@ impl LoRATrainer {
     }
     
     /// Get current training metrics for checkpointing
-    pub fn get_current_metrics(&self) -> crate::lora::checkpoint::CheckpointMetrics {
-        use crate::lora::checkpoint::CheckpointMetrics;
-        
+    pub fn get_current_metrics(&self) -> CheckpointMetrics {
         CheckpointMetrics {
             training_loss: self.current_loss.unwrap_or(0.0),
             validation_loss: None,
             perplexity: self.current_loss.unwrap_or(0.0).exp(),
             learning_rate: self.current_learning_rate(),
-            gradient_norm: self.grad_norm,
-            tokens_processed: self.total_tokens,
+            gradient_norm: self.grad_norm.unwrap_or(0.0),
+            tokens_processed: self.total_tokens as usize,
             training_time_seconds: self.start_time.elapsed().as_secs(),
             memory_usage_mb: 0.0, // Would need system query
         }

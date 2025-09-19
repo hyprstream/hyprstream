@@ -1,7 +1,7 @@
 //! Llama model implementation with support for Llama 1/2/3 and GQA
 
 use super::{ModelArchitecture, ModelOperations, ArchitectureConfig};
-use super::lora_adapter::ArchitectureAwareLoRAAdapter;
+// use super::lora_adapter::ArchitectureAwareLoRAAdapter; // Module removed
 use anyhow::{Result, anyhow};
 use tch::{Device, Kind as DType, Tensor};
 use crate::runtime::tensor_helpers::{ToIntList, clone_tensor, square_tensor, broadcast_mul, broadcast_add, broadcast_sub, scalar_tensor, dims3, dims4};
@@ -1421,7 +1421,7 @@ impl ModelOperations for LlamaModel {
         Ok(mask)
     }
     
-    fn apply_lora(&mut self, adapter: &ArchitectureAwareLoRAAdapter) -> Result<()> {
+    fn apply_lora(&mut self, adapter: &crate::lora::torch_adapter::LoRAModel) -> Result<()> {
         // Apply LoRA weights with architecture-specific handling
         // The adapter will handle GQA shape conversions for Llama 2/3
         let _ = adapter;

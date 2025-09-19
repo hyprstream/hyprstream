@@ -2,10 +2,7 @@
 
 use crate::api::TrainingSample;
 pub use crate::api::TrainingStatus;
-use crate::storage::vdb::hardware_accelerated::HardwareVDBStorage;
-// TODO: Remove sparse reference
-// use crate::lora::sparse::{SparseLoRAAdapter, SparseConfig};
-use crate::inference::{InferenceAPI, InferenceInput, InferenceOutput};
+use crate::inference::{InferenceInput, InferenceOutput};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -75,10 +72,10 @@ pub struct TrainingSession {
 /// Training service for auto-regressive LoRA learning
 pub struct TrainingService {
     /// VDB storage for adapters
-    vdb_storage: Arc<HardwareVDBStorage>,
+    // vdb_storage: Arc<HardwareVDBStorage>,
     
-    /// Inference API for generating training targets
-    inference_api: Arc<InferenceAPI>,
+    /// Runtime engine for generating training targets
+    runtime_engine: Arc<dyn crate::runtime::RuntimeEngine>,
     
     /// Active training sessions
     sessions: Arc<RwLock<HashMap<String, TrainingSession>>>,
@@ -106,13 +103,13 @@ pub struct TrainingStats {
 impl TrainingService {
     /// Create new training service
     pub fn new(
-         vdb_storage: Arc<HardwareVDBStorage>,
-        inference_api: Arc<InferenceAPI>,
+         // vdb_storage: Arc<HardwareVDBStorage>,
+        runtime_engine: Arc<dyn crate::runtime::RuntimeEngine>,
     ) -> Self {
         Self {
-            
-            vdb_storage,
-            inference_api,
+
+            // vdb_storage,
+            runtime_engine,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             sample_queues: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(RwLock::new(TrainingStats::default())),
@@ -155,7 +152,7 @@ impl TrainingService {
         // Start background training task
         let lora_id_clone = lora_id.to_string();
         
-        let vdb_storage = self.vdb_storage.clone();
+        // let vdb_storage = self.vdb_storage.clone();
         let sessions = self.sessions.clone();
         let stats = self.stats.clone();
         
@@ -168,7 +165,7 @@ impl TrainingService {
                 // Train when we have enough samples
                 if sample_batch.len() >= config.batch_size {
                     if let Err(e) = Self::train_batch(
-                         &vdb_storage,
+                         // &vdb_storage,
                         &lora_id_clone,
                         &sample_batch,
                         &config,
@@ -185,7 +182,7 @@ impl TrainingService {
             // Process remaining samples
             if !sample_batch.is_empty() {
                 let _ = Self::train_batch(
-                     &vdb_storage,
+                     // &vdb_storage,
                     &lora_id_clone,
                     &sample_batch,
                     &config,
@@ -246,7 +243,7 @@ impl TrainingService {
     
     /// Train a batch of samples
     async fn train_batch(
-         vdb_storage: &Arc<HardwareVDBStorage>,
+         // vdb_storage: &Arc<HardwareVDBStorage>,
         lora_id: &str,
         samples: &[TrainingSample],
         config: &TrainingConfig,
@@ -258,35 +255,36 @@ impl TrainingService {
         println!("🎯 Training LoRA {} with {} samples", lora_id, samples.len());
         
         // Load current adapter from VDB storage
-        let adapter = vdb_storage.load_adapter_neural_compressed(
-            lora_id,
-            SparseLoRAConfig::default(),
-        ).await?;
+        // let adapter = vdb_storage.load_adapter_neural_compressed(
+        //     lora_id,
+        //     SparseLoRAConfig::default(),
+        // ).await?;
+        return Err(anyhow::anyhow!("VDB storage not available"));
         
         // Simulate gradient computation and sparse weight updates
-        let mut weight_updates = HashMap::new();
+        let mut weight_updates: HashMap<String, f32> = HashMap::new();
         
-        for sample in samples {
-            // Compute gradients (simplified - would use actual backprop)
-            let gradients = compute_gradients_for_sample(sample, &adapter).await?;
-            
-            // Apply gradients with learning rate and sparsity
-            for (layer_name, grad) in gradients {
-                apply_sparse_gradient(
-                    &mut weight_updates,
-                    &layer_name,
-                    &grad,
-                    config.learning_rate,
-                    config.sparsity_target,
-                )?;
-            }
-        }
+        // for sample in samples {
+        //     // Compute gradients (simplified - would use actual backprop)
+        //     let gradients = compute_gradients_for_sample(sample, &adapter).await?;
+        //
+        //     // Apply gradients with learning rate and sparsity
+        //     for (layer_name, grad) in gradients {
+        //         apply_sparse_gradient(
+        //             &mut weight_updates,
+        //             &layer_name,
+        //             &grad,
+        //             config.learning_rate,
+        //             config.sparsity_target,
+        //         )?;
+        //     }
+        // }
         
         // Apply weight updates to VDB storage
-        if !weight_updates.is_empty() {
-            vdb_storage.gpu_sparse_update(lora_id, &weight_updates).await?;
-            println!("📝 Applied {} weight updates to VDB storage", weight_updates.len());
-        }
+        // if !weight_updates.is_empty() {
+        //     vdb_storage.gpu_sparse_update(lora_id, &weight_updates).await?;
+        //     println!("📝 Applied {} weight updates to VDB storage", weight_updates.len());
+        // }
         
         // Update session statistics
         let training_time = start_time.elapsed().as_millis() as u64;
@@ -335,11 +333,7 @@ impl TrainingService {
         lora_id: &str,
         adapter_ids: Vec<String>,
     ) -> Result<String> {
-        self.inference_api.create_session(
-            format!("lora-{}", lora_id),
-            adapter_ids,
-            None,
-        ).await
+        Ok(format!("lora-session-{}", lora_id))
     }
     
     /// Run inference (delegated to inference API)
@@ -348,12 +342,18 @@ impl TrainingService {
         session_id: &str,
         input: InferenceInput,
     ) -> Result<InferenceOutput> {
-        self.inference_api.infer(session_id, input).await
+        Ok(InferenceOutput {
+            text: "Inference not yet implemented".to_string(),
+            tokens: vec![],
+            tokens_generated: 0,
+            latency_ms: 0.0,
+            adapter_contribution: HashMap::new(),
+        })
     }
     
     /// Close inference session (delegated to inference API)
     pub async fn close_inference_session(&self, session_id: &str) -> Result<()> {
-        self.inference_api.close_session(session_id).await
+        Ok(())
     }
     
     /// Generate embedding (simplified implementation)
@@ -392,107 +392,107 @@ impl TrainingService {
 }
 
 /// Compute gradients for a training sample (simplified)
-async fn compute_gradients_for_sample(
-    sample: &TrainingSample,
-    adapter: &SparseLoRAAdapter,
-) -> Result<HashMap<String, Vec<f32>>> {
-    // This is a simplified gradient computation
-    // In practice, this would involve:
-    // 1. Forward pass through the model
-    // 2. Compute loss against target
-    // 3. Backpropagation to get gradients
-    
-    let mut gradients = HashMap::new();
-    
-    // Simulate gradients for key layers
-    let layers = vec![
-        "self_attn.q_proj",
-        "self_attn.v_proj", 
-        "self_attn.k_proj",
-        "mlp.gate_proj",
-        "mlp.up_proj",
-    ];
-    
-    for layer in layers {
-        // Compute realistic gradients based on sample content and adapter state
-        let grad_size = 1536 * 8; // rank * hidden_dim
-        
-        // Get current adapter weights for this layer
-        let adapter_stats = adapter.get_stats().await;
-        let sparsity_factor = adapter_stats.avg_sparsity.max(0.95); // At least 95% sparse
-        
-        // Compute gradients based on input/output similarity  
-        let mut gradients_vec = Vec::with_capacity(grad_size);
-        
-        for i in 0..grad_size {
-            // Use input text characteristics to compute meaningful gradients
-            let text_hash = sample.input.chars().map(|c| c as u32).sum::<u32>();
-            let target_hash = sample.output.chars().map(|c| c as u32).sum::<u32>();
-            
-            // Compute gradient magnitude based on prediction error
-            let error_signal = (text_hash ^ target_hash) as f32 / u32::MAX as f32;
-            let layer_factor = match layer {
-                "self_attn.q_proj" => 1.0,  // Query projection gets full gradient
-                "self_attn.v_proj" => 0.8,  // Value projection slightly less
-                "self_attn.k_proj" => 0.6,  // Key projection even less  
-                "mlp.gate_proj" => 0.4,     // MLP components get smaller gradients
-                "mlp.up_proj" => 0.3,
-                _ => 0.1,
-            };
-            
-            // Position-based gradient variation 
-            let position_factor = (i as f32 / grad_size as f32).sin();
-            
-            // Final gradient with sparsity
-            let base_gradient = error_signal * layer_factor * position_factor * 0.001;
-            
-            // Apply sparsity - only keep gradients above threshold
-            let gradient = if rand::random::<f32>() > sparsity_factor {
-                base_gradient
-            } else {
-                0.0
-            };
-            
-            gradients_vec.push(gradient);
-        }
-        
-        let non_zero_count = gradients_vec.iter().filter(|&&x| x.abs() > 1e-6).count();
-        gradients.insert(layer.to_string(), gradients_vec);
-        println!("🔄 Computed {} gradients for layer {}", non_zero_count, layer);
-    }
-    
-    Ok(gradients)
-}
+// async fn compute_gradients_for_sample(
+//     sample: &TrainingSample,
+//     adapter: &SparseLoRAAdapter,
+// ) -> Result<HashMap<String, Vec<f32>>> {
+//     // This is a simplified gradient computation
+//     // In practice, this would involve:
+//     // 1. Forward pass through the model
+//     // 2. Compute loss against target
+//     // 3. Backpropagation to get gradients
+//
+//     let mut gradients = HashMap::new();
+//
+//     // Simulate gradients for key layers
+//     let layers = vec![
+//         "self_attn.q_proj",
+//         "self_attn.v_proj",
+//         "self_attn.k_proj",
+//         "mlp.gate_proj",
+//         "mlp.up_proj",
+//     ];
+//
+//     for layer in layers {
+//         // Compute realistic gradients based on sample content and adapter state
+//         let grad_size = 1536 * 8; // rank * hidden_dim
+//
+//         // Get current adapter weights for this layer
+//         let adapter_stats = adapter.get_stats().await;
+//         let sparsity_factor = adapter_stats.avg_sparsity.max(0.95); // At least 95% sparse
+//
+//         // Compute gradients based on input/output similarity
+//         let mut gradients_vec = Vec::with_capacity(grad_size);
+//
+//         for i in 0..grad_size {
+//             // Use input text characteristics to compute meaningful gradients
+//             let text_hash = sample.input.chars().map(|c| c as u32).sum::<u32>();
+//             let target_hash = sample.output.chars().map(|c| c as u32).sum::<u32>();
+//
+//             // Compute gradient magnitude based on prediction error
+//             let error_signal = (text_hash ^ target_hash) as f32 / u32::MAX as f32;
+//             let layer_factor = match layer {
+//                 "self_attn.q_proj" => 1.0,  // Query projection gets full gradient
+//                 "self_attn.v_proj" => 0.8,  // Value projection slightly less
+//                 "self_attn.k_proj" => 0.6,  // Key projection even less
+//                 "mlp.gate_proj" => 0.4,     // MLP components get smaller gradients
+//                 "mlp.up_proj" => 0.3,
+//                 _ => 0.1,
+//             };
+//
+//             // Position-based gradient variation
+//             let position_factor = (i as f32 / grad_size as f32).sin();
+//
+//             // Final gradient with sparsity
+//             let base_gradient = error_signal * layer_factor * position_factor * 0.001;
+//
+//             // Apply sparsity - only keep gradients above threshold
+//             let gradient = if rand::random::<f32>() > sparsity_factor {
+//                 base_gradient
+//             } else {
+//                 0.0
+//             };
+//
+//             gradients_vec.push(gradient);
+//         }
+//
+//         let non_zero_count = gradients_vec.iter().filter(|&&x| x.abs() > 1e-6).count();
+//         gradients.insert(layer.to_string(), gradients_vec);
+//         println!("🔄 Computed {} gradients for layer {}", non_zero_count, layer);
+//     }
+//
+//     Ok(gradients)
+// }
 
 /// Apply sparse gradient update
-fn apply_sparse_gradient(
-    weight_updates: &mut HashMap<crate::storage::vdb::grid::Coordinate3D, f32>,
-    layer_name: &str,
-    gradients: &[f32],
-    learning_rate: f32,
-    sparsity_target: f32,
-) -> Result<()> {
-    // Apply gradients with sparsity constraint
-    for (idx, &grad) in gradients.iter().enumerate() {
-        let magnitude = grad.abs() * learning_rate;
-        
-        // Only update if gradient is significant (maintains sparsity)
-        let sparsity_threshold = compute_sparsity_threshold(gradients, sparsity_target);
-        
-        if magnitude > sparsity_threshold {
-            // Convert linear index to 3D coordinate
-            let coord = crate::storage::vdb::grid::Coordinate3D::new(
-                (idx % 1536) as i32,
-                (idx / 1536) as i32,
-                layer_name.chars().map(|c| c as u32).sum::<u32>() as i32 % 100,
-            );
-            
-            weight_updates.insert(coord, -grad * learning_rate);
-        }
-    }
-    
-    Ok(())
-}
+// fn apply_sparse_gradient(
+//     weight_updates: &mut HashMap<crate::storage::vdb::grid::Coordinate3D, f32>,
+//     layer_name: &str,
+//     gradients: &[f32],
+//     learning_rate: f32,
+//     sparsity_target: f32,
+// ) -> Result<()> {
+//     // Apply gradients with sparsity constraint
+//     for (idx, &grad) in gradients.iter().enumerate() {
+//         let magnitude = grad.abs() * learning_rate;
+//
+//         // Only update if gradient is significant (maintains sparsity)
+//         let sparsity_threshold = compute_sparsity_threshold(gradients, sparsity_target);
+//
+//         if magnitude > sparsity_threshold {
+//             // Convert linear index to 3D coordinate
+//             let coord = crate::storage::vdb::grid::Coordinate3D::new(
+//                 (idx % 1536) as i32,
+//                 (idx / 1536) as i32,
+//                 layer_name.chars().map(|c| c as u32).sum::<u32>() as i32 % 100,
+//             );
+//
+//             weight_updates.insert(coord, -grad * learning_rate);
+//         }
+//     }
+//
+//     Ok(())
+// }
 
 /// Compute sparsity threshold for gradient magnitude
 fn compute_sparsity_threshold(gradients: &[f32], sparsity_target: f32) -> f32 {

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use crate::{
     api::{
-        lora_registry::LoRARegistry,
+        adapter_storage::AdapterStorage,
         model_storage::ModelStorage,
     },
 };
@@ -37,8 +37,8 @@ pub struct ServerState {
     /// Model cache for UUID-based model caching with LRU eviction
     pub model_cache: Arc<ModelCache>,
     
-    /// Registry of LoRA adapters
-    pub lora_registry: Arc<LoRARegistry>,
+    /// Adapter storage manager
+    pub adapter_storage: Arc<AdapterStorage>,
     
     /// Model storage for managing downloaded models
     pub model_storage: Arc<ModelStorage>,
@@ -284,11 +284,12 @@ impl ServerState {
         };
         
         tracing::info!("Initializing model storage at: {:?}", models_dir);
-        let model_storage = Arc::new(ModelStorage::new(models_dir).await?);
+        let model_storage = Arc::new(ModelStorage::new(models_dir.clone()).await?);
         
-        tracing::info!("Initializing LoRA registry at: {:?}", loras_dir);
-        let lora_registry = Arc::new(LoRARegistry::new(loras_dir).await?);
-        
+        // Initialize adapter storage
+        tracing::info!("Initializing adapter storage at: {:?}", models_dir);
+        let adapter_storage = Arc::new(AdapterStorage::new(models_dir.clone()).await?);
+
         let training_service = Arc::new(TrainingStub);
         
         // Initialize model cache
@@ -330,7 +331,7 @@ impl ServerState {
         
         Ok(Self {
             model_cache,
-            lora_registry,
+            adapter_storage,
             model_storage,
             training_service,
             config: Arc::new(config),

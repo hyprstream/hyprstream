@@ -1,7 +1,7 @@
 //! Gemma model implementation with Multi-Query Attention support
 
 use super::{ModelArchitecture, ModelOperations, ArchitectureConfig};
-use super::lora_adapter::ArchitectureAwareLoRAAdapter;
+// use super::lora_adapter::ArchitectureAwareLoRAAdapter; // Module removed
 use anyhow::{Result, anyhow};
 use tch::{Device, Kind as DType, Tensor};
 use crate::runtime::tensor_helpers::{ToIntList, clone_tensor, square_tensor, broadcast_mul, broadcast_add, broadcast_sub, scalar_tensor, dims3, dims4};
@@ -1041,7 +1041,7 @@ impl ModelOperations for GemmaModel {
         Ok(mask)
     }
     
-    fn apply_lora(&mut self, adapter: &ArchitectureAwareLoRAAdapter) -> Result<()> {
+    fn apply_lora(&mut self, adapter: &crate::lora::torch_adapter::LoRAModel) -> Result<()> {
         // Apply LoRA weights with Gemma-specific adaptations
         // The adapter will handle shape conversions for MQA
         Ok(())
