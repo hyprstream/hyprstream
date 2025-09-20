@@ -10,9 +10,10 @@ HyprStream is a production-ready LLM inference engine built in Rust with PyTorch
 ### Core Features
 
 - **High-Performance Inference**: PyTorch-based engine with KV caching and optimized memory management
+- **Hardware Acceleration**: CPU and AMD GPU (ROCm) support, NVIDIA GPU (CUDA) coming soon
 - **LoRA Training & Adaptation**: Create, train, and deploy LoRA adapters for model customization
 - **Git-based Model Management**: Version control for models and adapters using Git workflows
-- **Multi-Model Support**: Compatible with Qwen, Llama, Gemma, and other popular architectures
+- **Multi-Model Support**: Qwen models (Qwen1/2/3 dense architectures), MoE support coming soon
 - **Training Checkpoints**: Automatic checkpoint management with Git integration
 - **Production Ready**: Built on stable PyTorch C++ API (libtorch) for reliability
 
@@ -23,7 +24,10 @@ HyprStream is a production-ready LLM inference engine built in Rust with PyTorch
 - Rust 1.75+
 - Git 2.0+
 - libtorch (automatically downloaded or use existing installation)
-- CUDA 12.x (optional, for GPU acceleration)
+- **Hardware Support:**
+  - **CPU**: Full support (x86_64, ARM64)
+  - **ROCm**: AMD GPU support (gfx90a, gfx1100+)
+  - **CUDA**: Coming soon
 - 8GB+ RAM for inference, 16GB+ for training
 
 ### Building from Source
@@ -37,8 +41,13 @@ cd hyprstream-torch
 export LIBTORCH=/path/to/libtorch
 export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
 
-# Build with CUDA support (optional)
-cargo build --release --features cuda
+# Build with ROCm support (for AMD GPUs) - Use the automated script
+# MUST PROVIDE ROCm libtorch - tested with rocm 6.4
+./build-rocm.sh release
+
+# Or manually with environment variables
+export LIBTORCH=/path/to/rocm-libtorch
+cargo build --release
 
 # The binary will be at ./target/release/hyprstream
 ```
@@ -47,42 +56,65 @@ cargo build --release --features cuda
 
 ### Model Management
 
-```bash
-# Download a model from HuggingFace
-hyprstream model pull Qwen/Qwen2.5-3B-Instruct
+#### Downloading Models
 
-# List available models
+```bash
+# Clone a model from Git repository (HuggingFace, GitHub, etc.)
+hyprstream model clone https://huggingface.co/Qwen/Qwen3-0.6B
+
+# Clone a specific branch or tag
+hyprstream model clone https://huggingface.co/Qwen/Qwen3-8B --git-ref main
+
+# List available models (shows UUID and names)
 hyprstream model list
 
-# Show model information
-hyprstream model info Qwen2.5-3B-Instruct
+# Show model information (use UUID from list)
+hyprstream model info <model-uuid>
 
-# Import a local model
-hyprstream model import ./path/to/model --name my-custom-model
+# Import a shared model from Git
+hyprstream model import https://github.com/user/custom-model.git --name my-custom-model
+```
+
+#### Managing Models
+
+```bash
+# List all cached models with UUIDs
+hyprstream model list
+
+# Get detailed model information
+hyprstream model info <model-uuid>
+
+# Remove a model (requires UUID)
+hyprstream model remove <model-uuid>
+
+# Share a model with others
+hyprstream model share <model-name> --push-to <git-remote-url>
 ```
 
 ### Running Inference
 
 ```bash
-# Basic inference
-hyprstream infer Qwen2.5-3B-Instruct \
+# Basic inference (use model UUID or name from list)
+hyprstream model infer <model-uuid> \
     --prompt "Explain quantum computing in simple terms"
 
 # With generation parameters
-hyprstream infer Qwen2.5-3B-Instruct \
+hyprstream model infer <model-uuid> \
     --prompt "Write a Python function to sort a list" \
     --temperature 0.7 \
     --top-p 0.9 \
-    --max-tokens 256
+    --max-tokens 1024
 ```
 
 ### LoRA Adapter Training
 
+Status: Experimental
+
 ```bash
-# Create a new LoRA adapter
+# Create a new LoRA adapter (use model UUID from list)
 hyprstream lora create \
     --name my-adapter \
-    --base-model Qwen2.5-3B-Instruct \
+    --base-model <model-uuid> \
     --rank 16 \
     --alpha 32
 
@@ -109,11 +141,11 @@ hyprstream lora export my-adapter \
 HyprStream uses Git for comprehensive model and adapter versioning:
 
 ```bash
-# Models are stored as Git repositories
-cd ~/.cache/hyprstream/models/Qwen2.5-3B-Instruct
+# Models are stored as Git repositories with UUID-based directories
+cd ~/.cache/hyprstream/models/<model-uuid>
 git log  # View model history
 
-# Each adapter is a Git branch
+# Each adapter is a Git branch with UUID-based naming
 git branch
 # Output:
 # * main
@@ -177,85 +209,71 @@ graph TD
 
 | Architecture | Status | Models |
 |-------------|--------|--------|
-| Qwen | ✅ Full Support | Qwen2, Qwen2.5 (0.5B to 72B) |
-| Llama | ⚠️ Experimental | Llama2, Llama3 |
-| Gemma | ⚠️ Experimental | Gemma 2B, 7B |
-| Mistral | 🚧 In Development | Mistral 7B |
+| Qwen Dense | ✅ Full Support | Qwen1, Qwen2, Qwen2.5, Qwen3 |
+| Qwen MoE | 🚧 Coming Soon | Qwen2-MoE, Qwen2.5-MoE |
+| Llama | 🚧 Planned | Llama2, Llama3 |
+| Gemma | 🚧 Planned | Gemma 2B, 7B |
+| Mistral | 🚧 Planned | Mistral 7B |
 
 ## API Usage
 
-### REST API (Coming Soon)
+### OpenAI-Compatible REST API
+
+HyprStream provides an OpenAI-compatible API endpoint for easy integration with existing tools and libraries:
 
 ```bash
 # Start API server
 hyprstream serve --port 8080
 
-# Make inference request
-curl -X POST http://localhost:8080/v1/completions \
+# Make chat completions request (OpenAI-compatible)
+curl -X POST http://localhost:8080/oai/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen2.5-3B-Instruct",
-    "prompt": "Hello, world!",
-    "max_tokens": 100
+    "model": "<model-uuid>",
+    "messages": [
+      {"role": "user", "content": "Hello, world!"}
+    ],
+    "max_tokens": 100,
+    "temperature": 0.7
   }'
+
+# Or use with any OpenAI-compatible client
+export OPENAI_API_KEY="dummy"
+export OPENAI_BASE_URL="http://localhost:8080/oai/v1"
+# Now use any OpenAI client library
 ```
 
-### Python Client (Planned)
+### Environment Configuration
 
-```python
-from hyprstream import Client
+HyprStream can be configured via environment variables with the `HYPRSTREAM_` prefix:
 
-client = Client("http://localhost:8080")
-response = client.generate(
-    model="Qwen2.5-3B-Instruct",
-    prompt="Explain neural networks",
-    temperature=0.7
-)
+```bash
+# Server configuration
+export HYPRSTREAM_SERVER_HOST=0.0.0.0
+export HYPRSTREAM_SERVER_PORT=8080
+export HYPRSTREAM_API_KEY=your-api-key
+
+# CORS settings
+export HYPRSTREAM_CORS_ENABLED=true
+export HYPRSTREAM_CORS_ORIGINS="*"
+
+# Model management
+export HYPRSTREAM_PRELOAD_MODELS=model1,model2,model3
+export HYPRSTREAM_MAX_CACHED_MODELS=5
+export HYPRSTREAM_MODELS_DIR=/custom/models/path
+
+# ROCm/HIP for AMD GPUs
+export ROCM_PATH=/usr
+export PYTORCH_ROCM_ARCH=gfx90a
+export LIBTORCH=./libtorch
+export LD_LIBRARY_PATH=./libtorch/lib:$LD_LIBRARY_PATH
+
+# Performance tuning
+export HYPRSTREAM_USE_MMAP=true
+export HYPRSTREAM_GENERATION_TIMEOUT=120
 ```
-
-## Performance
-
-| Model | Hardware | Tokens/sec | Memory |
-|-------|----------|------------|---------|
-| Qwen2.5-3B | RTX 4090 | ~120 | 6GB |
-| Qwen2.5-3B | CPU (16 cores) | ~15 | 8GB |
-| Qwen2.5-7B | RTX 4090 | ~85 | 14GB |
-| Qwen2.5-7B | A100 40GB | ~140 | 14GB |
-
-## Development Status
-
-### ✅ Completed
-- PyTorch/libtorch integration
-- SafeTensors model loading
-- KV caching system
-- Git-based model storage
-- LoRA adapter creation
-- Training checkpoint system
-- CLI interface
-
-### 🚧 In Progress
-- REST API server
-- Training data pipelines
-- Dynamic batching
-- Model quantization
-
-### 📋 Planned
-- WebSocket streaming
-- Distributed inference
-- Multi-GPU training
-- RLHF support
-- Model merging tools
-- Web UI
 
 ## Contributing
-
-We welcome contributions! Priority areas:
-
-- API development (REST/gRPC)
-- Training optimizations
-- Model architecture support
-- Documentation improvements
-- Testing infrastructure
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
@@ -271,4 +289,3 @@ Built with:
 - [SafeTensors](https://github.com/huggingface/safetensors) - Efficient tensor serialization
 - [Git2](https://github.com/rust-lang/git2-rs) - Git operations in Rust
 - [Tokio](https://tokio.rs/) - Async runtime
-- [HuggingFace Hub](https://huggingface.co/) - Model repository
