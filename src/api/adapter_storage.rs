@@ -139,24 +139,6 @@ impl AdapterStorage {
         let config_json = serde_json::to_string_pretty(&config)?;
         fs::write(&config_path, config_json).await?;
         
-        // Create README
-        let readme = format!(
-            "# {}\n\n\
-            Adapter for base model: {}\n\
-            Created: {}\n\
-            Type: LoRA\n\n\
-            ## Configuration\n\
-            - r: {:?}\n\
-            - alpha: {:?}\n\
-            - target_modules: {:?}\n",
-            adapter_name,
-            base_model,
-            config.created_at.format("%Y-%m-%d %H:%M:%S UTC"),
-            config.lora_r,
-            config.lora_alpha,
-            config.target_modules
-        );
-        fs::write(worktree_path.join("README.md"), readme).await?;
         
         // Commit adapter files in the worktree
         self.commit_adapter(&worktree_path, "Initialize adapter").await?;
