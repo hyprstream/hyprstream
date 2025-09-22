@@ -1,6 +1,6 @@
 //! Local model storage and metadata management
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use url::Url;
 use std::collections::HashMap;
@@ -823,10 +823,10 @@ impl ModelStorage {
     async fn get_models_from_registry(&self, registry: &crate::git::GitModelRegistry) -> Result<Vec<(ModelId, ModelMetadata)>> {
         let mut models = Vec::new();
         
-        for (name, reg_model) in registry.list_models()? {
+        for (uuid, reg_model) in registry.list_models()? {
             let model_id = ModelId(reg_model.uuid);
             let model_path = self.base_dir.join(reg_model.uuid.to_string());
-            
+
             // Read HuggingFace config.json for model details
             let config_path = model_path.join("config.json");
             let architecture = if config_path.exists() {
@@ -849,12 +849,12 @@ impl ModelStorage {
             } else {
                 "unknown".to_string()
             };
-            
+
             // Build metadata from registry info + config.json
             let metadata = ModelMetadata {
                 model_id: model_id.clone(),
-                name: name.clone(),
-                display_name: Some(name.clone()),
+                name: reg_model.name.clone(),
+                display_name: Some(reg_model.name.clone()),
                 architecture,
                 parameters: None, // Could parse from config.json if needed
                 model_type: match reg_model.model_type {
@@ -990,8 +990,38 @@ impl ModelStorage {
         }
         
         tracing::info!("Removed adapter {} worktree", adapter_id);
-        
+
         Ok(())
+    }
+
+    /// Get a model by its name
+    pub async fn get_model_by_name(&self, name: &str) -> Result<ModelId> {
+        // First check the registry
+        if let Some(registry) = self.git_registry.read().await.as_ref() {
+            if let Some(model) = registry.get_model_by_name(name) {
+                return Ok(ModelId(model.uuid));
+            }
+        }
+
+        // Fall back to searching through metadata
+        let models = self.list_models().await?;
+        for (model_id, metadata) in models {
+            if metadata.name == name || metadata.display_name.as_deref() == Some(name) {
+                return Ok(model_id);
+            }
+        }
+
+        bail!("Model '{}' not found", name)
+    }
+
+    /// Get the filesystem path for a model
+    pub fn get_model_path(&self, model_id: &ModelId) -> Result<PathBuf> {
+        let path = self.base_dir.join(model_id.0.to_string());
+        if path.exists() {
+            Ok(path)
+        } else {
+            bail!("Model path does not exist for ID: {}", model_id)
+        }
     }
 }
 

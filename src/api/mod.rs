@@ -14,6 +14,7 @@ pub mod adapter_storage;
 pub mod model_sharing;
 pub mod openai_compat;
 pub mod training_service;
+pub mod model_identifier;
 
 use adapter_storage::{AdapterStorage, AdapterId, AdapterConfig};
 use training_service::{TrainingService, TrainingConfig};
@@ -98,9 +99,6 @@ pub struct LoRAConfig {
     
     /// Sparsity ratio (0.0 to 1.0)
     pub sparsity_ratio: f32,
-    
-    /// Use neural compression
-    pub use_neural_compression: bool,
 }
 
 impl Default for LoRAConfig {
@@ -111,7 +109,6 @@ impl Default for LoRAConfig {
             dropout: 0.1,
             target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
             sparsity_ratio: 0.99,
-            use_neural_compression: true,
         }
     }
 }

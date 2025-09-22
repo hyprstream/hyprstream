@@ -12,3 +12,79 @@ pub mod pytorch_lora_handler;
 
 pub use handlers::{handle_config, handle_server, handle_model_command, handle_chat_command};
 pub use pytorch_lora_handler::handle_pytorch_lora_command;
+
+/// Device preference strategy
+#[derive(Debug, Clone, Copy)]
+pub enum DevicePreference {
+    /// Request GPU if available, fall back to CPU gracefully
+    RequestGPU,
+    /// Request CPU-only execution
+    RequestCPU,
+    /// Require GPU, fail if not available
+    RequireGPU,
+}
+
+/// Device configuration for command execution
+#[derive(Debug, Clone)]
+pub struct DeviceConfig {
+    /// Device preference strategy
+    pub preference: DevicePreference,
+    /// Specific CUDA device ID (None = auto-detect)
+    pub cuda_device: Option<u32>,
+    /// Specific ROCm device ID (None = auto-detect)
+    pub rocm_device: Option<u32>,
+}
+
+impl DeviceConfig {
+    /// Create a GPU request config with auto-detection
+    pub fn request_gpu() -> Self {
+        Self {
+            preference: DevicePreference::RequestGPU,
+            cuda_device: None,
+            rocm_device: None,
+        }
+    }
+
+    /// Create a CPU-only config
+    pub fn request_cpu() -> Self {
+        Self {
+            preference: DevicePreference::RequestCPU,
+            cuda_device: None,
+            rocm_device: None,
+        }
+    }
+
+    /// Create a GPU requirement config with auto-detection
+    pub fn require_gpu() -> Self {
+        Self {
+            preference: DevicePreference::RequireGPU,
+            cuda_device: None,
+            rocm_device: None,
+        }
+    }
+
+    /// Create a config with specific CUDA device
+    pub fn cuda_device(device_id: u32) -> Self {
+        Self {
+            preference: DevicePreference::RequireGPU,
+            cuda_device: Some(device_id),
+            rocm_device: None,
+        }
+    }
+
+    /// Create a config with specific ROCm device
+    pub fn rocm_device(device_id: u32) -> Self {
+        Self {
+            preference: DevicePreference::RequireGPU,
+            cuda_device: None,
+            rocm_device: Some(device_id),
+        }
+    }
+}
+
+/// Runtime configuration for commands
+#[derive(Debug, Clone)]
+pub struct RuntimeConfig {
+    pub device: DeviceConfig,
+    pub multi_threaded: bool,
+}

@@ -12,6 +12,39 @@ use uuid::Uuid;
 use chrono::Utc;
 use crate::api::model_storage::ModelId;
 use crate::git::{BranchManager, BranchInfo};
+use crate::storage::{XetNativeStorage, XetConfig};
+use std::sync::Arc;
+use thiserror::Error;
+
+/// Adapter-specific error types for better error handling
+#[derive(Error, Debug)]
+pub enum AdapterError {
+    #[error("Corrupted adapter configuration at {path}: {source}")]
+    CorruptedConfig {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("Failed to read adapter configuration at {path}: {source}")]
+    ConfigReadError {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("Base model '{name}' not found")]
+    BaseModelNotFound { name: String },
+
+    #[error("Adapter '{name}' already exists")]
+    AdapterAlreadyExists { name: String },
+
+    #[error("Adapter '{name}' not found")]
+    AdapterNotFound { name: String },
+
+    #[error("Invalid adapter identifier: {identifier}")]
+    InvalidIdentifier { identifier: String },
+}
 
 /// Adapter identifier
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -55,6 +88,8 @@ pub struct AdapterSession {
     pub base_model_path: PathBuf,
     pub config: AdapterConfig,
     pub is_training: bool,
+    /// Optional Xet storage for automatic handling of large files
+    pub xet_storage: Option<Arc<XetNativeStorage>>,
 }
 
 /// Adapter storage manager using branch-based storage
@@ -62,6 +97,8 @@ pub struct AdapterStorage {
     base_dir: PathBuf,
     working_dir: PathBuf,  // Directory for adapter worktrees
     registry: std::sync::Arc<tokio::sync::RwLock<Option<crate::git::GitModelRegistry>>>,
+    /// Optional Xet storage for large file handling
+    xet_storage: Option<Arc<XetNativeStorage>>,
 }
 
 impl AdapterStorage {
@@ -83,9 +120,45 @@ impl AdapterStorage {
             base_dir,
             working_dir,
             registry: std::sync::Arc::new(tokio::sync::RwLock::new(registry)),
+            xet_storage: None,
         })
     }
-    
+
+    /// Add Xet storage capability to this adapter storage
+    pub async fn with_xet(mut self, xet_config: XetConfig) -> Result<Self> {
+        self.xet_storage = Some(Arc::new(XetNativeStorage::new(xet_config).await
+            .context("Failed to initialize Xet storage")?));
+        Ok(self)
+    }
+
+    /// Universal file save - automatically detects and handles Xet pointers
+    pub async fn save_file(&self, file_path: &Path, data: &[u8]) -> Result<()> {
+        if let Some(xet) = &self.xet_storage {
+            xet.save_file(file_path, data).await
+        } else {
+            fs::write(file_path, data).await.map_err(Into::into)
+        }
+    }
+
+    /// Universal file load - automatically handles Xet pointers
+    pub async fn load_file(&self, file_path: &Path) -> Result<Vec<u8>> {
+        if let Some(xet) = &self.xet_storage {
+            xet.load_file(file_path).await
+        } else {
+            fs::read(file_path).await.map_err(Into::into)
+        }
+    }
+
+    /// Explicitly save file as Xet (force conversion to Xet storage)
+    pub async fn save_as_xet(&self, file_path: &Path, data: &[u8]) -> Result<()> {
+        if let Some(xet) = &self.xet_storage {
+            xet.save_as_xet(file_path, data).await
+        } else {
+            // No Xet storage available, save as regular file
+            fs::write(file_path, data).await.map_err(Into::into)
+        }
+    }
+
     /// Create a new adapter as a branch of the base model
     pub async fn create_adapter(
         &self,
@@ -145,12 +218,21 @@ impl AdapterStorage {
         
         // Register with Git registry if available
         if let Some(registry) = self.registry.write().await.as_mut() {
-            if let Err(e) = registry.register_adapter(
-                base_model,
-                adapter_name,
-                branch_info.uuid,
-            ).await {
-                tracing::warn!("Failed to register adapter with Git registry: {}", e);
+            // Extract UUID from base model path
+            if let Some(base_model_uuid_str) = base_model_path.file_name().and_then(|n| n.to_str()) {
+                if let Ok(base_model_uuid) = Uuid::parse_str(base_model_uuid_str) {
+                    if let Err(e) = registry.register_adapter(
+                        &base_model_uuid,
+                        adapter_name,
+                        branch_info.uuid,
+                    ).await {
+                        tracing::warn!("Failed to register adapter with Git registry: {}", e);
+                    }
+                } else {
+                    tracing::warn!("Could not parse base model UUID from path: {}", base_model_path.display());
+                }
+            } else {
+                tracing::warn!("Could not extract UUID from base model path: {}", base_model_path.display());
             }
         }
         
@@ -191,6 +273,7 @@ impl AdapterStorage {
             base_model_path,
             config,
             is_training: false,
+            xet_storage: self.xet_storage.clone(),
         })
     }
     
@@ -215,12 +298,23 @@ impl AdapterStorage {
                                         .to_string();
                                     adapters.push((name, config));
                                 }
+                                Err(e) if e.is_syntax() => {
+                                    // Corrupted config - log error and skip this adapter
+                                    tracing::error!("Corrupted adapter config at {}: {}", config_path.display(), e);
+                                    // Could attempt recovery or backup restoration here
+                                }
                                 Err(e) => {
+                                    // Other parsing errors - log warning
                                     tracing::warn!("Failed to parse adapter config at {}: {}", config_path.display(), e);
                                 }
                             }
                         }
+                        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                            // Permission issue - this is more serious
+                            tracing::error!("Permission denied reading adapter config at {}: {}", config_path.display(), e);
+                        }
                         Err(e) => {
+                            // Other I/O errors - log as warning
                             tracing::warn!("Failed to read adapter config at {}: {}", config_path.display(), e);
                         }
                     }
@@ -375,7 +469,7 @@ impl AdapterStorage {
         
         // Try to resolve via registry
         if let Some(registry) = self.registry.read().await.as_ref() {
-            if let Some(model) = registry.get_model(base_model) {
+            if let Some(model) = registry.get_model_by_name(base_model) {
                 let path = self.base_dir.join(model.uuid.to_string());
                 if path.exists() {
                     return Ok(path);
@@ -388,25 +482,98 @@ impl AdapterStorage {
 }
 
 impl AdapterSession {
-    /// Save adapter weights
+    /// Save adapter weights - automatically detects and handles Xet pointers
     pub async fn save_weights(&self, weights_data: &[u8]) -> Result<()> {
         let weights_path = self.adapter_path.join("adapter_model.bin");
-        fs::write(&weights_path, weights_data).await?;
-        Ok(())
+
+        if let Some(xet) = &self.xet_storage {
+            // Use Xet storage - automatically detects if file should be Xet
+            xet.save_file(&weights_path, weights_data).await
+        } else {
+            // Fallback to direct file write
+            fs::write(&weights_path, weights_data).await.map_err(Into::into)
+        }
     }
-    
-    /// Load adapter weights
+
+    /// Load adapter weights - automatically handles Xet pointers
     pub async fn load_weights(&self) -> Result<Vec<u8>> {
         let weights_path = self.adapter_path.join("adapter_model.bin");
         if !weights_path.exists() {
             // Return empty weights if file doesn't exist yet
             return Ok(Vec::new());
         }
-        Ok(fs::read(&weights_path).await?)
+
+        if let Some(xet) = &self.xet_storage {
+            // Use Xet storage - automatically handles pointers
+            xet.load_file(&weights_path).await
+        } else {
+            // Fallback to direct file read
+            fs::read(&weights_path).await.map_err(Into::into)
+        }
     }
-    
+
+    /// Save adapter weights explicitly as Xet (force conversion)
+    pub async fn save_weights_as_xet(&self, weights_data: &[u8]) -> Result<()> {
+        let weights_path = self.adapter_path.join("adapter_model.bin");
+
+        if let Some(xet) = &self.xet_storage {
+            xet.save_as_xet(&weights_path, weights_data).await
+        } else {
+            // No Xet storage available, save as regular file
+            fs::write(&weights_path, weights_data).await.map_err(Into::into)
+        }
+    }
+
+    /// Save any file in the adapter directory with automatic Xet handling
+    pub async fn save_file(&self, filename: &str, data: &[u8]) -> Result<()> {
+        let file_path = self.adapter_path.join(filename);
+
+        if let Some(xet) = &self.xet_storage {
+            xet.save_file(&file_path, data).await
+        } else {
+            fs::write(&file_path, data).await.map_err(Into::into)
+        }
+    }
+
+    /// Load any file from the adapter directory with automatic Xet handling
+    pub async fn load_file(&self, filename: &str) -> Result<Vec<u8>> {
+        let file_path = self.adapter_path.join(filename);
+
+        if let Some(xet) = &self.xet_storage {
+            xet.load_file(&file_path).await
+        } else {
+            fs::read(&file_path).await.map_err(Into::into)
+        }
+    }
+
+    /// Check if a file is stored as a Xet pointer
+    pub async fn is_xet_file(&self, filename: &str) -> Result<bool> {
+        if let Some(xet) = &self.xet_storage {
+            let file_path = self.adapter_path.join(filename);
+            if file_path.exists() {
+                let content = fs::read_to_string(&file_path).await?;
+                Ok(xet.is_xet_pointer(&content))
+            } else {
+                Ok(false)
+            }
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Get base model weights path
     pub fn base_model_weights_path(&self) -> PathBuf {
         self.base_model_path.join("model.safetensors")
+    }
+
+    /// Load base model weights with automatic Xet handling
+    pub async fn load_base_weights(&self) -> Result<Vec<u8>> {
+        let weights_path = self.base_model_weights_path();
+
+        if let Some(xet) = &self.xet_storage {
+            xet.load_file(&weights_path).await
+        } else {
+            fs::read(&weights_path).await.map_err(Into::into)
+        }
     }
 }

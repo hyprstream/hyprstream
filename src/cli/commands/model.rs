@@ -122,25 +122,9 @@ pub enum ModelAction {
         #[arg(long)]
         yes: bool,
     },
-    
-    /// Search for models across registries
-    Search {
-        /// Search query
-        query: String,
-        
-        /// Filter by registry type
-        #[arg(long)]
-        registry: Option<String>,
-        
-        /// Maximum number of results
-        #[arg(long, default_value = "20")]
-        limit: usize,
-        
-        /// Output format (table, json)
-        #[arg(long, default_value = "table")]
-        format: String,
-    },
-    
+
+    // Search functionality has been removed - use 'model list' with search filter instead
+
     /// Repair model metadata and fix inconsistencies
     Repair {
         /// Perform automatic repairs without confirmation
@@ -236,6 +220,17 @@ pub enum CacheAction {
         /// Model URI to verify (optional, verifies all if not specified)
         uri: Option<String>,
     },
+}
+
+impl ModelAction {
+    /// Returns the device configuration for this action
+    pub fn device_config(&self) -> crate::cli::DeviceConfig {
+        use crate::cli::DeviceConfig;
+        match self {
+            ModelAction::Infer { .. } => DeviceConfig::request_gpu(),
+            _ => DeviceConfig::request_cpu(),
+        }
+    }
 }
 
 /// Model pull configuration

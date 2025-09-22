@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 use crate::constants::validation::*;
+use anyhow::{Result, bail};
+use uuid::Uuid;
 
 /// Validate and sanitize a filename to prevent path traversal attacks
 /// 
@@ -106,6 +108,103 @@ pub fn verify_path_safety(base_dir: &Path, target_path: &Path) -> Result<PathBuf
     Ok(canonical_target)
 }
 
+/// Validate a model identifier (UUID, name, or URI)
+///
+/// Ensures the identifier is safe to use and follows expected formats
+pub fn validate_model_identifier(identifier: &str) -> Result<String> {
+    // Check for empty identifier
+    if identifier.is_empty() {
+        bail!("Model identifier cannot be empty");
+    }
+
+    // Check length limits
+    if identifier.len() > 512 {
+        bail!("Model identifier too long (max 512 characters)");
+    }
+
+    // Check for null bytes
+    if identifier.contains('\0') {
+        bail!("Model identifier contains null byte");
+    }
+
+    // Check for path traversal in identifier
+    if identifier.contains("..") {
+        bail!("Model identifier contains directory traversal");
+    }
+
+    // Validate UUID format if it looks like a UUID
+    if identifier.len() == 36 && identifier.chars().filter(|c| *c == '-').count() == 4 {
+        if Uuid::parse_str(identifier).is_err() {
+            bail!("Invalid UUID format: {}", identifier);
+        }
+    }
+
+    // Validate URI format if it looks like a URI
+    if identifier.starts_with("http://") || identifier.starts_with("https://")
+        || identifier.starts_with("git@") || identifier.starts_with("ssh://") {
+        // Basic URI validation - check for unescaped spaces
+        if identifier.contains(' ') && !identifier.contains("%20") {
+            bail!("URI contains unescaped spaces: {}", identifier);
+        }
+    }
+
+    Ok(identifier.to_string())
+}
+
+/// Validate an adapter name
+///
+/// Ensures adapter names are safe and follow naming conventions
+pub fn validate_adapter_name(name: &str) -> Result<String> {
+    // Check for empty name
+    if name.is_empty() {
+        bail!("Adapter name cannot be empty");
+    }
+
+    // Check length limits
+    if name.len() > 256 {
+        bail!("Adapter name too long (max 256 characters)");
+    }
+
+    // Check for invalid characters (only allow alphanumeric, dash, underscore)
+    if !name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+        bail!("Adapter name contains invalid characters. Only alphanumeric, dash, and underscore allowed");
+    }
+
+    // Check it doesn't start with a dash or underscore
+    if name.starts_with('-') || name.starts_with('_') {
+        bail!("Adapter name cannot start with dash or underscore");
+    }
+
+    Ok(name.to_string())
+}
+
+/// Validate a Git reference (branch, tag, or commit)
+///
+/// Ensures Git references are safe to use
+pub fn validate_git_ref(git_ref: &str) -> Result<String> {
+    // Check for empty ref
+    if git_ref.is_empty() {
+        bail!("Git reference cannot be empty");
+    }
+
+    // Check length limits
+    if git_ref.len() > 256 {
+        bail!("Git reference too long (max 256 characters)");
+    }
+
+    // Check for dangerous characters that could be interpreted as Git revision syntax
+    if git_ref.contains("..") || git_ref.contains("~") || git_ref.contains("^") {
+        bail!("Git reference contains potentially dangerous characters");
+    }
+
+    // Check for null bytes
+    if git_ref.contains('\0') {
+        bail!("Git reference contains null byte");
+    }
+
+    Ok(git_ref.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +234,52 @@ mod tests {
         assert_eq!(sanitize_path_component("../../../etc"), "_etc");
         assert_eq!(sanitize_path_component("path/with/slashes"), "path_with_slashes");
         assert_eq!(sanitize_path_component("path\\with\\backslashes"), "path_with_backslashes");
+    }
+
+    #[test]
+    fn test_validate_model_identifier() {
+        // Valid identifiers
+        assert!(validate_model_identifier("model-name").is_ok());
+        assert!(validate_model_identifier("550e8400-e29b-41d4-a716-446655440000").is_ok());
+        assert!(validate_model_identifier("https://huggingface.co/model").is_ok());
+        assert!(validate_model_identifier("git@github.com:org/repo.git").is_ok());
+
+        // Invalid identifiers
+        assert!(validate_model_identifier("").is_err());
+        assert!(validate_model_identifier("../../etc/passwd").is_err());
+        assert!(validate_model_identifier("model\0name").is_err());
+        assert!(validate_model_identifier(&"x".repeat(513)).is_err());
+    }
+
+    #[test]
+    fn test_validate_adapter_name() {
+        // Valid names
+        assert!(validate_adapter_name("my-adapter").is_ok());
+        assert!(validate_adapter_name("adapter_v1").is_ok());
+        assert!(validate_adapter_name("LoRA123").is_ok());
+
+        // Invalid names
+        assert!(validate_adapter_name("").is_err());
+        assert!(validate_adapter_name("-adapter").is_err());
+        assert!(validate_adapter_name("_adapter").is_err());
+        assert!(validate_adapter_name("adapter/name").is_err());
+        assert!(validate_adapter_name("adapter name").is_err());
+        assert!(validate_adapter_name(&"x".repeat(257)).is_err());
+    }
+
+    #[test]
+    fn test_validate_git_ref() {
+        // Valid refs
+        assert!(validate_git_ref("main").is_ok());
+        assert!(validate_git_ref("feature-branch").is_ok());
+        assert!(validate_git_ref("v1.0.0").is_ok());
+        assert!(validate_git_ref("abc123def").is_ok());
+
+        // Invalid refs
+        assert!(validate_git_ref("").is_err());
+        assert!(validate_git_ref("refs/heads/../../../etc").is_err());
+        assert!(validate_git_ref("HEAD~1").is_err());
+        assert!(validate_git_ref("main^").is_err());
+        assert!(validate_git_ref("branch\0name").is_err());
     }
 }

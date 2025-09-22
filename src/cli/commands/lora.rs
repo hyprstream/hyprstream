@@ -41,11 +41,7 @@ pub enum LoRAAction {
         /// Sparsity ratio (0.0 to 1.0)
         #[arg(long, default_value = "0.99")]
         sparsity: f32,
-        
-        /// Enable neural compression
-        #[arg(long)]
-        neural_compression: bool,
-        
+
         /// Enable auto-regressive training
         #[arg(long)]
         auto_regressive: bool,
@@ -449,6 +445,17 @@ pub enum CheckpointAction {
     },
 }
 
+impl LoRAAction {
+    /// Returns the device configuration for this action
+    pub fn device_config(&self) -> crate::cli::DeviceConfig {
+        use crate::cli::DeviceConfig;
+        match self {
+            LoRAAction::Infer { .. } => DeviceConfig::request_gpu(),
+            _ => DeviceConfig::request_cpu(),
+        }
+    }
+}
+
 /// LoRA configuration for creation
 #[derive(Debug, Clone)]
 pub struct LoRACreateConfig {
@@ -459,7 +466,6 @@ pub struct LoRACreateConfig {
     pub dropout: f32,
     pub target_modules: Vec<String>,
     pub sparsity_ratio: f32,
-    pub neural_compression: bool,
     pub auto_regressive: bool,
     pub learning_rate: f32,
     pub batch_size: usize,

@@ -254,14 +254,7 @@ pub async fn handle_embedding_query(
 pub fn handle_config(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = Config::builder()
         .set_default("host", "127.0.0.1")?
-        .set_default("port", "50051")?
-        .set_default("storage.path", "./storage")?
-        .set_default("storage.neural_compression", true)?
-        .set_default("storage.hardware_acceleration", true)?
-        .set_default("storage.cache_size_mb", 2048)?
-        .set_default("storage.compaction_interval_secs", 300)?
-        .set_default("storage.streaming_updates", true)?
-        .set_default("storage.update_batch_size", 1000)?;
+        .set_default("port", "50051")?;
 
     // Load config file if provided
     if let Some(path) = config_path {
@@ -379,11 +372,14 @@ pub async fn handle_model_command(
             let storage_paths = crate::storage::paths::StoragePaths::new()?;
             let models_dir = storage_paths.models_dir()?;
 
-            let git_source = crate::api::git_downloader::GitModelSource::new(models_dir);
+            // Initialize GitModelSource with XET support for LFS files
+            let git_source = crate::api::git_downloader::GitModelSource::with_xet_fallback(models_dir).await;
+
             let (model_id, model_path) = if let Some(ref_str) = git_ref {
-                git_source.clone_ref(&repo_url, &ref_str)?
+                // Now using async clone_ref with XET support
+                git_source.clone_ref(&repo_url, &ref_str).await?
             } else {
-                git_source.clone_model(&repo_url)?
+                git_source.clone_model(&repo_url).await?
             };
             
             let storage_paths = crate::storage::paths::StoragePaths::new()?;
@@ -418,8 +414,10 @@ pub async fn handle_model_command(
             let storage_paths = crate::storage::paths::StoragePaths::new()?;
             let models_dir = storage_paths.models_dir()?;
             
-            let git_source = crate::api::git_downloader::GitModelSource::new(models_dir.clone());
-            match git_source.clone_model(&uri) {
+            // Initialize GitModelSource with XET support for LFS files
+            let git_source = crate::api::git_downloader::GitModelSource::with_xet_fallback(models_dir.clone()).await;
+
+            match git_source.clone_model(&uri).await {
                 Ok((model_id, model_path)) => {
                     println!();
                     println!("✅ Model downloaded successfully!");
@@ -713,12 +711,7 @@ pub async fn handle_model_command(
                 }
             }
         }
-        ModelAction::Search { .. } => {
-            eprintln!("❌ Model search has been removed.");
-            eprintln!("   Use 'hyprstream model list' to see local models");
-            eprintln!("   Use 'hyprstream model pull <uri>' to download models");
-            return Err(anyhow::anyhow!("Model search feature has been removed").into());
-        }
+        // Search variant has been removed from the enum - use List with search filter
         ModelAction::Convert { source, to, output, precision, verify } => {
             info!("🔄 Converting model from {} to {}", source, to);
             
@@ -1056,7 +1049,6 @@ pub async fn create_lora_via_api(
         "alpha": alpha,
         "target_modules": target_modules,
         "sparsity_ratio": sparsity,
-        "neural_compression": true,
         "auto_regressive": true
     });
     

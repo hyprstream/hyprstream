@@ -85,7 +85,7 @@ impl ModelSharing {
     ) -> Result<ShareableModelRef> {
         // Try to find model in registry first
         if let Some(registry) = self.registry.read().await.as_ref() {
-            if let Some(model) = registry.get_model(model_name) {
+            if let Some(model) = registry.get_model_by_name(model_name) {
                 return self.create_ref_from_registry(model_name, model, include_metrics).await;
             }
         }
