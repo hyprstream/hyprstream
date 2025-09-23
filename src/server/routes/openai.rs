@@ -147,7 +147,7 @@ pub fn create_router() -> Router<ServerState> {
 async fn chat_completions(
     State(state): State<ServerState>,
     Json(request): Json<ChatCompletionRequest>,
-) -> Response {
+) -> impl IntoResponse {
     // Debug log the incoming request
     info!("Chat completion request - model: {}, stream: {:?}, messages: {} msgs", 
         request.model, request.stream, request.messages.len());
@@ -175,12 +175,12 @@ async fn chat_completions(
     // Check for streaming
     if request.stream.unwrap_or(false) {
         info!("Handling streaming request");
-        return stream_chat(state, request).await;
+        return stream_chat(state, request).await.into_response();
     }
     info!("Handling non-streaming request");
     
     // Get engine from model cache
-    let engine = match state.model_cache.get_or_load_by_name(&request.model).await {
+    let engine = match state.model_cache.get_or_load(&request.model).await {
         Ok(engine) => engine,
         Err(e) => {
             error!("Failed to load model '{}': {}", request.model, e);
@@ -329,7 +329,7 @@ async fn chat_completions(
 async fn stream_chat(
     state: ServerState,
     request: ChatCompletionRequest,
-) -> Response {
+) -> impl IntoResponse {
     // Create channel for SSE events
     let (tx, rx) = mpsc::channel::<Result<serde_json::Value, anyhow::Error>>(100);
     let cancel_token = CancellationToken::new();
@@ -354,7 +354,7 @@ async fn stream_chat(
         // Ensure metrics are decremented on all exit paths
         let _metrics_guard = MetricsGuard::new(&state.metrics);
         // Get engine from model cache
-        let engine_arc = match state.model_cache.get_or_load_by_name(&model_name).await {
+        let engine_arc = match state.model_cache.get_or_load(&model_name).await {
             Ok(engine) => engine,
             Err(e) => {
                 let error_msg = if e.to_string().contains("not found") {
@@ -482,13 +482,13 @@ async fn stream_chat(
 async fn completions(
     State(state): State<ServerState>,
     Json(request): Json<CompletionRequest>,
-) -> Response {
+) -> impl IntoResponse {
     // Similar to chat completions but with different format
     state.metrics.active_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     state.metrics.total_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     
     // Get engine from model cache
-    let engine = match state.model_cache.get_or_load_by_name(&request.model).await {
+    let engine = match state.model_cache.get_or_load(&request.model).await {
         Ok(engine) => engine,
         Err(e) => {
             state.metrics.active_requests.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -615,7 +615,7 @@ async fn completions(
 async fn embeddings(
     State(_state): State<ServerState>,
     Json(_request): Json<EmbeddingRequest>,
-) -> Response {
+) -> impl IntoResponse {
     (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({
         "error": {
             "message": "Embeddings not yet implemented",
@@ -628,14 +628,14 @@ async fn embeddings(
 /// List available models
 async fn list_models(
     State(state): State<ServerState>,
-) -> Response {
+) -> impl IntoResponse {
     // Get models from storage and LoRA registry
     let mut models = vec![];
     
     // Get models from storage - the backend should provide properly formatted names
-    match state.model_storage.children().await {
+    match state.model_storage.list_models().await {
         Ok(model_list) => {
-            for (_model_id, metadata) in model_list {
+            for (model_ref, metadata) in model_list {
                 // The backend should provide the correct display name
                 // API layer should not be determining how to name models
                 let model_name = metadata.display_name

@@ -108,47 +108,37 @@ pub fn verify_path_safety(base_dir: &Path, target_path: &Path) -> Result<PathBuf
     Ok(canonical_target)
 }
 
-/// Validate a model identifier (UUID, name, or URI)
+/// Validate a model reference (model:ref format)
 ///
-/// Ensures the identifier is safe to use and follows expected formats
-pub fn validate_model_identifier(identifier: &str) -> Result<String> {
-    // Check for empty identifier
-    if identifier.is_empty() {
-        bail!("Model identifier cannot be empty");
+/// Ensures the model reference is safe to use
+pub fn validate_model_ref(model_ref: &str) -> Result<String> {
+    // Check for empty
+    if model_ref.is_empty() {
+        bail!("Model reference cannot be empty");
     }
 
     // Check length limits
-    if identifier.len() > 512 {
-        bail!("Model identifier too long (max 512 characters)");
+    if model_ref.len() > 256 {
+        bail!("Model reference too long (max 256 characters)");
     }
 
     // Check for null bytes
-    if identifier.contains('\0') {
-        bail!("Model identifier contains null byte");
+    if model_ref.contains('\0') {
+        bail!("Model reference contains null byte");
     }
 
-    // Check for path traversal in identifier
-    if identifier.contains("..") {
-        bail!("Model identifier contains directory traversal");
+    // Check for path traversal
+    if model_ref.contains("..") {
+        bail!("Model reference contains directory traversal");
     }
 
-    // Validate UUID format if it looks like a UUID
-    if identifier.len() == 36 && identifier.chars().filter(|c| *c == '-').count() == 4 {
-        if Uuid::parse_str(identifier).is_err() {
-            bail!("Invalid UUID format: {}", identifier);
-        }
+    // Parse and validate components
+    let parts: Vec<&str> = model_ref.split(':').collect();
+    if parts.len() > 2 {
+        bail!("Model reference can only have one colon separator");
     }
 
-    // Validate URI format if it looks like a URI
-    if identifier.starts_with("http://") || identifier.starts_with("https://")
-        || identifier.starts_with("git@") || identifier.starts_with("ssh://") {
-        // Basic URI validation - check for unescaped spaces
-        if identifier.contains(' ') && !identifier.contains("%20") {
-            bail!("URI contains unescaped spaces: {}", identifier);
-        }
-    }
-
-    Ok(identifier.to_string())
+    Ok(model_ref.to_string())
 }
 
 /// Validate an adapter name
@@ -237,18 +227,19 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_model_identifier() {
-        // Valid identifiers
-        assert!(validate_model_identifier("model-name").is_ok());
-        assert!(validate_model_identifier("550e8400-e29b-41d4-a716-446655440000").is_ok());
-        assert!(validate_model_identifier("https://huggingface.co/model").is_ok());
-        assert!(validate_model_identifier("git@github.com:org/repo.git").is_ok());
+    fn test_validate_model_ref() {
+        // Valid references
+        assert!(validate_model_ref("model-name").is_ok());
+        assert!(validate_model_ref("model:main").is_ok());
+        assert!(validate_model_ref("model:v1.0").is_ok());
+        assert!(validate_model_ref("550e8400-e29b-41d4-a716-446655440000").is_ok());
 
-        // Invalid identifiers
-        assert!(validate_model_identifier("").is_err());
-        assert!(validate_model_identifier("../../etc/passwd").is_err());
-        assert!(validate_model_identifier("model\0name").is_err());
-        assert!(validate_model_identifier(&"x".repeat(513)).is_err());
+        // Invalid references
+        assert!(validate_model_ref("").is_err());
+        assert!(validate_model_ref("../../etc/passwd").is_err());
+        assert!(validate_model_ref("model\0name").is_err());
+        assert!(validate_model_ref(&"x".repeat(257)).is_err());
+        assert!(validate_model_ref("model:ref:extra").is_err());
     }
 
     #[test]

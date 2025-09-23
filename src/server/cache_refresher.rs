@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
-use tracing::{info, warn, error};
+use tracing::{info, warn, error, debug};
 use super::model_cache::ModelCache;
 
 /// Background task that periodically refreshes the model cache
@@ -35,15 +35,8 @@ impl CacheRefresher {
             loop {
                 interval.tick().await;
                 
-                info!("Running periodic cache refresh...");
-                match self.model_cache.refresh_name_cache().await {
-                    Ok(_) => {
-                        info!("Cache refresh completed successfully");
-                    }
-                    Err(e) => {
-                        error!("Cache refresh failed: {}", e);
-                    }
-                }
+                // Cache is automatically maintained, no refresh needed
+                debug!("Cache refresher tick - cache is automatically maintained");
             }
         })
     }

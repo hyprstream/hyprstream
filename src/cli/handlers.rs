@@ -1,9 +1,6 @@
 //! CLI handlers for adaptive ML inference server
 
-use crate::{
-    // storage::SparseStorageConfig,  // VDB removed
-    runtime::{RuntimeEngine, TorchEngine},
-};
+use crate::runtime::{RuntimeEngine, TorchEngine};
 use ::config::{Config, File};
 use std::{
     net::SocketAddr,
@@ -13,8 +10,7 @@ use std::{
 use reqwest::Client;
 use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
-use crate::api::model_storage::{ModelStorage, ModelId};
-use crate::api::model_storage::ModelUri;
+use crate::storage::{ModelStorage, ModelId, ModelMetadata};
 
 /// Response structure for LoRA inference
 #[derive(Debug, Clone)]
@@ -26,39 +22,27 @@ pub struct InferenceResponse {
     pub finish_reason: String,
 }
 
-/// Resolve base model identifier - can be UUID or URI
+/// Resolve base model identifier using ModelRef
 async fn resolve_base_model_identifier(identifier: &str) -> Result<String, anyhow::Error> {
-    // Try to parse as UUID first
-    if let Ok(uuid) = uuid::Uuid::parse_str(identifier) {
-        let model_id = ModelId(uuid);
-        
+    // Try to parse as ModelRef first
+    if let Ok(model_ref) = crate::storage::ModelRef::parse(identifier) {
         // Load model storage
         let config = crate::config::HyprConfig::load().unwrap_or_default();
-        let storage = ModelStorage::new(config.models_dir().to_path_buf()).await?;
-        
-        // Get metadata by UUID
-        if let Ok(metadata) = storage.get_metadata_by_id(&model_id).await {
-            return Ok(format!("UUID {} ({})", model_id, metadata.name));
+        let storage = ModelStorage::create(config.models_dir().to_path_buf()).await?;
+
+        // Check if model exists directly
+        if let Ok(model_path) = storage.get_model_path(&model_ref).await {
+            // Extract display name from git repo
+            let display_name = read_model_display_name(&model_path)
+                .unwrap_or_else(|| model_ref.model.clone());
+            return Ok(format!("{} ({})", model_ref.model, display_name));
         } else {
-            return Err(anyhow::anyhow!("Model with UUID {} not found in storage", model_id));
+            return Err(anyhow::anyhow!("Model '{}' not found in storage", model_ref.model));
         }
     }
-    
-    // Try to parse as URI
-    if let Ok(model_uri) = ModelUri::parse(identifier) {
-        let config = crate::config::HyprConfig::load().unwrap_or_default();
-        let storage = ModelStorage::new(config.models_dir().to_path_buf()).await?;
-        
-        // Check if model exists in storage
-        if let Ok(metadata) = storage.get_metadata(&model_uri).await {
-            return Ok(format!("URI {} (UUID: {})", model_uri.uri, metadata.model_id));
-        } else {
-            return Ok(format!("URI {} (not cached locally)", model_uri.uri));
-        }
-    }
-    
-    // If neither UUID nor valid URI, treat as simple string identifier
-    Err(anyhow::anyhow!("Invalid base model identifier format: {}", identifier))
+
+    // For invalid identifiers, return as-is (might be used elsewhere)
+    Ok(identifier.to_string())
 }
 
 pub async fn execute_sparse_query(
@@ -267,8 +251,6 @@ pub fn handle_config(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-// Placeholder implementations for model and LoRA commands
-// These will be fully implemented as part of the complete system
 pub async fn handle_model_command(
     cmd: crate::cli::commands::ModelCommand,
     _server_url: String,
@@ -276,42 +258,28 @@ pub async fn handle_model_command(
     use crate::cli::commands::model::ModelAction;
     
     match cmd.action {
-        ModelAction::List { registry, search, remote, format } => {
+        ModelAction::List {
+            registry,
+            search,
+            remote,
+            format,
+            show_git_ref,
+            show_status,
+            branch,
+            tag,
+            dirty_only
+        } => {
             info!("📋 Listing available models...");
             
             // Use model storage directly
             let storage_paths = crate::storage::paths::StoragePaths::new()?;
-            let model_storage = crate::api::model_storage::ModelStorage::new(storage_paths.models_dir()?).await?;
+            let model_storage = crate::storage::ModelStorage::create(storage_paths.models_dir()?).await?;
             
-            let mut models = Vec::new();
-            
-            // Get local models from cache
-            let local_models = model_storage.list_local_models().await?;
-            for (model_uri, model_metadata) in local_models {
-                let category = if model_uri.name.to_lowercase().contains("instruct") {
-                    "instruct"
-                } else if model_uri.name.to_lowercase().contains("chat") {
-                    "chat"
-                } else if model_uri.name.to_lowercase().contains("code") {
-                    "code"
-                } else {
-                    "general"
-                };
-                
-                models.push((
-                    model_uri.name.clone(),
-                    "local".to_string(),
-                    format!("{:.1}GB", model_metadata.size_bytes as f64 / (1024.0 * 1024.0 * 1024.0)),
-                    category.to_string(),
-                    model_metadata.model_id.to_string(), // Add UUID
-                ));
-            }
+            let models = model_storage.list_models().await?;
             
             // Get remote models if requested
             if remote {
-                if let Some(_reg_filter) = &registry {
-                    // Remote search functionality has been deprecated
-                    // Models should be pulled directly using git URLs
+                if let Some(_) = &registry {
                     eprintln!("⚠️  Remote model search is no longer supported");
                     eprintln!("   Use 'hyprstream model pull' with a git URL instead:");
                     eprintln!("   • hyprstream model pull https://huggingface.co/Qwen/Qwen2-0.5B-Instruct");
@@ -319,47 +287,125 @@ pub async fn handle_model_command(
                 }
             }
             
-            // Apply filters
-            if let Some(reg) = &registry {
-                models.retain(|(name, _, _, _, _)| name.starts_with(reg));
-            }
-            
-            if let Some(query) = &search {
-                let query_lower = query.to_lowercase();
-                models.retain(|(name, _, _, category, uuid)| 
-                    name.to_lowercase().contains(&query_lower) || 
-                    category.to_lowercase().contains(&query_lower) ||
-                    uuid.to_lowercase().contains(&query_lower)
-                );
-            }
-            
-            if !remote {
-                models.retain(|(_, location, _, _, _)| location == "local");
-            }
+            // Determine if git info should be extracted
+            let extract_git_info = show_git_ref || show_status || branch.is_some() || tag.is_some() || dirty_only;
+
+            // Extract git information if needed
+            let models_with_git: Vec<_> = models.into_iter()
+                .map(|(model_ref, metadata)| {
+                    let git_info = if extract_git_info {
+                        // Get model path
+                        let models_dir = storage_paths.models_dir().unwrap_or_default();
+                        let model_path = models_dir.join(&model_ref.model);
+                        crate::cli::commands::model::GitInfo::from_repo_path(&model_path)
+                    } else {
+                        None
+                    };
+                    (model_ref, metadata, git_info)
+                })
+                .collect();
+
+            // Apply git-based filters
+            let filtered_models: Vec<_> = models_with_git.into_iter()
+                .filter(|(model_ref, metadata, git_info)| {
+                    // Apply search filter
+                    if let Some(query) = &search {
+                        let query_lower = query.to_lowercase();
+                        if !(model_ref.model.to_lowercase().contains(&query_lower) ||
+                             metadata.name.to_lowercase().contains(&query_lower)) {
+                            return false;
+                        }
+                    }
+
+                    // Apply git branch filter
+                    if let Some(branch_filter) = &branch {
+                        match git_info {
+                            Some(git) => {
+                                if !git.matches_branch(branch_filter) {
+                                    return false;
+                                }
+                            }
+                            None => return false, // No git info means can't match branch
+                        }
+                    }
+
+                    // Apply git tag filter
+                    if let Some(tag_filter) = &tag {
+                        match git_info {
+                            Some(git) => {
+                                if !git.matches_tag(tag_filter) {
+                                    return false;
+                                }
+                            }
+                            None => return false, // No git info means can't match tag
+                        }
+                    }
+
+                    // Apply dirty-only filter
+                    if dirty_only {
+                        match git_info {
+                            Some(git) => {
+                                if !git.is_dirty {
+                                    return false;
+                                }
+                            }
+                            None => return false, // No git info means can't determine dirty status
+                        }
+                    }
+
+                    true
+                })
+                .collect();
             
             match format.as_str() {
                 "json" => {
-                    println!("{{");
-                    println!("  \"models\": [");
-                    for (i, (name, location, size, category, uuid)) in models.iter().enumerate() {
-                        let comma = if i < models.len() - 1 { "," } else { "" };
-                        println!("    {{\"name\": \"{}\", \"location\": \"{}\", \"size\": \"{}\", \"category\": \"{}\", \"uuid\": \"{}\"}}{}", 
-                               name, location, size, category, uuid, comma);
-                    }
-                    println!("  ]");
-                    println!("}}");
+                    let json_models: Vec<_> = filtered_models.iter()
+                        .map(|(model_ref, metadata, git_info)| {
+                            let mut model_json = serde_json::json!({
+                                "name": model_ref.model,
+                                "display_name": metadata.display_name,
+                                "size_bytes": metadata.size_bytes,
+                            });
+
+                            // Add git information if available
+                            if let Some(git) = git_info {
+                                model_json["git"] = serde_json::to_value(git).unwrap_or_default();
+                            }
+
+                            model_json
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                        "models": json_models
+                    }))?);
                 },
                 _ => {
-                    println!("Available Models ({} found):", models.len());
-                    for (name, location, size, category, uuid) in &models {
-                        let status = if *location == "local" { "📁" } else { "☁️" };
-                        println!("  {} {} ({}) - {} [{}]", status, name, size, category, location);
-                        if uuid != "N/A" {
-                            println!("    🆔 UUID: {}", uuid);
-                        }
+                    // Always use enhanced table format
+                    println!("{:<30} {:<15} {:<8} {:<6} {:<10}", "MODEL NAME", "REF", "COMMIT", "STATUS", "SIZE");
+                    println!("{}", "-".repeat(75));
+
+                    for (model_ref, metadata, git_info) in &filtered_models {
+                        let size_str = if let Some(size) = metadata.size_bytes {
+                            format!("{:.1}GB", size as f64 / (1024.0 * 1024.0 * 1024.0))
+                        } else {
+                            "n/a".to_string()
+                        };
+
+                        let (git_ref, commit, status) = match git_info {
+                            Some(git) => (
+                                git.current_ref.clone().unwrap_or_else(|| "detached".to_string()),
+                                git.short_commit.clone().unwrap_or_else(|| "unknown".to_string()),
+                                if git.is_dirty { "dirty" } else { "clean" }
+                            ),
+                            None => ("n/a".to_string(), "n/a".to_string(), "n/a")
+                        };
+
+                        println!("{:<30} {:<15} {:<8} {:<6} {:<10}",
+                            model_ref.model, git_ref, commit, status, size_str);
                     }
-                    if models.is_empty() {
-                        println!("No models found matching your criteria.");
+
+                    if filtered_models.is_empty() {
+                        println!("No models found.");
                         println!("Try: hyprstream model pull https://huggingface.co/Qwen/Qwen2-1.5B-Instruct");
                     }
                 }
@@ -368,44 +414,21 @@ pub async fn handle_model_command(
         ModelAction::Clone { repo_url, git_ref, model_id: _ } => {
             info!("📦 Cloning model from Git repository...");
 
-            // Get storage paths
-            let storage_paths = crate::storage::paths::StoragePaths::new()?;
-            let models_dir = storage_paths.models_dir()?;
-
-            // Initialize GitModelSource with XET support for LFS files
-            let git_source = crate::api::git_downloader::GitModelSource::with_xet_fallback(models_dir).await;
-
-            let (model_id, model_path) = if let Some(ref_str) = git_ref {
-                // Now using async clone_ref with XET support
-                git_source.clone_ref(&repo_url, &ref_str).await?
-            } else {
-                git_source.clone_model(&repo_url).await?
-            };
-            
-            let storage_paths = crate::storage::paths::StoragePaths::new()?;
-            let models_dir = storage_paths.models_dir()?;
-            let model_storage = crate::api::model_storage::ModelStorage::new(models_dir).await?;
-            let model_name = repo_url.split('/').last()
-                .unwrap_or("unknown")
-                .trim_end_matches(".git");
-            
-            if let Err(e) = model_storage.register_with_git_registry(
-                &model_id,
-                model_name,
-                Some(repo_url.clone())
-            ).await {
-                tracing::warn!("Failed to register with Git registry: {}", e);
-            }
+            // Use shared operation
+            let cloned = crate::storage::operations::clone_model(
+                &repo_url,
+                git_ref.as_deref()
+            ).await?;
             
             println!();
             println!("✅ Model cloned successfully!");
-            println!("   Model ID: {}", model_id);
-            println!("   Name: {}", model_name);
-            println!("   Location: {}", model_path.display());
+            println!("   Model ID: {}", cloned.model_id);
+            println!("   Name: {}", cloned.model_name);
+            println!("   Location: {}", cloned.model_path.display());
             println!();
             println!("📚 Next steps:");
-            println!("   • Create adapter: hyprstream lora create --base-model {}", model_id);
-            println!("   • Run inference: hyprstream model infer {} --prompt \"...\"", model_id);
+            println!("   • Create adapter: hyprstream lora create --base-model {}", cloned.model_id);
+            println!("   • Run inference: hyprstream model infer {} --prompt \"...\"", cloned.model_id);
         }
         ModelAction::Pull { uri, force, .. } => {
             info!("📥 Pulling model: {}", uri);
@@ -415,7 +438,7 @@ pub async fn handle_model_command(
             let models_dir = storage_paths.models_dir()?;
             
             // Initialize GitModelSource with XET support for LFS files
-            let git_source = crate::api::git_downloader::GitModelSource::with_xet_fallback(models_dir.clone()).await;
+            let git_source = crate::storage::GitModelSource::new(models_dir.clone());
 
             match git_source.clone_model(&uri).await {
                 Ok((model_id, model_path)) => {
@@ -424,22 +447,7 @@ pub async fn handle_model_command(
                     println!("   Model ID: {}", model_id);
                     println!("   Location: {}", model_path.display());
                     
-                    // Save metadata
-                    let model_storage = crate::api::model_storage::ModelStorage::new(models_dir).await?;
-                    let metadata = crate::api::model_storage::ModelMetadataFile {
-                        model_id: model_id.clone(),
-                        name: uri.clone(),
-                        display_name: uri.clone(),
-                        source_uri: uri.clone(),
-                        architecture: None,
-                        parameters: None,
-                        created_at: chrono::Utc::now().timestamp(),
-                        last_accessed: chrono::Utc::now().timestamp(),
-                    };
-                    model_storage.save_model_metadata_file(&model_id, &metadata).await?;
-                    
-                    // Register with Git registry (if available)
-                    // Extract a friendly name from the URI
+                    let model_storage = crate::storage::ModelStorage::create(models_dir).await?;
                     let model_name = uri.split('/').last().unwrap_or(&uri);
                     if let Err(e) = model_storage.register_with_git_registry(
                         &model_id, 
@@ -467,7 +475,7 @@ pub async fn handle_model_command(
             let storage_paths = crate::storage::paths::StoragePaths::new()?;
             let models_dir = storage_paths.models_dir()?;
             
-            let mut sharing = crate::api::model_sharing::ModelSharing::new(models_dir).await?;
+            let mut sharing = crate::storage::sharing::ModelSharing::new(models_dir).await?;
             
             // Create shareable reference
             let share_ref = sharing.create_share_ref(&model_name, include_metrics).await?;
@@ -506,7 +514,7 @@ pub async fn handle_model_command(
             let storage_paths = crate::storage::paths::StoragePaths::new()?;
             let models_dir = storage_paths.models_dir()?;
             
-            let mut sharing = crate::api::model_sharing::ModelSharing::new(models_dir).await?;
+            let mut sharing = crate::storage::sharing::ModelSharing::new(models_dir).await?;
             
             // Parse share reference if provided as JSON
             let share_ref = if git_url.starts_with('{') {
@@ -514,9 +522,9 @@ pub async fn handle_model_command(
                 serde_json::from_str(&git_url)?
             } else {
                 // Create minimal share ref
-                crate::api::model_sharing::ShareableModelRef {
+                crate::storage::sharing::ShareableModelRef {
                     name: name.clone().unwrap_or_else(|| "imported-model".to_string()),
-                    model_type: crate::api::model_sharing::ModelType::Base,
+                    model_type: crate::storage::sharing::ModelType::Base,
                     git_url: Some(git_url.clone()),
                     commit: "HEAD".to_string(),
                     size_bytes: 0,
@@ -534,15 +542,15 @@ pub async fn handle_model_command(
         }
         
         ModelAction::Remove { uri, keep_metadata, yes } => {
-            // Parse as UUID only - no fallbacks
-            let model_id = crate::api::model_storage::ModelId::from_str(&uri)
-                .map_err(|_| anyhow::anyhow!("Invalid UUID: '{}'. Use 'hyprstream model list' to see model UUIDs", uri))?;
+            // Parse model reference (e.g., "gitignore", "Qwen3-4B", "qwen/qwen-2b")
+            let model_ref = crate::storage::ModelRef::parse(&uri)
+                .map_err(|e| anyhow::anyhow!("Invalid model reference '{}': {}. Use 'hyprstream model list' to see available models", uri, e))?;
 
-            info!("🗑️ Removing model: {}", model_id);
+            info!("🗑️ Removing model: {}", model_ref.model);
 
             // Check if confirmation is needed
             if !yes {
-                println!("⚠️  Are you sure you want to remove model '{}'?", model_id);
+                println!("⚠️  Are you sure you want to remove model '{}'?", model_ref.model);
                 println!("This action cannot be undone.");
                 println!("");
                 println!("Type 'yes' to confirm, or use --yes flag to skip confirmation:");
@@ -558,18 +566,25 @@ pub async fn handle_model_command(
                 }
             }
 
-            // Get storage paths
+            // Get storage paths and model storage
             let storage_paths = crate::storage::paths::StoragePaths::new()?;
             let models_dir = storage_paths.models_dir()?;
+            let model_storage = crate::storage::ModelStorage::create(models_dir.clone()).await?;
 
-            // Direct UUID path - no fallbacks
-            let model_path = models_dir.join(model_id.to_string());
+            // Get model path from storage
+            let model_path = match model_storage.get_model_path(&model_ref).await {
+                Ok(path) => path,
+                Err(_) => {
+                    // Fallback to direct path lookup
+                    models_dir.join(&model_ref.model)
+                }
+            };
 
             // Check if model exists
             if !model_path.exists() {
-                eprintln!("❌ Model {} not found", model_id);
+                eprintln!("❌ Model '{}' not found", model_ref.model);
                 eprintln!("   Use 'hyprstream model list' to see available models");
-                return Err(anyhow::anyhow!("Model {} not found", model_id).into());
+                return Err(anyhow::anyhow!("Model '{}' not found", model_ref.model).into());
             }
 
             // Remove the model directory
@@ -580,71 +595,75 @@ pub async fn handle_model_command(
                 return Err(e.into());
             }
 
-            // Remove metadata unless keeping it
+            // Note: With git-native storage, metadata is embedded in the repository
+            // No separate metadata cleanup needed unless we implement registry cleanup
             if !keep_metadata {
-                let model_storage = crate::api::model_storage::ModelStorage::new(models_dir).await?;
-                if let Err(e) = model_storage.remove_metadata_by_id(&model_id).await {
-                    eprintln!("⚠️  Failed to remove metadata: {}", e);
-                    // Continue anyway since files are already deleted
-                }
-                println!("🗑️ Model metadata removed");
+                println!("🗑️ Model and git repository removed");
             } else {
-                println!("📋 Model metadata preserved");
+                println!("📋 Model files removed (git repository data deleted)");
             }
 
-            println!("✅ Model {} removed successfully", model_id);
+            println!("✅ Model '{}' removed successfully", model_ref.model);
         }
         ModelAction::Info { uri, format } => {
-            // Parse as UUID only for local models
-            let model_id = crate::api::model_storage::ModelId::from_str(&uri)
-                .map_err(|_| anyhow::anyhow!("Invalid UUID: '{}'. For remote model info, use 'hyprstream model search'", uri))?;
+            // Parse model reference (e.g., "Qwen3-4B", "qwen/qwen-2b", "model:branch")
+            let model_ref = crate::storage::ModelRef::parse(&uri)
+                .map_err(|e| anyhow::anyhow!("Invalid model reference '{}': {}. Use 'hyprstream model list' to see available models", uri, e))?;
 
-            info!("ℹ️ Getting model info: {}", model_id);
+            info!("ℹ️ Getting model info: {}", model_ref.model);
 
-            // Get storage and retrieve metadata
             let storage_paths = crate::storage::paths::StoragePaths::new()?;
-            let model_storage = crate::api::model_storage::ModelStorage::new(storage_paths.models_dir()?).await?;
-            let metadata = model_storage.get_metadata_by_id(&model_id).await?;
+            let model_storage = crate::storage::ModelStorage::create(storage_paths.models_dir()?).await?;
+
+            // Check if model exists and get path
+            let model_path = match model_storage.get_model_path(&model_ref).await {
+                Ok(path) => path,
+                Err(_) => {
+                    eprintln!("❌ Model '{}' not found", model_ref.model);
+                    eprintln!("   Use 'hyprstream model list' to see available models");
+                    return Err(anyhow::anyhow!("Model '{}' not found", model_ref.model).into());
+                }
+            };
+
+            // Extract metadata from git repo directly
+            let metadata = extract_model_metadata(&model_path, &model_ref.model)?;
 
             // Display metadata
             match format.as_str() {
                 "json" => {
                     let json_output = serde_json::json!({
-                        "model_id": metadata.model_id.to_string(),
                         "name": metadata.name,
                         "display_name": metadata.display_name,
-                        "architecture": metadata.architecture,
-                        "parameters": metadata.parameters,
+                        "model_type": metadata.model_type,
                         "size_bytes": metadata.size_bytes,
-                        "size_gb": format!("{:.2}", metadata.size_bytes as f64 / 1_073_741_824.0),
+                        "size_gb": format!("{:.2}", metadata.size_bytes.unwrap_or(0) as f64 / 1_073_741_824.0),
                         "created_at": metadata.created_at,
-                        "last_accessed": metadata.last_accessed,
+                        "updated_at": metadata.updated_at,
+                        "tags": metadata.tags,
                     });
                     println!("{}", serde_json::to_string_pretty(&json_output)?);
                 }
                 "yaml" => {
-                    println!("model_id: {}", metadata.model_id);
                     println!("name: {}", metadata.name);
                     if let Some(display_name) = &metadata.display_name {
                         println!("display_name: {}", display_name);
                     }
-                    println!("architecture: {}", metadata.architecture);
-                    if let Some(params) = metadata.parameters {
-                        println!("parameters: {}", params);
+                    println!("model_type: {}", metadata.model_type);
+                    if let Some(size) = metadata.size_bytes {
+                        println!("size_gb: {:.2}", size as f64 / 1_073_741_824.0);
                     }
-                    println!("size_gb: {:.2}", metadata.size_bytes as f64 / 1_073_741_824.0);
+                    println!("created_at: {}", metadata.created_at);
+                    println!("updated_at: {}", metadata.updated_at);
                 }
                 _ => {
                     println!("Model: {}", metadata.name);
-                    println!("UUID: {}", metadata.model_id);
                     if let Some(display_name) = &metadata.display_name {
                         println!("Display Name: {}", display_name);
                     }
-                    println!("Architecture: {}", metadata.architecture);
-                    if let Some(params) = metadata.parameters {
-                        println!("Parameters: {}", params);
+                    println!("Type: {}", metadata.model_type);
+                    if let Some(size) = metadata.size_bytes {
+                        println!("Size: {:.2} GB", size as f64 / 1_073_741_824.0);
                     }
-                    println!("Size: {:.2} GB", metadata.size_bytes as f64 / 1_073_741_824.0);
                     println!("Status: ✅ Available");
                 }
             }
@@ -674,9 +693,8 @@ pub async fn handle_model_command(
                 }
             }
             
-            // Get storage and run repair
             let storage_paths = crate::storage::paths::StoragePaths::new()?;
-            let model_storage = crate::api::model_storage::ModelStorage::new(storage_paths.models_dir()?).await?;
+            let model_storage = crate::storage::ModelStorage::create(storage_paths.models_dir()?).await?;
             
             if verbose {
                 println!("📂 Models directory: {}", storage_paths.models_dir()?.display());
@@ -690,17 +708,16 @@ pub async fn handle_model_command(
                     
                     // List repaired models
                     if verbose {
-                        if let Ok(models) = model_storage.children().await {
+                        if let Ok(models) = model_storage.list_models().await {
                             println!("\n📋 {} models found after repair:", models.len());
-                            for (id, metadata) in models.iter().take(10) {
-                                println!("  🆔 {} - {}", id, metadata.name);
+                            for (model_ref, metadata) in models.iter() {
+                                println!("  📁 {} ({})", model_ref.model, metadata.name);
                                 if let Some(display_name) = &metadata.display_name {
                                     println!("     Display: {}", display_name);
                                 }
-                                println!("     Size: {:.2} GB", metadata.size_bytes as f64 / 1_073_741_824.0);
-                            }
-                            if models.len() > 10 {
-                                println!("  ... and {} more", models.len() - 10);
+                                if let Some(size) = metadata.size_bytes {
+                                    println!("     Size: {:.2} GB", size as f64 / 1_073_741_824.0);
+                                }
                             }
                         }
                     }
@@ -748,9 +765,7 @@ pub async fn handle_model_command(
             
             // Model conversion is no longer supported
             eprintln!("❌ Model conversion has been removed.");
-            eprintln!("   Model format conversion is not supported.");
             eprintln!("   Please download models directly in SafeTensors format.");
-            eprintln!("");
             eprintln!("   Try: hyprstream model pull https://huggingface.co/<org>/<model-name>");
         }
         ModelAction::Cache { action: _ } => {
@@ -758,7 +773,7 @@ pub async fn handle_model_command(
             
             // Use real model management system for cache info
             let storage_paths = crate::storage::paths::StoragePaths::new()?;
-            let model_storage = crate::api::model_storage::ModelStorage::new(storage_paths.models_dir()?).await?;
+            let model_storage = crate::storage::ModelStorage::create(storage_paths.models_dir()?).await?;
             let cached_models = model_storage.list_local_models().await?;
             let cache_stats = model_storage.get_cache_stats().await?;
             
@@ -773,13 +788,13 @@ pub async fn handle_model_command(
                 println!("Try: hyprstream model pull hf://Qwen/Qwen2-1.5B-Instruct");
             } else {
                 println!("Cached Models:");
-                for (model_uri, model_metadata) in cached_models {
+                for (model_ref, model_metadata) in cached_models {
                     use chrono::{DateTime, Utc};
-                    let accessed_dt = DateTime::<Utc>::from_timestamp(model_metadata.last_accessed, 0)
+                    let accessed_dt = DateTime::<Utc>::from_timestamp(model_metadata.updated_at, 0)
                         .unwrap_or_else(|| Utc::now());
-                    println!("  📁 {} ({:.1} GB) - Last accessed: {}", 
-                        model_uri.name,
-                        model_metadata.size_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    println!("  📁 {} ({:.1} GB) - Last accessed: {}",
+                        model_ref.model,
+                        model_metadata.size_bytes.unwrap_or(0) as f64 / (1024.0 * 1024.0 * 1024.0),
                         accessed_dt.format("%Y-%m-%d %H:%M:%S")
                     );
                 }
@@ -810,86 +825,30 @@ pub async fn handle_model_command(
             use std::path::PathBuf;
             
             debug!("Looking up model: {}", model);
-            
-            // Initialize model storage to find models
+
+            // Parse model reference (e.g., "Qwen3-4B", "qwen/qwen-2b", "model:branch")
+            let model_ref = crate::storage::ModelRef::parse(&model)
+                .map_err(|e| anyhow::anyhow!("Invalid model reference '{}': {}. Use 'hyprstream model list' to see available models", model, e))?;
+
+            // Initialize model storage
             let storage_paths = crate::storage::paths::StoragePaths::new()?;
-            let model_storage = crate::api::model_storage::ModelStorage::new(storage_paths.models_dir()?).await?;
-            
-            // Get all available models (this calls children() which scans for models with model.json)
-            let available_models = model_storage.children().await?;
-            
-            // Try to find the model by UUID, name, or display name
-            let mut found_model = None;
-            for (model_id, metadata) in available_models {
-                // Check if UUID matches
-                if model_id.to_string() == model {
-                    debug!("Found model by UUID: {}", model);
-                    found_model = Some((model_id, metadata));
-                    break;
+            let models_dir = storage_paths.models_dir()?;
+            let model_storage = crate::storage::ModelStorage::create(models_dir.clone()).await?;
+
+            // Get model path using the same method as remove command
+            let model_path = match model_storage.get_model_path(&model_ref).await {
+                Ok(path) => path,
+                Err(_) => {
+                    // Fallback to direct path lookup if not in registry
+                    models_dir.join(&model_ref.model)
                 }
-                
-                // Check if name matches
-                if metadata.name == model {
-                    debug!("Found model by name: {}", model);
-                    found_model = Some((model_id, metadata));
-                    break;
-                }
-                
-                // Check if display name matches
-                if let Some(ref display_name) = metadata.display_name {
-                    if display_name == &model || display_name.ends_with(&format!("/{}", model)) {
-                        debug!("Found model by display name: {}", display_name);
-                        found_model = Some((model_id, metadata));
-                        break;
-                    }
-                }
-                
-                // Check if it's a partial match (just the model part of org/model)
-                if model.contains('/') {
-                    if metadata.name == model || metadata.name.ends_with(&format!("/{}", model)) {
-                        debug!("Found model by partial name: {}", &metadata.name);
-                        found_model = Some((model_id, metadata));
-                        break;
-                    }
-                } else {
-                    // Check if the model name ends with the requested name
-                    let name_parts: Vec<&str> = metadata.name.split('/').collect();
-                    if let Some(last_part) = name_parts.last() {
-                        if last_part == &model {
-                            debug!("Found model by short name: {} (full: {})", model, &metadata.name);
-                            found_model = Some((model_id, metadata));
-                            break;
-                        }
-                    }
-                }
-            }
-            
-            // Get the model path or error if not found
-            let model_path = match found_model {
-                Some((model_id, _metadata)) => {
-                    // Use UUID-based path
-                    storage_paths.models_dir()?.join(model_id.to_string())
-                }
-                None => {
-                    error!("Model '{}' not found in model storage", model);
-                    eprintln!("Error: Model '{}' not found", model);
-                    eprintln!("Available models:");
-                    
-                    // List available models to help the user
-                    let available_models = model_storage.children().await?;
-                    if available_models.is_empty() {
-                        eprintln!("  No models found. Download one with:");
-                        eprintln!("  hyprstream model pull https://huggingface.co/Qwen/Qwen2-0.5B-Instruct");
-                    } else {
-                        for (_id, metadata) in available_models.iter().take(5) {
-                            eprintln!("  - {} (UUID: {})", metadata.name, metadata.model_id);
-                        }
-                        if available_models.len() > 5 {
-                            eprintln!("  ... and {} more", available_models.len() - 5);
-                        }
-                    }
-                    return Ok(());
-                }
+            };
+
+            if !model_path.exists() {
+                error!("Model '{}' not found in model storage", model_ref.model);
+                eprintln!("❌ Model '{}' not found", model_ref.model);
+                eprintln!("   Use 'hyprstream model list' to see available models");
+                return Err(anyhow::anyhow!("Model '{}' not found", model_ref.model).into());
             };
             
             info!("Using model at: {}", model_path.display());
@@ -1014,7 +973,7 @@ pub async fn handle_model_command(
             );
         }
     }
-    
+
     Ok(())
 }
 
@@ -1229,9 +1188,8 @@ pub async fn handle_chat_command(
                 }
             }
             Err(e) => {
-                // Fallback to mock response if inference fails
                 println!("⚠️ Inference error: {}", e);
-                println!("📤 Response: [Mock response - inference system integration needed]");
+                println!("📤 Response: [Inference error occurred]");
                 
                 if cmd.train {
                     println!("📈 Training skipped due to inference failure");
@@ -1255,8 +1213,7 @@ pub async fn handle_chat_command(
     println!("Type 'quit' or 'exit' to end the conversation");
     println!("---");
     
-    println!("💡 Interactive chat coming soon!");
-    println!("   Integration with conversation router and inference system needed");
+    println!("💡 Interactive chat mode will be implemented in future versions");
     
     Ok(())
 }
@@ -1397,6 +1354,96 @@ async fn run_temporal_training(
     engine.train_temporal_lora(prompt, expected_response, learning_rate).await?;
     
     tracing::info!("✅ Temporal LoRA training completed");
-    
+
     Ok(())
+}
+
+/// Extract model metadata directly from git repository
+fn extract_model_metadata(model_path: &std::path::Path, model_name: &str) -> Result<ModelMetadata, Box<dyn std::error::Error>> {
+    // Calculate directory size
+    let size_bytes = calculate_directory_size(model_path).unwrap_or(0);
+
+    // Get git metadata if available
+    let (created_at, updated_at) = if let Ok(repo) = git2::Repository::open(model_path) {
+        // Get first commit time as created_at
+        let created_at = repo.head().ok()
+            .and_then(|head| head.peel_to_commit().ok())
+            .map(|commit| commit.time().seconds())
+            .unwrap_or_else(|| std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap().as_secs() as i64);
+
+        // Get last commit time as updated_at
+        let updated_at = repo.head().ok()
+            .and_then(|head| head.peel_to_commit().ok())
+            .map(|commit| commit.time().seconds())
+            .unwrap_or(created_at);
+
+        (created_at, updated_at)
+    } else {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap().as_secs() as i64;
+        (now, now)
+    };
+
+    // Try to read model card or config for display name
+    let display_name = read_model_display_name(model_path);
+
+    Ok(ModelMetadata {
+        name: model_name.to_string(),
+        display_name,
+        model_type: "transformer".to_string(), // Default type
+        size_bytes: Some(size_bytes),
+        created_at,
+        updated_at,
+        tags: Vec::new(),
+    })
+}
+
+/// Calculate directory size recursively
+fn calculate_directory_size(dir: &std::path::Path) -> std::io::Result<u64> {
+    let mut total_size = 0;
+
+    if dir.is_dir() {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if path.is_dir() {
+                total_size += calculate_directory_size(&path)?;
+            } else {
+                total_size += entry.metadata()?.len();
+            }
+        }
+    }
+
+    Ok(total_size)
+}
+
+/// Try to extract display name from model card or config
+fn read_model_display_name(model_path: &std::path::Path) -> Option<String> {
+    // Try README.md first
+    if let Ok(readme) = std::fs::read_to_string(model_path.join("README.md")) {
+        // Look for title in first few lines
+        for line in readme.lines().take(10) {
+            if let Some(title) = line.strip_prefix("# ") {
+                return Some(title.trim().to_string());
+            }
+        }
+    }
+
+    // Try config.json
+    if let Ok(config) = std::fs::read_to_string(model_path.join("config.json")) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&config) {
+            if let Some(name) = json.get("name").and_then(|v| v.as_str()) {
+                return Some(name.to_string());
+            }
+            if let Some(name) = json.get("model_name").and_then(|v| v.as_str()) {
+                return Some(name.to_string());
+            }
+        }
+    }
+
+    None
 }

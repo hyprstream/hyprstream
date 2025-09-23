@@ -565,7 +565,6 @@ pub struct SchedulerStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // use crate::storage::vdb::{VDBSparseStorage, SparseStorageConfig};
     
     #[tokio::test]
     async fn test_scheduler_creation() {
@@ -573,15 +572,6 @@ mod tests {
             BlockEngine::new(16, 100, 100).await.unwrap()
         );
         
-        // Commented out - VDB removed
-        // let storage_config = SparseStorageConfig::default();
-        // let vdb_storage = Arc::new(VDBSparseStorage::new(storage_config).await.unwrap());
-        // let temporal_layer = Arc::new(
-        //     crate::storage::vdb::TemporalStreamingLayer::new(
-        //         vdb_storage,
-        //         Default::default()
-        //     ).await.unwrap()
-        // );
         //
         // let router = Arc::new(ConversationRouter::new(temporal_layer).await);
 

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use uuid::Uuid;
-use crate::api::model_storage::ModelId;
+use crate::storage::ModelId;
 
 /// Registry metadata stored in registry.json
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -3,33 +3,11 @@
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use crate::{
-    api::{
-        adapter_storage::AdapterStorage,
-        model_storage::ModelStorage,
-    },
+    api::{adapter_storage::AdapterStorage, training_service::TrainingService},
+    storage::{ModelStorage, SharedModelRegistry},
 };
 use super::model_cache::ModelCache;
 
-/// Training service stub - placeholder until VDB storage integration
-pub struct TrainingStub;
-
-impl TrainingStub {
-    pub async fn start_auto_training(&self, _lora_id: &str, _config: crate::api::training_service::TrainingConfig) -> Result<(), anyhow::Error> {
-        Err(anyhow::anyhow!("Training service not yet implemented"))
-    }
-    
-    pub async fn stop_auto_training(&self, _lora_id: &str) -> Result<(), anyhow::Error> {
-        Ok(())
-    }
-    
-    pub async fn get_training_status(&self, _lora_id: &str) -> Result<crate::api::training_service::TrainingStatus, anyhow::Error> {
-        Err(anyhow::anyhow!("Training service not yet implemented"))
-    }
-    
-    pub async fn queue_training_sample(&self, _lora_id: &str, _sample: crate::api::TrainingSample) -> Result<(), anyhow::Error> {
-        Ok(())
-    }
-}
 
 /// Shared server state
 #[derive(Clone)]
@@ -43,8 +21,8 @@ pub struct ServerState {
     /// Model storage for managing downloaded models
     pub model_storage: Arc<ModelStorage>,
     
-    /// Training service for auto-regressive learning (stub)
-    pub training_service: Arc<TrainingStub>,
+    /// Training service for auto-regressive learning
+    pub training_service: Arc<TrainingService>,
     
     /// Server configuration
     pub config: Arc<ServerConfig>,
@@ -284,31 +262,38 @@ impl ServerState {
         };
         
         tracing::info!("Initializing model storage at: {:?}", models_dir);
-        let model_storage = Arc::new(ModelStorage::new(models_dir.clone()).await?);
+        let model_storage = Arc::new(ModelStorage::create(models_dir.clone()).await?);
         
         // Initialize adapter storage
         tracing::info!("Initializing adapter storage at: {:?}", models_dir);
         let adapter_storage = Arc::new(AdapterStorage::new(models_dir.clone()).await?);
 
-        let training_service = Arc::new(TrainingStub);
+        // Initialize training service with a runtime engine
+        use crate::runtime::{RuntimeEngine, TorchEngine, RuntimeConfig};
+        let runtime_engine: Arc<dyn RuntimeEngine> = Arc::new(TorchEngine::new(RuntimeConfig::default())?);
+        let training_service = Arc::new(TrainingService::new(runtime_engine));
         
         // Initialize model cache
+        let checkout_base = models_dir.join("checkouts");
+        std::fs::create_dir_all(&checkout_base)?;
+
+        // Get the registry from model_storage
+        let registry = model_storage.registry();
+
         let model_cache = Arc::new(ModelCache::new(
             config.max_cached_models,
-            Arc::clone(&model_storage),
-        ));
+            registry,
+            checkout_base,
+        )?);
         
-        // Pre-populate name cache to avoid disk scanning on first requests
-        if let Err(e) = model_cache.warm_name_cache().await {
-            tracing::warn!("Failed to warm name cache: {}. First requests may be slower.", e);
-        }
+        // Model cache is ready to use
         
         // Preload models for faster first request
         if !config.preload_models.is_empty() {
             tracing::info!("Preloading {} models into cache...", config.preload_models.len());
             for model_name in &config.preload_models {
                 tracing::info!("Preloading model: {}", model_name);
-                match model_cache.get_or_load_by_name(model_name).await {
+                match model_cache.get_or_load(model_name).await {
                     Ok(_) => tracing::info!("Successfully preloaded model: {}", model_name),
                     Err(e) => tracing::warn!("Failed to preload model '{}': {}", model_name, e),
                 }

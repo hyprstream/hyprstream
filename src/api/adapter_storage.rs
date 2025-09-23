@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use uuid::Uuid;
 use chrono::Utc;
-use crate::api::model_storage::ModelId;
+use crate::storage::ModelId;
 use crate::git::{BranchManager, BranchInfo};
 use crate::storage::{XetNativeStorage, XetConfig};
 use std::sync::Arc;

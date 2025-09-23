@@ -4,7 +4,6 @@ use crate::inference::{InferenceInput, InferenceOutput, InferenceToken, FusedAda
 use crate::inference::model_loader::ModelLoader;
 use crate::runtime::{RuntimeEngine, TorchEngine};
 use crate::config::{HyprConfig};
-// use crate::storage::vdb::hardware_accelerated::HardwareVDBStorage;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -211,7 +210,6 @@ impl InferenceEngine {
     pub async fn stream_infer_with_updates(
         &self,
         _model_loader: &ModelLoader,
-        _vdb_storage: &(), // HardwareVDBStorage removed
         session: crate::inference::InferenceSession,
         input: InferenceInput,
         mut _update_channel: mpsc::Receiver<crate::inference::SparseWeightUpdate>,

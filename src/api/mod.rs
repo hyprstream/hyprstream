@@ -6,15 +6,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use serde::{Deserialize, Serialize};
 
-pub mod model_registry;
-pub mod model_storage;
-pub mod model_downloader;
-pub mod git_downloader;
 pub mod adapter_storage;
-pub mod model_sharing;
 pub mod openai_compat;
 pub mod training_service;
-pub mod model_identifier;
 
 use adapter_storage::{AdapterStorage, AdapterId, AdapterConfig};
 use training_service::{TrainingService, TrainingConfig};

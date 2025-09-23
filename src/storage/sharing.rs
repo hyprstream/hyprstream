@@ -7,7 +7,7 @@ use anyhow::{Result, Context, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use git2::Repository;
-use crate::api::model_storage::ModelId;
+use crate::storage::ModelId;
 use crate::api::adapter_storage::AdapterId;
 use crate::git::GitModelRegistry;
 use std::sync::Arc;

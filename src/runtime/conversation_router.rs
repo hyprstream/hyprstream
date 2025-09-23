@@ -14,7 +14,6 @@ use uuid::Uuid;
 use crate::runtime::{RuntimeEngine};
 use crate::config::{GenerationRequest, RealtimeAdaptationRequest};
 use crate::adapters::lora_checkpoints::LoRACheckpoint;
-// use crate::storage::vdb::TemporalStreamingLayer;
 
 /// Conversation routing for seamless model transitions
 pub struct ConversationRouter {
@@ -22,8 +21,6 @@ pub struct ConversationRouter {
     active_conversations: Arc<RwLock<HashMap<String, ConversationSession>>>,
     /// Model pool for hot-swapping
     model_pool: Arc<ModelPool>,
-    /// Temporal streaming for real-time adaptation (VDB removed)
-    // temporal_streaming: Arc<TemporalStreamingLayer>,
     /// Routing configuration
     config: RoutingConfig,
 }
@@ -163,13 +160,11 @@ impl ConversationRouter {
     /// Create new conversation router
     pub async fn new(
         model_pool: Arc<ModelPool>,
-        // temporal_streaming: Arc<TemporalStreamingLayer>, // VDB removed
         config: RoutingConfig,
     ) -> Result<Self> {
         Ok(Self {
             active_conversations: Arc::new(RwLock::new(HashMap::new())),
             model_pool,
-            // temporal_streaming, // VDB removed
             config,
         })
     }
