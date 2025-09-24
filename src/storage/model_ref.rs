@@ -36,7 +36,9 @@ impl ModelRef {
         // Validate model name
         validate_model_name(&model)?;
         if let Some(ref r) = git_ref {
-            validate_git_ref(r)?;
+            if !git2::Reference::is_valid_name(r) {
+                bail!("Invalid git reference name: '{}'", r);
+            }
         }
 
         Ok(ModelRef { model, git_ref })
@@ -79,19 +81,48 @@ pub fn validate_model_name(name: &str) -> Result<()> {
         bail!("Model name must be 1-{} characters", MAX_LEN);
     }
 
-    // Must be alphanumeric with hyphens only (allow mixed case for HuggingFace compatibility)
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        bail!("Model name must contain only a-z, A-Z, 0-9, and hyphens");
+    // Follow Git reference naming rules (but adapted for model names)
+    // Reject characters that Git doesn't allow
+    if name.chars().any(|c|
+        c.is_ascii_control() ||    // ASCII control characters
+        c == ' ' ||                // Space
+        c == '~' ||                // Tilde
+        c == '^' ||                // Caret
+        c == ':' ||                // Colon
+        c == '?' ||                // Question mark
+        c == '*' ||                // Asterisk
+        c == '[' ||                // Open bracket
+        c == '\\' ||               // Backslash
+        c == '\t' ||               // Tab
+        c == '\n' ||               // Newline
+        c == '\r'                  // Carriage return
+    ) {
+        bail!("Model name contains invalid characters (spaces, control chars, or Git-forbidden chars)");
     }
 
-    // Can't start/end with hyphen
-    if name.starts_with('-') || name.ends_with('-') {
-        bail!("Model name cannot start or end with hyphen");
+    // No consecutive dots (Git rule)
+    if name.contains("..") {
+        bail!("Model name cannot contain consecutive dots (..)");
     }
 
-    // No consecutive hyphens
-    if name.contains("--") {
-        bail!("Model name cannot contain consecutive hyphens");
+    // Cannot end with .lock (Git rule)
+    if name.ends_with(".lock") {
+        bail!("Model name cannot end with '.lock'");
+    }
+
+    // Cannot be just "@" (Git rule)
+    if name == "@" {
+        bail!("Model name cannot be '@'");
+    }
+
+    // Cannot contain @{ sequence (Git rule)
+    if name.contains("@{") {
+        bail!("Model name cannot contain '@{{' sequence");
+    }
+
+    // Cannot start or end with dot (adapted Git rule - no component can start with dot)
+    if name.starts_with('.') || name.ends_with('.') {
+        bail!("Model name cannot start or end with dot");
     }
 
     // Check reserved names
@@ -102,27 +133,6 @@ pub fn validate_model_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate git reference
-pub fn validate_git_ref(ref_str: &str) -> Result<()> {
-    // Security: prevent injection attacks
-    if ref_str.contains("..") || ref_str.contains("~") || ref_str.contains("^") {
-        bail!("Git ref contains dangerous revision syntax");
-    }
-
-    if ref_str.len() > 128 {
-        bail!("Git ref too long (max 128 chars)");
-    }
-
-    // Allow valid git ref characters
-    if !ref_str.chars().all(|c|
-        c.is_ascii_alphanumeric() ||
-        c == '-' || c == '_' || c == '.' || c == '/'
-    ) {
-        bail!("Git ref contains invalid characters");
-    }
-
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
@@ -153,34 +163,62 @@ mod tests {
 
     #[test]
     fn test_validate_model_name() {
-        // Valid names
+        // Valid names (Git-compliant)
         assert!(validate_model_name("llama3").is_ok());
         assert!(validate_model_name("gpt-2").is_ok());
         assert!(validate_model_name("model-123").is_ok());
         assert!(validate_model_name("Qwen3-4B").is_ok()); // HuggingFace mixed case
         assert!(validate_model_name("GPT-4").is_ok()); // uppercase
-        assert!(validate_model_name("Model").is_ok()); // mixed case now allowed
+        assert!(validate_model_name("Model").is_ok()); // mixed case
+        assert!(validate_model_name("Qwen3-0.6B").is_ok()); // dots in version numbers
+        assert!(validate_model_name("model-v1.2.3").is_ok()); // dots in versions
+        assert!(validate_model_name("model_with_underscores").is_ok()); // underscores now allowed
+        assert!(validate_model_name("model/submodel").is_ok()); // slashes now allowed
+        assert!(validate_model_name("org-name_model.v1").is_ok()); // mixed separators
+        assert!(validate_model_name("123model").is_ok()); // starting with numbers
+        assert!(validate_model_name("model+special").is_ok()); // plus signs
+        assert!(validate_model_name("model=equals").is_ok()); // equals signs
 
-        // Invalid names
-        assert!(validate_model_name("").is_err());
-        assert!(validate_model_name("-model").is_err());
-        assert!(validate_model_name("model-").is_err());
-        assert!(validate_model_name("model--name").is_err());
+        // Invalid names (following Git rules)
+        assert!(validate_model_name("").is_err()); // empty
+        assert!(validate_model_name(".model").is_err()); // starts with dot
+        assert!(validate_model_name("model.").is_err()); // ends with dot
+        assert!(validate_model_name("model..name").is_err()); // consecutive dots
+        assert!(validate_model_name("model.lock").is_err()); // ends with .lock
+        assert!(validate_model_name("@").is_err()); // just @
+        assert!(validate_model_name("model@{ref}").is_err()); // contains @{
         assert!(validate_model_name("api").is_err()); // reserved
         assert!(validate_model_name("model with spaces").is_err()); // spaces not allowed
+        assert!(validate_model_name("model~1").is_err()); // tilde not allowed
+        assert!(validate_model_name("model^HEAD").is_err()); // caret not allowed
+        assert!(validate_model_name("model:tag").is_err()); // colon not allowed
+        assert!(validate_model_name("model?query").is_err()); // question mark not allowed
+        assert!(validate_model_name("model*glob").is_err()); // asterisk not allowed
+        assert!(validate_model_name("model[bracket]").is_err()); // bracket not allowed
     }
 
     #[test]
-    fn test_validate_git_ref() {
-        // Valid refs
-        assert!(validate_git_ref("main").is_ok());
-        assert!(validate_git_ref("v1.0.0").is_ok());
-        assert!(validate_git_ref("feature/new-model").is_ok());
-        assert!(validate_git_ref("abc123def").is_ok());
+    fn test_git_ref_validation() {
+        // Test using git2::Reference::is_valid_name directly
+        // Valid refs (according to libgit2)
+        assert!(git2::Reference::is_valid_name("refs/heads/main"));
+        assert!(git2::Reference::is_valid_name("refs/tags/v1.0.0"));
+        assert!(git2::Reference::is_valid_name("refs/heads/feature/new-model"));
+        assert!(git2::Reference::is_valid_name("HEAD"));
+        assert!(git2::Reference::is_valid_name("ORIG_HEAD"));
 
-        // Invalid refs
-        assert!(validate_git_ref("main~1").is_err());
-        assert!(validate_git_ref("HEAD^").is_err());
-        assert!(validate_git_ref("../etc/passwd").is_err());
+        // Invalid refs (according to libgit2)
+        assert!(!git2::Reference::is_valid_name("main")); // one-level refs not allowed by default
+        assert!(!git2::Reference::is_valid_name("main~1")); // tilde
+        assert!(!git2::Reference::is_valid_name("HEAD^")); // caret
+        assert!(!git2::Reference::is_valid_name("branch..other")); // consecutive dots
+        assert!(!git2::Reference::is_valid_name("@")); // just @
+        assert!(!git2::Reference::is_valid_name("branch@{HEAD}")); // @{ sequence
+        assert!(!git2::Reference::is_valid_name("/invalid")); // starts with slash
+        assert!(!git2::Reference::is_valid_name("invalid/")); // ends with slash
+        assert!(!git2::Reference::is_valid_name("refs/heads//double")); // consecutive slashes
+        assert!(!git2::Reference::is_valid_name("refs/.hidden")); // component starts with dot
+        assert!(!git2::Reference::is_valid_name("branch:tag")); // colon not allowed
+        assert!(!git2::Reference::is_valid_name("branch with spaces")); // spaces not allowed
     }
 }

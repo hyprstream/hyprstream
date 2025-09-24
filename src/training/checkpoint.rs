@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use tokio::fs;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use crate::git::BranchManager;
+use crate::git::{BranchManager, get_repository, create_hyprstream_signature};
 
 /// Checkpoint request sent to background worker
 #[derive(Debug, Clone)]
@@ -366,7 +366,7 @@ impl CheckpointManager {
         branch_name: &Option<String>,
     ) -> Result<()> {
         // Open repository
-        let repo = git2::Repository::open(model_path)?;
+        let repo = get_repository(model_path)?;
         
         // If we have a specific branch, ensure we're on it
         if let Some(branch) = branch_name {
@@ -391,7 +391,7 @@ impl CheckpointManager {
         // Create commit
         let tree_id = index.write_tree()?;
         let tree = repo.find_tree(tree_id)?;
-        let sig = git2::Signature::now("checkpoint", "checkpoint@hyprstream")?;
+        let sig = create_hyprstream_signature()?;
         
         let parent_commit = repo.head()?.peel_to_commit()?;
         let message = if branch_name.is_some() {

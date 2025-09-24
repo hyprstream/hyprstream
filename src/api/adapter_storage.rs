@@ -4,14 +4,13 @@
 //! providing optimized workflows for adapter training.
 
 use anyhow::{Result, Context, bail};
-use git2::{Repository, Signature, IndexAddOption};
+use git2::IndexAddOption;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use uuid::Uuid;
 use chrono::Utc;
-use crate::storage::ModelId;
-use crate::git::{BranchManager, BranchInfo};
+use crate::git::{BranchManager, GitManager};
 use crate::storage::{XetNativeStorage, XetConfig};
 use std::sync::Arc;
 use thiserror::Error;
@@ -354,7 +353,7 @@ impl AdapterStorage {
     
     /// Commit changes to adapter repository
     pub async fn commit_adapter(&self, adapter_path: &Path, message: &str) -> Result<()> {
-        let repo = Repository::open(adapter_path)?;
+        let repo = GitManager::global().get_repository(adapter_path)?;
         
         // Stage all changes
         let mut index = repo.index()?;
@@ -365,7 +364,7 @@ impl AdapterStorage {
         let tree_id = index.write_tree()?;
         let tree = repo.find_tree(tree_id)?;
         
-        let sig = Signature::now("hyprstream", "hyprstream@local")?;
+        let sig = GitManager::global().create_signature(None, None)?;
         
         // Get HEAD if it exists (for non-initial commits)
         if let Ok(head) = repo.head() {

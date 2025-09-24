@@ -4,7 +4,9 @@
 
 use anyhow::Result;
 use std::path::PathBuf;
+use std::sync::Arc;
 use super::{GitModelSource, ModelStorage, ModelId, paths::StoragePaths};
+use super::xet_native::{XetNativeStorage, XetConfig};
 
 /// Result of cloning a model
 pub struct ClonedModel {
@@ -24,8 +26,24 @@ pub async fn clone_model(
     let storage_paths = StoragePaths::new()?;
     let models_dir = storage_paths.models_dir()?;
 
-    // Initialize GitModelSource
-    let git_source = GitModelSource::new(models_dir.clone());
+    // Initialize XET storage for LFS processing (with default config)
+    let xet_storage = match XetNativeStorage::new(XetConfig::default()).await {
+        Ok(storage) => {
+            tracing::info!("XET storage initialized for LFS processing");
+            Some(Arc::new(storage))
+        }
+        Err(e) => {
+            tracing::warn!("Failed to initialize XET storage, LFS files will not be processed: {}", e);
+            None
+        }
+    };
+
+    // Initialize GitModelSource with optional XET storage
+    let git_source = if let Some(xet_storage) = xet_storage {
+        GitModelSource::new_with_xet(models_dir.clone(), xet_storage)
+    } else {
+        GitModelSource::new(models_dir.clone())
+    };
 
     // Clone the model
     let (model_id, model_path) = if let Some(ref_str) = git_ref {

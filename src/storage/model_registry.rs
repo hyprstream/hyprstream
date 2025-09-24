@@ -6,34 +6,49 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn, debug};
 use tokio::sync::RwLock;
+use crate::git::{GitManager, GitConfig};
 
-use super::model_ref::{ModelRef, validate_model_name, validate_git_ref};
+use super::model_ref::{ModelRef, validate_model_name};
 use super::xet_native::XetNativeStorage;
 
 /// Model registry that manages models as git submodules
 pub struct ModelRegistry {
     base_dir: PathBuf,
     xet_storage: Option<Arc<XetNativeStorage>>,
+    git_manager: Arc<GitManager>,
 }
 
 impl ModelRegistry {
     /// Open or initialize a model registry
     pub fn new(base_dir: PathBuf, xet_storage: Option<Arc<XetNativeStorage>>) -> Result<Self> {
+        Self::new_with_config(base_dir, xet_storage, GitConfig::default())
+    }
+
+    /// Create with custom Git configuration
+    pub fn new_with_config(
+        base_dir: PathBuf,
+        xet_storage: Option<Arc<XetNativeStorage>>,
+        git_config: GitConfig
+    ) -> Result<Self> {
         if !base_dir.join(".git").exists() {
             info!("Initializing new model registry at {:?}", base_dir);
             std::fs::create_dir_all(&base_dir)?;
-            Repository::init(&base_dir)?;
+            Repository::init(&base_dir)?; // One-time initialization
         }
+
+        let git_manager = Arc::new(GitManager::new(git_config));
 
         Ok(Self {
             base_dir,
             xet_storage,
+            git_manager,
         })
     }
 
-    /// Open the repository when needed
+    /// Open the repository when needed (with caching)
     fn open_repo(&self) -> Result<Repository> {
-        Repository::open(&self.base_dir).map_err(|e| anyhow!("Failed to open repository: {}", e))
+        self.git_manager.get_repository(&self.base_dir)
+            .map_err(|e| anyhow!("Failed to open repository: {}", e))
     }
 
     /// Resolve a model reference to a specific commit SHA
@@ -66,7 +81,7 @@ impl ModelRegistry {
                     .join(&model_ref.model);
 
                 if model_path.exists() {
-                    let model_repo = Repository::open(model_path)?;
+                    let model_repo = self.git_manager.get_repository(&model_path)?;
                     if let Some(ref git_ref) = model_ref.git_ref {
                         Ok(model_repo.revparse_single(git_ref)?.id())
                     } else {
@@ -123,7 +138,9 @@ impl ModelRegistry {
 
     /// Update a model to a different version
     pub async fn update_model(&self, name: &str, ref_spec: &str) -> Result<()> {
-        validate_git_ref(ref_spec)?;
+        if !git2::Reference::is_valid_name(ref_spec) {
+            bail!("Invalid git reference name: '{}'", ref_spec);
+        }
 
         let submodule_path = format!("models/{}", name);
         let repo = self.open_repo()?;
@@ -222,8 +239,12 @@ impl ModelRegistry {
 
     /// Create a branch for a model
     pub fn create_branch(&self, model_name: &str, branch_name: &str, from_ref: &str) -> Result<()> {
-        validate_git_ref(branch_name)?;
-        validate_git_ref(from_ref)?;
+        if !git2::Reference::is_valid_name(branch_name) {
+            bail!("Invalid git reference name: '{}'", branch_name);
+        }
+        if !git2::Reference::is_valid_name(from_ref) {
+            bail!("Invalid git reference name: '{}'", from_ref);
+        }
 
         let submodule_path = format!("models/{}", model_name);
         let repo = self.open_repo()?;
@@ -240,7 +261,7 @@ impl ModelRegistry {
     /// Helper to commit changes to the registry
     fn commit_registry(&self, message: &str) -> Result<()> {
         let repo = self.open_repo()?;
-        let sig = Signature::now("hyprstream", "hyprstream@local")?;
+        let sig = self.git_manager.create_signature(None, None)?;
         let mut index = repo.index()?;
 
         // Stage .gitmodules and submodule changes

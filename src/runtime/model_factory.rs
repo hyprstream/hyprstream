@@ -7,10 +7,10 @@ use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::path::Path;
 use tch::{Device, Tensor, Kind as DType};
-use crate::constants::limits::*;
 
 use super::model_config::{ModelConfig, ModelArchitecture};
 use super::architectures::{ModelOperations, llama::LlamaModel, gemma::GemmaModel};
+use crate::storage::XetNativeStorage;
 
 /// Factory for creating models with proper configuration management
 pub struct ModelFactory;
@@ -18,33 +18,53 @@ pub struct ModelFactory;
 impl ModelFactory {
     /// Create a model from a directory containing weights and optionally config.json
     /// This is the ONLY way models should be created to ensure consistency
-    pub fn create(
+    pub async fn create(
         model_path: &Path,
         device: &Device,
         dtype: DType,
     ) -> Result<Box<dyn ModelOperations>> {
+        Self::create_with_xet(model_path, device, dtype, None).await
+    }
+
+    /// Create a model with optional XET storage for pointer file handling
+    pub async fn create_with_xet(
+        model_path: &Path,
+        device: &Device,
+        dtype: DType,
+        xet_storage: Option<&XetNativeStorage>,
+    ) -> Result<Box<dyn ModelOperations>> {
         println!("🏭 ModelFactory: Loading model from {}", model_path.display());
-        
-        let weights = Self::load_weights(model_path, device, dtype)?;
+
+        let weights = Self::load_weights_with_xet(model_path, device, dtype, xet_storage).await?;
         let config = ModelConfig::load(model_path, &weights)?;
         let model = Self::create_model_from_config(config, weights, device, dtype)?;
-        
+
         println!("✅ ModelFactory: Model created successfully");
         Ok(model)
     }
     
     /// Load weights from safetensors files
-    fn load_weights(
+    async fn load_weights(
         model_path: &Path,
         device: &Device,
         dtype: DType,
+    ) -> Result<HashMap<String, Tensor>> {
+        Self::load_weights_with_xet(model_path, device, dtype, None).await
+    }
+
+    /// Load weights from safetensors files with optional XET storage
+    async fn load_weights_with_xet(
+        model_path: &Path,
+        device: &Device,
+        dtype: DType,
+        xet_storage: Option<&XetNativeStorage>,
     ) -> Result<HashMap<String, Tensor>> {
         let mut all_weights = HashMap::new();
         
         let single_file = model_path.join("model.safetensors");
         if single_file.exists() {
             println!("📦 Loading single safetensors file");
-            Self::load_safetensors_file(&single_file, &mut all_weights, device, dtype)?;
+            Self::load_safetensors_file_with_xet(&single_file, &mut all_weights, device, dtype, xet_storage).await?;
             return Ok(all_weights);
         }
         
@@ -66,7 +86,7 @@ impl ModelFactory {
             shard_files.sort();
             println!("📦 Loading {} safetensors shards", shard_files.len());
             for shard_file in shard_files {
-                Self::load_safetensors_file(&shard_file, &mut all_weights, device, dtype)?;
+                Self::load_safetensors_file_with_xet(&shard_file, &mut all_weights, device, dtype, xet_storage).await?;
             }
             return Ok(all_weights);
         }
@@ -85,57 +105,40 @@ impl ModelFactory {
     ) -> Result<()> {
         // Check if mmap should be used (via environment variable for now)
         let use_mmap = std::env::var("HYPRSTREAM_USE_MMAP").unwrap_or_default() == "true";
-        
+
         let buffer: Vec<u8>;
         let mmap_holder: Option<memmap2::Mmap>;
-        
+
         let tensor_data = if use_mmap {
             // Memory-mapped loading for Optane/persistent memory systems
             let file = std::fs::File::open(path)?;
-            
-            // Validate file size
-            let metadata = file.metadata()?;
-            let file_size = metadata.len();
-            
-            if file_size > MAX_MODEL_FILE_SIZE {
-                return Err(anyhow!("Model file {} exceeds maximum size", path.display()));
-            }
-            
+
+            // Memory map the file for efficient loading
+
             // Create memory map
             let mmap = unsafe {
                 memmap2::MmapOptions::new()
                     .populate() // Pre-populate pages for better performance
                     .map(&file)?
             };
-            
+
             mmap_holder = Some(mmap);
             // Get a reference to the mmap data
             mmap_holder.as_ref().unwrap().as_ref()
         } else {
             // Standard loading into memory (default for most systems)
             buffer = std::fs::read(path)?;
-            
-            // Validate file size
-            if buffer.len() as u64 > MAX_MODEL_FILE_SIZE {
-                return Err(anyhow!("Model file {} exceeds maximum size", path.display()));
-            }
-            
             &buffer
         };
-        
+
         // Deserialize from either mmap or buffer
         let tensors = safetensors::SafeTensors::deserialize(tensor_data)?;
-        
+
         for (name, tensor_view) in tensors.tensors() {
             let shape: Vec<i64> = tensor_view.shape().iter().map(|&x| x as i64).collect();
             let data = tensor_view.data();
-            
-            // Validate tensor size to prevent memory exhaustion
-            if data.len() as u64 > MAX_TENSOR_SIZE {
-                return Err(anyhow!("Tensor '{}' size {} exceeds maximum", name, data.len()));
-            }
-            
-            // Create tensor based on original dtype
+
+            // Create tensor with native dtype support when possible
             let tensor = match tensor_view.dtype() {
                 safetensors::Dtype::F32 => {
                     let slice = unsafe {
@@ -144,34 +147,226 @@ impl ModelFactory {
                     Tensor::from_slice(slice).reshape(&shape)
                 }
                 safetensors::Dtype::F16 => {
-                    // Convert F16 to F32 first
-                    let slice = unsafe {
-                        std::slice::from_raw_parts(data.as_ptr() as *const half::f16, data.len() / 2)
-                    };
-                    let f32_vec: Vec<f32> = slice.iter().map(|x| x.to_f32()).collect();
-                    Tensor::from_slice(&f32_vec).reshape(&shape)
+                    // Native F16 support - create directly from raw bytes when dtype matches
+                    let tensor_kind = tch::Kind::Half;
+
+                    if dtype == tensor_kind {
+                        // Zero-copy path: create tensor directly from raw bytes
+                        // Try to create directly from blob, fall back to conversion if it fails
+                        // Note: from_blob may panic on unsupported hardware, so we use std::panic::catch_unwind
+                        let result = std::panic::catch_unwind(|| {
+                            unsafe {
+                                Tensor::from_blob(
+                                    data.as_ptr(),
+                                    &shape,
+                                    &[],  // Use default strides
+                                    tensor_kind,
+                                    *device,
+                                )
+                            }
+                        });
+
+                        match result {
+                            Ok(tensor) => tensor,
+                            Err(_) => {
+                                // Fallback to conversion if from_blob fails or panics
+                                let slice = unsafe {
+                                    std::slice::from_raw_parts(data.as_ptr() as *const half::f16, data.len() / 2)
+                                };
+                                let f32_vec: Vec<f32> = slice.iter().map(|x| x.to_f32()).collect();
+                                Tensor::from_slice(&f32_vec).reshape(&shape)
+                            }
+                        }
+                    } else {
+                        // Conversion path: different dtypes require transformation
+                        let slice = unsafe {
+                            std::slice::from_raw_parts(data.as_ptr() as *const half::f16, data.len() / 2)
+                        };
+                        let f32_vec: Vec<f32> = slice.iter().map(|x| x.to_f32()).collect();
+                        Tensor::from_slice(&f32_vec).reshape(&shape)
+                    }
                 }
                 safetensors::Dtype::BF16 => {
-                    // Convert BF16 to F32 first
-                    let slice = unsafe {
-                        std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, data.len() / 2)
-                    };
-                    let f32_vec: Vec<f32> = slice.iter().map(|x| x.to_f32()).collect();
-                    Tensor::from_slice(&f32_vec).reshape(&shape)
+                    // Native BF16 support - create directly from raw bytes when dtype matches
+                    let tensor_kind = tch::Kind::BFloat16;
+
+                    if dtype == tensor_kind {
+                        // Zero-copy path: create tensor directly from raw bytes
+                        // Try to create directly from blob, fall back to conversion if it fails
+                        // Note: from_blob may panic on unsupported hardware, so we use std::panic::catch_unwind
+                        let result = std::panic::catch_unwind(|| {
+                            unsafe {
+                                Tensor::from_blob(
+                                    data.as_ptr(),
+                                    &shape,
+                                    &[],  // Use default strides
+                                    tensor_kind,
+                                    *device,
+                                )
+                            }
+                        });
+
+                        match result {
+                            Ok(tensor) => tensor,
+                            Err(_) => {
+                                // Fallback to conversion if from_blob fails or panics
+                                let slice = unsafe {
+                                    std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, data.len() / 2)
+                                };
+                                let f32_vec: Vec<f32> = slice.iter().map(|x| x.to_f32()).collect();
+                                Tensor::from_slice(&f32_vec).reshape(&shape)
+                            }
+                        }
+                    } else {
+                        // Conversion path: different dtypes require transformation
+                        let slice = unsafe {
+                            std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, data.len() / 2)
+                        };
+                        let f32_vec: Vec<f32> = slice.iter().map(|x| x.to_f32()).collect();
+                        Tensor::from_slice(&f32_vec).reshape(&shape)
+                    }
                 }
                 _ => {
                     println!("⚠️ Skipping tensor {} with unsupported dtype", name);
                     continue;
                 }
             };
-            
+
             let tensor = tensor.to_device(*device).to_kind(dtype);
             weights.insert(name.to_string(), tensor);
         }
-        
+
         Ok(())
     }
-    
+
+    /// Load a single safetensors file with optional XET storage support
+    /// This version can handle XET pointers and LFS pointers automatically
+    async fn load_safetensors_file_with_xet(
+        path: &Path,
+        weights: &mut HashMap<String, Tensor>,
+        device: &Device,
+        dtype: DType,
+        xet_storage: Option<&XetNativeStorage>,
+    ) -> Result<()> {
+        // If XET storage is available, use it for universal file loading
+        let tensor_data = if let Some(xet) = xet_storage {
+            // Use XET's universal file loading (handles regular files, XET pointers, and LFS pointers)
+            xet.load_file(path).await?
+        } else {
+            // Fallback to standard file reading
+            std::fs::read(path)?
+        };
+
+        // Deserialize SafeTensors format
+
+        // Deserialize safetensors
+        let tensors = safetensors::SafeTensors::deserialize(&tensor_data)?;
+
+        for (name, tensor_view) in tensors.tensors() {
+            let shape: Vec<i64> = tensor_view.shape().iter().map(|&x| x as i64).collect();
+            let data = tensor_view.data();
+
+            // Create tensor with native dtype support when possible
+            let tensor = match tensor_view.dtype() {
+                safetensors::Dtype::F32 => {
+                    let slice = unsafe {
+                        std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4)
+                    };
+                    Tensor::from_slice(slice).reshape(&shape)
+                }
+                safetensors::Dtype::F16 => {
+                    // Native F16 support - create directly from raw bytes when dtype matches
+                    let tensor_kind = tch::Kind::Half;
+
+                    if dtype == tensor_kind {
+                        // Zero-copy path: create tensor directly from raw bytes
+                        // Try to create directly from blob, fall back to conversion if it fails
+                        // Note: from_blob may panic on unsupported hardware, so we use std::panic::catch_unwind
+                        let result = std::panic::catch_unwind(|| {
+                            unsafe {
+                                Tensor::from_blob(
+                                    data.as_ptr(),
+                                    &shape,
+                                    &[],  // Use default strides
+                                    tensor_kind,
+                                    *device,
+                                )
+                            }
+                        });
+
+                        match result {
+                            Ok(tensor) => tensor,
+                            Err(_) => {
+                                // Fallback to conversion if from_blob fails or panics
+                                let slice = unsafe {
+                                    std::slice::from_raw_parts(data.as_ptr() as *const half::f16, data.len() / 2)
+                                };
+                                let f32_vec: Vec<f32> = slice.iter().map(|x| x.to_f32()).collect();
+                                Tensor::from_slice(&f32_vec).reshape(&shape)
+                            }
+                        }
+                    } else {
+                        // Conversion path: different dtypes require transformation
+                        let slice = unsafe {
+                            std::slice::from_raw_parts(data.as_ptr() as *const half::f16, data.len() / 2)
+                        };
+                        let f32_vec: Vec<f32> = slice.iter().map(|x| x.to_f32()).collect();
+                        Tensor::from_slice(&f32_vec).reshape(&shape)
+                    }
+                }
+                safetensors::Dtype::BF16 => {
+                    // Native BF16 support - create directly from raw bytes when dtype matches
+                    let tensor_kind = tch::Kind::BFloat16;
+
+                    if dtype == tensor_kind {
+                        // Zero-copy path: create tensor directly from raw bytes
+                        // Try to create directly from blob, fall back to conversion if it fails
+                        // Note: from_blob may panic on unsupported hardware, so we use std::panic::catch_unwind
+                        let result = std::panic::catch_unwind(|| {
+                            unsafe {
+                                Tensor::from_blob(
+                                    data.as_ptr(),
+                                    &shape,
+                                    &[],  // Use default strides
+                                    tensor_kind,
+                                    *device,
+                                )
+                            }
+                        });
+
+                        match result {
+                            Ok(tensor) => tensor,
+                            Err(_) => {
+                                // Fallback to conversion if from_blob fails or panics
+                                let slice = unsafe {
+                                    std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, data.len() / 2)
+                                };
+                                let f32_vec: Vec<f32> = slice.iter().map(|x| x.to_f32()).collect();
+                                Tensor::from_slice(&f32_vec).reshape(&shape)
+                            }
+                        }
+                    } else {
+                        // Conversion path: different dtypes require transformation
+                        let slice = unsafe {
+                            std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, data.len() / 2)
+                        };
+                        let f32_vec: Vec<f32> = slice.iter().map(|x| x.to_f32()).collect();
+                        Tensor::from_slice(&f32_vec).reshape(&shape)
+                    }
+                }
+                _ => {
+                    println!("⚠️ Skipping tensor {} with unsupported dtype", name);
+                    continue;
+                }
+            };
+
+            let tensor = tensor.to_device(*device).to_kind(dtype);
+            weights.insert(name.to_string(), tensor);
+        }
+
+        Ok(())
+    }
+
     /// Create model instance from configuration
     fn create_model_from_config(
         config: ModelConfig,

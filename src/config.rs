@@ -392,19 +392,6 @@ impl HyprConfig {
     
     /// Get the storage directory path
     
-    /// Get a specific model path by name
-    pub fn model_path(&self, model_name: &str) -> PathBuf {
-        use crate::utils::sanitize_filename;
-        let sanitized_name = sanitize_filename(model_name);
-        self.storage.models_dir.join(sanitized_name)
-    }
-    
-    /// Get a specific LoRA path by name
-    pub fn lora_path(&self, lora_name: &str) -> PathBuf {
-        use crate::utils::sanitize_filename;
-        let sanitized_name = sanitize_filename(lora_name);
-        self.storage.loras_dir.join(sanitized_name)
-    }
     
     /// Ensure all configured directories exist
     pub fn ensure_directories(&self) -> Result<(), std::io::Error> {

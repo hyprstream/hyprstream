@@ -1,17 +1,16 @@
 //! Model sharing protocol for distributed network
-//! 
+//!
 //! Enables selective sharing of models and adapters between
 //! nodes in a heterogeneous network via Git.
 
 use anyhow::{Result, Context, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use git2::Repository;
-use crate::storage::ModelId;
-use crate::api::adapter_storage::AdapterId;
-use crate::git::GitModelRegistry;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use crate::storage::ModelId;
+use crate::api::adapter_storage::AdapterId;
+use crate::git::{GitModelRegistry, GitManager, GitConfig, CloneOptions};
 
 /// Shareable reference to a model or adapter
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,11 +56,19 @@ pub struct ModelMetrics {
 pub struct ModelSharing {
     base_dir: PathBuf,
     registry: Arc<RwLock<Option<GitModelRegistry>>>,
+    git_manager: Arc<GitManager>,
 }
 
 impl ModelSharing {
     /// Create new model sharing manager
     pub async fn new(base_dir: PathBuf) -> Result<Self> {
+        Self::new_with_config(base_dir, GitConfig::default()).await
+    }
+
+    /// Create with custom Git configuration
+    pub async fn new_with_config(base_dir: PathBuf, git_config: GitConfig) -> Result<Self> {
+        let git_manager = Arc::new(GitManager::new(git_config));
+
         // Try to initialize Git registry
         let registry = match GitModelRegistry::init(base_dir.clone()).await {
             Ok(reg) => Some(reg),
@@ -70,10 +77,11 @@ impl ModelSharing {
                 None
             }
         };
-        
+
         Ok(Self {
             base_dir,
             registry: Arc::new(RwLock::new(registry)),
+            git_manager,
         })
     }
     
@@ -103,8 +111,8 @@ impl ModelSharing {
     ) -> Result<ShareableModelRef> {
         let model_path = self.base_dir.join(model.uuid.to_string());
         
-        // Open Git repository
-        let repo = Repository::open(&model_path)
+        // Open Git repository (with caching)
+        let repo = self.git_manager.get_repository(&model_path)
             .context("Failed to open model repository")?;
         
         // Get current commit
@@ -166,7 +174,7 @@ impl ModelSharing {
         
         for path in possible_paths {
             if path.exists() && path.join(".git").exists() {
-                let repo = Repository::open(&path)?;
+                let repo = self.git_manager.get_repository(&path)?;
                 let head = repo.head()?.peel_to_commit()?;
                 
                 let model_type = if path.join("adapter_config.json").exists() {
@@ -227,11 +235,19 @@ impl ModelSharing {
         }
         
         println!("📥 Importing model '{}' from {}", share_ref.name, git_url);
-        
-        // Clone the repository
-        let repo = Repository::clone(git_url, &target_dir)
+
+        // Clone the repository with advanced options (shallow for efficiency)
+        let clone_options = CloneOptions {
+            shallow: true,
+            depth: Some(1),
+            ..Default::default()
+        };
+
+        let repo = self.git_manager
+            .clone_repository(git_url, &target_dir, clone_options, None)
+            .await
             .context("Failed to clone shared model")?;
-        
+
         // Checkout specific commit
         let oid = git2::Oid::from_str(&share_ref.commit)?;
         let commit = repo.find_commit(oid)?;
@@ -275,7 +291,7 @@ impl ModelSharing {
         remote_name: Option<&str>,
     ) -> Result<()> {
         let model_path = self.find_model_path(model_name).await?;
-        let repo = Repository::open(&model_path)?;
+        let repo = self.git_manager.get_repository(&model_path)?;
         
         let remote_name = remote_name.unwrap_or("origin");
         

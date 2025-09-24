@@ -9,9 +9,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn, debug};
+use crate::git::{GitManager, GitConfig};
 
 use crate::runtime::{TorchEngine, RuntimeConfig, RuntimeEngine};
 use crate::storage::{ModelRef, SharedModelRegistry};
+use crate::storage::xet_native::XetNativeStorage;
 
 /// Cached model entry
 #[derive(Clone)]
@@ -38,6 +40,10 @@ pub struct ModelCache {
     checkouts: Arc<RwLock<HashMap<git2::Oid, PathBuf>>>,
     /// Maximum cache size
     max_size: usize,
+    /// Optional XET storage for LFS processing
+    xet_storage: Option<Arc<XetNativeStorage>>,
+    /// Git service for repository operations
+    git_manager: Arc<GitManager>,
 }
 
 impl ModelCache {
@@ -47,11 +53,24 @@ impl ModelCache {
         registry: Arc<SharedModelRegistry>,
         checkout_base: PathBuf,
     ) -> Result<Self> {
+        Self::new_with_config(max_size, registry, checkout_base, None, GitConfig::default())
+    }
+
+    /// Create a new model cache with custom Git configuration
+    pub fn new_with_config(
+        max_size: usize,
+        registry: Arc<SharedModelRegistry>,
+        checkout_base: PathBuf,
+        xet_storage: Option<Arc<XetNativeStorage>>,
+        git_config: GitConfig,
+    ) -> Result<Self> {
         let cache_size = NonZeroUsize::new(max_size)
             .unwrap_or_else(|| NonZeroUsize::new(5).unwrap());
 
         // Ensure checkout directory exists
         std::fs::create_dir_all(&checkout_base)?;
+
+        let git_manager = Arc::new(GitManager::new(git_config));
 
         Ok(Self {
             cache: Arc::new(Mutex::new(LruCache::new(cache_size))),
@@ -59,7 +78,25 @@ impl ModelCache {
             checkout_base,
             checkouts: Arc::new(RwLock::new(HashMap::new())),
             max_size,
+            xet_storage,
+            git_manager,
         })
+    }
+
+    /// Create a new model cache with XET storage for LFS processing
+    pub fn new_with_xet(
+        max_size: usize,
+        registry: Arc<SharedModelRegistry>,
+        checkout_base: PathBuf,
+        xet_storage: Arc<XetNativeStorage>,
+    ) -> Result<Self> {
+        Self::new_with_config(
+            max_size,
+            registry,
+            checkout_base,
+            Some(xet_storage),
+            GitConfig::default()
+        )
     }
 
     /// Get or load a model by reference
@@ -145,8 +182,9 @@ impl ModelCache {
 
             // Create worktree for specific commit
             let checkout_dir_clone = checkout_dir.clone();
+            let git_manager = Arc::clone(&self.git_manager);
             tokio::task::spawn_blocking(move || -> Result<()> {
-                let repo = git2::Repository::open(&model_path)?;
+                let repo = git_manager.get_repository(&model_path)?;
                 let worktree_name = format!("cache-{}", &commit_id.to_string()[..8]);
 
                 // Clean up if worktree already exists
@@ -164,7 +202,7 @@ impl ModelCache {
                 repo.worktree(&worktree_name, &checkout_dir_clone, Some(&opts))?;
 
                 // Checkout specific commit with detached HEAD
-                let wt_repo = git2::Repository::open(&checkout_dir_clone)?;
+                let wt_repo = git_manager.get_repository(&checkout_dir_clone)?;
                 wt_repo.set_head_detached(commit_id)?;
                 wt_repo.checkout_head(Some(
                     git2::build::CheckoutBuilder::default().force()
@@ -173,6 +211,22 @@ impl ModelCache {
                 debug!("Created worktree for commit {}", commit_id);
                 Ok(())
             }).await??;
+        }
+
+        // Process LFS files if XET storage is available
+        if let Some(xet_storage) = &self.xet_storage {
+            info!("Processing LFS files in worktree: {:?}", checkout_dir);
+            match xet_storage.process_worktree_lfs(&checkout_dir).await {
+                Ok(processed_files) => {
+                    if !processed_files.is_empty() {
+                        info!("Successfully processed {} LFS files", processed_files.len());
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to process LFS files in worktree: {}", e);
+                    // Continue anyway - the worktree is still usable even if LFS processing failed
+                }
+            }
         }
 
         // Cache the checkout path
@@ -258,9 +312,10 @@ impl ModelCache {
     /// Clean up old worktrees for a specific model repository
     async fn cleanup_worktrees_for_model(&self, model_path: &Path, keep_count: usize) -> Result<()> {
         let model_path = model_path.to_path_buf();
+        let git_manager = Arc::clone(&self.git_manager);
 
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let repo = match git2::Repository::open(&model_path) {
+            let repo = match git_manager.get_repository(&model_path) {
                 Ok(repo) => repo,
                 Err(_) => return Ok(()), // Skip if not a git repo
             };

@@ -9,9 +9,11 @@ use git2::{Repository, Signature, SubmoduleUpdateOptions, IndexAddOption};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs;
 use uuid::Uuid;
 use crate::storage::ModelId;
+use super::{GitManager, GitConfig, GitOperations, get_repository};
 
 /// Registry metadata stored in registry.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,47 +64,56 @@ pub struct GitModelRegistry {
 
     /// Registry metadata
     metadata: RegistryMetadata,
+
+    /// Git manager for operations
+    git_manager: Arc<GitManager>,
 }
 
 impl GitModelRegistry {
     /// Initialize or open the registry
     pub async fn init(base_dir: PathBuf) -> Result<Self> {
+        Self::init_with_config(base_dir, GitConfig::default()).await
+    }
+
+    /// Initialize with custom Git configuration
+    pub async fn init_with_config(base_dir: PathBuf, git_config: GitConfig) -> Result<Self> {
         let registry_path = base_dir.join(".registry");
-        
+        let git_manager = Arc::new(GitManager::new(git_config));
+
         // Create or open registry repo (temporarily for init)
         if registry_path.exists() {
             // Verify we can open it
-            let _repo = Repository::open(&registry_path)
+            let _repo = git_manager.get_repository(&registry_path)
                 .context("Failed to open registry repository")?;
         } else {
             // Initialize new registry
             tracing::info!("Initializing new model registry at {:?}", registry_path);
-            
+
             fs::create_dir_all(&registry_path).await?;
             let repo = Repository::init(&registry_path)?;
-            
+
             // Create directory structure
             fs::create_dir_all(registry_path.join("bases")).await?;
             fs::create_dir_all(registry_path.join("adapters")).await?;
-            
+
             // Create initial registry.json
             let metadata = RegistryMetadata {
                 version: "1.0.0".to_string(),
                 models: HashMap::new(),
             };
-            
+
             let json = serde_json::to_string_pretty(&metadata)?;
             fs::write(registry_path.join("registry.json"), json).await?;
-            
-            // Initial commit
-            let sig = Signature::now("hyprstream", "hyprstream@local")?;
+
+            // Initial commit using standardized signature
+            let sig = git_manager.create_signature(None, None)?;
             let tree_id = {
                 let mut index = repo.index()?;
                 index.add_all(["*"].iter(), IndexAddOption::DEFAULT, None)?;
                 index.write()?;
                 index.write_tree()?
             };
-            
+
             let tree = repo.find_tree(tree_id)?;
             repo.commit(
                 Some("HEAD"),
@@ -115,7 +126,7 @@ impl GitModelRegistry {
 
             // Repository created successfully, we'll open it on-demand now
         };
-        
+
         // Load metadata
         let metadata_path = registry_path.join("registry.json");
         let metadata = if metadata_path.exists() {
@@ -127,17 +138,18 @@ impl GitModelRegistry {
                 models: HashMap::new(),
             }
         };
-        
+
         Ok(Self {
             registry_path,
             base_dir,
             metadata,
+            git_manager,
         })
     }
 
     /// Open the repository on-demand
     fn open_repo(&self) -> Result<Repository> {
-        Repository::open(&self.registry_path)
+        self.git_manager.get_repository(&self.registry_path)
             .with_context(|| format!("Failed to open registry repository at {:?}", self.registry_path))
     }
 
@@ -277,7 +289,7 @@ impl GitModelRegistry {
 
         // Get the HEAD commit of the model
         let model_path = self.base_dir.join(model.uuid.to_string());
-        let model_repo = Repository::open(&model_path)?;
+        let model_repo = get_repository(&model_path)?;
         let head = model_repo.head()?;
         let commit = head.peel_to_commit()?;
 
@@ -324,29 +336,12 @@ impl GitModelRegistry {
     
     /// Commit changes to registry
     fn commit_changes(&self, message: &str) -> Result<()> {
-        let sig = Signature::now("hyprstream", "hyprstream@local")?;
-        
-        // Stage all changes
         let repo = self.open_repo()?;
-        let mut index = repo.index()?;
-        index.add_all(["*"].iter(), IndexAddOption::DEFAULT, None)?;
-        index.write()?;
+        let sig = self.git_manager.create_signature(None, None)?;
 
-        let tree_id = index.write_tree()?;
-        let tree = repo.find_tree(tree_id)?;
+        // Use the GitOperations trait for standardized commit behavior
+        repo.commit_changes(message, Some(&sig))?;
 
-        // Get HEAD as parent
-        let parent = repo.head()?.peel_to_commit()?;
-        
-        repo.commit(
-            Some("HEAD"),
-            &sig,
-            &sig,
-            message,
-            &tree,
-            &[&parent],
-        )?;
-        
         Ok(())
     }
 

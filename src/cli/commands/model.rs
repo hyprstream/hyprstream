@@ -393,9 +393,7 @@ impl ModelDisplayInfo {
 impl GitInfo {
     /// Create GitInfo from a git repository path
     pub fn from_repo_path(repo_path: &std::path::Path) -> Option<Self> {
-        use git2::Repository;
-
-        let repo = Repository::open(repo_path).ok()?;
+        let repo = crate::git::get_repository(repo_path).ok()?;
 
         // Get current reference
         let (current_ref, ref_type) = match repo.head() {

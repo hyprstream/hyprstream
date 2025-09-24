@@ -10,7 +10,9 @@ use git2::{Repository, BranchType, Oid, Signature};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use uuid::Uuid;
+use super::{GitManager, GitConfig, GitOperations, get_repository};
 
 /// Information about a branch
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,18 +27,38 @@ pub struct BranchInfo {
 
 /// Manages branches with UUID naming and human tags
 pub struct BranchManager {
-    repo: Repository,
     repo_path: PathBuf,
+    git_manager: Arc<GitManager>,
 }
 
 impl BranchManager {
     /// Create a new branch manager for a repository
     pub fn new(repo_path: impl AsRef<Path>) -> Result<Self> {
         let repo_path = repo_path.as_ref().to_path_buf();
-        let repo = Repository::open(&repo_path)
+        let git_manager = Arc::new(GitManager::new(GitConfig::default()));
+
+        // Verify repository exists
+        let _repo = git_manager.get_repository(&repo_path)
             .context("Failed to open repository")?;
-        
-        Ok(Self { repo, repo_path })
+
+        Ok(Self { repo_path, git_manager })
+    }
+
+    /// Create with custom Git configuration
+    pub fn new_with_config(repo_path: impl AsRef<Path>, git_config: GitConfig) -> Result<Self> {
+        let repo_path = repo_path.as_ref().to_path_buf();
+        let git_manager = Arc::new(GitManager::new(git_config));
+
+        // Verify repository exists
+        let _repo = git_manager.get_repository(&repo_path)
+            .context("Failed to open repository")?;
+
+        Ok(Self { repo_path, git_manager })
+    }
+
+    /// Get repository handle with caching
+    fn get_repo(&self) -> Result<Repository> {
+        self.git_manager.get_repository(&self.repo_path)
     }
     
     /// Create a new UUID-based branch
@@ -50,35 +72,36 @@ impl BranchManager {
         let uuid = Uuid::new_v4();
         let branch_name = format!("{}/{}", branch_type, uuid);
         
+        let repo = self.get_repo()?;
+
         // Get base commit (default to HEAD)
         let commit = if let Some(commit_ref) = base_commit {
             if let Ok(oid) = Oid::from_str(commit_ref) {
-                self.repo.find_commit(oid)?
+                repo.find_commit(oid)?
             } else {
                 // Try as reference (branch/tag name)
                 {
-                    let annotated = self.repo.reference_to_annotated_commit(
-                        &self.repo.find_reference(commit_ref)?
+                    let annotated = repo.reference_to_annotated_commit(
+                        &repo.find_reference(commit_ref)?
                     )?;
-                    self.repo.find_commit(annotated.id())?
+                    repo.find_commit(annotated.id())?
                 }
             }
         } else {
-            self.repo.head()?.peel_to_commit()?
+            repo.head()?.peel_to_commit()?
         };
-        
-        // Create branch
-        self.repo.branch(&branch_name, &commit, false)
-            .context("Failed to create branch")?;
+
+        // Create branch using GitOperations trait
+        repo.create_branch(&branch_name, Some(&commit.id().to_string()))?;
         
         // Create tag for human name if provided
         if let Some(name) = human_name {
             self.create_tag(name, &branch_name)?;
             
             // Store metadata in branch config
-            let config_key = format!("branch.{}.description", 
+            let config_key = format!("branch.{}.description",
                 branch_name.replace('/', "."));
-            self.repo.config()?.set_str(&config_key, name)?;
+            repo.config()?.set_str(&config_key, name)?;
         }
         
         let info = BranchInfo {
@@ -100,23 +123,26 @@ impl BranchManager {
     pub fn create_tag(&self, tag_name: &str, target: &str) -> Result<()> {
         let safe_name = Self::sanitize_name(tag_name);
         
+        // Get repository handle
+        let repo = self.get_repo()?;
+
         // Find target object
         let target_obj = if target.contains('/') {
             // It's a branch reference
-            let branch = self.repo.find_branch(target, BranchType::Local)
+            let branch = repo.find_branch(target, BranchType::Local)
                 .with_context(|| format!("Branch {} not found", target))?;
             branch.get().peel_to_commit()?.into_object()
         } else if target.len() == 40 {
             // Looks like a commit SHA
             let oid = Oid::from_str(target)?;
-            self.repo.find_commit(oid)?.into_object()
+            repo.find_commit(oid)?.into_object()
         } else {
             // Try as tag or other reference
-            self.repo.revparse_single(target)?
+            repo.revparse_single(target)?
         };
-        
+
         // Create lightweight tag
-        self.repo.tag_lightweight(&safe_name, &target_obj, true)?;
+        repo.tag_lightweight(&safe_name, &target_obj, true)?;
         
         tracing::info!("Created tag '{}' -> {}", safe_name, target);
         
@@ -125,16 +151,18 @@ impl BranchManager {
     
     /// Update or create a user-friendly name for a branch
     pub fn set_branch_name(&self, branch: &str, name: &str) -> Result<()> {
+        let repo = self.get_repo()?;
+
         // Verify branch exists
-        let _ = self.repo.find_branch(branch, BranchType::Local)?;
-        
+        let _ = repo.find_branch(branch, BranchType::Local)?;
+
         // Create/update tag
         self.create_tag(name, branch)?;
-        
+
         // Update branch description
         let config_key = format!("branch.{}.description", branch.replace('/', "."));
-        self.repo.config()?.set_str(&config_key, name)?;
-        
+        repo.config()?.set_str(&config_key, name)?;
+
         Ok(())
     }
     
@@ -146,12 +174,13 @@ impl BranchManager {
         }
         
         // Try to find tag
+        let repo = self.get_repo()?;
         let tag_ref = format!("refs/tags/{}", Self::sanitize_name(name));
-        if let Ok(reference) = self.repo.find_reference(&tag_ref) {
+        if let Ok(reference) = repo.find_reference(&tag_ref) {
             // Get the branch that the tag points to
             if let Ok(target) = reference.peel_to_commit() {
                 // Find which branch contains this commit
-                for branch_result in self.repo.branches(Some(BranchType::Local))? {
+                for branch_result in repo.branches(Some(BranchType::Local))? {
                     let (branch, _) = branch_result?;
                     if let Ok(branch_commit) = branch.get().peel_to_commit() {
                         if branch_commit.id() == target.id() {
@@ -163,14 +192,14 @@ impl BranchManager {
                 }
             }
         }
-        
+
         // Search branch descriptions
-        for branch_result in self.repo.branches(Some(BranchType::Local))? {
+        for branch_result in repo.branches(Some(BranchType::Local))? {
             let (branch, _) = branch_result?;
             if let Some(branch_name) = branch.name()? {
                 let config_key = format!("branch.{}.description", 
                     branch_name.replace('/', "."));
-                if let Ok(desc) = self.repo.config()?.get_string(&config_key) {
+                if let Ok(desc) = repo.config()?.get_string(&config_key) {
                     if desc == name {
                         return Ok(branch_name.to_string());
                     }
@@ -183,9 +212,10 @@ impl BranchManager {
     
     /// List all branches with their metadata
     pub fn list_branches(&self) -> Result<Vec<BranchInfo>> {
+        let repo = self.get_repo()?;
         let mut branches = Vec::new();
-        
-        for branch_result in self.repo.branches(Some(BranchType::Local))? {
+
+        for branch_result in repo.branches(Some(BranchType::Local))? {
             let (branch, _) = branch_result?;
             let branch_name = branch.name()?.unwrap_or("").to_string();
             
@@ -205,7 +235,7 @@ impl BranchManager {
                         // Get human name from description
                         let config_key = format!("branch.{}.description", 
                             branch_name.replace('/', "."));
-                        let human_name = self.repo.config()
+                        let human_name = repo.config()
                             .ok()
                             .and_then(|c| c.get_string(&config_key).ok());
                         
@@ -230,20 +260,21 @@ impl BranchManager {
     
     /// Delete a branch and its associated tags
     pub fn delete_branch(&mut self, identifier: &str) -> Result<()> {
+        let repo = self.get_repo()?;
         let branch_name = self.resolve_name(identifier)?;
-        
+
         // Get branch info before deletion
         let info = self.load_branch_metadata(&branch_name).ok();
-        
+
         // Delete the branch
-        let mut branch = self.repo.find_branch(&branch_name, BranchType::Local)?;
+        let mut branch = repo.find_branch(&branch_name, BranchType::Local)?;
         branch.delete()?;
         
         // Delete associated tags
         if let Some(info) = info {
             if let Some(human_name) = info.human_name {
                 let tag_name = Self::sanitize_name(&human_name);
-                let _ = self.repo.tag_delete(&tag_name);
+                let _ = repo.tag_delete(&tag_name);
             }
         }
         
@@ -280,15 +311,16 @@ impl BranchManager {
             .and_then(|n| n.to_str())
             .unwrap_or("worktree");
         
+        let repo = self.get_repo()?;
         let options = git2::WorktreeAddOptions::new();
-        self.repo.worktree(
+        repo.worktree(
             wt_name,
             &wt_path,
             Some(&options),
         )?;
         
         // Checkout the branch in the worktree
-        let wt_repo = Repository::open(&wt_path)?;
+        let wt_repo = get_repository(&wt_path)?;
         wt_repo.set_head(&format!("refs/heads/{}", branch_name))?;
         wt_repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
         
@@ -312,13 +344,14 @@ impl BranchManager {
     /// Store branch metadata in Git notes
     fn store_branch_metadata(&self, branch_name: &str, info: &BranchInfo) -> Result<()> {
         let json = serde_json::to_string(info)?;
-        let sig = Signature::now("branch-manager", "branch@hyprstream")?;
-        
+        let sig = self.git_manager.create_signature(Some("branch-manager"), Some("branch@hyprstream"))?;
+        let repo = self.get_repo()?;
+
         // Store as Git note
-        let branch = self.repo.find_branch(branch_name, BranchType::Local)?;
+        let branch = repo.find_branch(branch_name, BranchType::Local)?;
         let commit = branch.get().peel_to_commit()?;
-        
-        self.repo.note(
+
+        repo.note(
             &sig,
             &sig,
             Some("refs/notes/branches"),
@@ -326,28 +359,30 @@ impl BranchManager {
             &json,
             true,
         )?;
-        
+
         Ok(())
     }
     
     /// Load branch metadata from Git notes
     fn load_branch_metadata(&self, branch_name: &str) -> Result<BranchInfo> {
-        let branch = self.repo.find_branch(branch_name, BranchType::Local)?;
+        let repo = self.get_repo()?;
+        let branch = repo.find_branch(branch_name, BranchType::Local)?;
         let commit = branch.get().peel_to_commit()?;
-        
-        let note = self.repo.find_note(Some("refs/notes/branches"), commit.id())?;
+
+        let note = repo.find_note(Some("refs/notes/branches"), commit.id())?;
         let json = note.message()
             .ok_or_else(|| anyhow::anyhow!("Empty note"))?;
-        
+
         Ok(serde_json::from_str(json)?)
     }
     
     /// Delete branch metadata
     fn delete_branch_metadata(&self, branch_name: &str) -> Result<()> {
-        if let Ok(branch) = self.repo.find_branch(branch_name, BranchType::Local) {
+        let repo = self.get_repo()?;
+        if let Ok(branch) = repo.find_branch(branch_name, BranchType::Local) {
             if let Ok(commit) = branch.get().peel_to_commit() {
-                let sig = Signature::now("branch-manager", "branch@hyprstream")?;
-                let _ = self.repo.note_delete(
+                let sig = self.git_manager.create_signature(Some("branch-manager"), Some("branch@hyprstream"))?;
+                let _ = repo.note_delete(
                     commit.id(),
                     Some("refs/notes/branches"),
                     &sig,

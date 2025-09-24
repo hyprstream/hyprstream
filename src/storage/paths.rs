@@ -57,19 +57,6 @@ impl StoragePaths {
         Ok(self.config_dir()?.join("hf_token"))
     }
 
-    /// Get a specific model path by name
-    pub fn model_path(&self, model_name: &str) -> Result<PathBuf> {
-        use crate::utils::sanitize_filename;
-        let sanitized_name = sanitize_filename(model_name);
-        Ok(self.models_dir()?.join(sanitized_name))
-    }
-
-    /// Get a specific LoRA path by name
-    pub fn lora_path(&self, lora_name: &str) -> Result<PathBuf> {
-        use crate::utils::sanitize_filename;
-        let sanitized_name = sanitize_filename(lora_name);
-        Ok(self.loras_dir()?.join(sanitized_name))
-    }
 
     /// Get the temporary download directory
     pub fn temp_download_dir(&self) -> Result<PathBuf> {

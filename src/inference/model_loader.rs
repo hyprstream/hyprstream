@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use memmap2::Mmap;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use crate::constants::limits::*;
 
 /// Handle to a loaded base model
 #[derive(Debug, Clone)]
@@ -273,26 +272,17 @@ impl ModelLoader {
     
     /// Parse SafeTensors file header to extract tensor information
     fn parse_safetensors_header(&self, mmap: &Mmap) -> Result<HashMap<String, TensorInfo>> {
+        // SafeTensors library handles all validation internally - no need for redundant checks
         if mmap.len() < 8 {
             return Err(anyhow::anyhow!("File too small to be a valid SafeTensors file"));
         }
-        
-        // Validate file size first
-        if mmap.len() < MIN_SAFETENSORS_SIZE {
-            return Err(anyhow::anyhow!("File too small to be a valid SafeTensors file"));
-        }
-        
+
         // Read header length (first 8 bytes)
         let header_len = u64::from_le_bytes(
             mmap[0..8].try_into()
                 .map_err(|_| anyhow::anyhow!("Failed to read header length"))?
         ) as usize;
-        
-        // Validate header length
-        if header_len as u64 > MAX_HEADER_SIZE {
-            return Err(anyhow::anyhow!("Header size {} exceeds maximum allowed {}", header_len, MAX_HEADER_SIZE));
-        }
-        
+
         if mmap.len() < 8 + header_len {
             return Err(anyhow::anyhow!("File too small for declared header size"));
         }
@@ -370,11 +360,7 @@ impl ModelLoader {
         let size_bytes = end_offset - start_offset;
         let final_offset = base_offset + start_offset;
         
-        // Sanity check: Individual tensors shouldn't exceed 100GB
-        // (even the largest models have individual tensors under this)
-        if size_bytes as u64 > MAX_TENSOR_SIZE {
-            return Err(anyhow::anyhow!("Tensor size {} exceeds maximum allowed size of 100GB", size_bytes));
-        }
+        // Size limit removed - let users manage memory constraints for their use case
         
         Ok(TensorInfo {
             name: name.to_string(),

@@ -13,6 +13,7 @@ use crate::config::{GenerationRequest, GenerationResult, ModelInfo, RuntimeConfi
 use crate::runtime::RuntimeEngine;
 use crate::runtime::template_engine::{TemplateEngine, TemplateConfig, ChatMessage};
 use crate::runtime::gpu_sampling::GpuSampler;
+use crate::storage::{XetNativeStorage, XetConfig};
 
 /// Qwen2 special token IDs (based on official HuggingFace implementation)
 #[derive(Debug, Clone)]
@@ -106,6 +107,8 @@ pub struct TorchEngine {
     gpu_sampler: GpuSampler,
     /// Qwen special tokens for proper conversation handling - immutable after construction
     special_tokens: QwenSpecialTokens,
+    /// Optional XET storage for LFS/XET pointer handling - thread safe after initialization
+    xet_storage: Option<Arc<XetNativeStorage>>,
 }
 
 /// Helper functions for tensor operations
@@ -191,6 +194,7 @@ impl TorchEngine {
             sampling_config: config,
             gpu_sampler: GpuSampler::new(device),
             special_tokens: QwenSpecialTokens::default(),
+            xet_storage: None,
         })
     }
 
@@ -226,7 +230,7 @@ impl TorchEngine {
         let model_dir = path.parent().unwrap_or(path);
         
         // Use ModelFactory to load the model (handles all weight loading internally)
-        self.initialize_persistent_model(model_dir)?;
+        self.initialize_persistent_model(model_dir).await?;
         
         // Extract model info from the loaded model
         if let Some(model) = &self.persistent_model {
@@ -301,17 +305,42 @@ impl TorchEngine {
             .unwrap_or(false)
     }
 
+    /// Initialize XET storage with default configuration
+    async fn initialize_xet_storage(&mut self) {
+        match self.try_initialize_xet_storage().await {
+            Ok(storage) => {
+                println!("🔗 XET storage initialized successfully");
+                self.xet_storage = Some(Arc::new(storage));
+            }
+            Err(e) => {
+                println!("⚠️ Failed to initialize XET storage: {}. Continuing without XET support.", e);
+                self.xet_storage = None;
+            }
+        }
+    }
+
+    /// Try to initialize XET storage, returning an error if it fails
+    async fn try_initialize_xet_storage(&self) -> Result<XetNativeStorage> {
+        let config = XetConfig::default();
+        XetNativeStorage::new(config).await
+    }
+
     /// Initialize the persistent model instance using ModelFactory
-    fn initialize_persistent_model(&mut self, model_path: &Path) -> Result<()> {
+    async fn initialize_persistent_model(&mut self, model_path: &Path) -> Result<()> {
         use crate::runtime::model_factory::ModelFactory;
         use crate::runtime::model_config::ModelConfig;
-        
+
         println!("🏗️ Initializing persistent model using ModelFactory");
-        
+
+        // Initialize XET storage if not already done
+        if self.xet_storage.is_none() {
+            self.initialize_xet_storage().await;
+        }
+
         // Load model config first to get model parameters
         let empty_weights = HashMap::new();
         let config = ModelConfig::load(model_path, &empty_weights)?;
-        
+
         // Update ModelInfo with actual values from config
         {
             let mut model_info = self.handle_poison(self.model_info.lock())?;
@@ -323,10 +352,14 @@ impl TorchEngine {
             model_info.context_length = config.max_position_embeddings;
             model_info.architecture = config.model_type.clone();
         }
-        
-        // Use the factory to create the model with proper configuration management
-        let model = ModelFactory::create(model_path, &self.device, tch::Kind::BFloat16)?;
-        
+
+        // Use the factory to create the model with XET storage support
+        let model = if let Some(xet_storage) = &self.xet_storage {
+            ModelFactory::create_with_xet(model_path, &self.device, tch::Kind::BFloat16, Some(xet_storage)).await?
+        } else {
+            ModelFactory::create(model_path, &self.device, tch::Kind::BFloat16).await?
+        };
+
         self.persistent_model = Some(Arc::new(Mutex::new(model)));
         println!("✅ Persistent model initialized successfully");
         Ok(())

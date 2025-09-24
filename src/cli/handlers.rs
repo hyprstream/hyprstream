@@ -11,6 +11,7 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 use crate::storage::{ModelStorage, ModelId, ModelMetadata};
+use crate::git;
 
 /// Response structure for LoRA inference
 #[derive(Debug, Clone)]
@@ -1364,7 +1365,7 @@ fn extract_model_metadata(model_path: &std::path::Path, model_name: &str) -> Res
     let size_bytes = calculate_directory_size(model_path).unwrap_or(0);
 
     // Get git metadata if available
-    let (created_at, updated_at) = if let Ok(repo) = git2::Repository::open(model_path) {
+    let (created_at, updated_at) = if let Ok(repo) = git::get_repository(model_path) {
         // Get first commit time as created_at
         let created_at = repo.head().ok()
             .and_then(|head| head.peel_to_commit().ok())
