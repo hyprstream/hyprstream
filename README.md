@@ -12,7 +12,9 @@ HyprStream is a production-ready LLM inference engine built in Rust with PyTorch
 - **High-Performance Inference**: PyTorch-based engine with KV caching and optimized memory management
 - **Hardware Acceleration**: CPU and AMD GPU (ROCm) support, NVIDIA GPU (CUDA) coming soon
 - **LoRA Training & Adaptation**: Create, train, and deploy LoRA adapters for model customization
-- **Git-based Model Management**: Version control for models and adapters using Git workflows
+- **Git-based Model Management**: Version control for models using native Git repositories
+- **Hugging Face Compatible**: Direct cloning and usage of models from Hugging Face Hub
+- **Efficient Storage**: XET integration for lazy loading and deduplication of large model files
 - **Multi-Model Support**: Qwen models (Qwen1/2/3 dense architectures), MoE support coming soon
 - **Training Checkpoints**: Automatic checkpoint management with Git integration
 - **Production Ready**: Built on stable PyTorch C++ API (libtorch) for reliability
@@ -65,11 +67,8 @@ hyprstream model clone https://huggingface.co/Qwen/Qwen3-0.6B
 # Clone a specific branch or tag
 hyprstream model clone https://huggingface.co/Qwen/Qwen3-8B --git-ref main
 
-# List available models (shows UUID and names)
-hyprstream model list
-
-# Show model information (use UUID from list)
-hyprstream model info <model-uuid>
+# Clone with a custom name (instead of auto-generated UUID)
+hyprstream model clone https://huggingface.co/Qwen/Qwen3-0.6B --name qwen3-small
 
 # Import a shared model from Git
 hyprstream model import https://github.com/user/custom-model.git --name my-custom-model
@@ -78,28 +77,41 @@ hyprstream model import https://github.com/user/custom-model.git --name my-custo
 #### Managing Models
 
 ```bash
-# List all cached models with UUIDs
+# List all cached models (shows names and UUIDs)
 hyprstream model list
 
-# Get detailed model information
-hyprstream model info <model-uuid>
+# Get detailed model information using ModelRef syntax
+# Note that git-ref branch and tag management is a work in progress.
+# Simple 'by name' models are verified.
+hyprstream model info qwen3-small           # By name
+hyprstream model info qwen3-small:main      # Specific branch
+hyprstream model info qwen3-small:v1.0      # Specific tag
+hyprstream model info qwen3-small:abc123    # Specific commit
 
-# Remove a model (requires UUID)
-hyprstream model remove <model-uuid>
+# Remove a model using ModelRef
+hyprstream model remove qwen3-small         # Remove by name
+
+# Pull latest updates for a model
+hyprstream model pull qwen3-small           # Update to latest
+hyprstream model pull qwen3-small:main      # Update specific branch
 
 # Share a model with others
-hyprstream model share <model-name> --push-to <git-remote-url>
+hyprstream model share qwen3-small --push-to <git-remote-url>
 ```
 
 ### Running Inference
 
 ```bash
-# Basic inference (use model UUID or name from list)
-hyprstream model infer <model-uuid> \
+# Basic inference using ModelRef syntax
+hyprstream model infer qwen3-small \
     --prompt "Explain quantum computing in simple terms"
 
-# With generation parameters
-hyprstream model infer <model-uuid> \
+# Inference with specific model version
+hyprstream model infer qwen3-small:v1.0 \
+    --prompt "Explain quantum computing"
+
+# Inference with specific branch
+hyprstream model infer qwen3-small:main \
     --prompt "Write a Python function to sort a list" \
     --temperature 0.7 \
     --top-p 0.9 \
@@ -111,10 +123,17 @@ hyprstream model infer <model-uuid> \
 Status: Experimental
 
 ```bash
-# Create a new LoRA adapter (use model UUID from list)
+# Create a new LoRA adapter using ModelRef syntax
 hyprstream lora create \
     --name my-adapter \
-    --base-model <model-uuid> \
+    --base-model qwen3-small \
+    --rank 16 \
+    --alpha 32
+
+# Create adapter for specific model version
+hyprstream lora create \
+    --name my-adapter \
+    --base-model qwen3-small:v1.0 \
     --rank 16 \
     --alpha 32
 
@@ -134,33 +153,6 @@ hyprstream lora train status my-adapter
 # Export trained adapter
 hyprstream lora export my-adapter \
     --output ./my-adapter.safetensors
-```
-
-### Git-based Version Control
-
-HyprStream uses Git for comprehensive model and adapter versioning:
-
-```bash
-# Models are stored as Git repositories with UUID-based directories
-cd ~/.cache/hyprstream/models/<model-uuid>
-git log  # View model history
-
-# Each adapter is a Git branch with UUID-based naming
-git branch
-# Output:
-# * main
-#   adapter/uuid-1234  # my-adapter
-#   adapter/uuid-5678  # another-adapter
-
-# Adapters train in isolated worktrees
-ls ~/.cache/hyprstream/models/working/
-# uuid-1234/  # Active training environment for my-adapter
-
-# Training checkpoints are automatically committed
-git log --oneline adapter/uuid-1234
-# abc123 Checkpoint at step 10000
-# def456 Checkpoint at step 5000
-# ghi789 Initial adapter configuration
 ```
 
 ## Architecture
@@ -187,11 +179,11 @@ graph TD
 
 ### Key Design Decisions
 
-1. **Git-based Storage**: Models and adapters are Git repositories, enabling:
-   - Version control and rollback
-   - Efficient storage through Git's deduplication
-   - Distributed model sharing
-   - Atomic checkpoint commits
+1. **Git-based Storage**: Models are stored as native Git repositories:
+   - Full version control and rollback
+   - Efficient large file handling via XET
+   - Compatible with Hugging Face Hub
+   - Seamless model sharing
 
 2. **Branch-based Adapters**: Each LoRA adapter is a Git branch:
    - UUID-based branch names for stability
@@ -204,6 +196,30 @@ graph TD
    - Milestone tagging
    - Training metrics in commit messages
    - Easy rollback to previous states
+
+## Model References (ModelRef)
+
+HyprStream uses a flexible ModelRef syntax for referencing models and their versions:
+
+- **`model-name`** - Reference model by name (uses registry's pinned commit)
+- **`model-name:branch`** - Reference specific branch (e.g., `qwen3:main`)
+- **`model-name:tag`** - Reference specific tag/version (e.g., `qwen3:v1.0`)
+- **`model-name:commit`** - Reference specific commit (e.g., `qwen3:abc123`)
+
+Examples:
+```bash
+# Use the default version
+hyprstream model infer llama3 --prompt "Hello"
+
+# Use a specific branch
+hyprstream model infer llama3:experimental --prompt "Hello"
+
+# Use a specific release tag
+hyprstream model infer llama3:v2.0 --prompt "Hello"
+
+# Use a specific commit for reproducibility
+hyprstream model infer llama3:f3a8b92 --prompt "Hello"
+```
 
 ## Supported Models
 
@@ -229,7 +245,7 @@ hyprstream serve --port 8080
 curl -X POST http://localhost:8080/oai/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "<model-uuid>",
+    "model": "qwen3-small",
     "messages": [
       {"role": "user", "content": "Hello, world!"}
     ],
