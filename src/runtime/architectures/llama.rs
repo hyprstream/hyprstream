@@ -259,12 +259,12 @@ impl LlamaAttention {
                       batch_size, seq_len, hidden_size, start_pos, kv_cache.is_some());
         
         // Debug: Check shapes and dtypes before matmul
-        tracing::debug!("Attention forward - hidden_states shape: {:?}, dtype: {:?}", hidden_states.size(), hidden_states.kind());
-        tracing::debug!("Attention forward - q_proj shape: {:?}, dtype: {:?}", self.q_proj.size(), self.q_proj.kind());
+        // tracing::debug!("Attention forward - hidden_states shape: {:?}, dtype: {:?}", hidden_states.size(), hidden_states.kind());
+        // tracing::debug!("Attention forward - q_proj shape: {:?}, dtype: {:?}", self.q_proj.size(), self.q_proj.kind());
         
         // Reshape hidden_states for matmul: [batch*seq, hidden_size]
         let hidden_states_2d = hidden_states.reshape(&[batch_size * seq_len, hidden_size]);
-        tracing::debug!("Reshaped hidden_states_2d shape: {:?}, dtype: {:?}", hidden_states_2d.size(), hidden_states_2d.kind());
+        // tracing::debug!("Reshaped hidden_states_2d shape: {:?}, dtype: {:?}", hidden_states_2d.size(), hidden_states_2d.kind());
         
         // Project to Q, K, V using 2D matmul
         let q = hidden_states_2d.matmul(&self.q_proj);
@@ -972,26 +972,26 @@ impl LlamaModel {
             // Get and transpose q_proj weight
             let q_proj_orig = weights.get(&format!("{}.self_attn.q_proj.weight", prefix))
                 .ok_or_else(|| anyhow!("Missing q_proj weight"))?;
-            tracing::debug!("Layer {} q_proj original shape: {:?}, dtype: {:?}", layer_idx, q_proj_orig.size(), q_proj_orig.kind());
+            // tracing::debug!("Layer {} q_proj original shape: {:?}, dtype: {:?}", layer_idx, q_proj_orig.size(), q_proj_orig.kind());
             
             // Transpose from PyTorch format [out, in] to [in, out] for matmul
             // Make sure to make it contiguous after transpose
             let q_proj = q_proj_orig.transpose(0, 1).contiguous();
-            tracing::debug!("Layer {} q_proj transposed shape: {:?}, dtype: {:?}", layer_idx, q_proj.size(), q_proj.kind());
+            // tracing::debug!("Layer {} q_proj transposed shape: {:?}, dtype: {:?}", layer_idx, q_proj.size(), q_proj.kind());
             
             // Get and transpose k_proj weight
             let k_proj_orig = weights.get(&format!("{}.self_attn.k_proj.weight", prefix))
                 .ok_or_else(|| anyhow!("Missing k_proj weight"))?;
-            tracing::debug!("Layer {} k_proj original shape: {:?}", layer_idx, k_proj_orig.size());
+            // tracing::debug!("Layer {} k_proj original shape: {:?}", layer_idx, k_proj_orig.size());
             let k_proj = k_proj_orig.transpose(0, 1).contiguous();
-            tracing::debug!("Layer {} k_proj transposed shape: {:?}", layer_idx, k_proj.size());
+            // tracing::debug!("Layer {} k_proj transposed shape: {:?}", layer_idx, k_proj.size());
             
             // Get and transpose v_proj weight
             let v_proj_orig = weights.get(&format!("{}.self_attn.v_proj.weight", prefix))
                 .ok_or_else(|| anyhow!("Missing v_proj weight"))?;
-            tracing::debug!("Layer {} v_proj original shape: {:?}", layer_idx, v_proj_orig.size());
+            // tracing::debug!("Layer {} v_proj original shape: {:?}", layer_idx, v_proj_orig.size());
             let v_proj = v_proj_orig.transpose(0, 1).contiguous();
-            tracing::debug!("Layer {} v_proj transposed shape: {:?}", layer_idx, v_proj.size());
+            // tracing::debug!("Layer {} v_proj transposed shape: {:?}", layer_idx, v_proj.size());
             
             (q_proj, k_proj, v_proj)
         } else {
@@ -1226,15 +1226,15 @@ impl ModelOperations for LlamaModel {
             
             // Get input shape
             let input_shape = input.size();
-            tracing::debug!("Input tensor shape: {:?}, dtype: {:?}", input_shape, input.kind());
-            tracing::debug!("Embedding matrix shape: {:?}, dtype: {:?}", embed.size(), embed.kind());
+            // tracing::debug!("Input tensor shape: {:?}, dtype: {:?}", input_shape, input.kind());
+            // tracing::debug!("Embedding matrix shape: {:?}, dtype: {:?}", embed.size(), embed.kind());
             
             let batch_size = input_shape[0];
             let seq_len = if input_shape.len() > 1 { input_shape[1] } else { 1 };
             
             // Flatten input for embedding lookup (embedding expects 1D tensor)
             let flat_input = input.flatten(0, -1);
-            tracing::debug!("Flattened input shape: {:?}, dtype: {:?}", flat_input.size(), flat_input.kind());
+            // tracing::debug!("Flattened input shape: {:?}, dtype: {:?}", flat_input.size(), flat_input.kind());
             
             
             // Perform embedding lookup using index_select
@@ -1243,7 +1243,7 @@ impl ModelOperations for LlamaModel {
             // Get the actual hidden size from the embedding result
             let emb_dims = embeddings.size();
             let hidden_size = emb_dims[emb_dims.len() - 1]; // Last dimension is hidden size
-            tracing::debug!("Embeddings shape after lookup: {:?}, hidden_size: {}", emb_dims, hidden_size);
+            // tracing::debug!("Embeddings shape after lookup: {:?}, hidden_size: {}", emb_dims, hidden_size);
             
             // Reshape back to [batch_size, seq_len, hidden_size]
             let mut embeddings = embeddings.reshape(&[batch_size, seq_len, hidden_size]);
@@ -1332,12 +1332,12 @@ impl ModelOperations for LlamaModel {
         }
         
         // LM head
-        tracing::debug!("Before LM head: hidden_states shape={:?}", hidden_states.size());
+        // tracing::debug!("Before LM head: hidden_states shape={:?}", hidden_states.size());
         if let Some(lm_head) = &self.lm_head {
             // LM head weight also needs to be transposed
-            tracing::debug!("Using LM head: shape={:?}", lm_head.size());
+            // tracing::debug!("Using LM head: shape={:?}", lm_head.size());
             hidden_states = hidden_states.matmul(lm_head);
-            tracing::debug!("After LM head: logits shape={:?}", hidden_states.size());
+            // tracing::debug!("After LM head: logits shape={:?}", hidden_states.size());
         } else if let Some(embed) = &self.embed_tokens {
             // Gemma and some other models tie weights: lm_head = embed_tokens.T
             // The embedding matrix is [vocab_size, hidden_size]
@@ -1347,12 +1347,12 @@ impl ModelOperations for LlamaModel {
             
             // Get the shape for debugging
             let embed_shape = embed.size();
-            tracing::debug!("Embedding shape: {:?}, hidden_states shape: {:?}", embed_shape, hidden_states.size());
+            // tracing::debug!("Embedding shape: {:?}, hidden_states shape: {:?}", embed_shape, hidden_states.size());
             
             // The embedding tensor is [vocab_size, hidden_size]
             // We need to transpose it for the projection
             let output_proj = embed.transpose(0, 1).contiguous();
-            tracing::debug!("Output projection shape after transpose: {:?}", output_proj.size());
+            // tracing::debug!("Output projection shape after transpose: {:?}", output_proj.size());
             
             // Ensure hidden_states is the right shape for matmul
             // Should be [batch * seq_len, hidden_size] for the matmul

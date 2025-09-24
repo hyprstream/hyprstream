@@ -147,83 +147,29 @@ impl ModelFactory {
                     Tensor::from_slice(slice).reshape(&shape)
                 }
                 safetensors::Dtype::F16 => {
-                    // Native F16 support - create directly from raw bytes when dtype matches
-                    let tensor_kind = tch::Kind::Half;
-
-                    if dtype == tensor_kind {
-                        // Zero-copy path: create tensor directly from raw bytes
-                        // Try to create directly from blob, fall back to conversion if it fails
-                        // Note: from_blob may panic on unsupported hardware, so we use std::panic::catch_unwind
-                        let result = std::panic::catch_unwind(|| {
-                            unsafe {
-                                Tensor::from_blob(
-                                    data.as_ptr(),
-                                    &shape,
-                                    &[],  // Use default strides
-                                    tensor_kind,
-                                    *device,
-                                )
-                            }
-                        });
-
-                        match result {
-                            Ok(tensor) => tensor,
-                            Err(_) => {
-                                // Fallback to conversion if from_blob fails or panics
-                                let slice = unsafe {
-                                    std::slice::from_raw_parts(data.as_ptr() as *const half::f16, data.len() / 2)
-                                };
-                                let f32_vec: Vec<f32> = slice.iter().map(|x| x.to_f32()).collect();
-                                Tensor::from_slice(&f32_vec).reshape(&shape)
-                            }
-                        }
-                    } else {
-                        // Conversion path: different dtypes require transformation
-                        let slice = unsafe {
-                            std::slice::from_raw_parts(data.as_ptr() as *const half::f16, data.len() / 2)
-                        };
-                        let f32_vec: Vec<f32> = slice.iter().map(|x| x.to_f32()).collect();
-                        Tensor::from_slice(&f32_vec).reshape(&shape)
-                    }
+                    // F16 - convert via F32 for now
+                    let slice = unsafe {
+                        std::slice::from_raw_parts(data.as_ptr() as *const half::f16, data.len() / 2)
+                    };
+                    let f32_vec: Vec<f32> = slice.iter().map(|x| x.to_f32()).collect();
+                    Tensor::from_slice(&f32_vec).reshape(&shape)
                 }
                 safetensors::Dtype::BF16 => {
-                    // Native BF16 support - create directly from raw bytes when dtype matches
-                    let tensor_kind = tch::Kind::BFloat16;
+                    // BF16 - only support on BF16-capable devices
+                    if dtype != tch::Kind::BFloat16 {
+                        return Err(anyhow!("Model requires BF16 but target dtype is {:?}. BF16 models only work with BF16 dtype.", dtype));
+                    }
 
-                    if dtype == tensor_kind {
-                        // Zero-copy path: create tensor directly from raw bytes
-                        // Try to create directly from blob, fall back to conversion if it fails
-                        // Note: from_blob may panic on unsupported hardware, so we use std::panic::catch_unwind
-                        let result = std::panic::catch_unwind(|| {
-                            unsafe {
-                                Tensor::from_blob(
-                                    data.as_ptr(),
-                                    &shape,
-                                    &[],  // Use default strides
-                                    tensor_kind,
-                                    *device,
-                                )
-                            }
-                        });
-
-                        match result {
-                            Ok(tensor) => tensor,
-                            Err(_) => {
-                                // Fallback to conversion if from_blob fails or panics
-                                let slice = unsafe {
-                                    std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, data.len() / 2)
-                                };
-                                let f32_vec: Vec<f32> = slice.iter().map(|x| x.to_f32()).collect();
-                                Tensor::from_slice(&f32_vec).reshape(&shape)
-                            }
-                        }
-                    } else {
-                        // Conversion path: different dtypes require transformation
-                        let slice = unsafe {
-                            std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, data.len() / 2)
-                        };
-                        let f32_vec: Vec<f32> = slice.iter().map(|x| x.to_f32()).collect();
-                        Tensor::from_slice(&f32_vec).reshape(&shape)
+                    // BF16 tensor creation - must create on CPU first due to from_blob GPU issues
+                    // Creating BF16 directly on GPU causes cuda:-2 errors
+                    unsafe {
+                        Tensor::from_blob(
+                            data.as_ptr(),
+                            &shape,
+                            &[],  // Use default strides
+                            tch::Kind::BFloat16,
+                            Device::Cpu,  // Must create on CPU first
+                        )
                     }
                 }
                 _ => {
@@ -232,7 +178,16 @@ impl ModelFactory {
                 }
             };
 
-            let tensor = tensor.to_device(*device).to_kind(dtype);
+            // Only convert if needed - handle CPU-created tensors properly
+            let tensor = if tensor.device() == Device::Cpu && *device == Device::Cpu && tensor.kind() == dtype {
+                tensor  // Already on CPU with correct dtype, no transfer needed
+            } else if tensor.kind() == dtype {
+                tensor.to_device(*device)  // Only device transfer needed
+            } else if tensor.device() == *device {
+                tensor.to_kind(dtype)  // Only dtype conversion needed
+            } else {
+                tensor.to_device(*device).to_kind(dtype)  // Both needed
+            };
             weights.insert(name.to_string(), tensor);
         }
 
@@ -275,83 +230,29 @@ impl ModelFactory {
                     Tensor::from_slice(slice).reshape(&shape)
                 }
                 safetensors::Dtype::F16 => {
-                    // Native F16 support - create directly from raw bytes when dtype matches
-                    let tensor_kind = tch::Kind::Half;
-
-                    if dtype == tensor_kind {
-                        // Zero-copy path: create tensor directly from raw bytes
-                        // Try to create directly from blob, fall back to conversion if it fails
-                        // Note: from_blob may panic on unsupported hardware, so we use std::panic::catch_unwind
-                        let result = std::panic::catch_unwind(|| {
-                            unsafe {
-                                Tensor::from_blob(
-                                    data.as_ptr(),
-                                    &shape,
-                                    &[],  // Use default strides
-                                    tensor_kind,
-                                    *device,
-                                )
-                            }
-                        });
-
-                        match result {
-                            Ok(tensor) => tensor,
-                            Err(_) => {
-                                // Fallback to conversion if from_blob fails or panics
-                                let slice = unsafe {
-                                    std::slice::from_raw_parts(data.as_ptr() as *const half::f16, data.len() / 2)
-                                };
-                                let f32_vec: Vec<f32> = slice.iter().map(|x| x.to_f32()).collect();
-                                Tensor::from_slice(&f32_vec).reshape(&shape)
-                            }
-                        }
-                    } else {
-                        // Conversion path: different dtypes require transformation
-                        let slice = unsafe {
-                            std::slice::from_raw_parts(data.as_ptr() as *const half::f16, data.len() / 2)
-                        };
-                        let f32_vec: Vec<f32> = slice.iter().map(|x| x.to_f32()).collect();
-                        Tensor::from_slice(&f32_vec).reshape(&shape)
-                    }
+                    // F16 - convert via F32 for now
+                    let slice = unsafe {
+                        std::slice::from_raw_parts(data.as_ptr() as *const half::f16, data.len() / 2)
+                    };
+                    let f32_vec: Vec<f32> = slice.iter().map(|x| x.to_f32()).collect();
+                    Tensor::from_slice(&f32_vec).reshape(&shape)
                 }
                 safetensors::Dtype::BF16 => {
-                    // Native BF16 support - create directly from raw bytes when dtype matches
-                    let tensor_kind = tch::Kind::BFloat16;
+                    // BF16 - only support on BF16-capable devices
+                    if dtype != tch::Kind::BFloat16 {
+                        return Err(anyhow!("Model requires BF16 but target dtype is {:?}. BF16 models only work with BF16 dtype.", dtype));
+                    }
 
-                    if dtype == tensor_kind {
-                        // Zero-copy path: create tensor directly from raw bytes
-                        // Try to create directly from blob, fall back to conversion if it fails
-                        // Note: from_blob may panic on unsupported hardware, so we use std::panic::catch_unwind
-                        let result = std::panic::catch_unwind(|| {
-                            unsafe {
-                                Tensor::from_blob(
-                                    data.as_ptr(),
-                                    &shape,
-                                    &[],  // Use default strides
-                                    tensor_kind,
-                                    *device,
-                                )
-                            }
-                        });
-
-                        match result {
-                            Ok(tensor) => tensor,
-                            Err(_) => {
-                                // Fallback to conversion if from_blob fails or panics
-                                let slice = unsafe {
-                                    std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, data.len() / 2)
-                                };
-                                let f32_vec: Vec<f32> = slice.iter().map(|x| x.to_f32()).collect();
-                                Tensor::from_slice(&f32_vec).reshape(&shape)
-                            }
-                        }
-                    } else {
-                        // Conversion path: different dtypes require transformation
-                        let slice = unsafe {
-                            std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, data.len() / 2)
-                        };
-                        let f32_vec: Vec<f32> = slice.iter().map(|x| x.to_f32()).collect();
-                        Tensor::from_slice(&f32_vec).reshape(&shape)
+                    // BF16 tensor creation - must create on CPU first due to from_blob GPU issues
+                    // Creating BF16 directly on GPU causes cuda:-2 errors
+                    unsafe {
+                        Tensor::from_blob(
+                            data.as_ptr(),
+                            &shape,
+                            &[],  // Use default strides
+                            tch::Kind::BFloat16,
+                            Device::Cpu,  // Must create on CPU first
+                        )
                     }
                 }
                 _ => {
@@ -360,7 +261,16 @@ impl ModelFactory {
                 }
             };
 
-            let tensor = tensor.to_device(*device).to_kind(dtype);
+            // Only convert if needed - handle CPU-created tensors properly
+            let tensor = if tensor.device() == Device::Cpu && *device == Device::Cpu && tensor.kind() == dtype {
+                tensor  // Already on CPU with correct dtype, no transfer needed
+            } else if tensor.kind() == dtype {
+                tensor.to_device(*device)  // Only device transfer needed
+            } else if tensor.device() == *device {
+                tensor.to_kind(dtype)  // Only dtype conversion needed
+            } else {
+                tensor.to_device(*device).to_kind(dtype)  // Both needed
+            };
             weights.insert(name.to_string(), tensor);
         }
 

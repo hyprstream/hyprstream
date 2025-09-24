@@ -967,10 +967,17 @@ pub async fn handle_model_command(
                 result
             };
             
+            let seconds = result.latency_ms as f64 / 1000.0;
+            let tokens_per_sec = if seconds > 0.0 {
+                result.tokens_generated as f64 / seconds
+            } else {
+                0.0
+            };
             info!(
-                "Generation complete: {} tokens generated in {:.2}s", 
-                result.tokens_generated, 
-                result.latency_ms as f64 / 1000.0
+                "Generation complete: {} tokens generated in {:.2}s ({:.2} tokens/sec)",
+                result.tokens_generated,
+                seconds,
+                tokens_per_sec
             );
         }
     }

@@ -1589,3 +1589,32 @@ impl TorchEngine {
         Ok(())
     }
 }
+
+impl Drop for TorchEngine {
+    fn drop(&mut self) {
+        // Clean up tensors before automatic drop to avoid device mismatch errors
+        // This prevents cuda:-2 errors when tensors try to access device info during cleanup
+
+        // Clear the persistent model first (contains tensors)
+        self.persistent_model = None;
+
+        // Clear the var store (contains tensors)
+        if let Ok(mut var_store_guard) = self.var_store.lock() {
+            *var_store_guard = None;
+        }
+
+        // Clear LoRA models (may contain tensors)
+        if let Ok(mut lora_guard) = self.lora_model.lock() {
+            *lora_guard = None;
+        }
+
+        if let Ok(mut trainer_guard) = self.lora_trainer.lock() {
+            *trainer_guard = None;
+        }
+
+        // Clear XET storage
+        self.xet_storage = None;
+
+        // Other fields will be dropped automatically
+    }
+}
