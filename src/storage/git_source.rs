@@ -165,35 +165,57 @@ impl GitModelSource {
             e
         })?;
 
-        // Process LFS files if XET storage is available
+        // Process LFS pointer files after clone
+        // XET is a special case of LFS - try XET first for all LFS pointers,
+        // then use Git LFS for any that XET couldn't handle
+
+        // Step 1: Try XET processing if available (handles XET-enabled LFS pointers)
+        let mut xet_processed = 0;
         if let Some(xet_storage) = &self.xet_storage {
             if show_progress {
-                info!("Processing LFS files in parallel after clone: {}", model_path.display());
+                info!("Attempting to process LFS pointers with XET");
             }
 
-            // Use the enhanced batch processing method for better performance
+            // Try batch processing first for performance
             match xet_storage.batch_process_lfs_files(&model_path).await {
                 Ok(processed_files) => {
-                    if !processed_files.is_empty() && show_progress {
-                        info!("Successfully processed {} LFS files in parallel", processed_files.len());
+                    xet_processed = processed_files.len();
+                    if xet_processed > 0 && show_progress {
+                        info!("Successfully processed {} LFS pointers via XET", xet_processed);
                     }
                 }
                 Err(e) => {
-                    // Log warning but don't fail the clone operation
-                    warn!("Failed to batch process LFS files after clone: {}", e);
+                    // Log but don't fail - we'll try Git LFS next
+                    debug!("XET processing not applicable or failed: {}", e);
+                }
+            }
+        }
 
-                    // Fallback to sequential processing if parallel fails
-                    if show_progress {
-                        info!("Falling back to sequential LFS processing");
-                    }
-                    match xet_storage.process_worktree_lfs(&model_path).await {
-                        Ok(processed_files) => {
-                            if !processed_files.is_empty() && show_progress {
-                                info!("Successfully processed {} LFS files sequentially", processed_files.len());
-                            }
-                        }
-                        Err(fallback_e) => {
-                            warn!("Both parallel and sequential LFS processing failed: {}", fallback_e);
+        // Step 2: Process remaining LFS pointers with Git LFS
+        // This handles all LFS pointers that XET didn't process
+        // (either because XET isn't available or they're standard Git LFS pointers)
+
+        match self.process_git_lfs_files(&model_path).await {
+            Ok(lfs_count) => {
+                if lfs_count > 0 && show_progress {
+                    info!("Successfully processed {} LFS pointers via Git LFS", lfs_count);
+                }
+
+                let total_processed = xet_processed + lfs_count;
+                if show_progress && total_processed > 0 {
+                    info!("Total LFS pointers processed: {} (XET: {}, Git LFS: {})",
+                          total_processed, xet_processed, lfs_count);
+                }
+            }
+            Err(e) => {
+                // Don't fail the clone, but warn about incomplete files
+                warn!("Failed to process Git LFS pointers: {}. Some model files may be incomplete.", e);
+
+                // Check if we have unprocessed pointers
+                if xet_processed == 0 {
+                    if let Ok(has_lfs) = self.check_for_lfs_pointers(&model_path).await {
+                        if has_lfs {
+                            warn!("Repository contains LFS pointer files that couldn't be processed. Model files will be incomplete.");
                         }
                     }
                 }
@@ -232,5 +254,107 @@ impl GitModelSource {
         }).await??;
 
         Ok((model_id, model_path))
+    }
+
+    /// Process Git LFS files in a repository
+    async fn process_git_lfs_files(&self, repo_path: &Path) -> Result<usize> {
+        use tokio::process::Command;
+
+        // First, check which LFS files are still pointers (not yet smudged)
+        // git lfs ls-files shows all tracked files, but we need to check which are still pointers
+        let ls_files_output = Command::new("git")
+            .arg("lfs")
+            .arg("ls-files")
+            .arg("-n")  // Show just names
+            .current_dir(repo_path)
+            .output()
+            .await?;
+
+        if !ls_files_output.status.success() {
+            // git lfs might not be initialized for this repo, which is ok
+            return Ok(0);
+        }
+
+        let ls_files_str = String::from_utf8_lossy(&ls_files_output.stdout);
+        let lfs_files: Vec<_> = ls_files_str.lines().collect();
+
+        if lfs_files.is_empty() {
+            return Ok(0);
+        }
+
+        // Count how many are still pointers (not yet processed)
+        let mut unprocessed_count = 0;
+        for file in &lfs_files {
+            let file_path = repo_path.join(file);
+            if file_path.exists() {
+                // Check if it's still a pointer
+                if let Ok(contents) = tokio::fs::read_to_string(&file_path).await {
+                    if contents.starts_with("version https://git-lfs.github.com/spec/v1") {
+                        unprocessed_count += 1;
+                    }
+                }
+            }
+        }
+
+        if unprocessed_count == 0 {
+            // All LFS files already processed (probably by XET)
+            return Ok(0);
+        }
+
+        debug!("Found {} unprocessed LFS pointers, fetching via Git LFS", unprocessed_count);
+
+        // Fetch LFS objects
+        let fetch_result = Command::new("git")
+            .arg("lfs")
+            .arg("fetch")
+            .arg("--all")
+            .current_dir(repo_path)
+            .status()
+            .await?;
+
+        if !fetch_result.success() {
+            bail!("git lfs fetch failed with exit code {:?}", fetch_result.code());
+        }
+
+        // Checkout LFS objects
+        let checkout_result = Command::new("git")
+            .arg("lfs")
+            .arg("checkout")
+            .current_dir(repo_path)
+            .status()
+            .await?;
+
+        if !checkout_result.success() {
+            bail!("git lfs checkout failed with exit code {:?}", checkout_result.code());
+        }
+
+        Ok(unprocessed_count)
+    }
+
+    /// Check if a repository has LFS pointer files
+    async fn check_for_lfs_pointers(&self, repo_path: &Path) -> Result<bool> {
+        use tokio::process::Command;
+
+        // Use git lfs ls-files to check for LFS tracked files
+        let output = Command::new("git")
+            .arg("lfs")
+            .arg("ls-files")
+            .current_dir(repo_path)
+            .output()
+            .await?;
+
+        if output.status.success() {
+            let ls_files_str = String::from_utf8_lossy(&output.stdout);
+            Ok(!ls_files_str.trim().is_empty())
+        } else {
+            // If git lfs ls-files fails, check for .gitattributes with LFS filters
+            let gitattributes = repo_path.join(".gitattributes");
+            if gitattributes.exists() {
+                let content = tokio::fs::read_to_string(&gitattributes).await?;
+                Ok(content.contains("filter=lfs"))
+            } else {
+                Ok(false)
+            }
+        }
     }
 }

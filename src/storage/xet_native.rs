@@ -299,20 +299,33 @@ impl XetNativeStorage {
     /// if the file contains a Xet pointer, LFS pointer, and retrieves the actual content,
     /// or returns the file content directly if it's not a pointer.
     pub async fn load_file(&self, file_path: &Path) -> Result<Vec<u8>> {
-        let content = fs::read_to_string(file_path).await
+        // First read a small portion to check if it's a pointer file
+        let initial_bytes = fs::read(file_path).await
             .context("Failed to read file")?;
 
-        if self.is_xet_pointer(&content) {
-            // It's a Xet pointer - retrieve the actual content
-            self.smudge_bytes(&content).await
-        } else if self.is_lfs_pointer(&content) {
-            // It's an LFS pointer - parse and retrieve via XET
-            let lfs_pointer = self.parse_lfs_pointer(&content)?;
-            self.smudge_lfs_pointer(&lfs_pointer).await
-        } else {
-            // Regular file - return content as bytes
-            Ok(content.into_bytes())
+        // Check if the file starts with pointer markers (both XET and LFS are text-based)
+        // XET pointers start with "# xet version"
+        // LFS pointers start with "version https://git-lfs"
+        let is_likely_pointer = initial_bytes.len() < 1024 && // Pointer files are small
+            initial_bytes.starts_with(b"# xet version") ||
+            initial_bytes.starts_with(b"version https://git-lfs");
+
+        if is_likely_pointer {
+            // Try to parse as text for pointer detection
+            if let Ok(content) = String::from_utf8(initial_bytes.clone()) {
+                if self.is_xet_pointer(&content) {
+                    // It's a Xet pointer - retrieve the actual content
+                    return self.smudge_bytes(&content).await;
+                } else if self.is_lfs_pointer(&content) {
+                    // It's an LFS pointer - parse and retrieve via XET
+                    let lfs_pointer = self.parse_lfs_pointer(&content)?;
+                    return self.smudge_lfs_pointer(&lfs_pointer).await;
+                }
+            }
         }
+
+        // Not a pointer file - return the raw bytes
+        Ok(initial_bytes)
     }
 
     /// Universal file saver - can store as regular file or convert to Xet
