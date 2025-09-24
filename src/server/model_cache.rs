@@ -1,206 +1,262 @@
-//! UUID-based model cache for efficient model reuse across requests
+//! Git-native model cache using commit SHA for consistency
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use git2;
 use lru::LruCache;
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::collections::{HashMap, HashSet};
-use tokio::sync::RwLock;
-use tokio::sync::Mutex;
-use uuid::Uuid;
-use crate::runtime::{TorchEngine, RuntimeConfig, RuntimeEngine};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn, debug};
+use crate::git::{GitManager, GitConfig};
 
-/// Cached model entry containing the loaded engine
+use crate::runtime::{TorchEngine, RuntimeConfig, RuntimeEngine};
+use crate::storage::{ModelRef, SharedModelRegistry};
+use crate::storage::xet_native::XetNativeStorage;
+
+/// Cached model entry
 #[derive(Clone)]
 pub struct CachedModel {
-    /// UUID of the model
-    pub model_id: Uuid,
-    /// Model name
-    pub model_name: String,
-    /// Loaded engine with model
+    /// Commit SHA this model was loaded from
+    pub commit_id: git2::Oid,
+    /// Model reference string
+    pub model_ref: String,
+    /// Loaded engine
     pub engine: Arc<Mutex<TorchEngine>>,
-    /// Last access time for debugging
+    /// Last access time
     pub last_accessed: std::time::Instant,
 }
 
-/// Global model cache with LRU eviction
+/// Model cache that caches by commit SHA
 pub struct ModelCache {
-    /// LRU cache mapping model UUID to loaded engine
-    cache: Arc<Mutex<LruCache<Uuid, CachedModel>>>,
-    /// Cache for name to UUID mappings to avoid disk scanning
-    name_cache: Arc<RwLock<HashMap<String, Uuid>>>,
+    /// LRU cache mapping commit SHA to loaded engine
+    cache: Arc<Mutex<LruCache<git2::Oid, CachedModel>>>,
+    /// Registry for resolving model references
+    registry: Arc<SharedModelRegistry>,
+    /// Sparse checkouts directory
+    checkout_base: PathBuf,
+    /// Reuse checkouts for same commit
+    checkouts: Arc<RwLock<HashMap<git2::Oid, PathBuf>>>,
     /// Maximum cache size
     max_size: usize,
-    /// Model storage for resolving paths
-    model_storage: Arc<crate::api::model_storage::ModelStorage>,
+    /// Optional XET storage for LFS processing
+    xet_storage: Option<Arc<XetNativeStorage>>,
+    /// Git service for repository operations
+    git_manager: Arc<GitManager>,
 }
 
 impl ModelCache {
     /// Create a new model cache
     pub fn new(
         max_size: usize,
-        model_storage: Arc<crate::api::model_storage::ModelStorage>,
-    ) -> Self {
-        let cache_size = NonZeroUsize::new(max_size).unwrap_or(NonZeroUsize::new(5).unwrap());
-        Self {
-            cache: Arc::new(Mutex::new(LruCache::new(cache_size))),
-            name_cache: Arc::new(RwLock::new(HashMap::new())),
-            max_size,
-            model_storage,
-        }
+        registry: Arc<SharedModelRegistry>,
+        checkout_base: PathBuf,
+    ) -> Result<Self> {
+        Self::new_with_config(max_size, registry, checkout_base, None, GitConfig::default())
     }
 
-    /// Get or load a model by UUID
-    pub async fn get_or_load(&self, model_uuid: Uuid, model_name: &str) -> Result<Arc<Mutex<TorchEngine>>> {
-        // First check if model is in cache
+    /// Create a new model cache with custom Git configuration
+    pub fn new_with_config(
+        max_size: usize,
+        registry: Arc<SharedModelRegistry>,
+        checkout_base: PathBuf,
+        xet_storage: Option<Arc<XetNativeStorage>>,
+        git_config: GitConfig,
+    ) -> Result<Self> {
+        let cache_size = NonZeroUsize::new(max_size)
+            .unwrap_or_else(|| NonZeroUsize::new(5).unwrap());
+
+        // Ensure checkout directory exists
+        std::fs::create_dir_all(&checkout_base)?;
+
+        let git_manager = Arc::new(GitManager::new(git_config));
+
+        Ok(Self {
+            cache: Arc::new(Mutex::new(LruCache::new(cache_size))),
+            registry,
+            checkout_base,
+            checkouts: Arc::new(RwLock::new(HashMap::new())),
+            max_size,
+            xet_storage,
+            git_manager,
+        })
+    }
+
+    /// Create a new model cache with XET storage for LFS processing
+    pub fn new_with_xet(
+        max_size: usize,
+        registry: Arc<SharedModelRegistry>,
+        checkout_base: PathBuf,
+        xet_storage: Arc<XetNativeStorage>,
+    ) -> Result<Self> {
+        Self::new_with_config(
+            max_size,
+            registry,
+            checkout_base,
+            Some(xet_storage),
+            GitConfig::default()
+        )
+    }
+
+    /// Get or load a model by reference
+    pub async fn get_or_load(&self, model_ref_str: &str) -> Result<Arc<Mutex<TorchEngine>>> {
+        // Parse model reference
+        let model_ref = ModelRef::parse(model_ref_str)?;
+
+        // Resolve to exact commit SHA
+        let commit_id = self.registry.resolve(&model_ref).await?;
+
+        // Check cache by commit SHA
         {
             let mut cache = self.cache.lock().await;
-            if let Some(cached) = cache.get_mut(&model_uuid) {
-                info!("Model {} (UUID: {}) found in cache", model_name, model_uuid);
+            if let Some(cached) = cache.get_mut(&commit_id) {
+                info!("Cache hit: {} @ {}", model_ref_str, format_oid(&commit_id));
                 cached.last_accessed = std::time::Instant::now();
                 return Ok(Arc::clone(&cached.engine));
             }
         }
 
-        // Model not in cache, load it
-        info!("Model {} (UUID: {}) not in cache, loading...", model_name, model_uuid);
-        
-        // Get model path from storage with direct loading fallback
-        let model_id = crate::api::model_storage::ModelId(model_uuid);
-        let metadata = match self.model_storage.get_metadata_by_id_or_load(&model_id).await {
-            Ok(meta) => meta,
-            Err(e) => {
-                // UUID not found in storage at all
-                warn!("Model not found for UUID: {}. Error: {}", model_uuid, e);
-                self.invalidate_uuid_from_name_cache(model_uuid).await;
-                return Err(anyhow::anyhow!("Model not found for UUID: {}", model_uuid));
-            }
-        };
-        let model_path = metadata.local_path
-            .ok_or_else(|| anyhow::anyhow!("Model {} not cached locally", model_name))?;
+        // Load model at specific commit
+        info!("Cache miss: {} @ {}, loading...", model_ref_str, format_oid(&commit_id));
+        let checkout_path = self.get_or_create_checkout(&model_ref, commit_id).await?;
 
-        // Create new engine and load model
+        // Create engine and load model
         let config = RuntimeConfig::default();
         let mut engine = TorchEngine::new(config)?;
-        
-        info!("Loading model from: {:?}", model_path);
-        engine.load_model(&model_path).await?;
-        info!("Successfully loaded model {} into cache", model_name);
+
+        info!("Loading model from: {:?}", checkout_path);
+        engine.load_model(&checkout_path).await?;
+        info!("Successfully loaded model {}", model_ref_str);
+
+        let engine = Arc::new(Mutex::new(engine));
 
         // Create cached entry
         let cached_model = CachedModel {
-            model_id: model_uuid,
-            model_name: model_name.to_string(),
-            engine: Arc::new(Mutex::new(engine)),
+            commit_id,
+            model_ref: model_ref_str.to_string(),
+            engine: Arc::clone(&engine),
             last_accessed: std::time::Instant::now(),
         };
 
-        let engine_ref = Arc::clone(&cached_model.engine);
-
-        // Add to cache (this may evict LRU model)
+        // Add to cache (may evict LRU)
         {
             let mut cache = self.cache.lock().await;
-            if let Some((evicted_id, evicted_model)) = cache.push(model_uuid, cached_model) {
-                warn!("Evicted model {} (UUID: {}) from cache", evicted_model.model_name, evicted_id);
+            if let Some((evicted_id, evicted)) = cache.push(commit_id, cached_model) {
+                warn!("Evicted {} @ {} from cache",
+                      evicted.model_ref, format_oid(&evicted_id));
             }
         }
 
-        Ok(engine_ref)
+        Ok(engine)
     }
 
-    /// Get model by name (resolves name to UUID first)
+    /// Get or load a model by name (for backwards compatibility)
     pub async fn get_or_load_by_name(&self, model_name: &str) -> Result<Arc<Mutex<TorchEngine>>> {
-        // First try to parse as UUID directly
-        if let Ok(uuid) = Uuid::parse_str(model_name) {
-            return self.get_or_load(uuid, model_name).await;
-        }
-
-        // Check name cache first to avoid disk scanning
-        {
-            let name_cache = self.name_cache.read().await;
-            if let Some(&cached_uuid) = name_cache.get(model_name) {
-                debug!("Found cached name->UUID mapping for {}: {}", model_name, cached_uuid);
-                // Try to load, but handle stale cache entries
-                match self.get_or_load(cached_uuid, model_name).await {
-                    Ok(engine) => return Ok(engine),
-                    Err(e) => {
-                        warn!("Cached UUID {} for name '{}' is invalid: {}. Will rescan.", cached_uuid, model_name, e);
-                        // Continue to rescan below
-                    }
-                }
-            }
-        }
-
-        // Name not in cache or cached UUID was invalid, resolve it (this will scan disk)
-        info!("Name '{}' not in cache or stale, scanning disk for UUID mapping", model_name);
-        let uuid = self.resolve_model_name_to_uuid(model_name).await?;
-        
-        // Validate the UUID before caching (will also load from directory if needed)
-        let model_id = crate::api::model_storage::ModelId(uuid);
-        if let Err(e) = self.model_storage.get_metadata_by_id_or_load(&model_id).await {
-            return Err(anyhow::anyhow!("Model '{}' resolved to UUID {} but not found: {}", model_name, uuid, e));
-        }
-        
-        // Cache the name->UUID mapping for future requests
-        {
-            let mut name_cache = self.name_cache.write().await;
-            name_cache.insert(model_name.to_string(), uuid);
-            debug!("Cached name->UUID mapping: {} -> {}", model_name, uuid);
-        }
-        
-        self.get_or_load(uuid, model_name).await
+        self.get_or_load(model_name).await
     }
 
-    /// Resolve model name to UUID (scans disk - should be called rarely)
-    async fn resolve_model_name_to_uuid(&self, model_name: &str) -> Result<Uuid> {
-        // Try to find model through storage API
-        let models = self.model_storage.children().await?;
-        
-        for (id, metadata) in models {
-            // Check against the model's name field
-            if metadata.name == model_name {
-                return Ok(id.0);
+    /// Get or create a checkout for a specific commit
+    async fn get_or_create_checkout(
+        &self,
+        model_ref: &ModelRef,
+        commit_id: git2::Oid,
+    ) -> Result<PathBuf> {
+        // Check if we already have this checkout
+        {
+            let checkouts = self.checkouts.read().await;
+            if let Some(path) = checkouts.get(&commit_id) {
+                debug!("Reusing existing checkout at {:?}", path);
+                return Ok(path.clone());
             }
-            
-            // Check against display_name
-            if let Some(ref display_name) = metadata.display_name {
-                if display_name == model_name {
-                    return Ok(id.0);
+        }
+
+        // Create worktree checkout for this commit
+        let checkout_dir = self.checkout_base.join(format_oid(&commit_id));
+
+        if !checkout_dir.exists() {
+            info!("Creating worktree checkout at {:?}", checkout_dir);
+
+            // Get model path from registry
+            let model_path = self.registry.get_model_path(&model_ref.model).await?;
+
+            // Create worktree for specific commit
+            let checkout_dir_clone = checkout_dir.clone();
+            let git_manager = Arc::clone(&self.git_manager);
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let repo = git_manager.get_repository(&model_path)?;
+                let worktree_name = format!("cache-{}", &commit_id.to_string()[..8]);
+
+                // Clean up if worktree already exists
+                if let Ok(wt) = repo.find_worktree(&worktree_name) {
+                    wt.prune(Some(git2::WorktreePruneOptions::new().working_tree(true)))?;
                 }
-            }
-            
-            // Check directory name
-            if let Some(ref local_path) = metadata.local_path {
-                if let Some(dir_name) = local_path.file_name() {
-                    let dir_name_str = dir_name.to_string_lossy();
-                    
-                    // Exact match on directory name
-                    if dir_name_str == model_name {
-                        return Ok(id.0);
+
+                // Create parent directory
+                if let Some(parent) = checkout_dir_clone.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+
+                // Create worktree
+                let opts = git2::WorktreeAddOptions::new();
+                repo.worktree(&worktree_name, &checkout_dir_clone, Some(&opts))?;
+
+                // Checkout specific commit with detached HEAD
+                let wt_repo = git_manager.get_repository(&checkout_dir_clone)?;
+                wt_repo.set_head_detached(commit_id)?;
+                wt_repo.checkout_head(Some(
+                    git2::build::CheckoutBuilder::default().force()
+                ))?;
+
+                debug!("Created worktree for commit {}", commit_id);
+                Ok(())
+            }).await??;
+        }
+
+        // Process LFS files if XET storage is available
+        if let Some(xet_storage) = &self.xet_storage {
+            info!("Processing LFS files in worktree: {:?}", checkout_dir);
+            match xet_storage.process_worktree_lfs(&checkout_dir).await {
+                Ok(processed_files) => {
+                    if !processed_files.is_empty() {
+                        info!("Successfully processed {} LFS files", processed_files.len());
                     }
-                    
-                    // Handle "org/model" format
-                    if model_name.contains('/') {
-                        let model_part = model_name.split('/').last().unwrap_or("");
-                        if dir_name_str.to_lowercase().contains(&model_part.to_lowercase()) {
-                            return Ok(id.0);
-                        }
-                    }
+                }
+                Err(e) => {
+                    warn!("Failed to process LFS files in worktree: {}", e);
+                    // Continue anyway - the worktree is still usable even if LFS processing failed
                 }
             }
         }
-        
-        Err(anyhow::anyhow!("Model '{}' not found in storage", model_name))
+
+        // Cache the checkout path
+        {
+            let mut checkouts = self.checkouts.write().await;
+            checkouts.insert(commit_id, checkout_dir.clone());
+        }
+
+        Ok(checkout_dir)
+    }
+
+    /// Check if a model is cached by name
+    pub async fn is_cached_by_name(&self, model_ref_str: &str) -> bool {
+        if let Ok(model_ref) = ModelRef::parse(model_ref_str) {
+            if let Ok(commit_id) = self.registry.resolve(&model_ref).await {
+                let cache = self.cache.lock().await;
+                return cache.peek(&commit_id).is_some();
+            }
+        }
+        false
     }
 
     /// Get cache statistics
     pub async fn stats(&self) -> CacheStats {
         let cache = self.cache.lock().await;
-        let name_cache = self.name_cache.read().await;
+        let checkouts = self.checkouts.read().await;
+
         CacheStats {
             cached_models: cache.len(),
-            cached_names: name_cache.len(),
+            cached_checkouts: checkouts.len(),
             max_size: self.max_size,
         }
     }
@@ -209,137 +265,98 @@ impl ModelCache {
     pub async fn clear(&self) {
         let mut cache = self.cache.lock().await;
         cache.clear();
-        let mut name_cache = self.name_cache.write().await;
-        name_cache.clear();
-        info!("Model cache and name cache cleared");
-    }
-    
-    /// Invalidate cache entries for a specific model
-    pub async fn invalidate_model(&self, model_uuid: Uuid) {
-        // Remove from model cache
-        let mut cache = self.cache.lock().await;
-        if cache.pop(&model_uuid).is_some() {
-            info!("Invalidated model {} from cache", model_uuid);
+
+        let mut checkouts = self.checkouts.write().await;
+        checkouts.clear();
+
+        // Clean up checkout directory
+        if let Ok(entries) = std::fs::read_dir(&self.checkout_base) {
+            for entry in entries.flatten() {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
         }
-        
-        // Remove associated names from name cache
-        self.invalidate_uuid_from_name_cache(model_uuid).await;
-    }
-    
-    /// Remove a UUID from the name cache
-    async fn invalidate_uuid_from_name_cache(&self, model_uuid: Uuid) {
-        let mut name_cache = self.name_cache.write().await;
-        let names_to_remove: Vec<String> = name_cache
-            .iter()
-            .filter(|(_, &uuid)| uuid == model_uuid)
-            .map(|(name, _)| name.clone())
-            .collect();
-        
-        for name in names_to_remove {
-            name_cache.remove(&name);
-            debug!("Removed name '{}' -> {} from cache", name, model_uuid);
-        }
+
+        info!("Model cache cleared");
     }
 
-    /// Check if a model is cached by UUID
-    pub async fn is_cached(&self, model_uuid: Uuid) -> bool {
-        let cache = self.cache.lock().await;
-        cache.peek(&model_uuid).is_some()
-    }
-    
-    /// Check if a model is cached by name
-    pub async fn is_cached_by_name(&self, model_name: &str) -> bool {
-        // First try to parse as UUID directly
-        if let Ok(uuid) = Uuid::parse_str(model_name) {
-            return self.is_cached(uuid).await;
+    /// Clean up old worktrees when cache grows too large
+    pub async fn cleanup_old_worktrees(&self, keep_count: usize) -> Result<()> {
+        let checkouts = self.checkouts.read().await;
+
+        // Only clean up if we have too many checkouts
+        if checkouts.len() <= keep_count {
+            return Ok(());
         }
-        
-        // Check if we have the name in cache and if that UUID is loaded
-        let name_cache = self.name_cache.read().await;
-        if let Some(&uuid) = name_cache.get(model_name) {
-            drop(name_cache); // Release read lock before calling is_cached
-            return self.is_cached(uuid).await;
-        }
-        
-        false
-    }
-    
-    /// Pre-populate name cache by scanning available models once
-    pub async fn warm_name_cache(&self) -> Result<()> {
-        self.refresh_name_cache().await
-    }
-    
-    /// Refresh the name cache, removing stale entries and adding new ones
-    pub async fn refresh_name_cache(&self) -> Result<()> {
-        info!("Refreshing name cache by scanning available models...");
-        let models = self.model_storage.children().await?;
-        
-        // Build new cache from scratch to remove stale entries
-        let mut new_name_cache = HashMap::new();
-        let mut valid_uuids = std::collections::HashSet::new();
-        
-        for (id, metadata) in models {
-            // All models from children() are already validated
-            valid_uuids.insert(id.0);
-            debug!("Model {} (UUID: {}) is valid", metadata.name, id.0);
-            
-            // Cache by name field
-            new_name_cache.insert(metadata.name.clone(), id.0);
-            debug!("Cached name '{}' -> {}", metadata.name, id.0);
-            
-            // Cache by display_name if present
-            if let Some(ref display_name) = metadata.display_name {
-                new_name_cache.insert(display_name.clone(), id.0);
-                debug!("Cached display_name '{}' -> {}", display_name, id.0);
-            }
-            
-            // Cache by directory name
-            if let Some(ref local_path) = metadata.local_path {
-                if let Some(dir_name) = local_path.file_name() {
-                    let dir_name_str = dir_name.to_string_lossy().to_string();
-                    
-                    // Also cache without organization prefix for "org/model" format
-                    if let Some(model_part) = dir_name_str.split('/').last() {
-                        if model_part != &dir_name_str {
-                            new_name_cache.insert(model_part.to_string(), id.0);
-                            debug!("Cached model part '{}' -> {}", model_part, id.0);
-                        }
-                    }
-                    
-                    // Insert the full directory name last (clone to avoid move)
-                    debug!("Cached dir name '{}' -> {}", dir_name_str, id.0);
-                    new_name_cache.insert(dir_name_str, id.0);
+
+        // Get all model paths that have worktrees to clean
+        let mut model_paths = std::collections::HashSet::new();
+        if let Ok(entries) = std::fs::read_dir(&self.checkout_base.parent().unwrap_or(&self.checkout_base)) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() && path.join(".git").exists() {
+                    model_paths.insert(path);
                 }
             }
         }
-        
-        // Replace the old cache with the new one atomically
-        let mut name_cache = self.name_cache.write().await;
-        let old_size = name_cache.len();
-        *name_cache = new_name_cache;
-        let new_size = name_cache.len();
-        
-        // Also clean up the model cache - remove entries for deleted models
-        {
-            let mut model_cache = self.cache.lock().await;
-            let mut to_remove = Vec::new();
-            
-            // Collect UUIDs to remove (can't modify while iterating)
-            for (uuid, _) in model_cache.iter() {
-                if !valid_uuids.contains(uuid) {
-                    to_remove.push(*uuid);
-                }
-            }
-            
-            // Remove stale entries
-            for uuid in to_remove {
-                model_cache.pop(&uuid);
-                warn!("Removed deleted model {} from cache", uuid);
-            }
+
+        drop(checkouts); // Release the read lock
+
+        // Clean up old worktrees from each model repository
+        for model_path in model_paths {
+            self.cleanup_worktrees_for_model(&model_path, keep_count).await?;
         }
-        
-        info!("Name cache refreshed: {} -> {} entries", old_size, new_size);
+
         Ok(())
+    }
+
+    /// Clean up old worktrees for a specific model repository
+    async fn cleanup_worktrees_for_model(&self, model_path: &Path, keep_count: usize) -> Result<()> {
+        let model_path = model_path.to_path_buf();
+        let git_manager = Arc::clone(&self.git_manager);
+
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let repo = match git_manager.get_repository(&model_path) {
+                Ok(repo) => repo,
+                Err(_) => return Ok(()), // Skip if not a git repo
+            };
+
+            // List all worktrees that start with "cache-"
+            let mut cache_worktrees = Vec::new();
+
+            // Get worktree list from git
+            if let Ok(worktrees) = repo.worktrees() {
+                for worktree_name in worktrees.iter().flatten() {
+                    if worktree_name.starts_with("cache-") {
+                        cache_worktrees.push(worktree_name.to_string());
+                    }
+                }
+            }
+
+            // Sort by name (which includes commit ID)
+            cache_worktrees.sort();
+
+            // Remove old ones if we have too many
+            if cache_worktrees.len() > keep_count {
+                let to_remove = cache_worktrees.len() - keep_count;
+                for name in cache_worktrees.iter().take(to_remove) {
+                    if let Ok(wt) = repo.find_worktree(name) {
+                        info!("Pruning old worktree: {}", name);
+                        let _ = wt.prune(Some(
+                            git2::WorktreePruneOptions::new()
+                                .working_tree(true)
+                        ));
+                    }
+                }
+            }
+
+            Ok(())
+        }).await?
+    }
+
+    /// Invalidate a specific model (no-op in commit-based cache)
+    pub async fn invalidate_model(&self, _model_uuid: uuid::Uuid) {
+        // No-op for backwards compatibility
+        // Commit-based cache doesn't need UUID invalidation
     }
 }
 
@@ -347,6 +364,16 @@ impl ModelCache {
 #[derive(Debug, Clone)]
 pub struct CacheStats {
     pub cached_models: usize,
-    pub cached_names: usize,
+    pub cached_checkouts: usize,
     pub max_size: usize,
+}
+
+/// Format git OID for display
+fn format_oid(oid: &git2::Oid) -> String {
+    let s = oid.to_string();
+    if s.len() > 8 {
+        s[..8].to_string()
+    } else {
+        s
+    }
 }

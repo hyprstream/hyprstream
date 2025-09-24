@@ -1,39 +1,26 @@
-//! VDB-first storage for dynamic sparse weight adjustments
+//! Storage for model weights and adapters
 //!
-//! This module provides VDB-based storage optimized for:
-//! - 99% sparse neural network weights  
-//! - Real-time dynamic weight adjustments
+//! This module provides storage for:
+//! - Neural network weights
+//! - LoRA adapters
+//! - Model checkpoints
 //! - Memory-mapped disk persistence
-//! - Hardware-accelerated operations
-//! - Neural compression (10-100x compression ratios)
-//!
-//! The architecture is designed for adaptive ML inference systems
-//! that require streaming weight updates during inference.
-
-// VDB-first storage for sparse adaptive layers
-pub mod vdb;
+//! - Xet-based content-addressable storage
+//! - Git-native model registry
 pub mod paths;
-pub mod lora_storage_manager;
-pub mod lora_weight_cache;
-
-// Re-export main VDB interfaces
-pub use vdb::{
-    SparseStorage, VDBSparseStorage, SparseStorageConfig, 
-    SparseWeightUpdate, EmbeddingMatch, SparseStorageError,
-    AdapterStats, StorageStats, CompactionStats,
-    VDBStorage, VDBConfig, AdapterStore,
-};
-
-// Re-export LoRA storage manager and cache
-pub use lora_storage_manager::{
-    LoRAStorageManager, LoRAStorageConfig, 
-    LoRAAdapterInfo, LoRAStorageInfo, LoRAFullStats,
-};
-
-pub use lora_weight_cache::{
-    LoRAWeightCache, LoRAWeightCacheConfig, CachedLoRAAdapter,
-    AdapterCacheStats, CacheStats,
-};
+pub mod xet_native;
+pub mod model_ref;
+pub mod model_registry;
+pub mod model_storage;
+pub mod git_source;
+pub mod sharing;
+pub mod operations;
 
 // XDG-compliant path management (internal use only)
 pub use paths::StoragePaths;
+pub use xet_native::{XetNativeStorage, XetConfig};
+pub use model_ref::{ModelRef, validate_model_name};
+pub use model_registry::{ModelRegistry, SharedModelRegistry};
+pub use model_storage::{ModelStorage, ModelId, ModelMetadata, ModelMetadataFile};
+pub use git_source::GitModelSource;
+pub use sharing::{ModelSharing, ShareableModelRef, ModelType};

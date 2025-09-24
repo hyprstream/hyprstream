@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use uuid::Uuid;
 
-use crate::adapters::sparse_lora::SparseLoRAAdapter;
 use crate::storage::StoragePaths;
 
 /// Metadata for a LoRA checkpoint
@@ -106,54 +105,6 @@ impl LoRACheckpointManager {
         Ok(manager)
     }
     
-    /// Create a checkpoint from VDB sparse adapter
-    pub async fn create_checkpoint(
-        &mut self,
-        lora_uuid: Uuid,
-        adapter: &SparseLoRAAdapter,
-        tag: String,
-        metrics: CheckpointMetrics,
-    ) -> Result<LoRACheckpoint> {
-        let checkpoint_id = format!("{}_{}_{}",
-            lora_uuid.to_string()[..8].to_string(),
-            tag,
-            chrono::Utc::now().timestamp()
-        );
-        
-        tracing::info!("🏷️ Creating LoRA checkpoint: {} (tag: {})", checkpoint_id, tag);
-        
-        // Generate weights data file path
-        let weights_filename = format!("{}.json", checkpoint_id);
-        let weights_path = self.checkpoint_dir.join(&weights_filename);
-        
-        // Extract LoRA weights from VDB adapter
-        let file_size = self.extract_lora_weights(adapter, &weights_path).await?;
-        
-        // Calculate checksum
-        let checksum = self.calculate_checksum(&weights_path).await?;
-        
-        let checkpoint = LoRACheckpoint {
-            checkpoint_id: checkpoint_id.clone(),
-            lora_uuid,
-            tag,
-            created_at: chrono::Utc::now().timestamp(),
-            weights_path,
-            metrics,
-            file_size,
-            checksum,
-        };
-        
-        // Save checkpoint metadata
-        self.save_checkpoint_metadata(&checkpoint).await?;
-        
-        // Cache in memory
-        self.checkpoint_cache.insert(checkpoint_id.clone(), checkpoint.clone());
-        
-        tracing::info!("✅ Created checkpoint: {} ({:.2} MB)", 
-                      checkpoint_id, file_size as f64 / 1024.0 / 1024.0);
-        
-        Ok(checkpoint)
-    }
     
     /// List all checkpoints for a LoRA UUID
     pub fn list_checkpoints(&self, lora_uuid: Uuid) -> Vec<&LoRACheckpoint> {
@@ -196,59 +147,7 @@ impl LoRACheckpointManager {
         Ok(())
     }
     
-    /// Extract LoRA weights from VDB sparse adapter and save as JSON
-    async fn extract_lora_weights(
-        &self,
-        adapter: &SparseLoRAAdapter,
-        output_path: &Path,
-    ) -> Result<u64> {
-        tracing::info!("🔄 Extracting LoRA weights from VDB adapter: {}", output_path.display());
-        
-        let weights_data = self.create_lora_weights_data(adapter).await?;
-        let json_data = serde_json::to_vec_pretty(&weights_data)?;
-        fs::write(output_path, &json_data).await?;
-        
-        tracing::info!("✅ Extracted {} A matrices and {} B matrices", 
-                      weights_data.a_weights.len(), weights_data.b_weights.len());
-        
-        Ok(json_data.len() as u64)
-    }
     
-    /// Create LoRA weights data from VDB sparse adapter
-    async fn create_lora_weights_data(&self, adapter: &SparseLoRAAdapter) -> Result<LoRAWeightsData> {
-        let config = adapter.get_config();
-        
-        // Extract weights from the adapter 
-        // For now, create some representative weight matrices
-        
-        let mut a_weights = HashMap::new();
-        let mut b_weights = HashMap::new();
-        
-        // Create representative weight matrices for each target module
-        for module in &config.target_modules {
-            // A matrix: [hidden_size, rank] - projects input to low-rank space
-            let a_matrix = self.create_representative_matrix(4096, config.rank)?;
-            a_weights.insert(module.clone(), a_matrix);
-            
-            // B matrix: [rank, hidden_size] - projects from low-rank space to output
-            let b_matrix = self.create_representative_matrix(config.rank, 4096)?;
-            b_weights.insert(module.clone(), b_matrix);
-        }
-        
-        Ok(LoRAWeightsData {
-            config: LoRAConfig {
-                rank: config.rank,
-                alpha: config.alpha,
-                dropout: config.dropout,
-                target_modules: config.target_modules.clone(),
-                sparsity: config.sparsity,
-            },
-            a_weights,
-            b_weights,
-            target_modules: config.target_modules.clone(),
-            scaling: config.alpha / config.rank as f32,
-        })
-    }
     
     /// Create a representative weight matrix (mostly zeros for sparsity)
     fn create_representative_matrix(&self, rows: usize, cols: usize) -> Result<Vec<Vec<f32>>> {
@@ -350,4 +249,3 @@ impl CheckpointManagerStats {
     }
 }
 
-// Add blake3 dependency to Cargo.toml for checksums

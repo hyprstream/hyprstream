@@ -31,8 +31,6 @@ pub struct StorageConfig {
     pub cache_dir: PathBuf,
     /// Config directory path
     pub config_dir: PathBuf,
-    /// VDB storage directory path
-    pub vdb_storage_dir: PathBuf,
 }
 
 /// Model loading and identification
@@ -127,9 +125,6 @@ impl Default for StorageConfig {
             loras_dir: storage_paths.loras_dir().unwrap_or_else(|_| PathBuf::from("./loras")),
             cache_dir: storage_paths.cache_dir().unwrap_or_else(|_| PathBuf::from("./cache")),
             config_dir: storage_paths.config_dir().unwrap_or_else(|_| PathBuf::from("./config")),
-            vdb_storage_dir: storage_paths.cache_dir()
-                .unwrap_or_else(|_| PathBuf::from("./cache"))
-                .join("vdb_storage"),
         }
     }
 }
@@ -182,6 +177,10 @@ pub struct ModelInfo {
     pub parameters: u64,
     pub context_length: usize,
     pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub intermediate_size: Option<usize>,
+    pub num_attention_heads: Option<usize>,
+    pub num_hidden_layers: Option<usize>,
     pub architecture: String,
     pub quantization: Option<String>,
 }
@@ -391,24 +390,8 @@ impl HyprConfig {
         &self.storage.config_dir
     }
     
-    /// Get the VDB storage directory path
-    pub fn vdb_storage_dir(&self) -> &PathBuf {
-        &self.storage.vdb_storage_dir
-    }
+    /// Get the storage directory path
     
-    /// Get a specific model path by name
-    pub fn model_path(&self, model_name: &str) -> PathBuf {
-        use crate::utils::sanitize_filename;
-        let sanitized_name = sanitize_filename(model_name);
-        self.storage.models_dir.join(sanitized_name)
-    }
-    
-    /// Get a specific LoRA path by name
-    pub fn lora_path(&self, lora_name: &str) -> PathBuf {
-        use crate::utils::sanitize_filename;
-        let sanitized_name = sanitize_filename(lora_name);
-        self.storage.loras_dir.join(sanitized_name)
-    }
     
     /// Ensure all configured directories exist
     pub fn ensure_directories(&self) -> Result<(), std::io::Error> {
@@ -416,7 +399,6 @@ impl HyprConfig {
         std::fs::create_dir_all(&self.storage.loras_dir)?;
         std::fs::create_dir_all(&self.storage.cache_dir)?;
         std::fs::create_dir_all(&self.storage.config_dir)?;
-        std::fs::create_dir_all(&self.storage.vdb_storage_dir)?;
         Ok(())
     }
     
@@ -438,7 +420,6 @@ impl HyprConfig {
             loras_dir: storage_paths.loras_dir()?,
             cache_dir: storage_paths.cache_dir()?,
             config_dir: storage_paths.config_dir()?,
-            vdb_storage_dir: storage_paths.cache_dir()?.join("vdb_storage"),
         };
         
         Ok(config)

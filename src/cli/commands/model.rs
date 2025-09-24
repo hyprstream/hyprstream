@@ -1,6 +1,7 @@
 //! Model management CLI commands
 
 use clap::{Args, Subcommand};
+use serde::{Deserialize, Serialize};
 
 /// Model management commands
 #[derive(Args)]
@@ -14,7 +15,7 @@ pub struct ModelCommand {
 pub enum ModelAction {
     /// Pull a model from a registry
     Pull {
-        /// Model URI (e.g., hf://microsoft/DialoGPT-medium)
+        /// Git repository URL (e.g., https://huggingface.co/microsoft/DialoGPT-medium)
         uri: String,
         
         /// Force re-download even if cached
@@ -38,23 +39,57 @@ pub enum ModelAction {
         progress: bool,
     },
     
+    /// Clone a model using Git
+    Clone {
+        /// Git repository URL (supports all Git URL formats)
+        repo_url: String,
+        
+        /// Git ref (branch, tag, commit) to clone
+        #[arg(long)]
+        git_ref: Option<String>,
+        
+        /// Model ID to use (auto-generated if not provided)
+        #[arg(long)]
+        model_id: Option<String>,
+    },
+    
     /// List available models
     List {
         /// Filter by registry type (hf, custom)
         #[arg(long)]
         registry: Option<String>,
-        
+
         /// Search query to filter models
         #[arg(long)]
         search: Option<String>,
-        
+
         /// Include remote models (not just local cache)
         #[arg(long)]
         remote: bool,
-        
+
         /// Output format (table, json)
         #[arg(long, default_value = "table")]
         format: String,
+
+        /// Show git reference info (branch/tag/commit)
+        #[arg(long, default_value = "true")]
+        show_git_ref: bool,
+
+        /// Show repository status (clean/dirty)
+        #[arg(long)]
+        show_status: bool,
+
+        /// Filter by git branch
+        #[arg(long)]
+        branch: Option<String>,
+
+        /// Filter by git tag
+        #[arg(long)]
+        tag: Option<String>,
+
+        /// Show only models with uncommitted changes
+        #[arg(long)]
+        dirty_only: bool,
     },
     
     /// Get detailed information about a model
@@ -67,9 +102,37 @@ pub enum ModelAction {
         format: String,
     },
     
+    /// Share a model with the network
+    Share {
+        /// Model name to share
+        model_name: String,
+        
+        /// Include performance metrics
+        #[arg(long)]
+        include_metrics: bool,
+        
+        /// Push to remote repository
+        #[arg(long)]
+        push_to: Option<String>,
+    },
+    
+    /// Import a shared model from peer
+    Import {
+        /// Git URL of the shared model
+        git_url: String,
+        
+        /// Local name for the imported model
+        #[arg(long)]
+        name: Option<String>,
+        
+        /// Verify signature
+        #[arg(long)]
+        verify: bool,
+    },
+    
     /// Remove a model from local cache
     Remove {
-        /// Model URI
+        /// Model name or reference (e.g., "gitignore", "qwen/qwen-2b")
         uri: String,
         
         /// Keep metadata but remove files
@@ -80,25 +143,9 @@ pub enum ModelAction {
         #[arg(long)]
         yes: bool,
     },
-    
-    /// Search for models across registries
-    Search {
-        /// Search query
-        query: String,
-        
-        /// Filter by registry type
-        #[arg(long)]
-        registry: Option<String>,
-        
-        /// Maximum number of results
-        #[arg(long, default_value = "20")]
-        limit: usize,
-        
-        /// Output format (table, json)
-        #[arg(long, default_value = "table")]
-        format: String,
-    },
-    
+
+    // Search functionality has been removed - use 'model list' with search filter instead
+
     /// Repair model metadata and fix inconsistencies
     Repair {
         /// Perform automatic repairs without confirmation
@@ -143,7 +190,7 @@ pub enum ModelAction {
     
     /// Run pure base model inference without any LoRA adapters
     Infer {
-        /// Model name or UUID (e.g., "google/gemma-2b", UUID from model list)
+        /// Model reference (e.g., "Qwen3-4B", "qwen/qwen-2b", "model:branch")
         model: String,
         
         /// Prompt text
@@ -196,6 +243,17 @@ pub enum CacheAction {
     },
 }
 
+impl ModelAction {
+    /// Returns the device configuration for this action
+    pub fn device_config(&self) -> crate::cli::DeviceConfig {
+        use crate::cli::DeviceConfig;
+        match self {
+            ModelAction::Infer { .. } => DeviceConfig::request_gpu(),
+            _ => DeviceConfig::request_cpu(),
+        }
+    }
+}
+
 /// Model pull configuration
 #[derive(Debug, Clone)]
 pub struct PullConfig {
@@ -212,6 +270,11 @@ pub struct ListConfig {
     pub search: Option<String>,
     pub include_remote: bool,
     pub format: OutputFormat,
+    pub show_git_ref: bool,
+    pub show_status: bool,
+    pub branch_filter: Option<String>,
+    pub tag_filter: Option<String>,
+    pub dirty_only: bool,
 }
 
 /// Output format options
@@ -232,6 +295,26 @@ impl From<&str> for OutputFormat {
     }
 }
 
+/// Git information for a model repository
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitInfo {
+    pub current_ref: Option<String>,
+    pub ref_type: RefType,
+    pub commit: Option<String>,
+    pub short_commit: Option<String>,
+    pub is_dirty: bool,
+    pub last_commit_date: Option<String>,
+}
+
+/// Type of git reference
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RefType {
+    Branch,
+    Tag,
+    Commit,
+    Detached,
+}
+
 /// Model information for display
 #[derive(Debug, Clone)]
 pub struct ModelDisplayInfo {
@@ -245,6 +328,7 @@ pub struct ModelDisplayInfo {
     pub last_accessed: Option<String>,
     pub parameters: Option<String>,
     pub model_type: String,
+    pub git_info: Option<GitInfo>,
 }
 
 impl ModelDisplayInfo {
@@ -275,6 +359,106 @@ impl ModelDisplayInfo {
         match &self.last_accessed {
             Some(time) => time.clone(),
             None => "Never".to_string(),
+        }
+    }
+
+    /// Format git reference for display
+    pub fn format_git_ref(&self) -> String {
+        match &self.git_info {
+            Some(git) => match &git.current_ref {
+                Some(ref_name) => ref_name.clone(),
+                None => git.short_commit.clone().unwrap_or("unknown".to_string()),
+            },
+            None => "n/a".to_string(),
+        }
+    }
+
+    /// Format git status for display
+    pub fn format_git_status(&self) -> String {
+        match &self.git_info {
+            Some(git) => if git.is_dirty { "dirty".to_string() } else { "clean".to_string() },
+            None => "n/a".to_string(),
+        }
+    }
+
+    /// Get git commit for display
+    pub fn format_git_commit(&self) -> String {
+        match &self.git_info {
+            Some(git) => git.short_commit.clone().unwrap_or("unknown".to_string()),
+            None => "n/a".to_string(),
+        }
+    }
+}
+
+impl GitInfo {
+    /// Create GitInfo from a git repository path
+    pub fn from_repo_path(repo_path: &std::path::Path) -> Option<Self> {
+        let repo = crate::git::get_repository(repo_path).ok()?;
+
+        // Get current reference
+        let (current_ref, ref_type) = match repo.head() {
+            Ok(head) => {
+                if head.is_branch() {
+                    let name = head.shorthand().unwrap_or("unknown").to_string();
+                    (Some(name), RefType::Branch)
+                } else if head.is_tag() {
+                    let name = head.shorthand().unwrap_or("unknown").to_string();
+                    (Some(name), RefType::Tag)
+                } else {
+                    (None, RefType::Detached)
+                }
+            }
+            Err(_) => (None, RefType::Detached),
+        };
+
+        // Get commit information
+        let (commit, short_commit) = match repo.head().ok()?.peel_to_commit() {
+            Ok(commit) => {
+                let full = commit.id().to_string();
+                let short = if full.len() > 7 { full[..7].to_string() } else { full.clone() };
+                (Some(full), Some(short))
+            }
+            Err(_) => (None, None),
+        };
+
+        // Check if repository is dirty
+        let is_dirty = repo.statuses(None)
+            .map(|statuses| !statuses.is_empty())
+            .unwrap_or(false);
+
+        // Get last commit date
+        let last_commit_date = repo.head().ok()
+            .and_then(|head| head.peel_to_commit().ok())
+            .map(|commit| {
+                let seconds = commit.time().seconds();
+                chrono::DateTime::from_timestamp(seconds, 0)
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            });
+
+        Some(GitInfo {
+            current_ref,
+            ref_type,
+            commit,
+            short_commit,
+            is_dirty,
+            last_commit_date,
+        })
+    }
+
+    /// Check if this git info matches a branch filter
+    pub fn matches_branch(&self, branch_filter: &str) -> bool {
+        match (&self.ref_type, &self.current_ref) {
+            (RefType::Branch, Some(current_ref)) => current_ref == branch_filter,
+            _ => false,
+        }
+    }
+
+    /// Check if this git info matches a tag filter
+    pub fn matches_tag(&self, tag_filter: &str) -> bool {
+        match (&self.ref_type, &self.current_ref) {
+            (RefType::Tag, Some(current_ref)) => current_ref == tag_filter,
+            _ => false,
         }
     }
 }

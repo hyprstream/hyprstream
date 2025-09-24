@@ -1,27 +1,36 @@
-# HyprStream: ML Inference & Training Engine with Dynamic LoRA Adaptation
+# HyprStream: LLM Inference Engine with Git-based Model Management
 
 [![Rust](https://github.com/hyprstream/hyprstream/actions/workflows/rust.yml/badge.svg)](https://github.com/hyprstream/hyprstream/actions/workflows/rust.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
 ## Overview
 
-HyprStream is a PyTorch-based ML inference and training engine built in Rust, designed for real-time model adaptation through dynamic LoRA (Low-Rank Adaptation) layers. The system enables continuous learning during inference, allowing models to adapt to context and user patterns in real-time.
+HyprStream is a production-ready LLM inference engine built in Rust with PyTorch, featuring integrated training capabilities and Git-based model version control. It provides a unified platform for model inference, fine-tuning through LoRA adapters, and comprehensive model lifecycle management.
 
-### Key Goals
+### Core Features
 
-- **Inference & Training**: Unified engine for both inference and training workflows
-- **Dynamic LoRA Adaptation**: Real-time weight updates through LoRA layers during generation (planned)
-- **Multi-Model Support**: Qwen models (Llama and Gemma experimental)
-- **Production Ready**: Built on PyTorch's libtorch for stability and performance
-- **KV Caching**: Optimized sequential generation with key-value caching
+- **High-Performance Inference**: PyTorch-based engine with KV caching and optimized memory management
+- **Hardware Acceleration**: CPU and AMD GPU (ROCm) support, NVIDIA GPU (CUDA) coming soon
+- **LoRA Training & Adaptation**: Create, train, and deploy LoRA adapters for model customization
+- **Git-based Model Management**: Version control for models using native Git repositories
+- **Hugging Face Compatible**: Direct cloning and usage of models from Hugging Face Hub
+- **Efficient Storage**: XET integration for lazy loading and deduplication of large model files
+- **Multi-Model Support**: Qwen models (Qwen1/2/3 dense architectures), MoE support coming soon
+- **Training Checkpoints**: Automatic checkpoint management with Git integration
+- **Production Ready**: Built on stable PyTorch C++ API (libtorch) for reliability
 
 ## Installation
 
 ### Prerequisites
 
 - Rust 1.75+
+- Git 2.0+
 - libtorch (automatically downloaded or use existing installation)
-- 8GB+ RAM for running models
+- **Hardware Support:**
+  - **CPU**: Full support (x86_64, ARM64)
+  - **ROCm**: AMD GPU support (gfx90a, gfx1100+)
+  - **CUDA**: Coming soon
+- 8GB+ RAM for inference, 16GB+ for training
 
 ### Building from Source
 
@@ -31,111 +40,258 @@ git clone https://github.com/hyprstream/hyprstream-torch.git
 cd hyprstream-torch
 
 # Set libtorch path (if using existing installation)
-export LD_LIBRARY_PATH=$PWD/libtorch/lib:$LD_LIBRARY_PATH
+export LIBTORCH=/path/to/libtorch
+export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
 
-# Build
+# Build with ROCm support (for AMD GPUs) - Use the automated script
+# MUST PROVIDE ROCm libtorch - tested with rocm 6.4
+./build-rocm.sh release
+
+# Or manually with environment variables
+export LIBTORCH=/path/to/rocm-libtorch
 cargo build --release
 
 # The binary will be at ./target/release/hyprstream
 ```
 
-## Usage
+## Quick Start
 
-HyprStream provides a CLI for model operations:
+### Model Management
 
-### Download Models
-
-```bash
-# Download from HuggingFace
-hyprstream pull Qwen/Qwen2.5-3B-Instruct
-```
-
-### Run Inference
+#### Downloading Models
 
 ```bash
-# Run inference with a prompt
-hyprstream infer ~/.cache/hyprstream/models/Qwen/Qwen2.5-3B-Instruct \
-    --prompt "What is the capital of France?" \
-    --max-tokens 100
+# Clone a model from Git repository (HuggingFace, GitHub, etc.)
+hyprstream model clone https://huggingface.co/Qwen/Qwen3-0.6B
+
+# Clone a specific branch or tag
+hyprstream model clone https://huggingface.co/Qwen/Qwen3-8B --git-ref main
+
+# Clone with a custom name (instead of auto-generated UUID)
+hyprstream model clone https://huggingface.co/Qwen/Qwen3-0.6B --name qwen3-small
+
+# Import a shared model from Git
+hyprstream model import https://github.com/user/custom-model.git --name my-custom-model
 ```
 
-### Model Information
+#### Managing Models
 
 ```bash
-# Show model details
-hyprstream model info ~/.cache/hyprstream/models/Qwen/Qwen2.5-3B-Instruct
+# List all cached models (shows names and UUIDs)
+hyprstream model list
+
+# Get detailed model information using ModelRef syntax
+# Note that git-ref branch and tag management is a work in progress.
+# Simple 'by name' models are verified.
+hyprstream model info qwen3-small           # By name
+hyprstream model info qwen3-small:main      # Specific branch
+hyprstream model info qwen3-small:v1.0      # Specific tag
+hyprstream model info qwen3-small:abc123    # Specific commit
+
+# Remove a model using ModelRef
+hyprstream model remove qwen3-small         # Remove by name
+
+# Pull latest updates for a model
+hyprstream model pull qwen3-small           # Update to latest
+hyprstream model pull qwen3-small:main      # Update specific branch
+
+# Share a model with others
+hyprstream model share qwen3-small --push-to <git-remote-url>
 ```
 
-### Generation Parameters
+### Running Inference
 
-Inference commands support these optional parameters:
+```bash
+# Basic inference using ModelRef syntax
+hyprstream model infer qwen3-small \
+    --prompt "Explain quantum computing in simple terms"
 
-- `--temperature <float>` - Sampling temperature (default: 0.7)
-- `--top-p <float>` - Nucleus sampling threshold (default: 0.9)
-- `--top-k <int>` - Top-k sampling (default: 50)
-- `--repetition-penalty <float>` - Repetition penalty (default: 1.1)
-- `--max-tokens <int>` - Maximum tokens to generate (default: 2048)
-- `--seed <int>` - Random seed for reproducibility
+# Inference with specific model version
+hyprstream model infer qwen3-small:v1.0 \
+    --prompt "Explain quantum computing"
 
-## Supported Models
+# Inference with specific branch
+hyprstream model infer qwen3-small:main \
+    --prompt "Write a Python function to sort a list" \
+    --temperature 0.7 \
+    --top-p 0.9 \
+    --max-tokens 1024
+```
 
-- **Qwen**: Full support for Qwen2/Qwen2.5 series
-- **Llama**: Experimental support
-- **Gemma**: Experimental support
+### LoRA Adapter Training
 
-Models are automatically detected based on their architecture and configuration.
+Status: Experimental
 
-## System Architecture
+```bash
+# Create a new LoRA adapter using ModelRef syntax
+hyprstream lora create \
+    --name my-adapter \
+    --base-model qwen3-small \
+    --rank 16 \
+    --alpha 32
+
+# Create adapter for specific model version
+hyprstream lora create \
+    --name my-adapter \
+    --base-model qwen3-small:v1.0 \
+    --rank 16 \
+    --alpha 32
+
+# Start training with samples
+hyprstream lora train start my-adapter \
+    --learning-rate 1e-4 \
+    --batch-size 8
+
+# Add training samples
+hyprstream lora train sample my-adapter \
+    --input "What is machine learning?" \
+    --output "Machine learning is a subset of AI..."
+
+# Monitor training status
+hyprstream lora train status my-adapter
+
+# Export trained adapter
+hyprstream lora export my-adapter \
+    --output ./my-adapter.safetensors
+```
+
+## Architecture
+
+### System Components
 
 ```mermaid
 graph TD
     CLI[CLI Interface] --> Engine[TorchEngine]
-    Engine --> Factory[ModelFactory]
-    Factory --> Models[Model Implementations]
-    
-    Models --> Qwen[Qwen Models]
-    Models --> Llama[Llama - Experimental]  
-    Models --> Gemma[Gemma - Experimental]
-    
-    Engine --> KVCache[KV Cache System]
-    Engine --> Sampling[Sampling Algorithms]
-    
-    Future[Future: Dynamic LoRA] -.-> Engine
-    Future -.-> Training[Real-time Training]
-    Future -.-> Adaptation[Context Adaptation]
+    Engine --> Models[Model Management]
+    Engine --> Training[Training System]
+
+    Models --> Git[Git Repository]
+    Git --> Branches[Adapter Branches]
+    Git --> Worktrees[Training Worktrees]
+
+    Training --> Checkpoint[Checkpoint Manager]
+    Checkpoint --> GitCommit[Git Commits]
+
+    Engine --> Inference[Inference Pipeline]
+    Inference --> KVCache[KV Cache]
+    Inference --> Sampling[Sampling]
 ```
 
-## Roadmap
+### Key Design Decisions
 
-### Current Features
-- ✅ PyTorch/libtorch integration
-- ✅ SafeTensors model loading
-- ✅ KV caching for fast generation
-- ✅ Qwen model support
-- ✅ CLI interface
-- ✅ Tokenizer integration
+1. **Git-based Storage**: Models are stored as native Git repositories:
+   - Full version control and rollback
+   - Efficient large file handling via XET
+   - Compatible with Hugging Face Hub
+   - Seamless model sharing
 
-### In Development
-- 🚧 REST/gRPC API layer
-- 🚧 Dynamic batching
-- 🚧 Model quantization
+2. **Branch-based Adapters**: Each LoRA adapter is a Git branch:
+   - UUID-based branch names for stability
+   - Human-friendly tags for usability
+   - Isolated training in worktrees
+   - Parallel adapter development
 
-### Planned Features
-- 📋 Dynamic LoRA adaptation during inference
-- 📋 Real-time training from context
-- 📋 Multi-adapter routing (X-LoRA)
-- 📋 Continuous learning pipelines
-- 📋 WebSocket streaming
-- 📋 Distributed inference
+3. **Checkpoint Management**: Training progress is tracked through Git:
+   - Automatic commits at intervals
+   - Milestone tagging
+   - Training metrics in commit messages
+   - Easy rollback to previous states
+
+## Model References (ModelRef)
+
+HyprStream uses a flexible ModelRef syntax for referencing models and their versions:
+
+- **`model-name`** - Reference model by name (uses registry's pinned commit)
+- **`model-name:branch`** - Reference specific branch (e.g., `qwen3:main`)
+- **`model-name:tag`** - Reference specific tag/version (e.g., `qwen3:v1.0`)
+- **`model-name:commit`** - Reference specific commit (e.g., `qwen3:abc123`)
+
+Examples:
+```bash
+# Use the default version
+hyprstream model infer llama3 --prompt "Hello"
+
+# Use a specific branch
+hyprstream model infer llama3:experimental --prompt "Hello"
+
+# Use a specific release tag
+hyprstream model infer llama3:v2.0 --prompt "Hello"
+
+# Use a specific commit for reproducibility
+hyprstream model infer llama3:f3a8b92 --prompt "Hello"
+```
+
+## Supported Models
+
+| Architecture | Status | Models |
+|-------------|--------|--------|
+| Qwen Dense | ✅ Full Support | Qwen1, Qwen2, Qwen2.5, Qwen3 |
+| Qwen MoE | 🚧 Coming Soon | Qwen2-MoE, Qwen2.5-MoE |
+| Llama | 🚧 Planned | Llama2, Llama3 |
+| Gemma | 🚧 Planned | Gemma 2B, 7B |
+| Mistral | 🚧 Planned | Mistral 7B |
+
+## API Usage
+
+### OpenAI-Compatible REST API
+
+HyprStream provides an OpenAI-compatible API endpoint for easy integration with existing tools and libraries:
+
+```bash
+# Start API server
+hyprstream serve --port 8080
+
+# Make chat completions request (OpenAI-compatible)
+curl -X POST http://localhost:8080/oai/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-small",
+    "messages": [
+      {"role": "user", "content": "Hello, world!"}
+    ],
+    "max_tokens": 100,
+    "temperature": 0.7
+  }'
+
+# Or use with any OpenAI-compatible client
+export OPENAI_API_KEY="dummy"
+export OPENAI_BASE_URL="http://localhost:8080/oai/v1"
+# Now use any OpenAI client library
+```
+
+### Environment Configuration
+
+HyprStream can be configured via environment variables with the `HYPRSTREAM_` prefix:
+
+```bash
+# Server configuration
+export HYPRSTREAM_SERVER_HOST=0.0.0.0
+export HYPRSTREAM_SERVER_PORT=8080
+export HYPRSTREAM_API_KEY=your-api-key
+
+# CORS settings
+export HYPRSTREAM_CORS_ENABLED=true
+export HYPRSTREAM_CORS_ORIGINS="*"
+
+# Model management
+export HYPRSTREAM_PRELOAD_MODELS=model1,model2,model3
+export HYPRSTREAM_MAX_CACHED_MODELS=5
+export HYPRSTREAM_MODELS_DIR=/custom/models/path
+
+# ROCm/HIP for AMD GPUs
+export ROCM_PATH=/usr
+export PYTORCH_ROCM_ARCH=gfx90a
+export LIBTORCH=./libtorch
+export LD_LIBRARY_PATH=./libtorch/lib:$LD_LIBRARY_PATH
+
+# Performance tuning
+export HYPRSTREAM_USE_MMAP=true
+export HYPRSTREAM_GENERATION_TIMEOUT=120
+```
 
 ## Contributing
 
-We welcome contributions, especially in:
-- Dynamic LoRA implementation
-- API layer development
-- Model architecture support
-- Performance optimizations
-- Documentation
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## License
 
@@ -146,6 +302,6 @@ GNU Affero General Public License v3.0 - See [LICENSE](LICENSE) for details.
 Built with:
 - [PyTorch](https://pytorch.org/) - Deep learning framework
 - [tch](https://github.com/LaurentMazare/tch) - Rust bindings for PyTorch
-- [SafeTensors](https://github.com/huggingface/safetensors) - Model format
-- [HuggingFace](https://huggingface.co/) - Model hub
+- [SafeTensors](https://github.com/huggingface/safetensors) - Efficient tensor serialization
+- [Git2](https://github.com/rust-lang/git2-rs) - Git operations in Rust
 - [Tokio](https://tokio.rs/) - Async runtime

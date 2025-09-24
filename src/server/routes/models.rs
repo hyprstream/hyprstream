@@ -9,11 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use crate::{
-    api::{
-        model_storage::ModelUri,
-        model_storage::{ModelStorage, ModelMetadata, ModelId},
-        model_downloader::{ModelDownloader, DownloadOptions, ModelFormat},
-    },
+    storage::{ModelStorage, ModelMetadata, ModelId},
     server::state::ServerState,
     storage::paths::StoragePaths,
 };
@@ -63,22 +59,24 @@ struct ModelListItem {
 async fn list_models(
     State(state): State<ServerState>,
 ) -> impl IntoResponse {
-    match state.model_storage.children().await {
+    match state.model_storage.list_models().await {
         Ok(models) => {
             // Transform the raw model data into a cleaner response format
             let model_list: Vec<ModelListItem> = models
                 .into_iter()
-                .map(|(id, metadata)| ModelListItem {
-                    id: id.to_string(),
-                    name: metadata.display_name.clone()
-                        .unwrap_or_else(|| metadata.name.clone()),
-                    display_name: metadata.display_name,
-                    architecture: metadata.architecture,
-                    size_bytes: metadata.size_bytes,
-                    is_cached: metadata.is_cached,
-                    local_path: metadata.local_path.as_ref()
-                        .and_then(|p| p.to_str())
-                        .map(|s| s.to_string()),
+                .map(|(model_ref, metadata)| {
+                    let local_path = None; // Path is managed by registry
+
+                    ModelListItem {
+                        id: model_ref.model.clone(),
+                        name: metadata.display_name.clone()
+                            .unwrap_or_else(|| metadata.name.clone()),
+                        display_name: metadata.display_name,
+                        architecture: metadata.model_type.clone(),
+                        size_bytes: metadata.size_bytes.unwrap_or(0),
+                        is_cached: true,
+                        local_path,
+                    }
                 })
                 .collect();
             
@@ -97,19 +95,23 @@ async fn get_model_info(
     State(state): State<ServerState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    // Try to parse as UUID
-    if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
-        let model_id = crate::api::model_storage::ModelId(uuid);
-        match state.model_storage.get_metadata_by_id(&model_id).await {
-            Ok(metadata) => return Json(metadata).into_response(),
-            Err(_) => {}
-        }
-    }
-    
-    // Try as URI
-    if let Ok(uri) = ModelUri::parse(&id) {
-        match state.model_storage.get_metadata(&uri).await {
-            Ok(metadata) => return Json(metadata).into_response(),
+    // Parse model reference
+    use crate::storage::model_ref::ModelRef;
+    if let Ok(model_ref) = ModelRef::parse(&id) {
+        match state.model_storage.get_model_path(&model_ref).await {
+            Ok(_path) => {
+                // Create metadata for the found model
+                let metadata = crate::storage::ModelMetadata {
+                    name: model_ref.model.clone(),
+                    display_name: Some(id.clone()),
+                    model_type: "language_model".to_string(),
+                    created_at: chrono::Utc::now().timestamp(),
+                    updated_at: chrono::Utc::now().timestamp(),
+                    size_bytes: None,
+                    tags: vec![],
+                };
+                return Json(metadata).into_response();
+            }
             Err(_) => {}
         }
     }
@@ -124,17 +126,13 @@ async fn download_model(
     State(state): State<ServerState>,
     Json(request): Json<DownloadModelRequest>,
 ) -> impl IntoResponse {
-    // Parse and validate URI using standard URL parsing
-    let uri = match ModelUri::parse(&request.uri) {
-        Ok(uri) => uri,
-        Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                "error": format!("Invalid model URI '{}': {}", request.uri, e),
-                "details": "Model URIs must use the format: hf://org/model",
-                "example": "hf://Qwen/Qwen2-1.5B-Instruct"
-            }))).into_response();
-        }
-    };
+    // Basic validation - must be a non-empty string
+    let uri = request.uri.clone();
+    if uri.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Model URI cannot be empty"
+        }))).into_response();
+    }
     
     // Get storage paths and token
     let storage_paths = match StoragePaths::new() {
@@ -155,76 +153,14 @@ async fn download_model(
         }
     };
     
-    let hf_token = std::env::var("HF_TOKEN").ok()
-        .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok());
-    
-    // Create downloader - same as CLI does
-    let downloader = match ModelDownloader::new(models_dir, hf_token).await {
-        Ok(d) => d,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": format!("Failed to create downloader: {}", e)
-            }))).into_response();
-        }
-    };
-    
-    // Download options - same as CLI
-    let options = DownloadOptions {
-        preferred_format: ModelFormat::SafeTensors,
-        force: false,
-        show_progress: false,
-        files_filter: None,
-        verify_checksums: true,
-        max_size_bytes: None,
-    };
-    
-    // Download the model using the same method CLI uses
-    match downloader.download(&request.uri, options).await {
-        Ok(downloaded_model) => {
-            // Store metadata in ModelStorage after successful download
-            let model_id = ModelId::new();
-            
-            // Store the downloaded model metadata (uri already parsed above)
-            {
-                // Use the original model_id (e.g., "microsoft/phi-2") as the display name
-                let display_name = downloaded_model.model_id.clone();
-                // Use the user-provided name or the model_id for the internal name
-                let model_name = request.name.clone().unwrap_or_else(|| display_name.clone());
-                let architecture = downloaded_model.config.as_ref()
-                    .map(|c| c.architecture.clone())
-                    .unwrap_or_else(|| "unknown".to_string());
-                let parameters = None; // ModelConfig doesn't have a parameters field
-                    
-                let metadata = ModelMetadata {
-                    model_id: model_id.clone(),
-                    name: model_name.clone(),
-                    display_name: Some(display_name),
-                    architecture,
-                    parameters,
-                    model_type: "language_model".to_string(),
-                    tokenizer_type: downloaded_model.tokenizer.as_ref()
-                        .and_then(|t| t.tokenizer_class.clone()),
-                    size_bytes: downloaded_model.total_size_bytes,
-                    files: downloaded_model.files.clone(),
-                    external_sources: vec![],
-                    local_path: Some(downloaded_model.local_path.clone()),
-                    is_cached: true,
-                    tags: vec![],
-                    description: None,
-                    license: None,
-                    created_at: chrono::Utc::now().timestamp(),
-                    last_accessed: chrono::Utc::now().timestamp(),
-                    last_updated: chrono::Utc::now().timestamp(),
-                };
-                
-                let _ = state.model_storage.store_metadata(&uri, metadata).await;
-            }
-            
+    // Use shared operation
+    match crate::storage::operations::clone_model(&request.uri, None).await {
+        Ok(cloned) => {
             Json(DownloadModelResponse {
-                id: model_id.to_string(),
-                name: request.name.unwrap_or_else(|| downloaded_model.model_id),
+                id: cloned.model_id.to_string(),
+                name: request.name.unwrap_or_else(|| cloned.model_name),
                 status: "downloaded".to_string(),
-                path: downloaded_model.local_path.to_string_lossy().to_string(),
+                path: cloned.model_path.to_string_lossy().to_string(),
             }).into_response()
         }
         Err(e) => {
@@ -240,21 +176,24 @@ async fn load_model(
     State(state): State<ServerState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    // Get model path
-    let model_path = if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
-        let model_id = crate::api::model_storage::ModelId(uuid);
-        match state.model_storage.get_metadata_by_id(&model_id).await {
-            Ok(metadata) => metadata.local_path.unwrap_or_else(|| std::path::PathBuf::from(".")),
-            Err(e) => {
-                return (StatusCode::NOT_FOUND, Json(serde_json::json!({
-                    "error": format!("Model not found: {}", e)
-                }))).into_response();
-            }
+    // Parse model reference
+    let model_ref = match crate::storage::ModelRef::parse(&id) {
+        Ok(model_ref) => model_ref,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": format!("Invalid model reference: '{}'", id)
+            }))).into_response();
         }
-    } else {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Invalid model ID"
-        }))).into_response();
+    };
+
+    // Get model path
+    let model_path = match state.model_storage.get_model_path(&model_ref).await {
+        Ok(path) => path,
+        Err(e) => {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+                "error": format!("Model not found: {}", e)
+            }))).into_response();
+        }
     };
     
     // Load into engine pool
@@ -280,20 +219,11 @@ async fn unload_model(
 async fn refresh_cache(
     State(state): State<ServerState>,
 ) -> impl IntoResponse {
-    match state.model_cache.refresh_name_cache().await {
-        Ok(_) => {
-            Json(serde_json::json!({
-                "status": "success",
-                "message": "Model cache refreshed successfully"
-            })).into_response()
-        }
-        Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "status": "error",
-                "message": format!("Failed to refresh cache: {}", e)
-            }))).into_response()
-        }
-    }
+    // Cache is automatically maintained
+    Json(serde_json::json!({
+        "status": "success",
+        "message": "Model cache is automatically maintained"
+    })).into_response()
 }
 
 /// Get cache statistics
@@ -303,7 +233,6 @@ async fn cache_stats(
     let stats = state.model_cache.stats().await;
     Json(serde_json::json!({
         "cached_models": stats.cached_models,
-        "cached_names": stats.cached_names,
         "max_size": stats.max_size
     })).into_response()
 }

@@ -1,37 +1,34 @@
-//! VDB-first adaptive ML inference server with dynamic sparse weight adjustments.
+//! Adaptive ML inference server.
 //!
 //! This crate provides the core functionality for:
-//! - Real-time sparse weight updates for 99% sparse neural networks
-//! - Dynamic adaptive ML inference with streaming weight adjustments
-//! - Hardware-accelerated VDB storage with neural compression
-//! - Memory-mapped disk persistence with zero-copy operations
+//! - Real-time weight updates for neural networks
+//! - Dynamic adaptive ML inference
+//! - Hardware-accelerated storage
+//! - Memory-mapped disk persistence
 //! - FlightSQL interface for embeddings and similarity search
 
 pub mod adapters;
 pub mod api;
-pub mod auth;
 pub mod cli;
 pub mod config;
 pub mod constants;
 pub mod error;
-pub mod inference;
+pub mod git;
+pub mod lora;
 pub mod runtime;
+pub mod training;
 pub mod server;
 pub mod storage;
-pub mod utils;
 
-pub use storage::{
-    VDBSparseStorage, SparseStorageConfig, SparseStorage,
-    SparseWeightUpdate, EmbeddingMatch, SparseStorageError
-};
+// Storage exports removed
 pub use runtime::{
-    RuntimeEngine, TorchEngine, LoRAEngineWrapper, SparseLoRAAdapter, LoRAConfig,
+    RuntimeEngine, TorchEngine, LoRAEngineWrapper,
     ModelInfo, GenerationRequest, GenerationResult, FinishReason, RuntimeConfig,
     XLoRAAdapter, AdaptationMode, UserFeedback, XLoRARoutingStrategy, AdapterMetrics,
     // Model Evolution System exports
     ConversationRouter, ConversationSession, ConversationTurn, ConversationResponse,
     ConversationContext, ModelPool, AdaptationType, AdaptationTrigger, ModelState,
-    PoolStats, RoutingConfig, create_conversation_router
+    PoolStats, RoutingConfig
 };
 
 // Export TorchEngine as HyprStreamEngine for backward compatibility

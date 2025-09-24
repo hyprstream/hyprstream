@@ -74,7 +74,6 @@ pub use conversation_router::{
 
 // LoRA and adapter exports
 pub use lora_wrapper::{LoRAEngineWrapper, RuntimeLoRAAdapter};
-pub use crate::adapters::sparse_lora::SparseLoRAAdapter;
 
 /// Core runtime engine trait - all engines implement this
 #[async_trait]
@@ -154,6 +153,7 @@ pub fn create_engine(config: &RuntimeConfig) -> Result<TorchEngine> {
     TorchEngine::new(config.clone())
 }
 
+/* Commented out - VDB TemporalStreamingLayer removed
 /// Create conversation router with model pool and temporal streaming
 pub async fn create_conversation_router(
     model_pool: std::sync::Arc<ModelPool>,
@@ -166,5 +166,6 @@ pub async fn create_conversation_router(
         config.unwrap_or_default(),
     ).await
 }
+*/
 
 

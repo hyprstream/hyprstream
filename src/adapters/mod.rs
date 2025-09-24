@@ -1,12 +1,8 @@
-//! Sparse adaptive layer implementations
+//! Adapter implementations for storage and caching
 //!
-//! This module provides various types of sparse adapters for fine-tuning
-//! large language models with minimal memory overhead and real-time updates.
+//! This module provides checkpoint management for LoRA adapters
+//! The main LoRA implementations have been moved to src/lora/
 
-pub mod sparse_lora;
-pub mod openvdb_lora;
 pub mod lora_checkpoints;
 
-pub use sparse_lora::*;
-pub use openvdb_lora::*;
 pub use lora_checkpoints::*;
