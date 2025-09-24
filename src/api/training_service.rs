@@ -2,7 +2,7 @@
 
 use crate::api::TrainingSample;
 pub use crate::api::TrainingStatus;
-use crate::inference::{InferenceInput, InferenceOutput};
+use crate::runtime::inference::{InferenceRequest, InferenceResult};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -322,14 +322,12 @@ impl TrainingService {
     pub async fn infer(
         &self,
         session_id: &str,
-        input: InferenceInput,
-    ) -> Result<InferenceOutput> {
-        Ok(InferenceOutput {
+        input: InferenceRequest,
+    ) -> Result<InferenceResult> {
+        Ok(InferenceResult {
             text: "Inference not yet implemented".to_string(),
-            tokens: vec![],
             tokens_generated: 0,
-            latency_ms: 0.0,
-            adapter_contribution: HashMap::new(),
+            latency_ms: 0,
         })
     }
     

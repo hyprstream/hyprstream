@@ -14,7 +14,6 @@ pub mod config;
 pub mod constants;
 pub mod error;
 pub mod git;
-pub mod inference;
 pub mod lora;
 pub mod runtime;
 pub mod training;
