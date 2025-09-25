@@ -5,7 +5,7 @@
 //! specific models with peers in a heterogeneous network.
 
 use anyhow::{Result, Context, bail};
-use git2::{Repository, Signature, SubmoduleUpdateOptions, IndexAddOption};
+use git2::{Repository, IndexAddOption};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -400,7 +400,7 @@ impl GitModelRegistry {
         }
 
         // Check for orphaned submodules (in Git but not in metadata)
-        let mut submodule_iter = repo.submodules()?;
+        let submodule_iter = repo.submodules()?;
         for submodule in submodule_iter.iter() {
             let name = submodule.name().unwrap_or("");
 

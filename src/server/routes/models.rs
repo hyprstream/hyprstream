@@ -9,7 +9,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use crate::{
-    storage::{ModelStorage, ModelMetadata, ModelId},
     server::state::ServerState,
     storage::paths::StoragePaths,
 };

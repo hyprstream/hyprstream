@@ -7,7 +7,7 @@ use axum::{
     response::IntoResponse,
     http::StatusCode,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use crate::{
     api::training_service::TrainingConfig,
     api::TrainingStatus,

@@ -1,11 +1,9 @@
 //! LoRA training implementation with autograd
 
-use anyhow::{Result, anyhow};
-use tch::{nn, Device, Kind, Reduction, Tensor};
+use anyhow::Result;
+use tch::{nn, Device, Reduction, Tensor};
 use tch::nn::OptimizerConfig;
-use std::sync::Arc;
 use std::time::Instant;
-use super::LoRAConfig;
 
 /// Training configuration
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

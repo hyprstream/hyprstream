@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
-use tracing::{info, warn, error, debug};
+use tracing::{info, warn, debug};
 use super::model_cache::ModelCache;
 
 /// Background task that periodically refreshes the model cache

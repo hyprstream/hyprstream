@@ -1,7 +1,7 @@
 //! PyTorch-native LoRA adapter implementation with full autograd support
 
-use anyhow::{Result, anyhow};
-use tch::{nn, Device, Kind, Tensor};
+use anyhow::Result;
+use tch::{nn, Device, Tensor};
 use std::collections::HashMap;
 use std::path::Path;
 use async_trait::async_trait;
@@ -145,7 +145,7 @@ impl LoRAModel {
         module_configs: HashMap<String, (usize, usize)>, // module_name -> (in_features, out_features)
         device: Device,
     ) -> Result<Self> {
-        let mut vs = nn::VarStore::new(device);
+        let vs = nn::VarStore::new(device);
         let mut layers = HashMap::new();
         
         for (module_name, (in_features, out_features)) in module_configs {

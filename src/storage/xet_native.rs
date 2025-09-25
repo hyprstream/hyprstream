@@ -405,7 +405,7 @@ impl XetNativeStorage {
 
     /// Synchronous implementation of LFS file scanning using git2's tree traversal
     fn scan_lfs_files_in_directory_sync(&self, directory: &Path) -> Result<Vec<PathBuf>> {
-        use git2::{Repository, TreeWalkMode, TreeWalkResult, StatusOptions, ObjectType};
+        use git2::{TreeWalkMode, TreeWalkResult, ObjectType};
 
         // Find the git repository for this directory
         let repo = self.find_git_repository(directory)?;

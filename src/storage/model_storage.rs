@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
-use tokio::sync::RwLock;
 
 use super::model_ref::ModelRef;
 use super::model_registry::SharedModelRegistry;

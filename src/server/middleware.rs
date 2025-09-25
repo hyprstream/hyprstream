@@ -1,7 +1,6 @@
 //! Middleware for authentication, logging, and request processing
 
 use axum::{
-    body::Body,
     extract::{Request, State},
     http::{header, StatusCode},
     middleware::Next,

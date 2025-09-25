@@ -3,7 +3,7 @@
 //! This module implements sampling algorithms directly on GPU tensors,
 //! avoiding expensive GPU→CPU transfers of large logits tensors.
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use tch::{Device, Tensor, Kind};
 use std::collections::HashMap;
 

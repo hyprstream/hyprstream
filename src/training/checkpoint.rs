@@ -5,7 +5,6 @@
 
 use anyhow::{Result, Context};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::fs;

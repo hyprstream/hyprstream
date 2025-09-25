@@ -1,6 +1,6 @@
 //! Git-native model cache using commit SHA for consistency
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use git2;
 use lru::LruCache;
 use std::collections::HashMap;
@@ -8,7 +8,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{info, warn, debug, instrument, span, Level};
+use tracing::{info, warn, debug, instrument};
 use crate::git::{GitManager, GitConfig};
 
 use crate::runtime::{TorchEngine, RuntimeConfig, RuntimeEngine};

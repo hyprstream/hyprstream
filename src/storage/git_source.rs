@@ -4,7 +4,6 @@ use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, debug, warn};
-use uuid::Uuid;
 
 use super::ModelId;
 use super::xet_native::XetNativeStorage;

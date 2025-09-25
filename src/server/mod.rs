@@ -9,13 +9,11 @@
 use anyhow::Result;
 use axum::{
     Router,
-    routing::{get, post},
-    http::StatusCode,
+    routing::get,
     response::IntoResponse,
     Json,
 };
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tower_http::{
