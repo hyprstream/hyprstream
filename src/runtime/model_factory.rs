@@ -4,13 +4,13 @@
 //! clean factory pattern.
 
 use anyhow::{Result, anyhow};
+use tracing::{info, instrument, span, Level};
 use std::collections::HashMap;
 use std::path::Path;
 use tch::{Device, Tensor, Kind as DType};
 
 use super::model_config::{ModelConfig, ModelArchitecture};
 use super::architectures::{ModelOperations, llama::LlamaModel, gemma::GemmaModel};
-use crate::storage::XetNativeStorage;
 
 /// Factory for creating models with proper configuration management
 pub struct ModelFactory;
@@ -18,28 +18,88 @@ pub struct ModelFactory;
 impl ModelFactory {
     /// Create a model from a directory containing weights and optionally config.json
     /// This is the ONLY way models should be created to ensure consistency
+    #[instrument(name = "model_factory.create", skip(device, dtype), fields(model_path = %model_path.display()))]
     pub async fn create(
         model_path: &Path,
         device: &Device,
         dtype: DType,
     ) -> Result<Box<dyn ModelOperations>> {
-        Self::create_with_xet(model_path, device, dtype, None).await
+        info!("Loading model: {}", model_path.display());
+
+        // Check if we have sharded files that need incremental loading
+        let shard_files = Self::find_shard_files(model_path)?;
+
+        if !shard_files.is_empty() && shard_files.len() > 1 {
+            // Use incremental loading for large sharded models
+            info!("📦 Using incremental loading for {} shards", shard_files.len());
+            Self::create_incremental(model_path, device, dtype, shard_files).await
+        } else {
+            // Standard loading for single files or small models
+            let weights = Self::load_weights(model_path, device, dtype).await?;
+            let config = ModelConfig::load(model_path, &weights)?;
+            let model = Self::create_model_from_config(config, weights, device, dtype)?;
+            info!("✅ ModelFactory: Model created successfully");
+            Ok(model)
+        }
     }
 
-    /// Create a model with optional XET storage for pointer file handling
-    pub async fn create_with_xet(
+    /// Find all shard files in a model directory
+    fn find_shard_files(model_path: &Path) -> Result<Vec<std::path::PathBuf>> {
+        let mut shard_files = Vec::new();
+
+        // Check for single file first
+        let single_file = model_path.join("model.safetensors");
+        if single_file.exists() {
+            return Ok(vec![single_file]);
+        }
+
+        // Look for sharded files
+        for entry in std::fs::read_dir(model_path)? {
+            let entry = entry?;
+            let filename = entry.file_name();
+            if let Some(name) = filename.to_str() {
+                if name.starts_with("model-") && name.ends_with(".safetensors") {
+                    shard_files.push(entry.path());
+                }
+            }
+        }
+
+        shard_files.sort();
+        Ok(shard_files)
+    }
+
+    /// Create model using incremental loading for large sharded models
+    #[instrument(name = "model_factory.create_incremental", skip(device, dtype, shard_files), fields(shard_count = shard_files.len()))]
+    async fn create_incremental(
         model_path: &Path,
         device: &Device,
         dtype: DType,
-        xet_storage: Option<&XetNativeStorage>,
+        shard_files: Vec<std::path::PathBuf>,
     ) -> Result<Box<dyn ModelOperations>> {
-        println!("🏭 ModelFactory: Loading model from {}", model_path.display());
+        // For now, we still need to load all weights, but we do it more efficiently
+        // by processing shards sequentially and immediately transferring to GPU
+        info!("Loading {} weight shards", shard_files.len());
 
-        let weights = Self::load_weights_with_xet(model_path, device, dtype, xet_storage).await?;
-        let config = ModelConfig::load(model_path, &weights)?;
-        let model = Self::create_model_from_config(config, weights, device, dtype)?;
+        let mut all_weights = HashMap::new();
 
-        println!("✅ ModelFactory: Model created successfully");
+        for (idx, shard_file) in shard_files.iter().enumerate() {
+            info!("Loading shard {}/{}", idx + 1, shard_files.len());
+
+            // Load shard weights directly to GPU to minimize CPU memory usage
+            Self::load_safetensors_file(shard_file, &mut all_weights, device, dtype).await?;
+
+            // Note: In a true streaming implementation, we would:
+            // 1. Load layer weights
+            // 2. Create that layer on GPU
+            // 3. Free CPU memory before loading next layer
+            // But this requires refactoring model architectures
+        }
+
+        // Load config and create model
+        let config = ModelConfig::load(model_path, &all_weights)?;
+        let model = Self::create_model_from_config(config, all_weights, device, dtype)?;
+
+        info!("Model loaded");
         Ok(model)
     }
     
@@ -49,44 +109,36 @@ impl ModelFactory {
         device: &Device,
         dtype: DType,
     ) -> Result<HashMap<String, Tensor>> {
-        Self::load_weights_with_xet(model_path, device, dtype, None).await
-    }
-
-    /// Load weights from safetensors files with optional XET storage
-    async fn load_weights_with_xet(
-        model_path: &Path,
-        device: &Device,
-        dtype: DType,
-        xet_storage: Option<&XetNativeStorage>,
-    ) -> Result<HashMap<String, Tensor>> {
         let mut all_weights = HashMap::new();
         
         let single_file = model_path.join("model.safetensors");
         if single_file.exists() {
-            println!("📦 Loading single safetensors file");
-            Self::load_safetensors_file_with_xet(&single_file, &mut all_weights, device, dtype, xet_storage).await?;
+            info!("Loading model.safetensors");
+            Self::load_safetensors_file(&single_file, &mut all_weights, device, dtype).await?;
             return Ok(all_weights);
         }
         
         // Look for sharded safetensors files (model-00001-of-00002.safetensors pattern)
-        let entries = std::fs::read_dir(model_path)?;
-        let mut shard_files = Vec::new();
-        
-        for entry in entries {
-            let entry = entry?;
-            let filename = entry.file_name();
-            if let Some(name) = filename.to_str() {
-                if name.starts_with("model-") && name.ends_with(".safetensors") {
-                    shard_files.push(entry.path());
+        let model_path_buf = model_path.to_path_buf();
+        let mut shard_files = tokio::task::spawn_blocking(move || -> Result<Vec<std::path::PathBuf>> {
+            let mut files = Vec::new();
+            for entry in std::fs::read_dir(&model_path_buf)? {
+                let entry = entry?;
+                let filename = entry.file_name();
+                if let Some(name) = filename.to_str() {
+                    if name.starts_with("model-") && name.ends_with(".safetensors") {
+                        files.push(entry.path());
+                    }
                 }
             }
-        }
+            Ok(files)
+        }).await??;
         
         if !shard_files.is_empty() {
             shard_files.sort();
-            println!("📦 Loading {} safetensors shards", shard_files.len());
+            info!("Loading {} weight shards", shard_files.len());
             for shard_file in shard_files {
-                Self::load_safetensors_file_with_xet(&shard_file, &mut all_weights, device, dtype, xet_storage).await?;
+                Self::load_safetensors_file(&shard_file, &mut all_weights, device, dtype).await?;
             }
             return Ok(all_weights);
         }
@@ -95,182 +147,112 @@ impl ModelFactory {
     }
     
     /// Load a single safetensors file
-    /// Can optionally use memory mapping for large models on systems with
-    /// persistent memory (e.g., Optane drives)
-    fn load_safetensors_file(
+    #[instrument(name = "model_factory.load_safetensor_file", skip(weights, device, dtype), fields(file = %path.display()))]
+    async fn load_safetensors_file(
         path: &Path,
         weights: &mut HashMap<String, Tensor>,
         device: &Device,
         dtype: DType,
     ) -> Result<()> {
-        // Check if mmap should be used (via environment variable for now)
-        let use_mmap = std::env::var("HYPRSTREAM_USE_MMAP").unwrap_or_default() == "true";
+        // Check if mmap is enabled via environment variable
+        let use_mmap = std::env::var("HYPRSTREAM_USE_MMAP")
+            .map(|v| v.to_lowercase() == "true" || v == "1")
+            .unwrap_or(false);
 
-        let buffer: Vec<u8>;
-        let mmap_holder: Option<memmap2::Mmap>;
+        // Load file data in a blocking task to avoid blocking the async runtime
+        let path_buf = path.to_path_buf();
 
-        let tensor_data = if use_mmap {
-            // Memory-mapped loading for Optane/persistent memory systems
-            let file = std::fs::File::open(path)?;
+        // Use mmap for large files to reduce memory pressure
+        if use_mmap {
+            // Memory-mapped approach - OS manages paging
+            use std::fs::File;
+            use memmap2::Mmap;
 
-            // Memory map the file for efficient loading
+            let file = File::open(&path_buf)?;
+            let mmap = unsafe { Mmap::map(&file)? };
 
-            // Create memory map
-            let mmap = unsafe {
-                memmap2::MmapOptions::new()
-                    .populate() // Pre-populate pages for better performance
-                    .map(&file)?
-            };
+            // Note: We must deserialize and create tensors while mmap is alive
+            // The tensors will copy the data they need during creation
+            let tensors = safetensors::SafeTensors::deserialize(&mmap)?;
+            Self::create_tensors_from_safetensors(tensors, weights, device, dtype)?;
 
-            mmap_holder = Some(mmap);
-            // Get a reference to the mmap data
-            mmap_holder.as_ref().unwrap().as_ref()
-        } else {
-            // Standard loading into memory (default for most systems)
-            buffer = std::fs::read(path)?;
-            &buffer
-        };
-
-        // Deserialize from either mmap or buffer
-        let tensors = safetensors::SafeTensors::deserialize(tensor_data)?;
-
-        for (name, tensor_view) in tensors.tensors() {
-            let shape: Vec<i64> = tensor_view.shape().iter().map(|&x| x as i64).collect();
-            let data = tensor_view.data();
-
-            // Create tensor with native dtype support when possible
-            let tensor = match tensor_view.dtype() {
-                safetensors::Dtype::F32 => {
-                    let slice = unsafe {
-                        std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4)
-                    };
-                    Tensor::from_slice(slice).reshape(&shape)
-                }
-                safetensors::Dtype::F16 => {
-                    // F16 - convert via F32 for now
-                    let slice = unsafe {
-                        std::slice::from_raw_parts(data.as_ptr() as *const half::f16, data.len() / 2)
-                    };
-                    let f32_vec: Vec<f32> = slice.iter().map(|x| x.to_f32()).collect();
-                    Tensor::from_slice(&f32_vec).reshape(&shape)
-                }
-                safetensors::Dtype::BF16 => {
-                    // BF16 - only support on BF16-capable devices
-                    if dtype != tch::Kind::BFloat16 {
-                        return Err(anyhow!("Model requires BF16 but target dtype is {:?}. BF16 models only work with BF16 dtype.", dtype));
-                    }
-
-                    // BF16 tensor creation - must create on CPU first due to from_blob GPU issues
-                    // Creating BF16 directly on GPU causes cuda:-2 errors
-                    unsafe {
-                        Tensor::from_blob(
-                            data.as_ptr(),
-                            &shape,
-                            &[],  // Use default strides
-                            tch::Kind::BFloat16,
-                            Device::Cpu,  // Must create on CPU first
-                        )
-                    }
-                }
-                _ => {
-                    println!("⚠️ Skipping tensor {} with unsupported dtype", name);
-                    continue;
-                }
-            };
-
-            // Only convert if needed - handle CPU-created tensors properly
-            let tensor = if tensor.device() == Device::Cpu && *device == Device::Cpu && tensor.kind() == dtype {
-                tensor  // Already on CPU with correct dtype, no transfer needed
-            } else if tensor.kind() == dtype {
-                tensor.to_device(*device)  // Only device transfer needed
-            } else if tensor.device() == *device {
-                tensor.to_kind(dtype)  // Only dtype conversion needed
-            } else {
-                tensor.to_device(*device).to_kind(dtype)  // Both needed
-            };
-            weights.insert(name.to_string(), tensor);
+            // mmap drops here - tensors have already copied what they need
+            return Ok(());
         }
 
-        Ok(())
+        // Standard approach - load entire file into RAM
+        let tensor_data = tokio::fs::read(&path_buf).await?;
+        let tensors = safetensors::SafeTensors::deserialize(&tensor_data)?;
+        Self::create_tensors_from_safetensors(tensors, weights, device, dtype)
     }
 
-    /// Load a single safetensors file with optional XET storage support
-    /// This version can handle XET pointers and LFS pointers automatically
-    async fn load_safetensors_file_with_xet(
-        path: &Path,
+    /// Create tensors from deserialized safetensors
+    fn create_tensors_from_safetensors(
+        tensors: safetensors::SafeTensors,
         weights: &mut HashMap<String, Tensor>,
         device: &Device,
         dtype: DType,
-        xet_storage: Option<&XetNativeStorage>,
     ) -> Result<()> {
-        // If XET storage is available, use it for universal file loading
-        let tensor_data = if let Some(xet) = xet_storage {
-            // Use XET's universal file loading (handles regular files, XET pointers, and LFS pointers)
-            xet.load_file(path).await?
-        } else {
-            // Fallback to standard file reading
-            std::fs::read(path)?
-        };
-
-        // Deserialize SafeTensors format
-
-        // Deserialize safetensors
-        let tensors = safetensors::SafeTensors::deserialize(&tensor_data)?;
-
         for (name, tensor_view) in tensors.tensors() {
             let shape: Vec<i64> = tensor_view.shape().iter().map(|&x| x as i64).collect();
             let data = tensor_view.data();
 
-            // Create tensor with native dtype support when possible
+            // Create tensor optimized for GPU memory usage
             let tensor = match tensor_view.dtype() {
                 safetensors::Dtype::F32 => {
                     let slice = unsafe {
                         std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4)
                     };
-                    Tensor::from_slice(slice).reshape(&shape)
+                    // Create directly on target device to avoid CPU copy
+                    Tensor::from_slice(slice)
+                        .reshape(&shape)
+                        .to_device(*device)
+                        .to_kind(dtype)
                 }
                 safetensors::Dtype::F16 => {
-                    // F16 - convert via F32 for now
+                    // F16 requires conversion to F32 first
                     let slice = unsafe {
                         std::slice::from_raw_parts(data.as_ptr() as *const half::f16, data.len() / 2)
                     };
                     let f32_vec: Vec<f32> = slice.iter().map(|x| x.to_f32()).collect();
-                    Tensor::from_slice(&f32_vec).reshape(&shape)
+                    // Create and immediately transfer to GPU
+                    Tensor::from_slice(&f32_vec)
+                        .reshape(&shape)
+                        .to_device(*device)
+                        .to_kind(dtype)
                 }
                 safetensors::Dtype::BF16 => {
-                    // BF16 - only support on BF16-capable devices
+                    // BF16 - must create on CPU first due to from_blob limitations
                     if dtype != tch::Kind::BFloat16 {
-                        return Err(anyhow!("Model requires BF16 but target dtype is {:?}. BF16 models only work with BF16 dtype.", dtype));
+                        return Err(anyhow!("Model requires BF16 but target dtype is {:?}", dtype));
                     }
 
-                    // BF16 tensor creation - must create on CPU first due to from_blob GPU issues
-                    // Creating BF16 directly on GPU causes cuda:-2 errors
-                    unsafe {
+                    // Create on CPU then immediately transfer to GPU
+                    let cpu_tensor = unsafe {
                         Tensor::from_blob(
                             data.as_ptr(),
                             &shape,
-                            &[],  // Use default strides
+                            &[],
                             tch::Kind::BFloat16,
-                            Device::Cpu,  // Must create on CPU first
+                            Device::Cpu,
                         )
+                    };
+
+                    // Transfer to GPU if needed
+                    if *device != Device::Cpu {
+                        let gpu_tensor = cpu_tensor.to_device(*device);
+                        drop(cpu_tensor); // Explicitly free CPU memory
+                        gpu_tensor
+                    } else {
+                        cpu_tensor
                     }
                 }
                 _ => {
-                    println!("⚠️ Skipping tensor {} with unsupported dtype", name);
+                    info!("⚠️ Skipping tensor {} with unsupported dtype", name);
                     continue;
                 }
             };
 
-            // Only convert if needed - handle CPU-created tensors properly
-            let tensor = if tensor.device() == Device::Cpu && *device == Device::Cpu && tensor.kind() == dtype {
-                tensor  // Already on CPU with correct dtype, no transfer needed
-            } else if tensor.kind() == dtype {
-                tensor.to_device(*device)  // Only device transfer needed
-            } else if tensor.device() == *device {
-                tensor.to_kind(dtype)  // Only dtype conversion needed
-            } else {
-                tensor.to_device(*device).to_kind(dtype)  // Both needed
-            };
             weights.insert(name.to_string(), tensor);
         }
 
@@ -286,19 +268,19 @@ impl ModelFactory {
     ) -> Result<Box<dyn ModelOperations>> {
         match config.architecture {
             ModelArchitecture::Llama => {
-                println!("🦙 Creating Llama model");
+                info!("Creating Llama model");
                 Self::create_llama_model(config, weights, device, dtype)
             }
             ModelArchitecture::Qwen => {
-                println!("🐉 Creating Qwen model");
+                info!("Creating Qwen model");
                 Self::create_qwen_model(config, weights, device, dtype)
             }
             ModelArchitecture::Gemma => {
-                println!("💎 Creating Gemma model");
+                info!("Creating Gemma model");
                 Self::create_gemma_model(config, weights, device, dtype)
             }
             ModelArchitecture::Mistral => {
-                println!("🌪️ Creating Mistral model");
+                info!("Creating Mistral model");
                 // For now, Mistral uses Llama architecture
                 Self::create_llama_model(config, weights, device, dtype)
             }
@@ -354,8 +336,8 @@ impl ModelFactory {
     ) -> Result<Box<dyn ModelOperations>> {
         // Qwen uses Llama architecture with specific configuration
         // The key difference is in the config values, not the architecture
-        println!("   Using Llama architecture with Qwen configuration");
-        println!("   rope_theta: {} (from config)", config.rope_theta);
+        info!("   Using Llama architecture with Qwen configuration");
+        info!("   rope_theta: {} (from config)", config.rope_theta);
         Self::create_llama_model(config, weights, device, dtype)
     }
     

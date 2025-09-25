@@ -5,6 +5,7 @@ pub use crate::api::TrainingStatus;
 use crate::runtime::inference::{InferenceRequest, InferenceResult};
 
 use std::collections::HashMap;
+use tracing::{info, warn, error};
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc, Mutex};
 use serde::{Deserialize, Serialize};
@@ -166,7 +167,7 @@ impl TrainingService {
                         &sessions,
                         &stats,
                     ).await {
-                        eprintln!("Training error for {}: {}", lora_id_clone, e);
+                        warn!("Training error for {}: {}", lora_id_clone, e);
                     }
                     
                     sample_batch.clear();
@@ -244,7 +245,7 @@ impl TrainingService {
     ) -> Result<()> {
         let start_time = std::time::Instant::now();
         
-        println!("🎯 Training LoRA {} with {} samples", lora_id, samples.len());
+        info!("🎯 Training LoRA {} with {} samples", lora_id, samples.len());
         
         return Err(anyhow::anyhow!("Training not available"));
         
@@ -288,7 +289,7 @@ impl TrainingService {
             stats_guard.avg_training_loss = compute_avg_loss(samples);
         }
         
-        println!("✅ Training completed in {}ms for LoRA {}", 
+        info!("✅ Training completed in {}ms for LoRA {}", 
                 training_time, lora_id);
         
         Ok(())
@@ -438,7 +439,7 @@ impl TrainingService {
 //
 //         let non_zero_count = gradients_vec.iter().filter(|&&x| x.abs() > 1e-6).count();
 //         gradients.insert(layer.to_string(), gradients_vec);
-//         println!("🔄 Computed {} gradients for layer {}", non_zero_count, layer);
+//         info!("🔄 Computed {} gradients for layer {}", non_zero_count, layer);
 //     }
 //
 //     Ok(gradients)

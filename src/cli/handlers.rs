@@ -890,10 +890,13 @@ pub async fn handle_model_command(
             final_config.do_sample = final_config.temperature > 0.0;
             
             debug!("Loading base model (no LoRA)");
-            
-            // Load the model
+
+            // Time the model loading
+            let load_start = std::time::Instant::now();
             match engine.load_model(&model_path).await {
                 Ok(_) => {
+                    let load_time = load_start.elapsed();
+                    info!("Model loaded in {:.2}s", load_time.as_secs_f64());
                     // Clear any LoRA that might have been loaded
                     {
                         let mut lora_guard = engine.active_lora.lock().unwrap();
@@ -974,7 +977,7 @@ pub async fn handle_model_command(
                 0.0
             };
             info!(
-                "Generation complete: {} tokens generated in {:.2}s ({:.2} tokens/sec)",
+                "Generation: {} tokens in {:.2}s ({:.2} tokens/sec)",
                 result.tokens_generated,
                 seconds,
                 tokens_per_sec

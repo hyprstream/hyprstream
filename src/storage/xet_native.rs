@@ -546,7 +546,7 @@ impl XetNativeStorage {
             }
         }
 
-        info!("Successfully processed {}/{} LFS files", processed_files.len(), lfs_files.len());
+        info!("Processed {}/{} LFS files", processed_files.len(), lfs_files.len());
         Ok(processed_files)
     }
 
@@ -625,7 +625,7 @@ impl XetNativeStorage {
             }
         }
 
-        info!("Successfully processed {}/{} LFS files in parallel", processed_files.len(), total_files);
+        info!("Processed {}/{} LFS files", processed_files.len(), total_files);
         Ok(processed_files)
     }
 }

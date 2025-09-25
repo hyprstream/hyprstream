@@ -3,6 +3,7 @@
 //! Implements various sampling methods including temperature, top-k, and top-p (nucleus) sampling
 //! with model-specific configurations loaded from HuggingFace model cards.
 
+use tracing::{info, warn, debug};
 use anyhow::{Result, anyhow};
 use tch::Tensor;
 use rand::prelude::*;
@@ -242,7 +243,7 @@ impl TokenSampler {
                 .ok_or_else(|| anyhow!("Empty logits tensor"))?;
             let min = logits_vec.iter().min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                 .ok_or_else(|| anyhow!("Empty logits tensor"))?;
-            eprintln!("DEBUG: Logits shape: {:?}, min={:.3}, max={:.3}", logits.size(), min, max);
+            warn!("DEBUG: Logits shape: {:?}, min={:.3}, max={:.3}", logits.size(), min, max);
         }
         // Apply repetition penalty if needed
         let logits = if self.config.repetition_penalty != 1.0 && !self.token_history.is_empty() {
@@ -254,7 +255,7 @@ impl TokenSampler {
         // If not sampling, use greedy decoding
         if !self.config.do_sample {
             let token = logits.argmax(0, false).int64_value(&[]) as u32;
-            eprintln!("DEBUG: Using greedy decoding, selected token {}", token);
+            warn!("DEBUG: Using greedy decoding, selected token {}", token);
             self.token_history.push(token);
             return Ok(token);
         }

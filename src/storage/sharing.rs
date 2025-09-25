@@ -4,6 +4,7 @@
 //! nodes in a heterogeneous network via Git.
 
 use anyhow::{Result, Context, bail};
+use tracing::{info, warn, error};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -234,7 +235,7 @@ impl ModelSharing {
             bail!("Model '{}' already exists locally", name);
         }
         
-        println!("📥 Importing model '{}' from {}", share_ref.name, git_url);
+        info!("📥 Importing model '{}' from {}", share_ref.name, git_url);
 
         // Clone the repository with advanced options (shallow for efficiency)
         let clone_options = CloneOptions {
@@ -271,13 +272,13 @@ impl ModelSharing {
             self.verify_model_signature(&target_dir, signature).await?;
         }
         
-        println!("✅ Imported model '{}' as '{}'", share_ref.name, name);
-        println!("   Type: {:?}", share_ref.model_type);
-        println!("   Commit: {}", share_ref.commit);
-        println!("   Size: {:.2} GB", share_ref.size_bytes as f64 / 1_073_741_824.0);
+        info!("✅ Imported model '{}' as '{}'", share_ref.name, name);
+        info!("   Type: {:?}", share_ref.model_type);
+        info!("   Commit: {}", share_ref.commit);
+        info!("   Size: {:.2} GB", share_ref.size_bytes as f64 / 1_073_741_824.0);
         
         if let Some(metrics) = &share_ref.metrics {
-            println!("   Performance: loss={:.4}, steps={}", metrics.loss, metrics.training_steps);
+            info!("   Performance: loss={:.4}, steps={}", metrics.loss, metrics.training_steps);
         }
         
         Ok(model_id)
@@ -311,7 +312,7 @@ impl ModelSharing {
         
         remote.push(&refspecs, None)?;
         
-        println!("✅ Pushed model '{}' to {}", model_name, remote_url);
+        info!("✅ Pushed model '{}' to {}", model_name, remote_url);
         
         Ok(())
     }

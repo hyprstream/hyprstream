@@ -1,5 +1,6 @@
 //! PyTorch-based inference engine using tch-rs
 
+use tracing::{info, warn, debug, instrument};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use std::path::Path;
@@ -143,17 +144,17 @@ impl TorchEngine {
                 // Check if this is actually ROCm/HIP
                 if std::env::var("HIP_VISIBLE_DEVICES").is_ok() || 
                    std::path::Path::new("../libtorch/lib/libtorch_hip.so").exists() {
-                    println!("🚀 Using ROCm/HIP GPU acceleration");
+                    info!("🚀 Using ROCm/HIP GPU acceleration");
                 } else {
-                    println!("🚀 Using CUDA GPU acceleration");
+                    info!("🚀 Using CUDA GPU acceleration");
                 }
                 gpu_device
             } else {
-                println!("⚠️  GPU requested but not available, falling back to CPU");
+                info!("⚠️  GPU requested but not available, falling back to CPU");
                 Device::Cpu
             }
         } else {
-            println!("💻 Using CPU inference");
+            info!("💻 Using CPU inference");
             Device::Cpu
         };
 
@@ -210,7 +211,7 @@ impl TorchEngine {
             }
             "safetensors" => {
                 // Load SafeTensors model directly
-                println!("📦 Loading SafeTensors model: {}", path.display());
+                info!("Loading weights: {}", path.display());
                 self.load_safetensors(path).await?;
             }
             _ => {
@@ -224,7 +225,7 @@ impl TorchEngine {
 
     /// Load SafeTensors model using ModelFactory for unified weight loading
     async fn load_safetensors(&mut self, path: &Path) -> Result<()> {
-        println!("🚀 Loading SafeTensors model: {}", path.display());
+        info!("Loading weights: {}", path.display());
         
         // Get the model directory (parent of the safetensors file)
         let model_dir = path.parent().unwrap_or(path);
@@ -273,8 +274,8 @@ impl TorchEngine {
             *var_store_guard = Some(vs);
         }
         
-        println!("✅ SafeTensors model loaded via ModelFactory");
-        println!("🚀 Model initialized and ready for inference");
+        info!("✅ SafeTensors model loaded via ModelFactory");
+        info!("🚀 Model initialized and ready for inference");
         Ok(())
     }
 
@@ -309,11 +310,11 @@ impl TorchEngine {
     async fn initialize_xet_storage(&mut self) {
         match self.try_initialize_xet_storage().await {
             Ok(storage) => {
-                println!("🔗 XET storage initialized successfully");
+                info!("🔗 XET storage initialized successfully");
                 self.xet_storage = Some(Arc::new(storage));
             }
             Err(e) => {
-                println!("⚠️ Failed to initialize XET storage: {}. Continuing without XET support.", e);
+                info!("XET storage not available: {}", e);
                 self.xet_storage = None;
             }
         }
@@ -330,7 +331,7 @@ impl TorchEngine {
         use crate::runtime::model_factory::ModelFactory;
         use crate::runtime::model_config::ModelConfig;
 
-        println!("🏗️ Initializing persistent model using ModelFactory");
+        info!("Initializing model");
 
         // Initialize XET storage if not already done
         if self.xet_storage.is_none() {
@@ -353,19 +354,18 @@ impl TorchEngine {
             model_info.architecture = config.model_type.clone();
         }
 
-        // Use the factory to create the model with XET storage support
-        let model = if let Some(xet_storage) = &self.xet_storage {
-            ModelFactory::create_with_xet(model_path, &self.device, tch::Kind::BFloat16, Some(xet_storage)).await?
-        } else {
-            ModelFactory::create(model_path, &self.device, tch::Kind::BFloat16).await?
-        };
+        // Use the factory to create the model
+        let factory_start = std::time::Instant::now();
+        let model = ModelFactory::create(model_path, &self.device, tch::Kind::BFloat16).await?;
+        let factory_time = factory_start.elapsed();
+        info!("Model weights loaded in {:.2}s", factory_time.as_secs_f64());
 
         self.persistent_model = Some(Arc::new(Mutex::new(model)));
-        println!("✅ Persistent model initialized successfully");
         Ok(())
     }
 
     /// Load tokenizer and template configuration - thread safe
+    #[instrument(name = "torch_engine.load_tokenizer", skip(self), fields(model_path = %model_path.display()))]
     async fn load_tokenizer(&mut self, model_path: &Path) -> Result<()> {
         // Try to find tokenizer.json - if model_path is a directory, look inside it
         // If it's a file, look in the parent directory
@@ -379,7 +379,7 @@ impl TorchEngine {
         let tokenizer_config_path = search_dir.join("tokenizer_config.json");
 
         if tokenizer_path.exists() {
-            println!("📝 Loading tokenizer: {}", tokenizer_path.display());
+            info!("Loading tokenizer: {}", tokenizer_path.display());
             let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
                 .map_err(|e| anyhow!("Failed to load tokenizer: {}", e))?;
             
@@ -395,7 +395,7 @@ impl TorchEngine {
         
         // Load template configuration if available
         if tokenizer_config_path.exists() {
-            println!("📋 Loading tokenizer config: {}", tokenizer_config_path.display());
+            info!("Loading tokenizer config: {}", tokenizer_config_path.display());
             let config_content = tokio::fs::read_to_string(&tokenizer_config_path).await?;
             
             // Validate before parsing
@@ -417,9 +417,9 @@ impl TorchEngine {
             let mut template_guard = self.handle_poison(self.template_engine.lock())?;
             *template_guard = Some(template_engine);
             
-            println!("✅ Template engine initialized");
+            info!("✅ Template engine initialized");
         } else {
-            println!("⚠️ No tokenizer_config.json found, using fallback templates");
+            info!("⚠️ No tokenizer_config.json found, using fallback templates");
         }
 
         Ok(())
@@ -753,6 +753,7 @@ impl TorchEngine {
 
 #[async_trait]
 impl RuntimeEngine for TorchEngine {
+    #[instrument(name = "torch_engine.load_model", skip(self), fields(path = %path.display()))]
     async fn load_model(&mut self, path: &Path) -> Result<()> {
         // Store the original path for model naming
         let original_path = path.to_path_buf();
@@ -785,7 +786,7 @@ impl RuntimeEngine for TorchEngine {
                         let filename = entry.file_name();
                         if let Some(name) = filename.to_str() {
                             if name.starts_with("model-00001-of-") && name.ends_with(".safetensors") {
-                                println!("🔍 Detected sharded SafeTensors model starting with: {}", name);
+                                info!("🔍 Detected sharded SafeTensors model starting with: {}", name);
                                 found_file = Some(entry.path());
                                 break;
                             }
@@ -799,7 +800,7 @@ impl RuntimeEngine for TorchEngine {
             path.to_path_buf()
         };
 
-        println!("📦 Loading model file: {}", model_file_path.display());
+        info!("Loading model: {}", model_file_path.display());
         self.load_model_file(&model_file_path).await?;
         
         // Set the model name based on the canonical path
