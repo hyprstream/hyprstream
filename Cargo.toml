@@ -57,12 +57,12 @@ serde_yaml = "0.9"
 git2 = "0.19"
 clap = { version = "4.4", features = ["derive", "env"] }
 tracing = "0.1"
-tracing-opentelemetry = "0.31"
-opentelemetry = "0.30"
-opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.30", features = ["grpc-tonic", "trace"] }
-opentelemetry-semantic-conventions = "0.30"
-opentelemetry-stdout = { version = "0.30", features = ["trace"] }
+tracing-opentelemetry = { version = "0.31", optional = true }
+opentelemetry = { version = "0.30", optional = true }
+opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.30", features = ["grpc-tonic", "trace"], optional = true }
+opentelemetry-semantic-conventions = { version = "0.30", optional = true }
+opentelemetry-stdout = { version = "0.30", features = ["trace"], optional = true }
 parking_lot = "0.12"
 num_cpus = "1.16"
 once_cell = "1.19"  # For global GitService singleton
@@ -136,6 +136,7 @@ shellexpand = "3.1.1"
 [features]
 default = []
 cuda = []
+otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:opentelemetry-semantic-conventions", "dep:opentelemetry-stdout"]
 
 [build-dependencies]
 cc = "1.0"

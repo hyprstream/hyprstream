@@ -11,7 +11,12 @@ use hyprstream_core::cli::handlers::{
 };
 use hyprstream_core::cli::{handle_pytorch_lora_command, DeviceConfig, DevicePreference, RuntimeConfig};
 use tracing::info;
+#[cfg(feature = "otel")]
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+#[cfg(not(feature = "otel"))]
+use tracing_subscriber::EnvFilter;
+
+#[cfg(feature = "otel")]
 use tracing_opentelemetry::OpenTelemetryLayer;
 
 #[derive(Parser)]
@@ -93,6 +98,7 @@ fn handle_chat_cmd(cmd: hyprstream_core::cli::commands::chat::ChatCommand, serve
     async move { handle_chat_command(cmd, server_url).await }
 }
 
+#[cfg(feature = "otel")]
 /// Telemetry provider type
 #[derive(Debug, Clone, Copy)]
 enum TelemetryProvider {
@@ -102,6 +108,7 @@ enum TelemetryProvider {
     Stdout,
 }
 
+#[cfg(feature = "otel")]
 /// Initialize OpenTelemetry with the specified provider
 fn init_telemetry(provider: TelemetryProvider) -> Result<(), Box<dyn std::error::Error>> {
     use opentelemetry_sdk::Resource;
@@ -185,25 +192,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse CLI arguments
     let cli = Cli::parse();
 
-    // Determine telemetry provider based on command
-    let telemetry_provider = match &cli.command {
-        Commands::Server(_) => TelemetryProvider::Otlp,  // Server uses OTLP
-        _ => TelemetryProvider::Stdout,                  // All CLI commands use stdout
-    };
+    #[cfg(feature = "otel")]
+    {
+        // Determine telemetry provider based on command
+        let telemetry_provider = match &cli.command {
+            Commands::Server(_) => TelemetryProvider::Otlp,  // Server uses OTLP
+            _ => TelemetryProvider::Stdout,                  // All CLI commands use stdout
+        };
 
-    // Initialize OpenTelemetry based on environment
-    let otel_enabled = std::env::var("HYPRSTREAM_OTEL_ENABLE")
-        .unwrap_or_else(|_| "false".to_string())  // Default to disabled
-        .parse::<bool>()
-        .unwrap_or(false);
+        // Initialize OpenTelemetry based on environment
+        let otel_enabled = std::env::var("HYPRSTREAM_OTEL_ENABLE")
+            .unwrap_or_else(|_| "false".to_string())  // Default to disabled
+            .parse::<bool>()
+            .unwrap_or(false);
 
-    if otel_enabled {
-        init_telemetry(telemetry_provider)?;
-    } else {
-        // Fallback to simple logging without OpenTelemetry
-        let default_log_level = match telemetry_provider {
-            TelemetryProvider::Otlp => "hyprstream=info",
-            TelemetryProvider::Stdout => "hyprstream=debug",
+        if otel_enabled {
+            init_telemetry(telemetry_provider)?;
+        } else {
+            // Fallback to simple logging without OpenTelemetry
+            let default_log_level = match telemetry_provider {
+                TelemetryProvider::Otlp => "hyprstream=info",
+                TelemetryProvider::Stdout => "hyprstream=debug",
+            };
+
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::builder()
+                        .parse_lossy(std::env::var("RUST_LOG")
+                            .unwrap_or_else(|_| default_log_level.to_string()))
+                )
+                .with_target(true)
+                .with_file(true)
+                .with_line_number(true)
+                .init();
+        }
+    }
+
+    #[cfg(not(feature = "otel"))]
+    {
+        // Simple logging without OpenTelemetry support
+        let default_log_level = match &cli.command {
+            Commands::Server(_) => "hyprstream=info",
+            _ => "hyprstream=debug",
         };
 
         tracing_subscriber::fmt()
