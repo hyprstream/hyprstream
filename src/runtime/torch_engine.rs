@@ -56,7 +56,7 @@ impl Default for QwenSpecialTokens {
     }
 }
 use crate::runtime::architectures::ModelOperations;
-use tch::nn::{self, OptimizerConfig};
+use tch::nn;
 
 /// Basic context state for tracking generation state
 #[derive(Debug, Clone)]

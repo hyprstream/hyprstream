@@ -243,56 +243,10 @@ impl TrainingService {
         sessions: &Arc<RwLock<HashMap<String, TrainingSession>>>,
         stats: &Arc<RwLock<TrainingStats>>,
     ) -> Result<()> {
-        let start_time = std::time::Instant::now();
-        
         info!("🎯 Training LoRA {} with {} samples", lora_id, samples.len());
-        
+
+        // TODO: Implement actual training logic
         return Err(anyhow::anyhow!("Training not available"));
-        
-        // Simulate gradient computation and sparse weight updates
-        let mut weight_updates: HashMap<String, f32> = HashMap::new();
-        
-        // for sample in samples {
-        //     // Compute gradients (simplified - would use actual backprop)
-        //     let gradients = compute_gradients_for_sample(sample, &adapter).await?;
-        //
-        //     // Apply gradients with learning rate and sparsity
-        //     for (layer_name, grad) in gradients {
-        //         apply_sparse_gradient(
-        //             &mut weight_updates,
-        //             &layer_name,
-        //             &grad,
-        //             config.learning_rate,
-        //             config.sparsity_target,
-        //         )?;
-        //     }
-        // }
-        
-        
-        // Update session statistics
-        let training_time = start_time.elapsed().as_millis() as u64;
-        {
-            let mut sessions_guard = sessions.write().await;
-            if let Some(session) = sessions_guard.get_mut(lora_id) {
-                session.samples_processed += samples.len() as u64;
-                session.current_loss = compute_avg_loss(samples); // Simplified
-                session.last_update = chrono::Utc::now().timestamp();
-            }
-        }
-        
-        // Update global statistics
-        {
-            let mut stats_guard = stats.write().await;
-            stats_guard.total_samples_processed += samples.len() as u64;
-            stats_guard.total_gradient_updates += 1;
-            stats_guard.total_training_time_ms += training_time;
-            stats_guard.avg_training_loss = compute_avg_loss(samples);
-        }
-        
-        info!("✅ Training completed in {}ms for LoRA {}", 
-                training_time, lora_id);
-        
-        Ok(())
     }
     
     /// Get training status for a LoRA
@@ -475,29 +429,7 @@ impl TrainingService {
 //     Ok(())
 // }
 
-/// Compute sparsity threshold for gradient magnitude
-fn compute_sparsity_threshold(gradients: &[f32], sparsity_target: f32) -> f32 {
-    let mut magnitudes: Vec<f32> = gradients.iter()
-        .map(|g| g.abs())
-        .collect();
-    
-    magnitudes.sort_by(|a, b| b.partial_cmp(a).unwrap());
-    
-    let keep_count = ((1.0 - sparsity_target) * magnitudes.len() as f32) as usize;
-    
-    if keep_count > 0 && keep_count < magnitudes.len() {
-        magnitudes[keep_count]
-    } else {
-        0.0
-    }
-}
+// TODO: Re-add sparsity computation utilities when implementing training
 
-/// Compute average loss for samples (simplified)
-fn compute_avg_loss(samples: &[TrainingSample]) -> f32 {
-    // Simplified loss computation
-    samples.iter()
-        .map(|s| s.input.len() as f32 * 0.001) // Placeholder loss
-        .sum::<f32>() / samples.len() as f32
-}
 
 use chrono;

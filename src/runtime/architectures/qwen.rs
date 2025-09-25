@@ -7,7 +7,7 @@
 //! - SiLU activation function (same as Llama)
 //! - Most models use same num_attention_heads and num_key_value_heads (no GQA reduction)
 
-use super::{ModelOperations, ArchitectureConfig};
+use super::ModelOperations;
 use super::llama::LlamaModel;
 use anyhow::Result;
 use tch::{Device, Kind as DType, Tensor};

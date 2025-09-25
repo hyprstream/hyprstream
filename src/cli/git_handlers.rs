@@ -173,8 +173,15 @@ fn print_model_status(status: &crate::storage::model_registry::ModelStatus, verb
 pub async fn handle_lora_train(
     storage: &ModelStorage,
     model_ref_str: &str,
-    config: Option<String>,
     adapter_name: Option<String>,
+    index: Option<u32>,
+    rank: Option<u32>,
+    learning_rate: Option<f32>,
+    batch_size: Option<usize>,
+    epochs: Option<usize>,
+    data: Option<String>,
+    interactive: bool,
+    config: Option<String>,
 ) -> Result<()> {
     let model_ref = ModelRef::parse(model_ref_str)?;
 
@@ -188,30 +195,88 @@ pub async fn handle_lora_train(
         println!("  hyprstream branch {} training/experiment", model_ref.model);
     }
 
-    println!("Starting LoRA training for {}", model_ref.to_string());
+    println!("Starting LoRA adapter initialization for {}", model_ref.to_string());
     println!("Current branch: {}", status.current_ref);
 
+    // Get model path and create adapter manager
+    let model_path = storage.get_model_path(&model_ref).await?;
+    let adapter_manager = crate::storage::AdapterManager::new(&model_path);
+
+    // Determine adapter name and create indexed name
+    let adapter_base_name = adapter_name.as_deref().unwrap_or("default");
+    let indexed_adapter_name = adapter_manager.create_indexed_name(adapter_base_name, index)?;
+
+    // Create adapter configuration
+    let mut adapter_config = crate::storage::AdapterConfig {
+        rank: rank.unwrap_or(16),
+        alpha: 32.0,
+        learning_rate: learning_rate.unwrap_or(1e-4) as f64,
+        batch_size: batch_size.unwrap_or(4),
+        epochs: epochs.unwrap_or(10),
+        model_ref: model_ref.to_string(),
+        training_data: data.clone(),
+        ..Default::default()
+    };
+
+    // Add metadata
+    adapter_config.metadata.insert("branch".to_string(), status.current_ref.clone());
+    if interactive {
+        adapter_config.metadata.insert("mode".to_string(), "interactive".to_string());
+    }
+
+    // Display configuration
+    println!("\n→ Adapter configuration:");
+    println!("  Name: {}", indexed_adapter_name);
+    println!("  Rank: {}", adapter_config.rank);
+    println!("  Learning rate: {}", adapter_config.learning_rate);
+    println!("  Batch size: {}", adapter_config.batch_size);
+    println!("  Epochs: {}", adapter_config.epochs);
+
+    // Show current adapter stack
+    let existing_adapters = adapter_manager.list_adapters()?;
+    if !existing_adapters.is_empty() {
+        println!("\n→ Existing adapter stack:");
+        for adapter in &existing_adapters {
+            println!("  [{}] {}", adapter.index, adapter.name);
+        }
+    }
+
+    if interactive {
+        println!("\n  Mode: Interactive learning");
+    } else if let Some(data_file) = &data {
+        println!("\n  Training data: {}", data_file);
+    } else if config.is_none() {
+        println!("\n  Mode: Initialization only (no training data)");
+    }
+
     if let Some(cfg) = &config {
-        println!("Config: {}", cfg);
+        println!("  Config override: {}", cfg);
     }
 
-    if let Some(adapter) = &adapter_name {
-        println!("Adapter name: {}", adapter);
+    // Initialize the adapter
+    let adapter_path = adapter_manager.initialize_adapter(
+        adapter_base_name,
+        index,
+        adapter_config.clone(),
+    )?;
+
+    println!("\n✓ Initialized adapter: adapters/{}.safetensors", indexed_adapter_name);
+    println!("✓ Created config: adapters/{}.config.json", indexed_adapter_name);
+
+    if interactive {
+        println!("\n→ Interactive mode enabled");
+        println!("  Start an inference session to begin learning:");
+        println!("  hyprstream infer {} --prompt \"...\" --learn", model_ref.model);
+    } else if data.is_some() {
+        println!("\n→ Batch training ready");
+        println!("  Run training with: hyprstream train {} --adapter {}", model_ref.model, indexed_adapter_name);
     }
 
-    // Call the existing LoRA training handler
-    // This will save outputs to the model's working directory
-    // but will NOT auto-commit
-    crate::cli::pytorch_lora_handler::handle_lora_train(
-        storage,
-        &model_ref.to_string(),
-        config,
-        adapter_name,
-    ).await?;
-
-    println!("\nTraining complete!");
-    println!("Use 'hyprstream status {}' to see new files", model_ref.model);
-    println!("Use 'hyprstream commit {} -m \"message\"' to save changes", model_ref.model);
+    println!("\n✓ Adapter initialization complete!");
+    println!("\n→ Next steps:");
+    println!("  1. Check status: hyprstream status {}", model_ref.model);
+    println!("  2. Test inference: hyprstream infer {}", model_ref.model);
+    println!("  3. Commit changes: hyprstream commit {} -m \"Added {} adapter\"", model_ref.model, indexed_adapter_name);
 
     Ok(())
 }
@@ -553,7 +618,36 @@ pub async fn handle_infer(
     let load_time = load_start.elapsed();
     info!("Model loaded in {:.2}s", load_time.as_secs_f64());
 
-    // Clear any LoRA
+    // Auto-load adapters from the model directory
+    let adapter_manager = crate::storage::AdapterManager::new(&model_path);
+    let adapters = adapter_manager.list_adapters()?;
+
+    if !adapters.is_empty() {
+        println!("\n→ Loading adapters:");
+        for adapter_info in &adapters {
+            println!("  [{}] {} ({:.1} KB)",
+                     adapter_info.index,
+                     adapter_info.name,
+                     adapter_info.size as f64 / 1024.0);
+
+            // Load the adapter weights into the engine
+            match engine.load_lora_weights(adapter_info.path.to_str().unwrap()) {
+                Ok(_) => {
+                    info!("Successfully loaded adapter: {:?}", adapter_info.path);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load adapter {:?}: {}", adapter_info.path, e);
+                    println!("  ⚠️  Failed to load [{}] {} - continuing without it",
+                             adapter_info.index, adapter_info.name);
+                }
+            }
+        }
+        println!("  Total: {} adapters loaded", adapters.len());
+    } else {
+        info!("No adapters found, using base model");
+    }
+
+    // Clear any previously loaded LoRA (in case of manual loads)
     {
         let mut lora_guard = engine.active_lora.lock().unwrap();
         *lora_guard = None;

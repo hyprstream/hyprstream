@@ -10,7 +10,7 @@ use hyprstream_core::cli::handlers::{
     handle_chat_command
 };
 use hyprstream_core::cli::{
-    handle_pytorch_lora_command, DeviceConfig, DevicePreference, RuntimeConfig,
+    DeviceConfig, DevicePreference, RuntimeConfig,
     handle_branch, handle_checkout, handle_status, handle_commit,
     handle_lora_train, handle_serve, handle_infer,
     handle_push, handle_pull, handle_merge,
@@ -91,13 +91,6 @@ fn handle_model_cmd(cmd: hyprstream_core::cli::commands::model::ModelCommand, se
     async move { handle_model_command(cmd, server_url).await }
 }
 
-/// LoRA command handler - GPU requirements depend on action
-fn handle_lora_cmd(cmd: hyprstream_core::cli::commands::lora::LoRACommand) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> {
-    async move {
-        info!("Using PyTorch LoRA implementation");
-        handle_pytorch_lora_command(cmd).await.map_err(|e| e.into())
-    }
-}
 
 /// Chat command handler - requires multi-threaded runtime for GPU
 fn handle_chat_cmd(cmd: hyprstream_core::cli::commands::chat::ChatCommand, server_url: String) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> {
@@ -285,18 +278,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 || handle_model_cmd(cmd, server_url)
             )?
         }
-        Commands::Lora(cmd) => {
-            let device_config = cmd.action.device_config();
-            let multi_threaded = matches!(device_config.preference, DevicePreference::RequestGPU | DevicePreference::RequireGPU);
-
-            with_runtime(
-                RuntimeConfig {
-                    device: device_config,
-                    multi_threaded
-                },
-                || handle_lora_cmd(cmd)
-            )?
-        }
         Commands::Chat(cmd) => {
             let server_url = "http://127.0.0.1:50051".to_string();
 
@@ -355,7 +336,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?;
         }
 
-        Commands::LoraTrain { model, config, adapter } => {
+        Commands::LoraTrain { model, adapter, index, rank, learning_rate,
+                              batch_size, epochs, data, interactive, config } => {
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_gpu(),
@@ -366,7 +348,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let storage = hyprstream_core::storage::ModelStorage::create(
                         storage_paths.models_dir()?
                     ).await?;
-                    handle_lora_train(&storage, &model, config, adapter).await
+                    handle_lora_train(&storage, &model, adapter, index, rank, learning_rate,
+                                     batch_size, epochs, data, interactive, config).await
                         .map_err(|e| e.into())
                 }
             )?;
@@ -420,7 +403,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?;
         }
 
-        Commands::Info { model, verbose } => {
+        Commands::Inspect { model, verbose } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
                 let storage_paths = hyprstream_core::storage::StoragePaths::new()?;

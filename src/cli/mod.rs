@@ -8,11 +8,9 @@
 
 pub mod commands;
 pub mod handlers;
-pub mod pytorch_lora_handler;
 pub mod git_handlers;
 
 pub use handlers::{handle_config, handle_server, handle_model_command, handle_chat_command};
-pub use pytorch_lora_handler::handle_pytorch_lora_command;
 pub use git_handlers::{
     handle_branch, handle_checkout, handle_status, handle_commit,
     handle_lora_train, handle_serve, handle_infer,

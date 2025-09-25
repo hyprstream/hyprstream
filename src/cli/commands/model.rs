@@ -93,10 +93,10 @@ pub enum ModelAction {
     },
     
     /// Get detailed information about a model
-    Info {
+    Inspect {
         /// Model URI
         uri: String,
-        
+
         /// Output format (json, yaml)
         #[arg(long, default_value = "json")]
         format: String,

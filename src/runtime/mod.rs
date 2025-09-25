@@ -17,7 +17,6 @@ pub use crate::config::{
 
 pub mod torch_engine;         // PyTorch-based engine with tch-rs
 pub mod tensor_helpers;      // Helper functions for Tch tensor operations
-pub mod lora_wrapper;
 pub mod lora_integration;    // LoRA integration with gradient bridge
 pub mod conversation_router;  // Seamless model evolution and routing
 pub mod precision;           // BF16/FP8 precision management
@@ -75,7 +74,7 @@ pub use conversation_router::{
 };
 
 // LoRA and adapter exports
-pub use lora_wrapper::{LoRAEngineWrapper, RuntimeLoRAAdapter};
+// LoRA wrapper removed - using direct PyTorch implementation
 
 /// Core runtime engine trait - all engines implement this
 #[async_trait]

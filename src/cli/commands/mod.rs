@@ -1,13 +1,11 @@
 pub mod config;
 pub mod server;
 pub mod model;
-pub mod lora;
 pub mod chat;
 pub mod git;
 
 pub use server::{CacheConfig, EngineConfig, ServerCommand, ServerConfig};
 pub use model::ModelCommand;
-pub use lora::LoRACommand;
 pub use chat::ChatCommand;
 pub use git::{GitCommand, GitAction};
 
@@ -19,8 +17,6 @@ pub enum Commands {
     Server(ServerCommand),
     /// Manage models from registries (HuggingFace, etc.)
     Model(ModelCommand),
-    /// Manage LoRA adapters and training
-    Lora(LoRACommand),
     /// Chat with a model or composed model
     Chat(ChatCommand),
 
@@ -74,12 +70,42 @@ pub enum Commands {
     LoraTrain {
         /// Model reference
         model: String,
-        /// Training configuration file
-        #[arg(long)]
-        config: Option<String>,
-        /// Adapter name
+
+        /// Adapter name (will be auto-prefixed with index)
         #[arg(long)]
         adapter: Option<String>,
+
+        /// Explicit index for adapter (auto-increments if not specified)
+        #[arg(long)]
+        index: Option<u32>,
+
+        /// LoRA rank (default: 16)
+        #[arg(long, short = 'r')]
+        rank: Option<u32>,
+
+        /// Learning rate (default: 1e-4)
+        #[arg(long, short = 'l')]
+        learning_rate: Option<f32>,
+
+        /// Batch size (default: 4)
+        #[arg(long, short = 'b')]
+        batch_size: Option<usize>,
+
+        /// Number of epochs (default: 10)
+        #[arg(long, short = 'e')]
+        epochs: Option<usize>,
+
+        /// Training data file (JSONL format)
+        #[arg(long)]
+        data: Option<String>,
+
+        /// Enable interactive learning mode
+        #[arg(long)]
+        interactive: bool,
+
+        /// Training configuration file (overrides CLI args)
+        #[arg(long)]
+        config: Option<String>,
     },
 
     /// Fine-tuning
@@ -165,7 +191,7 @@ pub enum Commands {
     },
 
     /// Get detailed information about a model
-    Info {
+    Inspect {
         /// Model name or reference
         model: String,
         /// Show detailed output

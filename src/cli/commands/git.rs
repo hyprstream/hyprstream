@@ -7,7 +7,6 @@
 //! - commit: Save changes to git history
 
 use clap::{Args, Subcommand};
-use anyhow::Result;
 
 /// Git-style model management commands
 #[derive(Args)]

@@ -22,7 +22,7 @@ pub mod storage;
 
 // Storage exports removed
 pub use runtime::{
-    RuntimeEngine, TorchEngine, LoRAEngineWrapper,
+    RuntimeEngine, TorchEngine,
     ModelInfo, GenerationRequest, GenerationResult, FinishReason, RuntimeConfig,
     XLoRAAdapter, AdaptationMode, UserFeedback, XLoRARoutingStrategy, AdapterMetrics,
     // Model Evolution System exports

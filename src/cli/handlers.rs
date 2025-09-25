@@ -22,28 +22,7 @@ pub struct InferenceResponse {
     pub finish_reason: String,
 }
 
-/// Resolve base model identifier using ModelRef
-async fn resolve_base_model_identifier(identifier: &str) -> Result<String, anyhow::Error> {
-    // Try to parse as ModelRef first
-    if let Ok(model_ref) = crate::storage::ModelRef::parse(identifier) {
-        // Load model storage
-        let config = crate::config::HyprConfig::load().unwrap_or_default();
-        let storage = ModelStorage::create(config.models_dir().to_path_buf()).await?;
-
-        // Check if model exists directly
-        if let Ok(model_path) = storage.get_model_path(&model_ref).await {
-            // Extract display name from git repo
-            let display_name = read_model_display_name(&model_path)
-                .unwrap_or_else(|| model_ref.model.clone());
-            return Ok(format!("{} ({})", model_ref.model, display_name));
-        } else {
-            return Err(anyhow::anyhow!("Model '{}' not found in storage", model_ref.model));
-        }
-    }
-
-    // For invalid identifiers, return as-is (might be used elsewhere)
-    Ok(identifier.to_string())
-}
+// TODO: Re-add model identifier resolution when needed
 
 pub async fn execute_sparse_query(
     addr: Option<SocketAddr>,
@@ -605,7 +584,7 @@ pub async fn handle_model_command(
 
             println!("✅ Model '{}' removed successfully", model_ref.model);
         }
-        ModelAction::Info { uri, format } => {
+        ModelAction::Inspect { uri, format } => {
             // Parse model reference (e.g., "Qwen3-4B", "qwen/qwen-2b", "model:branch")
             let model_ref = crate::storage::ModelRef::parse(&uri)
                 .map_err(|e| anyhow::anyhow!("Invalid model reference '{}': {}. Use 'hyprstream model list' to see available models", uri, e))?;

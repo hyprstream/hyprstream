@@ -15,6 +15,7 @@ pub mod model_storage;
 pub mod git_source;
 pub mod sharing;
 pub mod operations;
+pub mod adapter_manager;
 
 // XDG-compliant path management (internal use only)
 pub use paths::StoragePaths;
@@ -24,3 +25,4 @@ pub use model_registry::{ModelRegistry, SharedModelRegistry, ModelStatus};
 pub use model_storage::{ModelStorage, ModelId, ModelMetadata, ModelMetadataFile};
 pub use git_source::GitModelSource;
 pub use sharing::{ModelSharing, ShareableModelRef, ModelType};
+pub use adapter_manager::{AdapterManager, AdapterInfo, AdapterConfig};
