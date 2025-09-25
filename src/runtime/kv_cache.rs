@@ -207,6 +207,7 @@ mod tests {
 
     #[test]
     fn test_layer_kv_cache() -> Result<()> {
+        use tch::Device;
         let device = Device::Cpu;
         let dtype = DType::Float;
         

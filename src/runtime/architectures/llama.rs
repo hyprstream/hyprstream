@@ -3,7 +3,7 @@
 use super::{ModelArchitecture, ModelOperations, ArchitectureConfig};
 // use super::lora_adapter::ArchitectureAwareLoRAAdapter; // Module removed
 use anyhow::{Result, anyhow};
-use tch::{Device, Kind as DType, Tensor};
+use tch::{Device, Kind as DType, Tensor, nn};
 use crate::runtime::tensor_helpers::{square_tensor, broadcast_mul, broadcast_add, scalar_tensor, dims3, dims4};
 use crate::runtime::rope::{RoPE, RoPEManager};
 use std::collections::HashMap;
@@ -190,18 +190,21 @@ pub struct LlamaModel {
     config: LlamaConfig,
     device: Device,
     dtype: DType,
-    
+
     // Model weights
     embed_tokens: Option<Tensor>,
     layers: Vec<LlamaLayer>,
     norm: Option<RMSNorm>,
     lm_head: Option<Tensor>,
-    
+
     // KV cache for efficient generation (interior mutability for &self forward)
     kv_cache: Option<std::cell::RefCell<crate::runtime::kv_cache::KVCacheManager>>,
-    
+
     // RoPE manager for position encoding
     rope_manager: std::cell::RefCell<RoPEManager>,
+
+    // VarStore for training (if model was created with training support)
+    vs: Option<nn::VarStore>,
 }
 
 // SAFETY: Tch tensors are thread-safe when used correctly
@@ -756,6 +759,7 @@ impl LlamaModel {
             lm_head: None,
             kv_cache: None, // Cache initialized on first use
             rope_manager: std::cell::RefCell::new(RoPEManager::new()),
+            vs: None, // No VarStore for safetensors loading
         })
     }
     
@@ -836,6 +840,7 @@ impl LlamaModel {
             lm_head,
             kv_cache,
             rope_manager: std::cell::RefCell::new(RoPEManager::new()),
+            vs: None, // No VarStore for weight loading - weights are stored directly
         })
     }
     
@@ -1204,14 +1209,22 @@ impl ModelOperations for LlamaModel {
     fn architecture(&self) -> ModelArchitecture {
         ModelArchitecture::Llama { version: self.config.version }
     }
-    
+
     fn config(&self) -> &dyn ArchitectureConfig {
         &self.config
     }
-    
+
     fn forward(&self, input: &Tensor, _past_kv: Option<&Tensor>) -> Result<Tensor> {
         // Default forward just calls forward_with_cache with start_pos = 0
         self.forward_with_cache(input, 0)
+    }
+
+    fn var_store(&self) -> Option<&nn::VarStore> {
+        self.vs.as_ref()
+    }
+
+    fn var_store_mut(&mut self) -> Option<&mut nn::VarStore> {
+        self.vs.as_mut()
     }
     
     fn forward_with_cache(&self, input: &Tensor, start_pos: usize) -> Result<Tensor> {
@@ -1483,7 +1496,9 @@ mod tests {
             layers: vec![],
             norm: None,
             lm_head: None,
+            kv_cache: None,
             rope_manager: std::cell::RefCell::new(RoPEManager::new()),
+            vs: None,
         };
         
         // Test tensor with shape [2, 10, 4096]

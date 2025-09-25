@@ -5,7 +5,7 @@
 //! tensor shape handling and LoRA compatibility.
 
 use anyhow::Result;
-use tch::Tensor;
+use tch::{Tensor, nn};
 
 pub mod detector;
 pub mod llama;
@@ -123,12 +123,35 @@ impl ModelArchitecture {
 pub trait ModelOperations: Send {
     /// Get the architecture type
     fn architecture(&self) -> ModelArchitecture;
-    
+
     /// Get architecture configuration
     fn config(&self) -> &dyn ArchitectureConfig;
-    
+
     /// Forward pass through the model
     fn forward(&self, input: &Tensor, past_kv: Option<&Tensor>) -> Result<Tensor>;
+
+    /// Forward pass with LoRA integration support (for gradient bridge)
+    /// Returns (logits, layer_activations) where layer_activations is for LoRA adapters
+    fn forward_with_lora_hooks(
+        &self,
+        input: &Tensor,
+        lora_model: Option<&crate::lora::torch_adapter::LoRAModel>,
+        training: bool,
+    ) -> Result<(Tensor, Vec<(String, Tensor)>)> {
+        // Default implementation without LoRA hooks
+        let logits = self.forward(input, None)?;
+        Ok((logits, Vec::new()))
+    }
+
+    /// Get VarStore for training (if available)
+    fn var_store(&self) -> Option<&nn::VarStore> {
+        None // Default implementation returns None
+    }
+
+    /// Get mutable VarStore for training (if available)
+    fn var_store_mut(&mut self) -> Option<&mut nn::VarStore> {
+        None // Default implementation returns None
+    }
     
     /// Forward pass with position information for KV caching
     fn forward_with_cache(&self, input: &Tensor, start_pos: usize) -> Result<Tensor> {

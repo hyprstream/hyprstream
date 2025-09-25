@@ -226,7 +226,37 @@ pub enum LoRAAction {
 /// Training management actions
 #[derive(Subcommand)]
 pub enum TrainingAction {
-    /// Start auto-regressive training
+    /// Start pre-training (full model training)
+    Pretrain {
+        /// Model UUID or path
+        model_id: String,
+
+        /// Learning rate
+        #[arg(long, default_value = "0.00005")]
+        learning_rate: f32,
+
+        /// Total training steps
+        #[arg(long, default_value = "1000")]
+        steps: usize,
+
+        /// Warmup steps
+        #[arg(long, default_value = "100")]
+        warmup_steps: usize,
+
+        /// Batch size
+        #[arg(long, default_value = "4")]
+        batch_size: usize,
+
+        /// Checkpoint every N steps
+        #[arg(long)]
+        checkpoint_every: Option<usize>,
+
+        /// Resume from checkpoint
+        #[arg(long)]
+        resume_from: Option<String>,
+    },
+
+    /// Start post-training (LoRA fine-tuning)
     Start {
         /// LoRA ID
         lora_id: String,
@@ -284,18 +314,50 @@ pub enum TrainingAction {
     Sample {
         /// LoRA ID
         lora_id: String,
-        
+
         /// Input text
         #[arg(long)]
         input: Option<String>,
-        
+
         /// Expected output
         #[arg(long)]
         output: Option<String>,
-        
+
         /// Input file with training samples (JSON format)
         #[arg(long)]
         input_file: Option<String>,
+    },
+
+    /// Write checkpoint to filesystem (no Git)
+    WriteCheckpoint {
+        /// Model or LoRA ID
+        model_id: String,
+
+        /// Optional checkpoint name
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Step number for checkpoint
+        #[arg(long)]
+        step: Option<usize>,
+    },
+
+    /// Commit checkpoint to Git (separate from write)
+    CommitCheckpoint {
+        /// Path to checkpoint file
+        checkpoint_path: String,
+
+        /// Commit message
+        #[arg(long, short = 'm')]
+        message: Option<String>,
+
+        /// Target branch
+        #[arg(long, short = 'b')]
+        branch: Option<String>,
+
+        /// Create tag
+        #[arg(long)]
+        tag: Option<String>,
     },
 }
 

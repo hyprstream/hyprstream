@@ -18,6 +18,7 @@ pub use crate::config::{
 pub mod torch_engine;         // PyTorch-based engine with tch-rs
 pub mod tensor_helpers;      // Helper functions for Tch tensor operations
 pub mod lora_wrapper;
+pub mod lora_integration;    // LoRA integration with gradient bridge
 pub mod conversation_router;  // Seamless model evolution and routing
 pub mod precision;           // BF16/FP8 precision management
 pub mod fp8;                 // FP8 (E4M3/E5M2) quantization support
@@ -31,6 +32,7 @@ pub mod model_config;        // Unified model configuration management
 pub mod model_factory;       // Single factory for model creation
 pub mod streaming;           // Async streaming support for token-by-token generation
 pub mod template_engine;     // Jinja2 template engine for chat templates
+pub mod weight_provider;     // Weight provider for streaming large models
 
 // Primary exports - use TorchEngine as default
 pub use torch_engine::TorchEngine;

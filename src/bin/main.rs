@@ -9,7 +9,13 @@ use hyprstream_core::cli::handlers::{
     handle_server, handle_model_command,
     handle_chat_command
 };
-use hyprstream_core::cli::{handle_pytorch_lora_command, DeviceConfig, DevicePreference, RuntimeConfig};
+use hyprstream_core::cli::{
+    handle_pytorch_lora_command, DeviceConfig, DevicePreference, RuntimeConfig,
+    handle_branch, handle_checkout, handle_status, handle_commit,
+    handle_lora_train, handle_serve, handle_infer,
+    handle_push, handle_pull, handle_merge,
+    handle_list, handle_info, handle_clone
+};
 use tracing::info;
 #[cfg(feature = "otel")]
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -301,6 +307,172 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 || handle_chat_cmd(cmd, server_url)
             )?
+        }
+
+        // Phase 1: Git-style commands
+        Commands::Branch { model, name, from } => {
+            // Create ModelStorage for git operations
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
+                let storage = hyprstream_core::storage::ModelStorage::create(
+                    storage_paths.models_dir()?
+                ).await?;
+                handle_branch(&storage, &model, &name, from).await
+            })?;
+        }
+
+        Commands::Checkout { model_ref, create_branch, force } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
+                let storage = hyprstream_core::storage::ModelStorage::create(
+                    storage_paths.models_dir()?
+                ).await?;
+                handle_checkout(&storage, &model_ref, create_branch, force).await
+            })?;
+        }
+
+        Commands::Status { model, verbose } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
+                let storage = hyprstream_core::storage::ModelStorage::create(
+                    storage_paths.models_dir()?
+                ).await?;
+                handle_status(&storage, model, verbose).await
+            })?;
+        }
+
+        Commands::Commit { model, message, all } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
+                let storage = hyprstream_core::storage::ModelStorage::create(
+                    storage_paths.models_dir()?
+                ).await?;
+                handle_commit(&storage, &model, &message, all).await
+            })?;
+        }
+
+        Commands::LoraTrain { model, config, adapter } => {
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_gpu(),
+                    multi_threaded: true
+                },
+                || async {
+                    let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
+                    let storage = hyprstream_core::storage::ModelStorage::create(
+                        storage_paths.models_dir()?
+                    ).await?;
+                    handle_lora_train(&storage, &model, config, adapter).await
+                        .map_err(|e| e.into())
+                }
+            )?;
+        }
+
+        Commands::FineTune { model, config } => {
+            println!("Fine-tuning not yet implemented for model: {}", model);
+            println!("Config: {:?}", config);
+        }
+
+        Commands::PreTrain { model, config } => {
+            println!("Pre-training not yet implemented for model: {}", model);
+            println!("Config: {:?}", config);
+        }
+
+        Commands::Serve { model, port, host } => {
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_gpu(),
+                    multi_threaded: true
+                },
+                || async { handle_serve(model, port, &host).await.map_err(|e| e.into()) }
+            )?;
+        }
+
+        Commands::Infer { model, prompt, max_tokens, temperature, top_p, top_k, stream, force_download } => {
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_gpu(),
+                    multi_threaded: true
+                },
+                || async {
+                    let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
+                    let storage = hyprstream_core::storage::ModelStorage::create(
+                        storage_paths.models_dir()?
+                    ).await?;
+                    handle_infer(&storage, &model, &prompt, max_tokens, temperature, top_p, top_k, stream, force_download).await
+                        .map_err(|e| e.into())
+                }
+            )?;
+        }
+
+        Commands::List { branch, tag, dirty, verbose } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
+                let storage = hyprstream_core::storage::ModelStorage::create(
+                    storage_paths.models_dir()?
+                ).await?;
+                handle_list(&storage, branch, tag, dirty, verbose).await
+            })?;
+        }
+
+        Commands::Info { model, verbose } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
+                let storage = hyprstream_core::storage::ModelStorage::create(
+                    storage_paths.models_dir()?
+                ).await?;
+                handle_info(&storage, &model, verbose).await
+            })?;
+        }
+
+        Commands::Clone { repo_url, name } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
+                let storage = hyprstream_core::storage::ModelStorage::create(
+                    storage_paths.models_dir()?
+                ).await?;
+                handle_clone(&storage, &repo_url, name).await
+            })?;
+        }
+
+        Commands::Push { model, remote, branch, set_upstream, force } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
+                let storage = hyprstream_core::storage::ModelStorage::create(
+                    storage_paths.models_dir()?
+                ).await?;
+                handle_push(&storage, &model, remote, branch, set_upstream, force).await
+            })?;
+        }
+
+        Commands::Pull { model, remote, branch, rebase } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
+                let storage = hyprstream_core::storage::ModelStorage::create(
+                    storage_paths.models_dir()?
+                ).await?;
+                handle_pull(&storage, &model, remote, branch, rebase).await
+            })?;
+        }
+
+        Commands::Merge { model, branch, ff_only, no_ff } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
+                let storage = hyprstream_core::storage::ModelStorage::create(
+                    storage_paths.models_dir()?
+                ).await?;
+                handle_merge(&storage, &model, &branch, ff_only, no_ff).await
+            })?;
         }
     };
 

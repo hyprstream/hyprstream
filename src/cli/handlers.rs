@@ -1457,3 +1457,115 @@ fn read_model_display_name(model_path: &std::path::Path) -> Option<String> {
 
     None
 }
+
+/// Handle pre-training command - NOT IMPLEMENTED
+pub async fn handle_pretrain(
+    model_id: String,
+    _learning_rate: f32,
+    _steps: usize,
+    _warmup_steps: usize,
+    _batch_size: usize,
+    _checkpoint_every: Option<usize>,
+    _resume_from: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    error!("Pre-training is not supported for model: {}", model_id);
+    error!("The base model doesn't expose its VarStore for training");
+    error!("Please use LoRA fine-tuning instead with 'hyprstream lora create' and 'hyprstream lora train start'");
+
+    Err("Pre-training not supported - use LoRA fine-tuning instead".into())
+}
+
+/// Handle checkpoint write command
+pub async fn handle_write_checkpoint(
+    model_id: String,
+    name: Option<String>,
+    step: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::training::{CheckpointManager, WeightSnapshot, WeightFormat};
+
+    info!("Writing checkpoint for model: {}", model_id);
+
+    // Load model storage
+    let config = crate::config::HyprConfig::load().unwrap_or_default();
+    let storage = ModelStorage::create(config.models_dir().to_path_buf()).await?;
+
+    // Resolve model path
+    let model_ref = crate::storage::ModelRef::parse(&model_id)?;
+    let model_path = storage.get_model_path(&model_ref).await?;
+
+    // Create checkpoint manager
+    let checkpoint_mgr = CheckpointManager::new(model_path.clone())?;
+
+    // Get step number
+    let step = step.unwrap_or_else(|| {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as usize
+    });
+
+    // Create weight snapshot (would need actual implementation)
+    let weights = WeightSnapshot::Memory {
+        data: vec![], // Placeholder - would need actual weight data
+        format: WeightFormat::SafeTensors,
+    };
+
+    // Write checkpoint
+    let checkpoint_path = checkpoint_mgr.write_checkpoint(
+        weights,
+        step,
+        None,
+    ).await?;
+
+    info!("✅ Checkpoint written to: {}", checkpoint_path.display());
+
+    Ok(())
+}
+
+/// Handle checkpoint commit command
+pub async fn handle_commit_checkpoint(
+    checkpoint_path: String,
+    message: Option<String>,
+    branch: Option<String>,
+    tag: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::training::CheckpointManager;
+    use std::path::PathBuf;
+
+    info!("Committing checkpoint: {}", checkpoint_path);
+
+    let checkpoint_path = PathBuf::from(&checkpoint_path);
+
+    // Get model path (parent of .checkpoints directory)
+    let model_path = checkpoint_path
+        .parent()
+        .and_then(|p| if p.file_name() == Some(std::ffi::OsStr::new(".checkpoints")) {
+            p.parent()
+        } else {
+            Some(p)
+        })
+        .ok_or("Invalid checkpoint path")?;
+
+    // Create checkpoint manager
+    let checkpoint_mgr = CheckpointManager::new(model_path.to_path_buf())?;
+
+    // Commit checkpoint
+    let commit_id = checkpoint_mgr.commit_checkpoint(
+        &checkpoint_path,
+        message,
+        branch,
+    ).await?;
+
+    info!("✅ Checkpoint committed: {}", commit_id);
+
+    // Create tag if requested
+    if let Some(tag_name) = tag {
+        use crate::git::BranchManager;
+        let branch_mgr = BranchManager::new(model_path)?;
+        branch_mgr.create_tag(&tag_name, "HEAD")?;
+        info!("✅ Tag created: {}", tag_name);
+    }
+
+    Ok(())
+}

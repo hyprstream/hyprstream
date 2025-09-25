@@ -88,9 +88,8 @@ impl ModelStorage {
 
     /// Get models directory
     pub fn get_models_dir(&self) -> PathBuf {
-        self.base_dir.parent()
-            .map(|p| p.join("models"))
-            .unwrap_or_else(|| self.base_dir.join("models"))
+        // base_dir is already the models directory
+        self.base_dir.clone()
     }
 
     /// Get model path by reference

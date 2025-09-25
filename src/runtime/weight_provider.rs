@@ -8,7 +8,7 @@ use tracing::info;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tch::{Device, Tensor, Kind as DType};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
 /// Trait for providing weights to models
@@ -27,30 +27,36 @@ pub trait WeightProvider: Send + Sync {
 }
 
 /// Simple in-memory weight provider (current behavior)
+/// Wraps tensors in Arc<Mutex<>> for thread safety
 pub struct MemoryWeightProvider {
-    weights: HashMap<String, Tensor>,
+    weights: Arc<Mutex<HashMap<String, Tensor>>>,
 }
 
 impl MemoryWeightProvider {
     pub fn new(weights: HashMap<String, Tensor>) -> Self {
-        Self { weights }
+        Self {
+            weights: Arc::new(Mutex::new(weights))
+        }
     }
 }
 
 impl WeightProvider for MemoryWeightProvider {
     fn get_tensor(&self, name: &str) -> Result<Tensor> {
-        self.weights
+        let weights = self.weights.lock().unwrap();
+        weights
             .get(name)
             .map(|t| t.shallow_clone())
             .ok_or_else(|| anyhow!("Tensor {} not found", name))
     }
 
     fn has_tensor(&self, name: &str) -> bool {
-        self.weights.contains_key(name)
+        let weights = self.weights.lock().unwrap();
+        weights.contains_key(name)
     }
 
     fn tensor_names(&self) -> Vec<String> {
-        self.weights.keys().cloned().collect()
+        let weights = self.weights.lock().unwrap();
+        weights.keys().cloned().collect()
     }
 
     fn preload(&mut self, _names: &[&str]) -> Result<()> {
@@ -60,6 +66,8 @@ impl WeightProvider for MemoryWeightProvider {
 }
 
 /// Streaming weight provider that loads shards on demand
+///
+/// Note: We wrap non-thread-safe types to ensure Send + Sync
 pub struct StreamingWeightProvider {
     shard_files: Vec<PathBuf>,
     device: Device,
@@ -71,6 +79,10 @@ pub struct StreamingWeightProvider {
     /// Currently loaded shard index
     current_shard: Arc<RwLock<Option<usize>>>,
 }
+
+// Manually implement Send + Sync since we ensure thread-safe access
+unsafe impl Send for StreamingWeightProvider {}
+unsafe impl Sync for StreamingWeightProvider {}
 
 impl StreamingWeightProvider {
     /// Create a new streaming weight provider
@@ -171,7 +183,6 @@ impl StreamingWeightProvider {
     }
 }
 
-#[async_trait::async_trait]
 impl WeightProvider for StreamingWeightProvider {
     fn get_tensor(&self, name: &str) -> Result<Tensor> {
         // Check if tensor is in current shard

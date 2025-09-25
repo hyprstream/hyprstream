@@ -3,7 +3,7 @@
 //! Provides non-blocking checkpoint saving during training,
 //! with commits to model branches for version control.
 
-use anyhow::{Result, Context};
+use anyhow::{Result, Context, anyhow};
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -161,6 +161,138 @@ impl CheckpointManager {
         }
     }
     
+    /// Write checkpoint to filesystem without Git commit
+    pub async fn write_checkpoint(
+        &self,
+        weights: WeightSnapshot,
+        step: usize,
+        metadata: Option<TrainingMetrics>,
+    ) -> Result<PathBuf> {
+        let checkpoint_path = self.checkpoint_dir.join(format!("step-{}.safetensors", step));
+
+        // Write weights directly to filesystem
+        match weights {
+            WeightSnapshot::Memory { ref data, format } => {
+                // Direct write from memory
+                fs::write(&checkpoint_path, data).await?;
+            }
+            WeightSnapshot::FilePath { ref source, format } => {
+                // Use copy-on-write if available
+                #[cfg(target_os = "linux")]
+                {
+                    use std::process::Command;
+                    let result = Command::new("cp")
+                        .args(&["--reflink=auto",
+                               source.to_str().unwrap(),
+                               checkpoint_path.to_str().unwrap()])
+                        .output();
+
+                    if result.is_err() || !result.unwrap().status.success() {
+                        fs::copy(source, &checkpoint_path).await?;
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    fs::copy(source, &checkpoint_path).await?;
+                }
+            }
+            WeightSnapshot::Diff { base_step, ref changes } => {
+                // Save diff file
+                let diff_path = self.checkpoint_dir.join(format!("diff_from_{}_to_{}.bin", base_step, step));
+                fs::write(&diff_path, changes).await?;
+                return Ok(diff_path);
+            }
+        }
+
+        // Save metadata if provided
+        if let Some(metrics) = metadata {
+            let metadata = CheckpointMetadata {
+                step,
+                epoch: None,
+                timestamp: Utc::now(),
+                metrics: Some(metrics),
+                format: WeightFormat::SafeTensors,
+                parent_checkpoint: None,
+            };
+
+            let metadata_path = checkpoint_path.with_extension("json");
+            let metadata_json = serde_json::to_string_pretty(&metadata)?;
+            fs::write(&metadata_path, metadata_json).await?;
+        }
+
+        tracing::info!("Checkpoint written to filesystem: {}", checkpoint_path.display());
+        Ok(checkpoint_path)
+    }
+
+    /// Commit existing checkpoint to Git (separate from write)
+    pub async fn commit_checkpoint(
+        &self,
+        checkpoint_path: &Path,
+        message: Option<String>,
+        branch: Option<String>,
+    ) -> Result<String> {
+        if !self.git_enabled {
+            return Err(anyhow!("Git is not enabled for this model path"));
+        }
+
+        // Open repository
+        let repo = get_repository(&self.model_path)?;
+
+        // Switch branch if specified
+        if let Some(branch_name) = branch {
+            let branch_ref = format!("refs/heads/{}", branch_name);
+            if repo.find_reference(&branch_ref).is_ok() {
+                repo.set_head(&branch_ref)?;
+                repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
+            } else {
+                // Create new branch
+                let head = repo.head()?.peel_to_commit()?;
+                repo.branch(&branch_name, &head, false)?;
+                repo.set_head(&branch_ref)?;
+            }
+        }
+
+        // Add checkpoint to index
+        let mut index = repo.index()?;
+        let relative_path = checkpoint_path.strip_prefix(&self.model_path)
+            .unwrap_or(checkpoint_path);
+        index.add_path(relative_path)?;
+
+        // Also add metadata if it exists
+        let metadata_path = checkpoint_path.with_extension("json");
+        if metadata_path.exists() {
+            let relative_metadata = metadata_path.strip_prefix(&self.model_path)
+                .unwrap_or(&metadata_path);
+            index.add_path(relative_metadata)?;
+        }
+
+        index.write()?;
+
+        // Create commit
+        let tree_id = index.write_tree()?;
+        let tree = repo.find_tree(tree_id)?;
+        let sig = create_hyprstream_signature()?;
+        let parent = repo.head()?.peel_to_commit()?;
+
+        let commit_message = message.unwrap_or_else(|| {
+            format!("Training checkpoint: {}", checkpoint_path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown"))
+        });
+
+        let oid = repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            &commit_message,
+            &tree,
+            &[&parent],
+        )?;
+
+        tracing::info!("Checkpoint committed to Git: {}", oid);
+        Ok(oid.to_string())
+    }
+
     /// Wait for all pending checkpoints to complete
     pub async fn flush(&self) -> Result<()> {
         // Send a sentinel value to ensure all previous requests are processed
@@ -175,12 +307,12 @@ impl CheckpointManager {
             timestamp: Utc::now(),
             commit_to_git: false,
         };
-        
+
         self.checkpoint(sentinel).await?;
-        
+
         // Give worker time to process
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        
+
         Ok(())
     }
     

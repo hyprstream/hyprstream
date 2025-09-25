@@ -251,14 +251,32 @@ async fn handle_training_action(action: TrainingAction) -> Result<()> {
             show_training_status(lora_id).await
         }
         
-        TrainingAction::Sample { 
-            lora_id, 
-            input, 
-            output, 
+        TrainingAction::Sample {
+            lora_id,
+            input,
+            output,
             input_file,
-            .. 
+            ..
         } => {
             add_training_sample(lora_id, input, output, input_file).await
+        }
+
+        TrainingAction::Pretrain { model_id, learning_rate, steps, warmup_steps, batch_size, checkpoint_every, resume_from } => {
+            use crate::cli::handlers::handle_pretrain;
+            handle_pretrain(model_id, learning_rate, steps, warmup_steps, batch_size, checkpoint_every, resume_from).await
+                .map_err(|e| anyhow::anyhow!("Pre-training failed: {}", e))
+        }
+
+        TrainingAction::WriteCheckpoint { model_id, name, step } => {
+            use crate::cli::handlers::handle_write_checkpoint;
+            handle_write_checkpoint(model_id, name, step).await
+                .map_err(|e| anyhow::anyhow!("Checkpoint write failed: {}", e))
+        }
+
+        TrainingAction::CommitCheckpoint { checkpoint_path, message, branch, tag } => {
+            use crate::cli::handlers::handle_commit_checkpoint;
+            handle_commit_checkpoint(checkpoint_path, message, branch, tag).await
+                .map_err(|e| anyhow::anyhow!("Checkpoint commit failed: {}", e))
         }
     }
 }
@@ -925,6 +943,35 @@ async fn run_lora_inference(
     println!("   Tokens generated: {}", result.tokens_generated);
     println!("   Time: {:.2}s", result.generation_time_ms as f64 / 1000.0);
     println!("   Speed: {:.1} tokens/s", result.tokens_per_second);
-    
+
+    Ok(())
+}
+
+/// Handle LoRA training for the new git-style commands
+pub async fn handle_lora_train(
+    _storage: &crate::storage::ModelStorage,
+    model_ref: &str,
+    config: Option<String>,
+    adapter_name: Option<String>,
+) -> Result<()> {
+    println!("Starting LoRA training for model: {}", model_ref);
+
+    if let Some(cfg) = &config {
+        println!("Using configuration: {}", cfg);
+    }
+
+    if let Some(adapter) = &adapter_name {
+        println!("Adapter name: {}", adapter);
+    }
+
+    // TODO: Implement actual LoRA training using the model from storage
+    // For now, this is a placeholder that shows the workflow
+    println!("Note: LoRA training implementation pending");
+    println!("Training would save adapter to: adapters/{}.safetensors",
+             adapter_name.as_deref().unwrap_or("default"));
+
+    // Simulate creating an adapter file
+    // In real implementation, this would train and save the LoRA weights
+
     Ok(())
 }
