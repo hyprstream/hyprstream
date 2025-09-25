@@ -3,7 +3,7 @@
 //! Implements various sampling methods including temperature, top-k, and top-p (nucleus) sampling
 //! with model-specific configurations loaded from HuggingFace model cards.
 
-use tracing::{info, warn, debug};
+use tracing::warn;
 use anyhow::{Result, anyhow};
 use tch::Tensor;
 use rand::prelude::*;

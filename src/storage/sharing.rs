@@ -4,13 +4,12 @@
 //! nodes in a heterogeneous network via Git.
 
 use anyhow::{Result, Context, bail};
-use tracing::{info, warn, error};
+use tracing::info;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use crate::storage::ModelId;
-use crate::api::adapter_storage::AdapterId;
 use crate::git::{GitModelRegistry, GitManager, GitConfig, CloneOptions};
 
 /// Shareable reference to a model or adapter
@@ -298,7 +297,7 @@ impl ModelSharing {
         
         // Add or update remote
         match repo.find_remote(remote_name) {
-            Ok(mut remote) => {
+            Ok(remote) => {
                 repo.remote_set_url(remote_name, remote_url)?;
             }
             Err(_) => {

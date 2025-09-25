@@ -5,7 +5,7 @@ pub use crate::api::TrainingStatus;
 use crate::runtime::inference::{InferenceRequest, InferenceResult};
 
 use std::collections::HashMap;
-use tracing::{info, warn, error};
+use tracing::{info, warn};
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc, Mutex};
 use serde::{Deserialize, Serialize};
@@ -501,4 +501,3 @@ fn compute_avg_loss(samples: &[TrainingSample]) -> f32 {
 }
 
 use chrono;
-use rand;

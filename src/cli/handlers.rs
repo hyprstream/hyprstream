@@ -5,12 +5,11 @@ use ::config::{Config, File};
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
-    str::FromStr,
 };
 use reqwest::Client;
 use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
-use crate::storage::{ModelStorage, ModelId, ModelMetadata};
+use crate::storage::{ModelStorage, ModelMetadata};
 use crate::git;
 
 /// Response structure for LoRA inference
@@ -431,7 +430,7 @@ pub async fn handle_model_command(
             println!("   • Create adapter: hyprstream lora create --base-model {}", cloned.model_id);
             println!("   • Run inference: hyprstream model infer {} --prompt \"...\"", cloned.model_id);
         }
-        ModelAction::Pull { uri, force, .. } => {
+        ModelAction::Pull { uri,  .. } => {
             info!("📥 Pulling model: {}", uri);
             
             // Get storage paths
@@ -476,7 +475,7 @@ pub async fn handle_model_command(
             let storage_paths = crate::storage::paths::StoragePaths::new()?;
             let models_dir = storage_paths.models_dir()?;
             
-            let mut sharing = crate::storage::sharing::ModelSharing::new(models_dir).await?;
+            let sharing = crate::storage::sharing::ModelSharing::new(models_dir).await?;
             
             // Create shareable reference
             let share_ref = sharing.create_share_ref(&model_name, include_metrics).await?;
@@ -823,7 +822,7 @@ pub async fn handle_model_command(
             
             use crate::runtime::{TorchEngine, RuntimeConfig};
             use crate::runtime::sampling::{SamplingConfig, load_sampling_config};
-            use std::path::PathBuf;
+            
             
             debug!("Looking up model: {}", model);
 
@@ -1237,7 +1236,7 @@ async fn run_chat_inference(
     temperature: f32,
 ) -> Result<String, Box<dyn std::error::Error>> {
     use crate::config::RuntimeConfig;
-    use std::path::PathBuf;
+    
     
     // Create runtime config
     let runtime_config = RuntimeConfig::default();

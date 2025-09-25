@@ -89,7 +89,7 @@ pub fn to_vec1<T: tch::kind::Element>(tensor: &Tensor) -> Result<Vec<T>> {
     
     // Get the data as a slice and convert to vec
     let numel = cpu_tensor.numel() as usize;
-    let mut result: Vec<T> = Vec::with_capacity(numel);
+    let result: Vec<T> = Vec::with_capacity(numel);
     
     // Use tensor's data pointer to extract values
     // This is a placeholder - actual implementation would use tensor.data_ptr() or similar

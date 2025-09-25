@@ -8,9 +8,8 @@ pub mod trainer;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::Path;
-use tch::{Device, Tensor};
+use tch::Tensor;
 
 /// Single LoRA configuration - only source of truth
 #[derive(Debug, Clone, Serialize, Deserialize)]

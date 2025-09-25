@@ -4,9 +4,8 @@
 //! transformer architectures (Llama, Gemma, Qwen, etc.) with proper
 //! tensor shape handling and LoRA compatibility.
 
-use anyhow::{Result, anyhow};
-use tch::{Device, Kind as DType, Tensor};
-use std::path::Path;
+use anyhow::Result;
+use tch::Tensor;
 
 pub mod detector;
 pub mod llama;

@@ -12,8 +12,7 @@ use serde::{Serialize, Deserialize};
 use uuid::Uuid;
 
 use crate::runtime::{RuntimeEngine};
-use crate::config::{GenerationRequest, RealtimeAdaptationRequest};
-use crate::adapters::lora_checkpoints::LoRACheckpoint;
+use crate::config::GenerationRequest;
 
 /// Conversation routing for seamless model transitions
 pub struct ConversationRouter {

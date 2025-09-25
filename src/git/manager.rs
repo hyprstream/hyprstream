@@ -6,7 +6,7 @@
 use anyhow::{Result, Context, bail};
 use git2::{
     Repository, Signature, RemoteCallbacks, FetchOptions, ProxyOptions,
-    CertificateCheckStatus, CredentialType, Cred, Progress, ErrorClass, ErrorCode,
+    CertificateCheckStatus, CredentialType, Cred, ErrorClass, ErrorCode,
     build::{RepoBuilder, CheckoutBuilder},
 };
 use lru::LruCache;
@@ -400,7 +400,7 @@ impl GitManager {
 
     /// Clean up stale cache entries
     pub fn cleanup_cache(&self) {
-        let mut cache = self.repo_path_cache.write();
+        let cache = self.repo_path_cache.write();
         let stale_threshold = Duration::from_secs(3600); // 1 hour
 
         // LruCache doesn't have a way to iterate and remove based on condition

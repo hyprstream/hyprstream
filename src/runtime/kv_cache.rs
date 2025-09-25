@@ -4,7 +4,7 @@
 //! states during inference, providing 10-50x speedup for long sequences.
 
 use anyhow::{Result, anyhow};
-use tch::{Device, Tensor, Kind as DType};
+use tch::{Tensor, Kind as DType};
 use std::collections::HashMap;
 
 /// KV cache for a single attention layer

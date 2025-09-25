@@ -1,11 +1,11 @@
 //! Server state management
 
 use std::sync::Arc;
-use tracing::{info, warn, error};
+use tracing::warn;
 use tokio::sync::RwLock;
 use crate::{
     api::{adapter_storage::AdapterStorage, training_service::TrainingService},
-    storage::{ModelStorage, SharedModelRegistry},
+    storage::ModelStorage,
 };
 use super::model_cache::ModelCache;
 

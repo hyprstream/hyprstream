@@ -7,12 +7,10 @@ use anyhow::{Result, anyhow};
 use crate::cli::commands::lora::{LoRAAction, TrainingAction};
 use crate::lora::{
     LoRAConfig, TrainingConfig,
-    trainer::{LoRATrainer, TrainingMetrics},
-    torch_adapter::LoRAModel,
 };
 use crate::runtime::{RuntimeEngine, TorchEngine};
-use std::path::{Path, PathBuf};
-use tracing::{info, warn, error};
+use std::path::PathBuf;
+use tracing::warn;
 
 /// Handle PyTorch LoRA commands
 pub async fn handle_pytorch_lora_command(
@@ -301,7 +299,7 @@ async fn start_training(
     engine.load_model(&model_path).await?;
     
     // Update training config with new parameters
-    let mut training_config = TrainingConfig {
+    let training_config = TrainingConfig {
         learning_rate: learning_rate as f64,
         batch_size,
         gradient_accumulation_steps: gradient_accumulation,

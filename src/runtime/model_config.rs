@@ -3,8 +3,8 @@
 //! This module provides a single source of truth for model configurations,
 //! resolving the current chaos of multiple override points.
 
-use tracing::{info, warn, debug};
-use anyhow::{Result, anyhow};
+use tracing::info;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::collections::HashMap;

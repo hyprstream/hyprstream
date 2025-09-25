@@ -10,7 +10,7 @@ pub mod adapter_storage;
 pub mod openai_compat;
 pub mod training_service;
 
-use adapter_storage::{AdapterStorage, AdapterId, AdapterConfig};
+use adapter_storage::{AdapterStorage, AdapterId};
 use training_service::{TrainingService, TrainingConfig};
 
 /// Main API server state

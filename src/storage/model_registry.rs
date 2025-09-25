@@ -1,10 +1,10 @@
 //! Git-native model registry using submodules
 
 use anyhow::{Result, anyhow, bail};
-use git2::{Repository, Signature, IndexAddOption, FetchOptions, build::RepoBuilder};
+use git2::{Repository, IndexAddOption, FetchOptions, build::RepoBuilder};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{info, warn, debug};
+use tracing::info;
 use tokio::sync::RwLock;
 use crate::git::{GitManager, GitConfig};
 
@@ -113,7 +113,7 @@ impl ModelRegistry {
         if let Some(_xet) = &self.xet_storage {
             // XET will handle LFS pointers automatically
             // Configure callbacks if needed
-            let mut callbacks = git2::RemoteCallbacks::new();
+            let callbacks = git2::RemoteCallbacks::new();
             let mut fetch_options = git2::FetchOptions::new();
             fetch_options.remote_callbacks(callbacks);
             builder.fetch_options(fetch_options);

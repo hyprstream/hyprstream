@@ -1,7 +1,7 @@
 //! Unified configuration system for LLaMA.cpp-based inference
 
 use config::{Config, ConfigError, Environment, File};
-use tracing::{info, warn, error};
+use tracing::info;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use crate::storage::paths::StoragePaths;

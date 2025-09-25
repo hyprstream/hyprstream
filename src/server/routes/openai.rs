@@ -4,10 +4,10 @@ use axum::{
     Router,
     routing::{get, post},
     extract::{State, Json},
-    response::{IntoResponse, Response, Sse},
+    response::{IntoResponse, Sse},
     http::{StatusCode, header},
 };
-use futures::stream::{Stream, StreamExt};
+use futures::stream::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -21,9 +21,8 @@ use crate::{
     api::openai_compat::{
         ChatCompletionRequest, ChatCompletionResponse, ChatChoice, ChatMessage,
         CompletionRequest, CompletionResponse, CompletionChoice,
-        EmbeddingRequest, EmbeddingResponse, EmbeddingData,
+        EmbeddingRequest,
         ListModelsResponse, Model, Usage,
-        OpenAIStreamResponse, StreamChoice, Delta,
     },
     runtime::{RuntimeEngine, GenerationRequest, FinishReason, TorchEngine},
     server::{

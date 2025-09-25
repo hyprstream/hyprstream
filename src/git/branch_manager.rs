@@ -6,9 +6,8 @@
 //! - Branch descriptions store metadata
 
 use anyhow::{Result, Context, bail};
-use git2::{Repository, BranchType, Oid, Signature};
+use git2::{Repository, BranchType, Oid};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;

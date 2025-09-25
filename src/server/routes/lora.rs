@@ -8,13 +8,7 @@ use axum::{
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
-use crate::{
-    api::{
-        // lora_registry::{LoRARegistry, LoRALayer, LoRAId},
-        // LoRAConfig,
-    },
-    server::state::ServerState,
-};
+use crate::server::state::ServerState;
 
 /// Create LoRA management router
 pub fn create_router() -> Router<ServerState> {

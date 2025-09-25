@@ -4,7 +4,7 @@ use super::{ModelArchitecture, ModelOperations, ArchitectureConfig};
 // use super::lora_adapter::ArchitectureAwareLoRAAdapter; // Module removed
 use anyhow::{Result, anyhow};
 use tch::{Device, Kind as DType, Tensor};
-use crate::runtime::tensor_helpers::{ToIntList, clone_tensor, square_tensor, broadcast_mul, broadcast_add, broadcast_sub, scalar_tensor, dims3, dims4};
+use crate::runtime::tensor_helpers::{square_tensor, broadcast_mul, broadcast_add, scalar_tensor, dims3, dims4};
 use crate::runtime::rope::{RoPE, RoPEManager};
 use std::collections::HashMap;
 use std::path::Path;

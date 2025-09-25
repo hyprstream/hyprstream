@@ -4,7 +4,7 @@
 //! clean factory pattern.
 
 use anyhow::{Result, anyhow};
-use tracing::{info, instrument, span, Level};
+use tracing::{info, instrument};
 use std::collections::HashMap;
 use std::path::Path;
 use tch::{Device, Tensor, Kind as DType};

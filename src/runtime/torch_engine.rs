@@ -1,6 +1,6 @@
 //! PyTorch-based inference engine using tch-rs
 
-use tracing::{info, warn, debug, instrument};
+use tracing::{info, instrument};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use std::path::Path;
@@ -12,7 +12,7 @@ use serde_json;
 use json_threat_protection as jtp;
 use crate::config::{GenerationRequest, GenerationResult, ModelInfo, RuntimeConfig, GenerationConfig, FinishReason};
 use crate::runtime::RuntimeEngine;
-use crate::runtime::template_engine::{TemplateEngine, TemplateConfig, ChatMessage};
+use crate::runtime::template_engine::{TemplateEngine, ChatMessage};
 use crate::runtime::gpu_sampling::GpuSampler;
 use crate::storage::{XetNativeStorage, XetConfig};
 
@@ -380,7 +380,7 @@ impl TorchEngine {
 
         if tokenizer_path.exists() {
             info!("Loading tokenizer: {}", tokenizer_path.display());
-            let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
+            let tokenizer = Tokenizer::from_file(&tokenizer_path)
                 .map_err(|e| anyhow!("Failed to load tokenizer: {}", e))?;
             
             // Thread safe assignment
@@ -1004,7 +1004,7 @@ impl TorchEngine {
         top_p: f32,
         top_k: Option<usize>,
         repeat_penalty: f32,
-        mut callback: F
+        callback: F
     ) -> Result<String>
     where 
         F: FnMut(&str)
@@ -1034,7 +1034,7 @@ impl TorchEngine {
     }
     
     /// Generate text with streaming callback (using default parameters)
-    pub async fn generate_streaming<F>(&self, prompt: &str, max_tokens: usize, mut callback: F) -> Result<String> 
+    pub async fn generate_streaming<F>(&self, prompt: &str, max_tokens: usize, callback: F) -> Result<String> 
     where 
         F: FnMut(&str)
     {
@@ -1295,7 +1295,7 @@ impl TorchEngine {
         config: crate::lora::LoRAConfig,
         training_config: crate::lora::TrainingConfig,
     ) -> Result<()> {
-        use crate::lora::torch_adapter::LoRAModel;
+        
 
         // Get module dimensions from loaded model
         let mut module_configs = HashMap::new();
