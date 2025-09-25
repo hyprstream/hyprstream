@@ -2,6 +2,7 @@
 
 use super::{ModelArchitecture, ModelOperations, ArchitectureConfig};
 // use super::lora_adapter::ArchitectureAwareLoRAAdapter; // Module removed
+use tracing::{info, warn, debug};
 use anyhow::{Result, anyhow};
 use tch::{Device, Kind as DType, Tensor};
 use crate::runtime::tensor_helpers::{ToIntList, clone_tensor, square_tensor, broadcast_mul, broadcast_add, broadcast_sub, scalar_tensor, dims3, dims4};
@@ -595,7 +596,7 @@ impl GemmaModel {
         config.rope_theta = 1000000.0;  // Global attention theta
         config.rope_local_base_freq = 10000.0;  // Local attention theta
         
-        tracing::info!("Loading Gemma3 with:");
+        tracing::info!("Loading Gemma model");
         tracing::info!("  - GELU PyTorch tanh activation");
         tracing::info!("  - Sliding window attention (512 tokens)");
         tracing::info!("  - QK-norm with scalar {}", config.query_pre_attn_scalar.unwrap());
@@ -1061,7 +1062,7 @@ impl GemmaModel {
             return Err(anyhow!("No tensors found in VarStore"));
         }
         
-        println!("🔍 Loading Gemma from VarStore with {} tensors", variables.len());
+        info!("Loading {} model tensors", variables.len());
         
         // Convert VarStore variables to HashMap<String, Tensor>
         let mut weights = HashMap::new();
@@ -1072,14 +1073,14 @@ impl GemmaModel {
         // Log some key weights for debugging
         if let Some(embed) = weights.get("model.embed_tokens.weight") {
             let shape = embed.size();
-            println!("📝 Found embeddings: {} -> [{}, {}]", "model.embed_tokens.weight", shape[0], shape[1]);
+            info!("📝 Found embeddings: {} -> [{}, {}]", "model.embed_tokens.weight", shape[0], shape[1]);
         }
         
         // Count layers
         let layer_count = weights.keys()
             .filter(|k| k.contains("layers.") && k.contains(".input_layernorm.weight"))
             .count();
-        println!("📝 Found {} transformer layers", layer_count);
+        info!("📝 Found {} transformer layers", layer_count);
         
         // Use existing from_weights method
         Self::from_weights(&weights, device, dtype)
@@ -1089,14 +1090,14 @@ impl GemmaModel {
     pub fn load_weights_from_varstore(&mut self, vs: &tch::nn::VarStore) -> Result<()> {
         let variables = vs.variables();
         
-        println!("🔍 Validating {} loaded tensors for Gemma architecture", variables.len());
+        info!("🔍 Validating {} loaded tensors for Gemma architecture", variables.len());
         
         // For now, just validate basic structure
         if variables.is_empty() {
             return Err(anyhow!("No tensors found in VarStore"));
         }
         
-        println!("✅ Gemma architecture ready (use from_varstore for proper loading)");
+        info!("✅ Gemma architecture ready (use from_varstore for proper loading)");
         Ok(())
     }
     
@@ -1110,7 +1111,7 @@ impl GemmaModel {
         let logits = Tensor::randn(&[batch_size, seq_len, self.config.vocab_size as i64], 
                                    (DType::Float, input.device()));
         
-        println!("🔍 Gemma simple forward: [{}, {}] → [{}, {}, {}]", 
+        info!("🔍 Gemma simple forward: [{}, {}] → [{}, {}, {}]", 
                 batch_size, seq_len, batch_size, seq_len, self.config.vocab_size);
         
         Ok(logits)

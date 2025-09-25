@@ -113,7 +113,7 @@ pub fn cors_layer(config: &crate::server::state::CorsConfig) -> tower_http::cors
     if config.permissive_headers {
         // Permissive mode - allow any header (development/debugging only)
         cors = cors.allow_headers(Any);
-        eprintln!("⚠️  CORS: Allowing ALL headers (permissive mode)");
+        warn!("⚠️  CORS: Allowing ALL headers (permissive mode)");
     } else {
         // Explicit mode - only allow specific headers for security
         cors = cors.allow_headers([

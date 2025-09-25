@@ -1,6 +1,7 @@
 //! Server state management
 
 use std::sync::Arc;
+use tracing::{info, warn, error};
 use tokio::sync::RwLock;
 use crate::{
     api::{adapter_storage::AdapterStorage, training_service::TrainingService},
@@ -208,7 +209,7 @@ impl ServerConfig {
         if let Ok(permissive) = std::env::var("HYPRSTREAM_CORS_PERMISSIVE_HEADERS") {
             config.cors.permissive_headers = permissive.to_lowercase() == "true";
             if config.cors.permissive_headers {
-                eprintln!("⚠️  WARNING: CORS permissive headers mode enabled - not recommended for production");
+                warn!("⚠️  WARNING: CORS permissive headers mode enabled - not recommended for production");
             }
         }
         
@@ -290,11 +291,11 @@ impl ServerState {
         
         // Preload models for faster first request
         if !config.preload_models.is_empty() {
-            tracing::info!("Preloading {} models into cache...", config.preload_models.len());
+            tracing::info!("Preloading {} models", config.preload_models.len());
             for model_name in &config.preload_models {
                 tracing::info!("Preloading model: {}", model_name);
                 match model_cache.get_or_load(model_name).await {
-                    Ok(_) => tracing::info!("Successfully preloaded model: {}", model_name),
+                    Ok(_) => tracing::info!("Preloaded: {}", model_name),
                     Err(e) => tracing::warn!("Failed to preload model '{}': {}", model_name, e),
                 }
             }
@@ -308,7 +309,7 @@ impl ServerState {
                 refresher_config.interval_secs,
             );
             let _handle = refresher.start();
-            tracing::info!("Started background cache refresher");
+            tracing::info!("Cache refresher started");
         }
         
         // Initialize metrics

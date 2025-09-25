@@ -46,7 +46,7 @@ json-threat-protection = "0.1.1"
 nix = "0.27"
 users = "0.11"
 rlimit = "0.10"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono", "json", "registry"] }
 
 # ADBC dependencies removed - focused on ML inference only
 
@@ -57,6 +57,12 @@ serde_yaml = "0.9"
 git2 = "0.19"
 clap = { version = "4.4", features = ["derive", "env"] }
 tracing = "0.1"
+tracing-opentelemetry = "0.31"
+opentelemetry = "0.30"
+opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.30", features = ["grpc-tonic", "trace"] }
+opentelemetry-semantic-conventions = "0.30"
+opentelemetry-stdout = { version = "0.30", features = ["trace"] }
 parking_lot = "0.12"
 num_cpus = "1.16"
 once_cell = "1.19"  # For global GitService singleton

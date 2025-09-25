@@ -6,6 +6,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tracing::instrument;
 
 use super::TorchEngine;
 use crate::adapters::LoRAWeightsData;
@@ -73,6 +74,11 @@ pub trait InferenceExt {
 }
 
 impl InferenceExt for TorchEngine {
+    #[instrument(name = "inference.run", skip(self, request), fields(
+        max_tokens = request.max_tokens,
+        temperature = request.temperature,
+        has_lora = request.lora_weights.is_some()
+    ))]
     async fn run_inference(&mut self, request: InferenceRequest) -> Result<InferenceResult> {
         let start_time = std::time::Instant::now();
         

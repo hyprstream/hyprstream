@@ -181,7 +181,7 @@ impl GitModelSource {
                 Ok(processed_files) => {
                     xet_processed = processed_files.len();
                     if xet_processed > 0 && show_progress {
-                        info!("Successfully processed {} LFS pointers via XET", xet_processed);
+                        info!("Processed {} LFS files via XET", xet_processed);
                     }
                 }
                 Err(e) => {
@@ -198,7 +198,7 @@ impl GitModelSource {
         match self.process_git_lfs_files(&model_path).await {
             Ok(lfs_count) => {
                 if lfs_count > 0 && show_progress {
-                    info!("Successfully processed {} LFS pointers via Git LFS", lfs_count);
+                    info!("Processed {} LFS files", lfs_count);
                 }
 
                 let total_processed = xet_processed + lfs_count;
@@ -209,7 +209,7 @@ impl GitModelSource {
             }
             Err(e) => {
                 // Don't fail the clone, but warn about incomplete files
-                warn!("Failed to process Git LFS pointers: {}. Some model files may be incomplete.", e);
+                warn!("LFS processing failed: {} - model files may be incomplete", e);
 
                 // Check if we have unprocessed pointers
                 if xet_processed == 0 {

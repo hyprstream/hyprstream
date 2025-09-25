@@ -3,6 +3,7 @@
 //! This module provides a single source of truth for model configurations,
 //! resolving the current chaos of multiple override points.
 
+use tracing::{info, warn, debug};
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -73,10 +74,10 @@ impl ModelConfig {
         // Step 1: Try to load config.json
         let config_path = model_path.join("config.json");
         let mut config = if config_path.exists() {
-            println!("📋 Loading model configuration from config.json");
+            info!("Loading model configuration");
             Self::from_json_file(&config_path)?
         } else {
-            println!("⚠️ No config.json found, detecting from weights");
+            info!("⚠️ No config.json found, detecting from weights");
             Self::detect_from_weights(weights)?
         };
         
@@ -84,15 +85,15 @@ impl ModelConfig {
         config.validate_with_weights(weights)?;
         
         // Step 3: Log final configuration
-        println!("✅ Final model configuration:");
-        println!("   Architecture: {:?}", config.architecture);
-        println!("   Hidden size: {}", config.hidden_size);
-        println!("   Layers: {}", config.num_hidden_layers);
-        println!("   Attention heads: {}", config.num_attention_heads);
-        println!("   KV heads: {}", config.num_key_value_heads);
-        println!("   Vocab size: {}", config.vocab_size);
-        println!("   RoPE theta: {}", config.rope_theta);
-        println!("   Max position: {}", config.max_position_embeddings);
+        info!("✅ Final model configuration:");
+        info!("   Architecture: {:?}", config.architecture);
+        info!("   Hidden size: {}", config.hidden_size);
+        info!("   Layers: {}", config.num_hidden_layers);
+        info!("   Attention heads: {}", config.num_attention_heads);
+        info!("   KV heads: {}", config.num_key_value_heads);
+        info!("   Vocab size: {}", config.vocab_size);
+        info!("   RoPE theta: {}", config.rope_theta);
+        info!("   Max position: {}", config.max_position_embeddings);
         
         Ok(config)
     }
@@ -327,13 +328,13 @@ impl ModelConfig {
             let actual_hidden = embed.size()[1] as usize;
             
             if self.vocab_size != actual_vocab {
-                println!("⚠️ Config vocab_size {} doesn't match weights {}, using weights", 
+                info!("⚠️ Config vocab_size {} doesn't match weights {}, using weights", 
                          self.vocab_size, actual_vocab);
                 self.vocab_size = actual_vocab;
             }
             
             if self.hidden_size != actual_hidden {
-                println!("⚠️ Config hidden_size {} doesn't match weights {}, using weights",
+                info!("⚠️ Config hidden_size {} doesn't match weights {}, using weights",
                          self.hidden_size, actual_hidden);
                 self.hidden_size = actual_hidden;
             }

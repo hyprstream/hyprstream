@@ -8,7 +8,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{info, warn, debug};
+use tracing::{info, warn, debug, instrument, span, Level};
 use crate::git::{GitManager, GitConfig};
 
 use crate::runtime::{TorchEngine, RuntimeConfig, RuntimeEngine};
@@ -100,6 +100,10 @@ impl ModelCache {
     }
 
     /// Get or load a model by reference
+    #[instrument(name = "model_cache.get_or_load", skip(self), fields(
+        model_ref = %model_ref_str,
+        cache_hit = tracing::field::Empty
+    ))]
     pub async fn get_or_load(&self, model_ref_str: &str) -> Result<Arc<Mutex<TorchEngine>>> {
         // Parse model reference
         let model_ref = ModelRef::parse(model_ref_str)?;
@@ -111,23 +115,27 @@ impl ModelCache {
         {
             let mut cache = self.cache.lock().await;
             if let Some(cached) = cache.get_mut(&commit_id) {
-                info!("Cache hit: {} @ {}", model_ref_str, format_oid(&commit_id));
+                info!("Using cached model: {} @ {}", model_ref_str, format_oid(&commit_id));
+                tracing::Span::current().record("cache_hit", true);
                 cached.last_accessed = std::time::Instant::now();
                 return Ok(Arc::clone(&cached.engine));
             }
         }
 
         // Load model at specific commit
-        info!("Cache miss: {} @ {}, loading...", model_ref_str, format_oid(&commit_id));
+        info!("Loading model: {} @ {}", model_ref_str, format_oid(&commit_id));
+        tracing::Span::current().record("cache_hit", false);
         let checkout_path = self.get_or_create_checkout(&model_ref, commit_id).await?;
 
         // Create engine and load model
         let config = RuntimeConfig::default();
         let mut engine = TorchEngine::new(config)?;
 
-        info!("Loading model from: {:?}", checkout_path);
+        info!("Model path: {:?}", checkout_path);
+        let load_start = std::time::Instant::now();
         engine.load_model(&checkout_path).await?;
-        info!("Successfully loaded model {}", model_ref_str);
+        let load_time = load_start.elapsed();
+        info!("Model ready: {} (loaded in {:.2}s)", model_ref_str, load_time.as_secs_f64());
 
         let engine = Arc::new(Mutex::new(engine));
 
@@ -143,7 +151,7 @@ impl ModelCache {
         {
             let mut cache = self.cache.lock().await;
             if let Some((evicted_id, evicted)) = cache.push(commit_id, cached_model) {
-                warn!("Evicted {} @ {} from cache",
+                warn!("Cache full - removing {} @ {}",
                       evicted.model_ref, format_oid(&evicted_id));
             }
         }

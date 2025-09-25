@@ -197,7 +197,7 @@ impl ConversationRouter {
         let mut conversations = self.active_conversations.write().await;
         conversations.insert(session_id.clone(), session);
         
-        tracing::info!("🌊 Started conversation session: {}", session_id);
+        tracing::info!("Started conversation: {}", session_id);
         Ok(session_id)
     }
 
