@@ -66,13 +66,13 @@ impl LoRATrainer {
         dataset: TrainingDataset,
         engine: &mut crate::runtime::TorchEngine,
     ) -> Result<()> {
-        println!("🚀 Starting LoRA training for adapter: {}", adapter_name);
-        println!("📊 Dataset: {} samples", dataset.len());
-        println!("⚙️  Configuration: {:?}", self.config);
+        tracing::info!("Starting LoRA training for adapter: {}", adapter_name);
+        tracing::info!("Dataset: {} samples", dataset.len());
+        tracing::info!("Configuration: {:?}", self.config);
 
         // Split dataset
         let (train_dataset, val_dataset) = dataset.train_test_split(0.9);
-        println!("📚 Train: {} samples, Validation: {} samples",
+        tracing::info!("Train: {} samples, Validation: {} samples",
                  train_dataset.len(), val_dataset.len());
 
         // Store dataset length before moving
@@ -90,7 +90,7 @@ impl LoRATrainer {
                  .unwrap_or(false));
 
         if !adapter_exists {
-            println!("🔧 Initializing new adapter weights...");
+            tracing::info!("Initializing new adapter weights...");
             let adapter_config = AdapterConfig {
                 model_ref: "current".to_string(),
                 ..Default::default()
@@ -113,10 +113,10 @@ impl LoRATrainer {
         let mut step = 0;
         let total_steps = (train_dataset_len / self.config.batch_size) * self.config.num_epochs;
 
-        println!("🎯 Starting training: {} total steps", total_steps);
+        tracing::info!("Starting training: {} total steps", total_steps);
 
         for epoch in 0..self.config.num_epochs {
-            println!("📖 Epoch {}/{}", epoch + 1, self.config.num_epochs);
+            tracing::info!("Epoch {}/{}", epoch + 1, self.config.num_epochs);
 
             let batches = data_loader.formatted_batches(self.config.batch_size);
 
@@ -135,26 +135,26 @@ impl LoRATrainer {
                 step += 1;
 
                 if step % 10 == 0 {
-                    println!("  Step {}/{} - Loss: {:.4}", step, total_steps, batch_loss);
+                    tracing::debug!("Step {}/{} - Loss: {:.4}", step, total_steps, batch_loss);
                 }
 
                 if step % self.config.save_every == 0 {
-                    println!("💾 Saving checkpoint at step {}", step);
+                    tracing::info!("Saving checkpoint at step {}", step);
                     engine.save_lora_weights(adapter_path.to_str().unwrap())?;
                 }
 
                 if step % self.config.eval_every == 0 && !val_dataset.is_empty() {
                     let val_loss = self.evaluate(engine, &val_dataset).await?;
-                    println!("🔍 Validation loss: {:.4}", val_loss);
+                    tracing::info!("Validation loss: {:.4}", val_loss);
                 }
             }
         }
 
         // Final save
-        println!("💾 Saving final adapter weights...");
+        tracing::info!("Saving final adapter weights...");
         engine.save_lora_weights(adapter_path.to_str().unwrap())?;
 
-        println!("✅ Training complete! Adapter saved to: {:?}", adapter_path);
+        tracing::info!("Training complete! Adapter saved to: {:?}", adapter_path);
 
         Ok(())
     }
@@ -241,10 +241,10 @@ impl LoRATrainer {
         adapter_name: &str,
         engine: &mut crate::runtime::TorchEngine,
     ) -> Result<()> {
-        println!("🤖 Interactive training mode for adapter: {}", adapter_name);
-        println!("💡 This would collect training samples from user interactions");
-        println!("📝 Each conversation turn becomes a training sample");
-        println!("🔄 Training happens in the background as samples accumulate");
+        tracing::info!("Interactive training mode for adapter: {}", adapter_name);
+        tracing::info!("This would collect training samples from user interactions");
+        tracing::info!("Each conversation turn becomes a training sample");
+        tracing::info!("Training happens in the background as samples accumulate");
 
         // This would integrate with the real-time feedback system
         // For now, just acknowledge the mode

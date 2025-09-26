@@ -7,6 +7,33 @@ use std::path::Path;
 use async_trait::async_trait;
 use super::{LoRAConfig, LoRAAdapter};
 
+/// Extract LoRA components from hierarchical tensor names
+/// e.g., "model.layers.0.q_proj.lora_a.weight" -> Some(("q_proj", "lora_a"))
+pub fn extract_lora_components(tensor_name: &str) -> Option<(String, String)> {
+    // Handle various patterns:
+    // "model.layers.X.module_name.lora_matrix.weight"
+    // "module_name.lora_matrix"
+    // "layers.X.module_name.lora_matrix.weight"
+
+    let parts: Vec<&str> = tensor_name.split('.').collect();
+
+    // Look for lora_a or lora_b in the parts
+    for (i, &part) in parts.iter().enumerate() {
+        if part.starts_with("lora_") && (part == "lora_a" || part == "lora_b") {
+            // The module name should be the part before lora_a/lora_b
+            if i > 0 {
+                let module = parts[i - 1];
+                // Filter to only the modules we care about
+                if matches!(module, "q_proj" | "k_proj" | "v_proj" | "o_proj" | "gate_proj" | "up_proj" | "down_proj") {
+                    return Some((module.to_string(), part.to_string()));
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// A single LoRA layer with automatic differentiation support
 pub struct TorchLoRALayer {
     /// LoRA A matrix [in_features, rank] - trainable
@@ -37,33 +64,34 @@ pub struct LoRALayerConfig {
     pub alpha: f64,
     pub dropout: f64,
     pub device: Device,
+    pub module_name: String,
 }
 
 impl TorchLoRALayer {
     /// Create a new LoRA layer with proper initialization
     pub fn new(vs: &nn::VarStore, config: LoRALayerConfig) -> Result<Self> {
         let root = vs.root();
-        
+
         // Initialize LoRA A with Kaiming uniform (good for ReLU-like activations)
         // Scale by sqrt(5) as per Kaiming initialization
         let fan_in = config.in_features;
         let gain = (5.0_f64).sqrt();
         let std = gain / (fan_in as f64).sqrt();
         let bound = (3.0_f64).sqrt() * std;
-        
+
         let lora_a = root.var(
-            "lora_a",
+            &format!("{}_lora_a", config.module_name),
             &[config.in_features, config.rank],
             nn::Init::Uniform {
                 lo: -bound,
                 up: bound,
             },
         );
-        
+
         // Initialize LoRA B with zeros (standard LoRA practice)
         // This ensures the adapter starts as identity
         let lora_b = root.var(
-            "lora_b",
+            &format!("{}_lora_b", config.module_name),
             &[config.rank, config.out_features],
             nn::Init::Const(0.0),
         );
@@ -161,6 +189,7 @@ impl LoRAModel {
                 alpha: config.alpha as f64,
                 dropout: config.dropout as f64,
                 device,
+                module_name: module_name.clone(),
             };
             
             let layer = TorchLoRALayer::new(&vs, layer_config)?;
@@ -197,10 +226,164 @@ impl LoRAModel {
         Ok(())
     }
     
-    /// Load all LoRA weights
+    /// Load all LoRA weights with dynamic tensor discovery
     pub fn load(&mut self, path: &str) -> Result<()> {
-        self.vs.load(path)?;
+        // First try the standard VarStore load approach
+        match self.vs.load(path) {
+            Ok(()) => {
+                tracing::debug!("Successfully loaded LoRA weights using VarStore::load");
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::debug!("VarStore::load failed: {}, trying dynamic tensor discovery", e);
+            }
+        }
+
+        // Fallback: Dynamic tensor discovery and loading
+        self.load_with_dynamic_discovery(path)
+    }
+
+    /// Load LoRA weights with dynamic tensor name discovery
+    fn load_with_dynamic_discovery(&mut self, path: &str) -> Result<()> {
+        tracing::info!("Attempting dynamic tensor discovery from SafeTensors file: {}", path);
+
+        // Load the SafeTensors file to discover available tensors
+        let safetensors_data = std::fs::read(path)?;
+        let safetensors = safetensors::SafeTensors::deserialize(&safetensors_data)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize SafeTensors: {}", e))?;
+
+        // Get all tensor names in the file
+        let available_tensors: Vec<String> = safetensors.names().into_iter().map(|s| s.to_string()).collect();
+        tracing::debug!("Available tensors in SafeTensors file: {:?}", available_tensors);
+
+        // Use the lower-level approach to load tensors
+        // Instead of directly loading into VarStore, we'll use the load mechanism with partial loading
+        let mut tensors_to_load = std::collections::HashMap::new();
+
+        // First, collect matching tensor names and their SafeTensors data
+        for available_name in &available_tensors {
+            // Try to find a VarStore tensor that matches this SafeTensors tensor
+            let vs_tensors = self.vs.variables();
+
+            let matching_vs_name = vs_tensors.keys()
+                .find(|vs_name| {
+                    // Exact match
+                    available_name == *vs_name ||
+                    // Match without module prefix (e.g., "lora_a" matches "q_proj_lora_a")
+                    available_name.ends_with(&format!("_{}", vs_name)) ||
+                    // Match with different naming conventions
+                    self.tensor_names_match(vs_name, available_name)
+                });
+
+            if let Some(vs_name) = matching_vs_name {
+                tracing::debug!("Found tensor match: '{}' -> '{}'", available_name, vs_name);
+                match safetensors.tensor(available_name) {
+                    Ok(tensor_data) => {
+                        // Convert SafeTensors tensor to raw data for tch loading
+                        let shape: Vec<i64> = tensor_data.shape().iter().map(|&s| s as i64).collect();
+                        let tch_tensor = match tensor_data.dtype() {
+                            safetensors::Dtype::F32 => {
+                                let f32_data: Vec<f32> = tensor_data.data().chunks_exact(4)
+                                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                                    .collect();
+                                Tensor::from_slice(&f32_data).reshape(&shape).to_device(self.device)
+                            }
+                            safetensors::Dtype::F16 => {
+                                // Convert f16 to f32
+                                let f16_data: &[u8] = tensor_data.data();
+                                let f32_data: Vec<f32> = f16_data.chunks_exact(2)
+                                    .map(|chunk| {
+                                        let f16_bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                                        half::f16::from_bits(f16_bits).to_f32()
+                                    })
+                                    .collect();
+                                Tensor::from_slice(&f32_data).reshape(&shape).to_device(self.device)
+                            }
+                            _ => {
+                                tracing::warn!("Unsupported tensor dtype for {}: {:?}", available_name, tensor_data.dtype());
+                                continue;
+                            }
+                        };
+
+                        tensors_to_load.insert(vs_name.clone(), tch_tensor);
+                        tracing::debug!("Prepared tensor '{}' -> '{}' with shape {:?}",
+                                      available_name, vs_name, shape);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to extract tensor '{}': {}", available_name, e);
+                    }
+                }
+            } else {
+                tracing::debug!("No VarStore match found for SafeTensors tensor '{}' (expected patterns: {:?})",
+                              available_name, vs_tensors.keys().collect::<Vec<_>>());
+            }
+        }
+
+        // Write matched tensors to a temporary SafeTensors file and load via VarStore
+        if tensors_to_load.is_empty() {
+            return Err(anyhow::anyhow!("No matching tensors found between SafeTensors file and LoRA model"));
+        }
+
+        let temp_file = format!("{}.temp", path);
+        let mut tensor_vec = Vec::new();
+
+        for (vs_name, tensor) in tensors_to_load {
+            // Convert tensor back to CPU for saving
+            let cpu_tensor = tensor.to(tch::Device::Cpu);
+            tensor_vec.push((vs_name.clone(), cpu_tensor));
+        }
+
+        // Save to temporary file
+        tch::Tensor::save_multi(&tensor_vec, &temp_file)?;
+        let loaded_count = tensor_vec.len();
+
+        // Load via VarStore
+        match self.vs.load(&temp_file) {
+            Ok(()) => {
+                tracing::debug!("Successfully loaded {} tensors via temporary file", loaded_count);
+                // Clean up temporary file
+                let _ = std::fs::remove_file(&temp_file);
+            }
+            Err(e) => {
+                // Clean up temporary file on error
+                let _ = std::fs::remove_file(&temp_file);
+                return Err(anyhow::anyhow!("Failed to load tensors via VarStore: {}", e));
+            }
+        }
+
+        if loaded_count == 0 {
+            return Err(anyhow::anyhow!("No tensors were successfully loaded from SafeTensors file"));
+        }
+
+        tracing::info!("Successfully loaded {} tensors using dynamic discovery", loaded_count);
         Ok(())
+    }
+
+    /// Check if two tensor names should be considered a match
+    fn tensor_names_match(&self, vs_name: &str, safetensors_name: &str) -> bool {
+        // Handle common naming variations
+        let vs_normalized = vs_name.replace("__", "_");
+        let st_normalized = safetensors_name.replace("__", "_");
+
+        // Check for various common patterns
+        if vs_normalized == st_normalized {
+            return true;
+        }
+
+        // Handle hierarchical naming like "model.layers.0.q_proj.lora_a.weight" -> "q_proj_lora_a"
+        if let Some(captures) = extract_lora_components(safetensors_name) {
+            let (module, matrix) = captures;
+            let expected_vs_name = format!("{}_{}", module, matrix);
+            if vs_name == expected_vs_name {
+                return true;
+            }
+        }
+
+        // Fallback patterns
+        safetensors_name.contains(&vs_normalized) ||
+        vs_name.contains(safetensors_name) ||
+        // Handle patterns like "lora_a" matching "lora_a__2"
+        (safetensors_name.starts_with(&format!("{}_", vs_name)) || safetensors_name.starts_with(&format!("{}__", vs_name)))
     }
     
     /// Get total number of trainable parameters

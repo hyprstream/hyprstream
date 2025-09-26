@@ -34,8 +34,10 @@ pub enum Commands {
 
     /// Switch branches or checkout specific commit/tag
     Checkout {
-        /// Model reference (e.g., "llama3:main")
-        model_ref: String,
+        /// Model name or model reference (e.g., "llama3" or "llama3:main")
+        model: String,
+        /// Git reference (branch/tag/commit) to checkout (optional)
+        git_ref: Option<String>,
         /// Create new branch if it doesn't exist
         #[arg(short = 'b')]
         create_branch: bool,
@@ -46,7 +48,7 @@ pub enum Commands {
 
     /// Show working tree status
     Status {
-        /// Model name
+        /// Model reference (e.g., "llama3", "llama3:main", "llama3:v2.0")
         model: Option<String>,
         /// Verbose output
         #[arg(short, long)]
@@ -197,6 +199,9 @@ pub enum Commands {
         /// Show detailed output
         #[arg(short, long)]
         verbose: bool,
+        /// Show only adapter information
+        #[arg(long)]
+        adapters_only: bool,
     },
 
     /// Clone a model repository

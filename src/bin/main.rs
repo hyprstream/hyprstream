@@ -303,14 +303,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?;
         }
 
-        Commands::Checkout { model_ref, create_branch, force } => {
+        Commands::Checkout { model, git_ref, create_branch, force } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
                 let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
                 let storage = hyprstream_core::storage::ModelStorage::create(
                     storage_paths.models_dir()?
                 ).await?;
-                handle_checkout(&storage, &model_ref, create_branch, force).await
+
+                // Build ModelRef from separate components
+                use hyprstream_core::storage::{ModelRef, GitRef};
+                let git_ref_parsed = match git_ref {
+                    Some(ref r) => GitRef::parse(r, None)?,
+                    None => GitRef::DefaultBranch,
+                };
+                let model_ref = ModelRef::with_ref(model, git_ref_parsed);
+
+                handle_checkout(&storage, &model_ref.to_string(), create_branch, force).await
             })?;
         }
 
@@ -403,14 +412,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?;
         }
 
-        Commands::Inspect { model, verbose } => {
+        Commands::Inspect { model, verbose, adapters_only } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
                 let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
                 let storage = hyprstream_core::storage::ModelStorage::create(
                     storage_paths.models_dir()?
                 ).await?;
-                handle_info(&storage, &model, verbose).await
+                handle_info(&storage, &model, verbose, adapters_only).await
             })?;
         }
 

@@ -58,7 +58,7 @@ impl Default for AdapterConfig {
 /// Manages LoRA adapters within a model's git repository
 pub struct AdapterManager {
     model_path: PathBuf,
-    adapters_dir: PathBuf,
+    pub adapters_dir: PathBuf,
 }
 
 impl AdapterManager {
@@ -160,131 +160,16 @@ impl AdapterManager {
         Ok(format!("{:02}_{}", idx, name))
     }
 
-    /// Initialize a new adapter with config
+    /// Initialize adapter (stub for training service compatibility)
     pub fn initialize_adapter(
         &self,
-        name: &str,
-        index: Option<u32>,
-        config: AdapterConfig,
-    ) -> Result<PathBuf> {
-        self.ensure_adapters_dir()?;
-
-        let indexed_name = self.create_indexed_name(name, index)?;
-        let adapter_path = self.adapters_dir.join(format!("{}.safetensors", indexed_name));
-        let config_path = self.adapters_dir.join(format!("{}.config.json", indexed_name));
-
-        // Save config
-        let config_json = serde_json::to_string_pretty(&config)?;
-        std::fs::write(&config_path, config_json)?;
-
-        // Initialize actual LoRA weights using PyTorch
-        self.initialize_lora_weights(&adapter_path, &config)?;
-
-        Ok(adapter_path)
-    }
-
-    /// Initialize LoRA weight tensors and save as safetensors
-    fn initialize_lora_weights(&self, path: &Path, config: &AdapterConfig) -> Result<()> {
-        use tch::{nn, Device, Tensor};
-        use safetensors::serialize;
-        use std::collections::HashMap;
-
-        // Use CPU for initialization (will be moved to GPU when loaded)
-        let device = Device::Cpu;
-        let vs = nn::VarStore::new(device);
-
-        // Common layer patterns for transformer models
-        // These would be discovered from the actual model, but for now use common patterns
-        let layer_patterns = vec![
-            // Attention layers
-            ("q_proj", 4096, 4096),  // Query projection
-            ("k_proj", 4096, 4096),  // Key projection
-            ("v_proj", 4096, 4096),  // Value projection
-            ("o_proj", 4096, 4096),  // Output projection
-            // MLP layers
-            ("gate_proj", 4096, 11008),  // Gate projection
-            ("up_proj", 4096, 11008),    // Up projection
-            ("down_proj", 11008, 4096),  // Down projection
-        ];
-
-        let mut tensors = HashMap::new();
-        let rank = config.rank as i64;
-        let alpha = config.alpha;
-        let scaling = alpha / rank as f32;
-
-        // Initialize LoRA weights for each layer pattern
-        // Using naming convention: model.layers.{layer_idx}.{module}.lora_{a|b}.weight
-        for layer_idx in 0..32 {  // Typical number of layers, adjust based on model
-            for (module_name, in_features, out_features) in &layer_patterns {
-                // Initialize LoRA A with Kaiming uniform
-                let fan_in = *in_features as f64;
-                let gain = (5.0_f64).sqrt();
-                let bound = gain * (3.0 / fan_in).sqrt();
-
-                let lora_a = Tensor::zeros(&[*in_features, rank], (tch::Kind::Float, device)).uniform_(-bound, bound);
-                let lora_a_name = format!("model.layers.{}.{}.lora_a.weight", layer_idx, module_name);
-                tensors.insert(lora_a_name, lora_a);
-
-                // Initialize LoRA B with zeros
-                let lora_b = Tensor::zeros(&[rank, *out_features], (tch::Kind::Float, device));
-                let lora_b_name = format!("model.layers.{}.{}.lora_b.weight", layer_idx, module_name);
-                tensors.insert(lora_b_name, lora_b);
-            }
-        }
-
-        // Add metadata tensor
-        let metadata = Tensor::from_slice(&[scaling as f32, rank as f32, alpha as f32]);
-        tensors.insert("lora_config".to_string(), metadata);
-
-        // Create a simple View implementation for tensors
-        struct TensorView {
-            data: Vec<u8>,
-            shape: Vec<usize>,
-            dtype: safetensors::Dtype,
-        }
-
-        impl safetensors::View for TensorView {
-            fn dtype(&self) -> safetensors::Dtype {
-                self.dtype
-            }
-
-            fn shape(&self) -> &[usize] {
-                &self.shape
-            }
-
-            fn data(&self) -> std::borrow::Cow<'_, [u8]> {
-                (&self.data).into()
-            }
-
-            fn data_len(&self) -> usize {
-                self.data.len()
-            }
-        }
-
-        // Convert to safetensors format
-        let mut tensor_views = HashMap::new();
-        for (name, tensor) in tensors {
-            // Convert tensor to bytes
-            let shape: Vec<usize> = tensor.size().iter().map(|&s| s as usize).collect();
-            // Flatten the tensor and make it contiguous before converting to Vec<f32>
-            let flattened = tensor.flatten(0, -1).contiguous();
-            let data: Vec<f32> = flattened.try_into()?;
-            let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-
-            let view = TensorView {
-                data: bytes,
-                shape,
-                dtype: safetensors::Dtype::F32,
-            };
-
-            tensor_views.insert(name, view);
-        }
-
-        // Serialize and save
-        let serialized = serialize(tensor_views, &None)?;
-        std::fs::write(path, serialized)?;
-
-        Ok(())
+        _name: &str,
+        _index: Option<u32>,
+        _config: AdapterConfig,
+    ) -> Result<std::path::PathBuf> {
+        // This is now handled by the engine in the CLI handlers
+        // The training service should be updated to use the engine approach
+        todo!("Training service needs to be updated to use engine-based adapter creation")
     }
 
     /// Load all adapter paths sorted by index

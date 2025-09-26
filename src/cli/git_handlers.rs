@@ -3,7 +3,7 @@
 use anyhow::Result;
 use tracing::info;
 
-use crate::storage::{ModelStorage, ModelRef};
+use crate::storage::{ModelStorage, ModelRef, AdapterConfig, CheckoutOptions};
 
 /// Handle branch command
 pub async fn handle_branch(
@@ -14,13 +14,19 @@ pub async fn handle_branch(
 ) -> Result<()> {
     info!("Creating branch {} for model {}", branch_name, model);
 
+    let model_ref = ModelRef::new(model.to_string());
     let registry = storage.registry();
-    registry.create_branch(model, branch_name, from_ref.as_deref()).await?;
+    let branch = registry.create_branch(&model_ref, branch_name, from_ref.as_deref()).await?;
 
     println!("✓ Created branch {} for model {}", branch_name, model);
 
-    if from_ref.is_some() {
-        println!("  Branch created from: {}", from_ref.unwrap());
+    if let Some(from) = from_ref {
+        println!("  Branch created from: {}", from);
+    }
+
+    // Show branch info using git2 types
+    if let Some(branch_name) = branch.name()? {
+        println!("  Branch reference: {}", branch_name);
     }
 
     Ok(())
@@ -37,14 +43,14 @@ pub async fn handle_checkout(
     let model_ref = ModelRef::parse(model_ref_str)?;
 
     info!("Checking out {} for model {}",
-          model_ref.git_ref.as_deref().unwrap_or("HEAD"),
+          model_ref.git_ref.to_string().as_deref().unwrap_or("HEAD"),
           model_ref.model);
 
     let registry = storage.registry();
 
     // Check for uncommitted changes if not forcing
     if !force {
-        let status = registry.status(&model_ref.model).await?;
+        let status = registry.status(&model_ref).await?;
         if status.is_dirty {
             println!("Warning: Model has uncommitted changes");
             println!("Use --force to discard changes, or commit them first");
@@ -52,10 +58,25 @@ pub async fn handle_checkout(
         }
     }
 
-    registry.checkout(&model_ref.model, model_ref.git_ref.as_deref(), create_branch).await?;
+    // Use the new registry API with CheckoutOptions
+    let options = CheckoutOptions {
+        create_branch,
+        force,
+    };
 
-    println!("✓ Switched to {}",
-             model_ref.git_ref.as_deref().unwrap_or("HEAD"));
+    let result = registry.checkout(&model_ref, options).await?;
+
+    // Display checkout results using reference names
+    let ref_display = result.new_ref_name.as_deref().unwrap_or("detached HEAD");
+    println!("✓ Switched to {} ({})", ref_display, result.new_oid);
+
+    if result.was_forced {
+        println!("  ⚠️ Forced checkout - local changes discarded");
+    }
+
+    if result.files_changed > 0 {
+        println!("  Files in working tree: {}", result.files_changed);
+    }
 
     Ok(())
 }
@@ -68,9 +89,10 @@ pub async fn handle_status(
 ) -> Result<()> {
     let registry = storage.registry();
 
-    if let Some(model_name) = model {
-        // Status for specific model
-        let status = registry.status(&model_name).await?;
+    if let Some(model_ref_str) = model {
+        // Status for specific model with full ModelRef support
+        let model_ref = ModelRef::parse(&model_ref_str)?;
+        let status = registry.status(&model_ref).await?;
         print_model_status(&status, verbose);
     } else {
         // Status for all models
@@ -82,7 +104,7 @@ pub async fn handle_status(
         }
 
         for (model_ref, _metadata) in models {
-            if let Ok(status) = registry.status(&model_ref.model).await {
+            if let Ok(status) = registry.status(&model_ref).await {
                 print_model_status(&status, verbose);
                 println!(); // Add spacing between models
             }
@@ -101,65 +123,103 @@ pub async fn handle_commit(
 ) -> Result<()> {
     info!("Committing changes to model {}", model);
 
+    let model_ref = ModelRef::parse(model)?;
     let registry = storage.registry();
 
     // Check status first
-    let status = registry.status(model).await?;
+    let status = registry.status(&model_ref).await?;
 
     if !status.is_dirty {
         println!("No changes to commit for model {}", model);
         return Ok(());
     }
 
-    // Show what will be committed
+    // Show what will be committed using git2 types
     if stage_all {
         println!("Staging all changes:");
-        for file in &status.new_files {
-            println!("  new: {}", file);
-        }
-        for file in &status.modified_files {
-            println!("  modified: {}", file);
-        }
-        for file in &status.deleted_files {
-            println!("  deleted: {}", file);
+        for (file_path, file_status) in &status.file_statuses {
+            if file_status.contains(git2::Status::WT_NEW) {
+                println!("  new: {}", file_path);
+            } else if file_status.contains(git2::Status::WT_MODIFIED) {
+                println!("  modified: {}", file_path);
+            } else if file_status.contains(git2::Status::WT_DELETED) {
+                println!("  deleted: {}", file_path);
+            }
         }
     }
 
-    // Commit
-    registry.commit_model(model, message, stage_all).await?;
+    // Commit and get the commit OID
+    let commit_oid = registry.commit_model(&model_ref, message, stage_all).await?;
 
     println!("✓ Committed changes to {}", model);
     println!("  Message: {}", message);
+    println!("  Commit: {}", commit_oid);
 
     Ok(())
 }
 
-/// Print model status in a nice format
+/// Print model status in a nice format using git2 reference information
 fn print_model_status(status: &crate::storage::model_registry::ModelStatus, verbose: bool) {
-    println!("Model: {}", status.model_name);
-    println!("Branch: {}", status.current_ref);
+    println!("Model: {}", status.model_ref.model);
+
+    // Show current state using reference name
+    if let Some(ref_name) = &status.current_ref_name {
+        println!("Current ref: {} ({})", ref_name, status.current_oid);
+    } else {
+        println!("Current ref: detached HEAD ({})", status.current_oid);
+    }
+
+    // Show target ref using reference name if available
+    if let Some(target_name) = &status.target_ref_name {
+        let oid_display = status.target_oid.map(|oid| oid.to_string()).unwrap_or_else(|| "<unknown>".to_string());
+        println!("Target ref: {} ({})", target_name, oid_display);
+        if !status.ref_matches {
+            println!("⚠️  Warning: Current ref does not match target ref");
+        }
+    } else if let Some(target_oid) = &status.target_oid {
+        println!("Target ref: {} (commit)", target_oid);
+        if !status.ref_matches {
+            println!("⚠️  Warning: Current ref does not match target ref");
+        }
+    } else {
+        println!("Target ref: <default branch>");
+    }
 
     if status.is_dirty {
         println!("Status: modified (uncommitted changes)");
 
-        if verbose || (!status.new_files.is_empty() || !status.modified_files.is_empty() || !status.deleted_files.is_empty()) {
-            if !status.new_files.is_empty() {
+        if verbose || !status.file_statuses.is_empty() {
+            let mut new_files = Vec::new();
+            let mut modified_files = Vec::new();
+            let mut deleted_files = Vec::new();
+
+            for (file_path, file_status) in &status.file_statuses {
+                if file_status.contains(git2::Status::WT_NEW) {
+                    new_files.push(file_path);
+                } else if file_status.contains(git2::Status::WT_MODIFIED) {
+                    modified_files.push(file_path);
+                } else if file_status.contains(git2::Status::WT_DELETED) {
+                    deleted_files.push(file_path);
+                }
+            }
+
+            if !new_files.is_empty() {
                 println!("\n  New files:");
-                for file in &status.new_files {
+                for file in new_files {
                     println!("    + {}", file);
                 }
             }
 
-            if !status.modified_files.is_empty() {
+            if !modified_files.is_empty() {
                 println!("\n  Modified files:");
-                for file in &status.modified_files {
+                for file in modified_files {
                     println!("    M {}", file);
                 }
             }
 
-            if !status.deleted_files.is_empty() {
+            if !deleted_files.is_empty() {
                 println!("\n  Deleted files:");
-                for file in &status.deleted_files {
+                for file in deleted_files {
                     println!("    - {}", file);
                 }
             }
@@ -187,7 +247,7 @@ pub async fn handle_lora_train(
 
     // Check that we're on a branch (not detached HEAD)
     let registry = storage.registry();
-    let status = registry.status(&model_ref.model).await?;
+    let status = registry.status(&model_ref).await?;
 
     if status.current_ref.starts_with("detached") {
         println!("Warning: Training on detached HEAD");
@@ -253,12 +313,44 @@ pub async fn handle_lora_train(
         println!("  Config override: {}", cfg);
     }
 
-    // Initialize the adapter
-    let adapter_path = adapter_manager.initialize_adapter(
-        adapter_base_name,
-        index,
-        adapter_config.clone(),
-    )?;
+    // Load the model to get proper dimensions
+    tracing::info!("Loading model to determine LoRA structure for adapter creation");
+    let config = crate::config::RuntimeConfig::default();
+    let mut engine = crate::runtime::TorchEngine::new(config)?;
+    crate::runtime::RuntimeEngine::load_model(&mut engine, &model_path).await?;
+
+    // Create LoRA configuration with proper target modules
+    let lora_config = crate::lora::LoRAConfig {
+        rank: adapter_config.rank as usize,
+        alpha: adapter_config.alpha,
+        dropout: 0.1,
+        // Use comprehensive target modules for full model adaptation
+        target_modules: vec![
+            "q_proj".to_string(),
+            "k_proj".to_string(),
+            "v_proj".to_string(),
+            "o_proj".to_string(),
+            "gate_proj".to_string(),
+            "up_proj".to_string(),
+            "down_proj".to_string(),
+        ],
+        learning_rate: adapter_config.learning_rate as f32,
+    };
+
+    // Create LoRA model structure using proper model dimensions
+    engine.create_lora(lora_config.clone())?;
+
+    // Ensure adapters directory exists
+    adapter_manager.ensure_adapters_dir()?;
+
+    // Save the initialized LoRA weights
+    let adapter_path = adapter_manager.adapters_dir.join(format!("{}.safetensors", indexed_adapter_name));
+    engine.save_lora_weights(adapter_path.to_str().unwrap())?;
+
+    // Save config
+    let config_path = adapter_manager.adapters_dir.join(format!("{}.config.json", indexed_adapter_name));
+    let config_json = serde_json::to_string_pretty(&adapter_config)?;
+    std::fs::write(&config_path, config_json)?;
 
     println!("\n✓ Initialized adapter: adapters/{}.safetensors", indexed_adapter_name);
     println!("✓ Created config: adapters/{}.config.json", indexed_adapter_name);
@@ -463,6 +555,7 @@ pub async fn handle_info(
     storage: &ModelStorage,
     model: &str,
     verbose: bool,
+    adapters_only: bool,
 ) -> Result<()> {
     info!("Getting info for model {}", model);
 
@@ -472,12 +565,23 @@ pub async fn handle_info(
     // Get model path
     let model_path = storage.get_model_path(&model_ref).await?;
 
-    println!("Model: {}", model_ref.model);
-    println!("Reference: {}", model_ref.git_ref.as_deref().unwrap_or("main"));
-    println!("Path: {}", model_path.display());
+    // If adapters_only is true, skip the general model info
+    if !adapters_only {
+        println!("Model: {}", model_ref.model);
+        let display_ref = match &model_ref.git_ref {
+            crate::storage::GitRef::DefaultBranch => {
+                registry.get_default_branch(&model_ref).await?
+            },
+            _ => {
+                model_ref.git_ref.to_string().unwrap_or_else(|| "HEAD".to_string())
+            }
+        };
+        println!("Reference: {}", display_ref);
+        println!("Path: {}", model_path.display());
+    }
 
     // Get git status
-    let status = registry.status(&model_ref.model).await?;
+    let status = registry.status(&model_ref).await?;
     println!("\nGit Status:");
     println!("  Current branch/ref: {}", status.current_ref);
 
@@ -532,6 +636,71 @@ pub async fn handle_info(
             println!("\nModel Size:");
             println!("  Files: {}", file_count);
             println!("  Total size: {:.2} MB", total_size as f64 / 1_048_576.0);
+        }
+    }
+
+    // List adapters for this model
+    let adapter_manager = crate::storage::AdapterManager::new(&model_path);
+
+    match adapter_manager.list_adapters() {
+        Ok(adapters) => {
+            if adapters.is_empty() {
+                println!("\nAdapters: None");
+            } else {
+                println!("\nAdapters: {}", adapters.len());
+
+                // Sort adapters by index for consistent display
+                let mut sorted_adapters = adapters;
+                sorted_adapters.sort_by_key(|a| a.index);
+
+                for adapter in &sorted_adapters {
+                    let size_kb = adapter.size as f64 / 1024.0;
+                    print!("  [{}] {} ({:.1} KB)", adapter.index, adapter.name, size_kb);
+
+                    // Show config info if available and verbose mode is on
+                    if verbose && adapter.config_path.is_some() {
+                        if let Ok(config_content) = std::fs::read_to_string(adapter.config_path.as_ref().unwrap()) {
+                            if let Ok(config) = serde_json::from_str::<crate::storage::AdapterConfig>(&config_content) {
+                                print!(" - rank: {}, alpha: {}, lr: {:.0e}",
+                                      config.rank, config.alpha, config.learning_rate);
+                            }
+                        }
+                    }
+                    println!();
+                }
+
+                if verbose {
+                    println!("\nAdapter Details:");
+                    for adapter in &sorted_adapters {
+                        println!("  [{}] {}", adapter.index, adapter.name);
+                        println!("      File: {}", adapter.filename);
+                        println!("      Path: {}", adapter.path.display());
+                        println!("      Size: {:.1} KB", adapter.size as f64 / 1024.0);
+
+                        if let Some(config_path) = &adapter.config_path {
+                            println!("      Config: {}", config_path.display());
+                            if let Ok(config_content) = std::fs::read_to_string(config_path) {
+                                if let Ok(config) = serde_json::from_str::<crate::storage::AdapterConfig>(&config_content) {
+                                    println!("      Rank: {}", config.rank);
+                                    println!("      Alpha: {}", config.alpha);
+                                    println!("      Learning Rate: {:.2e}", config.learning_rate);
+                                    println!("      Created: {}", config.created_at);
+                                }
+                            }
+                        } else {
+                            println!("      Config: Not found");
+                        }
+                        println!();
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            if verbose {
+                println!("\nAdapters: Error listing adapters: {}", e);
+            } else {
+                println!("\nAdapters: Unable to list");
+            }
         }
     }
 
@@ -624,27 +793,129 @@ pub async fn handle_infer(
 
     if !adapters.is_empty() {
         println!("\n→ Loading adapters:");
+
+        // Flag to track LoRA model initialization state across adapter loading iterations.
+        // The LoRA model structure must be initialized before individual adapter weights
+        // can be loaded. This is done once for the first valid adapter configuration.
+        let mut lora_model_initialized = false;
+
         for adapter_info in &adapters {
-            println!("  [{}] {} ({:.1} KB)",
+            tracing::info!("[{}] {} ({:.1} KB)",
                      adapter_info.index,
                      adapter_info.name,
                      adapter_info.size as f64 / 1024.0);
 
-            // Load the adapter weights into the engine
+            // Parse adapter configuration from JSON file.
+            // Each adapter has an associated .config.json file containing metadata
+            // like rank, alpha scaling factor, and training parameters.
+            let config_path = adapter_info.path.with_extension("config.json");
+            let adapter_config = match std::fs::read_to_string(&config_path) {
+                Ok(content) => {
+                    match serde_json::from_str::<crate::storage::AdapterConfig>(&content) {
+                        Ok(config) => config,
+                        Err(parse_error) => {
+                            tracing::error!(
+                                config_path = %config_path.display(),
+                                error = %parse_error,
+                                "Failed to deserialize adapter configuration - JSON structure may be invalid"
+                            );
+                            tracing::warn!("Failed to parse config for adapter [{}] {} - skipping",
+                                     adapter_info.index, adapter_info.name);
+                            continue;
+                        }
+                    }
+                }
+                Err(io_error) => {
+                    tracing::warn!(
+                        config_path = %config_path.display(),
+                        error = %io_error,
+                        adapter_name = %adapter_info.name,
+                        "Adapter configuration file not found - adapter may be corrupted"
+                    );
+                    tracing::warn!("No config found for adapter [{}] {} - skipping",
+                             adapter_info.index, adapter_info.name);
+                    continue;
+                }
+            };
+
+            // Initialize LoRA model structure on first successful adapter.
+            // This creates the VarStore and module mapping required for gradient tracking.
+            // All adapters share the same LoRA model structure but have different weights.
+            if !lora_model_initialized {
+                tracing::info!(
+                    rank = adapter_config.rank,
+                    alpha = adapter_config.alpha,
+                    learning_rate = adapter_config.learning_rate,
+                    "Initializing LoRA model structure with configuration from first adapter"
+                );
+
+                // Create LoRA config with comprehensive target modules
+                // The engine will auto-detect which modules are actually present in the SafeTensors file
+                let lora_config = crate::lora::LoRAConfig {
+                    rank: adapter_config.rank as usize, // Convert u32 to usize
+                    alpha: adapter_config.alpha,
+                    dropout: 0.1, // Standard dropout rate for LoRA training
+                    // Use comprehensive target modules - engine will filter based on what's available
+                    target_modules: vec![
+                        "q_proj".to_string(),
+                        "k_proj".to_string(),
+                        "v_proj".to_string(),
+                        "o_proj".to_string(),
+                        "gate_proj".to_string(),
+                        "up_proj".to_string(),
+                        "down_proj".to_string(),
+                    ],
+                    learning_rate: adapter_config.learning_rate as f32, // Convert f64 to f32
+                };
+
+                match engine.create_lora(lora_config) {
+                    Ok(_) => {
+                        tracing::info!("LoRA model structure initialized successfully - ready to load adapter weights");
+                        lora_model_initialized = true;
+                    }
+                    Err(init_error) => {
+                        tracing::error!(
+                            error = %init_error,
+                            "Failed to initialize LoRA model structure - adapters cannot be loaded"
+                        );
+                        tracing::error!("Failed to initialize LoRA model - skipping all adapters");
+                        break;
+                    }
+                }
+            }
+
+            // Load adapter weights into the initialized LoRA model.
+            // This loads the actual trained LoRA A and B matrices from SafeTensors format.
             match engine.load_lora_weights(adapter_info.path.to_str().unwrap()) {
                 Ok(_) => {
-                    info!("Successfully loaded adapter: {:?}", adapter_info.path);
+                    tracing::info!(
+                        adapter_path = %adapter_info.path.display(),
+                        adapter_name = %adapter_info.name,
+                        adapter_size_kb = adapter_info.size as f64 / 1024.0,
+                        "Successfully loaded LoRA adapter weights"
+                    );
+                    tracing::info!("Successfully loaded adapter [{}] {}", adapter_info.index, adapter_info.name);
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to load adapter {:?}: {}", adapter_info.path, e);
-                    println!("  ⚠️  Failed to load [{}] {} - continuing without it",
+                Err(load_error) => {
+                    tracing::warn!(
+                        adapter_path = %adapter_info.path.display(),
+                        adapter_name = %adapter_info.name,
+                        error = %load_error,
+                        "Failed to load LoRA adapter weights - SafeTensors file may be corrupted"
+                    );
+                    tracing::warn!("Failed to load adapter [{}] {} - continuing without it",
                              adapter_info.index, adapter_info.name);
                 }
             }
         }
-        println!("  Total: {} adapters loaded", adapters.len());
+
+        tracing::info!(
+            total_adapters = adapters.len(),
+            "Completed LoRA adapter loading process"
+        );
+        tracing::info!("Completed processing {} adapters", adapters.len());
     } else {
-        info!("No adapters found, using base model");
+        tracing::info!("No LoRA adapters found in model directory - using base model only");
     }
 
     // Clear any previously loaded LoRA (in case of manual loads)
@@ -745,8 +1016,9 @@ pub async fn handle_push(
     let registry = storage.registry();
     let remote_name = remote.as_deref().unwrap_or("origin");
     let branch_name = branch.as_deref();
+    let model_ref = ModelRef::new(model.to_string());
 
-    registry.push_model(model, remote_name, branch_name, set_upstream, force).await?;
+    registry.push_model(&model_ref, remote_name, branch_name, set_upstream, force).await?;
 
     println!("✓ Pushed model {} to {}", model, remote_name);
     if let Some(b) = branch_name {
@@ -772,8 +1044,9 @@ pub async fn handle_pull(
     let registry = storage.registry();
     let remote_name = remote.as_deref().unwrap_or("origin");
     let branch_name = branch.as_deref();
+    let model_ref = ModelRef::new(model.to_string());
 
-    registry.pull_model(model, remote_name, branch_name, rebase).await?;
+    registry.pull_model(&model_ref, remote_name, branch_name, rebase).await?;
 
     println!("✓ Pulled latest changes for model {}", model);
     println!("  Remote: {}", remote_name);
@@ -800,8 +1073,9 @@ pub async fn handle_merge(
     info!("Merging branch {} into model {}", branch, model);
 
     let registry = storage.registry();
+    let model_ref = ModelRef::new(model.to_string());
 
-    registry.merge_branch(model, branch, ff_only, no_ff).await?;
+    registry.merge_branch(&model_ref, branch, ff_only, no_ff).await?;
 
     println!("✓ Merged branch '{}' into model {}", branch, model);
     if ff_only {

@@ -1631,44 +1631,184 @@ impl TorchEngine {
         Ok(())
     }
     
-    /// Load LoRA weights from SafeTensor format
+    /// Load LoRA adapter weights from SafeTensors format.
+    ///
+    /// Loads pre-trained LoRA A and B matrices from a SafeTensors file into the
+    /// initialized LoRA model structure. This updates the VarStore with the new
+    /// weights, making them available for inference and further training.
+    ///
+    /// # Requirements
+    /// - LoRA model must be initialized first via create_lora()
+    /// - SafeTensors file must contain tensors with names matching the LoRA layer structure
+    /// - Tensor shapes must match the initialized LoRA model dimensions
+    ///
+    /// # Arguments
+    /// - `path` - Path to SafeTensors file containing LoRA weights
     pub fn load_lora_weights(&mut self, path: &str) -> Result<()> {
         if let Some(lora_model) = &mut *self.handle_poison(self.lora_model.lock())? {
+            tracing::debug!(
+                safetensors_path = path,
+                "Loading LoRA weights from SafeTensors format"
+            );
+
             lora_model.load(path)?;
-            tracing::info!("Loaded LoRA weights from SafeTensor format: {}", path);
+
+            tracing::info!(
+                safetensors_path = path,
+                total_parameters = lora_model.num_parameters(),
+                "Successfully loaded LoRA adapter weights from SafeTensors"
+            );
         } else {
-            return Err(anyhow!("No LoRA model initialized"));
+            tracing::error!(
+                safetensors_path = path,
+                "Cannot load LoRA weights: LoRA model structure not initialized - call create_lora() first"
+            );
+            return Err(anyhow!("No LoRA model initialized - call create_lora() first"));
         }
         Ok(())
     }
     
-    /// Create a LoRA adapter for this model
+    /// Check if LoRA model structure has been initialized.
+    ///
+    /// Returns true if a LoRA model with VarStore has been created, indicating
+    /// the engine is ready to load adapter weights. This is a prerequisite for
+    /// calling load_lora_weights().
+    pub fn has_lora_model(&self) -> bool {
+        self.handle_poison(self.lora_model.lock())
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Initialize LoRA model structure for low-rank adaptation.
+    ///
+    /// Creates the VarStore and layer mappings required for LoRA training and inference.
+    /// This must be called before loading any adapter weights. The configuration defines
+    /// the rank (bottleneck dimension), alpha scaling factor, and target modules to adapt.
+    ///
+    /// # Architecture
+    /// - Creates a shared VarStore for all LoRA layers with automatic differentiation
+    /// - Maps target modules to their input/output dimensions for weight initialization
+    /// - Uses proper Kaiming initialization for LoRA A and zero initialization for LoRA B
+    ///
+    /// # Arguments
+    /// - `config` - LoRA configuration including rank, alpha, target modules, and dropout
     pub fn create_lora(&mut self, config: crate::lora::LoRAConfig) -> Result<()> {
         use crate::lora::torch_adapter::LoRAModel;
-        
-        // Create module configurations (should detect from loaded model)
+
+        tracing::info!(
+            rank = config.rank,
+            alpha = config.alpha,
+            dropout = config.dropout,
+            target_modules = ?config.target_modules,
+            learning_rate = config.learning_rate,
+            "Initializing LoRA model structure for low-rank adaptation"
+        );
+
+        // Get module dimensions from loaded model instead of hardcoding
         let mut module_configs = std::collections::HashMap::new();
+
+        // Get model dimensions from model_info
+        let model_info = self.handle_poison(self.model_info.lock())?;
+        let hidden_size = model_info.hidden_size as i64;
+
+        // Calculate intermediate size based on model architecture
+        let intermediate_size = if let Some(intermediate) = model_info.intermediate_size {
+            intermediate as i64
+        } else {
+            // Use architecture-specific defaults
+            match model_info.architecture.as_str() {
+                "Qwen2ForCausalLM" => (hidden_size as f32 * 2.6667) as i64, // Qwen uses ~2.67x
+                "LlamaForCausalLM" => (hidden_size as f32 * 2.75) as i64,   // Llama uses 2.75x
+                _ => hidden_size * 4, // Default 4x expansion
+            }
+        };
+
+        // Extract dimensions for each target module
         for module_name in &config.target_modules {
-            module_configs.insert(module_name.clone(), (2560, 2560)); // Default
+            let (in_features, out_features) = match module_name.as_str() {
+                "q_proj" | "k_proj" | "v_proj" | "o_proj" => {
+                    // Self-attention projections
+                    (hidden_size, hidden_size)
+                }
+                "gate_proj" | "up_proj" => {
+                    // MLP projections (expand)
+                    (hidden_size, intermediate_size)
+                }
+                "down_proj" => {
+                    // MLP projection (contract)
+                    (intermediate_size, hidden_size)
+                }
+                _ => {
+                    return Err(anyhow!(
+                        "Unknown module '{}'. Supported modules: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj",
+                        module_name
+                    ));
+                }
+            };
+
+            module_configs.insert(module_name.clone(), (in_features as usize, out_features as usize));
         }
-        
-        // Create LoRA model
-        let lora_model = LoRAModel::new(config, module_configs, self.device)?;
-        
-        // Set the LoRA model
+
+        tracing::info!(
+            hidden_size = hidden_size,
+            intermediate_size = intermediate_size,
+            module_configs = ?module_configs,
+            "Using model-specific dimensions for LoRA initialization"
+        );
+
+        // Initialize the LoRA model with PyTorch VarStore for gradient tracking.
+        // This creates trainable LoRA A and B matrices for each target module.
+        let lora_model = LoRAModel::new(config.clone(), module_configs, self.device)?;
+        let total_params = lora_model.num_parameters();
+
+        // Install the LoRA model into the engine's shared state.
+        // This replaces any previously loaded LoRA model.
         {
             let mut lora_guard = self.handle_poison(self.lora_model.lock())?;
             *lora_guard = Some(lora_model);
         }
-        
-        tracing::info!("Created LoRA adapter");
+
+        tracing::info!(
+            total_parameters = total_params,
+            device = ?self.device,
+            "LoRA model structure created successfully - ready to load adapter weights"
+        );
         Ok(())
     }
     
-    /// Load LoRA from SafeTensors file
+    /// Load LoRA adapter weights from SafeTensors file (async version).
+    ///
+    /// Save LoRA weights to SafeTensors file
+    ///
+    /// Saves the current LoRA model's weights to a SafeTensors file for persistence.
+    /// This allows adapters to be saved after training or initialization.
+    ///
+    /// # Requirements
+    /// - LoRA model must be initialized first via create_lora()
+    ///
+
+    /// This is the async wrapper for load_lora_weights(), used in training contexts
+    /// where adapter loading may be part of a larger async workflow. The actual
+    /// loading is synchronous as PyTorch tensor operations are CPU/GPU bound.
+    ///
+    /// # Requirements
+    /// - LoRA model structure must be initialized first via create_lora()
+    /// - Path must point to a valid SafeTensors file with matching tensor shapes
+    ///
+    /// # Arguments
+    /// - `path` - Path to SafeTensors file containing LoRA A and B matrices
     pub async fn load_lora_from_file(&mut self, path: &std::path::Path) -> Result<()> {
-        tracing::info!("Loading LoRA from file: {:?}", path);
-        Ok(())
+        tracing::info!(
+            file_path = %path.display(),
+            "Loading LoRA adapter weights from SafeTensors file"
+        );
+
+        // Delegate to synchronous implementation
+        // SafeTensors loading is I/O bound but the actual tensor operations are sync
+        self.load_lora_weights(
+            path.to_str()
+                .ok_or_else(|| anyhow!("Invalid UTF-8 path for LoRA adapter file"))?
+        )
     }
     
     /// Apply LoRA adapter during forward pass (called internally)

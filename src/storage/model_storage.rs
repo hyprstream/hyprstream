@@ -116,10 +116,7 @@ impl ModelStorage {
                                 // Check if it's a git repository
                                 let git_dir = entry.path().join(".git");
                                 if git_dir.exists() {
-                                    let model_ref = ModelRef {
-                                        model: name.to_string(),
-                                        git_ref: None,
-                                    };
+                                    let model_ref = ModelRef::new(name.to_string());
 
                                     // Calculate size if possible
                                     let size_bytes = Self::calculate_dir_size(&entry.path()).ok();
@@ -147,10 +144,7 @@ impl ModelStorage {
             for (name, _commit_id) in registry_models {
                 // Don't duplicate if already found in directory scan
                 if !result.iter().any(|(ref r, _)| r.model == name) {
-                    let model_ref = ModelRef {
-                        model: name.clone(),
-                        git_ref: None,
-                    };
+                    let model_ref = ModelRef::new(name.clone());
                     let metadata = ModelMetadata {
                         name: name.clone(),
                         display_name: Some(name.clone()),
