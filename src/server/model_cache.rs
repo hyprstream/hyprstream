@@ -186,7 +186,7 @@ impl ModelCache {
             info!("Creating worktree checkout at {:?}", checkout_dir);
 
             // Get model path from registry
-            let model_path = self.registry.get_model_path(&model_ref.model).await?;
+            let model_path = self.registry.get_model_path(&model_ref).await?;
 
             // Create worktree for specific commit
             let checkout_dir_clone = checkout_dir.clone();

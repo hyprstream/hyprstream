@@ -73,8 +73,8 @@ impl ModelStorage {
 
     /// Create with a new registry
     pub async fn create(base_dir: PathBuf) -> Result<Self> {
-        let registry_dir = base_dir.join("registry");
-        let registry = SharedModelRegistry::new(registry_dir, None)?;
+        // Use the models directory itself as the registry, not a subdirectory
+        let registry = SharedModelRegistry::new(base_dir.clone(), None)?;
         Ok(Self {
             base_dir,
             registry: Arc::new(registry),
@@ -94,7 +94,7 @@ impl ModelStorage {
 
     /// Get model path by reference
     pub async fn get_model_path(&self, model_ref: &ModelRef) -> Result<PathBuf> {
-        self.registry.get_model_path(&model_ref.model).await
+        self.registry.get_model_path(&model_ref).await
     }
 
     /// List all models
@@ -177,12 +177,14 @@ impl ModelStorage {
 
     /// Check if a model exists
     pub async fn model_exists(&self, model_name: &str) -> bool {
-        self.registry.get_model_path(model_name).await.is_ok()
+        let model_ref = ModelRef::new(model_name.to_string());
+        self.registry.get_model_path(&model_ref).await.is_ok()
     }
 
     /// Add a new model
     pub async fn add_model(&self, name: &str, source: &str) -> Result<()> {
-        self.registry.add_model(name, source).await
+        self.registry.add_model(name, source).await?;
+        Ok(())
     }
 
     /// Update a model to a different version
@@ -228,14 +230,41 @@ impl ModelStorage {
         name: &str,
         source: Option<String>,
     ) -> Result<()> {
-        // Model is already cloned, just register it in our tracking
-        if source.is_some() {
-            tracing::info!("Model {} with ID {} already cloned to models/{}", name, model_id, name);
-            // The model should already exist in the models directory
-            // We don't need to clone it again via registry.add_model
-            // Just ensure it's tracked for listing
+        // CRITICAL FIX: Actually register the model with the git registry
+        // This fixes the registry bypass bug where models were cloned but never registered
+
+        tracing::info!("Registering model {} (ID: {}) with git registry", name, model_id);
+
+        // Create a ModelRef for the registry operations
+        let model_ref = ModelRef::new(name.to_string());
+
+        // Verify the model exists in the file system
+        let model_path = self.get_models_dir().join(name);
+        if !model_path.exists() {
+            bail!("Model {} not found at expected path {:?} - cannot register", name, model_path);
         }
-        Ok(())
+
+        // Check if it's actually a git repository
+        if !model_path.join(".git").exists() {
+            bail!("Model {} at {:?} is not a git repository", name, model_path);
+        }
+
+        // Register with the git registry as a submodule
+        // The registry will handle adding it as a git submodule
+        // Note: add_model takes name as a string, not ModelRef
+        match self.registry.add_model(name, source.as_deref().unwrap_or("")).await {
+            Ok(_) => {
+                tracing::info!("Successfully registered model {} in git registry", name);
+                Ok(())
+            }
+            Err(e) => {
+                // This is a critical error - the model exists but isn't properly tracked
+                tracing::error!("Failed to register model {} with git registry: {}", name, e);
+
+                // Re-throw as a more specific error
+                bail!("Failed to register model {} with git registry: {}. The model exists at {:?} but could not be added as a submodule. This may require manual intervention.", name, e, model_path)
+            }
+        }
     }
 
     pub async fn remove_metadata_by_id(&self, _id: &ModelId) -> Result<()> {

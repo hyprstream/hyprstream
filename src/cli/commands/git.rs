@@ -118,4 +118,22 @@ pub enum GitAction {
         #[arg(long)]
         rebase: bool,
     },
+
+    /// Remove a model from the system
+    Remove {
+        /// Model name to remove (e.g., "Qwen3-4B")
+        model: String,
+
+        /// Force removal without confirmation
+        #[arg(short, long)]
+        force: bool,
+
+        /// Remove only from registry, keep files
+        #[arg(long)]
+        registry_only: bool,
+
+        /// Remove files only, keep registry entry
+        #[arg(long)]
+        files_only: bool,
+    },
 }

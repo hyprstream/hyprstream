@@ -3,7 +3,7 @@
 use anyhow::Result;
 use tracing::info;
 
-use crate::storage::{ModelStorage, ModelRef, AdapterConfig, CheckoutOptions};
+use crate::storage::{ModelStorage, ModelRef, CheckoutOptions};
 
 /// Handle branch command
 pub async fn handle_branch(
@@ -16,7 +16,7 @@ pub async fn handle_branch(
 
     let model_ref = ModelRef::new(model.to_string());
     let registry = storage.registry();
-    let branch = registry.create_branch(&model_ref, branch_name, from_ref.as_deref()).await?;
+    registry.create_branch(&model_ref, branch_name, from_ref.as_deref()).await?;
 
     println!("✓ Created branch {} for model {}", branch_name, model);
 
@@ -24,10 +24,7 @@ pub async fn handle_branch(
         println!("  Branch created from: {}", from);
     }
 
-    // Show branch info using git2 types
-    if let Some(branch_name) = branch.name()? {
-        println!("  Branch reference: {}", branch_name);
-    }
+    // Branch created successfully
 
     Ok(())
 }
@@ -249,14 +246,14 @@ pub async fn handle_lora_train(
     let registry = storage.registry();
     let status = registry.status(&model_ref).await?;
 
-    if status.current_ref.starts_with("detached") {
+    if status.current_ref_name.as_deref().unwrap_or("detached").starts_with("detached") {
         println!("Warning: Training on detached HEAD");
         println!("Consider creating a branch first:");
         println!("  hyprstream branch {} training/experiment", model_ref.model);
     }
 
     println!("Starting LoRA adapter initialization for {}", model_ref.to_string());
-    println!("Current branch: {}", status.current_ref);
+    println!("Current branch: {}", status.current_ref_name.as_deref().unwrap_or("detached"));
 
     // Get model path and create adapter manager
     let model_path = storage.get_model_path(&model_ref).await?;
@@ -279,7 +276,7 @@ pub async fn handle_lora_train(
     };
 
     // Add metadata
-    adapter_config.metadata.insert("branch".to_string(), status.current_ref.clone());
+    adapter_config.metadata.insert("branch".to_string(), status.current_ref_name.as_deref().unwrap_or("detached").to_string());
     if interactive {
         adapter_config.metadata.insert("mode".to_string(), "interactive".to_string());
     }
@@ -583,30 +580,45 @@ pub async fn handle_info(
     // Get git status
     let status = registry.status(&model_ref).await?;
     println!("\nGit Status:");
-    println!("  Current branch/ref: {}", status.current_ref);
+    println!("  Current branch/ref: {}", status.current_ref_name.as_deref().unwrap_or("detached"));
 
     if status.is_dirty {
         println!("  Working tree: dirty");
-        if !status.modified_files.is_empty() {
-            println!("  Modified files: {}", status.modified_files.len());
+        let modified_files: Vec<_> = status.file_statuses.iter()
+            .filter(|(_, status)| status.is_wt_modified())
+            .map(|(path, _)| path)
+            .collect();
+
+        let new_files: Vec<_> = status.file_statuses.iter()
+            .filter(|(_, status)| status.is_wt_new())
+            .map(|(path, _)| path)
+            .collect();
+
+        if !modified_files.is_empty() {
+            println!("  Modified files: {}", modified_files.len());
             if verbose {
-                for file in &status.modified_files {
+                for file in &modified_files {
                     println!("    M {}", file);
                 }
             }
         }
-        if !status.new_files.is_empty() {
-            println!("  New files: {}", status.new_files.len());
+        if !new_files.is_empty() {
+            println!("  New files: {}", new_files.len());
             if verbose {
-                for file in &status.new_files {
+                for file in &new_files {
                     println!("    A {}", file);
                 }
             }
         }
-        if !status.deleted_files.is_empty() {
-            println!("  Deleted files: {}", status.deleted_files.len());
+        let deleted_files: Vec<_> = status.file_statuses.iter()
+            .filter(|(_, status)| status.is_wt_deleted())
+            .map(|(path, _)| path)
+            .collect();
+
+        if !deleted_files.is_empty() {
+            println!("  Deleted files: {}", deleted_files.len());
             if verbose {
-                for file in &status.deleted_files {
+                for file in &deleted_files {
                     println!("    D {}", file);
                 }
             }
@@ -1086,5 +1098,121 @@ pub async fn handle_merge(
         println!("  Strategy: auto (fast-forward if possible)");
     }
 
+    Ok(())
+}
+
+/// Handle remove command
+pub async fn handle_remove(
+    storage: &ModelStorage,
+    model: &str,
+    force: bool,
+    registry_only: bool,
+    files_only: bool,
+) -> Result<()> {
+    use std::io::{self, Write};
+
+    info!("Removing model {}", model);
+
+    // Validate flags
+    if registry_only && files_only {
+        return Err(anyhow::anyhow!("Cannot specify both --registry-only and --files-only"));
+    }
+
+    let model_ref = ModelRef::new(model.to_string());
+    let registry = storage.registry();
+
+    // Check if model exists in registry
+    let registry_exists = registry.get_model_path(&model_ref).await.is_ok();
+
+    // Check if model exists in filesystem
+    let model_path = storage.get_models_dir().join(model);
+    let files_exist = model_path.exists();
+
+    if !registry_exists && !files_exist {
+        println!("❌ Model '{}' not found in registry or filesystem", model);
+        return Ok(());
+    }
+
+    // Show what will be removed
+    println!("Model '{}' removal plan:", model);
+    if registry_exists && !files_only {
+        println!("  🗂️  Remove from git registry (submodule)");
+    }
+    if files_exist && !registry_only {
+        println!("  📁 Remove files from: {}", model_path.display());
+
+        // Show size if possible
+        if let Ok(metadata) = std::fs::metadata(&model_path) {
+            if metadata.is_dir() {
+                // Calculate directory size
+                let mut total_size = 0u64;
+                if let Ok(entries) = walkdir::WalkDir::new(&model_path).into_iter().collect::<Result<Vec<_>, _>>() {
+                    for entry in entries {
+                        if entry.file_type().is_file() {
+                            if let Ok(meta) = entry.metadata() {
+                                total_size += meta.len();
+                            }
+                        }
+                    }
+                }
+                println!("      Size: {:.2} GB", total_size as f64 / 1_073_741_824.0);
+            }
+        }
+    }
+
+    if registry_only && !registry_exists {
+        println!("⚠️  Model not found in registry, nothing to remove");
+        return Ok(());
+    }
+
+    if files_only && !files_exist {
+        println!("⚠️  Model files not found, nothing to remove");
+        return Ok(());
+    }
+
+    // Confirmation prompt unless forced
+    if !force {
+        print!("Are you sure you want to remove model '{}'? [y/N]: ", model);
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let input = input.trim().to_lowercase();
+
+        if input != "y" && input != "yes" {
+            println!("Removal cancelled");
+            return Ok(());
+        }
+    }
+
+    // Remove from registry (if requested and exists)
+    if registry_exists && !files_only {
+        match registry.remove_model(&model_ref).await {
+            Ok(_) => {
+                println!("✓ Removed '{}' from git registry", model);
+            }
+            Err(e) => {
+                eprintln!("❌ Failed to remove '{}' from git registry: {}", model, e);
+                if !files_only {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    // Remove files (if requested and exist)
+    if files_exist && !registry_only {
+        match std::fs::remove_dir_all(&model_path) {
+            Ok(_) => {
+                println!("✓ Removed model files from: {}", model_path.display());
+            }
+            Err(e) => {
+                eprintln!("❌ Failed to remove model files: {}", e);
+                return Err(anyhow::anyhow!("Failed to remove model files: {}", e));
+            }
+        }
+    }
+
+    println!("✓ Model '{}' removed successfully", model);
     Ok(())
 }

@@ -5,12 +5,14 @@
 
 ## Overview
 
-HyprStream is a production-ready LLM inference engine built in Rust with PyTorch, featuring integrated training capabilities and Git-based model version control. It provides a unified platform for model inference, fine-tuning through LoRA adapters, and comprehensive model lifecycle management.
+HyprStream is a LLM inference and training engine built in Rust with PyTorch, featuring integrated training capabilities and Git-based model version control. It provides a unified platform for model inference, fine-tuning through LoRA adapters, and comprehensive model lifecycle management.
 
 ### Core Features
 
+- **Inference API**: Providing compatibility with OpenAI's OpenAPI specification.
+- **Management API**: Providing management APIs (WIP)
 - **High-Performance Inference**: PyTorch-based engine with KV caching and optimized memory management
-- **Hardware Acceleration**: CPU and AMD GPU (ROCm) support, NVIDIA GPU (CUDA) coming soon
+- **Hardware Acceleration**: CPU and AMD GPU (ROCm) supported, NVIDIA GPU (CUDA) coming soon
 - **LoRA Training & Adaptation**: Create, train, and deploy LoRA adapters for model customization
 - **Git-based Model Management**: Version control for models using native Git repositories
 - **Hugging Face Compatible**: Direct cloning and usage of models from Hugging Face Hub
@@ -62,56 +64,50 @@ cargo build --release
 
 ```bash
 # Clone a model from Git repository (HuggingFace, GitHub, etc.)
-hyprstream model clone https://huggingface.co/Qwen/Qwen3-0.6B
+hyprstream clone https://huggingface.co/Qwen/Qwen3-0.6B
 
-# Clone a specific branch or tag
-hyprstream model clone https://huggingface.co/Qwen/Qwen3-8B --git-ref main
-
-# Clone with a custom name (instead of auto-generated UUID)
-hyprstream model clone https://huggingface.co/Qwen/Qwen3-0.6B --name qwen3-small
+# Clone with a custom name
+hyprstream clone https://huggingface.co/Qwen/Qwen3-0.6B --name qwen3-small
 
 # Import a shared model from Git
-hyprstream model import https://github.com/user/custom-model.git --name my-custom-model
+hyprstream clone https://github.com/user/custom-model.git --name my-custom-model
 ```
 
 #### Managing Models
 
 ```bash
 # List all cached models (shows names and UUIDs)
-hyprstream model list
+hyprstream list
 
 # Get detailed model information using ModelRef syntax
 # Note that git-ref branch and tag management is a work in progress.
 # Simple 'by name' models are verified.
-hyprstream model info qwen3-small           # By name
-hyprstream model info qwen3-small:main      # Specific branch
-hyprstream model info qwen3-small:v1.0      # Specific tag
-hyprstream model info qwen3-small:abc123    # Specific commit
-
-# Remove a model using ModelRef
-hyprstream model remove qwen3-small         # Remove by name
+hyprstream inspect qwen3-small           # By name
+hyprstream inspect qwen3-small:main      # Specific branch
+hyprstream inspect qwen3-small:v1.0      # Specific tag
+hyprstream inspect qwen3-small:abc123    # Specific commit
 
 # Pull latest updates for a model
-hyprstream model pull qwen3-small           # Update to latest
-hyprstream model pull qwen3-small:main      # Update specific branch
+hyprstream pull qwen3-small           # Update to latest
+hyprstream pull qwen3-small main      # Update specific branch
 
-# Share a model with others
-hyprstream model share qwen3-small --push-to <git-remote-url>
+# Push changes to remote
+hyprstream push qwen3-small origin main
 ```
 
 ### Running Inference
 
 ```bash
 # Basic inference using ModelRef syntax
-hyprstream model infer qwen3-small \
+hyprstream infer qwen3-small \
     --prompt "Explain quantum computing in simple terms"
 
 # Inference with specific model version
-hyprstream model infer qwen3-small:v1.0 \
+hyprstream infer qwen3-small:v1.0 \
     --prompt "Explain quantum computing"
 
 # Inference with specific branch
-hyprstream model infer qwen3-small:main \
+hyprstream infer qwen3-small:main \
     --prompt "Write a Python function to sort a list" \
     --temperature 0.7 \
     --top-p 0.9 \
@@ -122,37 +118,60 @@ hyprstream model infer qwen3-small:main \
 
 Status: Experimental
 
+HyprStream provides LoRA (Low-Rank Adaptation) training via the `lt` command, with full git integration for version control:
+
 ```bash
-# Create a new LoRA adapter using ModelRef syntax
-hyprstream lora create \
-    --name my-adapter \
-    --base-model qwen3-small \
+# Create and train a LoRA adapter
+hyprstream lt qwen3-small \
+    --adapter coding_assistant \
     --rank 16 \
-    --alpha 32
-
-# Create adapter for specific model version
-hyprstream lora create \
-    --name my-adapter \
-    --base-model qwen3-small:v1.0 \
-    --rank 16 \
-    --alpha 32
-
-# Start training with samples
-hyprstream lora train start my-adapter \
     --learning-rate 1e-4 \
-    --batch-size 8
+    --batch-size 4 \
+    --epochs 10
 
-# Add training samples
-hyprstream lora train sample my-adapter \
-    --input "What is machine learning?" \
-    --output "Machine learning is a subset of AI..."
+# Interactive training mode (learns from conversations)
+hyprstream lt qwen3-small \
+    --adapter interactive_tutor \
+    --interactive
 
-# Monitor training status
-hyprstream lora train status my-adapter
+# Training with custom data file (JSONL format)
+hyprstream lt qwen3-small \
+    --adapter domain_expert \
+    --data training_samples.jsonl \
+    --rank 32 \
+    --epochs 5
 
-# Export trained adapter
-hyprstream lora export my-adapter \
-    --output ./my-adapter.safetensors
+# Use existing training configuration
+hyprstream lt qwen3-small \
+    --adapter advanced_model \
+    --config training_config.json
+```
+
+#### Git Integration for LoRA Training
+
+LoRA adapters are automatically managed with git:
+
+```bash
+# Check training status and git state
+hyprstream status qwen3-small
+
+# Commit trained adapter to git
+hyprstream commit qwen3-small -m "Add coding assistant adapter"
+
+# Create branches for different training experiments
+hyprstream branch qwen3-small experiment-1
+hyprstream checkout qwen3-small:experiment-1
+
+# Train on the experimental branch
+hyprstream lt qwen3-small:experiment-1 --adapter test_model
+```
+
+#### Training Data Format
+
+Training data should be in JSONL format:
+```json
+{"input": "What is machine learning?", "output": "Machine learning is a subset of AI that enables computers to learn from data."}
+{"input": "Explain neural networks", "output": "Neural networks are computational models inspired by biological neural networks."}
 ```
 
 ## Architecture
@@ -209,16 +228,16 @@ HyprStream uses a flexible ModelRef syntax for referencing models and their vers
 Examples:
 ```bash
 # Use the default version
-hyprstream model infer llama3 --prompt "Hello"
+hyprstream infer llama3 --prompt "Hello"
 
 # Use a specific branch
-hyprstream model infer llama3:experimental --prompt "Hello"
+hyprstream infer llama3:experimental --prompt "Hello"
 
 # Use a specific release tag
-hyprstream model infer llama3:v2.0 --prompt "Hello"
+hyprstream infer llama3:v2.0 --prompt "Hello"
 
 # Use a specific commit for reproducibility
-hyprstream model infer llama3:f3a8b92 --prompt "Hello"
+hyprstream infer llama3:f3a8b92 --prompt "Hello"
 ```
 
 ## Supported Models

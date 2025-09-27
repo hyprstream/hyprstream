@@ -14,7 +14,7 @@ pub use handlers::{handle_config, handle_server, handle_model_command, handle_ch
 pub use git_handlers::{
     handle_branch, handle_checkout, handle_status, handle_commit,
     handle_lora_train, handle_serve, handle_infer,
-    handle_push, handle_pull, handle_merge,
+    handle_push, handle_pull, handle_merge, handle_remove,
     handle_list, handle_info, handle_clone
 };
 

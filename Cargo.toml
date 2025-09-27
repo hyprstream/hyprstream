@@ -6,7 +6,6 @@ description = "Real-time adaptive ML inference server"
 documentation = "https://docs.rs/hyprstream"
 readme = "README.md"
 license = "AGPL-3.0"
-license-file = "LICENSE"
 exclude = [
     "**/*.pyc",
     "**/__pycache__/",
@@ -119,6 +118,7 @@ glob = "0.3"
 walkdir = "2.5"
 reqwest = { version = "0.11", features = ["json", "stream"] }
 lru = "0.16.1"  # LRU cache for model caching and Git repository handles
+dashmap = "6.0"  # Concurrent HashMap for thread-safe repository caching
 indicatif = "0.17"              # Progress bars
 fastrand = "2.0"                # Fast random number generation for sampling
 xdg = "2.5"                     # XDG Base Directory specification

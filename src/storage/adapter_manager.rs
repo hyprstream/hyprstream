@@ -160,16 +160,36 @@ impl AdapterManager {
         Ok(format!("{:02}_{}", idx, name))
     }
 
-    /// Initialize adapter (stub for training service compatibility)
+    /// Initialize adapter with proper implementation
     pub fn initialize_adapter(
         &self,
-        _name: &str,
-        _index: Option<u32>,
-        _config: AdapterConfig,
+        name: &str,
+        index: Option<u32>,
+        config: AdapterConfig,
     ) -> Result<std::path::PathBuf> {
-        // This is now handled by the engine in the CLI handlers
-        // The training service should be updated to use the engine approach
-        todo!("Training service needs to be updated to use engine-based adapter creation")
+        self.ensure_adapters_dir()?;
+
+        let idx = if let Some(i) = index {
+            i
+        } else {
+            self.get_next_index()?
+        };
+
+        let adapter_name = format!("{:02}_{}", idx, name);
+        let adapter_path = self.adapters_dir.join(format!("{}.safetensors", adapter_name));
+
+        // Save configuration file
+        let config_path = self.adapters_dir.join(format!("{}.config.json", adapter_name));
+        let config_json = serde_json::to_string_pretty(&config)
+            .with_context(|| "Failed to serialize adapter config")?;
+        std::fs::write(&config_path, config_json)
+            .with_context(|| format!("Failed to write adapter config: {:?}", config_path))?;
+
+        // Create empty adapter file (weights will be added during training)
+        std::fs::File::create(&adapter_path)
+            .with_context(|| format!("Failed to create adapter file: {:?}", adapter_path))?;
+
+        Ok(adapter_path)
     }
 
     /// Load all adapter paths sorted by index
@@ -290,5 +310,9 @@ mod tests {
         let adapters_dir = model_path.join("adapters");
         assert!(adapters_dir.join("00_test.config.json").exists());
         assert!(adapters_dir.join("05_custom.config.json").exists());
+
+        // Verify adapter files were created
+        assert!(adapters_dir.join("00_test.safetensors").exists());
+        assert!(adapters_dir.join("05_custom.safetensors").exists());
     }
 }

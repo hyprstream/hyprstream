@@ -13,7 +13,7 @@ use hyprstream_core::cli::{
     DeviceConfig, DevicePreference, RuntimeConfig,
     handle_branch, handle_checkout, handle_status, handle_commit,
     handle_lora_train, handle_serve, handle_infer,
-    handle_push, handle_pull, handle_merge,
+    handle_push, handle_pull, handle_merge, handle_remove,
     handle_list, handle_info, handle_clone
 };
 use tracing::info;
@@ -464,6 +464,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     storage_paths.models_dir()?
                 ).await?;
                 handle_merge(&storage, &model, &branch, ff_only, no_ff).await
+            })?;
+        }
+        Commands::Remove { model, force, registry_only, files_only } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
+                let storage = hyprstream_core::storage::ModelStorage::create(
+                    storage_paths.models_dir()?
+                ).await?;
+                handle_remove(&storage, &model, force, registry_only, files_only).await
             })?;
         }
     };

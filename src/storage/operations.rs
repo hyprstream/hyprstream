@@ -15,42 +15,21 @@ pub struct ClonedModel {
     pub model_name: String,
 }
 
-/// Clone a model from a git repository
+/// Clone a model from a git repository using proper git submodule workflow
 ///
 /// This is the shared implementation used by both CLI and server
 pub async fn clone_model(
     repo_url: &str,
     git_ref: Option<&str>,
 ) -> Result<ClonedModel> {
+    // TODO: git_ref support for submodules (checkout specific branch/tag after clone)
+    if git_ref.is_some() {
+        tracing::warn!("git_ref not yet supported with submodule workflow, using default branch");
+    }
+
     // Get storage paths
     let storage_paths = StoragePaths::new()?;
     let models_dir = storage_paths.models_dir()?;
-
-    // Initialize XET storage for LFS processing (with default config)
-    let xet_storage = match XetNativeStorage::new(XetConfig::default()).await {
-        Ok(storage) => {
-            tracing::info!("XET storage initialized for LFS processing");
-            Some(Arc::new(storage))
-        }
-        Err(e) => {
-            tracing::warn!("Failed to initialize XET storage, LFS files will not be processed: {}", e);
-            None
-        }
-    };
-
-    // Initialize GitModelSource with optional XET storage
-    let git_source = if let Some(xet_storage) = xet_storage {
-        GitModelSource::new_with_xet(models_dir.clone(), xet_storage)
-    } else {
-        GitModelSource::new(models_dir.clone())
-    };
-
-    // Clone the model
-    let (model_id, model_path) = if let Some(ref_str) = git_ref {
-        git_source.clone_ref(repo_url, ref_str).await?
-    } else {
-        git_source.clone_model(repo_url).await?
-    };
 
     // Extract model name from URL
     let model_name = repo_url.split('/').last()
@@ -58,15 +37,21 @@ pub async fn clone_model(
         .trim_end_matches(".git")
         .to_string();
 
-    // Register with model storage
-    let model_storage = ModelStorage::create(models_dir).await?;
-    if let Err(e) = model_storage.register_with_git_registry(
-        &model_id,
-        &model_name,
-        Some(repo_url.to_string())
-    ).await {
-        tracing::warn!("Failed to register with Git registry: {}", e);
-    }
+    // Create model storage with registry
+    let model_storage = ModelStorage::create(models_dir.clone()).await?;
+    let registry = model_storage.registry();
+
+    // Use proper git submodule workflow
+    tracing::info!("Adding model {} as git submodule from {}", model_name, repo_url);
+    let model_ref = registry.add_model(&model_name, repo_url).await?;
+
+    // Get the model path (should exist after submodule add)
+    let model_path = registry.get_model_path(&model_ref).await?;
+
+    // Generate a model ID for compatibility
+    let model_id = ModelId::new();
+
+    tracing::info!("Successfully cloned model {} to {:?}", model_name, model_path);
 
     Ok(ClonedModel {
         model_id,
