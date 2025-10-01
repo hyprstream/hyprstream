@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
-use super::{GitManager, GitConfig, GitOperations, get_repository};
+use git2db::{GitManager, Git2DBConfig as GitConfig};
+use super::{GitOperations, get_repository};
 
 /// Information about a branch
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +59,7 @@ impl BranchManager {
     /// Get repository handle with caching
     fn get_repo(&self) -> Result<Repository> {
         self.git_manager.get_repository(&self.repo_path)
+            .map_err(|e| anyhow::anyhow!("Failed to get repository: {}", e))
     }
     
     /// Create a new UUID-based branch

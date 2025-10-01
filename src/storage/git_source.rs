@@ -7,7 +7,9 @@ use tracing::{info, debug, warn};
 
 use super::ModelId;
 use super::xet_native::XetNativeStorage;
-use crate::git::{GitManager, GitConfig, GitProgress, GitProgressInfo, GitError, CloneOptions};
+use git2db::{GitManager, Git2DBConfig as GitConfig, Git2DBError as GitError};
+use crate::git::{GitProgress, GitProgressInfo, CloneOptions};
+use git2::{ErrorClass, ErrorCode};
 
 /// Progress reporter implementation for git operations
 pub struct ModelCloneProgress {
@@ -30,9 +32,9 @@ impl GitProgress for ModelCloneProgress {
 
     fn on_error(&self, error: &GitError) {
         warn!("Git operation failed for {}: {} (class: {:?}, code: {:?})",
-              self.model_name, error.message, error.class, error.code);
+              self.model_name, error.message(), error.class().unwrap_or(ErrorClass::None), error.code().unwrap_or(ErrorCode::GenericError));
 
-        if error.retry_suggested {
+        if error.retry_suggested() {
             info!("Error may be retryable for {}", self.model_name);
         }
     }
@@ -55,8 +57,8 @@ impl GitModelSource {
     /// Create a new Git model source
     pub fn new(cache_dir: PathBuf) -> Self {
         let git_config = GitConfig {
-            prefer_shallow: true,
-            shallow_depth: Some(1),
+            repository: git2db::config::RepositoryConfig { prefer_shallow: true,
+            shallow_depth: Some(1), ..Default::default() },
             ..Default::default()
         };
 
@@ -79,8 +81,8 @@ impl GitModelSource {
     /// Create a new Git model source with XET storage for LFS processing
     pub fn new_with_xet(cache_dir: PathBuf, xet_storage: Arc<XetNativeStorage>) -> Self {
         let git_config = GitConfig {
-            prefer_shallow: true,
-            shallow_depth: Some(1),
+            repository: git2db::config::RepositoryConfig { prefer_shallow: true,
+            shallow_depth: Some(1), ..Default::default() },
             ..Default::default()
         };
 
@@ -154,11 +156,11 @@ impl GitModelSource {
         };
 
         // Clone repository directly (retry logic is handled internally by GitManager)
+        // Note: progress callback not yet supported in git2db
         let repository = self.git_manager.clone_repository(
             repo_url,
             &model_path,
-            clone_options,
-            progress
+            None,
         ).await.map_err(|e| {
             warn!("Failed to clone {} after retries: {}", repo_url, e);
             e

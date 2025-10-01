@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use crate::storage::ModelId;
-use crate::git::{GitModelRegistry, GitManager, GitConfig, CloneOptions};
+use git2db::{Git2DB as GitModelRegistry, GitManager, Git2DBConfig as GitConfig};
+use crate::git::CloneOptions;
 
 /// Shareable reference to a model or adapter
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,7 +71,7 @@ impl ModelSharing {
         let git_manager = Arc::new(GitManager::new(git_config));
 
         // Try to initialize Git registry
-        let registry = match GitModelRegistry::init(base_dir.clone()).await {
+        let registry = match GitModelRegistry::open(base_dir.clone()).await {
             Ok(reg) => Some(reg),
             Err(e) => {
                 tracing::warn!("Failed to initialize Git registry: {}", e);
@@ -93,7 +94,7 @@ impl ModelSharing {
     ) -> Result<ShareableModelRef> {
         // Try to find model in registry first
         if let Some(registry) = self.registry.read().await.as_ref() {
-            if let Some(model) = registry.get_model_by_name(model_name) {
+            if let Some(model) = registry.get_artifact_by_name(model_name) {
                 return self.create_ref_from_registry(model_name, model, include_metrics).await;
             }
         }
@@ -106,10 +107,10 @@ impl ModelSharing {
     async fn create_ref_from_registry(
         &self,
         name: &str,
-        model: &crate::git::registry::RegisteredModel,
+        model: &crate::git::RegisteredModel,
         include_metrics: bool,
     ) -> Result<ShareableModelRef> {
-        let model_path = self.base_dir.join(model.uuid.to_string());
+        let model_path = self.base_dir.join(model.uuid().to_string());
         
         // Open Git repository (with caching)
         let repo = self.git_manager.get_repository(&model_path)
@@ -244,7 +245,7 @@ impl ModelSharing {
         };
 
         let repo = self.git_manager
-            .clone_repository(git_url, &target_dir, clone_options, None)
+            .clone_repository(git_url, &target_dir, None)
             .await
             .context("Failed to clone shared model")?;
 
@@ -259,10 +260,11 @@ impl ModelSharing {
         
         // Register with local registry if available
         if let Some(registry) = self.registry.write().await.as_mut() {
+            let git2db_model_id = git2db::ModelId::from_uuid(model_id.0);
             registry.register_model(
-                &model_id,
+                &git2db_model_id,
                 &name,
-                Some(git_url.to_string())
+                Some(git_url.to_string()),
             ).await?;
         }
         

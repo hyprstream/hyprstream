@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use uuid::Uuid;
 use chrono::Utc;
-use crate::git::{BranchManager, GitManager};
+use git2db::GitManager;
+use crate::git::BranchManager;
 use crate::storage::{XetNativeStorage, XetConfig};
 use std::sync::Arc;
 use thiserror::Error;
@@ -107,7 +108,7 @@ impl AdapterStorage {
         fs::create_dir_all(&working_dir).await?;
         
         // Try to initialize Git registry
-        let registry = match crate::git::GitModelRegistry::init(base_dir.clone()).await {
+        let registry = match crate::git::GitModelRegistry::open(base_dir.clone()).await {
             Ok(reg) => Some(reg),
             Err(e) => {
                 tracing::warn!("Failed to initialize Git registry for adapters: {}", e);
@@ -219,11 +220,13 @@ impl AdapterStorage {
         if let Some(registry) = self.registry.write().await.as_mut() {
             // Extract UUID from base model path
             if let Some(base_model_uuid_str) = base_model_path.file_name().and_then(|n| n.to_str()) {
-                if let Ok(base_model_uuid) = Uuid::parse_str(base_model_uuid_str) {
-                    if let Err(e) = registry.register_adapter(
-                        &base_model_uuid,
+                if let Ok(_base_model_uuid) = Uuid::parse_str(base_model_uuid_str) {
+                    // Register adapter as a model
+                    let adapter_id = git2db::ModelId::from_uuid(branch_info.uuid);
+                    if let Err(e) = registry.register_model(
+                        &adapter_id,
                         adapter_name,
-                        branch_info.uuid,
+                        None,
                     ).await {
                         tracing::warn!("Failed to register adapter with Git registry: {}", e);
                     }
@@ -468,8 +471,8 @@ impl AdapterStorage {
         
         // Try to resolve via registry
         if let Some(registry) = self.registry.read().await.as_ref() {
-            if let Some(model) = registry.get_model_by_name(base_model) {
-                let path = self.base_dir.join(model.uuid.to_string());
+            if let Some(model) = registry.get_artifact_by_name(base_model) {
+                let path = self.base_dir.join(model.uuid().to_string());
                 if path.exists() {
                     return Ok(path);
                 }

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn, debug, instrument};
-use crate::git::{GitManager, GitConfig};
+use git2db::{GitManager, Git2DBConfig as GitConfig};
 
 use crate::runtime::{TorchEngine, RuntimeConfig, RuntimeEngine};
 use crate::storage::{ModelRef, SharedModelRegistry};

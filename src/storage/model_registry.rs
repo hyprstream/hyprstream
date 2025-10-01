@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
 use tokio::sync::RwLock;
-use crate::git::{GitManager, GitConfig};
+use git2db::{GitManager, Git2DBConfig as GitConfig};
 
 use super::model_ref::{ModelRef, validate_model_name};
 use super::xet_native::XetNativeStorage;
