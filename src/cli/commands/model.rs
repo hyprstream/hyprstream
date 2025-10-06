@@ -1,5 +1,6 @@
 //! Model management CLI commands
 
+use crate::cli::DeviceConfig;
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 
@@ -246,7 +247,6 @@ pub enum CacheAction {
 impl ModelAction {
     /// Returns the device configuration for this action
     pub fn device_config(&self) -> crate::cli::DeviceConfig {
-        use crate::cli::DeviceConfig;
         match self {
             ModelAction::Infer { .. } => DeviceConfig::request_gpu(),
             _ => DeviceConfig::request_cpu(),

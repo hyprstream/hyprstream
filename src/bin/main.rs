@@ -2,28 +2,40 @@
 //!
 //! This binary provides the main entry point for the Hyprstream service.
 
+// Standard library imports
+use anyhow::{Context as _, Result};
 use clap::Parser;
-use config::Config;
+use tracing::info;
+
+// Core application imports
 use hyprstream_core::cli::commands::Commands;
-use hyprstream_core::cli::handlers::{
-    handle_server, handle_model_command,
-    handle_chat_command
-};
 use hyprstream_core::cli::{
-    DeviceConfig, DevicePreference, RuntimeConfig,
+    AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
     handle_branch, handle_checkout, handle_status, handle_commit,
     handle_lora_train, handle_serve, handle_infer,
     handle_push, handle_pull, handle_merge, handle_remove,
     handle_list, handle_info, handle_clone
 };
-use tracing::info;
+use hyprstream_core::cli::handlers::{
+    handle_server, handle_model_command, handle_chat_command
+};
+use hyprstream_core::config::HyprConfig;
+use hyprstream_core::storage::{ModelRef, GitRef};
+// Tracing imports (feature-gated)
+#[cfg(feature = "otel")]
+use opentelemetry::KeyValue;
+#[cfg(feature = "otel")]
+use opentelemetry::trace::TracerProvider;
+#[cfg(feature = "otel")]
+use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+#[cfg(feature = "otel")]
+use opentelemetry_sdk::Resource;
+#[cfg(feature = "otel")]
+use tracing_opentelemetry::OpenTelemetryLayer;
 #[cfg(feature = "otel")]
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 #[cfg(not(feature = "otel"))]
 use tracing_subscriber::EnvFilter;
-
-#[cfg(feature = "otel")]
-use tracing_opentelemetry::OpenTelemetryLayer;
 
 #[derive(Parser)]
 #[command(
@@ -33,16 +45,41 @@ use tracing_opentelemetry::OpenTelemetryLayer;
     long_about = None
 )]
 struct Cli {
+    /// Path to configuration file (overrides default config locations)
+    #[arg(long, global = true, env = "HYPRSTREAM_CONFIG")]
+    config: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
 
 
+/// Load HyprConfig from file path or default locations
+fn load_config(path: Option<&std::path::Path>) -> Result<HyprConfig> {
+    match path {
+        Some(p) => {
+            info!("Loading config from: {}", p.display());
+            HyprConfig::from_file(p)
+                .with_context(|| format!("Failed to load config from {}", p.display()))
+        }
+        None => {
+            info!("Loading config from default locations");
+            match HyprConfig::load() {
+                Ok(config) => Ok(config),
+                Err(e) => {
+                    info!("No config file found ({}), using defaults", e);
+                    Ok(HyprConfig::default())
+                }
+            }
+        }
+    }
+}
+
 /// Execute a command with the appropriate runtime configuration
-fn with_runtime<F, Fut>(config: RuntimeConfig, handler: F) -> Result<(), Box<dyn std::error::Error>>
+fn with_runtime<F, Fut>(config: RuntimeConfig, handler: F) -> Result<()>
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
+    Fut: std::future::Future<Output = Result<()>>,
 {
     // Check GPU availability early if required
     if matches!(config.device.preference, DevicePreference::RequireGPU) {
@@ -52,7 +89,7 @@ where
            std::env::var("HIP_VISIBLE_DEVICES").is_err() &&
            !std::path::Path::new("/usr/local/cuda").exists() &&
            !std::path::Path::new("/opt/rocm").exists() {
-            return Err("GPU required but no CUDA or ROCm installation detected. Set CUDA_VISIBLE_DEVICES or HIP_VISIBLE_DEVICES, or install CUDA/ROCm.".into());
+            anyhow::bail!("GPU required but no CUDA or ROCm installation detected. Set CUDA_VISIBLE_DEVICES or HIP_VISIBLE_DEVICES, or install CUDA/ROCm.");
         }
     }
 
@@ -69,32 +106,35 @@ where
     // Create appropriate runtime
     if config.multi_threaded {
         // Multi-threaded runtime for GPU workloads and server
-        let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(handler())?;
+        let rt = tokio::runtime::Runtime::new()
+            .context("Failed to create multi-threaded runtime")?;
+        rt.block_on(handler())
     } else {
         // Single-threaded runtime for lightweight operations
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .build()?;
-        rt.block_on(handler())?;
+            .build()
+            .context("Failed to create single-threaded runtime")?;
+        rt.block_on(handler())
     }
-    Ok(())
 }
 
 /// Server command handler - requires multi-threaded runtime for GPU
-fn handle_server_cmd(config: Config) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> {
-    async move { handle_server(config).await }
+async fn handle_server_cmd(ctx: AppContext) -> Result<()> {
+    handle_server(ctx).await
+        .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
 /// Model command handler - GPU requirements depend on action
-fn handle_model_cmd(cmd: hyprstream_core::cli::commands::model::ModelCommand, server_url: String) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> {
-    async move { handle_model_command(cmd, server_url).await }
+async fn handle_model_cmd(cmd: hyprstream_core::cli::commands::model::ModelCommand, server_url: String) -> Result<()> {
+    handle_model_command(cmd, server_url).await
+        .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
-
 /// Chat command handler - requires multi-threaded runtime for GPU
-fn handle_chat_cmd(cmd: hyprstream_core::cli::commands::chat::ChatCommand, server_url: String) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> {
-    async move { handle_chat_command(cmd, server_url).await }
+async fn handle_chat_cmd(cmd: hyprstream_core::cli::commands::chat::ChatCommand, server_url: String) -> Result<()> {
+    handle_chat_command(cmd, server_url).await
+        .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
 #[cfg(feature = "otel")]
@@ -109,14 +149,11 @@ enum TelemetryProvider {
 
 #[cfg(feature = "otel")]
 /// Initialize OpenTelemetry with the specified provider
-fn init_telemetry(provider: TelemetryProvider) -> Result<(), Box<dyn std::error::Error>> {
-    use opentelemetry_sdk::Resource;
-
+fn init_telemetry(provider: TelemetryProvider) -> Result<()> {
     let service_name = std::env::var("OTEL_SERVICE_NAME")
         .unwrap_or_else(|_| "hyprstream".to_string());
 
     // Create resource with service information
-    use opentelemetry::KeyValue;
     let resource = Resource::builder()
         .with_service_name(service_name.clone())
         .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
@@ -127,8 +164,6 @@ fn init_telemetry(provider: TelemetryProvider) -> Result<(), Box<dyn std::error:
 
     let tracer_provider = match provider {
         TelemetryProvider::Otlp => {
-            use opentelemetry_otlp::{SpanExporter, WithExportConfig};
-
             let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://localhost:4317".to_string());
 
@@ -138,7 +173,7 @@ fn init_telemetry(provider: TelemetryProvider) -> Result<(), Box<dyn std::error:
                 .with_tonic()
                 .with_endpoint(endpoint)
                 .build()
-                .map_err(|e| format!("Failed to create OTLP exporter: {}", e))?;
+                .context("Failed to create OTLP exporter")?;
 
             opentelemetry_sdk::trace::SdkTracerProvider::builder()
                 .with_resource(resource.clone())
@@ -156,7 +191,6 @@ fn init_telemetry(provider: TelemetryProvider) -> Result<(), Box<dyn std::error:
     };
 
     // Get tracer
-    use opentelemetry::trace::TracerProvider;
     let tracer = tracer_provider.tracer("hyprstream");
 
     // Setup tracing subscriber with OpenTelemetry layer
@@ -187,9 +221,19 @@ fn init_telemetry(provider: TelemetryProvider) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<()> {
     // Parse CLI arguments
     let cli = Cli::parse();
+
+    // Load configuration early
+    let config = load_config(cli.config.as_deref())?;
+
+    // Validate configuration
+    config.validate()
+        .context("Configuration validation failed")?;
+
+    // Create application context
+    let ctx = AppContext::new(config);
 
     #[cfg(feature = "otel")]
     {
@@ -252,17 +296,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Handle commands with appropriate runtime configuration
     match cli.command {
         Commands::Server(_cmd) => {
-            let config = Config::builder()
-                .set_default("host", "127.0.0.1")?
-                .set_default("port", "50051")?
-                .build()?;
-
+            let ctx = ctx.clone();
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_gpu(),
                     multi_threaded: true
                 },
-                || handle_server_cmd(config)
+                || handle_server_cmd(ctx)
             )?
         }
         Commands::Model(cmd) => {
@@ -292,86 +332,91 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Phase 1: Git-style commands
         Commands::Branch { model, name, from } => {
-            // Create ModelStorage for git operations
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async {
-                let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
-                let storage = hyprstream_core::storage::ModelStorage::create(
-                    storage_paths.models_dir()?
-                ).await?;
-                handle_branch(&storage, &model, &name, from).await
-            })?;
+            let ctx = ctx.clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: false,
+                },
+                || async move {
+                    let storage = ctx.storage().await?;
+                    handle_branch(storage, &model, &name, from).await
+                }
+            )?;
         }
 
         Commands::Checkout { model, git_ref, create_branch, force } => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async {
-                let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
-                let storage = hyprstream_core::storage::ModelStorage::create(
-                    storage_paths.models_dir()?
-                ).await?;
+            let ctx = ctx.clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: false,
+                },
+                || async move {
+                    let storage = ctx.storage().await?;
 
-                // Build ModelRef from separate components
-                use hyprstream_core::storage::{ModelRef, GitRef};
-                let git_ref_parsed = match git_ref {
-                    Some(ref r) => GitRef::parse(r, None)?,
-                    None => GitRef::DefaultBranch,
-                };
-                let model_ref = ModelRef::with_ref(model, git_ref_parsed);
+                    // Build ModelRef from separate components
+                    let git_ref_parsed = match git_ref {
+                        Some(ref r) => GitRef::parse(r, None)?,
+                        None => GitRef::DefaultBranch,
+                    };
+                    let model_ref = ModelRef::with_ref(model, git_ref_parsed);
 
-                handle_checkout(&storage, &model_ref.to_string(), create_branch, force).await
-            })?;
+                    handle_checkout(storage, &model_ref.to_string(), create_branch, force).await
+                }
+            )?;
         }
 
         Commands::Status { model, verbose } => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async {
-                let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
-                let storage = hyprstream_core::storage::ModelStorage::create(
-                    storage_paths.models_dir()?
-                ).await?;
-                handle_status(&storage, model, verbose).await
-            })?;
+            let ctx = ctx.clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: false,
+                },
+                || async move {
+                    let storage = ctx.storage().await?;
+                    handle_status(storage, model, verbose).await
+                }
+            )?;
         }
 
         Commands::Commit { model, message, all } => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async {
-                let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
-                let storage = hyprstream_core::storage::ModelStorage::create(
-                    storage_paths.models_dir()?
-                ).await?;
-                handle_commit(&storage, &model, &message, all).await
-            })?;
+            let ctx = ctx.clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: false,
+                },
+                || async move {
+                    let storage = ctx.storage().await?;
+                    handle_commit(storage, &model, &message, all).await
+                                        }
+            )?;
         }
 
         Commands::LoraTrain { model, adapter, index, rank, learning_rate,
                               batch_size, epochs, data, interactive, config } => {
+            let ctx = ctx.clone();
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_gpu(),
                     multi_threaded: true
                 },
-                || async {
-                    let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
-                    let storage = hyprstream_core::storage::ModelStorage::create(
-                        storage_paths.models_dir()?
-                    ).await?;
-                    handle_lora_train(&storage, &model, adapter, index, rank, learning_rate,
+                || async move {
+                    let storage = ctx.storage().await?;
+                    handle_lora_train(storage, &model, adapter, index, rank, learning_rate,
                                      batch_size, epochs, data, interactive, config).await
-                        .map_err(|e| e.into())
-                }
+                                        }
             )?;
         }
 
         Commands::FineTune { model, config } => {
-            println!("Fine-tuning not yet implemented for model: {}", model);
-            println!("Config: {:?}", config);
+            anyhow::bail!("Fine-tuning is not yet implemented. Model: {}, Config: {:?}", model, config);
         }
 
         Commands::PreTrain { model, config } => {
-            println!("Pre-training not yet implemented for model: {}", model);
-            println!("Config: {:?}", config);
+            anyhow::bail!("Pre-training is not yet implemented. Model: {}, Config: {:?}", model, config);
         }
 
         Commands::Serve { model, port, host } => {
@@ -385,96 +430,114 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Infer { model, prompt, max_tokens, temperature, top_p, top_k, stream, force_download } => {
+            let ctx = ctx.clone();
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_gpu(),
                     multi_threaded: true
                 },
-                || async {
-                    let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
-                    let storage = hyprstream_core::storage::ModelStorage::create(
-                        storage_paths.models_dir()?
-                    ).await?;
-                    handle_infer(&storage, &model, &prompt, max_tokens, temperature, top_p, top_k, stream, force_download).await
-                        .map_err(|e| e.into())
-                }
+                || async move {
+                    let storage = ctx.storage().await?;
+                    handle_infer(storage, &model, &prompt, max_tokens, temperature, top_p, top_k, stream, force_download).await
+                                        }
             )?;
         }
 
         Commands::List { branch, tag, dirty, verbose } => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async {
-                let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
-                let storage = hyprstream_core::storage::ModelStorage::create(
-                    storage_paths.models_dir()?
-                ).await?;
-                handle_list(&storage, branch, tag, dirty, verbose).await
-            })?;
+            let ctx = ctx.clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: false,
+                },
+                || async move {
+                    let storage = ctx.storage().await?;
+                    handle_list(storage, branch, tag, dirty, verbose).await
+                                        }
+            )?;
         }
 
         Commands::Inspect { model, verbose, adapters_only } => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async {
-                let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
-                let storage = hyprstream_core::storage::ModelStorage::create(
-                    storage_paths.models_dir()?
-                ).await?;
-                handle_info(&storage, &model, verbose, adapters_only).await
-            })?;
+            let ctx = ctx.clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: false,
+                },
+                || async move {
+                    let storage = ctx.storage().await?;
+                    handle_info(storage, &model, verbose, adapters_only).await
+                                        }
+            )?;
         }
 
         Commands::Clone { repo_url, name } => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async {
-                let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
-                let storage = hyprstream_core::storage::ModelStorage::create(
-                    storage_paths.models_dir()?
-                ).await?;
-                handle_clone(&storage, &repo_url, name).await
-            })?;
+            let ctx = ctx.clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: false,
+                },
+                || async move {
+                    let storage = ctx.storage().await?;
+                    handle_clone(storage, &repo_url, name).await
+                                        }
+            )?;
         }
 
         Commands::Push { model, remote, branch, set_upstream, force } => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async {
-                let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
-                let storage = hyprstream_core::storage::ModelStorage::create(
-                    storage_paths.models_dir()?
-                ).await?;
-                handle_push(&storage, &model, remote, branch, set_upstream, force).await
-            })?;
+            let ctx = ctx.clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: false,
+                },
+                || async move {
+                    let storage = ctx.storage().await?;
+                    handle_push(storage, &model, remote, branch, set_upstream, force).await
+                                        }
+            )?;
         }
 
         Commands::Pull { model, remote, branch, rebase } => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async {
-                let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
-                let storage = hyprstream_core::storage::ModelStorage::create(
-                    storage_paths.models_dir()?
-                ).await?;
-                handle_pull(&storage, &model, remote, branch, rebase).await
-            })?;
+            let ctx = ctx.clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: false,
+                },
+                || async move {
+                    let storage = ctx.storage().await?;
+                    handle_pull(storage, &model, remote, branch, rebase).await
+                                        }
+            )?;
         }
 
         Commands::Merge { model, branch, ff_only, no_ff } => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async {
-                let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
-                let storage = hyprstream_core::storage::ModelStorage::create(
-                    storage_paths.models_dir()?
-                ).await?;
-                handle_merge(&storage, &model, &branch, ff_only, no_ff).await
-            })?;
+            let ctx = ctx.clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: false,
+                },
+                || async move {
+                    let storage = ctx.storage().await?;
+                    handle_merge(storage, &model, &branch, ff_only, no_ff).await
+                                        }
+            )?;
         }
         Commands::Remove { model, force, registry_only, files_only } => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async {
-                let storage_paths = hyprstream_core::storage::StoragePaths::new()?;
-                let storage = hyprstream_core::storage::ModelStorage::create(
-                    storage_paths.models_dir()?
-                ).await?;
-                handle_remove(&storage, &model, force, registry_only, files_only).await
-            })?;
+            let ctx = ctx.clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: false,
+                },
+                || async move {
+                    let storage = ctx.storage().await?;
+                    handle_remove(storage, &model, force, registry_only, files_only).await
+                                        }
+            )?;
         }
     };
 

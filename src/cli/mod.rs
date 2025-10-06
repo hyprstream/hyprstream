@@ -9,7 +9,9 @@
 pub mod commands;
 pub mod handlers;
 pub mod git_handlers;
+pub mod context;
 
+pub use context::AppContext;
 pub use handlers::{handle_config, handle_server, handle_model_command, handle_chat_command};
 pub use git_handlers::{
     handle_branch, handle_checkout, handle_status, handle_commit,

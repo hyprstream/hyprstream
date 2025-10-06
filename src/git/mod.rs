@@ -12,8 +12,9 @@ pub use git2db::{Git2DB as GitModelRegistry, RegisteredModel};
 
 // Hyprstream-specific types and traits
 use anyhow::Result;
+use git2::{Repository, Signature, FetchOptions, RemoteCallbacks};
+use git2::build::CheckoutBuilder;
 use std::path::Path;
-use git2::{Repository, Signature};
 use std::sync::Arc;
 use git2db::{GitManager, Git2DBError as GitError};
 
@@ -55,7 +56,6 @@ pub trait GitOperations {
 
 impl GitOperations for Repository {
     fn fetch_with_progress(&self, _progress: Option<Arc<dyn GitProgress>>) -> Result<()> {
-        use git2::{FetchOptions, RemoteCallbacks};
         let mut remote = self.find_remote("origin")?;
         let mut fetch_opts = FetchOptions::new();
         let callbacks = RemoteCallbacks::new();
@@ -75,7 +75,6 @@ impl GitOperations for Repository {
     }
 
     fn checkout_branch(&self, name: &str) -> Result<()> {
-        use git2::build::CheckoutBuilder;
         let obj = self.revparse_single(name)?;
         self.checkout_tree(&obj, Some(CheckoutBuilder::default().force()))?;
         self.set_head(&format!("refs/heads/{}", name))?;

@@ -153,11 +153,11 @@ async fn download_model(
     };
     
     // Use shared operation
-    match crate::storage::operations::clone_model(&request.uri, None).await {
+    match crate::storage::operations::clone_model(&request.uri, request.name.as_deref(), None).await {
         Ok(cloned) => {
             Json(DownloadModelResponse {
                 id: cloned.model_id.to_string(),
-                name: request.name.unwrap_or_else(|| cloned.model_name),
+                name: cloned.model_name,
                 status: "downloaded".to_string(),
                 path: cloned.model_path.to_string_lossy().to_string(),
             }).into_response()

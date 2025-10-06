@@ -1,7 +1,7 @@
 //! Advanced model reference type for git-native model management
 
 use anyhow::{Result, bail};
-use serde::{Deserialize, Serialize, Deserializer, Serializer};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use git2::{Oid, Repository};
 use std::fmt;

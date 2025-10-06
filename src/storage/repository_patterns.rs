@@ -100,11 +100,24 @@ impl RepositoryHandle {
     /// Get submodule information without lifetime issues
     pub fn get_submodule_info(&self, path: &str) -> Result<Option<SubmoduleInfo>> {
         self.with_submodule(path, |submodule| {
+            // Try to get index_id, but provide fallback if not available
+            let index_id = submodule.index_id().or_else(|| {
+                // Fallback: try to get HEAD commit from submodule repository
+                if let Ok(submodule_repo) = submodule.open() {
+                    if let Ok(head) = submodule_repo.head() {
+                        if let Ok(commit) = head.peel_to_commit() {
+                            return Some(commit.id());
+                        }
+                    }
+                }
+                None
+            });
+
             Ok(SubmoduleInfo {
                 name: submodule.name().map(String::from),
                 path: submodule.path().to_path_buf(),
                 url: submodule.url().map(String::from),
-                index_id: submodule.index_id(),
+                index_id,
                 head_id: submodule.head_id(),
             })
         })

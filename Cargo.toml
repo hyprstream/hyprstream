@@ -54,7 +54,7 @@ config = { version = "0.13", features = ["toml", "yaml", "json"] }
 toml = "0.8"
 serde_yaml = "0.9"
 git2 = "0.19"  # Still needed by git2db internally
-git2db = { path = "../git2db", features = ["gittorrent-transport"] }  # High-level git library
+git2db = { path = "../git2db" }  # High-level git library
 gittorrent = { path = "../gittorrent-rs", optional = true }  # P2P transport
 clap = { version = "4.4", features = ["derive", "env"] }
 tracing = "0.1"
@@ -136,10 +136,10 @@ half = "2.6.0"
 shellexpand = "3.1.1"
 
 [features]
-default = []
+default = ["gittorrent"]
 cuda = []
 otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:opentelemetry-semantic-conventions", "dep:opentelemetry-stdout"]
-gittorrent = ["dep:gittorrent"]  # Enable P2P model sharing via gittorrent transport
+gittorrent = ["dep:gittorrent", "git2db/gittorrent-transport"]  # Enable P2P model sharing via gittorrent transport
 
 [build-dependencies]
 cc = "1.0"

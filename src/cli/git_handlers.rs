@@ -1,9 +1,14 @@
 //! Handlers for git-style CLI commands
 
 use anyhow::Result;
-use tracing::info;
-
+use crate::cli::commands::model::GitInfo;
+use crate::config::GenerationRequest;
+use crate::runtime::{TorchEngine, RuntimeConfig, RuntimeEngine};
+use crate::runtime::sampling::{SamplingConfig, load_sampling_config};
+use crate::runtime::template_engine::ChatMessage;
 use crate::storage::{ModelStorage, ModelRef, CheckoutOptions};
+use std::io::{self, Write};
+use tracing::info;
 
 /// Handle branch command
 pub async fn handle_branch(
@@ -403,7 +408,6 @@ pub async fn handle_list(
     dirty: bool,
     verbose: bool,
 ) -> Result<()> {
-    use crate::cli::commands::model::GitInfo;
 
     info!("Listing models");
 
@@ -528,15 +532,7 @@ pub async fn handle_clone(
     println!("📦 Cloning model from: {}", repo_url);
 
     // Use the existing working implementation that handles LFS properly
-    let cloned = crate::storage::operations::clone_model(repo_url, None).await?;
-
-    // If user provided a custom name, inform them of the actual name used
-    if let Some(custom_name) = name {
-        if custom_name != cloned.model_name {
-            println!("ℹ️  Model cloned as '{}' (derived from URL)", cloned.model_name);
-            println!("    Custom naming will be supported in a future update");
-        }
-    }
+    let cloned = crate::storage::operations::clone_model(repo_url, name.as_deref(), None).await?;
 
     println!("✅ Model '{}' cloned successfully!", cloned.model_name);
     println!("   Model ID: {}", cloned.model_id);
@@ -731,11 +727,6 @@ pub async fn handle_infer(
     stream: bool,
     _force_download: bool,
 ) -> Result<()> {
-    use crate::runtime::{TorchEngine, RuntimeConfig, RuntimeEngine};
-    use crate::runtime::sampling::{SamplingConfig, load_sampling_config};
-    use crate::runtime::template_engine::ChatMessage;
-    use crate::config::GenerationRequest;
-    use std::io::{self, Write};
 
     info!("Running base model inference: model={}, prompt_len={}", model_ref_str, prompt.len());
 
@@ -1109,7 +1100,6 @@ pub async fn handle_remove(
     registry_only: bool,
     files_only: bool,
 ) -> Result<()> {
-    use std::io::{self, Write};
 
     info!("Removing model {}", model);
 

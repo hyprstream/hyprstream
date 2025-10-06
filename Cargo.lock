@@ -1021,6 +1021,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "config"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68578f196d2a33ff61b27fae256c3164f65e36382648e30666dde05b8cc9dfdf"
+dependencies = [
+ "nom",
+ "pathdiff",
+ "serde",
+ "serde_json",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "console"
 version = "0.15.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2159,6 +2172,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "config 0.14.1",
  "dashmap",
  "git2",
  "gittorrent",
@@ -2186,7 +2200,7 @@ dependencies = [
  "bytes",
  "clap",
  "colored",
- "config",
+ "config 0.13.4",
  "dirs 5.0.1",
  "ed25519-dalek",
  "futures",
@@ -2652,7 +2666,7 @@ dependencies = [
  "chrono",
  "chunk_cache",
  "clap",
- "config",
+ "config 0.13.4",
  "criterion",
  "cxx",
  "cxx-build",

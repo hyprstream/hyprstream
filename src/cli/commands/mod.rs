@@ -4,7 +4,7 @@ pub mod model;
 pub mod chat;
 pub mod git;
 
-pub use server::{CacheConfig, EngineConfig, ServerCommand, ServerConfig};
+pub use server::{ServerCommand, ServerCliArgs};
 pub use model::ModelCommand;
 pub use chat::ChatCommand;
 pub use git::{GitCommand, GitAction};

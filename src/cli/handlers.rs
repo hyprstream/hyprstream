@@ -1,16 +1,22 @@
 //! CLI handlers for adaptive ML inference server
 
-use crate::runtime::{RuntimeEngine, TorchEngine};
+use crate::cli::commands::model::ModelAction;
+use crate::config::RuntimeConfig;
+use crate::git::BranchManager;
+use crate::runtime::{RuntimeEngine, TorchEngine, InferenceExt};
+use crate::runtime::sampling::{SamplingConfig, load_sampling_config};
+use crate::runtime::template_engine::ChatMessage;
+use crate::storage::{ModelStorage, ModelMetadata};
+use crate::training::{CheckpointManager, WeightSnapshot, WeightFormat};
 use ::config::{Config, File};
-use std::{
-    net::SocketAddr,
-    path::{Path, PathBuf},
-};
+use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::io::{self, BufRead, Write};
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
-use crate::storage::{ModelStorage, ModelMetadata};
-use crate::git;
 
 /// Response structure for LoRA inference
 #[derive(Debug, Clone)]
@@ -88,78 +94,43 @@ pub async fn execute_sparse_query(
 
 
 pub async fn handle_server(
-    config: Config,
+    ctx: crate::cli::AppContext,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Check environment variable first, then config, then default to 0.0.0.0
-    let host = std::env::var("HYPRSTREAM_SERVER_HOST")
-        .unwrap_or_else(|_| config.get_string("host")
-            .unwrap_or_else(|_| "0.0.0.0".to_string()));
-    
-    let port = std::env::var("HYPRSTREAM_SERVER_PORT")
-        .unwrap_or_else(|_| config.get_string("port")
-            .unwrap_or_else(|_| "50051".to_string()));
-    
-    let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
-    
-    // Create server configuration from environment variables and config file
-    let mut server_config = crate::server::state::ServerConfig::from_env();
-    
-    // Override with config file values if present
-    if let Ok(preload_models) = config.get_array("server.preload_models") {
-        server_config.preload_models = preload_models
-            .into_iter()
-            .filter_map(|v| v.into_string().ok())
-            .collect();
-    }
-    if let Ok(enable_logging) = config.get_bool("server.enable_logging") {
-        server_config.enable_logging = enable_logging;
-    }
-    if let Ok(enable_metrics) = config.get_bool("server.enable_metrics") {
-        server_config.enable_metrics = enable_metrics;
-    }
-    if let Ok(api_key) = config.get_string("server.api_key") {
-        server_config.api_key = Some(api_key);
-    }
-    if let Ok(max_tokens_limit) = config.get_int("server.max_tokens_limit") {
-        server_config.max_tokens_limit = max_tokens_limit as usize;
-    }
-    if let Ok(request_timeout_secs) = config.get_int("server.request_timeout_secs") {
-        server_config.request_timeout_secs = request_timeout_secs as u64;
-    }
-    
-    // CORS permissive headers from config
-    if let Ok(permissive) = config.get_bool("server.cors_permissive_headers") {
-        server_config.cors.permissive_headers = permissive;
-    }
-    
-    // Update CORS to include the actual server address if not using wildcard
-    if !server_config.cors.allowed_origins.contains(&"*".to_string()) {
-        // Add the actual listening address to allowed origins
-        server_config.cors.allowed_origins.push(format!("http://{}", addr));
-        // If listening on 0.0.0.0, also add localhost variants with the port
-        if host == "0.0.0.0" {
-            server_config.cors.allowed_origins.extend(vec![
-                format!("http://localhost:{}", port),
-                format!("http://127.0.0.1:{}", port),
-            ]);
+    let config = ctx.config();
+
+    // Clone git2db config and set DHT mode to Server for full P2P participation
+    let git2db_config = {
+        let mut cfg = config.git2db.clone();
+
+        #[cfg(feature = "gittorrent")]
+        {
+            cfg.gittorrent.dht_mode = gittorrent::DhtMode::Server;
+            info!("DHT mode set to Server for full P2P participation");
         }
-    }
-    
-    // Create server state
-    let server_state = crate::server::state::ServerState::new(server_config).await?;
-    
+
+        cfg
+    };
+
+    // Use server config from HyprConfig
+    let server_config = config.server.clone();
+
+    // Get host and port for addr binding
+    let host = &server_config.host;
+    let port = server_config.port;
+    let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
+
+    // Create server state with git2db config (DHT mode set to Server)
+    let server_state = crate::server::state::ServerState::new_with_git2db(
+        server_config,
+        git2db_config
+    ).await?;
+
     info!("Starting Hyprstream HTTP server on {}", addr);
     info!("OpenAI-compatible API available at http://{}/oai/v1", addr);
-    
-    // Check for TLS configuration
-    if config.get_bool("tls.enabled").unwrap_or(false) {
-        let cert_path = config.get_string("tls.cert_path")?;
-        let key_path = config.get_string("tls.key_path")?;
-        crate::server::start_server_tls(addr, server_state, &cert_path, &key_path).await?;
-    } else {
-        crate::server::start_server(addr, server_state).await?;
-    }
-    
+
+    // Start server (TLS configuration would come from config.server.tls if needed)
+    crate::server::start_server(addr, server_state).await?;
+
     Ok(())
 }
 
@@ -234,7 +205,6 @@ pub async fn handle_model_command(
     cmd: crate::cli::commands::ModelCommand,
     _server_url: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::cli::commands::model::ModelAction;
     
     match cmd.action {
         ModelAction::List {
@@ -393,9 +363,10 @@ pub async fn handle_model_command(
         ModelAction::Clone { repo_url, git_ref, model_id: _ } => {
             info!("📦 Cloning model from Git repository...");
 
-            // Use shared operation
+            // Use shared operation (model_id parameter is deprecated, ignore it)
             let cloned = crate::storage::operations::clone_model(
                 &repo_url,
+                None,  // name - will be derived from URL
                 git_ref.as_deref()
             ).await?;
             
@@ -534,7 +505,6 @@ pub async fn handle_model_command(
                 println!("");
                 println!("Type 'yes' to confirm, or use --yes flag to skip confirmation:");
 
-                use std::io::{self, BufRead};
                 let stdin = io::stdin();
                 let mut line = String::new();
                 stdin.lock().read_line(&mut line)?;
@@ -661,7 +631,6 @@ pub async fn handle_model_command(
                 println!("");
                 println!("Type 'yes' to confirm:");
                 
-                use std::io::{self, BufRead};
                 let stdin = io::stdin();
                 let mut line = String::new();
                 stdin.lock().read_line(&mut line)?;
@@ -711,7 +680,6 @@ pub async fn handle_model_command(
         ModelAction::Convert { source, to, output, precision, verify } => {
             info!("🔄 Converting model from {} to {}", source, to);
             
-            use std::path::PathBuf;
             
             // Parse source path
             let source_path = PathBuf::from(&source);
@@ -768,7 +736,6 @@ pub async fn handle_model_command(
             } else {
                 println!("Cached Models:");
                 for (model_ref, model_metadata) in cached_models {
-                    use chrono::{DateTime, Utc};
                     let accessed_dt = DateTime::<Utc>::from_timestamp(model_metadata.updated_at, 0)
                         .unwrap_or_else(|| Utc::now());
                     println!("  📁 {} ({:.1} GB) - Last accessed: {}",
@@ -799,8 +766,6 @@ pub async fn handle_model_command(
         ModelAction::Infer { model, prompt, max_tokens, temperature, top_p, top_k, stream, force_download } => {
             info!("Running base model inference: model={}, prompt_len={}", model, prompt.len());
             
-            use crate::runtime::{TorchEngine, RuntimeConfig};
-            use crate::runtime::sampling::{SamplingConfig, load_sampling_config};
             
             
             debug!("Looking up model: {}", model);
@@ -899,9 +864,6 @@ pub async fn handle_model_command(
             debug!("Prompt: {}", prompt);
             
             // Use clean inference interface
-            use crate::runtime::InferenceExt;
-            use crate::runtime::template_engine::ChatMessage;
-            use std::io::{self, Write};
             
             // Apply chat template to the prompt
             let formatted_prompt = {
@@ -1214,7 +1176,6 @@ async fn run_chat_inference(
     max_tokens: usize,
     temperature: f32,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    use crate::config::RuntimeConfig;
     
     
     // Create runtime config
@@ -1265,7 +1226,6 @@ async fn run_chat_inference(
     engine.load_model(&model_path).await?;
     
     // Use clean inference interface
-    use crate::runtime::InferenceExt;
     
     println!("🔮 Generating response...");
     
@@ -1291,8 +1251,6 @@ async fn run_temporal_training(
     prompt: &str,
     expected_response: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::config::RuntimeConfig;
-    use crate::runtime::TorchEngine;
     
     tracing::info!("🎓 Starting temporal LoRA training for model: {}", model_id);
     
@@ -1353,7 +1311,7 @@ fn extract_model_metadata(model_path: &std::path::Path, model_name: &str) -> Res
     let size_bytes = calculate_directory_size(model_path).unwrap_or(0);
 
     // Get git metadata if available
-    let (created_at, updated_at) = if let Ok(repo) = git::get_repository(model_path) {
+    let (created_at, updated_at) = if let Ok(repo) = crate::git::get_repository(model_path) {
         // Get first commit time as created_at
         let created_at = repo.head().ok()
             .and_then(|head| head.peel_to_commit().ok())
@@ -1460,7 +1418,6 @@ pub async fn handle_write_checkpoint(
     name: Option<String>,
     step: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::training::{CheckpointManager, WeightSnapshot, WeightFormat};
 
     info!("Writing checkpoint for model: {}", model_id);
 
@@ -1477,7 +1434,6 @@ pub async fn handle_write_checkpoint(
 
     // Get step number
     let step = step.unwrap_or_else(|| {
-        use std::time::{SystemTime, UNIX_EPOCH};
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1509,8 +1465,6 @@ pub async fn handle_commit_checkpoint(
     branch: Option<String>,
     tag: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::training::CheckpointManager;
-    use std::path::PathBuf;
 
     info!("Committing checkpoint: {}", checkpoint_path);
 
@@ -1540,7 +1494,6 @@ pub async fn handle_commit_checkpoint(
 
     // Create tag if requested
     if let Some(tag_name) = tag {
-        use crate::git::BranchManager;
         let branch_mgr = BranchManager::new(model_path)?;
         branch_mgr.create_tag(&tag_name, "HEAD")?;
         info!("✅ Tag created: {}", tag_name);
