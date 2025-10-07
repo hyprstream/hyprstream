@@ -4,13 +4,11 @@
 //! providing optimized workflows for adapter training.
 
 use anyhow::{Result, Context, bail};
-use git2::IndexAddOption;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use uuid::Uuid;
 use chrono::Utc;
-use git2db::GitManager;
 use crate::git::BranchManager;
 use crate::storage::{XetNativeStorage, XetConfig};
 use std::sync::Arc;
@@ -96,7 +94,7 @@ pub struct AdapterSession {
 pub struct AdapterStorage {
     base_dir: PathBuf,
     working_dir: PathBuf,  // Directory for adapter worktrees
-    registry: std::sync::Arc<tokio::sync::RwLock<Option<crate::git::GitModelRegistry>>>,
+    registry: std::sync::Arc<tokio::sync::RwLock<crate::git::GitModelRegistry>>,
     /// Optional Xet storage for large file handling
     xet_storage: Option<Arc<XetNativeStorage>>,
 }
@@ -106,16 +104,11 @@ impl AdapterStorage {
     pub async fn new(base_dir: PathBuf) -> Result<Self> {
         let working_dir = base_dir.join("working");
         fs::create_dir_all(&working_dir).await?;
-        
-        // Try to initialize Git registry
-        let registry = match crate::git::GitModelRegistry::open(base_dir.clone()).await {
-            Ok(reg) => Some(reg),
-            Err(e) => {
-                tracing::warn!("Failed to initialize Git registry for adapters: {}", e);
-                None
-            }
-        };
-        
+
+        // Initialize Git registry (fail fast if unable to create)
+        let registry = crate::git::GitModelRegistry::open(base_dir.clone()).await
+            .context("Failed to initialize Git registry for adapters")?;
+
         Ok(Self {
             base_dir,
             working_dir,
@@ -160,6 +153,10 @@ impl AdapterStorage {
     }
 
     /// Create a new adapter as a branch of the base model
+    ///
+    /// This operation is atomic with automatic cleanup on failure:
+    /// - If any step fails, all created resources are cleaned up
+    /// - Branch, worktree, registry entry, and filesystem changes are rolled back
     pub async fn create_adapter(
         &self,
         base_model: &str,
@@ -168,27 +165,77 @@ impl AdapterStorage {
     ) -> Result<AdapterId> {
         // Find base model path (either UUID or name)
         let base_model_path = self.resolve_base_model_path(base_model).await?;
-        
+
         // Create branch manager for the base model
         let branch_mgr = BranchManager::new(&base_model_path)?;
-        
+
         // Create adapter branch with human-friendly name
         let branch_info = branch_mgr.create_branch(
             "adapter",
             Some(adapter_name),
             None,  // Use current HEAD
-        )?;
-        
+        ).context("Failed to create adapter branch")?;
+
         // Generate adapter ID from branch UUID
         let adapter_id = AdapterId::from_uuid(branch_info.uuid);
-        
+        let repo_id = git2db::RepoId::from_uuid(branch_info.uuid);
+
         // Create worktree for the adapter branch
         let worktree_path = self.working_dir.join(adapter_id.0.to_string());
-        let worktree_path = branch_mgr.create_worktree(
+        let worktree_path = match branch_mgr.create_worktree(
             &branch_info.branch_name,
-            Some(worktree_path),
-        )?;
-        
+            Some(worktree_path.clone()),
+        ) {
+            Ok(path) => path,
+            Err(e) => {
+                // Cleanup: Delete branch (BranchManager requires mutable reference)
+                tracing::warn!("Worktree creation failed, cleaning up branch");
+                let mut branch_mgr_mut = BranchManager::new(&base_model_path)?;
+                let _ = branch_mgr_mut.delete_branch(&branch_info.branch_name);
+                return Err(e).context("Failed to create adapter worktree");
+            }
+        };
+
+        // From here on, use scoped cleanup pattern
+        let cleanup_result = self.create_adapter_internal(
+            adapter_id.clone(),
+            repo_id.clone(),
+            adapter_name,
+            base_model,
+            &base_model_path,
+            &worktree_path,
+            &branch_mgr,
+            &branch_info.branch_name,
+            lora_config,
+        ).await;
+
+        match cleanup_result {
+            Ok(_) => {
+                tracing::info!("Created adapter '{}' with ID {}", adapter_name, adapter_id);
+                Ok(adapter_id)
+            }
+            Err(e) => {
+                // Cleanup on failure
+                tracing::error!("Adapter creation failed, cleaning up: {}", e);
+                self.cleanup_failed_adapter(&repo_id, &worktree_path, &base_model_path, &branch_info.branch_name).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Internal adapter creation (separated for cleanup handling)
+    async fn create_adapter_internal(
+        &self,
+        adapter_id: AdapterId,
+        repo_id: git2db::RepoId,
+        adapter_name: &str,
+        base_model: &str,
+        base_model_path: &Path,
+        worktree_path: &Path,
+        _branch_mgr: &BranchManager,
+        _branch_name: &str,
+        lora_config: Option<serde_json::Value>,
+    ) -> Result<()> {
         // Create adapter configuration
         let config = AdapterConfig {
             adapter_id: adapter_id.clone(),
@@ -206,41 +253,62 @@ impl AdapterStorage {
             created_at: Utc::now(),
             training_config: lora_config,
         };
-        
+
         // Save adapter configuration in worktree
         let config_path = worktree_path.join("adapter_config.json");
-        let config_json = serde_json::to_string_pretty(&config)?;
-        fs::write(&config_path, config_json).await?;
-        
-        
-        // Commit adapter files in the worktree
-        self.commit_adapter(&worktree_path, "Initialize adapter").await?;
-        
-        // Register with Git registry if available
-        if let Some(registry) = self.registry.write().await.as_mut() {
-            // Extract UUID from base model path
-            if let Some(base_model_uuid_str) = base_model_path.file_name().and_then(|n| n.to_str()) {
-                if let Ok(_base_model_uuid) = Uuid::parse_str(base_model_uuid_str) {
-                    // Register adapter as a model
-                    let adapter_id = git2db::ModelId::from_uuid(branch_info.uuid);
-                    if let Err(e) = registry.register_model(
-                        &adapter_id,
-                        adapter_name,
-                        None,
-                    ).await {
-                        tracing::warn!("Failed to register adapter with Git registry: {}", e);
-                    }
-                } else {
-                    tracing::warn!("Could not parse base model UUID from path: {}", base_model_path.display());
-                }
-            } else {
-                tracing::warn!("Could not extract UUID from base model path: {}", base_model_path.display());
+        let config_json = serde_json::to_string_pretty(&config)
+            .context("Failed to serialize adapter config")?;
+        fs::write(&config_path, config_json).await
+            .context("Failed to write adapter config")?;
+
+        // Register with Git registry FIRST (before commit)
+        {
+            let mut registry = self.registry.write().await;
+            registry.register_repository(
+                &repo_id,
+                Some(adapter_name.to_string()),
+                String::new(), // No URL for local adapters
+            ).await.context("Failed to register adapter with git2db registry")?;
+        }
+
+        // Now commit using git2db API (repository is registered)
+        self.commit_adapter(&adapter_id, "Initialize adapter").await
+            .context("Failed to commit adapter initialization")?;
+
+        Ok(())
+    }
+
+    /// Cleanup resources from failed adapter creation
+    async fn cleanup_failed_adapter(
+        &self,
+        repo_id: &git2db::RepoId,
+        worktree_path: &Path,
+        base_model_path: &Path,
+        branch_name: &str,
+    ) {
+        // 1. Remove from git2db registry (if registered)
+        {
+            let mut registry = self.registry.write().await;
+            if let Err(e) = registry.remove_repository(repo_id).await {
+                tracing::warn!("Failed to remove adapter from registry during cleanup: {}", e);
             }
         }
-        
-        tracing::info!("Created adapter '{}' with ID {}", adapter_name, adapter_id);
-        
-        Ok(adapter_id)
+
+        // 2. Remove worktree directory
+        if worktree_path.exists() {
+            if let Err(e) = fs::remove_dir_all(worktree_path).await {
+                tracing::warn!("Failed to remove worktree during cleanup: {}", e);
+            }
+        }
+
+        // 3. Delete branch
+        if let Ok(mut branch_mgr) = BranchManager::new(base_model_path) {
+            if let Err(e) = branch_mgr.delete_branch(branch_name) {
+                tracing::warn!("Failed to delete branch during cleanup: {}", e);
+            }
+        }
+
+        tracing::info!("Cleanup completed for failed adapter creation");
     }
     
     /// Load an adapter session
@@ -354,44 +422,23 @@ impl AdapterStorage {
         Ok(())
     }
     
-    /// Commit changes to adapter repository
-    pub async fn commit_adapter(&self, adapter_path: &Path, message: &str) -> Result<()> {
-        let repo = GitManager::global().get_repository(adapter_path)?;
-        
+    /// Commit changes to adapter repository using git2db API
+    ///
+    /// ✅ Phase 3: Now uses native git2db commit API
+    pub async fn commit_adapter(&self, adapter_id: &AdapterId, message: &str) -> Result<()> {
+        let registry = self.registry.read().await;
+        let repo_id = git2db::RepoId::from_uuid(adapter_id.0);
+        let handle = registry.repo(&repo_id)
+            .context("Adapter not found in git2db registry")?;
+
         // Stage all changes
-        let mut index = repo.index()?;
-        index.add_all(["*"].iter(), IndexAddOption::DEFAULT, None)?;
-        index.write()?;
-        
-        // Check if there are changes to commit
-        let tree_id = index.write_tree()?;
-        let tree = repo.find_tree(tree_id)?;
-        
-        let sig = GitManager::global().create_signature(None, None)?;
-        
-        // Get HEAD if it exists (for non-initial commits)
-        if let Ok(head) = repo.head() {
-            let parent = head.peel_to_commit()?;
-            repo.commit(
-                Some("HEAD"),
-                &sig,
-                &sig,
-                message,
-                &tree,
-                &[&parent],
-            )?;
-        } else {
-            // Initial commit
-            repo.commit(
-                Some("HEAD"),
-                &sig,
-                &sig,
-                message,
-                &tree,
-                &[],
-            )?;
-        }
-        
+        handle.staging().add_all()
+            .context("Failed to stage adapter changes")?;
+
+        // Commit
+        handle.commit(message).await
+            .context("Failed to commit adapter changes")?;
+
         Ok(())
     }
     
@@ -469,16 +516,17 @@ impl AdapterStorage {
             }
         }
         
-        // Try to resolve via registry
-        if let Some(registry) = self.registry.read().await.as_ref() {
-            if let Some(model) = registry.get_artifact_by_name(base_model) {
-                let path = self.base_dir.join(model.uuid().to_string());
-                if path.exists() {
-                    return Ok(path);
+        // ✅ Try to resolve via git2db registry
+        let registry = self.registry.read().await;
+        if let Ok(handle) = registry.repo_by_name(base_model) {
+            // ✅ Use RepositoryHandle to get worktree path from metadata
+            if let Ok(worktree) = handle.worktree() {
+                if worktree.exists() {
+                    return Ok(worktree.to_path_buf());
                 }
             }
         }
-        
+
         bail!("Base model '{}' not found", base_model)
     }
 }

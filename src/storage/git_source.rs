@@ -46,65 +46,59 @@ impl GitProgress for ModelCloneProgress {
 }
 
 /// Git-based model source for cloning models
+///
+/// ⚠️  ARCHITECTURAL NOTE: This component clones repositories but doesn't register them
+/// in git2db. For atomic clone+register operations, use git2db's CloneBuilder directly:
+///
+/// ```rust,ignore
+/// // ❌ Two-phase (race condition window)
+/// let (id, path) = git_source.clone_model(url).await?;
+/// registry.register_repository(&id, name, url).await?;
+///
+/// // ✅ Atomic (recommended)
+/// let repo_id = registry.clone(url)
+///     .name(name)
+///     .shallow(true)
+///     .exec()
+///     .await?;
+/// ```
 pub struct GitModelSource {
     cache_dir: PathBuf,
     /// Optional XET storage for LFS processing
     xet_storage: Option<Arc<XetNativeStorage>>,
-    /// Git manager for advanced operations
-    git_manager: Arc<GitManager>,
 }
 
 impl GitModelSource {
     /// Create a new Git model source
     pub fn new(cache_dir: PathBuf) -> Self {
-        let git_config = GitConfig {
-            repository: git2db::config::RepositoryConfig { prefer_shallow: true,
-            shallow_depth: Some(1), ..Default::default() },
-            ..Default::default()
-        };
-
         Self {
             cache_dir,
             xet_storage: None,
-            git_manager: Arc::new(GitManager::new(git_config)),
         }
     }
 
-    /// Create a new Git model source with custom Git configuration
-    pub fn new_with_config(cache_dir: PathBuf, git_config: GitConfig) -> Self {
-        Self {
-            cache_dir,
-            xet_storage: None,
-            git_manager: Arc::new(GitManager::new(git_config)),
-        }
+    /// Create a new Git model source with custom Git configuration (deprecated - use GitManager::global())
+    #[deprecated(note = "Git configuration is now global via GitManager::global()")]
+    pub fn new_with_config(cache_dir: PathBuf, _git_config: GitConfig) -> Self {
+        Self::new(cache_dir)
     }
 
     /// Create a new Git model source with XET storage for LFS processing
     pub fn new_with_xet(cache_dir: PathBuf, xet_storage: Arc<XetNativeStorage>) -> Self {
-        let git_config = GitConfig {
-            repository: git2db::config::RepositoryConfig { prefer_shallow: true,
-            shallow_depth: Some(1), ..Default::default() },
-            ..Default::default()
-        };
-
         Self {
             cache_dir,
             xet_storage: Some(xet_storage),
-            git_manager: Arc::new(GitManager::new(git_config)),
         }
     }
 
-    /// Create with both XET storage and custom git config
+    /// Create with both XET storage and custom git config (deprecated - use GitManager::global())
+    #[deprecated(note = "Git configuration is now global via GitManager::global()")]
     pub fn new_with_xet_and_config(
         cache_dir: PathBuf,
         xet_storage: Arc<XetNativeStorage>,
-        git_config: GitConfig,
+        _git_config: GitConfig,
     ) -> Self {
-        Self {
-            cache_dir,
-            xet_storage: Some(xet_storage),
-            git_manager: Arc::new(GitManager::new(git_config)),
-        }
+        Self::new_with_xet(cache_dir, xet_storage)
     }
 
     /// Clone a model from a Git repository
@@ -156,7 +150,7 @@ impl GitModelSource {
             .build();
 
         // Clone repository directly (retry logic is handled internally by GitManager)
-        let repository = self.git_manager.clone_repository(
+        let repository = GitManager::global().clone_repository(
             repo_url,
             &model_path,
             Some(clone_options),
@@ -237,10 +231,9 @@ impl GitModelSource {
         // If the model already existed, we still need to checkout the ref
         let ref_spec = ref_spec.to_string();
         let model_path_clone = model_path.clone();
-        let git_manager = Arc::clone(&self.git_manager);
 
         tokio::task::spawn_blocking(move || {
-            let repo = git_manager.get_repository(&model_path_clone)?;
+            let repo = GitManager::global().get_repository(&model_path_clone)?;
 
             // Fetch to ensure we have the latest refs
             let mut remote = repo.find_remote("origin")?;

@@ -56,7 +56,7 @@ pub struct ModelMetrics {
 /// Model sharing manager
 pub struct ModelSharing {
     base_dir: PathBuf,
-    registry: Arc<RwLock<Option<GitModelRegistry>>>,
+    registry: Arc<RwLock<GitModelRegistry>>,
     git_manager: Arc<GitManager>,
 }
 
@@ -70,14 +70,9 @@ impl ModelSharing {
     pub async fn new_with_config(base_dir: PathBuf, git_config: GitConfig) -> Result<Self> {
         let git_manager = Arc::new(GitManager::new(git_config));
 
-        // Try to initialize Git registry
-        let registry = match GitModelRegistry::open(base_dir.clone()).await {
-            Ok(reg) => Some(reg),
-            Err(e) => {
-                tracing::warn!("Failed to initialize Git registry: {}", e);
-                None
-            }
-        };
+        // Initialize Git registry (fail fast if unable to create)
+        let registry = GitModelRegistry::open(base_dir.clone()).await
+            .context("Failed to initialize Git registry for model sharing")?;
 
         Ok(Self {
             base_dir,
@@ -86,44 +81,46 @@ impl ModelSharing {
         })
     }
     
-    /// Create a shareable reference for a model
+    /// Create a shareable reference for a model using git2db APIs
     pub async fn create_share_ref(
         &self,
         model_name: &str,
         include_metrics: bool,
     ) -> Result<ShareableModelRef> {
-        // Try to find model in registry first
-        if let Some(registry) = self.registry.read().await.as_ref() {
-            if let Some(model) = registry.get_artifact_by_name(model_name) {
+        // ✅ Try to find model in registry first (git2db v2 API)
+        let registry = self.registry.read().await;
+        if let Ok(handle) = registry.repo_by_name(model_name) {
+            // ✅ Use RepositoryHandle to get metadata (no git operations)
+            if let Ok(model) = handle.metadata() {
                 return self.create_ref_from_registry(model_name, model, include_metrics).await;
             }
         }
-        
-        // Fallback to direct path lookup
+
+        // Fallback to direct path lookup for untracked models
         self.create_ref_from_path(model_name, include_metrics).await
     }
     
-    /// Create reference from registry entry
+    /// Create reference from registry entry using git2db RepositoryHandle
     async fn create_ref_from_registry(
         &self,
         name: &str,
         model: &crate::git::RegisteredModel,
         include_metrics: bool,
     ) -> Result<ShareableModelRef> {
-        let model_path = self.base_dir.join(model.uuid().to_string());
-        
-        // Open Git repository (with caching)
-        let repo = self.git_manager.get_repository(&model_path)
-            .context("Failed to open model repository")?;
-        
-        // Get current commit
-        let head = repo.head()?.peel_to_commit()?;
-        let commit = head.id().to_string();
-        
-        // Get remote URL if available
-        let git_url = repo.find_remote("origin")
-            .ok()
-            .and_then(|remote| remote.url().map(String::from));
+        // ✅ Use git2db metadata directly (no git operations needed)
+        let model_path = &model.worktree_path;
+        let git_url = Some(model.url.clone());
+
+        // ✅ Get HEAD commit from metadata if available, else query git
+        let commit = if let Some(ref oid_str) = model.current_oid {
+            oid_str.clone()
+        } else {
+            // Fallback: query git if metadata doesn't have current_oid
+            let repo = self.git_manager.get_repository(&model_path)
+                .context("Failed to open model repository")?;
+            let head = repo.head()?.peel_to_commit()?;
+            head.id().to_string()
+        };
         
         // Calculate size
         let size_bytes = self.calculate_model_size(&model_path).await?;
@@ -256,16 +253,15 @@ impl ModelSharing {
         
         // Generate local model ID
         let model_id = ModelId::new();
-        
-        // Register with local registry if available
-        if let Some(registry) = self.registry.write().await.as_mut() {
-            let git2db_model_id = git2db::ModelId::from_uuid(model_id.0);
-            registry.register_model(
-                &git2db_model_id,
-                &name,
-                Some(git_url.to_string()),
-            ).await?;
-        }
+
+        // Register with local registry
+        let mut registry = self.registry.write().await;
+        let git2db_repo_id = git2db::RepoId::from_uuid(model_id.0);
+        registry.register_repository(
+            &git2db_repo_id,
+            Some(name.to_string()),
+            git_url.to_string(),
+        ).await?;
         
         // Verify model integrity if signature provided
         if let Some(signature) = &share_ref.signature {

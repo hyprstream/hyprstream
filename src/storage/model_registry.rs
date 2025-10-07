@@ -63,7 +63,6 @@ pub struct ModelInfo {
 pub struct ModelRegistry {
     base_dir: PathBuf,
     xet_storage: Option<Arc<XetNativeStorage>>,
-    git_manager: Arc<GitManager>,
 }
 
 impl ModelRegistry {
@@ -72,11 +71,12 @@ impl ModelRegistry {
         Self::new_with_config(base_dir, xet_storage, GitConfig::default())
     }
 
-    /// Create with custom Git configuration
+    /// Create with custom Git configuration (deprecated - use GitManager::global())
+    #[deprecated(note = "Git configuration is now global via GitManager::global()")]
     pub fn new_with_config(
         base_dir: PathBuf,
         xet_storage: Option<Arc<XetNativeStorage>>,
-        git_config: GitConfig
+        _git_config: GitConfig
     ) -> Result<Self> {
         if !base_dir.join(".git").exists() {
             info!("Initializing new model registry at {:?}", base_dir);
@@ -87,12 +87,9 @@ impl ModelRegistry {
             Self::create_initial_commit(&repo)?;
         }
 
-        let git_manager = Arc::new(GitManager::new(git_config));
-
         Ok(Self {
             base_dir,
             xet_storage,
-            git_manager,
         })
     }
 
@@ -747,7 +744,7 @@ impl ModelRegistry {
         let (model_repo, _is_submodule) = self.get_model_repository(model_ref)?;
 
         // Create signature
-        let sig = self.git_manager.create_signature(None, None)?;
+        let sig = GitManager::global().create_signature(None, None)?;
 
         // Get index
         let mut index = model_repo.index()?;
@@ -904,7 +901,7 @@ impl ModelRegistry {
                 info!("Fast-forwarded {} to {}", model_ref.model, fetch_commit.id());
             } else if merge_analysis.is_normal() {
                 // Normal merge using git2::AnnotatedCommit
-                let sig = self.git_manager.create_signature(None, None)?;
+                let sig = GitManager::global().create_signature(None, None)?;
                 let local_commit = model_repo.reference_to_annotated_commit(&model_repo.head()?)?;
                 model_repo.merge(&[&fetch_commit], None, None)?;
                 let mut index = model_repo.index()?;
@@ -983,7 +980,7 @@ impl ModelRegistry {
             info!("Fast-forwarded to {}", branch_name);
         } else if merge_analysis.is_normal() || no_ff {
             // Normal merge using git2::AnnotatedCommit
-            let sig = self.git_manager.create_signature(None, None)?;
+            let sig = GitManager::global().create_signature(None, None)?;
             let local_annotated = model_repo.reference_to_annotated_commit(&model_repo.head()?)?;
             model_repo.merge(&[&branch_annotated], None, None)?;
             let mut index = model_repo.index()?;
@@ -1106,7 +1103,7 @@ impl ModelRegistry {
     /// Helper to commit changes to the registry
     fn commit_registry(&self, message: &str) -> Result<()> {
         let repo = self.open_repo()?;
-        let sig = self.git_manager.create_signature(None, None)?;
+        let sig = GitManager::global().create_signature(None, None)?;
         let mut index = repo.index()?;
 
         // Stage .gitmodules and submodule changes

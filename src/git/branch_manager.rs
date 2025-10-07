@@ -28,37 +28,29 @@ pub struct BranchInfo {
 /// Manages branches with UUID naming and human tags
 pub struct BranchManager {
     repo_path: PathBuf,
-    git_manager: Arc<GitManager>,
 }
 
 impl BranchManager {
     /// Create a new branch manager for a repository
     pub fn new(repo_path: impl AsRef<Path>) -> Result<Self> {
         let repo_path = repo_path.as_ref().to_path_buf();
-        let git_manager = Arc::new(GitManager::new(GitConfig::default()));
 
-        // Verify repository exists
-        let _repo = git_manager.get_repository(&repo_path)
+        // Verify repository exists using global GitManager
+        let _repo = GitManager::global().get_repository(&repo_path)
             .context("Failed to open repository")?;
 
-        Ok(Self { repo_path, git_manager })
+        Ok(Self { repo_path })
     }
 
-    /// Create with custom Git configuration
-    pub fn new_with_config(repo_path: impl AsRef<Path>, git_config: GitConfig) -> Result<Self> {
-        let repo_path = repo_path.as_ref().to_path_buf();
-        let git_manager = Arc::new(GitManager::new(git_config));
-
-        // Verify repository exists
-        let _repo = git_manager.get_repository(&repo_path)
-            .context("Failed to open repository")?;
-
-        Ok(Self { repo_path, git_manager })
+    /// Create with custom Git configuration (deprecated - use GitManager::global())
+    #[deprecated(note = "Git configuration is now global via GitManager::global()")]
+    pub fn new_with_config(repo_path: impl AsRef<Path>, _git_config: GitConfig) -> Result<Self> {
+        Self::new(repo_path)
     }
 
     /// Get repository handle with caching
     fn get_repo(&self) -> Result<Repository> {
-        self.git_manager.get_repository(&self.repo_path)
+        GitManager::global().get_repository(&self.repo_path)
             .map_err(|e| anyhow::anyhow!("Failed to get repository: {}", e))
     }
     
@@ -345,7 +337,7 @@ impl BranchManager {
     /// Store branch metadata in Git notes
     fn store_branch_metadata(&self, branch_name: &str, info: &BranchInfo) -> Result<()> {
         let json = serde_json::to_string(info)?;
-        let sig = self.git_manager.create_signature(Some("branch-manager"), Some("branch@hyprstream"))?;
+        let sig = GitManager::global().create_signature(Some("branch-manager"), Some("branch@hyprstream"))?;
         let repo = self.get_repo()?;
 
         // Store as Git note
@@ -363,7 +355,7 @@ impl BranchManager {
 
         Ok(())
     }
-    
+
     /// Load branch metadata from Git notes
     fn load_branch_metadata(&self, branch_name: &str) -> Result<BranchInfo> {
         let repo = self.get_repo()?;
@@ -376,13 +368,13 @@ impl BranchManager {
 
         Ok(serde_json::from_str(json)?)
     }
-    
+
     /// Delete branch metadata
     fn delete_branch_metadata(&self, branch_name: &str) -> Result<()> {
         let repo = self.get_repo()?;
         if let Ok(branch) = repo.find_branch(branch_name, BranchType::Local) {
             if let Ok(commit) = branch.get().peel_to_commit() {
-                let sig = self.git_manager.create_signature(Some("branch-manager"), Some("branch@hyprstream"))?;
+                let sig = GitManager::global().create_signature(Some("branch-manager"), Some("branch@hyprstream"))?;
                 let _ = repo.note_delete(
                     commit.id(),
                     Some("refs/notes/branches"),

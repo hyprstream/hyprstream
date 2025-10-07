@@ -539,7 +539,8 @@ pub async fn handle_model_command(
             println!("🗑️ Removing model files from: {}", model_path.display());
 
             // Use registry's remove_model to properly clean up submodule metadata and directories
-            // TODO: This should be fully handled by git2db's submodule removal implementation
+            // Note: git2db manages tracked repositories, not submodules within a parent repo.
+            // ModelRegistry uses submodules, which is outside git2db's scope.
             let registry = model_storage.registry();
             if let Err(e) = registry.remove_model(&model_ref).await {
                 eprintln!("❌ Failed to remove model: {}", e);

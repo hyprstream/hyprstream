@@ -8,7 +8,10 @@ pub mod branch_manager;
 pub use branch_manager::{BranchManager, BranchInfo};
 
 // Re-export commonly used git2db types
-pub use git2db::{Git2DB as GitModelRegistry, RegisteredModel};
+pub use git2db::{Git2DB as GitModelRegistry, TrackedRepository};
+
+// Compatibility alias for internal use
+pub type RegisteredModel = TrackedRepository;
 
 // Hyprstream-specific types and traits
 use anyhow::Result;
@@ -105,7 +108,6 @@ impl GitOperations for Repository {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ShareableModelRef {
     pub name: String,
-    pub model_type: git2db::ModelType,
     pub uuid: uuid::Uuid,
     pub git_commit: String,
     pub source: Option<String>,
