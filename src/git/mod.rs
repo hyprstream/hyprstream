@@ -18,16 +18,6 @@ use std::path::Path;
 use std::sync::Arc;
 use git2db::{GitManager, Git2DBError as GitError};
 
-/// Clone options for hyprstream git operations
-#[derive(Debug, Clone, Default)]
-pub struct CloneOptions {
-    pub shallow: bool,
-    pub depth: Option<u32>,
-    pub branch: Option<String>,
-    pub recurse_submodules: bool,
-    pub filter_spec: Option<String>,
-}
-
 /// Progress trait for git operations
 pub trait GitProgress: Send + Sync {
     fn on_progress(&self, progress: &GitProgressInfo);
@@ -131,12 +121,12 @@ pub fn get_repository<P: AsRef<Path>>(path: P) -> Result<Repository> {
 pub async fn clone_repository<P: AsRef<Path>>(
     url: &str,
     path: P,
-    _options: Option<CloneOptions>,
+    options: Option<git2db::clone_options::CloneOptions>,
     _progress: Option<Arc<dyn GitProgress>>,
 ) -> Result<Repository> {
-    // Note: Options and progress not yet fully supported in git2db
+    // Note: Progress callback not yet fully supported
     GitManager::global()
-        .clone_repository(url, path.as_ref(), None)
+        .clone_repository(url, path.as_ref(), options)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to clone repository: {}", e))
 }

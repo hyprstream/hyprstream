@@ -536,11 +536,14 @@ pub async fn handle_model_command(
                 return Err(anyhow::anyhow!("Model '{}' not found", model_ref.model).into());
             }
 
-            // Remove the model directory
             println!("🗑️ Removing model files from: {}", model_path.display());
-            if let Err(e) = tokio::fs::remove_dir_all(&model_path).await {
-                eprintln!("❌ Failed to remove model directory: {}", e);
-                eprintln!("   You may need to manually remove: {}", model_path.display());
+
+            // Use registry's remove_model to properly clean up submodule metadata and directories
+            // TODO: This should be fully handled by git2db's submodule removal implementation
+            let registry = model_storage.registry();
+            if let Err(e) = registry.remove_model(&model_ref).await {
+                eprintln!("❌ Failed to remove model: {}", e);
+                eprintln!("   You may need to manually clean up: {}", model_path.display());
                 return Err(e.into());
             }
 

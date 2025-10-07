@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use crate::storage::ModelId;
 use git2db::{Git2DB as GitModelRegistry, GitManager, Git2DBConfig as GitConfig};
-use crate::git::CloneOptions;
+use git2db::clone_options::CloneOptions;
 
 /// Shareable reference to a model or adapter
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,14 +238,13 @@ impl ModelSharing {
         info!("📥 Importing model '{}' from {}", share_ref.name, git_url);
 
         // Clone the repository with advanced options (shallow for efficiency)
-        let clone_options = CloneOptions {
-            shallow: true,
-            depth: Some(1),
-            ..Default::default()
-        };
+        let clone_options = CloneOptions::builder()
+            .shallow(true)
+            .depth(1)
+            .build();
 
         let repo = self.git_manager
-            .clone_repository(git_url, &target_dir, None)
+            .clone_repository(git_url, &target_dir, Some(clone_options))
             .await
             .context("Failed to clone shared model")?;
 

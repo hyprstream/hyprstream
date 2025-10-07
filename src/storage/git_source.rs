@@ -8,7 +8,8 @@ use tracing::{info, debug, warn};
 use super::ModelId;
 use super::xet_native::XetNativeStorage;
 use git2db::{GitManager, Git2DBConfig as GitConfig, Git2DBError as GitError};
-use crate::git::{GitProgress, GitProgressInfo, CloneOptions};
+use git2db::clone_options::CloneOptions;
+use crate::git::{GitProgress, GitProgressInfo};
 use git2::{ErrorClass, ErrorCode};
 
 /// Progress reporter implementation for git operations
@@ -149,18 +150,16 @@ impl GitModelSource {
         };
 
         // Configure clone options for shallow clone
-        let clone_options = CloneOptions {
-            shallow: true,
-            depth: Some(1),
-            ..Default::default()
-        };
+        let clone_options = CloneOptions::builder()
+            .shallow(true)
+            .depth(1)
+            .build();
 
         // Clone repository directly (retry logic is handled internally by GitManager)
-        // Note: progress callback not yet supported in git2db
         let repository = self.git_manager.clone_repository(
             repo_url,
             &model_path,
-            None,
+            Some(clone_options),
         ).await.map_err(|e| {
             warn!("Failed to clone {} after retries: {}", repo_url, e);
             e

@@ -228,21 +228,7 @@ impl ModelRegistry {
             }
         }
 
-        // Strategy 3: Fallback to parent repository's git object database
-        if let Ok(parent_repo) = submodule.repo() {
-            let submodule_path = submodule.path();
-            if let Some(path_str) = submodule_path.to_str() {
-                if let Ok(index) = parent_repo.index() {
-                    if let Ok(gitlink_entry) = index.get_path(Path::new(path_str), 0) {
-                        if gitlink_entry.mode == 0o160000 {  // git2::INDEX_MODE_GITLINK constant value
-                            return Ok(gitlink_entry.id);
-                        }
-                    }
-                }
-            }
-        }
-
-        Err(anyhow!("Could not resolve commit for submodule '{}' - all strategies failed", name))
+        Err(anyhow!("Could not resolve commit for submodule '{}' - both index_id and repository HEAD strategies failed", name))
     }
 
     /// Resolve a model reference to a specific commit SHA using git2 objects
@@ -386,7 +372,9 @@ impl ModelRegistry {
         // Step 4: Reload the submodule to get the updated state
         // Important: re-find the submodule after update
         drop(submodule); // Release the old reference
-        let mut submodule = repo.find_submodule(name)?; // Verify it exists (mutable for add_to_index)
+        {
+            let _submodule = repo.find_submodule(name)?; // Verify it exists
+        }
 
         // Step 5: Stage the changes in the index with explicit flush
         {

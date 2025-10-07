@@ -219,11 +219,11 @@ impl RegistryRepair {
     /// Get the git origin URL for a repository
     fn get_git_origin(&self, repo_path: &Path) -> Result<String> {
         let repo = git2::Repository::open(repo_path)?;
-        let remote = repo.find_remote("origin")?;
-
-        remote.url()
-            .ok_or_else(|| anyhow::anyhow!("No URL for origin remote"))
-            .map(String::from)
+        let url = repo.find_remote("origin")?
+            .url()
+            .ok_or_else(|| anyhow::anyhow!("No URL for origin remote"))?
+            .to_string();
+        Ok(url)
     }
 
     /// Verify git consistency between file system and registry
