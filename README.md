@@ -320,7 +320,7 @@ GNU Affero General Public License v3.0 - See [LICENSE](LICENSE) for details.
 
 Built with:
 - [PyTorch](https://pytorch.org/) - Deep learning framework
-- [tch](https://github.com/LaurentMazare/tch) - Rust bindings for PyTorch
+- [tch](https://github.com/LaurentMazare/tch-rs) - Rust bindings for PyTorch
 - [SafeTensors](https://github.com/huggingface/safetensors) - Efficient tensor serialization
 - [Git2](https://github.com/rust-lang/git2-rs) - Git operations in Rust
 - [Tokio](https://tokio.rs/) - Async runtime
