@@ -18,7 +18,6 @@ use data::{
     data_client,
 };
 use cas_client::{OutputProvider, FileProvider};
-use cas_object::CompressionScheme;
 use merklehash::MerkleHash;
 
 /// LFS pointer information parsed from pointer file

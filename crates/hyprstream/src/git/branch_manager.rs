@@ -9,7 +9,6 @@ use anyhow::{Result, Context, bail};
 use git2::{Repository, BranchType, Oid};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use uuid::Uuid;
 use git2db::{GitManager, Git2DBConfig as GitConfig};
 use super::{GitOperations, get_repository};

@@ -5,9 +5,7 @@
 use anyhow::Result;
 use git2::Repository;
 use std::path::PathBuf;
-use std::sync::Arc;
-use super::{GitModelSource, ModelStorage, ModelId, paths::StoragePaths};
-use super::xet_native::{XetNativeStorage, XetConfig};
+use super::{ModelStorage, ModelId, paths::StoragePaths};
 
 /// Result of cloning a model
 pub struct ClonedModel {

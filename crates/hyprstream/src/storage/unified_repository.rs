@@ -5,13 +5,13 @@
 
 use anyhow::{Result, Context, bail};
 use async_trait::async_trait;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn, error};
 
 use super::{
     ModelRef, ModelId, ModelMetadata, ModelStatus, CheckoutOptions, CheckoutResult,
-    SharedModelRegistry, ModelStorage, GitModelSource, StorageError, StorageResult,
+    SharedModelRegistry, GitModelSource, StorageError,
 };
 
 /// Unified model information combining registry and file system data

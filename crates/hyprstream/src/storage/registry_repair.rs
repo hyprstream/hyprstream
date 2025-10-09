@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tracing::{info, warn, error};
 
 use super::{
-    ModelRef, ModelStorage, SharedModelRegistry, StorageError,
+    ModelRef, SharedModelRegistry,
 };
 
 /// Report from repair operations

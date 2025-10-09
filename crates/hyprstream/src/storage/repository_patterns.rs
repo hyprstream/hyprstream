@@ -14,7 +14,6 @@
 use anyhow::{Result, Context, anyhow};
 use git2::{Repository, Submodule, Reference, Commit, Oid};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::marker::PhantomData;
 
 /// Type-safe wrapper for git2::Repository that ensures proper lifetime management

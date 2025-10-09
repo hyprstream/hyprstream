@@ -1043,7 +1043,7 @@ impl TorchEngine {
         let model = self.persistent_model
             .as_ref()
             .ok_or_else(|| anyhow!("Persistent model not available"))?;
-        let mut model_guard = self.handle_poison(model.lock())?;
+        let model_guard = self.handle_poison(model.lock())?;
 
         // Forward pass - gradients tracked if tensors have requires_grad
         if track_gradients {
