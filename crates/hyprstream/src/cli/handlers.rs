@@ -681,7 +681,7 @@ pub async fn handle_model_command(
             }
         }
         // Search variant has been removed from the enum - use List with search filter
-        ModelAction::Convert { source, to, output, precision, verify } => {
+        ModelAction::Convert { source, to, output, precision, verify: _ } => {
             info!("🔄 Converting model from {} to {}", source, to);
             
             
@@ -767,7 +767,7 @@ pub async fn handle_model_command(
             println!();
             println!("Configure registries with 'hyprstream config' command");
         }
-        ModelAction::Infer { model, prompt, max_tokens, temperature, top_p, top_k, stream, force_download } => {
+        ModelAction::Infer { model, prompt, max_tokens, temperature, top_p, top_k, stream, force_download: _ } => {
             info!("Running base model inference: model={}, prompt_len={}", model, prompt.len());
             
             
@@ -1419,7 +1419,7 @@ pub async fn handle_pretrain(
 /// Handle checkpoint write command
 pub async fn handle_write_checkpoint(
     model_id: String,
-    name: Option<String>,
+    _name: Option<String>,
     step: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
 

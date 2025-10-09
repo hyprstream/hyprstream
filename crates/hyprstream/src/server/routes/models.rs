@@ -122,7 +122,7 @@ async fn get_model_info(
 
 /// Download a model from a registry
 async fn download_model(
-    State(state): State<ServerState>,
+    State(_state): State<ServerState>,
     Json(request): Json<DownloadModelRequest>,
 ) -> impl IntoResponse {
     // Basic validation - must be a non-empty string
@@ -143,7 +143,7 @@ async fn download_model(
         }
     };
     
-    let models_dir = match storage_paths.models_dir() {
+    let _models_dir = match storage_paths.models_dir() {
         Ok(dir) => dir,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
@@ -216,7 +216,7 @@ async fn unload_model(
 
 /// Refresh the model cache (rescans disk for models)
 async fn refresh_cache(
-    State(state): State<ServerState>,
+    State(_state): State<ServerState>,
 ) -> impl IntoResponse {
     // Cache is automatically maintained
     Json(serde_json::json!({

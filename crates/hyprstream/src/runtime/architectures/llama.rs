@@ -188,7 +188,9 @@ impl ArchitectureConfig for LlamaConfig {
 /// Llama model implementation
 pub struct LlamaModel {
     config: LlamaConfig,
+    #[allow(dead_code)]
     device: Device,
+    #[allow(dead_code)]
     dtype: DType,
 
     // Model weights
@@ -201,6 +203,7 @@ pub struct LlamaModel {
     kv_cache: Option<std::cell::RefCell<crate::runtime::kv_cache::KVCacheManager>>,
 
     // RoPE manager for position encoding
+    #[allow(dead_code)]
     rope_manager: std::cell::RefCell<RoPEManager>,
 
     // VarStore for training (if model was created with training support)
@@ -233,10 +236,12 @@ struct LlamaAttention {
     num_kv_heads: usize,
     head_dim: usize,
     rope_theta: f32,
+    #[allow(dead_code)]
     rope_scaling: Option<RopeScaling>,
     // QK-norm weights (Gemma3)
     q_norm: Option<Tensor>,
     k_norm: Option<Tensor>,
+    #[allow(dead_code)]
     query_pre_attn_scalar: Option<f32>,
     // Sliding window attention (Gemma3)
     sliding_window: Option<usize>,
@@ -283,7 +288,7 @@ impl LlamaAttention {
         
         // Determine actual K/V heads from tensor dimensions
         let k_elements = k.size().iter().product::<i64>();
-        let v_elements = v.size().iter().product::<i64>();
+        let _v_elements = v.size().iter().product::<i64>();
         
         // For K and V, we need to figure out the actual number of heads
         // They might be different from what we detected in config
@@ -384,22 +389,7 @@ impl LlamaAttention {
         
         Ok(attn_output)
     }
-    
-    /// Expand KV heads for GQA (Llama 2/3)
-    fn expand_kv_for_gqa(&self, kv: &Tensor) -> Result<Tensor> {
-        let (batch_size, seq_len, num_kv_heads, head_dim) = dims4(&kv)?;
-        let repeat_factor = self.num_heads / (num_kv_heads as usize);
-        
-        if repeat_factor == 1 {
-            return Ok(kv.shallow_clone());
-        }
-        
-        // Repeat KV heads to match Q heads
-        Ok(kv.unsqueeze(3)  // [batch, seq, num_kv_heads, 1, head_dim]
-            .expand(&[batch_size, seq_len, num_kv_heads, repeat_factor as i64, head_dim], false)
-            .reshape(&[batch_size, seq_len, self.num_heads as i64, head_dim]))
-    }
-    
+
     /// Expand KV tensors for GQA with explicit head count
     fn expand_kv_for_gqa_with_heads(&self, kv: &Tensor, actual_kv_heads: usize) -> Result<Tensor> {
         let (batch_size, seq_len, _detected_heads, head_dim) = dims4(&kv)?;
@@ -958,7 +948,7 @@ impl LlamaModel {
         layer_idx: usize,
         weights: &HashMap<String, Tensor>,
         config: &LlamaConfig,
-        device: &Device,
+        _device: &Device,
     ) -> Result<Option<LlamaLayer>> {
         let prefix = format!("model.layers.{}", layer_idx);
         
@@ -1009,7 +999,7 @@ impl LlamaModel {
             // Split c_attn into Q, K, V
             // c_attn has shape [hidden_size, 3 * projection_size]
             let dims = c_attn.size();
-            let hidden_size = dims[0];
+            let _hidden_size = dims[0];
             let total_proj_size = dims[1];
             let proj_size = total_proj_size / 3;
             
@@ -1359,8 +1349,8 @@ impl ModelOperations for LlamaModel {
             tracing::debug!("Using tied weights: projecting with transposed embedding matrix");
             
             // Get the shape for debugging
-            let embed_shape = embed.size();
-            // tracing::debug!("Embedding shape: {:?}, hidden_states shape: {:?}", embed_shape, hidden_states.size());
+            let _embed_shape = embed.size();
+            // tracing::debug!("Embedding shape: {:?}, hidden_states shape: {:?}", _embed_shape, hidden_states.size());
             
             // The embedding tensor is [vocab_size, hidden_size]
             // We need to transpose it for the projection
@@ -1389,7 +1379,7 @@ impl ModelOperations for LlamaModel {
     }
     
     fn reshape_for_attention(&self, tensor: &Tensor, is_key_value: bool) -> Result<Tensor> {
-        let (batch_size, seq_len, hidden_size) = dims3(&tensor)?;
+        let (batch_size, seq_len, _hidden_size) = dims3(&tensor)?;
         
         if is_key_value {
             // For K,V: reshape to [batch, seq, num_kv_heads, head_dim]
@@ -1409,8 +1399,8 @@ impl ModelOperations for LlamaModel {
             ]))
         }
     }
-    
-    fn apply_rope(&self, tensor: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
+
+    fn apply_rope(&self, _tensor: &Tensor, _position_ids: &Tensor) -> Result<Tensor> {
         // RoPE is applied in the attention layers, not at the model level
         // This method should not be called
         Err(anyhow!("RoPE should be applied in attention layers, not at model level"))
@@ -1460,7 +1450,7 @@ impl LlamaModel {
 }
 
 // Temporarily disabled - needs updating for new Tensor API
-#[cfg(test_disabled)]
+#[cfg(test)]
 mod tests {
     use super::*;
     

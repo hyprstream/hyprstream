@@ -117,9 +117,11 @@ impl ArchitectureConfig for GemmaConfig {
 /// Gemma model implementation
 pub struct GemmaModel {
     config: GemmaConfig,
+    #[allow(dead_code)]
     device: Device,
+    #[allow(dead_code)]
     dtype: DType,
-    
+
     // Model weights
     embed_tokens: Option<Tensor>,
     layers: Vec<GemmaLayer>,
@@ -270,7 +272,7 @@ impl GemmaAttention {
             .collect::<Vec<_>>();
         
         // Create position indices
-        let positions = Tensor::arange(seq_len as i64, (DType::Int64, device))
+        let _positions = Tensor::arange(seq_len as i64, (DType::Int64, device))
             .to_dtype(DType::Float, false, false);
         
         // Compute sin and cos for each position and frequency
@@ -711,7 +713,7 @@ impl GemmaModel {
         layer_idx: usize,
         weights: &HashMap<String, Tensor>,
         config: &GemmaConfig,
-        device: &Device,
+        _device: &Device,
     ) -> Result<Option<GemmaLayer>> {
         let prefix = format!("model.layers.{}", layer_idx);
         
@@ -990,7 +992,7 @@ impl ModelOperations for GemmaModel {
     }
     
     fn reshape_for_attention(&self, tensor: &Tensor, is_key_value: bool) -> Result<Tensor> {
-        let (batch_size, seq_len, hidden_size) = dims3(&tensor)?;
+        let (batch_size, seq_len, _hidden_size) = dims3(&tensor)?;
         
         if is_key_value {
             // For Gemma MQA: reshape to [batch, seq, num_kv_heads, head_dim]
@@ -1041,7 +1043,7 @@ impl ModelOperations for GemmaModel {
         Ok(mask)
     }
     
-    fn apply_lora(&mut self, adapter: &crate::lora::torch_adapter::LoRAModel) -> Result<()> {
+    fn apply_lora(&mut self, _adapter: &crate::lora::torch_adapter::LoRAModel) -> Result<()> {
         // Apply LoRA weights with Gemma-specific adaptations
         // The adapter will handle shape conversions for MQA
         Ok(())
@@ -1118,7 +1120,7 @@ impl GemmaModel {
 }
 
 // Temporarily disabled - needs updating for new Tensor API
-#[cfg(test_disabled)]
+#[cfg(test)]
 mod tests {
     use super::*;
     

@@ -91,6 +91,7 @@ pub struct TorchEngine {
     /// Device for computation (CPU/CUDA/ROCm) - immutable after construction
     device: Device,
     /// Runtime configuration - immutable after construction
+    #[allow(dead_code)]
     config: RuntimeConfig,
     /// Generation configuration with defaults
     generation_config: GenerationConfig,
@@ -103,6 +104,7 @@ pub struct TorchEngine {
     /// LoRA trainer for fine-tuning
     lora_trainer: Arc<Mutex<Option<crate::lora::trainer::LoRATrainer>>>,
     /// Sampling configuration - immutable after construction
+    #[allow(dead_code)]
     sampling_config: RuntimeConfig,
     /// GPU sampler for efficient token sampling - thread safe after initialization
     gpu_sampler: GpuSampler,
@@ -237,8 +239,8 @@ impl TorchEngine {
         
         // Extract model info from the loaded model
         if let Some(model) = &self.persistent_model {
-            let model_guard = self.handle_poison(model.lock())?;
-            
+            let _model_guard = self.handle_poison(model.lock())?;
+
             // Get architecture info from the model
             // For now, use a default since we don't have a method to query this
             let architecture = "auto".to_string();
@@ -571,8 +573,8 @@ impl TorchEngine {
         // Extract logits for the last token
         let logits_shape = logits.size();
         let seq_len = logits_shape[1];
-        let vocab_size = logits_shape[2] as usize;
-        
+        let _vocab_size = logits_shape[2] as usize;
+
         // Get logits for last token: [batch=1, last_seq_pos, vocab_size]
         let last_token_logits = logits.narrow(1, seq_len - 1, 1).squeeze_dim(1); // [1, vocab_size]
         
@@ -609,12 +611,12 @@ impl TorchEngine {
         
         // Use the new forward_with_cache method that properly tracks position
         let logits = model.forward_with_cache(&input_tensor, start_pos)?;
-        
+
         // Extract logits for the last token
         let logits_shape = logits.size();
         let seq_len = logits_shape[1];
-        let vocab_size = logits_shape[2] as usize;
-        
+        let _vocab_size = logits_shape[2] as usize;
+
         // Get logits for last token
         let last_token_logits = logits.narrow(1, seq_len - 1, 1).squeeze_dim(1);
         
@@ -632,124 +634,6 @@ impl TorchEngine {
             repeat_penalty,
             previous_tokens,
         )
-    }
-
-    /// Sample next token from logits with proper ordering (DEPRECATED - use sample_token_gpu)
-    fn sample_token(&self, logits: &[f32], temperature: f32, top_p: f32, top_k: Option<usize>, repeat_penalty: f32, previous_tokens: &[i64]) -> Result<usize> {
-        tracing::debug!("Sampling: logits_len={}, temp={}, top_p={}, top_k={:?}, repeat_penalty={}", 
-                      logits.len(), temperature, top_p, top_k, repeat_penalty);
-        if logits.is_empty() {
-            return Err(anyhow!("Empty logits"));
-        }
-
-        // STEP 1: Apply repetition penalty to LOGITS (before softmax)
-        // This is much more effective than applying to probabilities
-        let mut adjusted_logits = logits.to_vec();
-        if repeat_penalty != 1.0 && !previous_tokens.is_empty() {
-            // Create a frequency map for recent tokens
-            let mut token_counts = std::collections::HashMap::new();
-            for &token_id in previous_tokens.iter().rev().take(64) {  // Last 64 tokens
-                *token_counts.entry(token_id as usize).or_insert(0) += 1;
-            }
-            
-            // Apply penalty based on frequency
-            for (token_id, count) in token_counts {
-                if token_id < adjusted_logits.len() {
-                    // Stronger penalty for more frequent tokens
-                    let penalty = repeat_penalty.powf(count as f32);
-                    if adjusted_logits[token_id] > 0.0 {
-                        adjusted_logits[token_id] /= penalty;
-                    } else {
-                        adjusted_logits[token_id] *= penalty;
-                    }
-                }
-            }
-        }
-
-        // STEP 2: Apply temperature scaling  
-        let scaled_logits: Vec<f32> = if temperature > 0.0 && temperature != 1.0 {
-            adjusted_logits.iter().map(|&x| x / temperature).collect()
-        } else {
-            adjusted_logits
-        };
-
-        // Find max for numerical stability in softmax
-        let max_logit = scaled_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        
-        // Compute softmax probabilities
-        let exp_logits: Vec<f32> = scaled_logits.iter()
-            .map(|&x| (x - max_logit).exp())
-            .collect();
-        
-        let sum: f32 = exp_logits.iter().sum();
-        let mut probs: Vec<f32> = exp_logits.iter().map(|&x| x / sum).collect();
-
-        // STEP 3: Apply top-k filtering (select top k most likely tokens)
-        if let Some(k) = top_k {
-            let mut indices: Vec<usize> = (0..probs.len()).collect();
-            indices.sort_by(|&a, &b| {
-                probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            
-            for &i in indices.iter().skip(k) {
-                probs[i] = 0.0;
-            }
-            
-            // Renormalize
-            let sum: f32 = probs.iter().sum();
-            if sum > 0.0 {
-                probs.iter_mut().for_each(|p| *p /= sum);
-            }
-        }
-
-        // STEP 4: Apply top-p (nucleus) sampling (cumulative probability threshold)
-        if top_p < 1.0 {
-            let mut indices: Vec<usize> = (0..probs.len()).collect();
-            indices.sort_by(|&a, &b| {
-                probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            
-            let mut cumsum = 0.0;
-            let mut cutoff = probs.len();
-            
-            for (pos, &i) in indices.iter().enumerate() {
-                cumsum += probs[i];
-                if cumsum >= top_p {
-                    cutoff = pos + 1;
-                    break;
-                }
-            }
-            
-            for &i in indices.iter().skip(cutoff) {
-                probs[i] = 0.0;
-            }
-            
-            // Renormalize
-            let sum: f32 = probs.iter().sum();
-            if sum > 0.0 {
-                probs.iter_mut().for_each(|p| *p /= sum);
-            }
-        }
-
-        // STEP 5: Sample from the final distribution
-        let rand_val: f32 = fastrand::f32();
-        let mut cumsum = 0.0;
-        
-        for (i, &prob) in probs.iter().enumerate() {
-            cumsum += prob;
-            if rand_val < cumsum && prob > 0.0 {
-                return Ok(i);
-            }
-        }
-
-        // Fallback: return last non-zero probability token
-        for (i, &prob) in probs.iter().enumerate().rev() {
-            if prob > 0.0 {
-                return Ok(i);
-            }
-        }
-
-        Err(anyhow!("Failed to sample token"))
     }
 }
 
@@ -782,7 +666,7 @@ impl RuntimeEngine for TorchEngine {
             
             // If no single file found, check for sharded SafeTensors
             if found_file.is_none() {
-                let shard_pattern = path.join("model-00001-of-*.safetensors");
+                let _shard_pattern = path.join("model-00001-of-*.safetensors");
                 if let Ok(entries) = std::fs::read_dir(path) {
                     for entry in entries.flatten() {
                         let filename = entry.file_name();
@@ -998,7 +882,7 @@ impl RuntimeEngine for TorchEngine {
 // Training-specific methods
 impl TorchEngine {
     /// Enable training mode for pre-training
-    pub fn enable_training(&mut self, learning_rate: f64) -> Result<()> {
+    pub fn enable_training(&mut self, _learning_rate: f64) -> Result<()> {
         // Ensure model is loaded
         if !self.is_persistent_model_ready() {
             return Err(anyhow!("Model not loaded - persistent model not initialized"));
@@ -1021,7 +905,7 @@ impl TorchEngine {
     }
 
     /// Perform a manual SGD step without optimizer
-    pub fn manual_sgd_step(&mut self, learning_rate: f32) -> Result<()> {
+    pub fn manual_sgd_step(&mut self, _learning_rate: f32) -> Result<()> {
         // This would manually update weights:
         // weight = weight - learning_rate * weight.grad()
         // But we don't have direct access to the model's tensors
@@ -1170,12 +1054,11 @@ impl TorchEngine {
         let repeat_penalty = request.repeat_penalty;
 
         // REAL streaming: generate tokens one by one and call callback for each
-        let start_time = std::time::Instant::now();
-        
+        let _start_time = std::time::Instant::now();
+
         // Tokenize input
         let mut input_ids = self.tokenize(prompt)?;
         let mut generated_text = String::new();
-        let mut tokens_generated = 0;
         let prompt_len = input_ids.len();
         
         tracing::info!("Starting generation with prompt of {} tokens", prompt_len);
@@ -1210,7 +1093,6 @@ impl TorchEngine {
 
             // Add to sequence
             input_ids.push(next_token as i64);
-            tokens_generated += 1;
 
             // Decode token and stream it immediately
             let token_text = self.detokenize(&[next_token as i64])?;
@@ -1231,9 +1113,6 @@ impl TorchEngine {
         Ok(generated_text)
     }
 
-    /// Update context state for tracking generation progress
-    fn update_context_state(&self, _sequence_length: usize) {
-    }
 
     /// Check if persistent model is initialized - thread safe
     pub fn is_persistent_model_ready(&self) -> bool {
@@ -1481,7 +1360,7 @@ impl TorchEngine {
     pub fn forward_with_lora(
         &self,
         input_ids: &Tensor,
-        attention_mask: Option<&Tensor>,
+        _attention_mask: Option<&Tensor>,
         training: bool,
     ) -> Result<Tensor> {
         // Check if LoRA is enabled

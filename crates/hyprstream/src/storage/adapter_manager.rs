@@ -57,6 +57,7 @@ impl Default for AdapterConfig {
 
 /// Manages LoRA adapters within a model's git repository
 pub struct AdapterManager {
+    #[allow(dead_code)]
     model_path: PathBuf,
     pub adapters_dir: PathBuf,
 }

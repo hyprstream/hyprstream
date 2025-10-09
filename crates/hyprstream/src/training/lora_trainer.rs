@@ -40,6 +40,7 @@ impl Default for LoRATrainingConfig {
 pub struct LoRATrainer {
     config: LoRATrainingConfig,
     adapter_manager: AdapterManager,
+    #[allow(dead_code)]
     device: Device,
 }
 
@@ -120,7 +121,7 @@ impl LoRATrainer {
 
             let batches = data_loader.formatted_batches(self.config.batch_size);
 
-            for (batch_idx, batch_result) in batches.enumerate() {
+            for (_batch_idx, batch_result) in batches.enumerate() {
                 let batch = batch_result?;
 
                 // Simple training step simulation
@@ -175,7 +176,7 @@ impl LoRATrainer {
 
         let mut total_loss = 0.0;
 
-        for (input, target) in batch {
+        for (input, _target) in batch {
             // Simulate forward pass - in reality this would generate logits
             // and compute cross-entropy loss against target tokens
             let _output = engine.generate_streaming(input, 50, |_| {}).await?;
@@ -239,7 +240,7 @@ impl LoRATrainer {
     pub async fn train_interactive(
         &self,
         adapter_name: &str,
-        engine: &mut crate::runtime::TorchEngine,
+        _engine: &mut crate::runtime::TorchEngine,
     ) -> Result<()> {
         tracing::info!("Interactive training mode for adapter: {}", adapter_name);
         tracing::info!("This would collect training samples from user interactions");

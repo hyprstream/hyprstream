@@ -40,13 +40,6 @@ impl<'a> MetricsGuard<'a> {
     fn new(metrics: &'a crate::server::state::Metrics) -> Self {
         Self { metrics, decremented: false }
     }
-    
-    fn mark_completed(&mut self) {
-        if !self.decremented {
-            self.metrics.active_requests.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            self.decremented = true;
-        }
-    }
 }
 
 impl<'a> Drop for MetricsGuard<'a> {
@@ -81,11 +74,7 @@ impl ErrorResponse {
             }
         }
     }
-    
-    fn service_unavailable(message: impl Into<String>) -> Self {
-        Self::new(message, "service_unavailable", "model_cache_exhausted")
-    }
-    
+
     #[allow(dead_code)]
     fn internal_error(message: impl Into<String>) -> Self {
         Self::new(message, "internal_error", "generation_failed")
@@ -634,7 +623,7 @@ async fn list_models(
     // Get models from storage - the backend should provide properly formatted names
     match state.model_storage.list_models().await {
         Ok(model_list) => {
-            for (model_ref, metadata) in model_list {
+            for (_model_ref, metadata) in model_list {
                 // The backend should provide the correct display name
                 // API layer should not be determining how to name models
                 let model_name = metadata.display_name

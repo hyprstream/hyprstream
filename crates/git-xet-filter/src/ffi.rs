@@ -76,6 +76,7 @@ pub type GitBuf = git_buf;
 // Link to vendored libgit2 from libgit2-sys
 // These functions are part of libgit2's filter API
 #[link(name = "git2", kind = "static")]
+#[allow(improper_ctypes)] // Opaque types are intentionally zero-sized for type safety
 extern "C" {
     /// Register a filter with libgit2
     pub fn git_filter_register(

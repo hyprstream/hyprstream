@@ -7,7 +7,7 @@ use axum::{
     response::IntoResponse,
     http::StatusCode,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use crate::server::state::ServerState;
 
 /// Create LoRA management router
@@ -22,19 +22,12 @@ pub fn create_router() -> Router<ServerState> {
 
 /// Request to create a new LoRA adapter
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct CreateLoRARequest {
     name: Option<String>,
     base_model: String,
     // config: LoRAConfig,
     auto_regressive: bool,
-}
-
-/// Response when creating a LoRA
-#[derive(Debug, Serialize)]
-struct CreateLoRAResponse {
-    id: String,
-    name: String,
-    status: String,
 }
 
 /// Create a new LoRA adapter

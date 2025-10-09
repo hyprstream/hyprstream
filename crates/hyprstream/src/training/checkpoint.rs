@@ -80,8 +80,10 @@ pub struct CheckpointManager {
     checkpoint_dir: PathBuf,
     checkpoint_tx: mpsc::Sender<CheckpointRequest>,
     worker_handle: Option<JoinHandle<()>>,
+    #[allow(dead_code)]
     max_checkpoints: usize,
     git_enabled: bool,
+    #[allow(dead_code)]
     branch_name: Option<String>,  // Track which branch we're on
 }
 
@@ -172,11 +174,11 @@ impl CheckpointManager {
 
         // Write weights directly to filesystem
         match weights {
-            WeightSnapshot::Memory { ref data, format } => {
+            WeightSnapshot::Memory { ref data, format: _ } => {
                 // Direct write from memory
                 fs::write(&checkpoint_path, data).await?;
             }
-            WeightSnapshot::FilePath { ref source, format } => {
+            WeightSnapshot::FilePath { ref source, format: _ } => {
                 // Use copy-on-write if available
                 #[cfg(target_os = "linux")]
                 {
@@ -368,7 +370,7 @@ impl CheckpointManager {
         model_path: PathBuf,
         checkpoint_dir: PathBuf,
         max_checkpoints: usize,
-        git_interval: usize,
+        _git_interval: usize,
         git_enabled: bool,
         branch_name: Option<String>,
     ) {
@@ -407,7 +409,7 @@ impl CheckpointManager {
         fs::create_dir_all(&step_dir).await?;
         
         // Save weights
-        let weights_file = match request.weights {
+        let _weights_file = match request.weights {
             WeightSnapshot::Memory { ref data, format } => {
                 let filename = match format {
                     WeightFormat::SafeTensors => "model.safetensors",
@@ -491,8 +493,8 @@ impl CheckpointManager {
     
     /// Commit checkpoint to Git branch
     async fn git_commit_checkpoint(
-        model_path: &Path, 
-        checkpoint_dir: &Path, 
+        model_path: &Path,
+        _checkpoint_dir: &Path,
         step: usize,
         branch_name: &Option<String>,
     ) -> Result<()> {

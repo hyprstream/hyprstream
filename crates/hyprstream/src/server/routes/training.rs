@@ -45,6 +45,7 @@ struct SubmitSamplesRequest {
 #[derive(Debug, Deserialize)]
 struct CheckpointRequest {
     model_id: String,
+    #[allow(dead_code)]
     name: Option<String>,
     step: Option<usize>,
 }
@@ -169,7 +170,7 @@ async fn submit_samples(
 
 /// Write checkpoint to filesystem (no Git)
 async fn write_checkpoint(
-    State(state): State<ServerState>,
+    State(_state): State<ServerState>,
     Json(req): Json<CheckpointRequest>,
 ) -> impl IntoResponse {
     use crate::storage::{ModelStorage, ModelRef};

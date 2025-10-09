@@ -21,11 +21,6 @@ impl ModelName {
         Ok(Self(name))
     }
 
-    /// Create from a string without validation (for internal use)
-    pub(crate) fn from_string_unchecked(name: String) -> Self {
-        Self(name)
-    }
-
     /// Get the inner string value
     pub fn as_str(&self) -> &str {
         &self.0
@@ -88,11 +83,6 @@ impl BranchName {
         Ok(Self(name))
     }
 
-    /// Create from string without validation (for internal use)
-    pub(crate) fn from_string_unchecked(name: String) -> Self {
-        Self(name)
-    }
-
     /// Get the inner string value
     pub fn as_str(&self) -> &str {
         &self.0
@@ -138,11 +128,6 @@ impl TagName {
         }
 
         Ok(Self(name))
-    }
-
-    /// Create from string without validation (for internal use)
-    pub(crate) fn from_string_unchecked(name: String) -> Self {
-        Self(name)
     }
 
     /// Get the inner string value

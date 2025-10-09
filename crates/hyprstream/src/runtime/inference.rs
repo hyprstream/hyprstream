@@ -59,10 +59,11 @@ pub struct InferenceResult {
 }
 
 /// Extension trait for TorchEngine to add clean inference methods
+#[allow(async_fn_in_trait)]
 pub trait InferenceExt {
     /// Run inference with the given request
     async fn run_inference(&mut self, request: InferenceRequest) -> Result<InferenceResult>;
-    
+
     /// Run inference with streaming output
     async fn run_inference_streaming<F>(
         &mut self,
@@ -165,7 +166,7 @@ impl InferenceExt for TorchEngine {
 }
 
 /// Apply LoRA weights to the engine
-async fn apply_lora_to_engine(engine: &mut TorchEngine, weights: &LoRAWeightsData) -> Result<()> {
+async fn apply_lora_to_engine(_engine: &mut TorchEngine, weights: &LoRAWeightsData) -> Result<()> {
     tracing::debug!(
         "Would apply LoRA weights: {} modules, rank {}, alpha {}",
         weights.target_modules.len(),

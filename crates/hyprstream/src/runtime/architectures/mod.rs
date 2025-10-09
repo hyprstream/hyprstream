@@ -135,8 +135,8 @@ pub trait ModelOperations: Send {
     fn forward_with_lora_hooks(
         &self,
         input: &Tensor,
-        lora_model: Option<&crate::lora::torch_adapter::LoRAModel>,
-        training: bool,
+        _lora_model: Option<&crate::lora::torch_adapter::LoRAModel>,
+        _training: bool,
     ) -> Result<(Tensor, Vec<(String, Tensor)>)> {
         // Default implementation without LoRA hooks
         let logits = self.forward(input, None)?;
@@ -154,7 +154,7 @@ pub trait ModelOperations: Send {
     }
     
     /// Forward pass with position information for KV caching
-    fn forward_with_cache(&self, input: &Tensor, start_pos: usize) -> Result<Tensor> {
+    fn forward_with_cache(&self, input: &Tensor, _start_pos: usize) -> Result<Tensor> {
         // Default implementation just calls regular forward
         // Models that support KV caching should override this
         self.forward(input, None)
@@ -187,7 +187,7 @@ pub enum AttentionType {
     GQA { num_groups: usize },
 }
 
-#[cfg(test_disabled)]
+#[cfg(test)]
 mod tests {
     use super::*;
     

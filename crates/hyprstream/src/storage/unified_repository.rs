@@ -71,6 +71,7 @@ pub struct SyncReport {
 
 /// Unified repository implementation
 pub struct UnifiedModelRepository {
+    #[allow(dead_code)]
     base_dir: PathBuf,
     models_dir: PathBuf,
     registry: Arc<SharedModelRegistry>,
@@ -129,7 +130,7 @@ impl UnifiedModelRepository {
     async fn register_model(&self, name: &str, source: Option<&str>) -> Result<()> {
         info!("Registering model {} with git registry", name);
 
-        let model_ref = ModelRef::new(name.to_string());
+        let _model_ref = ModelRef::new(name.to_string());
         let model_path = self.models_dir.join(name);
 
         // Verify the model exists locally
@@ -287,10 +288,10 @@ impl ModelRepository for UnifiedModelRepository {
 
                 Ok(model_id)
             }
-            ModelSource::Local { path } => {
+            ModelSource::Local { path: _ } => {
                 bail!("Local model import not yet implemented")
             }
-            ModelSource::Registry { name } => {
+            ModelSource::Registry { name: _ } => {
                 bail!("Registry model cloning not yet implemented")
             }
         }

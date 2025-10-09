@@ -165,11 +165,6 @@ impl PrecisionConfig {
         }
     }
 
-    /// Check FP8 support
-    fn supports_fp8(device: &Device) -> bool {
-        super::fp8::supports_fp8(device)
-    }
-
     /// Convert tensor to target precision
     pub fn convert_tensor(&self, tensor: &Tensor, target: TensorTarget) -> Result<Tensor> {
         let target_dtype = match target {
@@ -264,7 +259,7 @@ pub struct HardwareCapabilities {
 impl HardwareCapabilities {
     pub fn detect(device: &Device) -> Self {
         match device {
-            Device::Cuda(cuda_device) => {
+            Device::Cuda(_cuda_device) => {
                 // Simplified - real implementation would query CUDA
                 Self {
                     supports_bf16: true,

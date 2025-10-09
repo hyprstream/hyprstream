@@ -62,6 +62,7 @@ pub struct ModelInfo {
 /// Model registry that manages models as git submodules
 pub struct ModelRegistry {
     base_dir: PathBuf,
+    #[allow(dead_code)]
     xet_storage: Option<Arc<XetNativeStorage>>,
     /// Adapter layer for delegating to git2db
     adapter: Arc<RegistryAdapter>,
@@ -286,7 +287,7 @@ impl ModelRegistry {
     /// WARNING: This method has lifetime issues and should not be used.
     /// Use list_model_refs() instead which returns owned data.
     #[deprecated(note = "Use list_model_refs() instead to avoid lifetime issues")]
-    pub fn list_model_refs_legacy(&self, _model_ref: &ModelRef) -> Result<Vec<git2::Reference>> {
+    pub fn list_model_refs_legacy(&self, _model_ref: &ModelRef) -> Result<Vec<git2::Reference<'_>>> {
         // This method cannot be implemented safely due to git2::Reference lifetime constraints
         // Callers should use list_model_refs() instead
         Err(anyhow::anyhow!("list_model_refs_legacy is deprecated due to lifetime issues - use list_model_refs instead"))
@@ -533,7 +534,7 @@ impl ModelRegistry {
         remote_name: &str,
         branch_name: Option<&str>,
         set_upstream: bool,
-        force: bool,
+        _force: bool,
     ) -> Result<()> {
         // Resolve model name to RepoId
         let repo_id = self.adapter.resolve(model_ref)?;
@@ -652,7 +653,7 @@ impl ModelRegistry {
         } else if merge_analysis.is_normal() || no_ff {
             // Normal merge using git2::AnnotatedCommit
             let sig = GitManager::global().create_signature(None, None)?;
-            let local_annotated = model_repo.reference_to_annotated_commit(&model_repo.head()?)?;
+            let _local_annotated = model_repo.reference_to_annotated_commit(&model_repo.head()?)?;
             model_repo.merge(&[&branch_annotated], None, None)?;
             let mut index = model_repo.index()?;
 

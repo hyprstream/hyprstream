@@ -72,10 +72,11 @@ pub struct TrainingSession {
 
 /// Training service for auto-regressive LoRA learning
 pub struct TrainingService {
-    
+
     /// Runtime engine for generating training targets
+    #[allow(dead_code)]
     runtime_engine: Arc<dyn crate::runtime::RuntimeEngine>,
-    
+
     /// Active training sessions
     sessions: Arc<RwLock<HashMap<String, TrainingSession>>>,
     
@@ -239,9 +240,9 @@ impl TrainingService {
     async fn train_batch(
         lora_id: &str,
         samples: &[TrainingSample],
-        config: &TrainingConfig,
-        sessions: &Arc<RwLock<HashMap<String, TrainingSession>>>,
-        stats: &Arc<RwLock<TrainingStats>>,
+        _config: &TrainingConfig,
+        _sessions: &Arc<RwLock<HashMap<String, TrainingSession>>>,
+        _stats: &Arc<RwLock<TrainingStats>>,
     ) -> Result<()> {
         info!("🎯 Training LoRA {} with {} samples", lora_id, samples.len());
 
@@ -268,7 +269,7 @@ impl TrainingService {
     pub async fn create_inference_session(
         &self,
         lora_id: &str,
-        adapter_ids: Vec<String>,
+        _adapter_ids: Vec<String>,
     ) -> Result<String> {
         Ok(format!("lora-session-{}", lora_id))
     }
@@ -276,8 +277,8 @@ impl TrainingService {
     /// Run inference (delegated to inference API)
     pub async fn infer(
         &self,
-        session_id: &str,
-        input: InferenceRequest,
+        _session_id: &str,
+        _input: InferenceRequest,
     ) -> Result<InferenceResult> {
         Ok(InferenceResult {
             text: "Inference not yet implemented".to_string(),
@@ -287,7 +288,7 @@ impl TrainingService {
     }
     
     /// Close inference session (delegated to inference API)
-    pub async fn close_inference_session(&self, session_id: &str) -> Result<()> {
+    pub async fn close_inference_session(&self, _session_id: &str) -> Result<()> {
         Ok(())
     }
     

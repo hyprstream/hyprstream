@@ -134,7 +134,7 @@ impl GitModelSource {
         }
 
         // Create progress reporter
-        let progress: Option<Arc<dyn GitProgress>> = if show_progress {
+        let _progress: Option<Arc<dyn GitProgress>> = if show_progress {
             Some(Arc::new(ModelCloneProgress {
                 model_name: model_name.to_string(),
                 show_progress,
@@ -150,7 +150,7 @@ impl GitModelSource {
             .build();
 
         // Clone repository directly (retry logic is handled internally by GitManager)
-        let repository = GitManager::global().clone_repository(
+        let _repository = GitManager::global().clone_repository(
             repo_url,
             &model_path,
             Some(clone_options),

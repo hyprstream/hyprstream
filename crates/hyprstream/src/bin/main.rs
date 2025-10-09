@@ -336,7 +336,7 @@ fn main() -> Result<()> {
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_cpu(),
-                    multi_threaded: false,
+                    multi_threaded: true,
                 },
                 || async move {
                     let storage = ctx.storage().await?;
@@ -350,7 +350,7 @@ fn main() -> Result<()> {
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_cpu(),
-                    multi_threaded: false,
+                    multi_threaded: true,
                 },
                 || async move {
                     let storage = ctx.storage().await?;
@@ -372,7 +372,7 @@ fn main() -> Result<()> {
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_cpu(),
-                    multi_threaded: false,
+                    multi_threaded: true,
                 },
                 || async move {
                     let storage = ctx.storage().await?;
@@ -386,7 +386,7 @@ fn main() -> Result<()> {
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_cpu(),
-                    multi_threaded: false,
+                    multi_threaded: true,
                 },
                 || async move {
                     let storage = ctx.storage().await?;
@@ -448,7 +448,7 @@ fn main() -> Result<()> {
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_cpu(),
-                    multi_threaded: false,
+                    multi_threaded: true,
                 },
                 || async move {
                     let storage = ctx.storage().await?;
@@ -462,7 +462,7 @@ fn main() -> Result<()> {
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_cpu(),
-                    multi_threaded: false,
+                    multi_threaded: true,
                 },
                 || async move {
                     let storage = ctx.storage().await?;
@@ -476,7 +476,7 @@ fn main() -> Result<()> {
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_cpu(),
-                    multi_threaded: false,
+                    multi_threaded: true,
                 },
                 || async move {
                     let storage = ctx.storage().await?;
@@ -490,7 +490,7 @@ fn main() -> Result<()> {
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_cpu(),
-                    multi_threaded: false,
+                    multi_threaded: true,
                 },
                 || async move {
                     let storage = ctx.storage().await?;
@@ -504,7 +504,7 @@ fn main() -> Result<()> {
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_cpu(),
-                    multi_threaded: false,
+                    multi_threaded: true,
                 },
                 || async move {
                     let storage = ctx.storage().await?;
@@ -518,7 +518,7 @@ fn main() -> Result<()> {
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_cpu(),
-                    multi_threaded: false,
+                    multi_threaded: true,
                 },
                 || async move {
                     let storage = ctx.storage().await?;
@@ -531,7 +531,7 @@ fn main() -> Result<()> {
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_cpu(),
-                    multi_threaded: false,
+                    multi_threaded: true,
                 },
                 || async move {
                     let storage = ctx.storage().await?;

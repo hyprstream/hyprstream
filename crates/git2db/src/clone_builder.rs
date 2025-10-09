@@ -2,7 +2,6 @@
 //!
 //! Provides a git-native interface for cloning with multiple configuration options
 
-use crate::clone_options::CloneOptions;
 use crate::errors::{Git2DBError, Git2DBResult};
 use crate::references::GitRef;
 use crate::registry::{Git2DB, RemoteConfig, RepoId};

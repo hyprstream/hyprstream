@@ -21,7 +21,7 @@ impl LoRAIntegrationExample {
     pub fn apply_lora_to_layer(
         base_output: &Tensor,        // Output from frozen base layer
         lora_adapter: &crate::lora::torch_adapter::TorchLoRALayer,
-        module_name: &str,
+        _module_name: &str,
         input: &Tensor,               // Input to the layer
         training: bool,
     ) -> Result<Tensor> {
@@ -46,7 +46,7 @@ impl LoRAIntegrationExample {
     /// Example forward pass through a transformer model with LoRA
     pub fn forward_with_lora_integration(
         input_ids: &Tensor,
-        base_model: &dyn crate::runtime::architectures::ModelOperations,
+        _base_model: &dyn crate::runtime::architectures::ModelOperations,
         lora_model: &crate::lora::torch_adapter::LoRAModel,
         training: bool,
     ) -> Result<Tensor> {

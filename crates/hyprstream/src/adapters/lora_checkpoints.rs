@@ -77,6 +77,7 @@ pub struct CheckpointMetrics {
 /// Manages LoRA checkpoints with UUID-based tagging
 pub struct LoRACheckpointManager {
     /// Storage paths configuration
+    #[allow(dead_code)]
     storage_paths: StoragePaths,
     /// In-memory cache of checkpoint metadata
     checkpoint_cache: HashMap<String, LoRACheckpoint>,
@@ -146,41 +147,7 @@ impl LoRACheckpointManager {
         
         Ok(())
     }
-    
-    
-    
-    /// Create a representative weight matrix (mostly zeros for sparsity)
-    fn create_representative_matrix(&self, rows: usize, cols: usize) -> Result<Vec<Vec<f32>>> {
-        let mut matrix = vec![vec![0.0; cols]; rows];
-        
-        // Add some small random weights (very sparse)
-        let mut rng = fastrand::Rng::new();
-        let num_nonzero = ((rows * cols) as f32 * 0.01) as usize; // 1% non-zero
-        
-        for _ in 0..num_nonzero {
-            let row = rng.usize(0..rows);
-            let col = rng.usize(0..cols);
-            matrix[row][col] = (rng.f32() - 0.5) * 0.02; // Small random values
-        }
-        
-        Ok(matrix)
-    }
-    
-    /// Calculate file checksum for integrity verification
-    async fn calculate_checksum(&self, file_path: &Path) -> Result<String> {
-        let data = fs::read(file_path).await?;
-        let hash = blake3::hash(&data);
-        Ok(hash.to_hex().to_string())
-    }
-    
-    /// Save checkpoint metadata to disk
-    async fn save_checkpoint_metadata(&self, checkpoint: &LoRACheckpoint) -> Result<()> {
-        let metadata_path = self.get_metadata_path(&checkpoint.checkpoint_id);
-        let json = serde_json::to_string_pretty(checkpoint)?;
-        fs::write(metadata_path, json).await?;
-        Ok(())
-    }
-    
+
     /// Load all checkpoint metadata from disk
     async fn load_checkpoint_metadata(&mut self) -> Result<()> {
         let mut entries = fs::read_dir(&self.checkpoint_dir).await?;

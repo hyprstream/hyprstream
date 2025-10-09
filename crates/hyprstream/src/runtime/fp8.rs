@@ -102,7 +102,7 @@ impl FP8Scaler {
     /// Quantize tensor to FP8 with scaling
     pub fn quantize(&self, tensor: &Tensor, format: FP8Format) -> Result<(Tensor, f32)> {
         // Get appropriate scale based on format
-        let scale = match format {
+        let _scale = match format {
             FP8Format::E4M3 => *self.forward_scale.read(),
             FP8Format::E5M2 => *self.backward_scale.read(),
         };
@@ -277,8 +277,9 @@ impl FP8Config {
 /// FP8 mixed precision engine wrapper
 pub struct FP8Engine {
     config: FP8Config,
+    #[allow(dead_code)]
     device: Device,
-    
+
     /// Base model weights in FP8
     base_weights_fp8: Option<Vec<Tensor>>,
     
@@ -363,7 +364,7 @@ impl FP8Engine {
         // LoRA computation stays in BF16/FP32
         let mut output = Tensor::zeros_like(input);
         
-        for (i, weight) in lora_weights.iter().enumerate() {
+        for (i, _weight) in lora_weights.iter().enumerate() {
             if i % 2 == 0 && i + 1 < lora_weights.len() {
                 // LoRA: output = input @ A @ B
                 let a = &lora_weights[i];
@@ -407,7 +408,7 @@ impl FP8Engine {
 /// Check if current hardware supports FP8
 pub fn supports_fp8(device: &Device) -> bool {
     match device {
-        Device::Cuda(cuda_device) => {
+        Device::Cuda(_cuda_device) => {
             // FP8 requires compute capability 9.0+ (H100)
             // This is a simplified check - real implementation would query device
             false // Conservative default

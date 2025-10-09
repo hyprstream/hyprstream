@@ -14,8 +14,10 @@ pub struct RoPE {
     /// Base frequency for the rotary embeddings (10000 for most models, 1000000 for Qwen3)
     base: f64,
     /// Maximum sequence length to precompute
+    #[allow(dead_code)]
     max_seq_len: i64,
     /// Device for computation
+    #[allow(dead_code)]
     device: Device,
     /// Data type for tensors (matches model dtype)
     dtype: Kind,

@@ -8,6 +8,7 @@ use super::model_cache::ModelCache;
 
 /// Background task that periodically refreshes the model cache
 pub struct CacheRefresher {
+    #[allow(dead_code)]
     model_cache: Arc<ModelCache>,
     refresh_interval: Duration,
 }

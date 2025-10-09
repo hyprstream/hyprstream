@@ -17,33 +17,16 @@ use training_service::{TrainingService, TrainingConfig};
 #[derive(Clone)]
 pub struct ApiState {
     /// Adapter storage manager
+    #[allow(dead_code)]
     adapter_storage: Arc<AdapterStorage>,
 
     /// Training service for auto-regressive learning
+    #[allow(dead_code)]
     training_service: Arc<TrainingService>,
 
     /// Active endpoints mapping
+    #[allow(dead_code)]
     endpoints: Arc<RwLock<HashMap<String, LoRAEndpoint>>>,
-}
-
-impl ApiState {
-    /// Get model information with architecture configuration
-    /// This should eventually integrate with the model registry to get actual model configs
-    async fn get_model_info(&self, model_name: &str) -> Result<ModelArchitectureInfo, String> {
-        // For now, return an error to force proper implementation
-        // This ensures we don't create LoRA adapters without proper model configuration
-        Err(format!(
-            "Model configuration lookup not implemented. Please ensure model '{}' is registered in the model registry with proper architecture configuration.",
-            model_name
-        ))
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ModelArchitectureInfo {
-    hidden_size: usize,
-    vocab_size: usize,
-    architecture: crate::runtime::architectures::ModelArchitecture,
 }
 
 /// LoRA endpoint configuration

@@ -95,8 +95,8 @@ pub async fn start_server(
 pub async fn start_server_tls(
     addr: SocketAddr,
     state: ServerState,
-    cert_path: &str,
-    key_path: &str,
+    _cert_path: &str,
+    _key_path: &str,
 ) -> Result<()> {
     info!("TLS server support not yet implemented");
     start_server(addr, state).await

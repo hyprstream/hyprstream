@@ -329,7 +329,7 @@ impl ConversationRouter {
         &self,
         session_id: &str,
         new_model_id: String,
-        transition_reason: String,
+        _transition_reason: String,
     ) -> Result<()> {
         if !self.config.enable_seamless_transitions {
             return Err(anyhow!("Seamless transitions not enabled"));
@@ -724,7 +724,7 @@ impl ModelPool {
     /// Warmup model variant in background
     async fn warmup_model_variant(&self, model_id: &str) -> Result<()> {
         // Extract base model and LoRA info
-        let base_model = extract_base_model_from_id(model_id);
+        let _base_model = extract_base_model_from_id(model_id);
         let lora_ids = extract_lora_ids_from_model_id(model_id);
         
         // Create engine with LoRA adaptations

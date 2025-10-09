@@ -297,7 +297,7 @@ impl ModelSharing {
 
         // Add or update remote
         match repo.find_remote(remote_name) {
-            Ok(remote) => {
+            Ok(_remote) => {
                 repo.remote_set_url(remote_name, remote_url)?;
             }
             Err(_) => {

@@ -80,7 +80,7 @@ impl ServerState {
             storage_paths.models_dir()?
         };
 
-        let loras_dir = if let Ok(dir) = std::env::var("HYPRSTREAM_LORA_DIR") {
+        let _loras_dir = if let Ok(dir) = std::env::var("HYPRSTREAM_LORA_DIR") {
             std::path::PathBuf::from(dir)
         } else {
             storage_paths.loras_dir()?

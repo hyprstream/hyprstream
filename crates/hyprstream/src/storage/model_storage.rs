@@ -247,7 +247,7 @@ impl ModelStorage {
         tracing::info!("Registering model {} (ID: {}) with git registry", name, model_id);
 
         // Create a ModelRef for the registry operations
-        let model_ref = ModelRef::new(name.to_string());
+        let _model_ref = ModelRef::new(name.to_string());
 
         // Verify the model exists in the file system
         let model_path = self.get_models_dir().join(name);

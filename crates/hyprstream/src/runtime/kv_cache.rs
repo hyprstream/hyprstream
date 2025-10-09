@@ -131,6 +131,7 @@ pub struct KVCacheManager {
     /// Cache for each layer
     layer_caches: HashMap<usize, LayerKVCache>,
     /// Maximum sequence length
+    #[allow(dead_code)]
     max_seq_len: usize,
     /// Whether caching is enabled
     enabled: bool,

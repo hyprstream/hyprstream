@@ -10,6 +10,7 @@ use std::collections::HashMap;
 /// GPU-based token sampler
 #[derive(Clone)]
 pub struct GpuSampler {
+    #[allow(dead_code)]
     device: Device,
 }
 
@@ -168,8 +169,8 @@ impl GpuSampler {
         
         // Scatter back to original order
         let mut filtered_probs = Tensor::zeros_like(probs);
-        filtered_probs.scatter_(-1, &sorted_indices, &filtered_sorted);
-        
+        let _ = filtered_probs.scatter_(-1, &sorted_indices, &filtered_sorted);
+
         // Renormalize
         let sum = filtered_probs.sum(filtered_probs.kind());
         Ok(&filtered_probs / &sum)

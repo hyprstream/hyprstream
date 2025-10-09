@@ -342,7 +342,7 @@ impl ModelFactory {
     }
     
     fn create_gemma_model(
-        config: ModelConfig,
+        _config: ModelConfig,
         weights: HashMap<String, Tensor>,
         device: &Device,
         dtype: DType,
