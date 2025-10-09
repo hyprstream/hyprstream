@@ -10,6 +10,7 @@
 pub mod paths;
 pub mod xet_native;
 pub mod model_ref;
+pub mod model_registry_adapter;
 pub mod model_registry;
 pub mod model_storage;
 pub mod git_source;
@@ -18,7 +19,6 @@ pub mod operations;
 pub mod adapter_manager;
 pub mod errors;
 pub mod domain_types;
-pub mod repository_cache;
 pub mod repository_patterns;
 pub mod unified_repository;
 pub mod registry_repair;
@@ -34,7 +34,6 @@ pub use sharing::{ModelSharing, ShareableModelRef, ModelType};
 pub use adapter_manager::{AdapterManager, AdapterInfo, AdapterConfig};
 pub use errors::{StorageError, ModelRefError, GitOperationError, StorageResult, ModelRefResult, GitOperationResult};
 pub use domain_types::{ModelName, BranchName, TagName, RevSpec, AdapterName, RemoteName};
-pub use repository_cache::{RepositoryCache, RepositoryCacheConfig, CacheStats, local_repository_cache, get_cached_repository};
 pub use repository_patterns::{
     RepositoryHandle, SubmoduleInfo, ReferenceInfo, CommitInfo,
     RepositoryOperation, RepositoryOperationBuilder, CachedRepositoryFactory,

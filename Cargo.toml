@@ -54,7 +54,7 @@ config = { version = "0.13", features = ["toml", "yaml", "json"] }
 toml = "0.8"
 serde_yaml = "0.9"
 git2 = "0.19"  # Still needed by git2db internally
-git2db = { path = "../git2db" }  # High-level git library
+git2db = { path = "../git2db/crates/git2db", features = ["xet-storage"] }  # High-level git library with XET support
 gittorrent = { path = "../gittorrent-rs", optional = true }  # P2P transport
 clap = { version = "4.4", features = ["derive", "env"] }
 tracing = "0.1"

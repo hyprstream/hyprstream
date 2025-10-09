@@ -115,8 +115,10 @@ pub struct ShareableModelRef {
 
 /// Get a repository handle using the global GitManager
 pub fn get_repository<P: AsRef<Path>>(path: P) -> Result<Repository> {
-    GitManager::global().get_repository(path)
-        .map_err(|e| anyhow::anyhow!("Failed to get repository: {}", e))
+    let cache = GitManager::global().get_repository(path)
+        .map_err(|e| anyhow::anyhow!("Failed to get repository: {}", e))?;
+    cache.open()
+        .map_err(|e| anyhow::anyhow!("Failed to open repository: {}", e))
 }
 
 /// Clone a repository using the global GitManager

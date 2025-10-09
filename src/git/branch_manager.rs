@@ -50,8 +50,10 @@ impl BranchManager {
 
     /// Get repository handle with caching
     fn get_repo(&self) -> Result<Repository> {
-        GitManager::global().get_repository(&self.repo_path)
-            .map_err(|e| anyhow::anyhow!("Failed to get repository: {}", e))
+        let cache = GitManager::global().get_repository(&self.repo_path)
+            .map_err(|e| anyhow::anyhow!("Failed to get repository: {}", e))?;
+        cache.open()
+            .map_err(|e| anyhow::anyhow!("Failed to open repository: {}", e))
     }
     
     /// Create a new UUID-based branch

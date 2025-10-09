@@ -2152,6 +2152,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07e28edb80900c19c28f1072f2e8aeca7fa06b23cd4169cefe1af5aa3260783f"
 
 [[package]]
+name = "git-xet-filter"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cas_client",
+ "cas_object",
+ "dashmap",
+ "data",
+ "git2",
+ "libc",
+ "libgit2-sys",
+ "merklehash",
+ "once_cell",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "git2"
 version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2171,12 +2193,19 @@ name = "git2db"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "cas_client",
+ "cas_object",
  "chrono",
  "config 0.14.1",
  "dashmap",
+ "data",
+ "git-xet-filter",
  "git2",
  "gittorrent",
+ "libc",
  "lru 0.12.5",
+ "merklehash",
  "once_cell",
  "parking_lot 0.12.4",
  "safe-path",

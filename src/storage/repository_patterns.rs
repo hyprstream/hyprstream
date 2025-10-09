@@ -348,13 +348,16 @@ impl RepositoryOperationBuilder {
 
 /// Cache-aware repository factory
 ///
-/// This pattern integrates with the repository cache while maintaining proper lifetimes
+/// This pattern integrates with GitManager's repository cache while maintaining proper lifetimes
 pub struct CachedRepositoryFactory;
 
 impl CachedRepositoryFactory {
-    /// Get or create a repository handle using the cache
+    /// Get or create a repository handle using GitManager's cache
     pub fn get_or_create<P: AsRef<Path>>(path: P) -> Result<RepositoryHandle> {
-        let repo = crate::storage::get_cached_repository(path)?;
+        let cache = git2db::GitManager::global().get_repository(path)
+            .map_err(|e| anyhow::anyhow!("Failed to get repository: {}", e))?;
+        let repo = cache.open()
+            .map_err(|e| anyhow::anyhow!("Failed to open repository: {}", e))?;
         RepositoryHandle::from_repository(repo)
     }
 

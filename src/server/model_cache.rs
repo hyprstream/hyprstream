@@ -192,7 +192,8 @@ impl ModelCache {
             let checkout_dir_clone = checkout_dir.clone();
             let git_manager = Arc::clone(&self.git_manager);
             tokio::task::spawn_blocking(move || -> Result<()> {
-                let repo = git_manager.get_repository(&model_path)?;
+                let repo_cache = git_manager.get_repository(&model_path)?;
+                let repo = repo_cache.open()?;
                 let worktree_name = format!("cache-{}", &commit_id.to_string()[..8]);
 
                 // Clean up if worktree already exists
@@ -210,7 +211,8 @@ impl ModelCache {
                 repo.worktree(&worktree_name, &checkout_dir_clone, Some(&opts))?;
 
                 // Checkout specific commit with detached HEAD
-                let wt_repo = git_manager.get_repository(&checkout_dir_clone)?;
+                let wt_cache = git_manager.get_repository(&checkout_dir_clone)?;
+                let wt_repo = wt_cache.open()?;
                 wt_repo.set_head_detached(commit_id)?;
                 wt_repo.checkout_head(Some(
                     git2::build::CheckoutBuilder::default().force()
@@ -323,10 +325,11 @@ impl ModelCache {
         let git_manager = Arc::clone(&self.git_manager);
 
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let repo = match git_manager.get_repository(&model_path) {
-                Ok(repo) => repo,
+            let repo_cache = match git_manager.get_repository(&model_path) {
+                Ok(cache) => cache,
                 Err(_) => return Ok(()), // Skip if not a git repo
             };
+            let repo = repo_cache.open()?;
 
             // List all worktrees that start with "cache-"
             let mut cache_worktrees = Vec::new();

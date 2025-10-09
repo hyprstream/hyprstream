@@ -116,8 +116,9 @@ impl ModelSharing {
             oid_str.clone()
         } else {
             // Fallback: query git if metadata doesn't have current_oid
-            let repo = self.git_manager.get_repository(&model_path)
+            let repo_cache = self.git_manager.get_repository(&model_path)
                 .context("Failed to open model repository")?;
+            let repo = repo_cache.open()?;
             let head = repo.head()?.peel_to_commit()?;
             head.id().to_string()
         };
@@ -172,7 +173,8 @@ impl ModelSharing {
         
         for path in possible_paths {
             if path.exists() && path.join(".git").exists() {
-                let repo = self.git_manager.get_repository(&path)?;
+                let repo_cache = self.git_manager.get_repository(&path)?;
+                let repo = repo_cache.open()?;
                 let head = repo.head()?.peel_to_commit()?;
                 
                 let model_type = if path.join("adapter_config.json").exists() {
@@ -288,10 +290,11 @@ impl ModelSharing {
         remote_name: Option<&str>,
     ) -> Result<()> {
         let model_path = self.find_model_path(model_name).await?;
-        let repo = self.git_manager.get_repository(&model_path)?;
-        
+        let repo_cache = self.git_manager.get_repository(&model_path)?;
+        let repo = repo_cache.open()?;
+
         let remote_name = remote_name.unwrap_or("origin");
-        
+
         // Add or update remote
         match repo.find_remote(remote_name) {
             Ok(remote) => {
@@ -301,7 +304,7 @@ impl ModelSharing {
                 repo.remote(remote_name, remote_url)?;
             }
         }
-        
+
         // Push to remote
         let mut remote = repo.find_remote(remote_name)?;
         let refspecs: Vec<String> = vec!["refs/heads/main:refs/heads/main".to_string()];

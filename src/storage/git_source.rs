@@ -233,7 +233,8 @@ impl GitModelSource {
         let model_path_clone = model_path.clone();
 
         tokio::task::spawn_blocking(move || {
-            let repo = GitManager::global().get_repository(&model_path_clone)?;
+            let repo_cache = GitManager::global().get_repository(&model_path_clone)?;
+            let repo = repo_cache.open()?;
 
             // Fetch to ensure we have the latest refs
             let mut remote = repo.find_remote("origin")?;

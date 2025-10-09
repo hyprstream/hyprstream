@@ -1,16 +1,16 @@
 //! Git-native model registry using submodules
 
 use anyhow::{Result, anyhow, bail};
-use git2::{Repository, IndexAddOption, FetchOptions, RemoteCallbacks};
 use safe_path::scoped_join;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, debug};
 use tokio::sync::RwLock;
-use git2db::{GitManager, Git2DBConfig as GitConfig};
+use git2db::{GitManager, Git2DB};
 
 use super::model_ref::{ModelRef, validate_model_name};
 use super::xet_native::XetNativeStorage;
+use super::model_registry_adapter::RegistryAdapter;
 
 /// Status of a model's git repository using git2 types
 #[derive(Debug, Clone)]
@@ -63,196 +63,56 @@ pub struct ModelInfo {
 pub struct ModelRegistry {
     base_dir: PathBuf,
     xet_storage: Option<Arc<XetNativeStorage>>,
+    /// Adapter layer for delegating to git2db
+    adapter: Arc<RegistryAdapter>,
 }
 
 impl ModelRegistry {
-    /// Open or initialize a model registry
-    pub fn new(base_dir: PathBuf, xet_storage: Option<Arc<XetNativeStorage>>) -> Result<Self> {
-        Self::new_with_config(base_dir, xet_storage, GitConfig::default())
-    }
+    /// Open or initialize a model registry with git2db integration
+    pub async fn open(base_dir: PathBuf, xet_storage: Option<Arc<XetNativeStorage>>) -> Result<Self> {
+        info!("Opening model registry at {:?} with git2db integration", base_dir);
 
-    /// Create with custom Git configuration (deprecated - use GitManager::global())
-    #[deprecated(note = "Git configuration is now global via GitManager::global()")]
-    pub fn new_with_config(
-        base_dir: PathBuf,
-        xet_storage: Option<Arc<XetNativeStorage>>,
-        _git_config: GitConfig
-    ) -> Result<Self> {
-        if !base_dir.join(".git").exists() {
-            info!("Initializing new model registry at {:?}", base_dir);
-            std::fs::create_dir_all(&base_dir)?;
-            let repo = Repository::init(&base_dir)?; // One-time initialization
-
-            // Create initial commit so we can add submodules
-            Self::create_initial_commit(&repo)?;
-        }
+        // Open or create git2db registry
+        let git2db = Git2DB::open(&base_dir).await?;
+        let adapter = Arc::new(RegistryAdapter::new(git2db));
 
         Ok(Self {
             base_dir,
             xet_storage,
+            adapter,
         })
     }
 
-    /// Open the repository when needed (with proper caching)
-    fn open_repo(&self) -> Result<Repository> {
-        crate::storage::get_cached_repository(&self.base_dir)
+    /// Get raw repository for sync operations (escape hatch)
+    ///
+    /// TODO: Migrate callers to async RepositoryHandle when possible.
+    /// This is a temporary bridge for sync methods that need git2::Repository.
+    fn get_raw_repo(&self, model_ref: &ModelRef) -> Result<git2::Repository> {
+        let repo_id = self.adapter.resolve(model_ref)?;
+
+        // Use tokio::task::block_in_place for sync context
+        let model_path = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let registry = self.adapter.registry().await;
+                registry.get_worktree_path(&repo_id)
+            })
+        }).ok_or_else(|| anyhow!("Model '{}' not found", model_ref.model))?;
+
+        let cache = GitManager::global().get_repository(&model_path)
+            .map_err(|e| anyhow!("Failed to get repository: {}", e))?;
+        cache.open()
             .map_err(|e| anyhow!("Failed to open repository: {}", e))
     }
 
-    /// Create initial commit for new repository so submodules can be added
-    fn create_initial_commit(repo: &Repository) -> Result<()> {
-        // Check if there are already commits
-        if repo.head().is_ok() {
-            return Ok(()); // Already has commits
-        }
-
-        // Create an empty .gitignore file
-        let gitignore_path = repo.path().parent().unwrap().join(".gitignore");
-        std::fs::write(&gitignore_path, "# HyprStream model registry\n")?;
-
-        // Stage the .gitignore file
-        let mut index = repo.index()?;
-        index.add_path(std::path::Path::new(".gitignore"))?;
-        index.write()?;
-
-        // Create signature for commit
-        let signature = git2::Signature::now("HyprStream", "noreply@hyprstream.ai")?;
-
-        // Get the tree from the index
-        let tree_id = index.write_tree()?;
-        let tree = repo.find_tree(tree_id)?;
-
-        // Create initial commit
-        repo.commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            "Initial commit: HyprStream model registry",
-            &tree,
-            &[],
-        )?;
-
-        info!("Created initial commit for model registry");
-        Ok(())
-    }
-
-    /// Check if a submodule exists for a model
-    /// Uses the Interior Mutability pattern to safely handle repository lifetimes
-    fn has_submodule(&self, model_ref: &ModelRef) -> Result<bool> {
-        let submodule_path = model_ref.model.clone(); // Models are direct children
-
-        // RAII pattern: Repository is owned for the entire scope
-        let repo = self.open_repo()?;
-
-        // Perform the check and immediately return the boolean result
-        // This avoids lifetime issues by not returning any references
-        let x = match repo.find_submodule(&submodule_path) {
-            Ok(_) => Ok(true),
-            Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(false),
-            Err(e) => Err(anyhow!("Failed to access submodule {}: {}", submodule_path, e)),
-        }; x
-    }
-
-    /// Execute a closure with a submodule reference
-    /// Uses the Visitor pattern to safely handle git2 object lifetimes
-    fn with_submodule<F, R>(&self, model_ref: &ModelRef, f: F) -> Result<Option<R>>
-    where
-        F: FnOnce(&git2::Submodule) -> Result<R>,
-        R: 'static,  // Result must be independent of repository lifetime
-    {
-        let submodule_path = model_ref.model.clone(); // Models are direct children
-
-        // RAII pattern: Repository owns the submodule for this scope
-        let repo = self.open_repo()?;
-
-        // Execute the closure within the repository's lifetime scope
-        let x = match repo.find_submodule(&submodule_path) {
-            Ok(submodule) => {
-                // The closure must extract owned data, not references
-                let result = f(&submodule)?;
-                Ok(Some(result))
-            },
-            Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
-            Err(e) => Err(anyhow!("Failed to access submodule {}: {}", submodule_path, e)),
-        }; x
-    }
-
-    /// Get the model repository and check if it's a submodule
-    /// Uses the Factory pattern to create repositories with proper ownership
-    ///
-    /// STRICT MODE: Only returns repositories that are properly registered as submodules.
-    /// This enforces git2db architectural integrity.
-    fn get_model_repository(&self, model_ref: &ModelRef) -> Result<(git2::Repository, bool)> {
-        let submodule_path = model_ref.model.clone(); // Models are direct children
-        let repo = self.open_repo()?;
-
-        // Submodule must exist - no fallback to untracked directories
-        let submodule = repo.find_submodule(&submodule_path)
-            .map_err(|e| {
-                if e.code() == git2::ErrorCode::NotFound {
-                    anyhow!("Model '{}' not found in registry. Use 'model add' to register it as a submodule.", model_ref.model)
-                } else {
-                    anyhow!("Failed to access submodule {}: {}", submodule_path, e)
-                }
-            })?;
-
-        // Open the submodule repository directly by path
-        let submodule_repo_path = submodule.path();
-        let full_path = self.base_dir.join(submodule_repo_path);
-
-        if !full_path.exists() {
-            bail!("Submodule '{}' registered but path {:?} not found. Run 'git submodule update --init' to populate it.",
-                  model_ref.model, full_path);
-        }
-
-        let model_repo = crate::storage::get_cached_repository(&full_path)?;
-        Ok((model_repo, true))
-    }
-
-    /// Robust helper to resolve submodule commit with multiple fallback strategies
-    fn resolve_submodule_commit(&self, submodule: &git2::Submodule<'_>, name: &str) -> Result<git2::Oid> {
-        // Strategy 1: Try index_id (may fail for transitional submodules)
-        if let Some(commit_id) = submodule.index_id() {
-            return Ok(commit_id);
-        }
-
-        // Strategy 2: Fallback to submodule repository HEAD
-        if let Ok(submodule_repo) = submodule.open() {
-            if let Ok(head_ref) = submodule_repo.head() {
-                if let Ok(commit) = head_ref.peel_to_commit() {
-                    return Ok(commit.id());
-                }
-            }
-        }
-
-        Err(anyhow!("Could not resolve commit for submodule '{}' - both index_id and repository HEAD strategies failed", name))
-    }
 
     /// Resolve a model reference to a specific commit SHA using git2 objects
     pub fn resolve(&self, model_ref: &ModelRef) -> Result<git2::Oid> {
-        let (model_repo, is_submodule) = self.get_model_repository(model_ref)?;
+        let model_repo = self.get_raw_repo(model_ref)?;
 
         match &model_ref.git_ref {
             crate::storage::GitRef::DefaultBranch => {
-                if is_submodule {
-                    // For submodules, get the pinned commit from the parent repository
-                    let parent_repo = self.open_repo()?;
-                    let submodule_path = model_ref.model.clone(); // Models are direct children
-
-                    let x = match parent_repo.find_submodule(&submodule_path) {
-                        Ok(submodule) => {
-                            // Use robust commit resolution
-                            self.resolve_submodule_commit(&submodule, &model_ref.model)
-                        },
-                        Err(_) => {
-                            // Fallback to model repo's HEAD if submodule not found
-                            Ok(model_repo.head()?.peel_to_commit()?.id())
-                        }
-                    }; x
-                } else {
-                    // Use HEAD for direct repositories
-                    Ok(model_repo.head()?.peel_to_commit()?.id())
-                }
+                // Use HEAD for default branch
+                Ok(model_repo.head()?.peel_to_commit()?.id())
             },
             crate::storage::GitRef::Commit(oid) => {
                 // Direct commit reference - just return the OID
@@ -276,7 +136,7 @@ impl ModelRegistry {
 
     /// Resolve a model reference to reference information (name and target)
     pub fn resolve_reference(&self, model_ref: &ModelRef) -> Result<Option<(String, git2::Oid)>> {
-        let (model_repo, _) = self.get_model_repository(model_ref)?;
+        let model_repo = self.get_raw_repo(model_ref)?;
 
         match &model_ref.git_ref {
             crate::storage::GitRef::DefaultBranch => {
@@ -317,157 +177,83 @@ impl ModelRegistry {
         }
     }
 
-    /// Add a new model to the registry using proper git submodule workflow with race condition protection
+    /// Add a new model to the registry using git2db with XET filter support
     pub async fn add_model(&self, name: &str, source: &str) -> Result<ModelRef> {
         validate_model_name(name)?;
+        info!("Adding model '{}' from '{}' via git2db", name, source);
 
-        info!("Adding model {} as git submodule from {}", name, source);
-
-        // Use safe-path to prevent race conditions with path operations
-        let safe_model_path = scoped_join(&self.base_dir, name)?;
-
-        let repo = self.open_repo()?;
-
-        // Check if submodule already exists
-        if repo.find_submodule(name).is_ok() {
-            return Err(anyhow!("Model '{}' already exists as submodule", name));
+        // Check if model already exists
+        if self.adapter.exists(name) {
+            return Err(anyhow!("Model '{}' already exists in registry", name));
         }
 
-        // Check if directory already exists using safe path operations
-        if safe_model_path.exists() {
-            return Err(anyhow!("Directory '{}' already exists at {:?}", name, safe_model_path));
-        }
+        // Use git2db's clone builder (handles registration automatically)
+        info!("Cloning model '{}' from '{}'", name, source);
+        let mut registry = self.adapter.registry_mut().await;
 
-        // Use proper libgit2 submodule workflow
-        // Step 1: Create the submodule entry (adds to .gitmodules)
-        // Note: use_gitlink=true ensures proper .git file creation in submodule directory
-        let mut submodule = repo.submodule(source, std::path::Path::new(name), true)?;
+        let _repo_id = registry.clone(source)
+            .name(name)
+            .depth(1)  // Shallow clone by default
+            .exec()
+            .await
+            .map_err(|e| anyhow!("Failed to clone model '{}': {}", name, e))?;
 
-        // Step 2: Initialize the submodule configuration
-        // This writes the submodule.<name>.url to .git/config
-        submodule.init(false)?;
-
-        // Step 3: Clone and checkout the submodule (THIS WAS THE MISSING STEP!)
-        // This is critical - it actually populates the submodule directory
-        let mut update_opts = git2::SubmoduleUpdateOptions::new();
-
-        // Configure fetch options with authentication callbacks
-        let mut fetch_opts = git2::FetchOptions::new();
-        let mut callbacks = git2::RemoteCallbacks::new();
-
-        // Add authentication callbacks for private repos
-        callbacks.credentials(|_url, username_from_url, _allowed_types| {
-            git2::Cred::ssh_key_from_agent(username_from_url.unwrap_or("git"))
-        });
-
-        fetch_opts.remote_callbacks(callbacks);
-        update_opts.fetch(fetch_opts);
-
-        // Perform the actual clone and checkout
-        submodule.update(true, Some(&mut update_opts))?;
-
-        // Step 4: Reload the submodule to get the updated state
-        // Important: re-find the submodule after update
-        drop(submodule); // Release the old reference
-        {
-            let _submodule = repo.find_submodule(name)?; // Verify it exists
-        }
-
-        // Step 5: Stage the changes in the index with explicit flush
-        {
-            let mut index = repo.index()?;
-
-            // Add .gitmodules file if it has content
-            if std::path::Path::new(".gitmodules").exists() {
-                index.add_path(std::path::Path::new(".gitmodules"))?;
-            }
-
-            // Add the submodule path - this should create the proper gitlink entry
-            // after submodule.update() has completed successfully
-            index.add_path(std::path::Path::new(name))?;
-
-            // Write the index to disk
-            index.write()?;
-
-            // Explicitly drop index to ensure file handle is closed and flushed
-            drop(index);
-        }
-
-        info!("Successfully added model {} as submodule", name);
-
-        // Commit the submodule addition to registry BEFORE returning
-        // This ensures the submodule has a proper index_id when accessed later
-        self.commit_registry(&format!("Add model: {}", name))?;
-
-        // Reload the repository to ensure the index is fresh after commit
-        drop(repo);
-        let _repo = self.open_repo()?;
-
-        // Return the ModelRef for the new model
+        info!("Successfully added model '{}' via git2db with XET support", name);
         Ok(ModelRef::new(name.to_string()))
     }
 
-    /// Update a model to a different version
+    /// Update a model to a different version using git2db
     pub async fn update_model(&self, name: &str, ref_spec: &str) -> Result<()> {
         if !git2::Reference::is_valid_name(ref_spec) {
             bail!("Invalid git reference name: '{}'", ref_spec);
         }
 
-        let submodule_path = name.to_string(); // Models are direct children
-        let repo = self.open_repo()?;
-        let submodule = repo.find_submodule(&submodule_path)?;
-        let model_repo = submodule.open()?;
+        info!("Updating model '{}' to '{}' via git2db", name, ref_spec);
 
-        // Fetch latest changes
-        info!("Fetching updates for model {}", name);
-        let mut remote = model_repo.find_remote("origin")?;
+        // Resolve model name to RepoId
+        let model_ref = ModelRef::new(name.to_string());
+        let repo_id = self.adapter.resolve(&model_ref)?;
 
-        let mut fetch_opts = FetchOptions::new();
-        if let Some(_xet) = &self.xet_storage {
-            // Configure XET callbacks if needed
-            let callbacks = git2::RemoteCallbacks::new();
-            fetch_opts.remote_callbacks(callbacks);
-        }
+        // Get repository handle from git2db
+        let registry = self.adapter.registry().await;
+        let handle = registry.repo(&repo_id)?;
 
-        remote.fetch(&[ref_spec], Some(&mut fetch_opts), None)?;
+        // Fetch from remote (uses GitManager, applies XET filters)
+        info!("Fetching updates for model '{}'", name);
+        handle.fetch(None).await?;
 
-        // Resolve and checkout the ref
-        let commit = model_repo.revparse_single(ref_spec)?.peel_to_commit()?;
-        model_repo.set_head_detached(commit.id())?;
-        model_repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
+        // Checkout the specified ref (XET filters apply automatically)
+        info!("Checking out '{}' for model '{}'", ref_spec, name);
+        handle.checkout(ref_spec).await?;
 
-        // Update submodule pointer in registry with explicit flush
-        {
-            let mut index = self.open_repo()?.index()?;
-            index.add_path(Path::new(&submodule_path))?;
-            index.write()?;
-            drop(index);  // Ensure index is flushed
-        }
-
-        // Commit registry change
-        self.commit_registry(&format!("Update {} to {}", name, ref_spec))?;
-
-        // Reload the repository to ensure the index is fresh after commit
-        let _repo = self.open_repo()?;
-
+        info!("Successfully updated model '{}' to '{}'", name, ref_spec);
         Ok(())
     }
 
-    /// List all registered models with their current commits
-    pub fn list_models(&self) -> Result<Vec<(String, git2::Oid)>> {
+    /// List all registered models with their current commits using git2db
+    pub async fn list_models(&self) -> Result<Vec<(String, git2::Oid)>> {
+        let registry = self.adapter.registry().await;
         let mut models = Vec::new();
 
-        // List submodules (models are now direct children)
-        for submodule in self.open_repo()?.submodules()? {
-            if let Some(path) = submodule.path().to_str() {
-                // Use robust commit resolution with fallbacks
-                match self.resolve_submodule_commit(&submodule, path) {
-                    Ok(commit_id) => {
-                        models.push((path.to_string(), commit_id));
-                    },
+        for tracked in registry.list() {
+            if let Some(name) = &tracked.name {
+                // Get current OID from the repository
+                match registry.repo(&tracked.id) {
+                    Ok(handle) => {
+                        match handle.current_oid() {
+                            Ok(Some(oid)) => {
+                                models.push((name.clone(), oid));
+                            }
+                            Ok(None) => {
+                                debug!("Model '{}' has no current OID", name);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to get OID for '{}': {}", name, e);
+                            }
+                        }
+                    }
                     Err(e) => {
-                        // Log warning but continue listing other models
-                        tracing::warn!("Could not resolve commit for submodule '{}': {}", path, e);
+                        tracing::warn!("Failed to get repository handle for '{}': {}", name, e);
                     }
                 }
             }
@@ -478,7 +264,7 @@ impl ModelRegistry {
 
     /// List available refs for a model - returns reference info without lifetimes
     pub fn list_model_refs(&self, model_ref: &ModelRef) -> Result<Vec<(String, git2::Oid)>> {
-        let (model_repo, _is_submodule) = self.get_model_repository(model_ref)?;
+        let model_repo = self.get_raw_repo(model_ref)?;
 
         let mut ref_info = Vec::new();
 
@@ -508,7 +294,7 @@ impl ModelRegistry {
 
     /// Get branch and tag names for a model (legacy string interface)
     pub fn list_model_ref_names(&self, model_ref: &ModelRef) -> Result<Vec<String>> {
-        let (model_repo, _is_submodule) = self.get_model_repository(model_ref)?;
+        let model_repo = self.get_raw_repo(model_ref)?;
 
         let mut refs = Vec::new();
 
@@ -545,18 +331,16 @@ impl ModelRegistry {
     }
 
     /// Create a branch for a model using ModelRef
-    pub fn create_branch(&self, model_ref: &ModelRef, branch_name: &str, from_ref: Option<&str>) -> Result<()> {
-        let (model_repo, _is_submodule) = self.get_model_repository(model_ref)?;
+    pub async fn create_branch(&self, model_ref: &ModelRef, branch_name: &str, from_ref: Option<&str>) -> Result<()> {
+        // Resolve model name to RepoId
+        let repo_id = self.adapter.resolve(model_ref)?;
 
-        // Get the commit to branch from
-        let commit = if let Some(ref_str) = from_ref {
-            model_repo.revparse_single(ref_str)?.peel_to_commit()?
-        } else {
-            model_repo.head()?.peel_to_commit()?
-        };
+        // Get repository handle from git2db
+        let registry = self.adapter.registry().await;
+        let handle = registry.repo(&repo_id)?;
 
-        // Create the branch
-        let _branch = model_repo.branch(branch_name, &commit, false)?;
+        // Use BranchManager to create branch
+        handle.branch().create(branch_name, from_ref).await?;
 
         info!("Created branch {} for model {} from {}",
               branch_name, model_ref.model, from_ref.unwrap_or("HEAD"));
@@ -565,7 +349,7 @@ impl ModelRegistry {
 
     /// Get the default branch of a repository using ModelRef
     pub fn get_default_branch(&self, model_ref: &ModelRef) -> Result<String> {
-        let (model_repo, _is_submodule) = self.get_model_repository(model_ref)?;
+        let model_repo = self.get_raw_repo(model_ref)?;
 
         // Try to get the symbolic reference HEAD points to
         if let Ok(head_ref) = model_repo.head() {
@@ -597,98 +381,59 @@ impl ModelRegistry {
         Ok("main".to_string())
     }
 
-    /// Checkout a specific ref for a model using ModelRef and git2 objects
-    pub fn checkout(&self, model_ref: &ModelRef, options: CheckoutOptions) -> Result<CheckoutResult> {
-        let (model_repo, is_submodule) = self.get_model_repository(model_ref)?;
+    /// Checkout a specific ref for a model using git2db with XET filter support
+    pub async fn checkout(&self, model_ref: &ModelRef, _options: CheckoutOptions) -> Result<CheckoutResult> {
+        let ref_str = model_ref.git_ref_str().unwrap_or_else(|| "default".to_string());
+        info!("Checking out '{}' for model '{}' via git2db", ref_str, model_ref.model);
 
-        // Get current state before checkout using git2::Reference
-        let previous_reference = match model_repo.head() {
-            Ok(head_ref) => Some(head_ref),
-            Err(_) => None,
+        // Resolve model name to RepoId
+        let repo_id = self.adapter.resolve(model_ref)?;
+
+        // Get repository handle from git2db
+        let registry = self.adapter.registry().await;
+        let handle = registry.repo(&repo_id)?;
+
+        // Get previous state
+        let previous_oid = handle.current_oid()?.unwrap_or(git2::Oid::zero());
+
+        // Convert hyprstream GitRef to git2db-compatible string
+        let ref_string = match &model_ref.git_ref {
+            crate::storage::GitRef::Branch(name) => name.clone(),
+            crate::storage::GitRef::Tag(name) => name.clone(),
+            crate::storage::GitRef::Commit(oid) => oid.to_string(),
+            crate::storage::GitRef::Revspec(spec) => spec.clone(),
+            crate::storage::GitRef::DefaultBranch => "HEAD".to_string(),
         };
-        let previous_oid = previous_reference.as_ref()
-            .and_then(|r| r.target())
-            .unwrap_or_else(|| git2::Oid::zero());
 
-        // Resolve the target using our existing resolve method
-        let target_oid = self.resolve(model_ref)?;
-        let target_commit = model_repo.find_commit(target_oid)?;
+        // Perform checkout (XET filters apply automatically)
+        handle.checkout(ref_string.as_str()).await?;
 
-        // Determine how to checkout based on the git ref type using git2::Reference
+        // Get new state
+        let new_oid = handle.current_oid()?.unwrap_or(git2::Oid::zero());
+
+        // Get ref names for result
         let new_ref_name = match &model_ref.git_ref {
-            crate::storage::GitRef::DefaultBranch => {
-                // Get or create the default branch reference
-                let default_branch = self.get_default_branch(model_ref)?;
-                let branch_ref_name = format!("refs/heads/{}", default_branch);
-                match model_repo.find_reference(&branch_ref_name) {
-                    Ok(branch_ref) => {
-                        model_repo.set_head(branch_ref.name().unwrap())?;
-                        Some(default_branch)
-                    },
-                    Err(_) => {
-                        // Create the default branch if it doesn't exist
-                        let _branch = model_repo.branch(&default_branch, &target_commit, false)?;
-                        model_repo.set_head(&branch_ref_name)?;
-                        Some(default_branch)
-                    }
-                }
-            },
-            crate::storage::GitRef::Branch(branch_name) => {
-                let branch_ref_name = format!("refs/heads/{}", branch_name);
-                match model_repo.find_reference(&branch_ref_name) {
-                    Ok(_branch_ref) => {
-                        model_repo.set_head(&branch_ref_name)?;
-                        Some(branch_name.clone())
-                    },
-                    Err(_) if options.create_branch => {
-                        // Create new branch
-                        let _branch = model_repo.branch(branch_name, &target_commit, false)?;
-                        model_repo.set_head(&branch_ref_name)?;
-                        Some(branch_name.clone())
-                    },
-                    Err(e) => return Err(anyhow!("Branch '{}' not found and create_branch=false: {}", branch_name, e)),
-                }
-            },
-            crate::storage::GitRef::Tag(tag_name) => {
-                // Detached HEAD for tags
-                model_repo.set_head_detached(target_commit.id())?;
-                Some(tag_name.clone())
-            },
-            crate::storage::GitRef::Commit(_) | crate::storage::GitRef::Revspec(_) => {
-                // Detached HEAD for commits and revspecs
-                model_repo.set_head_detached(target_commit.id())?;
-                None
-            }
+            crate::storage::GitRef::Branch(name) => Some(name.clone()),
+            crate::storage::GitRef::Tag(name) => Some(name.clone()),
+            _ => None,
         };
 
-        // Update working directory
-        let mut checkout_builder = git2::build::CheckoutBuilder::new();
-        if options.force {
-            checkout_builder.force();
-        }
-        model_repo.checkout_head(Some(&mut checkout_builder))?;
-
-        let files_changed = target_commit.tree()?.len();
-
-        info!("Checked out {} for model {} ({})",
-              new_ref_name.as_ref().unwrap_or(&"detached".to_string()),
-              model_ref.model,
-              target_oid);
+        info!("Successfully checked out '{}' for model '{}'", ref_str, model_ref.model);
 
         Ok(CheckoutResult {
             previous_oid,
-            new_oid: target_oid,
-            previous_ref_name: previous_reference.and_then(|r| r.shorthand().map(|s| s.to_string())),
+            new_oid,
+            previous_ref_name: None,
             new_ref_name,
-            was_forced: options.force,
-            files_changed,
-            has_submodule: is_submodule,
+            was_forced: false,
+            files_changed: 0,
+            has_submodule: true,
         })
     }
 
     /// Get the status of a model's repository using git2 objects
     pub fn status(&self, model_ref: &ModelRef) -> Result<ModelStatus> {
-        let (model_repo, _is_submodule) = self.get_model_repository(model_ref)?;
+        let model_repo = self.get_raw_repo(model_ref)?;
 
         // Get current state using git2::Reference
         let (current_oid, current_ref_name, current_ref_type) = match model_repo.head() {
@@ -740,31 +485,31 @@ impl ModelRegistry {
     }
 
     /// Commit changes in a model's repository using ModelRef
-    pub fn commit_model(&self, model_ref: &ModelRef, message: &str, stage_all: bool) -> Result<git2::Oid> {
-        let (model_repo, _is_submodule) = self.get_model_repository(model_ref)?;
+    ///
+    /// Note: This uses raw git2 for commit creation as git2db's commit() API
+    /// is not yet available (Phase 3). Uses RepositoryHandle for everything else.
+    pub async fn commit_model(&self, model_ref: &ModelRef, message: &str, stage_all: bool) -> Result<git2::Oid> {
+        // Resolve model name to RepoId
+        let repo_id = self.adapter.resolve(model_ref)?;
 
-        // Create signature
-        let sig = GitManager::global().create_signature(None, None)?;
+        // Get repository handle from git2db
+        let registry = self.adapter.registry().await;
+        let handle = registry.repo(&repo_id)?;
 
-        // Get index
-        let mut index = model_repo.index()?;
-
-        // Stage files if requested
+        // Stage files if requested using git2db StageManager
         if stage_all {
-            index.add_all(["*"].iter(), IndexAddOption::DEFAULT, None)?;
-            index.update_all(["*"].iter(), None)?;
+            handle.staging().add_all().await?;
         }
 
-        index.write()?;
+        // TODO: Replace with handle.commit(message) when git2db Phase 3 complete
+        // For now, use escape hatch to raw git2 for commit creation
+        let model_repo = handle.open_repo()?;
+        let sig = GitManager::global().create_signature(None, None)?;
 
-        // Create tree from index
-        let tree_id = index.write_tree()?;
+        let tree_id = model_repo.index()?.write_tree()?;
         let tree = model_repo.find_tree(tree_id)?;
-
-        // Get parent commit
         let parent_commit = model_repo.head()?.peel_to_commit()?;
 
-        // Create commit and return the OID
         let commit_oid = model_repo.commit(
             Some("HEAD"),
             &sig,
@@ -779,7 +524,10 @@ impl ModelRegistry {
     }
 
     /// Push changes to remote using ModelRef
-    pub fn push_model(
+    ///
+    /// Note: Uses git2db RepositoryHandle.push() for push operations.
+    /// Upstream tracking requires raw git2 (not in RepositoryHandle yet).
+    pub async fn push_model(
         &self,
         model_ref: &ModelRef,
         remote_name: &str,
@@ -787,43 +535,29 @@ impl ModelRegistry {
         set_upstream: bool,
         force: bool,
     ) -> Result<()> {
-        let (model_repo, _is_submodule) = self.get_model_repository(model_ref)?;
+        // Resolve model name to RepoId
+        let repo_id = self.adapter.resolve(model_ref)?;
 
-        // Get remote
-        let mut remote = model_repo.find_remote(remote_name)?;
+        // Get repository handle from git2db
+        let registry = self.adapter.registry().await;
+        let handle = registry.repo(&repo_id)?;
 
-        // Determine refspec
+        // Determine what to push
         let refspec = if let Some(branch) = branch_name {
-            if force {
-                format!("+refs/heads/{}:refs/heads/{}", branch, branch)
-            } else {
-                format!("refs/heads/{}:refs/heads/{}", branch, branch)
-            }
+            git2db::GitRef::Branch(branch.to_string())
         } else {
-            // Push current branch
-            let head = model_repo.head()?;
-            let branch_name = head.shorthand().ok_or_else(|| anyhow!("Not on a branch"))?;
-            if force {
-                format!("+refs/heads/{}:refs/heads/{}", branch_name, branch_name)
-            } else {
-                format!("refs/heads/{}:refs/heads/{}", branch_name, branch_name)
-            }
+            git2db::GitRef::DefaultBranch
         };
 
-        // Configure callbacks
-        let mut push_opts = git2::PushOptions::new();
-        let callbacks = RemoteCallbacks::new();
-        push_opts.remote_callbacks(callbacks);
+        // Use RepositoryHandle to push
+        handle.push(Some(remote_name), refspec).await?;
 
-        // Push
-        remote.push(&[&refspec], Some(&mut push_opts))?;
-
-        // Set upstream if requested
+        // Set upstream if requested (requires escape hatch for now)
         if set_upstream {
+            let model_repo = handle.open_repo()?;
             let resolved_branch = if let Some(branch) = branch_name {
                 branch.to_string()
             } else {
-                // No branch specified - use current branch from HEAD
                 let head = model_repo.head()?;
                 head.shorthand().ok_or_else(|| anyhow!("Not on a branch"))?.to_string()
             };
@@ -835,108 +569,45 @@ impl ModelRegistry {
         Ok(())
     }
 
-    /// Pull changes from remote using ModelRef and git2::AnnotatedCommit
-    pub fn pull_model(
+    /// Pull changes from remote using ModelRef
+    ///
+    /// Note: Uses git2db RepositoryHandle.pull() for pull operations.
+    /// Rebase is not yet supported - will fail with error.
+    pub async fn pull_model(
         &self,
         model_ref: &ModelRef,
         remote_name: &str,
         branch_name: Option<&str>,
         rebase: bool,
     ) -> Result<()> {
+        if rebase {
+            bail!("Rebase not yet supported by git2db RepositoryHandle");
+        }
+
         // Check for uncommitted changes before pulling
         let status = self.status(model_ref)?;
         if status.is_dirty {
             bail!("Cannot pull: model '{}' has uncommitted changes. Commit or stash them first.", model_ref.model);
         }
 
-        let (model_repo, _is_submodule) = self.get_model_repository(model_ref)?;
+        // Resolve model name to RepoId
+        let repo_id = self.adapter.resolve(model_ref)?;
 
-        // Fetch from remote
-        let mut remote = model_repo.find_remote(remote_name)?;
-        let mut fetch_opts = git2::FetchOptions::new();
-        let callbacks = RemoteCallbacks::new();
-        fetch_opts.remote_callbacks(callbacks);
+        // Get repository handle from git2db
+        let registry = self.adapter.registry().await;
+        let handle = registry.repo(&repo_id)?;
 
-        let refspec = branch_name.unwrap_or("+refs/heads/*:refs/remotes/origin/*");
-        remote.fetch(&[refspec], Some(&mut fetch_opts), None)?;
-
-        // Get the remote branch reference using git2::Reference
-        let remote_ref_name = if let Some(branch) = branch_name {
-            format!("refs/remotes/{}/{}", remote_name, branch)
+        // Determine what to pull
+        let refspec = if let Some(branch) = branch_name {
+            git2db::GitRef::Branch(branch.to_string())
         } else {
-            // Use current branch's upstream
-            let head = model_repo.head()?;
-            let local_branch = model_repo.find_branch(
-                head.shorthand().unwrap(),
-                git2::BranchType::Local
-            )?;
-            let upstream = local_branch.upstream()?;
-            upstream.get().name().unwrap().to_string()
+            git2db::GitRef::DefaultBranch
         };
-        let remote_branch_ref = model_repo.find_reference(&remote_ref_name)?;
 
-        // Create git2::AnnotatedCommit from the remote reference
-        let fetch_commit = model_repo.reference_to_annotated_commit(&remote_branch_ref)?;
-        let remote_branch = remote_branch_ref.shorthand().unwrap_or("<unknown>");
+        // Use RepositoryHandle to pull
+        handle.pull(Some(remote_name), refspec).await?;
 
-        // Perform merge or rebase
-        if rebase {
-            // TODO: Implement rebase (complex operation)
-            return Err(anyhow!("Rebase not yet implemented. Use merge for now."));
-        } else {
-            // Merge
-            let (merge_analysis, _) = model_repo.merge_analysis(&[&fetch_commit])?;
-
-            if merge_analysis.is_fast_forward() {
-                // Fast-forward using git2::Reference
-                let current_branch_name = match branch_name {
-                    Some(name) => name.to_string(),
-                    None => model_repo.head()?.shorthand().unwrap().to_string(),
-                };
-                let refname = format!("refs/heads/{}", current_branch_name);
-                let mut current_ref = model_repo.find_reference(&refname)?;
-                current_ref.set_target(fetch_commit.id(), "Fast-forward")?;
-                model_repo.set_head(&refname)?;
-                model_repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
-                info!("Fast-forwarded {} to {}", model_ref.model, fetch_commit.id());
-            } else if merge_analysis.is_normal() {
-                // Normal merge using git2::AnnotatedCommit
-                let sig = GitManager::global().create_signature(None, None)?;
-                let local_commit = model_repo.reference_to_annotated_commit(&model_repo.head()?)?;
-                model_repo.merge(&[&fetch_commit], None, None)?;
-                let mut index = model_repo.index()?;
-
-                // Check for conflicts
-                if index.has_conflicts() {
-                    return Err(anyhow!("Merge conflicts detected. Please resolve manually."));
-                }
-
-                // Write merged tree
-                let tree_id = index.write_tree_to(&model_repo)?;
-                let tree = model_repo.find_tree(tree_id)?;
-
-                // Create merge commit
-                let parent_commits = vec![
-                    model_repo.head()?.peel_to_commit()?,
-                    model_repo.find_commit(fetch_commit.id())?
-                ];
-                let parent_refs: Vec<&git2::Commit> = parent_commits.iter().collect();
-
-                model_repo.commit(
-                    Some("HEAD"),
-                    &sig,
-                    &sig,
-                    &format!("Merge {} from {}", remote_branch, remote_name),
-                    &tree,
-                    &parent_refs,
-                )?;
-
-                info!("Merged {} from {}", remote_branch, remote_name);
-            } else if merge_analysis.is_up_to_date() {
-                info!("Already up-to-date");
-            }
-        }
-
+        info!("Pulled model {} from {}", model_ref.model, remote_name);
         Ok(())
     }
 
@@ -954,7 +625,7 @@ impl ModelRegistry {
             bail!("Cannot merge: model '{}' has uncommitted changes. Commit or stash them first.", model_ref.model);
         }
 
-        let (model_repo, _is_submodule) = self.get_model_repository(model_ref)?;
+        let model_repo = self.get_raw_repo(model_ref)?;
 
         // Get the branch to merge using git2::Reference and git2::AnnotatedCommit
         let branch = model_repo.find_branch(branch_name, git2::BranchType::Local)?;
@@ -1019,124 +690,25 @@ impl ModelRegistry {
     }
 
     /// Remove a model from the registry
-    pub fn remove_model(&self, model_ref: &ModelRef) -> Result<()> {
+    ///
+    /// Uses git2db's remove_repository() which handles complete cleanup.
+    pub async fn remove_model(&self, model_ref: &ModelRef) -> Result<()> {
         info!("Removing model {} from registry", model_ref.model);
 
-        // Check if model exists as submodule
-        let submodule_path = model_ref.model.clone(); // Models are direct children
-        let repo = self.open_repo()?;
+        // Resolve model name to RepoId
+        let repo_id = self.adapter.resolve(model_ref)?;
 
-        // Check if submodule exists
-        let _submodule = match repo.find_submodule(&submodule_path) {
-            Ok(submodule) => submodule,
-            Err(_) => {
-                return Err(anyhow!("Model '{}' not found in registry (no submodule)", model_ref.model));
-            }
-        };
-
-        // Remove the submodule
-        // This involves several steps:
-        // 1. Remove the submodule entry from .gitmodules
-        // 2. Remove the submodule entry from .git/config
-        // 3. Remove the submodule directory
-        // 4. Remove from git index
-
-        // Atomic staging of submodule removal
-        {
-            let mut index = repo.index()?;
-            index.remove_path(std::path::Path::new(&submodule_path))?;
-            index.write()?;
-        }
-
-        // Remove submodule configuration
-        let mut config = repo.config()?;
-        let config_key = format!("submodule.{}.url", submodule_path);
-        if let Err(_) = config.remove(&config_key) {
-            // Config entry might not exist, that's okay
-        }
-
-        // Remove from .gitmodules file using safe-path
-        let gitmodules_path = scoped_join(repo.workdir().unwrap(), ".gitmodules")?;
-        if gitmodules_path.exists() {
-            let content = std::fs::read_to_string(&gitmodules_path)?;
-            let mut new_content = String::new();
-            let mut lines = content.lines();
-            let mut skip_section = false;
-
-            while let Some(line) = lines.next() {
-                if line.trim().starts_with(&format!("[submodule \"{}\"", submodule_path)) {
-                    skip_section = true;
-                    continue;
-                }
-
-                if skip_section {
-                    if line.trim().starts_with("[") && !line.trim().starts_with(&format!("[submodule \"{}\"", submodule_path)) {
-                        skip_section = false;
-                        new_content.push_str(line);
-                        new_content.push('\n');
-                    }
-                    // Skip lines in the section we're removing
-                    continue;
-                }
-
-                new_content.push_str(line);
-                new_content.push('\n');
-            }
-
-            std::fs::write(&gitmodules_path, new_content)?;
-        }
-
-        // Atomic staging of .gitmodules changes
-        {
-            let mut index = repo.index()?;
-            index.add_path(std::path::Path::new(".gitmodules"))?;
-            index.write()?;
-        }
-
-        // Commit the changes
-        self.commit_registry(&format!("Remove model {}", model_ref.model))?;
+        // Use git2db to remove repository (handles submodule cleanup)
+        let mut registry = self.adapter.registry_mut().await;
+        registry.remove_repository(&repo_id).await?;
 
         info!("Successfully removed model {} from registry", model_ref.model);
         Ok(())
     }
 
-    /// Helper to commit changes to the registry
-    fn commit_registry(&self, message: &str) -> Result<()> {
-        let repo = self.open_repo()?;
-        let sig = GitManager::global().create_signature(None, None)?;
-        let mut index = repo.index()?;
-
-        // Stage .gitmodules and submodule changes
-        index.add_all(["*"].iter(), IndexAddOption::DEFAULT, None)?;
-        index.write()?;
-
-        let tree_id = index.write_tree()?;
-        let tree = repo.find_tree(tree_id)?;
-
-        let parent_commit = if repo.head().is_ok() {
-            Some(repo.head()?.peel_to_commit()?)
-        } else {
-            None
-        };
-
-        let parent_commits: Vec<&git2::Commit> = parent_commit.as_ref().map(|c| vec![c]).unwrap_or_default();
-
-        repo.commit(
-            Some("HEAD"),
-            &sig,
-            &sig,
-            message,
-            &tree,
-            &parent_commits,
-        )?;
-
-        info!("Committed to registry: {}", message);
-        Ok(())
-    }
-
     /// Get comprehensive model information using git2 types
     pub fn get_model_info(&self, model_ref: &ModelRef) -> Result<ModelInfo> {
-        let (model_repo, is_submodule) = self.get_model_repository(model_ref)?;
+        let model_repo = self.get_raw_repo(model_ref)?;
 
         // Extract path from repository for ModelInfo struct
         let model_path = model_repo.workdir()
@@ -1172,7 +744,7 @@ impl ModelRegistry {
             target_ref_name,
             status,
             repository: model_repo,
-            has_submodule: is_submodule,
+            has_submodule: true,  // All models are managed by git2db now
         })
     }
 
@@ -1189,19 +761,11 @@ pub struct SharedModelRegistry {
 }
 
 impl SharedModelRegistry {
-    pub fn new(base_dir: PathBuf, xet_storage: Option<Arc<XetNativeStorage>>) -> Result<Self> {
+    /// Open shared registry with git2db integration
+    pub async fn open(base_dir: PathBuf, xet_storage: Option<Arc<XetNativeStorage>>) -> Result<Self> {
+        let registry = ModelRegistry::open(base_dir, xet_storage).await?;
         Ok(Self {
-            inner: Arc::new(RwLock::new(ModelRegistry::new(base_dir, xet_storage)?)),
-        })
-    }
-
-    pub fn new_with_config(
-        base_dir: PathBuf,
-        xet_storage: Option<Arc<XetNativeStorage>>,
-        git_config: GitConfig,
-    ) -> Result<Self> {
-        Ok(Self {
-            inner: Arc::new(RwLock::new(ModelRegistry::new_with_config(base_dir, xet_storage, git_config)?)),
+            inner: Arc::new(RwLock::new(registry)),
         })
     }
 
@@ -1222,7 +786,7 @@ impl SharedModelRegistry {
 
     pub async fn list_models(&self) -> Result<Vec<(String, git2::Oid)>> {
         let registry = self.inner.read().await;
-        registry.list_models()
+        registry.list_models().await
     }
 
     /// List model refs as reference information (name and target)
@@ -1257,13 +821,13 @@ impl SharedModelRegistry {
     /// Create a branch for a model
     pub async fn create_branch(&self, model_ref: &ModelRef, branch_name: &str, from_ref: Option<&str>) -> Result<()> {
         let registry = self.inner.write().await;  // WRITE lock - creates branch
-        registry.create_branch(model_ref, branch_name, from_ref)
+        registry.create_branch(model_ref, branch_name, from_ref).await
     }
 
     /// Checkout a branch/tag/commit for a model
     pub async fn checkout(&self, model_ref: &ModelRef, options: CheckoutOptions) -> Result<CheckoutResult> {
         let registry = self.inner.write().await;  // WRITE lock - modifies working directory
-        registry.checkout(model_ref, options)
+        registry.checkout(model_ref, options).await
     }
 
     /// Get the default branch of a repository
@@ -1281,7 +845,7 @@ impl SharedModelRegistry {
     /// Commit changes in a model's repository
     pub async fn commit_model(&self, model_ref: &ModelRef, message: &str, stage_all: bool) -> Result<git2::Oid> {
         let registry = self.inner.write().await;  // WRITE lock - creates commit
-        registry.commit_model(model_ref, message, stage_all)
+        registry.commit_model(model_ref, message, stage_all).await
     }
 
     /// Push model to remote
@@ -1294,7 +858,7 @@ impl SharedModelRegistry {
         force: bool,
     ) -> Result<()> {
         let registry = self.inner.write().await;  // WRITE lock - may update upstream
-        registry.push_model(model_ref, remote_name, branch_name, set_upstream, force)
+        registry.push_model(model_ref, remote_name, branch_name, set_upstream, force).await
     }
 
     /// Pull model from remote
@@ -1306,7 +870,7 @@ impl SharedModelRegistry {
         rebase: bool,
     ) -> Result<()> {
         let registry = self.inner.write().await;  // WRITE lock - merges changes
-        registry.pull_model(model_ref, remote_name, branch_name, rebase)
+        registry.pull_model(model_ref, remote_name, branch_name, rebase).await
     }
 
     /// Merge branch
@@ -1324,7 +888,7 @@ impl SharedModelRegistry {
     /// Remove a model from the registry
     pub async fn remove_model(&self, model_ref: &ModelRef) -> Result<()> {
         let registry = self.inner.write().await;  // WRITE lock - removes submodule
-        registry.remove_model(model_ref)
+        registry.remove_model(model_ref).await
     }
 }
 
@@ -1338,10 +902,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let registry_path = dir.path().join("registry");
 
-        let registry = ModelRegistry::new(registry_path.clone(), None).unwrap();
+        let registry = ModelRegistry::open(registry_path.clone(), None).await.unwrap();
 
         // Test listing (should be empty)
-        let models = registry.list_models().unwrap();
+        let models = registry.list_models().await.unwrap();
         assert_eq!(models.len(), 0);
 
         // Test resolving non-existent model
@@ -1357,7 +921,7 @@ mod tests {
         let registry_path = dir.path().join("registry");
 
         // Create shared registry
-        let registry = Arc::new(SharedModelRegistry::new(registry_path.clone(), None).unwrap());
+        let registry = Arc::new(SharedModelRegistry::open(registry_path.clone(), None).await.unwrap());
 
         // Spawn concurrent operations
         let add_task = {
@@ -1398,7 +962,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let registry_path = dir.path().join("registry");
 
-        let registry = ModelRegistry::new(registry_path.clone(), None).unwrap();
+        let registry = ModelRegistry::open(registry_path.clone(), None).await.unwrap();
 
         // Create a test repository for the model
         let model_path = registry_path.join("test_model");

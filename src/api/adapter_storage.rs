@@ -432,7 +432,7 @@ impl AdapterStorage {
             .context("Adapter not found in git2db registry")?;
 
         // Stage all changes
-        handle.staging().add_all()
+        handle.staging().add_all().await
             .context("Failed to stage adapter changes")?;
 
         // Commit

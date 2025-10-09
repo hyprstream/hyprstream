@@ -6,3 +6,4 @@ _future
 target
 models
 libtorch
+.cargo

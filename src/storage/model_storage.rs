@@ -79,10 +79,11 @@ impl ModelStorage {
     /// Create with a new registry and custom git2db configuration
     pub async fn create_with_config(
         base_dir: PathBuf,
-        git2db_config: git2db::config::Git2DBConfig,
+        _git2db_config: git2db::config::Git2DBConfig,
     ) -> Result<Self> {
         // Use the models directory itself as the registry, not a subdirectory
-        let registry = SharedModelRegistry::new_with_config(base_dir.clone(), None, git2db_config)?;
+        // Note: git2db_config is now applied globally via GitManager
+        let registry = SharedModelRegistry::open(base_dir.clone(), None).await?;
         Ok(Self {
             base_dir,
             registry: Arc::new(registry),

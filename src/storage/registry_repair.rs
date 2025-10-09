@@ -341,7 +341,7 @@ mod tests {
         std::fs::create_dir_all(&models_dir)?;
 
         let registry_dir = temp_dir.path().join("registry");
-        let registry = SharedModelRegistry::new(registry_dir, None)?;
+        let registry = SharedModelRegistry::open(registry_dir, None).await?;
 
         let repair = RegistryRepair::new(
             models_dir,

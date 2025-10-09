@@ -107,25 +107,9 @@ impl IndicatifProgressUpdater {
 }
 
 /// Configuration for Xet storage
-#[derive(Debug, Clone)]
-pub struct XetConfig {
-    /// CAS endpoint URL (e.g., "https://cas.xet.dev")
-    pub endpoint: String,
-    /// Authentication token
-    pub token: Option<String>,
-    /// Optional compression scheme
-    pub compression: Option<CompressionScheme>,
-}
-
-impl Default for XetConfig {
-    fn default() -> Self {
-        Self {
-            endpoint: "https://cas.xet.dev".to_string(),
-            token: None,
-            compression: None,
-        }
-    }
-}
+///
+/// This is now a re-export of git2db's XetConfig for unified configuration.
+pub use git2db::config::XetConfig;
 
 /// Native Xet storage implementation using xet-core APIs
 #[derive(Clone)]

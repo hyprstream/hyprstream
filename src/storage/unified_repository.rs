@@ -404,7 +404,7 @@ mod tests {
         let base_dir = temp_dir.path().to_path_buf();
 
         let registry_dir = base_dir.join("registry");
-        let registry = SharedModelRegistry::new(registry_dir, None)?;
+        let registry = SharedModelRegistry::open(registry_dir, None).await?;
         let repo = UnifiedModelRepository::new(base_dir, Arc::new(registry))?;
 
         Ok((repo, temp_dir))
