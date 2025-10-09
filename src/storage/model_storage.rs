@@ -81,8 +81,10 @@ impl ModelStorage {
         base_dir: PathBuf,
         _git2db_config: git2db::config::Git2DBConfig,
     ) -> Result<Self> {
+        // Note: GitManager::global() now loads config from environment automatically
+        // We don't need to explicitly initialize it here anymore
+
         // Use the models directory itself as the registry, not a subdirectory
-        // Note: git2db_config is now applied globally via GitManager
         let registry = SharedModelRegistry::open(base_dir.clone(), None).await?;
         Ok(Self {
             base_dir,

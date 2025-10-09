@@ -45,8 +45,14 @@ pub async fn clone_model(
         extracted.to_string()
     };
 
-    // Create model storage with registry
-    let model_storage = ModelStorage::create(models_dir.clone()).await?;
+    // Load config to get git2db settings (includes auth tokens from env)
+    let hypr_config = crate::config::HyprConfig::load().unwrap_or_default();
+
+    // Create model storage with registry and config
+    let model_storage = ModelStorage::create_with_config(
+        models_dir.clone(),
+        hypr_config.git2db.clone()
+    ).await?;
     let registry = model_storage.registry();
 
     // Use proper git submodule workflow
@@ -90,6 +96,10 @@ pub async fn clone_model(
 /// List all available models
 pub async fn list_models() -> Result<Vec<(super::ModelRef, super::ModelMetadata)>> {
     let storage_paths = StoragePaths::new()?;
-    let model_storage = ModelStorage::create(storage_paths.models_dir()?).await?;
+    let hypr_config = crate::config::HyprConfig::load().unwrap_or_default();
+    let model_storage = ModelStorage::create_with_config(
+        storage_paths.models_dir()?,
+        hypr_config.git2db.clone()
+    ).await?;
     model_storage.list_models().await
 }

@@ -306,7 +306,21 @@ impl HyprConfig {
             .add_source(Environment::with_prefix("HYPRSTREAM").separator("__"));
 
         // Build and deserialize configuration
-        settings.build()?.try_deserialize()
+        let mut hypr_config: HyprConfig = settings.build()?.try_deserialize()?;
+
+        // Load git2db config from environment/file (it has its own env handling)
+        // This ensures GIT2DB__* environment variables are properly loaded
+        match git2db::config::Git2DBConfig::load() {
+            Ok(git2db_config) => {
+                tracing::info!("Loaded git2db config, token present: {}", git2db_config.network.access_token.is_some());
+                hypr_config.git2db = git2db_config;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load git2db config: {}, using default", e);
+            }
+        }
+
+        Ok(hypr_config)
     }
 
     /// Load configuration from file
