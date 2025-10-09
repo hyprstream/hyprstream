@@ -222,29 +222,59 @@ impl ModelFactory {
                         .to_kind(dtype)
                 }
                 safetensors::Dtype::BF16 => {
-                    // BF16 - must create on CPU first due to from_blob limitations
-                    if dtype != tch::Kind::BFloat16 {
-                        return Err(anyhow!("Model requires BF16 but target dtype is {:?}", dtype));
-                    }
+                    // BF16 handling - must copy data to avoid use-after-free
+                    // The source buffer will be dropped, so we CANNOT use from_blob
 
-                    // Create on CPU then immediately transfer to GPU
-                    let cpu_tensor = unsafe {
-                        Tensor::from_blob(
-                            data.as_ptr(),
-                            &shape,
-                            &[],
-                            tch::Kind::BFloat16,
-                            Device::Cpu,
-                        )
-                    };
+                    if matches!(device, Device::Cuda(_)) && dtype == tch::Kind::BFloat16 {
+                        // GPU path: Create BF16 tensor directly from owned data (no F32 conversion)
 
-                    // Transfer to GPU if needed
-                    if *device != Device::Cpu {
-                        let gpu_tensor = cpu_tensor.to_device(*device);
-                        drop(cpu_tensor); // Explicitly free CPU memory
-                        gpu_tensor
+                        // Copy BF16 data into owned vector (avoids use-after-free)
+                        let owned_bytes: Vec<u8> = data.to_vec();
+
+                        // Calculate total number of elements
+                        let numel: i64 = shape.iter().product();
+
+                        // Create tensor directly from bytes on CPU with BF16 dtype
+                        // This uses tch's internal C++ API to wrap the data
+                        let cpu_tensor = unsafe {
+                            // Reinterpret Vec<u8> as *const i16 for BF16 (represented as i16 in tch)
+                            let ptr = owned_bytes.as_ptr() as *const i16;
+                            let mut t = Tensor::from_blob(
+                                ptr as *const _,
+                                &shape,
+                                &[],  // strides (empty = contiguous)
+                                tch::Kind::BFloat16,
+                                Device::Cpu,
+                            );
+
+                            // Make the tensor own the data by cloning it
+                            // This ensures the data persists after owned_bytes is dropped
+                            t = t.copy();
+
+                            t
+                        };
+
+                        // Transfer directly to GPU (no conversion needed)
+                        cpu_tensor.to_device(*device)
                     } else {
-                        cpu_tensor
+                        // CPU path or non-BF16 target: Convert to F32 since CPU doesn't support BF16
+                        info!("Converting BF16 to F32 for CPU inference (BF16 not supported on CPU)");
+
+                        let bf16_slice = unsafe {
+                            std::slice::from_raw_parts(data.as_ptr() as *const u16, data.len() / 2)
+                        };
+
+                        // Convert BF16 to f32 with pre-allocated capacity
+                        let mut f32_vec = Vec::with_capacity(bf16_slice.len());
+                        f32_vec.extend(bf16_slice.iter().map(|&bf16_bits| {
+                            f32::from_bits((bf16_bits as u32) << 16)
+                        }));
+
+                        // Create tensor from copied data
+                        Tensor::from_slice(&f32_vec)
+                            .reshape(&shape)
+                            .to_device(*device)
+                            .to_kind(dtype)
                     }
                 }
                 _ => {

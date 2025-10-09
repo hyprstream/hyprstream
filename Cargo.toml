@@ -3,6 +3,7 @@ members = [
     "crates/hyprstream",
     "crates/git2db",
     "crates/git-xet-filter",
+    "crates/gittorrent",
 ]
 default-members = ["crates/hyprstream"]
 resolver = "2"
@@ -77,7 +78,7 @@ merklehash = { git = "https://github.com/huggingface/xet-core", branch = "main" 
 async-trait = "0.1"
 
 # Optional gittorrent transport support
-gittorrent = { path = "../gittorrent-rs" }
+gittorrent = { path = "crates/gittorrent" }
 
 # Network and HTTP
 bytes = "1.9.0"
