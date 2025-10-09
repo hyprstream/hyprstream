@@ -1,0 +1,50 @@
+[package]
+name = "git-xet-filter"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT"
+repository.workspace = true
+description = "XET large file storage filter integration for libgit2"
+
+[dependencies]
+# Core Git operations
+git2.workspace = true
+libgit2-sys.workspace = true
+libc.workspace = true
+
+# Async runtime
+tokio.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Data structures and concurrency
+dashmap.workspace = true
+once_cell.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Utilities
+tempfile.workspace = true
+
+# XET large file storage (all optional, enabled via features)
+data = { workspace = true, optional = true }
+cas_client = { workspace = true, optional = true }
+cas_object = { workspace = true, optional = true }
+merklehash = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio-test.workspace = true
+tracing-subscriber.workspace = true
+tempfile.workspace = true
+
+[features]
+default = []
+# Enable XET large file storage support
+xet-storage = ["data", "cas_client", "cas_object", "merklehash", "async-trait"]

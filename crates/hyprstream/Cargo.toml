@@ -1,0 +1,153 @@
+[package]
+name = "hyprstream"
+version = "0.1.0-alpha-7"
+edition.workspace = true
+description = "Real-time adaptive ML inference server"
+documentation = "https://docs.rs/hyprstream"
+readme = "README.md"
+license.workspace = true
+exclude = [
+    "**/*.pyc",
+    "**/__pycache__/",
+]
+repository.workspace = true
+
+[lib]
+name = "hyprstream_core"
+path = "src/lib.rs"
+doctest = true
+
+[[bin]]
+name = "hyprstream"
+path = "src/bin/main.rs"
+
+[dependencies]
+# Arrow and DataFusion dependencies removed - focused on ML inference only
+bytes.workspace = true
+safe-path.workspace = true  # Safe path traversal prevention
+futures.workspace = true
+futures-util.workspace = true
+pin-project-lite.workspace = true
+polars.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tonic.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+async-trait.workspace = true
+tokio-util.workspace = true
+sqlparser.workspace = true
+serde.workspace = true
+serde_derive.workspace = true
+lazy_static.workspace = true
+serde_json.workspace = true
+json-threat-protection.workspace = true
+nix.workspace = true
+users.workspace = true
+rlimit.workspace = true
+tracing-subscriber.workspace = true
+
+# ADBC dependencies removed - focused on ML inference only
+
+# Configuration
+config.workspace = true
+toml.workspace = true
+serde_yaml.workspace = true
+git2.workspace = true  # Still needed by git2db internally
+git2db = { path = "../git2db", features = ["xet-storage"] }  # High-level git library with XET support
+gittorrent = { workspace = true, optional = true }  # P2P transport
+clap.workspace = true
+tracing.workspace = true
+tracing-opentelemetry = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+opentelemetry-semantic-conventions = { workspace = true, optional = true }
+opentelemetry-stdout = { workspace = true, optional = true }
+parking_lot.workspace = true
+num_cpus.workspace = true
+once_cell.workspace = true  # For global GitService singleton
+
+# Build dependencies
+cxx.workspace = true
+tracing-log.workspace = true
+tracing-appender.workspace = true
+bincode.workspace = true
+tokio-stream.workspace = true
+hex.workspace = true
+chrono.workspace = true
+async-stream.workspace = true
+anyhow.workspace = true
+daemonize.workspace = true
+prost.workspace = true
+# Arrow JSON removed - focused on ML inference only
+
+# ML dependencies
+thiserror.workspace = true
+rayon.workspace = true  # Parallel processing for tensor operations
+memmap2.workspace = true
+rand.workspace = true
+# PyTorch Rust bindings - replaces Candle
+tch.workspace = true
+
+# Candle ML Framework - REMOVED: Fully migrated to Tch (PyTorch Rust bindings)
+# candle-core = "0.9.1"
+# candle-nn = "0.9.1"
+# candle-transformers = "0.9.1"
+# candle-examples = "0.9.1"
+tokenizers.workspace = true
+safetensors.workspace = true
+regex.workspace = true
+minijinja.workspace = true
+
+# Runtime Integration Dependencies
+# llama-cpp-2 = "0.1.67"          # REMOVED: Replaced by Tch (PyTorch) inference
+# mistralrs dependencies commented out during Candle migration
+# mistralrs = { path = "../mistral.rs/mistralrs" }
+# mistralrs-core = { path = "../mistral.rs/mistralrs-core" }
+# hf-hub removed - using Git for all model downloads
+
+# Xet integration for LFS replacement (using git repository since crates not published)
+data.workspace = true
+cas_client.workspace = true
+cas_object.workspace = true
+cas_types.workspace = true
+chunk_cache.workspace = true
+merklehash.workspace = true
+
+uuid.workspace = true
+glob.workspace = true
+walkdir.workspace = true
+reqwest.workspace = true
+lru.workspace = true  # LRU cache for model caching and Git repository handles
+dashmap.workspace = true  # Concurrent HashMap for thread-safe repository caching
+indicatif.workspace = true              # Progress bars
+fastrand.workspace = true                # Fast random number generation for sampling
+xdg.workspace = true                     # XDG Base Directory specification
+blake3.workspace = true                  # Fast cryptographic hashing for checksums
+tempfile.workspace = true                # Temporary files for model conversion
+
+# HTTP API dependencies
+axum.workspace = true
+tower-http.workspace = true
+url.workspace = true
+urlencoding.workspace = true
+half.workspace = true
+shellexpand.workspace = true
+
+[features]
+default = ["gittorrent"]
+cuda = []
+otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:opentelemetry-semantic-conventions", "dep:opentelemetry-stdout"]
+gittorrent = ["dep:gittorrent", "git2db/gittorrent-transport"]  # Enable P2P model sharing via gittorrent transport
+
+[build-dependencies]
+cc.workspace = true
+bindgen.workspace = true
+cxx-build.workspace = true
+pkg-config.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile.workspace = true
+tokio-stream.workspace = true

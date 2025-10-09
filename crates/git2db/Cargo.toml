@@ -1,0 +1,76 @@
+[package]
+name = "git2db"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT"
+repository.workspace = true
+description = "Git-native database operations using libgit2 with submodules as storage"
+
+[dependencies]
+# Core Git operations
+git2.workspace = true
+libc.workspace = true
+
+# Async runtime
+tokio.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Data structures and concurrency
+dashmap.workspace = true
+parking_lot.workspace = true
+lru.workspace = true
+once_cell.workspace = true
+
+# Path handling and security
+safe-path.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Configuration management
+config.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Utilities
+uuid.workspace = true
+chrono.workspace = true
+tempfile.workspace = true
+
+# Optional gittorrent support
+gittorrent = { workspace = true, optional = true }
+
+# XET large file storage support (always available, but implementation is feature-gated)
+git-xet-filter = { path = "../git-xet-filter" }
+
+# Optional XET dependencies (only needed when xet-storage feature is enabled)
+data = { workspace = true, optional = true }
+cas_client = { workspace = true, optional = true }
+cas_object = { workspace = true, optional = true }
+merklehash = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio-test.workspace = true
+tracing-subscriber.workspace = true
+# Property-based testing for security tests
+proptest.workspace = true
+quickcheck.workspace = true
+quickcheck_macros.workspace = true
+
+[features]
+default = []
+# Enable experimental features
+experimental = []
+# Enable detailed tracing
+tracing-detail = []
+# Enable gittorrent transport support
+gittorrent-transport = ["gittorrent"]
+# Enable XET large file storage support
+xet-storage = ["git-xet-filter/xet-storage", "data", "cas_client", "cas_object", "merklehash", "async-trait"]
