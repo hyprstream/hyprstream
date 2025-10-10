@@ -1730,29 +1730,22 @@ impl TorchEngine {
 
 impl Drop for TorchEngine {
     fn drop(&mut self) {
-        // Clean up tensors before automatic drop to avoid device mismatch errors
-        // This prevents cuda:-2 errors when tensors try to access device info during cleanup
+        // Drop our Arc references to shared resources.
+        // The actual cleanup happens when the LAST Arc reference drops.
+        //
+        // IMPORTANT: Do NOT clear the contents of Arc<Mutex<Option<T>>> fields!
+        // All TorchEngine clones share the same Arc instances. Clearing the contents
+        // would break other clones (especially the cached engine in model_cache).
+        //
+        // Previous implementation cleared shared Arc contents, causing:
+        // - First request: clone for spawn_blocking drops, clears var_store
+        // - Second request: cached engine has var_store = None, fails with "No model loaded"
 
-        // Clear the persistent model first (contains tensors)
-        self.persistent_model = None;
+        // Drop our Arc references (NOT the contents)
+        self.persistent_model = None;  // Drops our Option<Arc<...>> reference
+        self.xet_storage = None;       // Drops our Option<Arc<...>> reference
 
-        // Clear the var store (contains tensors)
-        if let Ok(mut var_store_guard) = self.var_store.lock() {
-            *var_store_guard = None;
-        }
-
-        // Clear LoRA models (may contain tensors)
-        if let Ok(mut lora_guard) = self.lora_model.lock() {
-            *lora_guard = None;
-        }
-
-        if let Ok(mut trainer_guard) = self.lora_trainer.lock() {
-            *trainer_guard = None;
-        }
-
-        // Clear XET storage
-        self.xet_storage = None;
-
-        // Other fields will be dropped automatically
+        // Arc<Mutex<...>> fields are automatically cleaned up via Arc reference counting
+        // when the last TorchEngine clone drops. No manual intervention needed.
     }
 }
