@@ -119,7 +119,7 @@ async-stream = "0.3"
 rayon = "1.8"
 memmap2 = "0.9"
 rand = "0.8"
-tch = { version = "0.21" }
+# tch is feature-gated per crate (see crates/hyprstream/Cargo.toml for tch-cpu/tch-cuda/tch-rocm)
 tokenizers = { version = "0.20", features = ["onig"] }
 safetensors = "0.4"
 regex = "1.11"
@@ -141,8 +141,11 @@ quickcheck = "1.0"
 quickcheck_macros = "1.0"
 criterion = "0.5.1"
 
-[patch.crates-io]
-tch = { git = "https://github.com/hyprstream/tch-rs", branch = "hip" }
+# NOTE: [patch.crates-io] section removed
+# tch backend selection is now handled via features in crates/hyprstream/Cargo.toml:
+# - default: tch-cpu (CPU-only)
+# - Build with: cargo build --no-default-features --features tch-cuda
+# - Build with: cargo build --no-default-features --features tch-rocm
 
 # Build dependencies
 [workspace.dependencies.cc]

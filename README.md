@@ -12,7 +12,7 @@ HyprStream is a LLM inference and training engine built in Rust with PyTorch, fe
 - **Inference API**: Providing compatibility with OpenAI's OpenAPI specification.
 - **Management API**: Providing management APIs (WIP)
 - **High-Performance Inference**: PyTorch-based engine with KV caching and optimized memory management
-- **Hardware Acceleration**: CPU and AMD GPU (ROCm) supported, NVIDIA GPU (CUDA) coming soon
+- **Hardware Acceleration**: CPU (default), NVIDIA GPU (CUDA), and AMD GPU (ROCm) support
 - **LoRA Training & Adaptation**: Create, train, and deploy LoRA adapters for model customization
 - **Git-based Model Management**: Version control for models using native Git repositories
 - **Hugging Face Compatible**: Direct cloning and usage of models from Hugging Face Hub
@@ -25,35 +25,156 @@ HyprStream is a LLM inference and training engine built in Rust with PyTorch, fe
 
 ### Prerequisites
 
+- **Operating System**: Linux (x86_64, ARM64)
+  - Windows users: Use WSL2 (Windows Subsystem for Linux)
+  - macOS: Not currently supported
 - Rust 1.75+
 - Git 2.0+
-- libtorch (automatically downloaded or use existing installation)
+- libtorch (PyTorch C++ library)
 - **Hardware Support:**
   - **CPU**: Full support (x86_64, ARM64)
+  - **CUDA**: NVIDIA GPU support
   - **ROCm**: AMD GPU support (gfx90a, gfx1100+)
-  - **CUDA**: Coming soon
 - 8GB+ RAM for inference, 16GB+ for training
+
+### PyTorch Backend Selection
+
+Hyprstream uses feature flags to select the PyTorch backend:
+
+- **`tch-cpu`** (default): CPU-only inference
+- **`tch-cuda`**: NVIDIA GPU acceleration via CUDA
+- **`tch-rocm`**: AMD GPU acceleration via ROCm/HIP
 
 ### Building from Source
 
+#### 1. Clone Repository
+
 ```bash
-# Clone repository
-git clone https://github.com/hyprstream/hyprstream-torch.git
-cd hyprstream-torch
+git clone https://github.com/hyprstream/hyprstream.git
+cd hyprstream
+```
 
-# Set libtorch path (if using existing installation)
+#### 2. Install libtorch
+
+You have three options for obtaining libtorch:
+
+**Option A: Automatic Download (Recommended)**
+```bash
+# tch-rs will automatically download libtorch during build
+# CPU version is downloaded by default
+cargo build --release
+```
+
+**Option B: Download from PyTorch**
+```bash
+# CUDA 12.9 version
+wget https://download.pytorch.org/libtorch/cu129/libtorch-cxx11-abi-shared-with-deps-2.8.0%2Bcu129.zip
+unzip libtorch-cxx11-abi-shared-with-deps-2.8.0+cu129.zip
+
+# CUDA 13.0 Nightly
+wget https://download.pytorch.org/libtorch/nightly/cu130/libtorch-shared-with-deps-latest.zip
+unzip libtorch-shared-with-deps-latest.zip
+
+# ROCm 7.0 Nightly
+wget https://download.pytorch.org/libtorch/nightly/rocm7.0/libtorch-shared-with-deps-latest.zip
+unzip libtorch-shared-with-deps-latest.zip
+```
+
+**Option C: Use Existing PyTorch Installation**
+```bash
+# If you have PyTorch installed via pip/conda
+export LIBTORCH_USE_PYTORCH=1
+```
+
+#### 3. Set Environment Variables
+
+Configure libtorch location:
+
+```bash
+# Option 1: Set LIBTORCH to the directory containing 'lib' and 'include'
 export LIBTORCH=/path/to/libtorch
+
+# Option 2: Set individual paths
+export LIBTORCH_INCLUDE=/path/to/libtorch
+export LIBTORCH_LIB=/path/to/libtorch
+
+# Option 3: Use system-wide installation
+# libtorch installed at /usr/lib/libtorch.so is detected automatically
+
+# Add to library path
 export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
+```
 
-# Build with ROCm support (for AMD GPUs) - Use the automated script
-# MUST PROVIDE ROCm libtorch - tested with rocm 6.4
-./build-rocm.sh release
+#### 4. Build with Backend Selection
 
-# Or manually with environment variables
-export LIBTORCH=/path/to/rocm-libtorch
+**CPU Backend (Default)**
+```bash
+# Automatic download
 cargo build --release
 
+# Or with manual libtorch
+export LIBTORCH=/path/to/libtorch-cpu
+export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
+cargo build --release
+```
+
+**CUDA Backend**
+```bash
+# Set CUDA version for automatic download
+export TORCH_CUDA_VERSION=cu118  # or cu121, cu124
+cargo build --release --no-default-features --features tch-cuda
+
+# Or with manual CUDA libtorch
+export LIBTORCH=/path/to/libtorch-cuda
+export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
+cargo build --release --no-default-features --features tch-cuda
+```
+
+**ROCm Backend (AMD GPUs)**
+```bash
+# Download ROCm libtorch (must be done manually)
+# Visit: https://pytorch.org/get-started/locally/
+# Select: Linux > Libtorch > C++/Java > ROCm
+
+# ROCm 7.0 Nightly
+wget https://download.pytorch.org/libtorch/nightly/rocm7.0/libtorch-shared-with-deps-latest.zip
+unzip libtorch-shared-with-deps-latest.zip
+
+# Set environment variables
+export ROCM_PATH=/opt/rocm
+export LIBTORCH=/path/to/libtorch-rocm
+export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
+export PYTORCH_ROCM_ARCH=gfx90a  # or gfx1100, gfx1101, etc.
+
+# Build with ROCm feature
+cargo build --release --no-default-features --features tch-rocm
+
+# Alternative: Use the automated script (tested with ROCm 6.4 & ROCm 7.0 nightly)
+./build-rocm.sh release
+```
+
+#### 5. Run
+
+```bash
 # The binary will be at ./target/release/hyprstream
+./target/release/hyprstream --help
+```
+
+### Additional Build Options
+
+**Static Linking**
+```bash
+export LIBTORCH_STATIC=1
+cargo build --release
+```
+
+**Combining Features**
+```bash
+# CUDA + OpenTelemetry
+cargo build --release --no-default-features --features tch-cuda,otel
+
+# ROCm + GitTorrent P2P transport
+cargo build --release --no-default-features --features tch-rocm,gittorrent
 ```
 
 ## Quick Start
@@ -297,15 +418,32 @@ export HYPRSTREAM_PRELOAD_MODELS=model1,model2,model3
 export HYPRSTREAM_MAX_CACHED_MODELS=5
 export HYPRSTREAM_MODELS_DIR=/custom/models/path
 
-# ROCm/HIP for AMD GPUs
-export ROCM_PATH=/usr
-export PYTORCH_ROCM_ARCH=gfx90a
-export LIBTORCH=./libtorch
-export LD_LIBRARY_PATH=./libtorch/lib:$LD_LIBRARY_PATH
-
 # Performance tuning
 export HYPRSTREAM_USE_MMAP=true
 export HYPRSTREAM_GENERATION_TIMEOUT=120
+```
+
+### Runtime Configuration for GPU Backends
+
+**For CUDA builds:**
+```bash
+# Ensure CUDA libraries are in path
+export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
+
+# Optional: Specify GPU device
+export CUDA_VISIBLE_DEVICES=0,1
+```
+
+**For ROCm builds:**
+```bash
+# ROCm/HIP configuration
+export ROCM_PATH=/opt/rocm
+export PYTORCH_ROCM_ARCH=gfx90a  # or your GPU architecture
+export LIBTORCH=/path/to/libtorch-rocm
+export LD_LIBRARY_PATH=$LIBTORCH/lib:$ROCM_PATH/lib:$LD_LIBRARY_PATH
+
+# Optional: Specify GPU device
+export HIP_VISIBLE_DEVICES=0,1
 ```
 
 ## Contributing
