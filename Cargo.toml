@@ -134,6 +134,7 @@ fastrand = "2.0"
 xdg = "2.5"
 blake3 = "1.5"
 shellexpand = "3.1.1"
+caps = "0.5"  # Linux capabilities for privilege detection
 
 # Dev dependencies
 proptest = "1.0"

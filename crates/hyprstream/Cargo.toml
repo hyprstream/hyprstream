@@ -54,7 +54,7 @@ config.workspace = true
 toml.workspace = true
 serde_yaml.workspace = true
 git2.workspace = true  # Still needed by git2db internally
-git2db = { path = "../git2db", features = ["xet-storage"] }  # High-level git library with XET support
+git2db = { path = "../git2db", features = ["xet-storage", "overlayfs"] }  # High-level git library with XET support and overlayfs
 gittorrent = { workspace = true, optional = true }  # P2P transport
 clap.workspace = true
 tracing.workspace = true
@@ -118,6 +118,7 @@ uuid.workspace = true
 glob.workspace = true
 walkdir.workspace = true
 reqwest.workspace = true
+libc = "0.2"  # For system calls in overlay2 driver
 lru.workspace = true  # LRU cache for model caching and Git repository handles
 dashmap.workspace = true  # Concurrent HashMap for thread-safe repository caching
 indicatif.workspace = true              # Progress bars
@@ -138,6 +139,7 @@ shellexpand.workspace = true
 otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:opentelemetry-semantic-conventions", "dep:opentelemetry-stdout"]
 gittorrent = ["dep:gittorrent", "git2db/gittorrent-transport"]  # Enable P2P model sharing via gittorrent transport
 download-libtorch = ["tch/download-libtorch"]
+overlayfs = ["git2db/overlayfs"]  # Enable overlayfs-backed worktrees (delegated to git2db)
 
 [build-dependencies]
 cc.workspace = true

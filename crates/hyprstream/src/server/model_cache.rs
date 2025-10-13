@@ -188,39 +188,19 @@ impl ModelCache {
             // Get model path from registry
             let model_path = self.registry.get_model_path(&model_ref).await?;
 
-            // Create worktree for specific commit
+            // Create worktree for specific commit using storage drivers
+            // This automatically applies CoW optimization (overlay2 on Linux, vfs elsewhere)
+            let model_path_clone = model_path.clone();
             let checkout_dir_clone = checkout_dir.clone();
-            let git_manager = Arc::clone(&self.git_manager);
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                let repo_cache = git_manager.get_repository(&model_path)?;
-                let repo = repo_cache.open()?;
-                let worktree_name = format!("cache-{}", &commit_id.to_string()[..8]);
+            let commit_sha = commit_id.to_string();
 
-                // Clean up if worktree already exists
-                if let Ok(wt) = repo.find_worktree(&worktree_name) {
-                    wt.prune(Some(git2::WorktreePruneOptions::new().working_tree(true)))?;
-                }
+            // Use git2db's unified ref API - supports commits, branches, tags, etc.
+            GitManager::global()
+                .create_worktree(&model_path_clone, &checkout_dir_clone, &commit_sha)
+                .await
+                .context("Failed to create worktree for commit")?;
 
-                // Create parent directory
-                if let Some(parent) = checkout_dir_clone.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-
-                // Create worktree
-                let opts = git2::WorktreeAddOptions::new();
-                repo.worktree(&worktree_name, &checkout_dir_clone, Some(&opts))?;
-
-                // Checkout specific commit with detached HEAD
-                let wt_cache = git_manager.get_repository(&checkout_dir_clone)?;
-                let wt_repo = wt_cache.open()?;
-                wt_repo.set_head_detached(commit_id)?;
-                wt_repo.checkout_head(Some(
-                    git2::build::CheckoutBuilder::default().force()
-                ))?;
-
-                debug!("Created worktree for commit {}", commit_id);
-                Ok(())
-            }).await??;
+            debug!("Created worktree for commit {} with storage driver", commit_id);
         }
 
         // Process LFS files if XET storage is available

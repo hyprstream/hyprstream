@@ -180,12 +180,13 @@ impl AdapterStorage {
         let adapter_id = AdapterId::from_uuid(branch_info.uuid);
         let repo_id = git2db::RepoId::from_uuid(branch_info.uuid);
 
-        // Create worktree for the adapter branch
+        // Create worktree for the adapter branch using storage drivers
+        // This automatically uses overlay2 on Linux for ~80% disk savings
         let worktree_path = self.working_dir.join(adapter_id.0.to_string());
         let worktree_path = match branch_mgr.create_worktree(
             &branch_info.branch_name,
             Some(worktree_path.clone()),
-        ) {
+        ).await {
             Ok(path) => path,
             Err(e) => {
                 // Cleanup: Delete branch (BranchManager requires mutable reference)

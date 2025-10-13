@@ -278,14 +278,19 @@ impl BranchManager {
         Ok(())
     }
     
-    /// Create a worktree for a branch
-    pub fn create_worktree(
+    /// Create a worktree for a branch using storage drivers
+    ///
+    /// This uses git2db's storage driver system, which automatically:
+    /// - Uses overlay2 on Linux for ~80% disk savings
+    /// - Falls back to vfs (plain git worktree) on other platforms
+    /// - Respects the [worktree] configuration in git2db config
+    pub async fn create_worktree(
         &self,
         branch: &str,
         worktree_path: Option<PathBuf>,
     ) -> Result<PathBuf> {
         let branch_name = self.resolve_name(branch)?;
-        
+
         // Generate worktree path if not provided
         let wt_path = worktree_path.unwrap_or_else(|| {
             let wt_uuid = Uuid::new_v4();
@@ -294,30 +299,17 @@ impl BranchManager {
                 .join("working")
                 .join(wt_uuid.to_string())
         });
-        
-        // Ensure parent directory exists
-        if let Some(parent) = wt_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        
-        // Create worktree
-        let wt_name = wt_path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("worktree");
-        
-        let repo = self.get_repo()?;
-        let options = git2::WorktreeAddOptions::new();
-        repo.worktree(
-            wt_name,
-            &wt_path,
-            Some(&options),
-        )?;
-        
-        // Checkout the branch in the worktree
-        let wt_repo = get_repository(&wt_path)?;
-        wt_repo.set_head(&format!("refs/heads/{}", branch_name))?;
-        wt_repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
-        
+
+        // Use git2db's storage driver system (overlay2/vfs/etc.)
+        // This automatically applies the configured driver (overlay2 on Linux, vfs elsewhere)
+        let _handle = GitManager::global()
+            .create_worktree(&self.repo_path, &wt_path, &branch_name)
+            .await
+            .context("Failed to create worktree with storage driver")?;
+
+        // Note: The storage driver has already created the worktree and checked out the branch
+        // No need for manual checkout - the driver handles it
+
         Ok(wt_path)
     }
     

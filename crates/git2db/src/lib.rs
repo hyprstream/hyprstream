@@ -27,6 +27,10 @@ pub mod repository;
 pub mod repository_handle;
 pub mod stage;
 pub mod transaction;
+pub mod worktree;
+
+// Storage drivers (Docker's graphdriver pattern)
+pub mod storage;
 
 // Optional gittorrent integration
 #[cfg(feature = "gittorrent-transport")]
@@ -37,7 +41,7 @@ pub mod gittorrent_integration;
 pub mod xet_filter;
 
 // Re-export main types
-pub use config::{Git2DBConfig, GitSignature};
+pub use config::{Git2DBConfig, GitSignature, WorktreeConfig};
 pub use errors::{Git2DBError, Git2DBResult};
 
 // Re-export XetConfig even when xet-storage feature is disabled (for API compatibility)
@@ -58,6 +62,16 @@ pub use repository_handle::{RepositoryHandle, RepositoryStatus};
 pub use stage::{StageManager, StagedFile};
 pub use transaction::{IsolationMode, TransactionHandle};
 pub use transport::TransportFactory;
+
+// Worktree exports
+pub use worktree::{WorktreeHandle, WorktreeMetadata};
+
+// Overlayfs exports (feature-gated)
+#[cfg(feature = "overlayfs")]
+pub use worktree::overlayfs_available;
+
+// Storage driver exports
+pub use storage::{Driver, DriverRegistry, StorageDriver};
 
 /// Version of git2db library
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -141,9 +155,13 @@ pub mod ops {
         manager().get_repository(path)?.open()
     }
 
-    /// Create a worktree
-    pub fn create_worktree(base_repo: &Path, worktree: &Path, branch: &str) -> Git2DBResult<()> {
-        manager().create_worktree(base_repo, worktree, branch, None)
+    /// Create a worktree (async)
+    pub async fn create_worktree(
+        base_repo: &Path,
+        worktree: &Path,
+        branch: &str,
+    ) -> Git2DBResult<Box<dyn crate::worktree::WorktreeHandle>> {
+        manager().create_worktree(base_repo, worktree, branch).await
     }
 
     /// Remove a worktree
