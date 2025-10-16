@@ -1,12 +1,12 @@
 //! Handlers for git-style CLI commands
 
-use anyhow::Result;
 use crate::cli::commands::model::GitInfo;
 use crate::config::GenerationRequest;
-use crate::runtime::{TorchEngine, RuntimeConfig, RuntimeEngine};
-use crate::runtime::sampling::{SamplingConfig, load_sampling_config};
+use crate::runtime::sampling::{load_sampling_config, SamplingConfig};
 use crate::runtime::template_engine::ChatMessage;
-use crate::storage::{ModelStorage, ModelRef, CheckoutOptions};
+use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
+use crate::storage::{CheckoutOptions, ModelRef, ModelStorage};
+use anyhow::Result;
 use std::io::{self, Write};
 use tracing::info;
 
@@ -20,8 +20,12 @@ pub async fn handle_branch(
     info!("Creating branch {} for model {}", branch_name, model);
 
     let model_ref = ModelRef::new(model.to_string());
-    let registry = storage.registry();
-    registry.create_branch(&model_ref, branch_name, from_ref.as_deref()).await?;
+
+    // Create branch using git2db directly
+    let repo_id = storage.resolve_repo_id(&model_ref)?;
+    let registry = storage.registry().await;
+    let handle = registry.repo(&repo_id)?;
+    handle.branch().create(branch_name, from_ref.as_deref()).await?;
 
     println!("✓ Created branch {} for model {}", branch_name, model);
 
@@ -44,29 +48,29 @@ pub async fn handle_checkout(
     // Parse model reference
     let model_ref = ModelRef::parse(model_ref_str)?;
 
-    info!("Checking out {} for model {}",
-          model_ref.git_ref.to_string().as_deref().unwrap_or("HEAD"),
-          model_ref.model);
-
-    let registry = storage.registry();
+    info!(
+        "Checking out {} for model {}",
+        model_ref.git_ref.to_string(),
+        model_ref.model
+    );
 
     // Check for uncommitted changes if not forcing
     if !force {
-        let status = registry.status(&model_ref).await?;
-        if status.is_dirty {
+        let status = storage.status(&model_ref).await?;
+        if !status.is_clean {
             println!("Warning: Model has uncommitted changes");
             println!("Use --force to discard changes, or commit them first");
             return Ok(());
         }
     }
 
-    // Use the new registry API with CheckoutOptions
+    // Use CheckoutOptions
     let options = CheckoutOptions {
         create_branch,
         force,
     };
 
-    let result = registry.checkout(&model_ref, options).await?;
+    let result = storage.checkout(&model_ref, options).await?;
 
     // Display checkout results using reference names
     let ref_display = result.new_ref_name.as_deref().unwrap_or("detached HEAD");
@@ -89,13 +93,11 @@ pub async fn handle_status(
     model: Option<String>,
     verbose: bool,
 ) -> Result<()> {
-    let registry = storage.registry();
-
     if let Some(model_ref_str) = model {
         // Status for specific model with full ModelRef support
         let model_ref = ModelRef::parse(&model_ref_str)?;
-        let status = registry.status(&model_ref).await?;
-        print_model_status(&status, verbose);
+        let status = storage.status(&model_ref).await?;
+        print_model_status(&model_ref.model, &status, verbose);
     } else {
         // Status for all models
         let models = storage.list_models().await?;
@@ -106,8 +108,8 @@ pub async fn handle_status(
         }
 
         for (model_ref, _metadata) in models {
-            if let Ok(status) = registry.status(&model_ref).await {
-                print_model_status(&status, verbose);
+            if let Ok(status) = storage.status(&model_ref).await {
+                print_model_status(&model_ref.model, &status, verbose);
                 println!(); // Add spacing between models
             }
         }
@@ -126,32 +128,33 @@ pub async fn handle_commit(
     info!("Committing changes to model {}", model);
 
     let model_ref = ModelRef::parse(model)?;
-    let registry = storage.registry();
 
     // Check status first
-    let status = registry.status(&model_ref).await?;
+    let status = storage.status(&model_ref).await?;
 
-    if !status.is_dirty {
+    if status.is_clean {
         println!("No changes to commit for model {}", model);
         return Ok(());
     }
 
-    // Show what will be committed using git2 types
+    // Show what will be committed
     if stage_all {
         println!("Staging all changes:");
-        for (file_path, file_status) in &status.file_statuses {
-            if file_status.contains(git2::Status::WT_NEW) {
-                println!("  new: {}", file_path);
-            } else if file_status.contains(git2::Status::WT_MODIFIED) {
-                println!("  modified: {}", file_path);
-            } else if file_status.contains(git2::Status::WT_DELETED) {
-                println!("  deleted: {}", file_path);
-            }
+        for file_path in &status.modified_files {
+            println!("  M {}", file_path.display());
         }
     }
 
-    // Commit and get the commit OID
-    let commit_oid = registry.commit_model(&model_ref, message, stage_all).await?;
+    // Use git2db API for commit
+    let repo_id = storage.resolve_repo_id(&model_ref)?;
+    let registry = storage.registry().await;
+    let handle = registry.repo(&repo_id)?;
+
+    if stage_all {
+        handle.staging().add_all().await?;
+    }
+
+    let commit_oid = handle.commit(message).await?;
 
     println!("✓ Committed changes to {}", model);
     println!("  Message: {}", message);
@@ -160,70 +163,39 @@ pub async fn handle_commit(
     Ok(())
 }
 
-/// Print model status in a nice format using git2 reference information
-fn print_model_status(status: &crate::storage::model_registry::ModelStatus, verbose: bool) {
-    println!("Model: {}", status.model_ref.model);
+/// Print model status in a nice format using git2db's RepositoryStatus
+fn print_model_status(model_name: &str, status: &git2db::RepositoryStatus, verbose: bool) {
+    println!("Model: {}", model_name);
 
-    // Show current state using reference name
-    if let Some(ref_name) = &status.current_ref_name {
-        println!("Current ref: {} ({})", ref_name, status.current_oid);
+    // Show current branch/commit
+    if let Some(branch) = &status.branch {
+        if let Some(head) = status.head {
+            println!("Current ref: {} ({})", branch, head);
+        } else {
+            println!("Current ref: {}", branch);
+        }
+    } else if let Some(head) = status.head {
+        println!("Current ref: detached HEAD ({})", head);
     } else {
-        println!("Current ref: detached HEAD ({})", status.current_oid);
+        println!("Current ref: unknown");
     }
 
-    // Show target ref using reference name if available
-    if let Some(target_name) = &status.target_ref_name {
-        let oid_display = status.target_oid.map(|oid| oid.to_string()).unwrap_or_else(|| "<unknown>".to_string());
-        println!("Target ref: {} ({})", target_name, oid_display);
-        if !status.ref_matches {
-            println!("⚠️  Warning: Current ref does not match target ref");
-        }
-    } else if let Some(target_oid) = &status.target_oid {
-        println!("Target ref: {} (commit)", target_oid);
-        if !status.ref_matches {
-            println!("⚠️  Warning: Current ref does not match target ref");
-        }
-    } else {
-        println!("Target ref: <default branch>");
+    // Show ahead/behind if tracking a remote
+    if status.ahead > 0 || status.behind > 0 {
+        println!(
+            "Tracking: ahead {}, behind {}",
+            status.ahead, status.behind
+        );
     }
 
-    if status.is_dirty {
+    // Show dirty/clean status
+    if !status.is_clean {
         println!("Status: modified (uncommitted changes)");
 
-        if verbose || !status.file_statuses.is_empty() {
-            let mut new_files = Vec::new();
-            let mut modified_files = Vec::new();
-            let mut deleted_files = Vec::new();
-
-            for (file_path, file_status) in &status.file_statuses {
-                if file_status.contains(git2::Status::WT_NEW) {
-                    new_files.push(file_path);
-                } else if file_status.contains(git2::Status::WT_MODIFIED) {
-                    modified_files.push(file_path);
-                } else if file_status.contains(git2::Status::WT_DELETED) {
-                    deleted_files.push(file_path);
-                }
-            }
-
-            if !new_files.is_empty() {
-                println!("\n  New files:");
-                for file in new_files {
-                    println!("    + {}", file);
-                }
-            }
-
-            if !modified_files.is_empty() {
-                println!("\n  Modified files:");
-                for file in modified_files {
-                    println!("    M {}", file);
-                }
-            }
-
-            if !deleted_files.is_empty() {
-                println!("\n  Deleted files:");
-                for file in deleted_files {
-                    println!("    - {}", file);
-                }
+        if verbose || !status.modified_files.is_empty() {
+            println!("\n  Modified files:");
+            for file in &status.modified_files {
+                println!("    M {}", file.display());
             }
         }
     } else {
@@ -248,17 +220,26 @@ pub async fn handle_lora_train(
     let model_ref = ModelRef::parse(model_ref_str)?;
 
     // Check that we're on a branch (not detached HEAD)
-    let registry = storage.registry();
-    let status = registry.status(&model_ref).await?;
+    let status = storage.status(&model_ref).await?;
 
-    if status.current_ref_name.as_deref().unwrap_or("detached").starts_with("detached") {
+    if status.branch.is_none()
+    {
         println!("Warning: Training on detached HEAD");
         println!("Consider creating a branch first:");
-        println!("  hyprstream branch {} training/experiment", model_ref.model);
+        println!(
+            "  hyprstream branch {} training/experiment",
+            model_ref.model
+        );
     }
 
-    println!("Starting LoRA adapter initialization for {}", model_ref.to_string());
-    println!("Current branch: {}", status.current_ref_name.as_deref().unwrap_or("detached"));
+    println!(
+        "Starting LoRA adapter initialization for {}",
+        model_ref.to_string()
+    );
+    println!(
+        "Current branch: {}",
+        status.branch.as_deref().unwrap_or("detached")
+    );
 
     // Get model path and create adapter manager
     let model_path = storage.get_model_path(&model_ref).await?;
@@ -281,9 +262,18 @@ pub async fn handle_lora_train(
     };
 
     // Add metadata
-    adapter_config.metadata.insert("branch".to_string(), status.current_ref_name.as_deref().unwrap_or("detached").to_string());
+    adapter_config.metadata.insert(
+        "branch".to_string(),
+        status
+            .branch
+            .as_deref()
+            .unwrap_or("detached")
+            .to_string(),
+    );
     if interactive {
-        adapter_config.metadata.insert("mode".to_string(), "interactive".to_string());
+        adapter_config
+            .metadata
+            .insert("mode".to_string(), "interactive".to_string());
     }
 
     // Display configuration
@@ -346,41 +336,56 @@ pub async fn handle_lora_train(
     adapter_manager.ensure_adapters_dir()?;
 
     // Save the initialized LoRA weights
-    let adapter_path = adapter_manager.adapters_dir.join(format!("{}.safetensors", indexed_adapter_name));
+    let adapter_path = adapter_manager
+        .adapters_dir
+        .join(format!("{}.safetensors", indexed_adapter_name));
     engine.save_lora_weights(adapter_path.to_str().unwrap())?;
 
     // Save config
-    let config_path = adapter_manager.adapters_dir.join(format!("{}.config.json", indexed_adapter_name));
+    let config_path = adapter_manager
+        .adapters_dir
+        .join(format!("{}.config.json", indexed_adapter_name));
     let config_json = serde_json::to_string_pretty(&adapter_config)?;
     std::fs::write(&config_path, config_json)?;
 
-    println!("\n✓ Initialized adapter: adapters/{}.safetensors", indexed_adapter_name);
-    println!("✓ Created config: adapters/{}.config.json", indexed_adapter_name);
+    println!(
+        "\n✓ Initialized adapter: adapters/{}.safetensors",
+        indexed_adapter_name
+    );
+    println!(
+        "✓ Created config: adapters/{}.config.json",
+        indexed_adapter_name
+    );
 
     if interactive {
         println!("\n→ Interactive mode enabled");
         println!("  Start an inference session to begin learning:");
-        println!("  hyprstream infer {} --prompt \"...\" --learn", model_ref.model);
+        println!(
+            "  hyprstream infer {} --prompt \"...\" --learn",
+            model_ref.model
+        );
     } else if data.is_some() {
         println!("\n→ Batch training ready");
-        println!("  Run training with: hyprstream train {} --adapter {}", model_ref.model, indexed_adapter_name);
+        println!(
+            "  Run training with: hyprstream train {} --adapter {}",
+            model_ref.model, indexed_adapter_name
+        );
     }
 
     println!("\n✓ Adapter initialization complete!");
     println!("\n→ Next steps:");
     println!("  1. Check status: hyprstream status {}", model_ref.model);
     println!("  2. Test inference: hyprstream infer {}", model_ref.model);
-    println!("  3. Commit changes: hyprstream commit {} -m \"Added {} adapter\"", model_ref.model, indexed_adapter_name);
+    println!(
+        "  3. Commit changes: hyprstream commit {} -m \"Added {} adapter\"",
+        model_ref.model, indexed_adapter_name
+    );
 
     Ok(())
 }
 
 /// Handle serve command
-pub async fn handle_serve(
-    model: Option<String>,
-    port: u16,
-    host: &str,
-) -> Result<()> {
+pub async fn handle_serve(model: Option<String>, port: u16, host: &str) -> Result<()> {
     if let Some(ref model_ref_str) = model {
         println!("Starting server with pre-loaded model: {}", model_ref_str);
     } else {
@@ -393,8 +398,18 @@ pub async fn handle_serve(
     // TODO: Call the actual server start function
     // For now, just simulate
     println!("\n→ Server configuration:");
-    println!("  Lazy loading: {}", if model.is_none() { "enabled" } else { "disabled" });
-    println!("  Pre-loaded models: {}", model.as_deref().unwrap_or("none"));
+    println!(
+        "  Lazy loading: {}",
+        if model.is_none() {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "  Pre-loaded models: {}",
+        model.as_deref().unwrap_or("none")
+    );
     println!("  API endpoint: http://{}:{}/v1/completions", host, port);
 
     Ok(())
@@ -408,7 +423,6 @@ pub async fn handle_list(
     dirty: bool,
     verbose: bool,
 ) -> Result<()> {
-
     info!("Listing models");
 
     let models = storage.list_models().await?;
@@ -472,8 +486,14 @@ pub async fn handle_list(
             }
 
             if let Some(git) = git_info {
-                println!("  Git Reference: {}", git.current_ref.as_deref().unwrap_or("detached"));
-                println!("  Commit: {}", git.short_commit.as_deref().unwrap_or("unknown"));
+                println!(
+                    "  Git Reference: {}",
+                    git.current_ref.as_deref().unwrap_or("detached")
+                );
+                println!(
+                    "  Commit: {}",
+                    git.short_commit.as_deref().unwrap_or("unknown")
+                );
                 println!("  Status: {}", if git.is_dirty { "dirty" } else { "clean" });
                 if let Some(date) = &git.last_commit_date {
                     println!("  Last Commit: {}", date);
@@ -483,14 +503,20 @@ pub async fn handle_list(
             if let Some(size) = metadata.size_bytes {
                 println!("  Size: {:.2} GB", size as f64 / 1_073_741_824.0);
             }
-            println!("  Created: {}", chrono::DateTime::from_timestamp(metadata.created_at, 0)
-                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                .unwrap_or_else(|| "unknown".to_string()));
+            println!(
+                "  Created: {}",
+                chrono::DateTime::from_timestamp(metadata.created_at, 0)
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
             println!();
         }
     } else {
         // Table format - the nice format you liked!
-        println!("{:<30} {:<15} {:<8} {:<6} {:<10}", "MODEL NAME", "REF", "COMMIT", "STATUS", "SIZE");
+        println!(
+            "{:<30} {:<15} {:<8} {:<6} {:<10}",
+            "MODEL NAME", "REF", "COMMIT", "STATUS", "SIZE"
+        );
         println!("{}", "-".repeat(75));
 
         for (model_ref, metadata, git_info) in &models_with_git {
@@ -502,15 +528,21 @@ pub async fn handle_list(
 
             let (git_ref, commit, status) = match git_info {
                 Some(git) => (
-                    git.current_ref.clone().unwrap_or_else(|| "detached".to_string()),
-                    git.short_commit.clone().unwrap_or_else(|| "unknown".to_string()),
-                    if git.is_dirty { "dirty" } else { "clean" }
+                    git.current_ref
+                        .clone()
+                        .unwrap_or_else(|| "detached".to_string()),
+                    git.short_commit
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    if git.is_dirty { "dirty" } else { "clean" },
                 ),
-                None => ("n/a".to_string(), "n/a".to_string(), "n/a")
+                None => ("n/a".to_string(), "n/a".to_string(), "n/a"),
             };
 
-            println!("{:<30} {:<15} {:<8} {:<6} {:<10}",
-                model_ref.model, git_ref, commit, status, size_str);
+            println!(
+                "{:<30} {:<15} {:<8} {:<6} {:<10}",
+                model_ref.model, git_ref, commit, status, size_str
+            );
         }
 
         if models_with_git.is_empty() {
@@ -553,7 +585,6 @@ pub async fn handle_info(
     info!("Getting info for model {}", model);
 
     let model_ref = ModelRef::parse(model)?;
-    let registry = storage.registry();
 
     // Get model path
     let model_path = storage.get_model_path(&model_ref).await?;
@@ -563,60 +594,28 @@ pub async fn handle_info(
         println!("Model: {}", model_ref.model);
         let display_ref = match &model_ref.git_ref {
             crate::storage::GitRef::DefaultBranch => {
-                registry.get_default_branch(&model_ref).await?
-            },
-            _ => {
-                model_ref.git_ref.to_string().unwrap_or_else(|| "HEAD".to_string())
+                storage.get_default_branch(&model_ref).await?
             }
+            _ => model_ref.git_ref.to_string(),
         };
         println!("Reference: {}", display_ref);
         println!("Path: {}", model_path.display());
     }
 
     // Get git status
-    let status = registry.status(&model_ref).await?;
+    let status = storage.status(&model_ref).await?;
     println!("\nGit Status:");
-    println!("  Current branch/ref: {}", status.current_ref_name.as_deref().unwrap_or("detached"));
+    println!(
+        "  Current branch/ref: {}",
+        status.branch.as_deref().unwrap_or("detached")
+    );
 
-    if status.is_dirty {
+    if !status.is_clean {
         println!("  Working tree: dirty");
-        let modified_files: Vec<_> = status.file_statuses.iter()
-            .filter(|(_, status)| status.is_wt_modified())
-            .map(|(path, _)| path)
-            .collect();
-
-        let new_files: Vec<_> = status.file_statuses.iter()
-            .filter(|(_, status)| status.is_wt_new())
-            .map(|(path, _)| path)
-            .collect();
-
-        if !modified_files.is_empty() {
-            println!("  Modified files: {}", modified_files.len());
-            if verbose {
-                for file in &modified_files {
-                    println!("    M {}", file);
-                }
-            }
-        }
-        if !new_files.is_empty() {
-            println!("  New files: {}", new_files.len());
-            if verbose {
-                for file in &new_files {
-                    println!("    A {}", file);
-                }
-            }
-        }
-        let deleted_files: Vec<_> = status.file_statuses.iter()
-            .filter(|(_, status)| status.is_wt_deleted())
-            .map(|(path, _)| path)
-            .collect();
-
-        if !deleted_files.is_empty() {
-            println!("  Deleted files: {}", deleted_files.len());
-            if verbose {
-                for file in &deleted_files {
-                    println!("    D {}", file);
-                }
+        println!("  Modified files: {}", status.modified_files.len());
+        if verbose {
+            for file in &status.modified_files {
+                println!("    M {}", file.display());
             }
         }
     } else {
@@ -667,10 +666,16 @@ pub async fn handle_info(
 
                     // Show config info if available and verbose mode is on
                     if verbose && adapter.config_path.is_some() {
-                        if let Ok(config_content) = std::fs::read_to_string(adapter.config_path.as_ref().unwrap()) {
-                            if let Ok(config) = serde_json::from_str::<crate::storage::AdapterConfig>(&config_content) {
-                                print!(" - rank: {}, alpha: {}, lr: {:.0e}",
-                                      config.rank, config.alpha, config.learning_rate);
+                        if let Ok(config_content) =
+                            std::fs::read_to_string(adapter.config_path.as_ref().unwrap())
+                        {
+                            if let Ok(config) = serde_json::from_str::<crate::storage::AdapterConfig>(
+                                &config_content,
+                            ) {
+                                print!(
+                                    " - rank: {}, alpha: {}, lr: {:.0e}",
+                                    config.rank, config.alpha, config.learning_rate
+                                );
                             }
                         }
                     }
@@ -688,7 +693,11 @@ pub async fn handle_info(
                         if let Some(config_path) = &adapter.config_path {
                             println!("      Config: {}", config_path.display());
                             if let Ok(config_content) = std::fs::read_to_string(config_path) {
-                                if let Ok(config) = serde_json::from_str::<crate::storage::AdapterConfig>(&config_content) {
+                                if let Ok(config) =
+                                    serde_json::from_str::<crate::storage::AdapterConfig>(
+                                        &config_content,
+                                    )
+                                {
                                     println!("      Rank: {}", config.rank);
                                     println!("      Alpha: {}", config.alpha);
                                     println!("      Learning Rate: {:.2e}", config.learning_rate);
@@ -727,8 +736,11 @@ pub async fn handle_infer(
     stream: bool,
     _force_download: bool,
 ) -> Result<()> {
-
-    info!("Running base model inference: model={}, prompt_len={}", model_ref_str, prompt.len());
+    info!(
+        "Running base model inference: model={}, prompt_len={}",
+        model_ref_str,
+        prompt.len()
+    );
 
     // Parse model reference
     let model_ref = ModelRef::parse(model_ref_str)?;
@@ -784,9 +796,9 @@ pub async fn handle_infer(
 
     // Load the model
     let load_start = std::time::Instant::now();
-    RuntimeEngine::load_model(&mut engine, &model_path).await.map_err(|e| {
-        anyhow::anyhow!("Failed to load model: {}", e)
-    })?;
+    RuntimeEngine::load_model(&mut engine, &model_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to load model: {}", e))?;
     let load_time = load_start.elapsed();
     info!("Model loaded in {:.2}s", load_time.as_secs_f64());
 
@@ -803,10 +815,12 @@ pub async fn handle_infer(
         let mut lora_model_initialized = false;
 
         for adapter_info in &adapters {
-            tracing::info!("[{}] {} ({:.1} KB)",
-                     adapter_info.index,
-                     adapter_info.name,
-                     adapter_info.size as f64 / 1024.0);
+            tracing::info!(
+                "[{}] {} ({:.1} KB)",
+                adapter_info.index,
+                adapter_info.name,
+                adapter_info.size as f64 / 1024.0
+            );
 
             // Parse adapter configuration from JSON file.
             // Each adapter has an associated .config.json file containing metadata
@@ -822,8 +836,11 @@ pub async fn handle_infer(
                                 error = %parse_error,
                                 "Failed to deserialize adapter configuration - JSON structure may be invalid"
                             );
-                            tracing::warn!("Failed to parse config for adapter [{}] {} - skipping",
-                                     adapter_info.index, adapter_info.name);
+                            tracing::warn!(
+                                "Failed to parse config for adapter [{}] {} - skipping",
+                                adapter_info.index,
+                                adapter_info.name
+                            );
                             continue;
                         }
                     }
@@ -835,8 +852,11 @@ pub async fn handle_infer(
                         adapter_name = %adapter_info.name,
                         "Adapter configuration file not found - adapter may be corrupted"
                     );
-                    tracing::warn!("No config found for adapter [{}] {} - skipping",
-                             adapter_info.index, adapter_info.name);
+                    tracing::warn!(
+                        "No config found for adapter [{}] {} - skipping",
+                        adapter_info.index,
+                        adapter_info.name
+                    );
                     continue;
                 }
             };
@@ -897,7 +917,11 @@ pub async fn handle_infer(
                         adapter_size_kb = adapter_info.size as f64 / 1024.0,
                         "Successfully loaded LoRA adapter weights"
                     );
-                    tracing::info!("Successfully loaded adapter [{}] {}", adapter_info.index, adapter_info.name);
+                    tracing::info!(
+                        "Successfully loaded adapter [{}] {}",
+                        adapter_info.index,
+                        adapter_info.name
+                    );
                 }
                 Err(load_error) => {
                     tracing::warn!(
@@ -906,8 +930,11 @@ pub async fn handle_infer(
                         error = %load_error,
                         "Failed to load LoRA adapter weights - SafeTensors file may be corrupted"
                     );
-                    tracing::warn!("Failed to load adapter [{}] {} - continuing without it",
-                             adapter_info.index, adapter_info.name);
+                    tracing::warn!(
+                        "Failed to load adapter [{}] {} - continuing without it",
+                        adapter_info.index,
+                        adapter_info.name
+                    );
                 }
             }
         }
@@ -937,12 +964,10 @@ pub async fn handle_infer(
 
     // Apply chat template to the prompt
     let formatted_prompt = {
-        let messages = vec![
-            ChatMessage {
-                role: "user".to_string(),
-                content: prompt.to_string(),
-            }
-        ];
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: prompt.to_string(),
+        }];
 
         match RuntimeEngine::apply_chat_template(&engine, &messages, true) {
             Ok(formatted) => formatted,
@@ -971,34 +996,38 @@ pub async fn handle_infer(
     if stream {
         // Stream tokens as they're generated
         print!("\n");
-        let result = engine.generate_streaming_with_params(
-            &request.prompt,
-            request.max_tokens,
-            request.temperature,
-            request.top_p,
-            request.top_k,
-            request.repeat_penalty,
-            |token| {
-                print!("{}", token);
-                let _ = io::stdout().flush();
-            }
-        ).await?;
+        let result = engine
+            .generate_streaming_with_params(
+                &request.prompt,
+                request.max_tokens,
+                request.temperature,
+                request.top_p,
+                request.top_k,
+                request.repeat_penalty,
+                |token| {
+                    print!("{}", token);
+                    let _ = io::stdout().flush();
+                },
+            )
+            .await?;
         println!();
         info!("Generated {} tokens", result.split_whitespace().count());
     } else {
         // Generate all at once using streaming with collection
         let mut response = String::new();
-        engine.generate_streaming_with_params(
-            &request.prompt,
-            request.max_tokens,
-            request.temperature,
-            request.top_p,
-            request.top_k,
-            request.repeat_penalty,
-            |token| {
-                response.push_str(token);
-            }
-        ).await?;
+        engine
+            .generate_streaming_with_params(
+                &request.prompt,
+                request.max_tokens,
+                request.temperature,
+                request.top_p,
+                request.top_k,
+                request.repeat_penalty,
+                |token| {
+                    response.push_str(token);
+                },
+            )
+            .await?;
         println!("\n{}", response);
     }
 
@@ -1016,12 +1045,26 @@ pub async fn handle_push(
 ) -> Result<()> {
     info!("Pushing model {} to remote", model);
 
-    let registry = storage.registry();
     let remote_name = remote.as_deref().unwrap_or("origin");
     let branch_name = branch.as_deref();
     let model_ref = ModelRef::new(model.to_string());
 
-    registry.push_model(&model_ref, remote_name, branch_name, set_upstream, force).await?;
+    // Use git2db API for push
+    let repo_id = storage.resolve_repo_id(&model_ref)?;
+    let registry = storage.registry().await;
+    let handle = registry.repo(&repo_id)?;
+
+    if let Some(branch) = branch_name {
+        handle.push(Some(remote_name), branch).await?;
+    } else {
+        // Push current branch
+        let status = handle.status().await?;
+        if let Some(current_branch) = status.branch {
+            handle.push(Some(remote_name), current_branch).await?;
+        } else {
+            anyhow::bail!("Not on a branch - specify branch to push");
+        }
+    }
 
     println!("✓ Pushed model {} to {}", model, remote_name);
     if let Some(b) = branch_name {
@@ -1044,12 +1087,26 @@ pub async fn handle_pull(
 ) -> Result<()> {
     info!("Pulling model {} from remote", model);
 
-    let registry = storage.registry();
     let remote_name = remote.as_deref().unwrap_or("origin");
     let branch_name = branch.as_deref();
     let model_ref = ModelRef::new(model.to_string());
 
-    registry.pull_model(&model_ref, remote_name, branch_name, rebase).await?;
+    // Use git2db API for pull
+    let repo_id = storage.resolve_repo_id(&model_ref)?;
+    let registry = storage.registry().await;
+    let handle = registry.repo(&repo_id)?;
+
+    if let Some(branch) = branch_name {
+        handle.pull(Some(remote_name), branch).await?;
+    } else {
+        // Pull current branch
+        let status = handle.status().await?;
+        if let Some(current_branch) = status.branch {
+            handle.pull(Some(remote_name), current_branch).await?;
+        } else {
+            anyhow::bail!("Not on a branch - specify branch to pull");
+        }
+    }
 
     println!("✓ Pulled latest changes for model {}", model);
     println!("  Remote: {}", remote_name);
@@ -1075,10 +1132,13 @@ pub async fn handle_merge(
 ) -> Result<()> {
     info!("Merging branch {} into model {}", branch, model);
 
-    let registry = storage.registry();
     let model_ref = ModelRef::new(model.to_string());
 
-    registry.merge_branch(&model_ref, branch, ff_only, no_ff).await?;
+    // Use git2db's merge() API
+    let repo_id = storage.resolve_repo_id(&model_ref)?;
+    let registry = storage.registry().await;
+    let handle = registry.repo(&repo_id)?;
+    let _merge_oid = handle.merge(branch, ff_only, no_ff).await?;
 
     println!("✓ Merged branch '{}' into model {}", branch, model);
     if ff_only {
@@ -1100,19 +1160,19 @@ pub async fn handle_remove(
     registry_only: bool,
     files_only: bool,
 ) -> Result<()> {
-
     info!("Removing model {}", model);
 
     // Validate flags
     if registry_only && files_only {
-        return Err(anyhow::anyhow!("Cannot specify both --registry-only and --files-only"));
+        return Err(anyhow::anyhow!(
+            "Cannot specify both --registry-only and --files-only"
+        ));
     }
 
     let model_ref = ModelRef::new(model.to_string());
-    let registry = storage.registry();
 
     // Check if model exists in registry
-    let registry_exists = registry.get_model_path(&model_ref).await.is_ok();
+    let registry_exists = storage.get_model_path(&model_ref).await.is_ok();
 
     // Check if model exists in filesystem
     let model_path = storage.get_models_dir().join(model);
@@ -1136,7 +1196,10 @@ pub async fn handle_remove(
             if metadata.is_dir() {
                 // Calculate directory size
                 let mut total_size = 0u64;
-                if let Ok(entries) = walkdir::WalkDir::new(&model_path).into_iter().collect::<Result<Vec<_>, _>>() {
+                if let Ok(entries) = walkdir::WalkDir::new(&model_path)
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()
+                {
                     for entry in entries {
                         if entry.file_type().is_file() {
                             if let Ok(meta) = entry.metadata() {
@@ -1177,7 +1240,7 @@ pub async fn handle_remove(
 
     // Remove from registry (if requested and exists)
     if registry_exists && !files_only {
-        match registry.remove_model(&model_ref).await {
+        match storage.remove_model(&model_ref).await {
             Ok(_) => {
                 println!("✓ Removed '{}' from git registry", model);
             }

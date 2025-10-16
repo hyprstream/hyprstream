@@ -69,11 +69,11 @@ impl DriverRegistry {
     fn auto_select(&self) -> Result<Arc<dyn Driver>, DriverError> {
         // Priority order (like Docker's GetDriver)
         let priorities = [
-            "overlay2",  // Best: ~80% space savings on Linux
-            "btrfs",     // Future: Native btrfs CoW
-            "reflink",   // Future: XFS/APFS reflinks
-            "hardlink",  // Future: Cross-platform hardlinks
-            "vfs",       // Fallback: Always works
+            "overlay2", // Best: ~80% space savings on Linux
+            "btrfs",    // Future: Native btrfs CoW
+            "reflink",  // Future: XFS/APFS reflinks
+            "hardlink", // Future: Cross-platform hardlinks
+            "vfs",      // Fallback: Always works
         ];
 
         for name in &priorities {
@@ -130,7 +130,9 @@ mod tests {
     #[test]
     fn test_auto_select() {
         let registry = DriverRegistry::new();
-        let driver = registry.auto_select().expect("Should always select a driver");
+        let driver = registry
+            .auto_select()
+            .expect("Should always select a driver");
 
         // Should select best available
         println!("Auto-selected driver: {}", driver.name());

@@ -1,6 +1,6 @@
 //! FUSE overlayfs backend using fuse-overlayfs
 
-use super::backend::{OverlayBackend, BackendCapabilities};
+use super::backend::{BackendCapabilities, OverlayBackend};
 use crate::errors::{Git2DBError, Git2DBResult};
 use async_trait::async_trait;
 use std::path::Path;
@@ -56,11 +56,16 @@ impl OverlayBackend for FuseBackend {
             .arg(target)
             .output()
             .await
-            .map_err(|e| Git2DBError::internal(format!("Failed to execute fuse-overlayfs: {}", e)))?;
+            .map_err(|e| {
+                Git2DBError::internal(format!("Failed to execute fuse-overlayfs: {}", e))
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Git2DBError::internal(format!("fuse-overlayfs failed: {}", stderr)));
+            return Err(Git2DBError::internal(format!(
+                "fuse-overlayfs failed: {}",
+                stderr
+            )));
         }
 
         info!("Mounted fuse-overlayfs at {}", target.display());
@@ -80,10 +85,7 @@ impl OverlayBackend for FuseBackend {
 
         if let Err(e) = output {
             // Fallback to regular umount
-            let _ = Command::new("umount")
-                .arg(target)
-                .status()
-                .await;
+            let _ = Command::new("umount").arg(target).status().await;
 
             return Err(Git2DBError::internal(format!("Failed to unmount: {}", e)));
         }

@@ -4,16 +4,11 @@
 //! Optimizations like overlayfs are optional enhancements underneath.
 
 use git2db::worktree::{
-    OptimizedGitStrategy,
-    WorktreeConfig,
-    StorageOptimization,
-    CoWConfig,
-    CoWBackend,
-    FallbackBehavior,
-    OptimizedWorktreeBuilder,
+    CoWBackend, CoWConfig, FallbackBehavior, OptimizedGitStrategy, OptimizedWorktreeBuilder,
+    StorageOptimization, WorktreeConfig,
 };
 use std::path::Path;
-use tracing::{info, error};
+use tracing::{error, info};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -31,11 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let strategy = OptimizedGitStrategy::standard();
         let worktree = strategy
-            .create(
-                repo_path,
-                &worktree_base.join("standard"),
-                "feature-branch",
-            )
+            .create(repo_path, &worktree_base.join("standard"), "feature-branch")
             .await?;
 
         info!("Created standard worktree at: {:?}", worktree.path());
@@ -54,11 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // This is the DEFAULT - automatically uses best available optimization
         let strategy = OptimizedGitStrategy::new();
         let worktree = strategy
-            .create(
-                repo_path,
-                &worktree_base.join("auto-optimized"),
-                "main",
-            )
+            .create(repo_path, &worktree_base.join("auto-optimized"), "main")
             .await?;
 
         let metadata = worktree.metadata();
@@ -83,11 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let strategy = OptimizedGitStrategy::with_config(config);
         let worktree = strategy
-            .create(
-                repo_path,
-                &worktree_base.join("cow-optimized"),
-                "develop",
-            )
+            .create(repo_path, &worktree_base.join("cow-optimized"), "develop")
             .await?;
 
         info!("Created CoW-optimized worktree at: {:?}", worktree.path());
@@ -129,9 +112,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("\nExample 5: Using the builder pattern");
     {
         let config = OptimizedWorktreeBuilder::new()
-            .with_cow()                              // Enable CoW optimization
-            .fallback(FallbackBehavior::Warn)        // Warn if not available
-            .log_optimization(true)                  // Log what happens
+            .with_cow() // Enable CoW optimization
+            .fallback(FallbackBehavior::Warn) // Warn if not available
+            .log_optimization(true) // Log what happens
             .build();
 
         let strategy = OptimizedGitStrategy::with_config(config);
@@ -163,11 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let strategy = OptimizedGitStrategy::with_config(fail_config);
         match strategy
-            .create(
-                repo_path,
-                &worktree_base.join("may-fail"),
-                "test",
-            )
+            .create(repo_path, &worktree_base.join("may-fail"), "test")
             .await
         {
             Ok(worktree) => {
@@ -188,11 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let strategy = OptimizedGitStrategy::with_config(fallback_config);
                 let worktree = strategy
-                    .create(
-                        repo_path,
-                        &worktree_base.join("fallback-success"),
-                        "test",
-                    )
+                    .create(repo_path, &worktree_base.join("fallback-success"), "test")
                     .await?;
 
                 info!("Fallback successful - created standard git worktree");
@@ -249,10 +224,7 @@ async fn demonstrate_git_functionality(worktree_path: &Path) {
 }
 
 /// Show disk usage comparison
-async fn compare_disk_usage(
-    standard_path: &Path,
-    optimized_path: &Path,
-) {
+async fn compare_disk_usage(standard_path: &Path, optimized_path: &Path) {
     use std::process::Command;
 
     let get_size = |path: &Path| -> u64 {
@@ -283,5 +255,9 @@ async fn compare_disk_usage(
     info!("Disk Usage Comparison:");
     info!("  Standard worktree:  {} MB", standard_size / 1024 / 1024);
     info!("  Optimized worktree: {} MB", optimized_size / 1024 / 1024);
-    info!("  Space saved:        {} MB ({:.1}%)", saved / 1024 / 1024, saved_percent);
+    info!(
+        "  Space saved:        {} MB ({:.1}%)",
+        saved / 1024 / 1024,
+        saved_percent
+    );
 }

@@ -19,10 +19,10 @@ impl LoRAIntegrationExample {
     /// Key principle: Base weights are frozen (no gradients), but activations
     /// flowing between layers have gradients enabled during training.
     pub fn apply_lora_to_layer(
-        base_output: &Tensor,        // Output from frozen base layer
+        base_output: &Tensor, // Output from frozen base layer
         lora_adapter: &crate::lora::torch_adapter::TorchLoRALayer,
         _module_name: &str,
-        input: &Tensor,               // Input to the layer
+        input: &Tensor, // Input to the layer
         training: bool,
     ) -> Result<Tensor> {
         if training {
@@ -59,7 +59,8 @@ impl LoRAIntegrationExample {
 
         // Process through transformer layers
         // This is conceptual - actual implementation would iterate through real layers
-        for layer_idx in 0..32 {  // Assuming 32 layers
+        for layer_idx in 0..32 {
+            // Assuming 32 layers
             // Self-attention with LoRA on Q and V projections
             let attn_input = if training {
                 hidden_states.set_requires_grad(true)
@@ -74,7 +75,10 @@ impl LoRAIntegrationExample {
             });
 
             // Apply LoRA to Q projection if it exists
-            if let Some(q_lora) = lora_model.layers.get(&format!("layer.{}.self_attn.q_proj", layer_idx)) {
+            if let Some(q_lora) = lora_model
+                .layers
+                .get(&format!("layer.{}.self_attn.q_proj", layer_idx))
+            {
                 hidden_states = Self::apply_lora_to_layer(
                     &base_attn_output,
                     q_lora,
@@ -91,7 +95,10 @@ impl LoRAIntegrationExample {
             }
 
             // Apply LoRA to V projection if it exists
-            if let Some(v_lora) = lora_model.layers.get(&format!("layer.{}.self_attn.v_proj", layer_idx)) {
+            if let Some(v_lora) = lora_model
+                .layers
+                .get(&format!("layer.{}.self_attn.v_proj", layer_idx))
+            {
                 let v_input = if training {
                     hidden_states.set_requires_grad(true)
                 } else {
@@ -126,10 +133,7 @@ impl LoRAIntegrationExample {
     }
 
     /// Compute loss with proper gradient flow
-    pub fn compute_lora_loss(
-        logits: &Tensor,
-        labels: &Tensor,
-    ) -> Result<Tensor> {
+    pub fn compute_lora_loss(logits: &Tensor, labels: &Tensor) -> Result<Tensor> {
         // Cross-entropy loss
         // The loss will have gradients that flow back through:
         // 1. LoRA adapter weights (trainable, in VarStore)
@@ -147,18 +151,15 @@ impl LoRAIntegrationExample {
             &labels_flat,
             None,
             tch::Reduction::Mean,
-            -100,  // ignore_index
-            0.0,   // label_smoothing
+            -100, // ignore_index
+            0.0,  // label_smoothing
         );
 
         Ok(loss)
     }
 
     /// Backward pass and optimizer step
-    pub fn training_step(
-        loss: &Tensor,
-        lora_optimizer: &mut tch::nn::Optimizer,
-    ) -> Result<()> {
+    pub fn training_step(loss: &Tensor, lora_optimizer: &mut tch::nn::Optimizer) -> Result<()> {
         // Backward pass computes gradients
         // Gradients flow through:
         // - LoRA weights (stored in VarStore)

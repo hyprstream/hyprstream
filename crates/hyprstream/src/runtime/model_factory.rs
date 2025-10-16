@@ -3,14 +3,14 @@
 //! This replaces the chaotic multiple paths for model creation with a single,
 //! clean factory pattern.
 
-use anyhow::{Result, anyhow};
-use tracing::{info, instrument};
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::Path;
-use tch::{Device, Tensor, Kind as DType};
+use tch::{Device, Kind as DType, Tensor};
+use tracing::{info, instrument};
 
-use super::model_config::{ModelConfig, ModelArchitecture};
-use super::architectures::{ModelOperations, llama::LlamaModel, gemma::GemmaModel};
+use super::architectures::{gemma::GemmaModel, llama::LlamaModel, ModelOperations};
+use super::model_config::{ModelArchitecture, ModelConfig};
 
 /// Factory for creating models with proper configuration management
 pub struct ModelFactory;
@@ -31,7 +31,10 @@ impl ModelFactory {
 
         if !shard_files.is_empty() && shard_files.len() > 1 {
             // Use incremental loading for large sharded models
-            info!("📦 Using incremental loading for {} shards", shard_files.len());
+            info!(
+                "📦 Using incremental loading for {} shards",
+                shard_files.len()
+            );
             Self::create_incremental(model_path, device, dtype, shard_files).await
         } else {
             // Standard loading for single files or small models
@@ -102,7 +105,7 @@ impl ModelFactory {
         info!("Model loaded");
         Ok(model)
     }
-    
+
     /// Load weights from safetensors files
     async fn load_weights(
         model_path: &Path,
@@ -110,30 +113,32 @@ impl ModelFactory {
         dtype: DType,
     ) -> Result<HashMap<String, Tensor>> {
         let mut all_weights = HashMap::new();
-        
+
         let single_file = model_path.join("model.safetensors");
         if single_file.exists() {
             info!("Loading model.safetensors");
             Self::load_safetensors_file(&single_file, &mut all_weights, device, dtype).await?;
             return Ok(all_weights);
         }
-        
+
         // Look for sharded safetensors files (model-00001-of-00002.safetensors pattern)
         let model_path_buf = model_path.to_path_buf();
-        let mut shard_files = tokio::task::spawn_blocking(move || -> Result<Vec<std::path::PathBuf>> {
-            let mut files = Vec::new();
-            for entry in std::fs::read_dir(&model_path_buf)? {
-                let entry = entry?;
-                let filename = entry.file_name();
-                if let Some(name) = filename.to_str() {
-                    if name.starts_with("model-") && name.ends_with(".safetensors") {
-                        files.push(entry.path());
+        let mut shard_files =
+            tokio::task::spawn_blocking(move || -> Result<Vec<std::path::PathBuf>> {
+                let mut files = Vec::new();
+                for entry in std::fs::read_dir(&model_path_buf)? {
+                    let entry = entry?;
+                    let filename = entry.file_name();
+                    if let Some(name) = filename.to_str() {
+                        if name.starts_with("model-") && name.ends_with(".safetensors") {
+                            files.push(entry.path());
+                        }
                     }
                 }
-            }
-            Ok(files)
-        }).await??;
-        
+                Ok(files)
+            })
+            .await??;
+
         if !shard_files.is_empty() {
             shard_files.sort();
             info!("Loading {} weight shards", shard_files.len());
@@ -142,10 +147,13 @@ impl ModelFactory {
             }
             return Ok(all_weights);
         }
-        
-        Err(anyhow!("No safetensors files found in {}", model_path.display()))
+
+        Err(anyhow!(
+            "No safetensors files found in {}",
+            model_path.display()
+        ))
     }
-    
+
     /// Load a single safetensors file
     #[instrument(name = "model_factory.load_safetensor_file", skip(weights, device, dtype), fields(file = %path.display()))]
     async fn load_safetensors_file(
@@ -165,8 +173,8 @@ impl ModelFactory {
         // Use mmap for large files to reduce memory pressure
         if use_mmap {
             // Memory-mapped approach - OS manages paging
-            use std::fs::File;
             use memmap2::Mmap;
+            use std::fs::File;
 
             let file = File::open(&path_buf)?;
             let mmap = unsafe { Mmap::map(&file)? };
@@ -212,7 +220,10 @@ impl ModelFactory {
                 safetensors::Dtype::F16 => {
                     // F16 requires conversion to F32 first
                     let slice = unsafe {
-                        std::slice::from_raw_parts(data.as_ptr() as *const half::f16, data.len() / 2)
+                        std::slice::from_raw_parts(
+                            data.as_ptr() as *const half::f16,
+                            data.len() / 2,
+                        )
                     };
                     let f32_vec: Vec<f32> = slice.iter().map(|x| x.to_f32()).collect();
                     // Create and immediately transfer to GPU
@@ -222,56 +233,32 @@ impl ModelFactory {
                         .to_kind(dtype)
                 }
                 safetensors::Dtype::BF16 => {
-                    // BF16 handling - must copy data to avoid use-after-free
-                    // The source buffer will be dropped, so we CANNOT use from_blob
+                    // BF16 - must create on CPU first due to from_blob limitations
+                    if dtype != tch::Kind::BFloat16 {
+                        return Err(anyhow!(
+                            "Model requires BF16 but target dtype is {:?}",
+                            dtype
+                        ));
+                    }
 
-                    if matches!(device, Device::Cuda(_)) && dtype == tch::Kind::BFloat16 {
-                        // GPU path: Create BF16 tensor directly from owned data (no F32 conversion)
+                    // Create on CPU then immediately transfer to GPU
+                    let cpu_tensor = unsafe {
+                        Tensor::from_blob(
+                            data.as_ptr(),
+                            &shape,
+                            &[],
+                            tch::Kind::BFloat16,
+                            Device::Cpu,
+                        )
+                    };
 
-                        // Copy BF16 data into owned vector (avoids use-after-free)
-                        let owned_bytes: Vec<u8> = data.to_vec();
-
-                        // Create tensor directly from bytes on CPU with BF16 dtype
-                        // This uses tch's internal C++ API to wrap the data
-                        let cpu_tensor = unsafe {
-                            // Reinterpret Vec<u8> as *const i16 for BF16 (represented as i16 in tch)
-                            let ptr = owned_bytes.as_ptr() as *const i16;
-                            let mut t = Tensor::from_blob(
-                                ptr as *const _,
-                                &shape,
-                                &[],  // strides (empty = contiguous)
-                                tch::Kind::BFloat16,
-                                Device::Cpu,
-                            );
-
-                            // Make the tensor own the data by cloning it
-                            // This ensures the data persists after owned_bytes is dropped
-                            t = t.copy();
-
-                            t
-                        };
-
-                        // Transfer directly to GPU (no conversion needed)
-                        cpu_tensor.to_device(*device)
+                    // Transfer to GPU if needed
+                    if *device != Device::Cpu {
+                        let gpu_tensor = cpu_tensor.to_device(*device);
+                        drop(cpu_tensor); // Explicitly free CPU memory
+                        gpu_tensor
                     } else {
-                        // CPU path or non-BF16 target: Convert to F32 since CPU doesn't support BF16
-                        info!("Converting BF16 to F32 for CPU inference (BF16 not supported on CPU)");
-
-                        let bf16_slice = unsafe {
-                            std::slice::from_raw_parts(data.as_ptr() as *const u16, data.len() / 2)
-                        };
-
-                        // Convert BF16 to f32 with pre-allocated capacity
-                        let mut f32_vec = Vec::with_capacity(bf16_slice.len());
-                        f32_vec.extend(bf16_slice.iter().map(|&bf16_bits| {
-                            f32::from_bits((bf16_bits as u32) << 16)
-                        }));
-
-                        // Create tensor from copied data
-                        Tensor::from_slice(&f32_vec)
-                            .reshape(&shape)
-                            .to_device(*device)
-                            .to_kind(dtype)
+                        cpu_tensor
                     }
                 }
                 _ => {
@@ -311,12 +298,10 @@ impl ModelFactory {
                 // For now, Mistral uses Llama architecture
                 Self::create_llama_model(config, weights, device, dtype)
             }
-            ModelArchitecture::Unknown(arch) => {
-                Err(anyhow!("Unknown architecture: {}", arch))
-            }
+            ModelArchitecture::Unknown(arch) => Err(anyhow!("Unknown architecture: {}", arch)),
         }
     }
-    
+
     fn create_llama_model(
         config: ModelConfig,
         weights: HashMap<String, Tensor>,
@@ -324,7 +309,7 @@ impl ModelFactory {
         dtype: DType,
     ) -> Result<Box<dyn ModelOperations>> {
         use super::architectures::llama::LlamaConfig;
-        
+
         // Convert unified config to LlamaConfig
         let llama_config = LlamaConfig {
             version: config.version as u8,
@@ -346,7 +331,7 @@ impl ModelFactory {
             layer_types: vec![],
             rope_local_base_freq: None,
         };
-        
+
         Ok(Box::new(LlamaModel::from_weights_with_config(
             &weights,
             llama_config,
@@ -354,7 +339,7 @@ impl ModelFactory {
             dtype,
         )?))
     }
-    
+
     fn create_qwen_model(
         config: ModelConfig,
         weights: HashMap<String, Tensor>,
@@ -367,7 +352,7 @@ impl ModelFactory {
         info!("   rope_theta: {} (from config)", config.rope_theta);
         Self::create_llama_model(config, weights, device, dtype)
     }
-    
+
     fn create_gemma_model(
         _config: ModelConfig,
         weights: HashMap<String, Tensor>,

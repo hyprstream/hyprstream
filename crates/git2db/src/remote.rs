@@ -145,7 +145,10 @@ impl<'a> RemoteManager<'a> {
 
             // Update URL
             repo.remote_set_url(&name, &url).map_err(|e| {
-                Git2DBError::configuration(format!("Failed to set URL for remote '{}': {}", name, e))
+                Git2DBError::configuration(format!(
+                    "Failed to set URL for remote '{}': {}",
+                    name, e
+                ))
             })?;
 
             Ok(())
@@ -173,8 +176,9 @@ impl<'a> RemoteManager<'a> {
             })?;
 
             // Verify old remote exists
-            repo.find_remote(&old_name)
-                .map_err(|_| Git2DBError::configuration(format!("Remote '{}' not found", old_name)))?;
+            repo.find_remote(&old_name).map_err(|_| {
+                Git2DBError::configuration(format!("Remote '{}' not found", old_name))
+            })?;
 
             // Check new name doesn't exist
             if repo.find_remote(&new_name).is_ok() {

@@ -34,7 +34,9 @@ pub struct CorsConfig {
     pub permissive_headers: bool,
 }
 
-fn default_cors_enabled() -> bool { true }
+fn default_cors_enabled() -> bool {
+    true
+}
 fn default_cors_origins() -> Vec<String> {
     vec![
         "http://localhost:3000".to_string(),
@@ -43,8 +45,12 @@ fn default_cors_origins() -> Vec<String> {
         "http://127.0.0.1:3001".to_string(),
     ]
 }
-fn default_cors_credentials() -> bool { true }
-fn default_cors_max_age() -> u64 { 3600 }
+fn default_cors_credentials() -> bool {
+    true
+}
+fn default_cors_max_age() -> u64 {
+    3600
+}
 
 impl Default for CorsConfig {
     fn default() -> Self {
@@ -89,11 +95,21 @@ pub struct GenerationDefaults {
     pub stream_timeout_secs: u64,
 }
 
-fn default_max_tokens() -> usize { 2048 }
-fn default_temperature() -> f32 { 1.0 }
-fn default_top_p() -> f32 { 1.0 }
-fn default_repeat_penalty() -> f32 { 1.1 }
-fn default_stream_timeout_secs() -> u64 { 300 }
+fn default_max_tokens() -> usize {
+    2048
+}
+fn default_temperature() -> f32 {
+    1.0
+}
+fn default_top_p() -> f32 {
+    1.0
+}
+fn default_repeat_penalty() -> f32 {
+    1.1
+}
+fn default_stream_timeout_secs() -> u64 {
+    300
+}
 
 impl Default for GenerationDefaults {
     fn default() -> Self {
@@ -175,13 +191,27 @@ pub struct ServerConfig {
 }
 
 // Default value functions for serde
-fn default_host() -> String { "0.0.0.0".to_string() }
-fn default_port() -> u16 { 50051 }
-fn default_max_cached_models() -> usize { 5 }
-fn default_true() -> bool { true }
-fn default_max_tokens_limit() -> usize { 4096 }
-fn default_request_timeout_secs() -> u64 { 300 }
-fn default_tls_min_version() -> String { "1.2".to_string() }
+fn default_host() -> String {
+    "0.0.0.0".to_string()
+}
+fn default_port() -> u16 {
+    50051
+}
+fn default_max_cached_models() -> usize {
+    5
+}
+fn default_true() -> bool {
+    true
+}
+fn default_max_tokens_limit() -> usize {
+    4096
+}
+fn default_request_timeout_secs() -> u64 {
+    300
+}
+fn default_tls_min_version() -> String {
+    "1.2".to_string()
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {

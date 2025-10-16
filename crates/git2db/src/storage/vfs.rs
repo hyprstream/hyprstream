@@ -9,7 +9,6 @@
 use super::driver::{Driver, DriverCapabilities, DriverOpts, WorktreeHandle};
 use crate::errors::{Git2DBError, Git2DBResult};
 use async_trait::async_trait;
-use std::path::Path;
 use tracing::info;
 
 /// Configuration for vfs driver
@@ -57,11 +56,9 @@ impl Driver for VfsDriver {
 
         // Ensure parent directory exists
         if let Some(parent) = opts.worktree_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| {
-                    Git2DBError::internal(format!("Failed to create parent directory: {}", e))
-                })?;
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                Git2DBError::internal(format!("Failed to create parent directory: {}", e))
+            })?;
         }
 
         info!(
@@ -88,9 +85,8 @@ impl VfsDriver {
     /// Supports any git ref: branches, commits, tags, symbolic refs (HEAD~3), etc.
     async fn create_git_worktree(&self, opts: &DriverOpts) -> Git2DBResult<()> {
         // Open the base repository
-        let repo = git2::Repository::open(&opts.base_repo).map_err(|e| {
-            Git2DBError::internal(format!("Failed to open repository: {}", e))
-        })?;
+        let repo = git2::Repository::open(&opts.base_repo)
+            .map_err(|e| Git2DBError::internal(format!("Failed to open repository: {}", e)))?;
 
         // Resolve ref_spec to a commit using git_revparse_single
         let object = repo.revparse_single(&opts.ref_spec).map_err(|e| {
@@ -98,7 +94,10 @@ impl VfsDriver {
         })?;
 
         let commit = object.peel_to_commit().map_err(|e| {
-            Git2DBError::internal(format!("Ref '{}' does not point to a commit: {}", opts.ref_spec, e))
+            Git2DBError::internal(format!(
+                "Ref '{}' does not point to a commit: {}",
+                opts.ref_spec, e
+            ))
         })?;
 
         // Check if this is a branch (for branch tracking)
@@ -111,10 +110,7 @@ impl VfsDriver {
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| {
-                Git2DBError::invalid_path(
-                    opts.worktree_path.clone(),
-                    "Invalid worktree path",
-                )
+                Git2DBError::invalid_path(opts.worktree_path.clone(), "Invalid worktree path")
             })?;
 
         // Create worktree appropriately based on ref type
@@ -124,14 +120,9 @@ impl VfsDriver {
             repo.worktree(
                 worktree_name,
                 &opts.worktree_path,
-                Some(
-                    git2::WorktreeAddOptions::new()
-                        .reference(Some(&reference)),
-                ),
+                Some(git2::WorktreeAddOptions::new().reference(Some(&reference))),
             )
-            .map_err(|e| {
-                Git2DBError::internal(format!("Failed to create worktree: {}", e))
-            })?;
+            .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {}", e)))?;
 
             info!(
                 "Created git worktree at {} for branch '{}' (commit: {})",
@@ -142,9 +133,7 @@ impl VfsDriver {
         } else {
             // Commit/Tag/Symbolic: Create with detached HEAD
             repo.worktree(worktree_name, &opts.worktree_path, None)
-                .map_err(|e| {
-                    Git2DBError::internal(format!("Failed to create worktree: {}", e))
-                })?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {}", e)))?;
 
             // Set detached HEAD to the resolved commit
             let wt_repo = git2::Repository::open(&opts.worktree_path)?;
@@ -153,11 +142,9 @@ impl VfsDriver {
             })?;
 
             // Checkout the commit
-            wt_repo.checkout_head(Some(
-                git2::build::CheckoutBuilder::default().force()
-            )).map_err(|e| {
-                Git2DBError::internal(format!("Failed to checkout HEAD: {}", e))
-            })?;
+            wt_repo
+                .checkout_head(Some(git2::build::CheckoutBuilder::default().force()))
+                .map_err(|e| Git2DBError::internal(format!("Failed to checkout HEAD: {}", e)))?;
 
             info!(
                 "Created git worktree at {} for ref '{}' (detached HEAD at {})",

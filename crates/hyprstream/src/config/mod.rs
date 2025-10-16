@@ -8,15 +8,15 @@
 pub mod server;
 
 // Re-export main configuration types
-pub use server::{ServerConfig, ServerConfigBuilder, CorsConfig, GenerationDefaults};
+pub use server::{CorsConfig, GenerationDefaults, ServerConfig, ServerConfigBuilder};
 
 // Export root configuration and builder (defined below in this module)
 // Note: HyprConfig and HyprConfigBuilder are exported automatically as pub structs
 
+use crate::storage::paths::StoragePaths;
 use config::{Config, ConfigError, Environment, File};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use crate::storage::paths::StoragePaths;
 
 /// Unified configuration for the Hyprstream system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,10 +68,18 @@ impl Default for StorageConfig {
         let storage_paths = StoragePaths::new().expect("Failed to initialize storage paths");
 
         Self {
-            models_dir: storage_paths.models_dir().unwrap_or_else(|_| PathBuf::from("./models")),
-            loras_dir: storage_paths.loras_dir().unwrap_or_else(|_| PathBuf::from("./loras")),
-            cache_dir: storage_paths.cache_dir().unwrap_or_else(|_| PathBuf::from("./cache")),
-            config_dir: storage_paths.config_dir().unwrap_or_else(|_| PathBuf::from("./config")),
+            models_dir: storage_paths
+                .models_dir()
+                .unwrap_or_else(|_| PathBuf::from("./models")),
+            loras_dir: storage_paths
+                .loras_dir()
+                .unwrap_or_else(|_| PathBuf::from("./loras")),
+            cache_dir: storage_paths
+                .cache_dir()
+                .unwrap_or_else(|_| PathBuf::from("./cache")),
+            config_dir: storage_paths
+                .config_dir()
+                .unwrap_or_else(|_| PathBuf::from("./config")),
         }
     }
 }
@@ -288,10 +296,12 @@ impl HyprConfig {
 
     /// Load configuration using the config crate with XDG directories and environment variables
     pub fn load() -> Result<Self, ConfigError> {
-        let storage = StoragePaths::new()
-            .map_err(|e| ConfigError::Message(format!("Failed to initialize storage paths: {}", e)))?;
+        let storage = StoragePaths::new().map_err(|e| {
+            ConfigError::Message(format!("Failed to initialize storage paths: {}", e))
+        })?;
 
-        let config_dir = storage.config_dir()
+        let config_dir = storage
+            .config_dir()
             .map_err(|e| ConfigError::Message(format!("Failed to get config directory: {}", e)))?;
 
         let settings = Config::builder()
@@ -312,7 +322,10 @@ impl HyprConfig {
         // This ensures GIT2DB__* environment variables are properly loaded
         match git2db::config::Git2DBConfig::load() {
             Ok(git2db_config) => {
-                tracing::info!("Loaded git2db config, token present: {}", git2db_config.network.access_token.is_some());
+                tracing::info!(
+                    "Loaded git2db config, token present: {}",
+                    git2db_config.network.access_token.is_some()
+                );
                 hypr_config.git2db = git2db_config;
             }
             Err(e) => {
@@ -426,7 +439,8 @@ impl HyprConfig {
         let mut config = Self::default();
 
         config.model.path = model_path.to_path_buf();
-        config.model.name = model_path.file_stem()
+        config.model.name = model_path
+            .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown")
             .to_string();

@@ -1,20 +1,22 @@
 //! PyTorch-based inference engine using tch-rs
 
-use tracing::{info, instrument};
-use anyhow::{Result, anyhow};
-use async_trait::async_trait;
-use std::path::Path;
-use tch::{Device, Tensor, nn::VarStore};
-use tokenizers::Tokenizer;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
-use serde_json;
-use json_threat_protection as jtp;
-use crate::config::{GenerationRequest, GenerationResult, ModelInfo, RuntimeConfig, GenerationConfig, FinishReason};
-use crate::runtime::RuntimeEngine;
-use crate::runtime::template_engine::{TemplateEngine, ChatMessage};
+use crate::config::{
+    FinishReason, GenerationConfig, GenerationRequest, GenerationResult, ModelInfo, RuntimeConfig,
+};
 use crate::runtime::gpu_sampling::GpuSampler;
-use crate::storage::{XetNativeStorage, XetConfig};
+use crate::runtime::template_engine::{ChatMessage, TemplateEngine};
+use crate::runtime::RuntimeEngine;
+use crate::storage::{XetConfig, XetNativeStorage};
+use anyhow::{anyhow, Result};
+use async_trait::async_trait;
+use json_threat_protection as jtp;
+use serde_json;
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError};
+use tch::{nn::VarStore, Device, Tensor};
+use tokenizers::Tokenizer;
+use tracing::{info, instrument};
 
 /// Qwen2 special token IDs (based on official HuggingFace implementation)
 #[derive(Debug, Clone)]
@@ -40,9 +42,9 @@ pub struct QwenSpecialTokens {
 impl Default for QwenSpecialTokens {
     fn default() -> Self {
         Self {
-            endoftext: 151643,      // "<|endoftext|>"
-            im_start: 151644,       // "<|im_start|>" 
-            im_end: 151645,         // "<|im_end|>"
+            endoftext: 151643, // "<|endoftext|>"
+            im_start: 151644,  // "<|im_start|>"
+            im_end: 151645,    // "<|im_end|>"
             object_ref_start: 151646,
             object_ref_end: 151647,
             box_start: 151648,
@@ -69,7 +71,7 @@ pub struct ContextState {
 }
 
 /// PyTorch inference engine using tch-rs
-/// 
+///
 /// Thread-safe implementation using proper synchronization primitives.
 /// All mutable state is protected by mutexes with poisoning recovery.
 #[derive(Clone)]
@@ -128,7 +130,7 @@ impl TorchEngine {
             }
         }
     }
-    
+
     /// Create new PyTorch engine
     pub fn new(config: RuntimeConfig) -> Result<Self> {
         Self::new_sync(config)
@@ -146,8 +148,9 @@ impl TorchEngine {
             let gpu_device = Device::cuda_if_available();
             if gpu_device != Device::Cpu {
                 // Check if this is actually ROCm/HIP
-                if std::env::var("HIP_VISIBLE_DEVICES").is_ok() || 
-                   std::path::Path::new("../libtorch/lib/libtorch_hip.so").exists() {
+                if std::env::var("HIP_VISIBLE_DEVICES").is_ok()
+                    || std::path::Path::new("../libtorch/lib/libtorch_hip.so").exists()
+                {
                     info!("🚀 Using ROCm/HIP GPU acceleration");
                 } else {
                     info!("🚀 Using CUDA GPU acceleration");
@@ -205,7 +208,8 @@ impl TorchEngine {
 
     /// Load model from safetensors or torchscript
     async fn load_model_file(&mut self, path: &Path) -> Result<()> {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .ok_or_else(|| anyhow!("Invalid file extension"))?;
 
@@ -226,17 +230,16 @@ impl TorchEngine {
         Ok(())
     }
 
-
     /// Load SafeTensors model using ModelFactory for unified weight loading
     async fn load_safetensors(&mut self, path: &Path) -> Result<()> {
         info!("Loading weights: {}", path.display());
-        
+
         // Get the model directory (parent of the safetensors file)
         let model_dir = path.parent().unwrap_or(path);
-        
+
         // Use ModelFactory to load the model (handles all weight loading internally)
         self.initialize_persistent_model(model_dir).await?;
-        
+
         // Extract model info from the loaded model
         if let Some(model) = &self.persistent_model {
             let _model_guard = self.handle_poison(model.lock())?;
@@ -244,23 +247,23 @@ impl TorchEngine {
             // Get architecture info from the model
             // For now, use a default since we don't have a method to query this
             let architecture = "auto".to_string();
-            
+
             // Update model info
             {
                 let mut model_info_guard = self.handle_poison(self.model_info.lock())?;
                 model_info_guard.architecture = architecture.clone();
             }
-            
+
             // Set architecture
             {
                 let mut arch_guard = self.handle_poison(self.model_architecture.lock())?;
                 *arch_guard = Some(architecture.clone());
             }
         }
-        
+
         // Get context window from model info that was populated from config
         let context_window = self.handle_poison(self.model_info.lock())?.context_length;
-        
+
         // Initialize context state
         {
             let mut context_guard = self.handle_poison(self.context_state.lock())?;
@@ -270,14 +273,14 @@ impl TorchEngine {
                 initialized: true,
             });
         }
-        
+
         // Create dummy VarStore for backward compatibility
         {
             let vs = VarStore::new(self.device);
             let mut var_store_guard = self.handle_poison(self.var_store.lock())?;
             *var_store_guard = Some(vs);
         }
-        
+
         info!("✅ SafeTensors model loaded via ModelFactory");
         info!("🚀 Model initialized and ready for inference");
         Ok(())
@@ -332,8 +335,8 @@ impl TorchEngine {
 
     /// Initialize the persistent model instance using ModelFactory
     async fn initialize_persistent_model(&mut self, model_path: &Path) -> Result<()> {
-        use crate::runtime::model_factory::ModelFactory;
         use crate::runtime::model_config::ModelConfig;
+        use crate::runtime::model_factory::ModelFactory;
 
         info!("Initializing model");
 
@@ -378,7 +381,7 @@ impl TorchEngine {
         } else {
             model_path.parent().unwrap_or(model_path)
         };
-        
+
         let tokenizer_path = search_dir.join("tokenizer.json");
         let tokenizer_config_path = search_dir.join("tokenizer_config.json");
 
@@ -386,7 +389,7 @@ impl TorchEngine {
             info!("Loading tokenizer: {}", tokenizer_path.display());
             let tokenizer = Tokenizer::from_file(&tokenizer_path)
                 .map_err(|e| anyhow!("Failed to load tokenizer: {}", e))?;
-            
+
             // Thread safe assignment
             let mut tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
             *tokenizer_guard = Some(tokenizer);
@@ -396,31 +399,34 @@ impl TorchEngine {
                 tokenizer_path.display()
             ));
         }
-        
+
         // Load template configuration if available
         if tokenizer_config_path.exists() {
-            info!("Loading tokenizer config: {}", tokenizer_config_path.display());
+            info!(
+                "Loading tokenizer config: {}",
+                tokenizer_config_path.display()
+            );
             let config_content = tokio::fs::read_to_string(&tokenizer_config_path).await?;
-            
+
             // Validate before parsing
             jtp::from_str(&config_content)
                 .with_max_depth(10)
                 .with_max_string_length(50000)
                 .validate()
                 .map_err(|e| anyhow!("Invalid tokenizer config: {:?}", e))?;
-            
+
             let config_json: serde_json::Value = serde_json::from_str(&config_content)?;
-            
+
             // Parse template configuration
             let template_config = TemplateEngine::from_tokenizer_config(&config_json)?;
-            
+
             // Create template engine
             let template_engine = TemplateEngine::new(template_config)?;
-            
+
             // Store template engine
             let mut template_guard = self.handle_poison(self.template_engine.lock())?;
             *template_guard = Some(template_engine);
-            
+
             info!("✅ Template engine initialized");
         } else {
             info!("⚠️ No tokenizer_config.json found, using fallback templates");
@@ -432,17 +438,22 @@ impl TorchEngine {
     /// Tokenize text to input IDs - thread safe
     fn tokenize(&self, text: &str) -> Result<Vec<i64>> {
         let tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
-        let tokenizer = tokenizer_guard.as_ref()
+        let tokenizer = tokenizer_guard
+            .as_ref()
             .ok_or_else(|| anyhow!("Tokenizer not loaded. Call load_tokenizer() first."))?;
-        
-        let encoding = tokenizer.encode(text, false)
+
+        let encoding = tokenizer
+            .encode(text, false)
             .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
         let token_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
-        
+
         if token_ids.is_empty() {
-            return Err(anyhow!("Tokenization produced empty token sequence for text: '{}'", text));
+            return Err(anyhow!(
+                "Tokenization produced empty token sequence for text: '{}'",
+                text
+            ));
         }
-        
+
         tracing::debug!("Tokenized '{}' -> {:?}", text, token_ids);
         Ok(token_ids)
     }
@@ -453,7 +464,7 @@ impl TorchEngine {
         if let Ok(template_guard) = self.template_engine.lock() {
             if let Some(ref engine) = *template_guard {
                 let mut messages = Vec::new();
-                
+
                 // Add system message if provided
                 if let Some(system_msg) = system {
                     messages.push(ChatMessage {
@@ -461,74 +472,78 @@ impl TorchEngine {
                         content: system_msg.to_string(),
                     });
                 }
-                
+
                 // Add user message
                 messages.push(ChatMessage {
                     role: "user".to_string(),
                     content: user.to_string(),
                 });
-                
+
                 // Apply template
                 if let Ok(formatted) = engine.apply_chat_template(&messages, Some(true)) {
                     return formatted;
                 }
             }
         }
-        
+
         // Fallback to hardcoded Qwen2 template if template engine not available
         let mut formatted = String::new();
-        
+
         // Add system message if provided
         if let Some(system_msg) = system {
             formatted.push_str("<|im_start|>system\n");
             formatted.push_str(system_msg);
             formatted.push_str("<|im_end|>\n");
         }
-        
+
         // Add user message
         formatted.push_str("<|im_start|>user\n");
         formatted.push_str(user);
         formatted.push_str("<|im_end|>\n");
-        
+
         // Add assistant prompt
         formatted.push_str("<|im_start|>assistant\n");
-        
+
         formatted
     }
-    
+
     /// Check if a token ID is a special EOS token for Qwen
     fn is_eos_token(&self, token_id: usize) -> bool {
         let token_id_u32 = token_id as u32;
         // Qwen can end on either im_end (for conversations) or endoftext (for completion)
-        token_id_u32 == self.special_tokens.im_end || 
-        token_id_u32 == self.special_tokens.endoftext
+        token_id_u32 == self.special_tokens.im_end || token_id_u32 == self.special_tokens.endoftext
     }
 
     /// Detokenize IDs back to text - thread safe
     fn detokenize(&self, ids: &[i64]) -> Result<String> {
         let tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
-        let tokenizer = tokenizer_guard.as_ref()
+        let tokenizer = tokenizer_guard
+            .as_ref()
             .ok_or_else(|| anyhow!("Tokenizer not loaded. Call load_tokenizer() first."))?;
-        
+
         if ids.is_empty() {
             return Ok(String::new());
         }
-        
+
         let ids_u32: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
-        
+
         // Debug tokenizer state
         tracing::debug!("Detokenizing token IDs: {:?}", ids_u32);
-        
+
         // Decode tokens - skip special tokens for clean output
         // The tokenizer is already configured with NFC Unicode normalization
-        let decoded_text = tokenizer.decode(&ids_u32, true)
+        let decoded_text = tokenizer
+            .decode(&ids_u32, true)
             .map_err(|e| anyhow!("Detokenization failed for token IDs {:?}: {}", ids, e))?;
-        
+
         // Log any Unicode replacement characters for debugging
         if decoded_text.contains('\u{FFFD}') {
-            tracing::warn!("Unicode replacement characters detected in token IDs {:?}", ids_u32);
+            tracing::warn!(
+                "Unicode replacement characters detected in token IDs {:?}",
+                ids_u32
+            );
         }
-        
+
         tracing::debug!("Detokenized {:?} -> '{}'", ids_u32, decoded_text);
         Ok(decoded_text)
     }
@@ -539,37 +554,40 @@ impl TorchEngine {
         if self.has_varstore() {
             return self.forward_varstore(input_ids);
         }
-        
+
         Err(anyhow!("No model loaded - call load_model() first"))
     }
 
     /// Run inference using VarStore (SafeTensors models) with persistent model - thread safe
     fn forward_varstore(&self, input_ids: &[i64]) -> Result<Tensor> {
         // Use the persistent model instance - NO recreation!
-        let model_arc = self.persistent_model.as_ref()
+        let model_arc = self
+            .persistent_model
+            .as_ref()
             .ok_or_else(|| anyhow!("Persistent model not initialized - call load_model() first"))?;
-        
+
         // Verify context state with thread safety
         {
             let context_guard = self.handle_poison(self.context_state.lock())?;
-            let _context_state = context_guard.as_ref()
+            let _context_state = context_guard
+                .as_ref()
                 .ok_or_else(|| anyhow!("Context state not initialized"))?;
         }
-        
+
         if !self.is_persistent_model_ready() {
             return Err(anyhow!("Model not properly initialized"));
         }
-        
+
         // Convert input IDs to tensor (keep as int64 for embeddings)
         let input_tensor = Tensor::from_slice(input_ids)
-            .to_kind(tch::Kind::Int64)  // Ensure int64 for embedding lookup
+            .to_kind(tch::Kind::Int64) // Ensure int64 for embedding lookup
             .to_device(self.device)
             .unsqueeze(0); // Add batch dimension: [1, seq_len]
-        
+
         // Lock the model and run forward pass (efficient!) with poison recovery
         let model = self.handle_poison(model_arc.lock())?;
         let logits = model.forward(&input_tensor, None)?;
-        
+
         // Extract logits for the last token
         let logits_shape = logits.size();
         let seq_len = logits_shape[1];
@@ -577,38 +595,45 @@ impl TorchEngine {
 
         // Get logits for last token: [batch=1, last_seq_pos, vocab_size]
         let last_token_logits = logits.narrow(1, seq_len - 1, 1).squeeze_dim(1); // [1, vocab_size]
-        
+
         Ok(last_token_logits)
     }
-    
+
     /// Run optimized inference with KV caching - only process new tokens
-    fn forward_cached(&self, input_ids: &[i64], start_pos: usize, use_cache: bool) -> Result<Tensor> {
+    fn forward_cached(
+        &self,
+        input_ids: &[i64],
+        start_pos: usize,
+        use_cache: bool,
+    ) -> Result<Tensor> {
         // Use the persistent model instance
-        let model_arc = self.persistent_model.as_ref()
+        let model_arc = self
+            .persistent_model
+            .as_ref()
             .ok_or_else(|| anyhow!("Persistent model not initialized"))?;
-        
+
         if !self.is_persistent_model_ready() {
             return Err(anyhow!("Model not properly initialized"));
         }
-        
+
         // For KV cached generation, only process new tokens after initial prompt
         let tokens_to_process = if use_cache && start_pos > 0 {
             // Only process the last token (the newly generated one)
-            &input_ids[input_ids.len()-1..]
+            &input_ids[input_ids.len() - 1..]
         } else {
             // Process all tokens (initial prompt or no caching)
             input_ids
         };
-        
+
         // Convert to tensor
         let input_tensor = Tensor::from_slice(tokens_to_process)
             .to_kind(tch::Kind::Int64)
             .to_device(self.device)
             .unsqueeze(0); // [1, seq_len]
-        
+
         // Run forward pass with position info for proper KV cache usage
         let model = self.handle_poison(model_arc.lock())?;
-        
+
         // Use the new forward_with_cache method that properly tracks position
         let logits = model.forward_with_cache(&input_tensor, start_pos)?;
 
@@ -619,13 +644,20 @@ impl TorchEngine {
 
         // Get logits for last token
         let last_token_logits = logits.narrow(1, seq_len - 1, 1).squeeze_dim(1);
-        
+
         Ok(last_token_logits)
     }
 
-
     /// Sample next token from GPU logits tensor
-    fn sample_token_gpu(&self, logits_tensor: &Tensor, temperature: f32, top_p: f32, top_k: Option<usize>, repeat_penalty: f32, previous_tokens: &[i64]) -> Result<usize> {
+    fn sample_token_gpu(
+        &self,
+        logits_tensor: &Tensor,
+        temperature: f32,
+        top_p: f32,
+        top_k: Option<usize>,
+        repeat_penalty: f32,
+        previous_tokens: &[i64],
+    ) -> Result<usize> {
         self.gpu_sampler.sample_token(
             logits_tensor,
             temperature,
@@ -643,18 +675,18 @@ impl RuntimeEngine for TorchEngine {
     async fn load_model(&mut self, path: &Path) -> Result<()> {
         // Store the original path for model naming
         let original_path = path.to_path_buf();
-        
+
         // If path is a directory, find the model file inside it
         let model_file_path = if path.is_dir() {
             // First check for single file patterns
             let single_files = [
-                "model.safetensors", 
+                "model.safetensors",
                 "pytorch_model.bin",
                 "model.bin",
                 "model.pt",
-                "model.pth"
+                "model.pth",
             ];
-            
+
             let mut found_file = None;
             for filename in &single_files {
                 let candidate = path.join(filename);
@@ -663,7 +695,7 @@ impl RuntimeEngine for TorchEngine {
                     break;
                 }
             }
-            
+
             // If no single file found, check for sharded SafeTensors
             if found_file.is_none() {
                 let _shard_pattern = path.join("model-00001-of-*.safetensors");
@@ -671,8 +703,12 @@ impl RuntimeEngine for TorchEngine {
                     for entry in entries.flatten() {
                         let filename = entry.file_name();
                         if let Some(name) = filename.to_str() {
-                            if name.starts_with("model-00001-of-") && name.ends_with(".safetensors") {
-                                info!("🔍 Detected sharded SafeTensors model starting with: {}", name);
+                            if name.starts_with("model-00001-of-") && name.ends_with(".safetensors")
+                            {
+                                info!(
+                                    "🔍 Detected sharded SafeTensors model starting with: {}",
+                                    name
+                                );
                                 found_file = Some(entry.path());
                                 break;
                             }
@@ -680,37 +716,44 @@ impl RuntimeEngine for TorchEngine {
                     }
                 }
             }
-            
-            found_file.ok_or_else(|| anyhow!("No supported model file found in directory: {}", path.display()))?
+
+            found_file.ok_or_else(|| {
+                anyhow!(
+                    "No supported model file found in directory: {}",
+                    path.display()
+                )
+            })?
         } else {
             path.to_path_buf()
         };
 
         info!("Loading model: {}", model_file_path.display());
         self.load_model_file(&model_file_path).await?;
-        
+
         // Set the model name based on the canonical path
         // Use directory name if loading from directory, otherwise use filename
         let model_name = if original_path.is_dir() {
             // Get the last component of the directory path as the model name
-            original_path.file_name()
+            original_path
+                .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown")
                 .to_string()
         } else {
             // Use the file stem for single files
-            original_path.file_stem()
+            original_path
+                .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown")
                 .to_string()
         };
-        
+
         // Update model info with the correct name
         {
             let mut model_info_guard = self.handle_poison(self.model_info.lock())?;
             model_info_guard.name = model_name;
         }
-        
+
         self.load_tokenizer(path).await?;
         Ok(())
     }
@@ -718,10 +761,10 @@ impl RuntimeEngine for TorchEngine {
     async fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String> {
         // Format prompt with Qwen2 chat template
         let formatted_prompt = self.format_chat_message(
-            Some("You are Qwen, created by Alibaba Cloud. You are a helpful assistant."), 
-            prompt
+            Some("You are Qwen, created by Alibaba Cloud. You are a helpful assistant."),
+            prompt,
         );
-        
+
         let request = GenerationRequest {
             prompt: formatted_prompt,
             max_tokens,
@@ -748,15 +791,17 @@ impl RuntimeEngine for TorchEngine {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(120);
         let timeout_duration = std::time::Duration::from_secs(timeout_secs);
-        
+
         // Run the CPU-intensive generation in a blocking thread to avoid blocking the async runtime
         let self_clone = self.clone();
         let generation_future = tokio::task::spawn_blocking(move || {
             // Ensure persistent model is ready
             if !self_clone.is_persistent_model_ready() {
-                return Err(anyhow!("Model not properly initialized - persistent model not ready"));
+                return Err(anyhow!(
+                    "Model not properly initialized - persistent model not ready"
+                ));
             }
-            
+
             let start_time = std::time::Instant::now();
 
             // Tokenize input
@@ -774,7 +819,7 @@ impl RuntimeEngine for TorchEngine {
                     // Subsequent passes: only process new token with KV cache
                     self_clone.forward_cached(&input_ids, prompt_len + i - 1, true)?
                 };
-                
+
                 // Sample next token with proper parameters
                 let next_token = self_clone.sample_token_gpu(
                     &logits,
@@ -784,7 +829,7 @@ impl RuntimeEngine for TorchEngine {
                     request.repeat_penalty,
                     &input_ids,
                 )?;
-                
+
                 tracing::debug!("Sampled token ID: {}", next_token);
 
                 // Check EOS BEFORE decoding or adding to sequence
@@ -803,7 +848,11 @@ impl RuntimeEngine for TorchEngine {
                 generated_text.push_str(&token_text);
 
                 // Check stop tokens
-                if request.stop_tokens.iter().any(|stop| generated_text.contains(stop)) {
+                if request
+                    .stop_tokens
+                    .iter()
+                    .any(|stop| generated_text.contains(stop))
+                {
                     break;
                 }
             }
@@ -822,15 +871,13 @@ impl RuntimeEngine for TorchEngine {
                 tokens_per_second: tokens_generated as f32 / generation_time.as_secs_f32(),
             })
         });
-        
+
         // Apply timeout to prevent runaway generation
         match tokio::time::timeout(timeout_duration, generation_future).await {
-            Ok(Ok(Ok(result))) => Ok(result),  // Unwrap nested Results: timeout -> JoinHandle -> generation
-            Ok(Ok(Err(e))) => Err(e),          // Generation error
+            Ok(Ok(Ok(result))) => Ok(result), // Unwrap nested Results: timeout -> JoinHandle -> generation
+            Ok(Ok(Err(e))) => Err(e),         // Generation error
             Ok(Err(e)) => Err(anyhow!("Blocking task panicked: {}", e)), // Task panic
-            Err(_) => {
-                Err(anyhow!("Generation timed out after {:?}", timeout_duration))
-            }
+            Err(_) => Err(anyhow!("Generation timed out after {:?}", timeout_duration)),
         }
     }
 
@@ -854,14 +901,18 @@ impl RuntimeEngine for TorchEngine {
     fn is_loaded(&self) -> bool {
         let varstore_loaded = self.has_varstore();
         let persistent_loaded = self.persistent_model.is_some();
-        
+
         varstore_loaded || persistent_loaded
     }
-    
-    fn apply_chat_template(&self, messages: &[ChatMessage], add_generation_prompt: bool) -> Result<String> {
+
+    fn apply_chat_template(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+    ) -> Result<String> {
         // Use our template engine if available
         let template_guard = self.handle_poison(self.template_engine.lock())?;
-        
+
         if let Some(ref engine) = *template_guard {
             // Use the template engine
             engine.apply_chat_template(messages, Some(add_generation_prompt))
@@ -885,7 +936,9 @@ impl TorchEngine {
     pub fn enable_training(&mut self, _learning_rate: f64) -> Result<()> {
         // Ensure model is loaded
         if !self.is_persistent_model_ready() {
-            return Err(anyhow!("Model not loaded - persistent model not initialized"));
+            return Err(anyhow!(
+                "Model not loaded - persistent model not initialized"
+            ));
         }
 
         // For pre-training without VarStore:
@@ -915,16 +968,13 @@ impl TorchEngine {
     }
 
     /// Forward pass for training (with gradient tracking)
-    pub fn forward_training(
-        &self,
-        input_ids: &Tensor,
-        track_gradients: bool,
-    ) -> Result<Tensor> {
+    pub fn forward_training(&self, input_ids: &Tensor, track_gradients: bool) -> Result<Tensor> {
         if !self.is_persistent_model_ready() {
             return Err(anyhow!("Model not initialized"));
         }
 
-        let model = self.persistent_model
+        let model = self
+            .persistent_model
             .as_ref()
             .ok_or_else(|| anyhow!("Persistent model not available"))?;
         let model_guard = self.handle_poison(model.lock())?;
@@ -939,11 +989,7 @@ impl TorchEngine {
     }
 
     /// Compute loss and backward (without optimizer step)
-    pub fn compute_loss_and_backward(
-        &self,
-        input_ids: &Tensor,
-        labels: &Tensor,
-    ) -> Result<f64> {
+    pub fn compute_loss_and_backward(&self, input_ids: &Tensor, labels: &Tensor) -> Result<f64> {
         // Forward pass with gradients
         let logits = self.forward_training(input_ids, true)?;
 
@@ -988,23 +1034,25 @@ impl TorchEngine {
 impl TorchEngine {
     /// Generate text with streaming callback and custom parameters
     pub async fn generate_streaming_with_params<F>(
-        &self, 
-        prompt: &str, 
-        max_tokens: usize, 
+        &self,
+        prompt: &str,
+        max_tokens: usize,
         temperature: f32,
         top_p: f32,
         top_k: Option<usize>,
         repeat_penalty: f32,
-        callback: F
+        callback: F,
     ) -> Result<String>
-    where 
-        F: FnMut(&str)
+    where
+        F: FnMut(&str),
     {
         // Ensure persistent model is ready
         if !self.is_persistent_model_ready() {
-            return Err(anyhow!("Model not properly initialized - persistent model not ready"));
+            return Err(anyhow!(
+                "Model not properly initialized - persistent model not ready"
+            ));
         }
-        
+
         let request = GenerationRequest {
             prompt: prompt.to_string(),
             max_tokens,
@@ -1019,15 +1067,20 @@ impl TorchEngine {
             realtime_adaptation: None,
             user_feedback: None,
         };
-        
+
         // Use the internal streaming implementation with these parameters
         self.generate_streaming_internal(request, callback).await
     }
-    
+
     /// Generate text with streaming callback (using default parameters)
-    pub async fn generate_streaming<F>(&self, prompt: &str, max_tokens: usize, callback: F) -> Result<String> 
-    where 
-        F: FnMut(&str)
+    pub async fn generate_streaming<F>(
+        &self,
+        prompt: &str,
+        max_tokens: usize,
+        callback: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&str),
     {
         // Use model-specific defaults or fallback to generic defaults
         self.generate_streaming_with_params(
@@ -1037,14 +1090,19 @@ impl TorchEngine {
             self.generation_config.top_p,
             self.generation_config.top_k,
             self.generation_config.repeat_penalty,
-            callback
-        ).await
+            callback,
+        )
+        .await
     }
-    
+
     /// Internal streaming implementation
-    async fn generate_streaming_internal<F>(&self, request: GenerationRequest, mut callback: F) -> Result<String>
+    async fn generate_streaming_internal<F>(
+        &self,
+        request: GenerationRequest,
+        mut callback: F,
+    ) -> Result<String>
     where
-        F: FnMut(&str)
+        F: FnMut(&str),
     {
         let prompt = &request.prompt;
         let max_tokens = request.max_tokens;
@@ -1060,7 +1118,7 @@ impl TorchEngine {
         let mut input_ids = self.tokenize(prompt)?;
         let mut generated_text = String::new();
         let prompt_len = input_ids.len();
-        
+
         tracing::info!("Starting generation with prompt of {} tokens", prompt_len);
         tracing::debug!("Initial token IDs: {:?}", &input_ids[..prompt_len.min(20)]);
 
@@ -1074,7 +1132,7 @@ impl TorchEngine {
                 // Position is prompt_len + (i-1) since we're processing the token generated in the previous iteration
                 self.forward_cached(&input_ids, prompt_len + i - 1, true)?
             };
-            
+
             // Sample next token
             let next_token = self.sample_token_gpu(
                 &logits,
@@ -1097,15 +1155,23 @@ impl TorchEngine {
             // Decode token and stream it immediately
             let token_text = self.detokenize(&[next_token as i64])?;
             generated_text.push_str(&token_text);
-            
-            tracing::debug!("Iteration {}: generated token {} -> '{}'", 
-                         i, next_token, token_text);
-            
+
+            tracing::debug!(
+                "Iteration {}: generated token {} -> '{}'",
+                i,
+                next_token,
+                token_text
+            );
+
             // Stream the token immediately (real streaming)
             callback(&token_text);
 
             // Check stop tokens
-            if request.stop_tokens.iter().any(|stop| generated_text.contains(stop)) {
+            if request
+                .stop_tokens
+                .iter()
+                .any(|stop| generated_text.contains(stop))
+            {
                 break;
             }
         }
@@ -1113,14 +1179,14 @@ impl TorchEngine {
         Ok(generated_text)
     }
 
-
     /// Check if persistent model is initialized - thread safe
     pub fn is_persistent_model_ready(&self) -> bool {
         let persistent_ready = self.persistent_model.is_some();
-        let context_ready = self.handle_poison(self.context_state.lock())
+        let context_ready = self
+            .handle_poison(self.context_state.lock())
             .map(|guard| guard.as_ref().map_or(false, |c| c.initialized))
             .unwrap_or(false);
-        
+
         persistent_ready && context_ready
     }
 
@@ -1133,20 +1199,23 @@ impl TorchEngine {
     ) -> Result<GenerationResult> {
         use crate::runtime::streaming::ContinueGeneration;
         use tokio::time::timeout;
-        
+
         let start_time = std::time::Instant::now();
-        
+
         // Notify start
         callback.on_start().await;
-        
+
         // Tokenize input
         let mut input_ids = self.tokenize(&request.prompt)?;
         let mut generated_text = String::new();
         let mut tokens_generated = 0;
         let prompt_len = input_ids.len();
-        
-        tracing::info!("Starting async generation with prompt of {} tokens", prompt_len);
-        
+
+        tracing::info!(
+            "Starting async generation with prompt of {} tokens",
+            prompt_len
+        );
+
         // Create timeout future
         let generation_future = async {
             for i in 0..request.max_tokens {
@@ -1155,14 +1224,14 @@ impl TorchEngine {
                     tracing::info!("Generation cancelled by client");
                     break;
                 }
-                
+
                 // Forward pass
                 let logits = if i == 0 {
                     self.forward(&input_ids)?
                 } else {
                     self.forward_cached(&input_ids, prompt_len + i - 1, true)?
                 };
-                
+
                 // Sample next token
                 let next_token = self.sample_token_gpu(
                     &logits,
@@ -1172,7 +1241,7 @@ impl TorchEngine {
                     request.repeat_penalty,
                     &input_ids,
                 )?;
-                
+
                 // Check EOS BEFORE decoding or adding to sequence
                 if self.is_eos_token(next_token) {
                     tracing::debug!("EOS token detected: {}", next_token);
@@ -1182,36 +1251,40 @@ impl TorchEngine {
                 // Add to sequence
                 input_ids.push(next_token as i64);
                 tokens_generated += 1;
-                
+
                 // Decode token
                 let token_text = self.detokenize(&[next_token as i64])?;
                 generated_text.push_str(&token_text);
-                
+
                 // Stream token via callback
                 match callback.on_token(&token_text).await {
-                    Ok(ContinueGeneration::Continue) => {},
+                    Ok(ContinueGeneration::Continue) => {}
                     Ok(ContinueGeneration::Stop) => {
                         tracing::info!("Generation stopped by callback");
                         break;
-                    },
+                    }
                     Ok(ContinueGeneration::Pause(duration)) => {
                         tokio::time::sleep(duration).await;
-                    },
+                    }
                     Err(e) => {
                         callback.on_error(anyhow::anyhow!("{}", e)).await;
                         return Err(e);
                     }
                 }
-                
+
                 // Check stop conditions
-                if request.stop_tokens.iter().any(|stop| generated_text.contains(stop)) {
+                if request
+                    .stop_tokens
+                    .iter()
+                    .any(|stop| generated_text.contains(stop))
+                {
                     break;
                 }
             }
-            
+
             Ok::<_, anyhow::Error>(())
         };
-        
+
         // Apply timeout
         match timeout(context.timeout, generation_future).await {
             Ok(Ok(())) => {
@@ -1223,9 +1296,9 @@ impl TorchEngine {
                 } else {
                     FinishReason::Stop
                 };
-                
+
                 callback.on_complete(finish_reason.clone()).await;
-                
+
                 Ok(GenerationResult {
                     text: generated_text,
                     tokens_generated,
@@ -1247,7 +1320,7 @@ impl TorchEngine {
             }
         }
     }
-    
+
     /// Generate text with raw prompt (no chat formatting)
     pub async fn generate_raw(&self, prompt: &str, max_tokens: usize) -> Result<String> {
         let request = GenerationRequest {
@@ -1270,7 +1343,12 @@ impl TorchEngine {
     }
 
     /// Generate text with custom chat formatting
-    pub async fn generate_chat(&self, system: Option<&str>, user: &str, max_tokens: usize) -> Result<String> {
+    pub async fn generate_chat(
+        &self,
+        system: Option<&str>,
+        user: &str,
+        max_tokens: usize,
+    ) -> Result<String> {
         let formatted_prompt = self.format_chat_message(system, user);
         self.generate_raw(&formatted_prompt, max_tokens).await
     }
@@ -1281,15 +1359,13 @@ impl TorchEngine {
         config: crate::lora::LoRAConfig,
         training_config: crate::lora::TrainingConfig,
     ) -> Result<()> {
-        
-
         // Get module dimensions from loaded model
         let mut module_configs = HashMap::new();
-        
+
         // Get model dimensions from model_info
         let model_info = self.handle_poison(self.model_info.lock())?;
         let hidden_size = model_info.hidden_size as i64;
-        
+
         // Calculate intermediate size based on model architecture
         let intermediate_size = if let Some(intermediate) = model_info.intermediate_size {
             intermediate as i64
@@ -1298,10 +1374,10 @@ impl TorchEngine {
             match model_info.architecture.as_str() {
                 "Qwen2ForCausalLM" => (hidden_size as f32 * 2.6667) as i64, // Qwen uses ~2.67x
                 "LlamaForCausalLM" => (hidden_size as f32 * 2.75) as i64,   // Llama uses 2.75x
-                _ => hidden_size * 4, // Default 4x expansion
+                _ => hidden_size * 4,                                       // Default 4x expansion
             }
         };
-        
+
         // Extract dimensions for each target module
         for module_name in &config.target_modules {
             let (in_features, out_features) = match module_name.as_str() {
@@ -1324,38 +1400,38 @@ impl TorchEngine {
                     ));
                 }
             };
-            
-            module_configs.insert(module_name.clone(), (in_features as usize, out_features as usize));
+
+            module_configs.insert(
+                module_name.clone(),
+                (in_features as usize, out_features as usize),
+            );
         }
-        
+
         // Create LoRA model
         let lora_model = crate::lora::torch_adapter::LoRAModel::new(
             config.clone(),
             module_configs,
             self.device,
         )?;
-        
+
         tracing::info!(
             "Initialized LoRA with {} trainable parameters",
             lora_model.num_parameters()
         );
-        
+
         // Create trainer that uses the model's VarStore
-        let trainer = crate::lora::trainer::LoRATrainer::new(
-            &lora_model.vs,
-            self.device,
-            training_config,
-        )?;
+        let trainer =
+            crate::lora::trainer::LoRATrainer::new(&lora_model.vs, self.device, training_config)?;
 
         // Store the single model and trainer
         *self.handle_poison(self.lora_model.lock())? = Some(lora_model);
         *self.handle_poison(self.lora_trainer.lock())? = Some(trainer);
-        
+
         // Gradient computation enabled by default in training mode
-        
+
         Ok(())
     }
-    
+
     /// Forward pass with LoRA adapters (Smart Hybrid with Gradient Bridge)
     pub fn forward_with_lora(
         &self,
@@ -1372,7 +1448,9 @@ impl TorchEngine {
         }
 
         // Get the persistent model for layer-wise forward pass
-        let model = self.persistent_model.as_ref()
+        let model = self
+            .persistent_model
+            .as_ref()
             .ok_or_else(|| anyhow!("Model not loaded"))?;
         let model_guard = self.handle_poison(model.lock())?;
 
@@ -1406,7 +1484,7 @@ impl TorchEngine {
 
         Ok(logits)
     }
-    
+
     /// Train LoRA adapter on a single example
     pub async fn train_temporal_lora(
         &mut self,
@@ -1420,42 +1498,37 @@ impl TorchEngine {
                 rank: 16,
                 alpha: 16.0,
                 dropout: 0.1,
-                target_modules: vec![
-                    "q_proj".to_string(),
-                    "v_proj".to_string(),
-                ],
+                target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
                 ..Default::default()
             };
-            
+
             let training_config = crate::lora::TrainingConfig {
                 learning_rate: learning_rate as f64,
                 ..Default::default()
             };
-            
+
             self.enable_lora_training(lora_config, training_config)?;
         }
-        
+
         // Tokenize inputs
         let tokenizer = self.handle_poison(self.tokenizer.lock())?;
-        let tokenizer = tokenizer.as_ref()
-            .ok_or(anyhow!("No tokenizer loaded"))?;
-        
+        let tokenizer = tokenizer.as_ref().ok_or(anyhow!("No tokenizer loaded"))?;
+
         // Combine prompt and response
         let full_text = format!("{} {}", prompt, expected_response);
-        let encoding = tokenizer.encode(full_text.as_str(), false)
+        let encoding = tokenizer
+            .encode(full_text.as_str(), false)
             .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
-        
+
         let ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
-        let input_ids = Tensor::from_slice(&ids)
-            .to_device(self.device)
-            .unsqueeze(0); // Add batch dimension
-        
+        let input_ids = Tensor::from_slice(&ids).to_device(self.device).unsqueeze(0); // Add batch dimension
+
         // Create labels (shift input_ids by 1)
         let labels = input_ids.shallow_clone();
-        
+
         // Forward pass with LoRA
         let logits = self.forward_with_lora(&input_ids, None, true)?;
-        
+
         // Training step
         let metrics = {
             let mut trainer_guard = self.handle_poison(self.lora_trainer.lock())?;
@@ -1470,12 +1543,15 @@ impl TorchEngine {
 
         tracing::info!(
             "LoRA training step {}: loss={:.4}, ppl={:.2}, lr={:.6}",
-            metrics.step, metrics.loss, metrics.perplexity, metrics.learning_rate
+            metrics.step,
+            metrics.loss,
+            metrics.perplexity,
+            metrics.learning_rate
         );
-        
+
         Ok(())
     }
-    
+
     /// Save LoRA weights
     pub fn save_lora(&self, path: &str) -> Result<()> {
         if let Some(lora_model) = &*self.handle_poison(self.lora_model.lock())? {
@@ -1486,7 +1562,7 @@ impl TorchEngine {
         }
         Ok(())
     }
-    
+
     /// Load LoRA weights
     pub fn load_lora(&mut self, path: &str) -> Result<()> {
         if let Some(lora_model) = &mut *self.handle_poison(self.lora_model.lock())? {
@@ -1497,7 +1573,7 @@ impl TorchEngine {
         }
         Ok(())
     }
-    
+
     /// Save LoRA weights in SafeTensor format
     pub fn save_lora_weights(&self, path: &str) -> Result<()> {
         if let Some(lora_model) = &*self.handle_poison(self.lora_model.lock())? {
@@ -1508,7 +1584,7 @@ impl TorchEngine {
         }
         Ok(())
     }
-    
+
     /// Load LoRA adapter weights from SafeTensors format.
     ///
     /// Loads pre-trained LoRA A and B matrices from a SafeTensors file into the
@@ -1541,11 +1617,13 @@ impl TorchEngine {
                 safetensors_path = path,
                 "Cannot load LoRA weights: LoRA model structure not initialized - call create_lora() first"
             );
-            return Err(anyhow!("No LoRA model initialized - call create_lora() first"));
+            return Err(anyhow!(
+                "No LoRA model initialized - call create_lora() first"
+            ));
         }
         Ok(())
     }
-    
+
     /// Check if LoRA model structure has been initialized.
     ///
     /// Returns true if a LoRA model with VarStore has been created, indicating
@@ -1597,7 +1675,7 @@ impl TorchEngine {
             match model_info.architecture.as_str() {
                 "Qwen2ForCausalLM" => (hidden_size as f32 * 2.6667) as i64, // Qwen uses ~2.67x
                 "LlamaForCausalLM" => (hidden_size as f32 * 2.75) as i64,   // Llama uses 2.75x
-                _ => hidden_size * 4, // Default 4x expansion
+                _ => hidden_size * 4,                                       // Default 4x expansion
             }
         };
 
@@ -1624,7 +1702,10 @@ impl TorchEngine {
                 }
             };
 
-            module_configs.insert(module_name.clone(), (in_features as usize, out_features as usize));
+            module_configs.insert(
+                module_name.clone(),
+                (in_features as usize, out_features as usize),
+            );
         }
 
         tracing::info!(
@@ -1653,7 +1734,7 @@ impl TorchEngine {
         );
         Ok(())
     }
-    
+
     /// Load LoRA adapter weights from SafeTensors file (async version).
     ///
     /// Save LoRA weights to SafeTensors file
@@ -1685,14 +1766,19 @@ impl TorchEngine {
         // SafeTensors loading is I/O bound but the actual tensor operations are sync
         self.load_lora_weights(
             path.to_str()
-                .ok_or_else(|| anyhow!("Invalid UTF-8 path for LoRA adapter file"))?
+                .ok_or_else(|| anyhow!("Invalid UTF-8 path for LoRA adapter file"))?,
         )
     }
-    
+
     /// Apply LoRA adapter during forward pass (called internally)
-    pub fn apply_lora_to_output(&self, module_name: &str, input: &Tensor, base_output: &Tensor) -> Result<Tensor> {
+    pub fn apply_lora_to_output(
+        &self,
+        module_name: &str,
+        input: &Tensor,
+        base_output: &Tensor,
+    ) -> Result<Tensor> {
         let lora_guard = self.handle_poison(self.lora_model.lock())?;
-        
+
         if let Some(lora_model) = lora_guard.as_ref() {
             // Apply LoRA if available for this module
             if let Some(lora_output) = lora_model.forward(module_name, input, false)? {
@@ -1704,25 +1790,25 @@ impl TorchEngine {
             Ok(base_output.shallow_clone())
         }
     }
-    
+
     /// Get active LoRA adapter name
     pub fn get_active_lora(&self) -> Result<Option<String>> {
         let active_guard = self.handle_poison(self.active_lora.lock())?;
         Ok(active_guard.clone())
     }
-    
+
     /// Unload current LoRA adapter
     pub fn unload_lora(&mut self) -> Result<()> {
         {
             let mut lora_guard = self.handle_poison(self.lora_model.lock())?;
             *lora_guard = None;
         }
-        
+
         {
             let mut active_guard = self.handle_poison(self.active_lora.lock())?;
             *active_guard = None;
         }
-        
+
         tracing::info!("Unloaded LoRA adapter");
         Ok(())
     }
@@ -1742,8 +1828,8 @@ impl Drop for TorchEngine {
         // - Second request: cached engine has var_store = None, fails with "No model loaded"
 
         // Drop our Arc references (NOT the contents)
-        self.persistent_model = None;  // Drops our Option<Arc<...>> reference
-        self.xet_storage = None;       // Drops our Option<Arc<...>> reference
+        self.persistent_model = None; // Drops our Option<Arc<...>> reference
+        self.xet_storage = None; // Drops our Option<Arc<...>> reference
 
         // Arc<Mutex<...>> fields are automatically cleaned up via Arc reference counting
         // when the last TorchEngine clone drops. No manual intervention needed.

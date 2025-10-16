@@ -70,16 +70,20 @@ impl Overlay2Driver {
     /// Create with custom configuration
     #[cfg(feature = "overlayfs")]
     pub fn with_config(config: Overlay2Config) -> Self {
-        let backend = if let Some(ref name) = config.force_backend {
-            match name.as_str() {
-                "fuse" => std::sync::Arc::new(FuseBackend::new()) as std::sync::Arc<dyn OverlayBackend>,
-                "userns" => std::sync::Arc::new(UserNamespaceBackend::new()) as std::sync::Arc<dyn OverlayBackend>,
-                "kernel" => std::sync::Arc::new(KernelBackend::new()) as std::sync::Arc<dyn OverlayBackend>,
-                _ => select_best_backend(),
-            }
-        } else {
-            select_best_backend()
-        };
+        let backend =
+            if let Some(ref name) = config.force_backend {
+                match name.as_str() {
+                    "fuse" => std::sync::Arc::new(FuseBackend::new())
+                        as std::sync::Arc<dyn OverlayBackend>,
+                    "userns" => std::sync::Arc::new(UserNamespaceBackend::new())
+                        as std::sync::Arc<dyn OverlayBackend>,
+                    "kernel" => std::sync::Arc::new(KernelBackend::new())
+                        as std::sync::Arc<dyn OverlayBackend>,
+                    _ => select_best_backend(),
+                }
+            } else {
+                select_best_backend()
+            };
 
         Self { backend, config }
     }
@@ -180,12 +184,12 @@ impl Driver for Overlay2Driver {
         let upper_dir = overlay_base.join("upper");
         let work_dir = overlay_base.join("work");
 
-        tokio::fs::create_dir_all(&upper_dir)
-            .await
-            .map_err(|e| Git2DBError::internal(format!("Failed to create upper directory: {}", e)))?;
-        tokio::fs::create_dir_all(&work_dir)
-            .await
-            .map_err(|e| Git2DBError::internal(format!("Failed to create work directory: {}", e)))?;
+        tokio::fs::create_dir_all(&upper_dir).await.map_err(|e| {
+            Git2DBError::internal(format!("Failed to create upper directory: {}", e))
+        })?;
+        tokio::fs::create_dir_all(&work_dir).await.map_err(|e| {
+            Git2DBError::internal(format!("Failed to create work directory: {}", e))
+        })?;
         tokio::fs::create_dir_all(&opts.worktree_path)
             .await
             .map_err(|e| Git2DBError::internal(format!("Failed to create mount point: {}", e)))?;
@@ -204,7 +208,8 @@ impl Driver for Overlay2Driver {
             .await?;
 
         // Create git worktree on the overlay mount (supports any ref: branch, commit, tag, etc.)
-        self.create_git_worktree(&opts.base_repo, &opts.worktree_path, &opts.ref_spec).await?;
+        self.create_git_worktree(&opts.base_repo, &opts.worktree_path, &opts.ref_spec)
+            .await?;
 
         // Create handle with cleanup
         let mount_point = opts.worktree_path.clone();
@@ -225,7 +230,11 @@ impl Driver for Overlay2Driver {
 
                 // Unmount
                 if let Err(e) = backend.unmount(&mount_point).await {
-                    warn!("Failed to unmount {} in cleanup: {}", mount_point.display(), e);
+                    warn!(
+                        "Failed to unmount {} in cleanup: {}",
+                        mount_point.display(),
+                        e
+                    );
                 }
 
                 // Remove overlay directories
@@ -256,11 +265,15 @@ impl Overlay2Driver {
     ///
     /// Note: The overlay is already mounted at worktree_path by the driver.
     /// We just need to create the git worktree structure on top of it.
-    async fn create_git_worktree(&self, base_repo: &Path, worktree_path: &Path, ref_spec: &str) -> Git2DBResult<()> {
+    async fn create_git_worktree(
+        &self,
+        base_repo: &Path,
+        worktree_path: &Path,
+        ref_spec: &str,
+    ) -> Git2DBResult<()> {
         // Open the base repository
-        let repo = git2::Repository::open(base_repo).map_err(|e| {
-            Git2DBError::internal(format!("Failed to open repository: {}", e))
-        })?;
+        let repo = git2::Repository::open(base_repo)
+            .map_err(|e| Git2DBError::internal(format!("Failed to open repository: {}", e)))?;
 
         // Resolve ref_spec to a commit
         let object = repo.revparse_single(ref_spec).map_err(|e| {
@@ -268,7 +281,10 @@ impl Overlay2Driver {
         })?;
 
         let commit = object.peel_to_commit().map_err(|e| {
-            Git2DBError::internal(format!("Ref '{}' does not point to a commit: {}", ref_spec, e))
+            Git2DBError::internal(format!(
+                "Ref '{}' does not point to a commit: {}",
+                ref_spec, e
+            ))
         })?;
 
         // Check if this is a branch
@@ -280,10 +296,7 @@ impl Overlay2Driver {
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| {
-                Git2DBError::invalid_path(
-                    worktree_path.to_path_buf(),
-                    "Invalid worktree path",
-                )
+                Git2DBError::invalid_path(worktree_path.to_path_buf(), "Invalid worktree path")
             })?;
 
         // Create worktree on the overlay mount
@@ -292,14 +305,9 @@ impl Overlay2Driver {
             repo.worktree(
                 worktree_name,
                 worktree_path,
-                Some(
-                    git2::WorktreeAddOptions::new()
-                        .reference(Some(&reference)),
-                ),
+                Some(git2::WorktreeAddOptions::new().reference(Some(&reference))),
             )
-            .map_err(|e| {
-                Git2DBError::internal(format!("Failed to create worktree: {}", e))
-            })?;
+            .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {}", e)))?;
 
             info!(
                 "Created overlay2 worktree at {} for branch '{}' (commit: {})",
@@ -309,15 +317,11 @@ impl Overlay2Driver {
             );
         } else {
             repo.worktree(worktree_name, worktree_path, None)
-                .map_err(|e| {
-                    Git2DBError::internal(format!("Failed to create worktree: {}", e))
-                })?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {}", e)))?;
 
             let wt_repo = git2::Repository::open(worktree_path)?;
             wt_repo.set_head_detached(commit.id())?;
-            wt_repo.checkout_head(Some(
-                git2::build::CheckoutBuilder::default().force()
-            ))?;
+            wt_repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
 
             info!(
                 "Created overlay2 worktree at {} for ref '{}' (detached HEAD at {})",
@@ -347,6 +351,17 @@ mod tests {
         let driver = Overlay2Driver::new();
         // May or may not be available depending on system
         println!("Overlay2 available: {}", driver.is_available());
+    }
+
+    #[test]
+    #[cfg(feature = "overlayfs")]
+    fn test_with_config() {
+        // Test public API for custom configuration
+        let config = Overlay2Config {
+            force_backend: Some("userns".to_string()),
+        };
+        let driver = Overlay2Driver::with_config(config);
+        assert_eq!(driver.name(), "overlay2");
     }
 
     #[test]

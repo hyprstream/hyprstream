@@ -24,7 +24,7 @@ use crate::transport_registry::TransportRegistry;
 use crate::worktree::WorktreeHandle;
 
 // Import storage driver system
-use crate::storage::{Driver, DriverOpts, DriverRegistry, StorageDriver};
+use crate::storage::{DriverOpts, DriverRegistry, StorageDriver};
 
 /// Global GitManager instance - singleton pattern from hyprstream
 static GLOBAL_GIT_MANAGER: OnceCell<GitManager> = OnceCell::new();
@@ -131,7 +131,10 @@ impl GitManager {
                 }
 
                 if !expired.is_empty() {
-                    debug!("Cleaned up {} expired repository cache entries", expired.len());
+                    debug!(
+                        "Cleaned up {} expired repository cache entries",
+                        expired.len()
+                    );
                 }
 
                 // Evict oldest if over max size
@@ -245,8 +248,10 @@ impl GitManager {
         let token = token_from_config.or(token_from_env);
 
         if let Some(ref token_value) = token {
-            tracing::info!("Using token authentication (token starts with: {})",
-                &token_value.chars().take(10).collect::<String>());
+            tracing::info!(
+                "Using token authentication (token starts with: {})",
+                &token_value.chars().take(10).collect::<String>()
+            );
             callback_builder = callback_builder.auth(AuthStrategy::Token {
                 token: token_value.clone(),
             });
@@ -364,8 +369,10 @@ impl GitManager {
 
             oldest_created = Some(oldest_created.map_or(created, |old: Instant| old.min(created)));
             newest_created = Some(newest_created.map_or(created, |new: Instant| new.max(created)));
-            oldest_accessed = Some(oldest_accessed.map_or(accessed, |old: Instant| old.min(accessed)));
-            newest_accessed = Some(newest_accessed.map_or(accessed, |new: Instant| new.max(accessed)));
+            oldest_accessed =
+                Some(oldest_accessed.map_or(accessed, |old: Instant| old.min(accessed)));
+            newest_accessed =
+                Some(newest_accessed.map_or(accessed, |new: Instant| new.max(accessed)));
         }
 
         CacheStats {
@@ -404,7 +411,10 @@ impl GitManager {
             self.repo_cache.remove(path);
         }
 
-        debug!("Manually cleaned up {} expired cache entries", expired.len());
+        debug!(
+            "Manually cleaned up {} expired cache entries",
+            expired.len()
+        );
     }
 
     /// Clone a repository with Send-safe async support
@@ -717,7 +727,11 @@ impl GitManager {
         let worktree_path = worktree_path.as_ref();
 
         // Parse driver selection from config
-        let driver_selection = self.config.worktree.driver.parse::<StorageDriver>()
+        let driver_selection = self
+            .config
+            .worktree
+            .driver
+            .parse::<StorageDriver>()
             .map_err(|e| Git2DBError::internal(format!("Invalid driver selection: {}", e)))?;
 
         // Get driver from registry
@@ -726,7 +740,8 @@ impl GitManager {
             Err(e) if self.config.worktree.fallback => {
                 // Fallback to vfs
                 warn!("Driver not available, falling back to vfs: {}", e);
-                self.driver_registry.get_driver(StorageDriver::Vfs)
+                self.driver_registry
+                    .get_driver(StorageDriver::Vfs)
                     .map_err(|e| Git2DBError::internal(format!("VFS fallback failed: {}", e)))?
             }
             Err(e) => return Err(Git2DBError::internal(format!("Driver error: {}", e))),

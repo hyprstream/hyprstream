@@ -3,9 +3,9 @@
 //! This module implements KV caching to avoid recomputing past key and value
 //! states during inference, providing 10-50x speedup for long sequences.
 
-use anyhow::{Result, anyhow};
-use tch::{Tensor, Kind as DType};
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
+use tch::{Kind as DType, Tensor};
 
 /// KV cache for a single attention layer
 #[derive(Debug)]
@@ -50,7 +50,7 @@ impl LayerKVCache {
         if self.keys.is_none() || self.values.is_none() {
             let device = new_keys.device();
             let dtype = new_keys.kind();
-            
+
             // Allocate cache tensors
             self.keys = Some(Tensor::zeros(
                 &[batch_size, self.max_seq_len as i64, num_heads, head_dim],
@@ -63,9 +63,13 @@ impl LayerKVCache {
         }
 
         // Get mutable references to cache tensors
-        let cached_keys = self.keys.as_mut()
+        let cached_keys = self
+            .keys
+            .as_mut()
             .ok_or_else(|| anyhow!("Keys cache not initialized"))?;
-        let cached_values = self.values.as_mut()
+        let cached_values = self
+            .values
+            .as_mut()
             .ok_or_else(|| anyhow!("Values cache not initialized"))?;
 
         // Check bounds
@@ -78,13 +82,13 @@ impl LayerKVCache {
 
         // Update cache using narrow and copy
         let end_pos = start_pos + seq_len;
-        
+
         // Update keys: cached_keys[:, start_pos:end_pos] = new_keys
         let _ = cached_keys
             .narrow(1, start_pos as i64, seq_len as i64)
             .copy_(new_keys);
-            
-        // Update values: cached_values[:, start_pos:end_pos] = new_values  
+
+        // Update values: cached_values[:, start_pos:end_pos] = new_values
         let _ = cached_values
             .narrow(1, start_pos as i64, seq_len as i64)
             .copy_(new_values);
@@ -97,9 +101,13 @@ impl LayerKVCache {
 
     /// Get cached keys and values up to current position
     pub fn get(&self) -> Result<(Tensor, Tensor)> {
-        let cached_keys = self.keys.as_ref()
+        let cached_keys = self
+            .keys
+            .as_ref()
             .ok_or_else(|| anyhow!("Keys cache not initialized"))?;
-        let cached_values = self.values.as_ref()
+        let cached_values = self
+            .values
+            .as_ref()
             .ok_or_else(|| anyhow!("Values cache not initialized"))?;
 
         if self.seq_pos == 0 {
@@ -144,7 +152,7 @@ impl KVCacheManager {
         for layer_idx in 0..num_layers {
             layer_caches.insert(layer_idx, LayerKVCache::new(max_seq_len));
         }
-        
+
         Self {
             layer_caches,
             max_seq_len,
@@ -190,14 +198,14 @@ impl KVCacheManager {
                     DType::BFloat16 => 2,
                     _ => 4,
                 };
-                
+
                 let key_elements = keys.size().iter().product::<i64>() as usize;
                 let value_elements = values.size().iter().product::<i64>() as usize;
-                
+
                 total += (key_elements + value_elements) * element_size;
             }
         }
-        
+
         total
     }
 }
@@ -211,16 +219,16 @@ mod tests {
         use tch::Device;
         let device = Device::Cpu;
         let dtype = DType::Float;
-        
+
         // Create cache
         let mut cache = LayerKVCache::new(100);
-        
+
         // Create test tensors
         let batch_size = 2;
         let seq_len = 10;
         let num_heads = 8;
         let head_dim = 64;
-        
+
         let keys = Tensor::randn(
             &[batch_size, seq_len as i64, num_heads, head_dim],
             (dtype, device),
@@ -229,16 +237,22 @@ mod tests {
             &[batch_size, seq_len as i64, num_heads, head_dim],
             (dtype, device),
         );
-        
+
         // Update cache
         cache.update(&keys, &values, 0)?;
         assert_eq!(cache.seq_pos, 10);
-        
+
         // Get cached values
         let (cached_keys, cached_values) = cache.get()?;
-        assert_eq!(cached_keys.size(), vec![batch_size, 10, num_heads, head_dim]);
-        assert_eq!(cached_values.size(), vec![batch_size, 10, num_heads, head_dim]);
-        
+        assert_eq!(
+            cached_keys.size(),
+            vec![batch_size, 10, num_heads, head_dim]
+        );
+        assert_eq!(
+            cached_values.size(),
+            vec![batch_size, 10, num_heads, head_dim]
+        );
+
         Ok(())
     }
 
@@ -246,18 +260,18 @@ mod tests {
     fn test_kv_cache_manager() {
         let num_layers = 32;
         let max_seq_len = 2048;
-        
+
         let mut manager = KVCacheManager::new(num_layers, max_seq_len);
-        
+
         // Check all layers are initialized
         for layer_idx in 0..num_layers {
             assert!(manager.get_layer_cache(layer_idx).is_some());
         }
-        
+
         // Test enable/disable
         manager.set_enabled(false);
         assert!(manager.get_layer_cache(0).is_none());
-        
+
         manager.set_enabled(true);
         assert!(manager.get_layer_cache(0).is_some());
     }

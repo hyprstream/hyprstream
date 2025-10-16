@@ -84,12 +84,12 @@ impl WorktreeStrategy for OverlayWorktreeStrategy {
         let upper_dir = overlay_base.join("upper");
         let work_dir = overlay_base.join("work");
 
-        tokio::fs::create_dir_all(&upper_dir)
-            .await
-            .map_err(|e| Git2DBError::internal(format!("Failed to create upper directory: {}", e)))?;
-        tokio::fs::create_dir_all(&work_dir)
-            .await
-            .map_err(|e| Git2DBError::internal(format!("Failed to create work directory: {}", e)))?;
+        tokio::fs::create_dir_all(&upper_dir).await.map_err(|e| {
+            Git2DBError::internal(format!("Failed to create upper directory: {}", e))
+        })?;
+        tokio::fs::create_dir_all(&work_dir).await.map_err(|e| {
+            Git2DBError::internal(format!("Failed to create work directory: {}", e))
+        })?;
         tokio::fs::create_dir_all(worktree_path)
             .await
             .map_err(|e| Git2DBError::internal(format!("Failed to create mount point: {}", e)))?;
@@ -169,11 +169,7 @@ impl WorktreeHandle for OverlayWorktreeHandle {
             strategy_name: format!("overlayfs-{}", self.backend.name()),
             created_at: self.created_at,
             space_saved_bytes: Some(space_saved),
-            backend_info: Some(format!(
-                "backend: {}, id: {}",
-                self.backend.name(),
-                self.id
-            )),
+            backend_info: Some(format!("backend: {}, id: {}", self.backend.name(), self.id)),
             read_only: false,
         }
     }

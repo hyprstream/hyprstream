@@ -20,6 +20,7 @@ pub mod branch;
 pub mod clone_builder;
 pub mod manager;
 pub mod references;
+pub mod registration_builder;
 pub mod registry;
 pub mod remote;
 pub mod repo_accessor;
@@ -44,6 +45,11 @@ pub mod xet_filter;
 pub use config::{Git2DBConfig, GitSignature, WorktreeConfig};
 pub use errors::{Git2DBError, Git2DBResult};
 
+// Re-export git2 types for cleaner API boundary
+// Consumers should use git2db::Oid and git2db::Repository instead of git2::Oid and git2::Repository
+// This maintains a clean abstraction layer while allowing low-level access when needed
+pub use git2::{Oid, Repository};
+
 // Re-export XetConfig even when xet-storage feature is disabled (for API compatibility)
 #[cfg(feature = "xet-storage")]
 pub use config::XetConfig;
@@ -56,6 +62,7 @@ pub use branch::{Branch, BranchKind, BranchManager};
 pub use clone_builder::CloneBuilder;
 pub use manager::GitManager;
 pub use references::{GitRef, IntoGitRef};
+pub use registration_builder::RegistrationBuilder;
 pub use registry::{Git2DB, RemoteConfig, RepoId, TrackedRepository};
 pub use remote::{Remote, RemoteManager};
 pub use repository_handle::{RepositoryHandle, RepositoryStatus};

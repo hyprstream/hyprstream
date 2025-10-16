@@ -194,9 +194,11 @@ impl Git2DBConfig {
             .context("Failed to deserialize configuration")?;
 
         // Debug log
-        tracing::info!("Loaded git2db config: token present = {}, use_cred_helper = {}",
+        tracing::info!(
+            "Loaded git2db config: token present = {}, use_cred_helper = {}",
             deserialized.network.access_token.is_some(),
-            deserialized.network.use_credential_helper);
+            deserialized.network.use_credential_helper
+        );
 
         Ok(deserialized)
     }

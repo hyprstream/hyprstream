@@ -85,7 +85,10 @@ pub async fn mount_in_userns(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(Git2DBError::internal(format!("User namespace mount failed: {}", stderr)));
+        return Err(Git2DBError::internal(format!(
+            "User namespace mount failed: {}",
+            stderr
+        )));
     }
 
     info!("Successfully mounted overlayfs in user namespace");
@@ -100,7 +103,9 @@ pub async fn mount_in_userns(
     _work: &Path,
     _target: &Path,
 ) -> Git2DBResult<()> {
-    Err(Git2DBError::internal("User namespace mounting not supported"))
+    Err(Git2DBError::internal(
+        "User namespace mounting not supported",
+    ))
 }
 
 /// Backend that wraps kernel overlayfs with user namespace support
@@ -116,7 +121,7 @@ impl UserNamespaceBackend {
     }
 }
 
-use super::backend::{OverlayBackend, BackendCapabilities};
+use super::backend::{BackendCapabilities, OverlayBackend};
 use async_trait::async_trait;
 
 #[async_trait]
@@ -135,10 +140,7 @@ impl OverlayBackend for UserNamespaceBackend {
         use tokio::process::Command;
 
         // Unmount can be done from outside the namespace
-        let _ = Command::new("umount")
-            .arg(target)
-            .status()
-            .await;
+        let _ = Command::new("umount").arg(target).status().await;
 
         Ok(())
     }

@@ -81,7 +81,11 @@ impl<'a> StageManager<'a> {
                 .map_err(|e| Git2DBError::internal(format!("Failed to get index: {}", e)))?;
 
             index.add_path(&file_path).map_err(|e| {
-                Git2DBError::internal(format!("Failed to add path '{}': {}", file_path.display(), e))
+                Git2DBError::internal(format!(
+                    "Failed to add path '{}': {}",
+                    file_path.display(),
+                    e
+                ))
             })?;
 
             index
@@ -141,7 +145,11 @@ impl<'a> StageManager<'a> {
                 .map_err(|e| Git2DBError::internal(format!("Failed to get index: {}", e)))?;
 
             index.remove_path(&file_path).map_err(|e| {
-                Git2DBError::internal(format!("Failed to remove path '{}': {}", file_path.display(), e))
+                Git2DBError::internal(format!(
+                    "Failed to remove path '{}': {}",
+                    file_path.display(),
+                    e
+                ))
             })?;
 
             index
@@ -167,9 +175,9 @@ impl<'a> StageManager<'a> {
             })?;
 
             // Get HEAD commit
-            let head = repo
-                .head()
-                .map_err(|e| Git2DBError::reference("HEAD", format!("Failed to get HEAD: {}", e)))?;
+            let head = repo.head().map_err(|e| {
+                Git2DBError::reference("HEAD", format!("Failed to get HEAD: {}", e))
+            })?;
 
             let head_commit = head.peel_to_commit().map_err(|e| {
                 Git2DBError::reference("HEAD", format!("Failed to get HEAD commit: {}", e))
@@ -178,7 +186,11 @@ impl<'a> StageManager<'a> {
             // Reset the path to HEAD
             repo.reset_default(Some(head_commit.as_object()), [&file_path].iter())
                 .map_err(|e| {
-                    Git2DBError::internal(format!("Failed to unstage '{}': {}", file_path.display(), e))
+                    Git2DBError::internal(format!(
+                        "Failed to unstage '{}': {}",
+                        file_path.display(),
+                        e
+                    ))
                 })?;
 
             Ok(())
@@ -198,16 +210,18 @@ impl<'a> StageManager<'a> {
                 Git2DBError::repository(&repo_path, format!("Failed to open repository: {}", e))
             })?;
 
-            let head = repo
-                .head()
-                .map_err(|e| Git2DBError::reference("HEAD", format!("Failed to get HEAD: {}", e)))?;
+            let head = repo.head().map_err(|e| {
+                Git2DBError::reference("HEAD", format!("Failed to get HEAD: {}", e))
+            })?;
 
             let head_commit = head.peel_to_commit().map_err(|e| {
                 Git2DBError::reference("HEAD", format!("Failed to get HEAD commit: {}", e))
             })?;
 
             repo.reset(head_commit.as_object(), git2::ResetType::Mixed, None)
-                .map_err(|e| Git2DBError::internal(format!("Failed to reset staging area: {}", e)))?;
+                .map_err(|e| {
+                    Git2DBError::internal(format!("Failed to reset staging area: {}", e))
+                })?;
 
             Ok(())
         })

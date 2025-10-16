@@ -1,13 +1,13 @@
-pub mod config;
-pub mod server;
-pub mod model;
 pub mod chat;
+pub mod config;
 pub mod git;
+pub mod model;
+pub mod server;
 
-pub use server::{ServerCommand, ServerCliArgs};
-pub use model::ModelCommand;
 pub use chat::ChatCommand;
-pub use git::{GitCommand, GitAction};
+pub use git::{GitAction, GitCommand};
+pub use model::ModelCommand;
+pub use server::{ServerCliArgs, ServerCommand};
 
 use clap::Subcommand;
 

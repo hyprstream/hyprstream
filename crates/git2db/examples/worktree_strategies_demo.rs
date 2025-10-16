@@ -2,16 +2,19 @@
 //!
 //! Run with: cargo run --example worktree_strategies_demo --features overlayfs
 
-use git2db::worktree::strategy_enum::{WorktreeStrategyType, WorktreeStrategyBuilder};
-use git2db::config_v2::{WorktreeConfigV2, PlatformOverrides};
-use std::env;
 use colored::*;
+use git2db::config_v2::{PlatformOverrides, WorktreeConfigV2};
+use git2db::worktree::strategy_enum::{WorktreeStrategyBuilder, WorktreeStrategyType};
+use std::env;
 
 fn main() {
     // Initialize logging
     env_logger::init();
 
-    println!("{}", "=== Explicit Worktree Strategy Demo ===".bold().cyan());
+    println!(
+        "{}",
+        "=== Explicit Worktree Strategy Demo ===".bold().cyan()
+    );
     println!();
 
     // Parse command line arguments
@@ -120,7 +123,7 @@ fn check_availability() {
     // Check each backend availability
     #[cfg(all(target_os = "linux", feature = "overlayfs"))]
     {
-        use git2db::worktree::overlay_enhanced::{BackendType, BackendSelector};
+        use git2db::worktree::overlay_enhanced::{BackendSelector, BackendType};
 
         println!("{}", "Overlayfs backends:".bold());
 
@@ -135,7 +138,12 @@ fn check_availability() {
                 "✗".red().to_string()
             };
 
-            println!("  {} {:15} - {}", available, backend.name(), backend.description());
+            println!(
+                "  {} {:15} - {}",
+                available,
+                backend.name(),
+                backend.description()
+            );
 
             if !backend.is_available() {
                 println!("      Requirements:");
@@ -152,7 +160,10 @@ fn check_availability() {
         if let Some(best) = selector.select() {
             println!("  {} ({})", best.name().green(), best.description());
         } else {
-            println!("  {} (fallback to git worktrees)", "None available".yellow());
+            println!(
+                "  {} (fallback to git worktrees)",
+                "None available".yellow()
+            );
         }
     }
 
@@ -172,43 +183,51 @@ fn show_config_examples() {
 
     println!("{}", "1. Simple Git-only Configuration:".bold());
     println!("{}", "```toml".dimmed());
-    println!(r#"[worktree]
+    println!(
+        r#"[worktree]
 strategy = "git"
-require_strategy = true"#);
+require_strategy = true"#
+    );
     println!("{}", "```".dimmed());
     println!();
 
     println!("{}", "2. Prefer Overlayfs with Fallback:".bold());
     println!("{}", "```toml".dimmed());
-    println!(r#"[worktree]
+    println!(
+        r#"[worktree]
 strategy = "prefer-overlayfs"
 require_strategy = false
-log_selection = true"#);
+log_selection = true"#
+    );
     println!("{}", "```".dimmed());
     println!();
 
     println!("{}", "3. Platform-specific Configuration:".bold());
     println!("{}", "```toml".dimmed());
-    println!(r#"[worktree]
+    println!(
+        r#"[worktree]
 strategy = "automatic"
 
 [worktree.platform_overrides]
 linux = "overlayfs"
 macos = "git"
-windows = "git""#);
+windows = "git""#
+    );
     println!("{}", "```".dimmed());
     println!();
 
     println!("{}", "4. Advanced Overlayfs Configuration:".bold());
     println!("{}", "```toml".dimmed());
-    println!(r#"[worktree]
+    println!(
+        r#"[worktree]
 strategy = "overlayfs-kernel"
 require_strategy = true
 
 [worktree.advanced]
 mount_timeout_ms = 10000
 retry_mount = true
-mount_retries = 5"#);
+mount_retries = 5"#
+    );
     println!("{}", "```".dimmed());
 }
 
@@ -218,20 +237,24 @@ fn show_migration() {
 
     println!("{}", "Old Configuration (Abstract):".bold().red());
     println!("{}", "```toml".dimmed());
-    println!(r#"[worktree]
+    println!(
+        r#"[worktree]
 use_overlayfs = true    # Abstract: "use if available"
 fallback = true         # Hidden behavior
 backend = null          # Implicit selection
-log = true"#);
+log = true"#
+    );
     println!("{}", "```".dimmed());
     println!();
 
     println!("{}", "New Configuration (Explicit):".bold().green());
     println!("{}", "```toml".dimmed());
-    println!(r#"[worktree]
+    println!(
+        r#"[worktree]
 strategy = "prefer-overlayfs"  # Explicit: try overlayfs, fallback to git
 require_strategy = false        # Clear behavior
-log_selection = true"#);
+log_selection = true"#
+    );
     println!("{}", "```".dimmed());
     println!();
 
@@ -284,11 +307,21 @@ fn demo_strategy(name: &str) {
             println!("  Implementation: {}", strategy.name());
 
             let caps = strategy.capabilities();
-            println!("  Space efficient: {}",
-                if caps.space_efficient { "Yes".green() } else { "No".yellow() }
+            println!(
+                "  Space efficient: {}",
+                if caps.space_efficient {
+                    "Yes".green()
+                } else {
+                    "No".yellow()
+                }
             );
-            println!("  Requires privileges: {}",
-                if caps.requires_privileges { "Yes".yellow() } else { "No".green() }
+            println!(
+                "  Requires privileges: {}",
+                if caps.requires_privileges {
+                    "Yes".yellow()
+                } else {
+                    "No".green()
+                }
             );
             println!("  Performance: {:.1}x", caps.relative_performance);
         }
@@ -305,8 +338,10 @@ fn demo_strategy(name: &str) {
     println!("[worktree]");
     println!("strategy = \"{}\"", strategy_type);
 
-    if matches!(strategy_type, WorktreeStrategyType::Automatic |
-                WorktreeStrategyType::Git) {
+    if matches!(
+        strategy_type,
+        WorktreeStrategyType::Automatic | WorktreeStrategyType::Git
+    ) {
         println!("# Always available, no special requirements");
     } else {
         println!("require_strategy = false  # Fallback if unavailable");

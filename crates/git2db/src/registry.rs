@@ -289,7 +289,10 @@ impl Git2DB {
                 // Note: XET filter initialization will now properly fail with a clear error
                 // if called from within an existing runtime context
                 if let Err(e) = crate::xet_filter::initialize(config.xet.clone()).await {
-                    warn!("Failed to initialize XET filter: {}. Falling back to Git LFS.", e);
+                    warn!(
+                        "Failed to initialize XET filter: {}. Falling back to Git LFS.",
+                        e
+                    );
                 }
             }
         }
@@ -299,7 +302,8 @@ impl Git2DB {
 
     /// Open the repository on-demand
     fn open_repo(&self) -> Git2DBResult<Repository> {
-        let repo_cache = self.git_manager
+        let repo_cache = self
+            .git_manager
             .get_repository(&self.registry_path)
             .map_err(|e| {
                 Git2DBError::repository(
@@ -328,7 +332,8 @@ impl Git2DB {
     /// ```
     pub async fn add_repository(&mut self, name: &str, url: &str) -> Git2DBResult<RepoId> {
         let repo_id = RepoId::new();
-        self.add_repository_with_id(repo_id.clone(), name, url).await?;
+        self.add_repository_with_id(repo_id.clone(), name, url)
+            .await?;
         Ok(repo_id)
     }
 
@@ -353,14 +358,35 @@ impl Git2DB {
                 Git2DBError::repository(&repo_path, format!("Failed to clone repository: {}", e))
             })?;
 
-        // Register the repository
-        self.register_repository(&repo_id, Some(name.to_string()), url.to_string())
+        // Register the repository using the builder API
+        let repo_path = self.base_dir.join(repo_id.0.to_string());
+        self.register(repo_id.clone())
+            .name(name)
+            .url(url)
+            .worktree_path(repo_path)
+            .exec()
             .await?;
 
         Ok(())
     }
 
     /// Register a repository that was cloned to a UUID directory
+    ///
+    /// **DEPRECATED:** Use `registry.register(repo_id)` builder instead.
+    ///
+    /// This method assumes the repository is at `base_dir/{uuid}/` which doesn't
+    /// work for worktrees at custom paths. Use the builder for flexibility:
+    ///
+    /// ```rust,ignore
+    /// registry.register(repo_id)
+    ///     .name("my-repo")
+    ///     .worktree_path(actual_path)
+    ///     .exec().await?;
+    /// ```
+    #[deprecated(
+        since = "2.1.0",
+        note = "Use `registry.register(repo_id)` builder instead"
+    )]
     pub async fn register_repository(
         &mut self,
         repo_id: &RepoId,
@@ -433,8 +459,11 @@ impl Git2DB {
         Ok(())
     }
 
-    /// Register a repository with full configuration (used by CloneBuilder)
-    pub(crate) async fn register_repository_full(
+    /// Internal registration method with full configuration
+    ///
+    /// Used by both CloneBuilder and RegistrationBuilder.
+    /// External callers should use `registry.register(repo_id)` builder.
+    pub(crate) async fn register_repository_internal(
         &mut self,
         repo_id: RepoId,
         name: Option<String>,
@@ -442,6 +471,7 @@ impl Git2DB {
         worktree_path: PathBuf,
         tracking_ref: GitRef,
         remotes: Vec<RemoteConfig>,
+        metadata: std::collections::HashMap<String, String>,
     ) -> Git2DBResult<()> {
         // Check if UUID is already registered
         if self.metadata.repositories.contains_key(&repo_id.0) {
@@ -462,7 +492,8 @@ impl Git2DB {
 
         // Add as submodule (relative path from .registry)
         // Use the actual worktree path to calculate the relative path
-        let worktree_name = worktree_path.file_name()
+        let worktree_name = worktree_path
+            .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| Git2DBError::internal("Invalid worktree path"))?;
         let relative_path = format!("../{}", worktree_name);
@@ -499,7 +530,7 @@ impl Git2DB {
                 remotes,
                 registered_at: Utc::now().timestamp(),
                 current_oid: None,
-                metadata: HashMap::new(),
+                metadata,
             },
         );
 
@@ -537,7 +568,9 @@ impl Git2DB {
         // Get repository info before removal
         let repo_info = self
             .get_by_id(id)
-            .ok_or_else(|| Git2DBError::invalid_repository(&id.to_string(), "Repository not found"))?
+            .ok_or_else(|| {
+                Git2DBError::invalid_repository(&id.to_string(), "Repository not found")
+            })?
             .clone();
 
         info!("Removing repository {}", id);
@@ -767,11 +800,48 @@ impl Git2DB {
     /// # Ok(())
     /// # }
     /// ```
+    /// Clone a repository using fluent builder API
+    ///
+    /// Returns a builder for configuring clone operations.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let id = registry.clone("https://github.com/user/repo.git")
+    ///     .name("my-repo")
+    ///     .branch("develop")
+    ///     .exec()
+    ///     .await?;
+    /// ```
     pub fn clone<'a>(
         &'a mut self,
         url: impl Into<String>,
     ) -> crate::clone_builder::CloneBuilder<'a> {
         crate::clone_builder::CloneBuilder::new(self, url.into())
+    }
+
+    /// Register an existing repository or worktree using fluent builder API
+    ///
+    /// Returns a builder for configuring registration parameters.
+    /// Use this to register repos/worktrees at custom paths.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// // Register a worktree (adapter)
+    /// registry.register(adapter_id)
+    ///     .name("my-adapter")
+    ///     .worktree_path(worktree_path)
+    ///     .tracking_ref(GitRef::Branch("adapter/uuid".to_string()))
+    ///     .metadata("type", "adapter")
+    ///     .exec()
+    ///     .await?;
+    /// ```
+    pub fn register<'a>(
+        &'a mut self,
+        repo_id: RepoId,
+    ) -> crate::registration_builder::RegistrationBuilder<'a> {
+        crate::registration_builder::RegistrationBuilder::new(self, repo_id)
     }
 
     /// Get the base directory where repositories are stored
@@ -820,8 +890,6 @@ impl Git2DB {
             .ok_or_else(|| Git2DBError::invalid_repository(name, "Repository not found"))?;
         Ok(RepositoryHandle::new(self, repo.id.clone()))
     }
-
-
 
     /// Get registry path
     pub fn registry_path(&self) -> &Path {

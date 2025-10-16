@@ -45,8 +45,8 @@
 //! ```
 
 mod driver;
-mod registry;
 mod overlay2;
+mod registry;
 mod vfs;
 
 pub use driver::{Driver, DriverCapabilities, DriverError, DriverOpts, StorageDriver};

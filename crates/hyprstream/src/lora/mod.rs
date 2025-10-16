@@ -32,10 +32,7 @@ impl Default for LoRAConfig {
             rank: 8,
             alpha: 16.0,
             dropout: 0.1,
-            target_modules: vec![
-                "q_proj".to_string(),
-                "v_proj".to_string(),
-            ],
+            target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
             learning_rate: 1e-4,
         }
     }
@@ -46,20 +43,20 @@ impl Default for LoRAConfig {
 pub trait LoRAAdapter: Send {
     /// Get adapter configuration
     fn config(&self) -> &LoRAConfig;
-    
+
     /// Save weights to SafeTensors
     async fn save(&self, path: &Path) -> Result<()>;
-    
+
     /// Load weights from SafeTensors
     async fn load(&mut self, path: &Path) -> Result<()>;
-    
+
     /// Forward pass for a module
     fn forward(&self, module_name: &str, input: &Tensor) -> Result<Option<Tensor>>;
-    
+
     /// Get number of parameters
     fn num_parameters(&self) -> i64;
 }
 
 // Re-export the torch implementation
-pub use torch_adapter::{LoRAModel, TorchLoRALayer, LoRALayerConfig};
-pub use trainer::{LoRATrainer, TrainingConfig, CheckpointMetrics};
+pub use torch_adapter::{LoRALayerConfig, LoRAModel, TorchLoRALayer};
+pub use trainer::{CheckpointMetrics, LoRATrainer, TrainingConfig};

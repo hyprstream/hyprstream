@@ -59,7 +59,6 @@ impl<'a> BranchManager<'a> {
         Self { registry, repo_id }
     }
 
-
     /// List all branches (local and remote)
     ///
     /// Similar to `git branch -a`
@@ -81,10 +80,9 @@ impl<'a> BranchManager<'a> {
                 .map(|s| s.to_string());
 
             // List local branches
-            for branch_result in repo
-                .branches(Some(BranchType::Local))
-                .map_err(|e| Git2DBError::internal(format!("Failed to list local branches: {}", e)))?
-            {
+            for branch_result in repo.branches(Some(BranchType::Local)).map_err(|e| {
+                Git2DBError::internal(format!("Failed to list local branches: {}", e))
+            })? {
                 if let Ok((branch, _)) = branch_result {
                     if let Some(name) = branch.name().ok().flatten() {
                         let is_head = head_name.as_deref() == Some(name);
@@ -105,10 +103,9 @@ impl<'a> BranchManager<'a> {
             }
 
             // List remote branches
-            for branch_result in repo
-                .branches(Some(BranchType::Remote))
-                .map_err(|e| Git2DBError::internal(format!("Failed to list remote branches: {}", e)))?
-            {
+            for branch_result in repo.branches(Some(BranchType::Remote)).map_err(|e| {
+                Git2DBError::internal(format!("Failed to list remote branches: {}", e))
+            })? {
                 if let Ok((branch, _)) = branch_result {
                     if let Some(name) = branch.name().ok().flatten() {
                         let oid = branch.get().target();
@@ -141,9 +138,9 @@ impl<'a> BranchManager<'a> {
                 Git2DBError::repository(&path, format!("Failed to open repository: {}", e))
             })?;
 
-            let head = repo
-                .head()
-                .map_err(|e| Git2DBError::reference("HEAD", format!("Failed to get HEAD: {}", e)))?;
+            let head = repo.head().map_err(|e| {
+                Git2DBError::reference("HEAD", format!("Failed to get HEAD: {}", e))
+            })?;
 
             // Check if HEAD is a branch
             if !head.is_branch() {
@@ -224,7 +221,10 @@ impl<'a> BranchManager<'a> {
                         })?;
                         head.peel_to_commit()
                             .map_err(|e| {
-                                Git2DBError::reference("HEAD", format!("HEAD is not a commit: {}", e))
+                                Git2DBError::reference(
+                                    "HEAD",
+                                    format!("HEAD is not a commit: {}", e),
+                                )
                             })?
                             .id()
                     }
@@ -260,8 +260,9 @@ impl<'a> BranchManager<'a> {
             };
 
             // Create the branch
-            repo.branch(&name, &commit, false)
-                .map_err(|e| Git2DBError::reference(&name, format!("Failed to create branch: {}", e)))?;
+            repo.branch(&name, &commit, false).map_err(|e| {
+                Git2DBError::reference(&name, format!("Failed to create branch: {}", e))
+            })?;
 
             Ok(())
         })
@@ -287,9 +288,9 @@ impl<'a> BranchManager<'a> {
                 .map_err(|_| Git2DBError::reference(&name, "Branch not found"))?;
 
             let reference = branch.into_reference();
-            let commit = reference
-                .peel_to_commit()
-                .map_err(|e| Git2DBError::reference(&name, format!("Failed to get commit: {}", e)))?;
+            let commit = reference.peel_to_commit().map_err(|e| {
+                Git2DBError::reference(&name, format!("Failed to get commit: {}", e))
+            })?;
 
             // Checkout the branch
             repo.checkout_tree(commit.as_object(), None)
@@ -358,9 +359,9 @@ impl<'a> BranchManager<'a> {
                 }
             }
 
-            branch
-                .delete()
-                .map_err(|e| Git2DBError::reference(&name, format!("Failed to delete branch: {}", e)))?;
+            branch.delete().map_err(|e| {
+                Git2DBError::reference(&name, format!("Failed to delete branch: {}", e))
+            })?;
 
             Ok(())
         })

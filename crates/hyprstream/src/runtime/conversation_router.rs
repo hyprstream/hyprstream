@@ -4,15 +4,15 @@
 //! between different model versions with checkpointed LoRA adaptations.
 
 use anyhow::{anyhow, Result};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use chrono::{DateTime, Utc};
-use serde::{Serialize, Deserialize};
 use uuid::Uuid;
 
-use crate::runtime::{RuntimeEngine};
 use crate::config::GenerationRequest;
+use crate::runtime::RuntimeEngine;
 
 /// Conversation routing for seamless model transitions
 pub struct ConversationRouter {
@@ -78,7 +78,10 @@ pub enum AdaptationType {
     /// Model variant spawned with new LoRA
     ModelVariantSpawn { new_model_id: String },
     /// Seamless routing to different model
-    SeamlessTransition { from_model: String, to_model: String },
+    SeamlessTransition {
+        from_model: String,
+        to_model: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -157,10 +160,7 @@ impl Default for RoutingConfig {
 
 impl ConversationRouter {
     /// Create new conversation router
-    pub async fn new(
-        model_pool: Arc<ModelPool>,
-        config: RoutingConfig,
-    ) -> Result<Self> {
+    pub async fn new(model_pool: Arc<ModelPool>, config: RoutingConfig) -> Result<Self> {
         Ok(Self {
             active_conversations: Arc::new(RwLock::new(HashMap::new())),
             model_pool,
@@ -175,7 +175,7 @@ impl ConversationRouter {
         initial_model_id: String,
     ) -> Result<String> {
         let session_id = Uuid::new_v4().to_string();
-        
+
         let session = ConversationSession {
             session_id: session_id.clone(),
             user_id,
@@ -195,7 +195,7 @@ impl ConversationRouter {
 
         let mut conversations = self.active_conversations.write().await;
         conversations.insert(session_id.clone(), session);
-        
+
         tracing::info!("Started conversation: {}", session_id);
         Ok(session_id)
     }
@@ -207,27 +207,32 @@ impl ConversationRouter {
         user_message: String,
     ) -> Result<ConversationResponse> {
         let start_time = std::time::Instant::now();
-        
+
         // Get conversation session
         let session_id_copy = session_id.to_string();
         let mut conversation = {
             let conversations = self.active_conversations.read().await;
-            conversations.get(&session_id_copy)
+            conversations
+                .get(&session_id_copy)
                 .ok_or_else(|| anyhow!("Conversation session not found: {}", session_id_copy))?
                 .clone()
         };
 
         // Check if adaptation is needed
         let adaptation_needed = self.should_adapt(&conversation).await?;
-        
+
         if adaptation_needed {
             // Perform adaptation (checkpoint + potential model switch)
-            self.perform_conversation_adaptation(&mut conversation).await?;
+            self.perform_conversation_adaptation(&mut conversation)
+                .await?;
         }
 
         // Get current model from pool
-        let model = self.model_pool.get_model(&conversation.current_model_id).await?;
-        
+        let model = self
+            .model_pool
+            .get_model(&conversation.current_model_id)
+            .await?;
+
         // Generate response
         let request = GenerationRequest {
             prompt: self.build_conversation_prompt(&conversation, &user_message)?,
@@ -240,7 +245,7 @@ impl ConversationRouter {
         };
 
         let result = model.generate_with_params(request).await?;
-        
+
         // Create conversation turn
         let turn = ConversationTurn {
             turn_id: Uuid::new_v4().to_string(),
@@ -264,10 +269,11 @@ impl ConversationRouter {
         }
 
         // Accumulate temporal gradients for future adaptation
-        self.accumulate_conversation_gradients(&conversation, &turn).await?;
+        self.accumulate_conversation_gradients(&conversation, &turn)
+            .await?;
 
         let response_time = start_time.elapsed();
-        
+
         Ok(ConversationResponse {
             turn,
             model_used: conversation.current_model_id,
@@ -285,18 +291,22 @@ impl ConversationRouter {
         quality_score: f32,
     ) -> Result<()> {
         let mut conversations = self.active_conversations.write().await;
-        let conversation = conversations.get_mut(session_id)
+        let conversation = conversations
+            .get_mut(session_id)
             .ok_or_else(|| anyhow!("Conversation session not found: {}", session_id))?;
 
         // Find and update the turn with feedback
-        if let Some(turn) = conversation.conversation_history
+        if let Some(turn) = conversation
+            .conversation_history
             .iter_mut()
-            .find(|t| t.turn_id == turn_id) {
+            .find(|t| t.turn_id == turn_id)
+        {
             turn.quality_feedback = Some(quality_score);
         }
 
         // Check if feedback triggers adaptation
-        let recent_feedback: Vec<f32> = conversation.conversation_history
+        let recent_feedback: Vec<f32> = conversation
+            .conversation_history
             .iter()
             .rev()
             .take(5) // Last 5 turns
@@ -305,19 +315,27 @@ impl ConversationRouter {
 
         if recent_feedback.len() >= 3 {
             let avg_score = recent_feedback.iter().sum::<f32>() / recent_feedback.len() as f32;
-            
-            if avg_score < 0.6 { // Poor feedback threshold
+
+            if avg_score < 0.6 {
+                // Poor feedback threshold
                 let event = AdaptationEvent {
                     event_id: Uuid::new_v4().to_string(),
-                    event_type: AdaptationType::RealTimeUpdate { magnitude: 1.0 - avg_score },
-                    trigger: AdaptationTrigger::FeedbackThreshold { average_score: avg_score },
+                    event_type: AdaptationType::RealTimeUpdate {
+                        magnitude: 1.0 - avg_score,
+                    },
+                    trigger: AdaptationTrigger::FeedbackThreshold {
+                        average_score: avg_score,
+                    },
                     checkpoint_created: None,
                     performance_delta: avg_score - 0.8, // Negative delta
                     timestamp: Utc::now(),
                 };
-                
+
                 conversation.adaptation_history.push(event);
-                tracing::info!("📊 Feedback-triggered adaptation queued for session: {}", session_id);
+                tracing::info!(
+                    "📊 Feedback-triggered adaptation queued for session: {}",
+                    session_id
+                );
             }
         }
 
@@ -336,20 +354,22 @@ impl ConversationRouter {
         }
 
         let mut conversations = self.active_conversations.write().await;
-        let conversation = conversations.get_mut(session_id)
+        let conversation = conversations
+            .get_mut(session_id)
             .ok_or_else(|| anyhow!("Conversation session not found: {}", session_id))?;
 
         let old_model_id = conversation.current_model_id.clone();
-        
+
         // Ensure new model is warmed up in pool
         self.model_pool.ensure_warmed_up(&new_model_id).await?;
-        
+
         // Transfer conversation context
-        self.transfer_conversation_context(&old_model_id, &new_model_id, conversation).await?;
-        
+        self.transfer_conversation_context(&old_model_id, &new_model_id, conversation)
+            .await?;
+
         // Update conversation state
         conversation.current_model_id = new_model_id.clone();
-        
+
         // Record transition event
         let event = AdaptationEvent {
             event_id: Uuid::new_v4().to_string(),
@@ -362,81 +382,103 @@ impl ConversationRouter {
             performance_delta: 0.0, // Unknown until tested
             timestamp: Utc::now(),
         };
-        
+
         conversation.adaptation_history.push(event);
-        
-        tracing::info!("🔄 Seamless transition: {} -> {} for session: {}", 
-                      old_model_id, new_model_id, session_id);
-        
+
+        tracing::info!(
+            "🔄 Seamless transition: {} -> {} for session: {}",
+            old_model_id,
+            new_model_id,
+            session_id
+        );
+
         Ok(())
     }
 
     /// Check if conversation needs adaptation
     async fn should_adapt(&self, conversation: &ConversationSession) -> Result<bool> {
         // Check recent performance
-        let recent_turns = conversation.conversation_history
-            .iter()
-            .rev()
-            .take(5);
-        
+        let recent_turns = conversation.conversation_history.iter().rev().take(5);
+
         let avg_feedback = recent_turns
             .filter_map(|t| t.quality_feedback)
-            .fold(0.0f32, |acc, score| acc + score) / 5.0;
-        
+            .fold(0.0f32, |acc, score| acc + score)
+            / 5.0;
+
         // Check if below adaptation threshold
         if avg_feedback < self.config.checkpoint_threshold && avg_feedback > 0.0 {
             return Ok(true);
         }
-        
+
         // Check adaptation history for concept drift
         if let Some(last_event) = conversation.adaptation_history.last() {
             let time_since_last = Utc::now().timestamp() - last_event.timestamp.timestamp();
-            if time_since_last > 300 { // 5 minutes since last adaptation
+            if time_since_last > 300 {
+                // 5 minutes since last adaptation
                 return Ok(true);
             }
         }
-        
+
         Ok(false)
     }
 
     /// Perform conversation-specific adaptation
-    async fn perform_conversation_adaptation(&self, conversation: &mut ConversationSession) -> Result<()> {
-        tracing::info!("🧠 Performing adaptation for conversation: {}", conversation.session_id);
-        
+    async fn perform_conversation_adaptation(
+        &self,
+        conversation: &mut ConversationSession,
+    ) -> Result<()> {
+        tracing::info!(
+            "🧠 Performing adaptation for conversation: {}",
+            conversation.session_id
+        );
+
         // Create checkpoint from conversation history
-        let checkpoint_id = format!("conv_{}_{}", 
-                                   conversation.session_id, 
-                                   Utc::now().format("%Y%m%d_%H%M"));
-        
-        conversation.model_state.active_lora_checkpoints.push(checkpoint_id.clone());
+        let checkpoint_id = format!(
+            "conv_{}_{}",
+            conversation.session_id,
+            Utc::now().format("%Y%m%d_%H%M")
+        );
+
+        conversation
+            .model_state
+            .active_lora_checkpoints
+            .push(checkpoint_id.clone());
         conversation.model_state.adaptation_strength += 0.1;
-        
+
         let event = AdaptationEvent {
             event_id: Uuid::new_v4().to_string(),
-            event_type: AdaptationType::CheckpointCreation { 
-                checkpoint_id: checkpoint_id.clone() 
+            event_type: AdaptationType::CheckpointCreation {
+                checkpoint_id: checkpoint_id.clone(),
             },
-            trigger: AdaptationTrigger::QualityImprovement { expected_gain: 0.15 },
+            trigger: AdaptationTrigger::QualityImprovement {
+                expected_gain: 0.15,
+            },
             checkpoint_created: Some(checkpoint_id),
             performance_delta: 0.15,
             timestamp: Utc::now(),
         };
-        
+
         conversation.adaptation_history.push(event);
-        
+
         Ok(())
     }
 
     /// Build conversation prompt with context
-    fn build_conversation_prompt(&self, conversation: &ConversationSession, user_message: &str) -> Result<String> {
+    fn build_conversation_prompt(
+        &self,
+        conversation: &ConversationSession,
+        user_message: &str,
+    ) -> Result<String> {
         let mut prompt = String::new();
-        
+
         // Add recent conversation history for context
         for turn in conversation.conversation_history.iter().rev().take(5).rev() {
-            prompt.push_str(&format!("Human: {}\nAssistant: {}\n\n", 
-                                   turn.user_message, turn.assistant_response));
+            prompt.push_str(&format!(
+                "Human: {}\nAssistant: {}\n\n",
+                turn.user_message, turn.assistant_response
+            ));
         }
-        
+
         prompt.push_str(&format!("Human: {}\nAssistant:", user_message));
         Ok(prompt)
     }
@@ -457,29 +499,37 @@ impl ConversationRouter {
         to_model: &str,
         conversation: &ConversationSession,
     ) -> Result<()> {
-        tracing::info!("🔄 Transferring context: {} -> {} for session {}", 
-                      from_model, to_model, conversation.session_id);
-        
+        tracing::info!(
+            "🔄 Transferring context: {} -> {} for session {}",
+            from_model,
+            to_model,
+            conversation.session_id
+        );
+
         let transfer_start = std::time::Instant::now();
-        
+
         // Extract conversation context for transfer
         let context = ConversationContext::extract_from_session(conversation)?;
-        
+
         // Get target model instance
         let target_model = self.model_pool.get_model(to_model).await?;
-        
+
         // Transfer context to new model
-        self.apply_conversation_context(&target_model, &context).await?;
-        
+        self.apply_conversation_context(&target_model, &context)
+            .await?;
+
         // Transfer LoRA adaptations if they exist
         if !conversation.model_state.active_lora_checkpoints.is_empty() {
-            self.transfer_lora_adaptations(from_model, to_model, &conversation.model_state).await?;
+            self.transfer_lora_adaptations(from_model, to_model, &conversation.model_state)
+                .await?;
         }
-        
+
         let transfer_time = transfer_start.elapsed();
-        tracing::info!("✅ Context transfer completed in {:.2}ms", 
-                      transfer_time.as_micros() as f64 / 1000.0);
-        
+        tracing::info!(
+            "✅ Context transfer completed in {:.2}ms",
+            transfer_time.as_micros() as f64 / 1000.0
+        );
+
         Ok(())
     }
 
@@ -491,13 +541,16 @@ impl ConversationRouter {
     ) -> Result<()> {
         // Build context prompt from conversation history
         let context_prompt = self.build_context_prompt(context)?;
-        
+
         // Prime the model with conversation context (warmup inference)
         let _priming_result = target_model.generate(&context_prompt, 1).await?;
-        
-        tracing::debug!("📝 Applied conversation context: {} turns, {} tokens", 
-                       context.turn_count, context.total_tokens);
-        
+
+        tracing::debug!(
+            "📝 Applied conversation context: {} turns, {} tokens",
+            context.turn_count,
+            context.total_tokens
+        );
+
         Ok(())
     }
 
@@ -509,32 +562,41 @@ impl ConversationRouter {
         model_state: &ModelState,
     ) -> Result<()> {
         let _target_model = self.model_pool.get_model(to_model).await?;
-        
-        tracing::warn!("🔧 LoRA adapter switching requires mutable model access - skipping for now");
-        
-        tracing::debug!("🧬 Transferred {} LoRA adaptations to {}", 
-                       model_state.active_lora_checkpoints.len(), to_model);
-        
+
+        tracing::warn!(
+            "🔧 LoRA adapter switching requires mutable model access - skipping for now"
+        );
+
+        tracing::debug!(
+            "🧬 Transferred {} LoRA adaptations to {}",
+            model_state.active_lora_checkpoints.len(),
+            to_model
+        );
+
         Ok(())
     }
 
     /// Build context prompt from conversation context
     fn build_context_prompt(&self, context: &ConversationContext) -> Result<String> {
         let mut prompt = String::new();
-        
+
         // Add system context
         prompt.push_str("Previous conversation context:\n");
-        
+
         // Add recent turns for context
         for turn in &context.recent_turns {
-            prompt.push_str(&format!("Human: {}\nAssistant: {}\n\n", 
-                                   turn.user_message, turn.assistant_response));
+            prompt.push_str(&format!(
+                "Human: {}\nAssistant: {}\n\n",
+                turn.user_message, turn.assistant_response
+            ));
         }
-        
+
         // Add context metadata
-        prompt.push_str(&format!("Context: {} turns, adaptation strength: {:.2}\n", 
-                               context.turn_count, context.adaptation_strength));
-        
+        prompt.push_str(&format!(
+            "Context: {} turns, adaptation strength: {:.2}\n",
+            context.turn_count, context.adaptation_strength
+        ));
+
         Ok(prompt)
     }
 }
@@ -553,7 +615,8 @@ pub struct ConversationContext {
 impl ConversationContext {
     /// Extract conversation context from session
     pub fn extract_from_session(session: &ConversationSession) -> Result<Self> {
-        let recent_turns = session.conversation_history
+        let recent_turns = session
+            .conversation_history
             .iter()
             .rev()
             .take(5) // Last 5 turns for context
@@ -562,10 +625,10 @@ impl ConversationContext {
             .into_iter()
             .rev() // Restore chronological order
             .collect();
-        
+
         // Extract user preferences from feedback patterns
         let user_preferences = Self::extract_user_preferences(&session.conversation_history);
-        
+
         Ok(Self {
             session_id: session.session_id.clone(),
             recent_turns,
@@ -575,11 +638,11 @@ impl ConversationContext {
             user_preferences,
         })
     }
-    
+
     /// Extract user preferences from conversation patterns
     fn extract_user_preferences(history: &[ConversationTurn]) -> Vec<String> {
         let mut preferences = Vec::new();
-        
+
         // Analyze high-feedback turns for preferences
         for turn in history.iter().rev().take(10) {
             if let Some(feedback) = turn.quality_feedback {
@@ -588,7 +651,9 @@ impl ConversationContext {
                     if turn.assistant_response.len() > 100 {
                         preferences.push("detailed_responses".to_string());
                     }
-                    if turn.assistant_response.contains("example") || turn.assistant_response.contains("Example") {
+                    if turn.assistant_response.contains("example")
+                        || turn.assistant_response.contains("Example")
+                    {
                         preferences.push("examples_preferred".to_string());
                     }
                     if turn.assistant_response.contains("```") {
@@ -597,8 +662,12 @@ impl ConversationContext {
                 }
             }
         }
-        
-        preferences.into_iter().collect::<std::collections::HashSet<_>>().into_iter().collect()
+
+        preferences
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect()
     }
 }
 
@@ -631,7 +700,8 @@ impl ModelPool {
     /// Get model instance from pool
     pub async fn get_model(&self, model_id: &str) -> Result<Arc<dyn RuntimeEngine>> {
         let instances = self.model_instances.read().await;
-        instances.get(model_id)
+        instances
+            .get(model_id)
             .cloned()
             .ok_or_else(|| anyhow!("Model not found in pool: {}", model_id))
     }
@@ -661,7 +731,7 @@ impl ModelPool {
 
         // Trigger warmup process
         self.warmup_model_variant(model_id).await?;
-        
+
         tracing::info!("🔥 Model variant warmed up: {}", model_id);
         Ok(())
     }
@@ -672,12 +742,18 @@ impl ModelPool {
         variant_id: String,
         lora_checkpoints: Vec<String>,
     ) -> Result<()> {
-        tracing::info!("🚀 Spawning model variant: {} with {} LoRA adapters", 
-                      variant_id, lora_checkpoints.len());
+        tracing::info!(
+            "🚀 Spawning model variant: {} with {} LoRA adapters",
+            variant_id,
+            lora_checkpoints.len()
+        );
 
         // Create mock engine for now - in real implementation would load actual model
-        let engine = Arc::new(MockRuntimeEngine::new(variant_id.clone(), lora_checkpoints)?);
-        
+        let engine = Arc::new(MockRuntimeEngine::new(
+            variant_id.clone(),
+            lora_checkpoints,
+        )?);
+
         // Add to pool
         {
             let mut instances = self.model_instances.write().await;
@@ -696,16 +772,12 @@ impl ModelPool {
     }
 
     /// Hot swap model instance (< 1ms target)
-    pub async fn hot_swap_model(
-        &self,
-        old_model_id: &str,
-        new_model_id: &str,
-    ) -> Result<()> {
+    pub async fn hot_swap_model(&self, old_model_id: &str, new_model_id: &str) -> Result<()> {
         let swap_start = std::time::Instant::now();
-        
+
         // Ensure new model is ready
         self.ensure_warmed_up(new_model_id).await?;
-        
+
         // Atomic swap - this is the key for seamless transitions
         {
             let mut instances = self.model_instances.write().await;
@@ -713,11 +785,15 @@ impl ModelPool {
                 instances.insert(old_model_id.to_string(), new_engine);
             }
         }
-        
+
         let swap_time = swap_start.elapsed();
-        tracing::info!("⚡ Hot swap completed in {:.2}ms: {} -> {}", 
-                      swap_time.as_micros() as f64 / 1000.0, old_model_id, new_model_id);
-        
+        tracing::info!(
+            "⚡ Hot swap completed in {:.2}ms: {} -> {}",
+            swap_time.as_micros() as f64 / 1000.0,
+            old_model_id,
+            new_model_id
+        );
+
         Ok(())
     }
 
@@ -726,20 +802,20 @@ impl ModelPool {
         // Extract base model and LoRA info
         let _base_model = extract_base_model_from_id(model_id);
         let lora_ids = extract_lora_ids_from_model_id(model_id);
-        
+
         // Create engine with LoRA adaptations
         let engine = Arc::new(MockRuntimeEngine::new(model_id.to_string(), lora_ids)?);
-        
+
         // Pre-allocate resources and run warmup inference
         let warmup_prompt = "System warmup test";
         let _warmup_result = engine.generate(warmup_prompt, 10).await?;
-        
+
         // Add to active pool
         {
             let mut instances = self.model_instances.write().await;
             instances.insert(model_id.to_string(), engine);
         }
-        
+
         Ok(())
     }
 
@@ -747,7 +823,7 @@ impl ModelPool {
     pub async fn get_pool_stats(&self) -> PoolStats {
         let instances = self.model_instances.read().await;
         let queue = self.warmup_queue.read().await;
-        
+
         PoolStats {
             active_instances: instances.len(),
             queued_variants: queue.len(),
@@ -805,23 +881,28 @@ impl RuntimeEngine for MockRuntimeEngine {
         self.is_ready = true;
         Ok(())
     }
-    
+
     async fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String> {
         // Mock generation based on model variant
         let response = if self.model_id.contains("specialist") {
-            format!("Specialized response to '{}' using LoRA adapters: {:?}", 
-                   prompt, self.lora_checkpoints)
+            format!(
+                "Specialized response to '{}' using LoRA adapters: {:?}",
+                prompt, self.lora_checkpoints
+            )
         } else {
             format!("General response to '{}' from {}", prompt, self.model_id)
         };
-        
+
         // Simulate response length
         Ok(response[..response.len().min(max_tokens * 4)].to_string())
     }
-    
-    async fn generate_with_params(&self, request: crate::config::GenerationRequest) -> Result<crate::config::GenerationResult> {
+
+    async fn generate_with_params(
+        &self,
+        request: crate::config::GenerationRequest,
+    ) -> Result<crate::config::GenerationResult> {
         let response = self.generate(&request.prompt, request.max_tokens).await?;
-        
+
         Ok(crate::config::GenerationResult {
             text: response.clone(),
             tokens_generated: response.len() / 4, // Rough token estimate
@@ -830,7 +911,7 @@ impl RuntimeEngine for MockRuntimeEngine {
             generation_time_ms: 100,
         })
     }
-    
+
     fn model_info(&self) -> crate::config::ModelInfo {
         crate::config::ModelInfo {
             name: self.model_id.clone(),
@@ -845,7 +926,7 @@ impl RuntimeEngine for MockRuntimeEngine {
             quantization: None,
         }
     }
-    
+
     fn is_loaded(&self) -> bool {
         self.is_ready
     }

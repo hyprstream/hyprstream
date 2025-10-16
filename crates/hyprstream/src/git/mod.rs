@@ -3,9 +3,7 @@
 //! This module contains hyprstream-specific git extensions.
 //! Core git functionality is provided by git2db.
 
-pub mod branch_manager;
-
-pub use branch_manager::{BranchManager, BranchInfo};
+pub mod helpers;
 
 // Re-export commonly used git2db types
 pub use git2db::{Git2DB as GitModelRegistry, TrackedRepository};
@@ -15,11 +13,10 @@ pub type RegisteredModel = TrackedRepository;
 
 // Hyprstream-specific types and traits
 use anyhow::Result;
-use git2::{Repository, Signature, FetchOptions, RemoteCallbacks};
-use git2::build::CheckoutBuilder;
+use git2::Signature;
+use git2db::{Git2DBError as GitError, GitManager, Repository};
 use std::path::Path;
 use std::sync::Arc;
-use git2db::{GitManager, Git2DBError as GitError};
 
 /// Progress trait for git operations
 pub trait GitProgress: Send + Sync {
@@ -39,85 +36,13 @@ pub struct GitProgressInfo {
     pub elapsed: std::time::Duration,
 }
 
-/// Git operations trait for Repository extensions
-pub trait GitOperations {
-    fn fetch_with_progress(&self, progress: Option<Arc<dyn GitProgress>>) -> Result<()>;
-    fn create_branch(&self, name: &str, target: Option<&str>) -> Result<()>;
-    fn checkout_branch(&self, name: &str) -> Result<()>;
-    fn commit_changes(&self, message: &str, signature: Option<&Signature>) -> Result<()>;
-}
-
-impl GitOperations for Repository {
-    fn fetch_with_progress(&self, _progress: Option<Arc<dyn GitProgress>>) -> Result<()> {
-        let mut remote = self.find_remote("origin")?;
-        let mut fetch_opts = FetchOptions::new();
-        let callbacks = RemoteCallbacks::new();
-        fetch_opts.remote_callbacks(callbacks);
-        remote.fetch(&[] as &[&str], Some(&mut fetch_opts), None)?;
-        Ok(())
-    }
-
-    fn create_branch(&self, name: &str, target: Option<&str>) -> Result<()> {
-        let commit = if let Some(target_ref) = target {
-            self.revparse_single(target_ref)?.peel_to_commit()?
-        } else {
-            self.head()?.peel_to_commit()?
-        };
-        self.branch(name, &commit, false)?;
-        Ok(())
-    }
-
-    fn checkout_branch(&self, name: &str) -> Result<()> {
-        let obj = self.revparse_single(name)?;
-        self.checkout_tree(&obj, Some(CheckoutBuilder::default().force()))?;
-        self.set_head(&format!("refs/heads/{}", name))?;
-        Ok(())
-    }
-
-    fn commit_changes(&self, message: &str, signature: Option<&Signature>) -> Result<()> {
-        let sig = match signature {
-            Some(s) => git2::Signature::now(
-                s.name().unwrap_or("unknown"),
-                s.email().unwrap_or("unknown@local")
-            )?,
-            None => GitManager::global().create_signature(None, None)?,
-        };
-
-        let mut index = self.index()?;
-        index.add_all(["."].iter(), git2::IndexAddOption::DEFAULT, None)?;
-        index.write()?;
-
-        let tree_id = index.write_tree()?;
-        let tree = self.find_tree(tree_id)?;
-        let parent = self.head()?.peel_to_commit()?;
-
-        self.commit(
-            Some("HEAD"),
-            &sig,
-            &sig,
-            message,
-            &tree,
-            &[&parent],
-        )?;
-
-        Ok(())
-    }
-}
-
-/// Shareable model reference for P2P model sharing
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ShareableModelRef {
-    pub name: String,
-    pub uuid: uuid::Uuid,
-    pub git_commit: String,
-    pub source: Option<String>,
-}
-
 /// Get a repository handle using the global GitManager
 pub fn get_repository<P: AsRef<Path>>(path: P) -> Result<Repository> {
-    let cache = GitManager::global().get_repository(path)
+    let cache = GitManager::global()
+        .get_repository(path)
         .map_err(|e| anyhow::anyhow!("Failed to get repository: {}", e))?;
-    cache.open()
+    cache
+        .open()
         .map_err(|e| anyhow::anyhow!("Failed to open repository: {}", e))
 }
 

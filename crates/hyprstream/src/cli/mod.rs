@@ -7,18 +7,17 @@
 //! - LoRA adapter creation and training
 
 pub mod commands;
-pub mod handlers;
-pub mod git_handlers;
 pub mod context;
+pub mod git_handlers;
+pub mod handlers;
 
 pub use context::AppContext;
-pub use handlers::{handle_config, handle_server, handle_model_command, handle_chat_command};
 pub use git_handlers::{
-    handle_branch, handle_checkout, handle_status, handle_commit,
-    handle_lora_train, handle_serve, handle_infer,
-    handle_push, handle_pull, handle_merge, handle_remove,
-    handle_list, handle_info, handle_clone
+    handle_branch, handle_checkout, handle_clone, handle_commit, handle_infer, handle_info,
+    handle_list, handle_lora_train, handle_merge, handle_pull, handle_push, handle_remove,
+    handle_serve, handle_status,
 };
+pub use handlers::{handle_chat_command, handle_config, handle_model_command, handle_server};
 
 /// Device preference strategy
 #[derive(Debug, Clone, Copy)]

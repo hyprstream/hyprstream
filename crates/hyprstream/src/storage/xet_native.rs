@@ -5,20 +5,17 @@
 //! operation with both regular files and Xet-tracked files without requiring
 //! Git LFS or git-xet transfer agent setup.
 
-use anyhow::{Result, Context, bail, anyhow};
+use anyhow::{anyhow, bail, Context, Result};
+use cas_client::{FileProvider, OutputProvider};
+use data::{data_client, FileDownloader, FileUploadSession, XetFileInfo};
+use indicatif::{ProgressBar, ProgressStyle};
+use merklehash::MerkleHash;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 use tokio::fs;
 use tokio::sync::Semaphore;
-use indicatif::{ProgressBar, ProgressStyle};
-use tracing::{info, warn, debug};
-use data::{
-    FileUploadSession, FileDownloader, XetFileInfo,
-    data_client,
-};
-use cas_client::{OutputProvider, FileProvider};
-use merklehash::MerkleHash;
+use tracing::{debug, info, warn};
 
 /// LFS pointer information parsed from pointer file
 #[derive(Debug, Clone)]
@@ -93,9 +90,13 @@ impl IndicatifProgressUpdater {
             self.progress_bar.set_length(total);
             let mb_current = current as f64 / (1024.0 * 1024.0);
             let mb_total = total as f64 / (1024.0 * 1024.0);
-            self.progress_bar.set_message(format!("{}: {:.1}MB/{:.1}MB", item_name, mb_current, mb_total));
+            self.progress_bar.set_message(format!(
+                "{}: {:.1}MB/{:.1}MB",
+                item_name, mb_current, mb_total
+            ));
         } else {
-            self.progress_bar.set_message(format!("{}: {}B", item_name, current));
+            self.progress_bar
+                .set_message(format!("{}: {}B", item_name, current));
         }
         self.progress_bar.set_position(current);
     }
@@ -125,14 +126,20 @@ impl XetNativeStorage {
     }
 
     /// Create a new Xet storage instance with optional progress tracking
-    pub async fn new_with_progress(config: XetConfig, progress_bar: Option<ProgressBar>) -> Result<Self> {
+    pub async fn new_with_progress(
+        config: XetConfig,
+        progress_bar: Option<ProgressBar>,
+    ) -> Result<Self> {
         // Create translator config using xet-core's default_config
-        let translator_config = Arc::new(data_client::default_config(
-            config.endpoint.clone(),
-            config.compression,
-            config.token.as_ref().map(|t| (t.clone(), u64::MAX)), // Token with far future expiry
-            None, // No token refresher
-        ).context("Failed to create Xet translator config")?);
+        let translator_config = Arc::new(
+            data_client::default_config(
+                config.endpoint.clone(),
+                config.compression,
+                config.token.as_ref().map(|t| (t.clone(), u64::MAX)), // Token with far future expiry
+                None,                                                 // No token refresher
+            )
+            .context("Failed to create Xet translator config")?,
+        );
 
         // Create progress updater if progress bar is provided
         let _progress_updater = progress_bar.map(|pb| {
@@ -166,43 +173,46 @@ impl XetNativeStorage {
     /// This uploads the file to Xet CAS and returns a JSON pointer that
     /// should be stored in place of the original file content.
     pub async fn clean_file(&self, file_path: &Path) -> Result<String> {
-        let (xet_info, _metrics) = data_client::clean_file(
-            self.upload_session.clone(),
-            file_path
-        ).await.context("Failed to clean file for Xet storage")?;
+        let (xet_info, _metrics) = data_client::clean_file(self.upload_session.clone(), file_path)
+            .await
+            .context("Failed to clean file for Xet storage")?;
 
-        xet_info.as_pointer_file()
+        xet_info
+            .as_pointer_file()
             .context("Failed to serialize Xet pointer")
     }
 
     /// Store data from memory and return Xet pointer
     pub async fn clean_bytes(&self, data: &[u8]) -> Result<String> {
-        let (xet_info, _metrics) = data_client::clean_bytes(
-            self.upload_session.clone(),
-            data.to_vec()
-        ).await.context("Failed to clean bytes for Xet storage")?;
+        let (xet_info, _metrics) =
+            data_client::clean_bytes(self.upload_session.clone(), data.to_vec())
+                .await
+                .context("Failed to clean bytes for Xet storage")?;
 
-        xet_info.as_pointer_file()
+        xet_info
+            .as_pointer_file()
             .context("Failed to serialize Xet pointer")
     }
 
     /// Retrieve file from Xet pointer to specified path (smudge operation)
     pub async fn smudge_file(&self, pointer_content: &str, output_path: &Path) -> Result<()> {
-        let xet_info: XetFileInfo = serde_json::from_str(pointer_content)
-            .context("Failed to parse Xet pointer")?;
+        let xet_info: XetFileInfo =
+            serde_json::from_str(pointer_content).context("Failed to parse Xet pointer")?;
 
-        let merkle_hash = xet_info.merkle_hash()
+        let merkle_hash = xet_info
+            .merkle_hash()
             .context("Failed to parse merkle hash from Xet pointer")?;
 
-        self.downloader.smudge_file_from_hash(
-            &merkle_hash,
-            output_path.to_string_lossy().into(),
-            &OutputProvider::File(FileProvider::new(output_path.to_path_buf())),
-            None,
-            None
-        )
-        .await
-        .context("Failed to smudge file from Xet storage")?;
+        self.downloader
+            .smudge_file_from_hash(
+                &merkle_hash,
+                output_path.to_string_lossy().into(),
+                &OutputProvider::File(FileProvider::new(output_path.to_path_buf())),
+                None,
+                None,
+            )
+            .await
+            .context("Failed to smudge file from Xet storage")?;
 
         Ok(())
     }
@@ -210,13 +220,13 @@ impl XetNativeStorage {
     /// Retrieve file from Xet pointer to memory
     pub async fn smudge_bytes(&self, pointer_content: &str) -> Result<Vec<u8>> {
         // Create temporary file for smudging
-        let temp_file = NamedTempFile::new()
-            .context("Failed to create temporary file")?;
+        let temp_file = NamedTempFile::new().context("Failed to create temporary file")?;
 
         self.smudge_file(pointer_content, temp_file.path()).await?;
 
         // Read the smudged content
-        fs::read(temp_file.path()).await
+        fs::read(temp_file.path())
+            .await
             .context("Failed to read smudged file")
     }
 
@@ -244,8 +254,7 @@ impl XetNativeStorage {
     fn sha256_to_merkle_hash(&self, sha256_hex: &str) -> Result<MerkleHash> {
         // Direct conversion: LFS SHA256 hex string → MerkleHash
         // This follows the same pattern as xet-core data/src/sha256.rs:45
-        MerkleHash::from_hex(sha256_hex)
-            .context("Failed to convert LFS SHA256 to MerkleHash")
+        MerkleHash::from_hex(sha256_hex).context("Failed to convert LFS SHA256 to MerkleHash")
     }
 
     /// Resolve LFS pointer to actual content via XET
@@ -258,21 +267,24 @@ impl XetNativeStorage {
         let merkle_hash = self.sha256_to_merkle_hash(&lfs_pointer.oid)?;
 
         // Create temporary output for smudging
-        let temp_file = NamedTempFile::new()
-            .context("Failed to create temporary file for LFS smudging")?;
+        let temp_file =
+            NamedTempFile::new().context("Failed to create temporary file for LFS smudging")?;
 
         // Use XET downloader to retrieve content by hash
-        self.downloader.smudge_file_from_hash(
-            &merkle_hash,
-            temp_file.path().to_string_lossy().into(),
-            &OutputProvider::File(FileProvider::new(temp_file.path().to_path_buf())),
-            None, // No range - download entire file
-            None  // No progress updater
-        ).await
-        .context("Failed to smudge LFS content from XET storage")?;
+        self.downloader
+            .smudge_file_from_hash(
+                &merkle_hash,
+                temp_file.path().to_string_lossy().into(),
+                &OutputProvider::File(FileProvider::new(temp_file.path().to_path_buf())),
+                None, // No range - download entire file
+                None, // No progress updater
+            )
+            .await
+            .context("Failed to smudge LFS content from XET storage")?;
 
         // Read and return the content
-        fs::read(temp_file.path()).await
+        fs::read(temp_file.path())
+            .await
             .context("Failed to read smudged LFS content")
     }
 
@@ -283,15 +295,14 @@ impl XetNativeStorage {
     /// or returns the file content directly if it's not a pointer.
     pub async fn load_file(&self, file_path: &Path) -> Result<Vec<u8>> {
         // First read a small portion to check if it's a pointer file
-        let initial_bytes = fs::read(file_path).await
-            .context("Failed to read file")?;
+        let initial_bytes = fs::read(file_path).await.context("Failed to read file")?;
 
         // Check if the file starts with pointer markers (both XET and LFS are text-based)
         // XET pointers start with "# xet version"
         // LFS pointers start with "version https://git-lfs"
         let is_likely_pointer = initial_bytes.len() < 1024 && // Pointer files are small
-            initial_bytes.starts_with(b"# xet version") ||
-            initial_bytes.starts_with(b"version https://git-lfs");
+            initial_bytes.starts_with(b"# xet version")
+            || initial_bytes.starts_with(b"version https://git-lfs");
 
         if is_likely_pointer {
             // Try to parse as text for pointer detection
@@ -319,20 +330,23 @@ impl XetNativeStorage {
     pub async fn save_file(&self, file_path: &Path, data: &[u8]) -> Result<()> {
         // Check if the file already exists as a Xet pointer
         if file_path.exists() {
-            let existing_content = fs::read_to_string(file_path).await
+            let existing_content = fs::read_to_string(file_path)
+                .await
                 .context("Failed to read existing file")?;
 
             if self.is_xet_pointer(&existing_content) {
                 // File is already a Xet pointer - update it
                 let pointer = self.clean_bytes(data).await?;
-                fs::write(file_path, pointer).await
+                fs::write(file_path, pointer)
+                    .await
                     .context("Failed to write updated Xet pointer")?;
                 return Ok(());
             }
         }
 
         // Store as regular file
-        fs::write(file_path, data).await
+        fs::write(file_path, data)
+            .await
             .context("Failed to write regular file")
     }
 
@@ -342,7 +356,8 @@ impl XetNativeStorage {
     /// it was previously a regular file or Xet pointer.
     pub async fn save_as_xet(&self, file_path: &Path, data: &[u8]) -> Result<()> {
         let pointer = self.clean_bytes(data).await?;
-        fs::write(file_path, pointer).await
+        fs::write(file_path, pointer)
+            .await
             .context("Failed to write Xet pointer file")
     }
 
@@ -362,12 +377,13 @@ impl XetNativeStorage {
             bail!("File does not exist: {}", file_path.display());
         }
 
-        let content = fs::read_to_string(file_path).await
+        let content = fs::read_to_string(file_path)
+            .await
             .context("Failed to read file")?;
 
         if self.is_xet_pointer(&content) {
-            let xet_info: XetFileInfo = serde_json::from_str(&content)
-                .context("Failed to parse Xet pointer")?;
+            let xet_info: XetFileInfo =
+                serde_json::from_str(&content).context("Failed to parse Xet pointer")?;
             Ok(xet_info.file_size())
         } else {
             Ok(content.len() as u64)
@@ -381,31 +397,29 @@ impl XetNativeStorage {
         let directory = directory.to_path_buf();
         let storage = self.clone(); // We need to clone self to move into the blocking task
 
-        tokio::task::spawn_blocking(move || {
-            storage.scan_lfs_files_in_directory_sync(&directory)
-        }).await?
+        tokio::task::spawn_blocking(move || storage.scan_lfs_files_in_directory_sync(&directory))
+            .await?
     }
 
     /// Synchronous implementation of LFS file scanning using git2's tree traversal
     fn scan_lfs_files_in_directory_sync(&self, directory: &Path) -> Result<Vec<PathBuf>> {
-        use git2::{TreeWalkMode, TreeWalkResult, ObjectType};
+        use git2::{ObjectType, TreeWalkMode, TreeWalkResult};
 
         // Find the git repository for this directory
         let repo = self.find_git_repository(directory)?;
-        let repo_workdir = repo.workdir()
+        let repo_workdir = repo
+            .workdir()
             .ok_or_else(|| anyhow!("Repository has no working directory"))?;
 
         // Get the current HEAD commit and its tree
-        let head = repo.head()
-            .context("Failed to get HEAD reference")?;
-        let commit = head.peel_to_commit()
-            .context("Failed to get HEAD commit")?;
-        let tree = commit.tree()
-            .context("Failed to get commit tree")?;
+        let head = repo.head().context("Failed to get HEAD reference")?;
+        let commit = head.peel_to_commit().context("Failed to get HEAD commit")?;
+        let tree = commit.tree().context("Failed to get commit tree")?;
 
         // Convert directory to relative path if needed
         let scan_prefix = if directory.starts_with(repo_workdir) {
-            directory.strip_prefix(repo_workdir)
+            directory
+                .strip_prefix(repo_workdir)
                 .context("Failed to get relative path")?
                 .to_string_lossy()
                 .into_owned()
@@ -421,7 +435,11 @@ impl XetNativeStorage {
             let entry_path = if root.is_empty() {
                 entry.name().unwrap_or("").to_string()
             } else {
-                format!("{}/{}", root.trim_end_matches('/'), entry.name().unwrap_or(""))
+                format!(
+                    "{}/{}",
+                    root.trim_end_matches('/'),
+                    entry.name().unwrap_or("")
+                )
             };
 
             // Check if this path is within our scan prefix
@@ -452,16 +470,19 @@ impl XetNativeStorage {
     }
 
     /// Find the git repository for a given directory
-    fn find_git_repository(&self, directory: &Path) -> Result<git2::Repository> {
+    fn find_git_repository(&self, directory: &Path) -> Result<git2db::Repository> {
         // Try to open as a git repository or find the parent repository
-        git2::Repository::discover(directory)
-            .context("Directory is not part of a git repository")
+        git2db::Repository::discover(directory).context("Directory is not part of a git repository")
     }
 
     /// Filter candidate files using git status to respect .gitignore (sync version)
-    fn filter_files_by_git_status_sync(&self, repo: &git2::Repository, candidates: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
-
-        let repo_workdir = repo.workdir()
+    fn filter_files_by_git_status_sync(
+        &self,
+        repo: &git2db::Repository,
+        candidates: Vec<PathBuf>,
+    ) -> Result<Vec<PathBuf>> {
+        let repo_workdir = repo
+            .workdir()
             .ok_or_else(|| anyhow!("Repository has no working directory"))?;
 
         // For LFS files found via git tree walk, they are already tracked files
@@ -475,7 +496,8 @@ impl XetNativeStorage {
                 // Check if file exists in worktree
                 if candidate.exists() {
                     // Check if it's ignored using git's ignore rules
-                    let is_ignored = repo.status_file(relative_path)
+                    let is_ignored = repo
+                        .status_file(relative_path)
                         .map(|status| status.contains(git2::Status::IGNORED))
                         .unwrap_or(false);
 
@@ -487,7 +509,11 @@ impl XetNativeStorage {
             }
         }
 
-        debug!("Filtered {} LFS candidates to {} files", candidate_count, filtered_files.len());
+        debug!(
+            "Filtered {} LFS candidates to {} files",
+            candidate_count,
+            filtered_files.len()
+        );
         Ok(filtered_files)
     }
 
@@ -497,13 +523,19 @@ impl XetNativeStorage {
     /// to resolve them via XET storage. For commit-based processing, this processes
     /// all LFS files present in the checked out commit.
     pub async fn process_worktree_lfs(&self, worktree_path: &Path) -> Result<Vec<PathBuf>> {
-        use tracing::{info, warn, debug};
+        use tracing::{debug, info, warn};
 
         if !worktree_path.is_dir() {
-            bail!("Worktree path does not exist or is not a directory: {}", worktree_path.display());
+            bail!(
+                "Worktree path does not exist or is not a directory: {}",
+                worktree_path.display()
+            );
         }
 
-        info!("Scanning worktree for LFS files: {}", worktree_path.display());
+        info!(
+            "Scanning worktree for LFS files: {}",
+            worktree_path.display()
+        );
         let lfs_files = self.scan_lfs_files_in_directory(worktree_path).await?;
 
         if lfs_files.is_empty() {
@@ -529,14 +561,19 @@ impl XetNativeStorage {
             }
         }
 
-        info!("Processed {}/{} LFS files", processed_files.len(), lfs_files.len());
+        info!(
+            "Processed {}/{} LFS files",
+            processed_files.len(),
+            lfs_files.len()
+        );
         Ok(processed_files)
     }
 
     /// Smudge an LFS file in place (replace pointer with actual content)
     async fn smudge_lfs_file_in_place(&self, file_path: &Path) -> Result<()> {
         // Read the LFS pointer content
-        let pointer_content = fs::read_to_string(file_path).await
+        let pointer_content = fs::read_to_string(file_path)
+            .await
             .context("Failed to read LFS pointer file")?;
 
         if !self.is_lfs_pointer(&pointer_content) {
@@ -550,16 +587,17 @@ impl XetNativeStorage {
         let actual_content = self.smudge_lfs_pointer(&lfs_pointer).await?;
 
         // Write actual content to a temporary file first
-        let temp_file = NamedTempFile::new_in(
-            file_path.parent().unwrap_or(Path::new("."))
-        ).context("Failed to create temporary file for atomic replacement")?;
+        let temp_file = NamedTempFile::new_in(file_path.parent().unwrap_or(Path::new(".")))
+            .context("Failed to create temporary file for atomic replacement")?;
 
-        fs::write(temp_file.path(), &actual_content).await
+        fs::write(temp_file.path(), &actual_content)
+            .await
             .context("Failed to write smudged content to temporary file")?;
 
         // Atomically replace the original file
         let temp_path = temp_file.into_temp_path();
-        temp_path.persist(file_path)
+        temp_path
+            .persist(file_path)
             .context("Failed to atomically replace LFS pointer with actual content")?;
 
         Ok(())
@@ -586,7 +624,9 @@ impl XetNativeStorage {
 
             let task = tokio::spawn(async move {
                 let _permit = semaphore.acquire().await.unwrap();
-                storage.smudge_lfs_file_in_place(&lfs_file).await
+                storage
+                    .smudge_lfs_file_in_place(&lfs_file)
+                    .await
                     .map(|_| lfs_file)
             });
             tasks.push(task);
@@ -608,7 +648,11 @@ impl XetNativeStorage {
             }
         }
 
-        info!("Processed {}/{} LFS files", processed_files.len(), total_files);
+        info!(
+            "Processed {}/{} LFS files",
+            processed_files.len(),
+            total_files
+        );
         Ok(processed_files)
     }
 }
@@ -692,7 +736,10 @@ mod tests {
         let parsed = storage.parse_lfs_pointer(valid_lfs_content).unwrap();
 
         assert_eq!(parsed.version, "https://git-lfs.github.com/spec/v1");
-        assert_eq!(parsed.oid, "abc123def456789012345678901234567890123456789012345678901234567890");
+        assert_eq!(
+            parsed.oid,
+            "abc123def456789012345678901234567890123456789012345678901234567890"
+        );
         assert_eq!(parsed.size, 12345);
 
         // Test with extra whitespace and empty lines
@@ -700,7 +747,10 @@ mod tests {
         let parsed2 = storage.parse_lfs_pointer(lfs_with_whitespace).unwrap();
 
         assert_eq!(parsed2.version, "https://git-lfs.github.com/spec/v1");
-        assert_eq!(parsed2.oid, "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
+        assert_eq!(
+            parsed2.oid,
+            "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+        );
         assert_eq!(parsed2.size, 9876);
     }
 
@@ -722,7 +772,8 @@ mod tests {
         assert!(storage.parse_lfs_pointer(missing_size).is_err());
 
         // Test invalid OID length (too short)
-        let invalid_oid_short = "version https://git-lfs.github.com/spec/v1\noid sha256:abc123\nsize 12345\n";
+        let invalid_oid_short =
+            "version https://git-lfs.github.com/spec/v1\noid sha256:abc123\nsize 12345\n";
         assert!(storage.parse_lfs_pointer(invalid_oid_short).is_err());
 
         // Test invalid OID characters
@@ -757,7 +808,8 @@ mod tests {
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("LFS pointer found"));
-        assert!(error_msg.contains("abc123def456789012345678901234567890123456789012345678901234567890"));
+        assert!(error_msg
+            .contains("abc123def456789012345678901234567890123456789012345678901234567890"));
         assert!(error_msg.contains("12345 bytes"));
     }
 
@@ -786,17 +838,26 @@ mod tests {
     fn test_lfs_pointer_struct_validation() {
         // Test valid OID
         let valid_oid = "a".repeat(64);
-        let result = LfsPointer::parse(&format!("version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 1000", valid_oid));
+        let result = LfsPointer::parse(&format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 1000",
+            valid_oid
+        ));
         assert!(result.is_ok());
 
         // Test invalid OID length
         let short_oid = "a".repeat(32);
-        let result = LfsPointer::parse(&format!("version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 1000", short_oid));
+        let result = LfsPointer::parse(&format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 1000",
+            short_oid
+        ));
         assert!(result.is_err());
 
         // Test invalid OID characters
         let invalid_oid = "g".repeat(64); // 'g' is not hex
-        let result = LfsPointer::parse(&format!("version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 1000", invalid_oid));
+        let result = LfsPointer::parse(&format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 1000",
+            invalid_oid
+        ));
         assert!(result.is_err());
     }
 }

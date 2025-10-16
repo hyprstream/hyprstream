@@ -16,23 +16,40 @@ pub mod error;
 pub mod git;
 pub mod lora;
 pub mod runtime;
-pub mod training;
 pub mod server;
 pub mod storage;
+pub mod training;
 
 // Storage exports removed
 pub use runtime::{
-    RuntimeEngine, TorchEngine,
-    ModelInfo, GenerationRequest, GenerationResult, FinishReason, RuntimeConfig,
-    XLoRAAdapter, AdaptationMode, UserFeedback, XLoRARoutingStrategy, AdapterMetrics,
+    AdaptationMode,
+    AdaptationTrigger,
+    AdaptationType,
+    AdapterMetrics,
+    ConversationContext,
+    ConversationResponse,
     // Model Evolution System exports
-    ConversationRouter, ConversationSession, ConversationTurn, ConversationResponse,
-    ConversationContext, ModelPool, AdaptationType, AdaptationTrigger, ModelState,
-    PoolStats, RoutingConfig
+    ConversationRouter,
+    ConversationSession,
+    ConversationTurn,
+    FinishReason,
+    GenerationRequest,
+    GenerationResult,
+    ModelInfo,
+    ModelPool,
+    ModelState,
+    PoolStats,
+    RoutingConfig,
+    RuntimeConfig,
+    RuntimeEngine,
+    TorchEngine,
+    UserFeedback,
+    XLoRAAdapter,
+    XLoRARoutingStrategy,
 };
 
 // Export TorchEngine as HyprStreamEngine for backward compatibility
 pub use runtime::TorchEngine as HyprStreamEngine;
 
-// Export init function from runtime 
+// Export init function from runtime
 pub use runtime::create_engine as init;

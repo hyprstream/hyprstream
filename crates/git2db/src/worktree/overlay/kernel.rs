@@ -1,6 +1,6 @@
 //! Kernel overlayfs backend using direct mount syscalls
 
-use super::backend::{OverlayBackend, BackendCapabilities};
+use super::backend::{BackendCapabilities, OverlayBackend};
 use crate::errors::{Git2DBError, Git2DBResult};
 use async_trait::async_trait;
 use std::path::Path;
@@ -27,10 +27,11 @@ impl KernelBackend {
             // Try to detect capabilities if caps crate is available
             #[cfg(feature = "overlayfs")]
             {
-                use caps::{Capability, CapSet};
+                use caps::{CapSet, Capability};
 
                 // Check for CAP_SYS_ADMIN
-                if let Ok(true) = caps::has_cap(None, CapSet::Effective, Capability::CAP_SYS_ADMIN) {
+                if let Ok(true) = caps::has_cap(None, CapSet::Effective, Capability::CAP_SYS_ADMIN)
+                {
                     return true;
                 }
             }
@@ -70,7 +71,8 @@ impl OverlayBackend for KernelBackend {
             Some("overlay"),
             MsFlags::empty(),
             Some(options.as_str()),
-        ).map_err(|e| Git2DBError::internal(format!("Failed to mount kernel overlayfs: {}", e)))?;
+        )
+        .map_err(|e| Git2DBError::internal(format!("Failed to mount kernel overlayfs: {}", e)))?;
 
         Ok(())
     }
@@ -83,7 +85,9 @@ impl OverlayBackend for KernelBackend {
         _work: &Path,
         _target: &Path,
     ) -> Git2DBResult<()> {
-        Err(Git2DBError::internal("Kernel overlayfs not available on this platform"))
+        Err(Git2DBError::internal(
+            "Kernel overlayfs not available on this platform",
+        ))
     }
 
     #[cfg(all(target_os = "linux", feature = "overlayfs"))]

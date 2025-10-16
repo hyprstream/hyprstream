@@ -1,5 +1,6 @@
 //! Middleware for authentication, logging, and request processing
 
+use crate::server::state::ServerState;
 use axum::{
     extract::{Request, State},
     http::{header, StatusCode},
@@ -8,7 +9,6 @@ use axum::{
 };
 use std::time::Instant;
 use tracing::{info, warn};
-use crate::server::state::ServerState;
 
 /// API key authentication middleware
 pub async fn auth_middleware(
@@ -19,19 +19,21 @@ pub async fn auth_middleware(
     // Check if API key is configured
     if let Some(ref expected_key) = state.config.api_key {
         // Get API key from Authorization header
-        let auth_header = request.headers()
+        let auth_header = request
+            .headers()
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok());
-        
+
         let api_key = auth_header
             .and_then(|h| h.strip_prefix("Bearer "))
             .or_else(|| {
                 // Also check X-API-Key header
-                request.headers()
+                request
+                    .headers()
                     .get("x-api-key")
                     .and_then(|v| v.to_str().ok())
             });
-        
+
         match api_key {
             Some(key) if key == expected_key => {
                 // Valid API key, proceed
@@ -45,42 +47,27 @@ pub async fn auth_middleware(
             }
         }
     }
-    
+
     next.run(request).await
 }
 
 /// Request logging middleware
-pub async fn logging_middleware(
-    request: Request,
-    next: Next,
-) -> Response {
+pub async fn logging_middleware(request: Request, next: Next) -> Response {
     let method = request.method().clone();
     let uri = request.uri().clone();
     let start = Instant::now();
-    
+
     let response = next.run(request).await;
-    
+
     let duration = start.elapsed();
     let status = response.status();
-    
+
     if status.is_client_error() || status.is_server_error() {
-        warn!(
-            "{} {} {} ({:?})",
-            method,
-            uri,
-            status,
-            duration
-        );
+        warn!("{} {} {} ({:?})", method, uri, status, duration);
     } else {
-        info!(
-            "{} {} {} ({:?})",
-            method,
-            uri,
-            status,
-            duration
-        );
+        info!("{} {} {} ({:?})", method, uri, status, duration);
     }
-    
+
     response
 }
 
@@ -95,9 +82,9 @@ pub async fn rate_limit_middleware(
 
 /// CORS middleware configuration
 pub fn cors_layer(config: &crate::server::state::CorsConfig) -> tower_http::cors::CorsLayer {
-    use tower_http::cors::{CorsLayer, Any};
-    use axum::http::{HeaderValue, Method, HeaderName};
-    
+    use axum::http::{HeaderName, HeaderValue, Method};
+    use tower_http::cors::{Any, CorsLayer};
+
     let mut cors = CorsLayer::new()
         .allow_methods([
             Method::GET,
@@ -107,7 +94,7 @@ pub fn cors_layer(config: &crate::server::state::CorsConfig) -> tower_http::cors
             Method::OPTIONS,
         ])
         .max_age(std::time::Duration::from_secs(config.max_age));
-    
+
     // Configure allowed headers
     if config.permissive_headers {
         // Permissive mode - allow any header (development/debugging only)
@@ -126,10 +113,8 @@ pub fn cors_layer(config: &crate::server::state::CorsConfig) -> tower_http::cors
             header::REFERER,
             header::ORIGIN,
             header::CONNECTION,
-            
             // Custom API headers
             HeaderName::from_static("x-api-key"),
-            
             // OpenAI SDK headers (x-stainless-*)
             HeaderName::from_static("x-stainless-arch"),
             HeaderName::from_static("x-stainless-lang"),
@@ -139,18 +124,16 @@ pub fn cors_layer(config: &crate::server::state::CorsConfig) -> tower_http::cors
             HeaderName::from_static("x-stainless-runtime"),
             HeaderName::from_static("x-stainless-runtime-version"),
             HeaderName::from_static("x-stainless-timeout"),
-            
             // Additional OpenAI headers
             HeaderName::from_static("openai-organization"),
             HeaderName::from_static("openai-project"),
             HeaderName::from_static("openai-beta"),
-            
             // Request ID tracking
             HeaderName::from_static("x-request-id"),
             HeaderName::from_static("x-trace-id"),
         ]);
     }
-    
+
     // Configure allowed origins
     if config.allowed_origins.contains(&"*".to_string()) {
         // Allow all origins with Any (handles wildcard properly)
@@ -161,7 +144,7 @@ pub fn cors_layer(config: &crate::server::state::CorsConfig) -> tower_http::cors
         // If no origins specified, use default localhost origins
         let default_origins = vec![
             "http://localhost:3000",
-            "http://localhost:3001", 
+            "http://localhost:3001",
             "http://127.0.0.1:3000",
             "http://127.0.0.1:3001",
         ];
@@ -186,6 +169,6 @@ pub fn cors_layer(config: &crate::server::state::CorsConfig) -> tower_http::cors
             cors = cors.allow_credentials(true);
         }
     }
-    
+
     cors
 }

@@ -7,26 +7,17 @@
 //! - Training service at /training
 
 use anyhow::Result;
-use axum::{
-    Router,
-    routing::get,
-    response::IntoResponse,
-    Json,
-};
+use axum::{response::IntoResponse, routing::get, Json, Router};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tower_http::{
-    trace::TraceLayer,
-    timeout::TimeoutLayer,
-};
+use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 use tracing::info;
 
-pub mod state;
-pub mod routes;
 pub mod middleware;
 pub mod model_cache;
-pub mod cache_refresher;
+pub mod routes;
+pub mod state;
 
 use state::ServerState;
 
@@ -35,34 +26,27 @@ pub fn create_app(state: ServerState) -> Router {
     // Clone config for middleware
     let cors_config = state.config.cors.clone();
     let timeout_duration = Duration::from_secs(state.config.request_timeout_secs);
-    
+
     let mut app = Router::new()
         // Health check endpoint
         .route("/", get(health_check))
         .route("/health", get(health_check))
-        
         // OpenAI-compatible API routes at /oai/v1
         .nest("/oai/v1", routes::openai::create_router())
-        
-        // LoRA management routes
-        .nest("/lora", routes::lora::create_router())
-        
         // Model management routes
         .nest("/models", routes::models::create_router())
-        
         // Training service routes
         .nest("/training", routes::training::create_router())
-        
         // Add middleware (order matters: timeout should be before state)
         .layer(TimeoutLayer::new(timeout_duration))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
-    
+
     // Add CORS middleware if enabled (should be outermost)
     if cors_config.enabled {
         app = app.layer(middleware::cors_layer(&cors_config));
     }
-    
+
     app
 }
 
@@ -76,18 +60,15 @@ async fn health_check() -> impl IntoResponse {
 }
 
 /// Start the HTTP server
-pub async fn start_server(
-    addr: SocketAddr,
-    state: ServerState,
-) -> Result<()> {
+pub async fn start_server(addr: SocketAddr, state: ServerState) -> Result<()> {
     let app = create_app(state);
-    
+
     info!("Starting Hyprstream server on {}", addr);
     info!("OpenAI-compatible API available at http://{}/oai/v1", addr);
-    
+
     let listener = TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
-    
+
     Ok(())
 }
 

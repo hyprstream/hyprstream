@@ -3,7 +3,7 @@
 //! This example shows how our worktree system follows Docker's graphdriver
 //! pattern for managing storage backends.
 
-use hyprstream::worktree::{StorageDriver, DriverRegistry};
+use hyprstream::worktree::{DriverRegistry, StorageDriver};
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,7 +23,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  {} - {} [Available: {}]",
             driver_status.info.name,
             driver_status.info.description,
-            if driver_status.available { "✓" } else { "✗" }
+            if driver_status.available {
+                "✓"
+            } else {
+                "✗"
+            }
         );
         println!(
             "    Capabilities: CoW={}, Snapshots={}, Space Savings={}%",
@@ -92,7 +96,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("-----------------------------------");
     println!("When using 'auto', drivers are tried in this order:");
     for (i, driver_type) in StorageDriver::auto_priority().iter().enumerate() {
-        println!("  {}. {} {}",
+        println!(
+            "  {}. {} {}",
             i + 1,
             driver_type.name(),
             if driver_type == &StorageDriver::Vfs {

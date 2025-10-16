@@ -1,14 +1,14 @@
 //! Unified model configuration management
-//! 
+//!
 //! This module provides a single source of truth for model configurations,
 //! resolving the current chaos of multiple override points.
 
-use tracing::info;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::collections::HashMap;
+use std::path::Path;
 use tch::Tensor;
+use tracing::info;
 
 /// Unified model configuration that combines all sources
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,7 +17,7 @@ pub struct ModelConfig {
     pub architecture: ModelArchitecture,
     pub model_type: String,
     pub version: u32,
-    
+
     // Core transformer parameters
     pub hidden_size: usize,
     pub num_hidden_layers: usize,
@@ -25,25 +25,25 @@ pub struct ModelConfig {
     pub num_key_value_heads: usize,
     pub head_dim: usize,
     pub intermediate_size: usize,
-    
+
     // Vocabulary and embeddings
     pub vocab_size: usize,
     pub max_position_embeddings: usize,
     pub rope_theta: f32,
     pub rope_scaling: Option<RopeScaling>,
-    
+
     // Normalization
     pub rms_norm_eps: f32,
     pub layer_norm_eps: Option<f32>,
-    
+
     // Activation
     pub hidden_activation: String,
-    
+
     // Special configurations
     pub use_qk_norm: bool,
     pub scale_embeddings: bool,
     pub query_pre_attn_scalar: Option<f32>,
-    
+
     // Precision and optimization
     pub dtype: String,
     pub use_flash_attention: bool,
@@ -80,10 +80,10 @@ impl ModelConfig {
             info!("⚠️ No config.json found, detecting from weights");
             Self::detect_from_weights(weights)?
         };
-        
+
         // Step 2: Validate against weights
         config.validate_with_weights(weights)?;
-        
+
         // Step 3: Log final configuration
         info!("✅ Final model configuration:");
         info!("   Architecture: {:?}", config.architecture);
@@ -94,24 +94,24 @@ impl ModelConfig {
         info!("   Vocab size: {}", config.vocab_size);
         info!("   RoPE theta: {}", config.rope_theta);
         info!("   Max position: {}", config.max_position_embeddings);
-        
+
         Ok(config)
     }
-    
+
     /// Load from config.json
     fn from_json_file(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let json: serde_json::Value = serde_json::from_str(&content)?;
-        
+
         // Detect architecture from model_type or architectures field
         let architecture = Self::detect_architecture_from_json(&json);
-        
+
         // Extract all configuration values
         let config = Self {
             architecture: architecture.clone(),
             model_type: json["model_type"].as_str().unwrap_or("unknown").to_string(),
             version: Self::detect_version(&json, &architecture),
-            
+
             hidden_size: json["hidden_size"].as_u64().unwrap_or(4096) as usize,
             num_hidden_layers: json["num_hidden_layers"].as_u64().unwrap_or(32) as usize,
             num_attention_heads: json["num_attention_heads"].as_u64().unwrap_or(32) as usize,
@@ -121,64 +121,63 @@ impl ModelConfig {
                 .unwrap_or(32) as usize,
             head_dim: json["head_dim"].as_u64().unwrap_or(128) as usize,
             intermediate_size: json["intermediate_size"].as_u64().unwrap_or(11008) as usize,
-            
+
             vocab_size: json["vocab_size"].as_u64().unwrap_or(32000) as usize,
-            max_position_embeddings: json["max_position_embeddings"]
-                .as_u64()
-                .unwrap_or(4096) as usize,
+            max_position_embeddings: json["max_position_embeddings"].as_u64().unwrap_or(4096)
+                as usize,
             rope_theta: json["rope_theta"].as_f64().unwrap_or(10_000.0) as f32,
             rope_scaling: Self::parse_rope_scaling(&json),
-            
+
             rms_norm_eps: json["rms_norm_eps"].as_f64().unwrap_or(1e-5) as f32,
             layer_norm_eps: json["layer_norm_eps"].as_f64().map(|v| v as f32),
-            
+
             hidden_activation: json["hidden_activation"]
                 .as_str()
                 .unwrap_or("silu")
                 .to_string(),
-            
+
             use_qk_norm: json["use_qk_norm"].as_bool().unwrap_or(false),
             scale_embeddings: json["scale_embeddings"].as_bool().unwrap_or(false),
-            query_pre_attn_scalar: json["query_pre_attn_scalar"]
-                .as_f64()
-                .map(|v| v as f32),
-            
+            query_pre_attn_scalar: json["query_pre_attn_scalar"].as_f64().map(|v| v as f32),
+
             dtype: "bfloat16".to_string(),
             use_flash_attention: true,
             use_kv_cache: true,
         };
-        
+
         Ok(config)
     }
-    
+
     /// Detect configuration from weights only (fallback)
     fn detect_from_weights(weights: &HashMap<String, Tensor>) -> Result<Self> {
         // Start with defaults
         let mut config = Self::default();
-        
+
         // Detect architecture from weight names
         config.architecture = Self::detect_architecture_from_weights(weights);
-        
+
         // Extract dimensions from embeddings
-        if let Some(embed) = weights.get("model.embed_tokens.weight")
-            .or_else(|| weights.get("embed_tokens.weight")) {
+        if let Some(embed) = weights
+            .get("model.embed_tokens.weight")
+            .or_else(|| weights.get("embed_tokens.weight"))
+        {
             let shape = embed.size();
             config.vocab_size = shape[0] as usize;
             config.hidden_size = shape[1] as usize;
         }
-        
+
         // Count layers
         config.num_hidden_layers = Self::count_layers(weights);
-        
+
         // Detect attention configuration from projections
         Self::detect_attention_config(weights, &mut config)?;
-        
+
         // Apply architecture-specific defaults
         config.apply_architecture_defaults();
-        
+
         Ok(config)
     }
-    
+
     fn detect_architecture_from_json(json: &serde_json::Value) -> ModelArchitecture {
         // Check model_type field
         if let Some(model_type) = json["model_type"].as_str() {
@@ -190,7 +189,7 @@ impl ModelConfig {
                 _ => ModelArchitecture::Unknown(model_type.to_string()),
             };
         }
-        
+
         // Check architectures field
         if let Some(architectures) = json["architectures"].as_array() {
             if let Some(first) = architectures.first() {
@@ -205,10 +204,10 @@ impl ModelConfig {
                 }
             }
         }
-        
+
         ModelArchitecture::Unknown("unknown".to_string())
     }
-    
+
     fn detect_architecture_from_weights(weights: &HashMap<String, Tensor>) -> ModelArchitecture {
         // Check for architecture-specific weight patterns
         for key in weights.keys() {
@@ -219,23 +218,21 @@ impl ModelConfig {
                 return ModelArchitecture::Gemma;
             }
         }
-        
+
         // Default to Llama as most common
         ModelArchitecture::Llama
     }
-    
+
     fn detect_version(json: &serde_json::Value, architecture: &ModelArchitecture) -> u32 {
         // Try to extract version from model_type or name
         if let Some(model_type) = json["model_type"].as_str() {
-            if let Some(captures) = regex::Regex::new(r"(\d+)")
-                .unwrap()
-                .captures(model_type) {
+            if let Some(captures) = regex::Regex::new(r"(\d+)").unwrap().captures(model_type) {
                 if let Ok(version) = captures[1].parse::<u32>() {
                     return version;
                 }
             }
         }
-        
+
         // Architecture-specific version detection
         match architecture {
             ModelArchitecture::Qwen => {
@@ -248,22 +245,18 @@ impl ModelConfig {
             _ => 1,
         }
     }
-    
+
     fn parse_rope_scaling(json: &serde_json::Value) -> Option<RopeScaling> {
-        json["rope_scaling"].as_object().map(|obj| {
-            RopeScaling {
-                rope_type: obj["type"].as_str().unwrap_or("linear").to_string(),
-                factor: obj["factor"].as_f64().unwrap_or(1.0) as f32,
-            }
+        json["rope_scaling"].as_object().map(|obj| RopeScaling {
+            rope_type: obj["type"].as_str().unwrap_or("linear").to_string(),
+            factor: obj["factor"].as_f64().unwrap_or(1.0) as f32,
         })
     }
-    
+
     fn count_layers(weights: &HashMap<String, Tensor>) -> usize {
         let mut max_layer = 0;
         for key in weights.keys() {
-            if let Some(captures) = regex::Regex::new(r"layers\.(\d+)")
-                .unwrap()
-                .captures(key) {
+            if let Some(captures) = regex::Regex::new(r"layers\.(\d+)").unwrap().captures(key) {
                 if let Ok(layer_idx) = captures[1].parse::<usize>() {
                     max_layer = max_layer.max(layer_idx + 1);
                 }
@@ -271,20 +264,22 @@ impl ModelConfig {
         }
         max_layer
     }
-    
+
     fn detect_attention_config(weights: &HashMap<String, Tensor>, config: &mut Self) -> Result<()> {
         // Find Q and K projection shapes
-        let q_proj = weights.keys()
+        let q_proj = weights
+            .keys()
             .find(|k| k.contains("q_proj.weight"))
             .and_then(|k| weights.get(k));
-        let k_proj = weights.keys()
+        let k_proj = weights
+            .keys()
             .find(|k| k.contains("k_proj.weight"))
             .and_then(|k| weights.get(k));
-        
+
         if let (Some(q), Some(k)) = (q_proj, k_proj) {
             let q_out = q.size()[0] as usize;
             let k_out = k.size()[0] as usize;
-            
+
             // Try different head dimensions
             for head_dim in &[256, 128, 64, 32] {
                 if q_out % head_dim == 0 && k_out % head_dim == 0 {
@@ -295,10 +290,10 @@ impl ModelConfig {
                 }
             }
         }
-        
+
         Ok(())
     }
-    
+
     fn apply_architecture_defaults(&mut self) {
         match &self.architecture {
             ModelArchitecture::Qwen => {
@@ -319,27 +314,31 @@ impl ModelConfig {
             _ => {}
         }
     }
-    
+
     /// Validate configuration against actual weights
     fn validate_with_weights(&mut self, weights: &HashMap<String, Tensor>) -> Result<()> {
         // Check if detected values match weights
         if let Some(embed) = weights.get("model.embed_tokens.weight") {
             let actual_vocab = embed.size()[0] as usize;
             let actual_hidden = embed.size()[1] as usize;
-            
+
             if self.vocab_size != actual_vocab {
-                info!("⚠️ Config vocab_size {} doesn't match weights {}, using weights", 
-                         self.vocab_size, actual_vocab);
+                info!(
+                    "⚠️ Config vocab_size {} doesn't match weights {}, using weights",
+                    self.vocab_size, actual_vocab
+                );
                 self.vocab_size = actual_vocab;
             }
-            
+
             if self.hidden_size != actual_hidden {
-                info!("⚠️ Config hidden_size {} doesn't match weights {}, using weights",
-                         self.hidden_size, actual_hidden);
+                info!(
+                    "⚠️ Config hidden_size {} doesn't match weights {}, using weights",
+                    self.hidden_size, actual_hidden
+                );
                 self.hidden_size = actual_hidden;
             }
         }
-        
+
         Ok(())
     }
 }

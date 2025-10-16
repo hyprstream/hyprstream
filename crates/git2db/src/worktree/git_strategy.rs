@@ -3,9 +3,7 @@
 //! This is the default, always-available strategy that uses Git's native
 //! worktree feature for branch isolation.
 
-use super::strategy::{
-    WorktreeStrategy, WorktreeHandle, StrategyCapabilities, WorktreeMetadata,
-};
+use super::strategy::{StrategyCapabilities, WorktreeHandle, WorktreeMetadata, WorktreeStrategy};
 use crate::errors::{Git2DBError, Git2DBResult};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -52,9 +50,8 @@ impl WorktreeStrategy for GitWorktreeStrategy {
         let branch = branch.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let repo = Repository::open(&base_repo).map_err(|e| {
-                Git2DBError::internal(format!("Failed to open repository: {}", e))
-            })?;
+            let repo = Repository::open(&base_repo)
+                .map_err(|e| Git2DBError::internal(format!("Failed to open repository: {}", e)))?;
 
             // Create worktree
             let mut opts = WorktreeAddOptions::new();
@@ -93,7 +90,7 @@ impl WorktreeStrategy for GitWorktreeStrategy {
     fn capabilities(&self) -> StrategyCapabilities {
         StrategyCapabilities {
             requires_privileges: false,
-            space_efficient: false, // Full checkout per worktree
+            space_efficient: false,    // Full checkout per worktree
             relative_performance: 1.0, // Baseline
             platforms: vec!["linux", "macos", "windows"],
             requirements: Vec::new(),

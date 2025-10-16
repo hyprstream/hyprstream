@@ -3,13 +3,13 @@
 //! This module provides an abstraction for loading model weights on-demand,
 //! allowing models larger than system memory to be loaded.
 
-use anyhow::{Result, anyhow};
-use tracing::info;
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tch::{Device, Tensor, Kind as DType};
 use std::sync::{Arc, Mutex};
+use tch::{Device, Kind as DType, Tensor};
 use tokio::sync::RwLock;
+use tracing::info;
 
 /// Trait for providing weights to models
 pub trait WeightProvider: Send + Sync {
@@ -35,7 +35,7 @@ pub struct MemoryWeightProvider {
 impl MemoryWeightProvider {
     pub fn new(weights: HashMap<String, Tensor>) -> Self {
         Self {
-            weights: Arc::new(Mutex::new(weights))
+            weights: Arc::new(Mutex::new(weights)),
         }
     }
 }
@@ -86,11 +86,7 @@ unsafe impl Sync for StreamingWeightProvider {}
 
 impl StreamingWeightProvider {
     /// Create a new streaming weight provider
-    pub async fn new(
-        shard_files: Vec<PathBuf>,
-        device: Device,
-        dtype: DType,
-    ) -> Result<Self> {
+    pub async fn new(shard_files: Vec<PathBuf>, device: Device, dtype: DType) -> Result<Self> {
         // Build tensor -> shard mapping by reading headers
         let mut tensor_shard_map = HashMap::new();
 
@@ -193,7 +189,8 @@ impl WeightProvider for StreamingWeightProvider {
         drop(current_weights);
 
         // Find which shard contains this tensor
-        let shard_idx = self.tensor_shard_map
+        let shard_idx = self
+            .tensor_shard_map
             .get(name)
             .ok_or_else(|| anyhow!("Tensor {} not found in any shard", name))?;
 
@@ -201,8 +198,8 @@ impl WeightProvider for StreamingWeightProvider {
         let mut current_shard = self.current_shard.blocking_write();
         if current_shard.as_ref() != Some(shard_idx) {
             // Load new shard (blocking for simplicity - could be async)
-            let new_weights = tokio::runtime::Handle::current()
-                .block_on(self.load_shard(*shard_idx))?;
+            let new_weights =
+                tokio::runtime::Handle::current().block_on(self.load_shard(*shard_idx))?;
 
             let mut current_weights = self.current_weights.blocking_write();
             *current_weights = new_weights;
@@ -238,8 +235,8 @@ impl WeightProvider for StreamingWeightProvider {
 
         // For now, just load the first needed shard
         if let Some(shard_idx) = needed_shards.first() {
-            let new_weights = tokio::runtime::Handle::current()
-                .block_on(self.load_shard(*shard_idx))?;
+            let new_weights =
+                tokio::runtime::Handle::current().block_on(self.load_shard(*shard_idx))?;
 
             let mut current_weights = self.current_weights.blocking_write();
             *current_weights = new_weights;

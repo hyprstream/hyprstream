@@ -148,7 +148,10 @@ impl Git2DB {
 
                 tokio::task::spawn_blocking(move || -> Git2DBResult<()> {
                     let repo = Repository::open(&registry_path).map_err(|e| {
-                        Git2DBError::repository(&registry_path, format!("Failed to open registry: {}", e))
+                        Git2DBError::repository(
+                            &registry_path,
+                            format!("Failed to open registry: {}", e),
+                        )
                     })?;
 
                     let mut opts = WorktreeAddOptions::new();
@@ -324,7 +327,10 @@ impl TransactionHandle {
         }
 
         // Will need to clone - queue upsert operation
-        debug!("Transaction {}: queue ensure {} from {}", state.id, name, url);
+        debug!(
+            "Transaction {}: queue ensure {} from {}",
+            state.id, name, url
+        );
 
         let result_id = Arc::new(RwLock::new(None));
         state.operations.push(Operation::Upsert {
@@ -383,7 +389,9 @@ impl TransactionHandle {
             match operation {
                 Operation::Clone { id, name, url } => {
                     debug!("Cloning {} from {} with ID {}", name, url, id);
-                    registry.add_repository_with_id(id.clone(), name, url).await?;
+                    registry
+                        .add_repository_with_id(id.clone(), name, url)
+                        .await?;
                 }
                 Operation::Remove { id } => {
                     debug!("Removing repository {}", id);
@@ -393,21 +401,34 @@ impl TransactionHandle {
                     debug!("Updating repository {}", id);
                     registry.update_repository(id, url.clone()).await?;
                 }
-                Operation::Upsert { name, url, result_id } => {
+                Operation::Upsert {
+                    name,
+                    url,
+                    result_id,
+                } => {
                     debug!("Upserting {} from {}", name, url);
 
                     // Check if repository already exists
                     if let Some(existing) = registry.get_by_name(name) {
-                        debug!("Repository '{}' already exists with ID {}", name, existing.id);
+                        debug!(
+                            "Repository '{}' already exists with ID {}",
+                            name, existing.id
+                        );
                         // Update result_id with existing ID
                         *result_id.write().await = Some(existing.id.clone());
                     } else {
                         // Use the pre-generated ID from ensure()
-                        let expected_id = result_id.read().await.clone()
-                            .ok_or_else(|| Git2DBError::internal("Upsert operation missing pre-generated ID"))?;
+                        let expected_id = result_id.read().await.clone().ok_or_else(|| {
+                            Git2DBError::internal("Upsert operation missing pre-generated ID")
+                        })?;
 
-                        debug!("Creating repository '{}' with pre-generated ID {}", name, expected_id);
-                        registry.add_repository_with_id(expected_id, name, url).await?;
+                        debug!(
+                            "Creating repository '{}' with pre-generated ID {}",
+                            name, expected_id
+                        );
+                        registry
+                            .add_repository_with_id(expected_id, name, url)
+                            .await?;
                         // ID is already set in result_id from ensure()
                     }
                 }
@@ -558,14 +579,20 @@ impl<'a> Transaction<'a> {
     }
 
     pub async fn ensure(&mut self, name: &str, url: &str) -> Git2DBResult<RepoId> {
-        debug!("Legacy transaction {}: ensure {} from {}", self.tx_id, name, url);
+        debug!(
+            "Legacy transaction {}: ensure {} from {}",
+            self.tx_id, name, url
+        );
         self.operations
             .push(format!("ensure {} from {}", name, url));
         self.registry.upsert_repository(name, url).await
     }
 
     pub async fn clone(&mut self, name: &str, url: &str) -> Git2DBResult<RepoId> {
-        debug!("Legacy transaction {}: clone {} from {}", self.tx_id, name, url);
+        debug!(
+            "Legacy transaction {}: clone {} from {}",
+            self.tx_id, name, url
+        );
         self.operations.push(format!("clone {} from {}", name, url));
         self.registry.add_repository(name, url).await
     }
