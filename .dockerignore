@@ -1,0 +1,40 @@
+# Build artifacts
+target/
+dist/
+
+# Git repository
+.git/
+.gitignore
+
+# Archives and logs
+*.tar.gz
+*.log
+
+# Environment and secrets
+.env
+*.pem
+*.key
+
+# Documentation (not needed in image)
+*.md
+!README.md
+
+# CI/CD
+.github/
+
+# Development files
+*.sh
+!run-hyprstream.sh
+
+# Test files
+tests/
+examples/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Package files
+cuda-keyring_*.deb

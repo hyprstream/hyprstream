@@ -87,9 +87,7 @@ thiserror.workspace = true
 rayon.workspace = true  # Parallel processing for tensor operations
 memmap2.workspace = true
 rand.workspace = true
-# PyTorch Rust bindings - feature-gated for CPU/CUDA/ROCm
-tch = { version = "0.21", git = "https://github.com/LaurentMazare/tch-rs", optional = true }
-tch-rocm = { package = "tch", version = "0.21", git = "https://github.com/hyprstream/tch-rs", branch = "hip", optional = true }
+tch = { git = "https://github.com/LaurentMazare/tch-rs", branch = "main" }
 
 # Candle ML Framework - REMOVED: Fully migrated to Tch (PyTorch Rust bindings)
 # candle-core = "0.9.1"
@@ -137,12 +135,6 @@ half.workspace = true
 shellexpand.workspace = true
 
 [features]
-default = ["tch-cpu"]
-# PyTorch backend selection (mutually exclusive)
-tch-cpu = ["dep:tch"]
-tch-cuda = ["dep:tch"]
-tch-rocm = ["dep:tch-rocm"]
-# Other features
 otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:opentelemetry-semantic-conventions", "dep:opentelemetry-stdout"]
 gittorrent = ["dep:gittorrent", "git2db/gittorrent-transport"]  # Enable P2P model sharing via gittorrent transport
 
