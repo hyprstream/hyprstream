@@ -1,4 +1,5 @@
 .claude
+*.swp
 .env
 .aider*
 .context

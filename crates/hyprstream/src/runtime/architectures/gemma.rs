@@ -1139,7 +1139,7 @@ mod tests {
         };
         
         // Test tensor with shape [1, 21, 1024]
-        let tensor = Tensor::randn(0.0, 1.0, &[1, 21, 1024], &device).unwrap();
+        let tensor = Tensor::randn(&[1, 21, 1024], (DType::Float, device));
         
         // Reshape for key/value (MQA)
         let reshaped = model.reshape_for_attention(&tensor, true).unwrap();
@@ -1161,10 +1161,16 @@ mod tests {
             num_heads: 16,
             num_kv_heads: 4,
             head_dim: 256,
+            rope_theta: 10000.0,
+            q_norm: None,
+            k_norm: None,
+            query_pre_attn_scalar: None,
+            sliding_window: None,
+            layer_type: "global".to_string(),
         };
         
         // Create KV tensor with 4 heads
-        let kv = Tensor::randn(0.0, 1.0, &[2, 10, 4, 256], &device).unwrap();
+        let kv = Tensor::randn(&[2, 10, 4, 256], (DType::Float, device));
         
         // Expand to match 16 query heads
         let expanded = attn.expand_kv_for_mqa(&kv).unwrap();
