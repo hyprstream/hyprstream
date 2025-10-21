@@ -26,10 +26,13 @@ jobs:
         include:
           - variant: cpu
             tag_suffix: cpu
+            docker_variant: cpu
           - variant: cuda-129
             tag_suffix: cuda-129
+            docker_variant: cuda
           - variant: rocm-6.4
             tag_suffix: rocm-6.4
+            docker_variant: rocm
 
     steps:
     - name: Log in to Docker Hub
@@ -73,7 +76,7 @@ jobs:
         context: .
         file: ./Dockerfile
         build-args: |
-          VARIANT=${{ matrix.variant }}
+          VARIANT=${{ matrix.docker_variant }}
         push: ${{ github.event_name != 'pull_request' }}
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
