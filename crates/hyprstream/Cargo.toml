@@ -87,8 +87,7 @@ thiserror.workspace = true
 rayon.workspace = true  # Parallel processing for tensor operations
 memmap2.workspace = true
 rand.workspace = true
-# PyTorch Rust bindings - replaces Candle
-tch.workspace = true
+tch = { git = "https://github.com/hyprstream/tch-rs", branch = "hip" }
 
 # Candle ML Framework - REMOVED: Fully migrated to Tch (PyTorch Rust bindings)
 # candle-core = "0.9.1"
@@ -136,8 +135,6 @@ half.workspace = true
 shellexpand.workspace = true
 
 [features]
-default = ["gittorrent"]
-cuda = []
 otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:opentelemetry-semantic-conventions", "dep:opentelemetry-stdout"]
 gittorrent = ["dep:gittorrent", "git2db/gittorrent-transport"]  # Enable P2P model sharing via gittorrent transport
 

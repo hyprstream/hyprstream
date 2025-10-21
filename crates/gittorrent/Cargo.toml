@@ -1,0 +1,86 @@
+[package]
+name = "gittorrent"
+version = "0.2.0"
+edition = "2021"
+authors = ["Chris Ball <chris@printf.net>"]
+description = "Decentralized git hosting using libp2p networking"
+license = "MIT"
+repository = "https://github.com/cjb/gittorrent"
+keywords = ["git", "p2p", "libp2p", "decentralized", "networking"]
+categories = ["network-programming", "development-tools"]
+
+[[bin]]
+name = "gittorrentd"
+path = "src/bin/gittorrentd.rs"
+
+[[bin]]
+name = "git-remote-gittorrent"
+path = "src/bin/git-remote-gittorrent.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4.0", features = ["derive"] }
+
+# Crypto
+ed25519-dalek = { version = "2.0", features = ["rand_core"] }
+rand = "0.8"
+
+# Networking
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1.0"
+
+# Encoding
+hex = "0.4"
+base64 = "0.21"
+
+# Configuration
+config = "0.13"
+dirs = "5.0"
+toml = "0.8"
+
+# Git utilities
+git2 = "0.19"
+
+# Using libp2p for P2P networking and DHT
+
+# Terminal colors
+colored = "2.0"
+
+# File operations
+glob = "0.3"
+tempfile = "3.0"
+
+# XET integration dependencies
+async-trait = "0.1"
+
+# libp2p networking
+libp2p = { version = "0.56", features = ["kad", "mdns", "noise", "tcp", "tokio", "yamux", "identify", "request-response", "macros"] }
+multihash = "0.19"
+sha2 = "0.10"
+
+# Additional networking and crypto
+futures = "0.3"
+bincode = "1.3"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[features]
+default = []
+# Enable additional debug logging
+debug = []

@@ -1,0 +1,21 @@
+# GitTorrent Remote Helper Configuration
+
+# P2P port for DHT (0 = random)
+p2p_port = 4001
+
+# Bootstrap nodes (multiaddr format)
+bootstrap_nodes = [
+    "/ip4/127.0.0.1/tcp/9999/p2p/12D3KooWAH2hSYGijcVs3VhZJjtk1djFP98gTS886FsqQf75amaN"
+]
+
+# Storage directory for cached repositories
+# storage_dir = "/path/to/storage"
+
+# Service bind address
+bind_address = "127.0.0.1"
+
+# Service bind port
+bind_port = 8081
+
+# Enable auto-discovery via mDNS
+auto_discovery = true

@@ -10,7 +10,13 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
 
-    let libtorch_path = env::var("LIBTORCH").unwrap_or_else(|_| "./libtorch".to_string());
+    // If using Python PyTorch or download-libtorch, tch-rs handles libtorch setup
+    if env::var("LIBTORCH_USE_PYTORCH").is_ok() || env::var("LIBTORCH").is_err() {
+        // tch-rs will handle libtorch setup
+        return;
+    }
+
+    let libtorch_path = env::var("LIBTORCH").unwrap();
 
     // Validate libtorch exists
     let libtorch_dir = Path::new(&libtorch_path);
