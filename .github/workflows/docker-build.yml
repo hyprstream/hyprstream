@@ -32,6 +32,11 @@ jobs:
             tag_suffix: rocm-6.4
 
     steps:
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
     - name: Checkout repository
       uses: actions/checkout@v4
 
@@ -52,10 +57,14 @@ jobs:
       with:
         images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         tags: |
-          type=ref,event=branch,suffix=-${{ matrix.tag_suffix }}
-          type=ref,event=pr,suffix=-${{ matrix.tag_suffix }}
+          # PR builds - tagged as pr-{number}
+          type=ref,event=pr,suffix=-${{ matrix.tag_suffix }},prefix=pr-
+          # Branch builds (excluding main) - tagged as {branch}
+          type=ref,event=branch,suffix=-${{ matrix.tag_suffix }},enable={{is_default_branch}}==false
+          # Tag builds (releases) - semantic versioning
           type=semver,pattern={{version}},suffix=-${{ matrix.tag_suffix }}
           type=semver,pattern={{major}}.{{minor}},suffix=-${{ matrix.tag_suffix }}
+          # Latest tag for main branch
           type=raw,value=latest,enable={{is_default_branch}},suffix=-${{ matrix.tag_suffix }}
 
     - name: Build and push Docker image
