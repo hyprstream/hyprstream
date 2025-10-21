@@ -1492,7 +1492,7 @@ mod tests {
         };
         
         // Test tensor with shape [2, 10, 4096]
-        let tensor = Tensor::randn(0.0, 1.0, &[2, 10, 4096], &device).unwrap();
+        let tensor = Tensor::randn(&[2, 10, 4096], (DType::Float, device));
         
         // Reshape for key/value (GQA)
         let reshaped = model.reshape_for_attention(&tensor, true).unwrap();
@@ -1519,14 +1519,19 @@ mod tests {
                 scaling_type: "linear".to_string(),
                 factor: 8.0,
             }),
-            hidden_activation: "silu".to_string(),
+            q_norm: None,
+            k_norm: None,
+            query_pre_attn_scalar: None,
+            sliding_window: None,
+            layer_type: "global".to_string(),
+            layer_idx: 0,
         };
         
         // Create KV tensor with 8 heads
-        let kv = Tensor::randn(0.0, 1.0, &[2, 10, 8, 128], &device).unwrap();
+        let kv = Tensor::randn(&[2, 10, 8, 128], (DType::Float, device));
         
-        // Expand to match 32 query heads
-        let expanded = attn.expand_kv_for_gqa(&kv).unwrap();
+        // Expand to match 32 query heads (8 KV heads -> 32 Q heads)
+        let expanded = attn.expand_kv_for_gqa_with_heads(&kv, 8).unwrap();
         assert_eq!(expanded.size(), &[2, 10, 32, 128]);
     }
 }

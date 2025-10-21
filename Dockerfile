@@ -27,7 +27,8 @@ RUN apt-get update && apt-get install -y \
     dialog \
     rsync \
     ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
 # Install Rust
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -49,7 +50,8 @@ RUN wget https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_6
     apt-get update && \
     apt-get install -y \
     cuda-toolkit-13-0 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
 # Download and extract LibTorch for CUDA
 RUN wget -q ${LIBTORCH_CUDA_URL} -O libtorch.zip && \
@@ -126,7 +128,8 @@ RUN apt-get update && apt-get install -y \
     git \
     git-lfs \
     wget \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
 #############################################
 # CUDA Runtime
@@ -141,7 +144,8 @@ RUN wget https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_6
     apt-get update && \
     apt-get install -y \
     cuda-runtime-13-0 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
 # Copy LibTorch libraries from builder
 COPY --from=builder /opt/libtorch /opt/libtorch
@@ -158,7 +162,8 @@ RUN wget https://repo.radeon.com/amdgpu-install/7.0.2/ubuntu/jammy/amdgpu-instal
     apt install -y python3-setuptools python3-wheel rsync dialog && \
     apt update && \
     apt install -y rocm && \
-    rm -rf /var/lib/apt/lists/*;
+    rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
 # Copy LibTorch libraries from builder
 COPY --from=builder /opt/libtorch /opt/libtorch

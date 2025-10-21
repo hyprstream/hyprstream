@@ -137,6 +137,7 @@ shellexpand.workspace = true
 [features]
 otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:opentelemetry-semantic-conventions", "dep:opentelemetry-stdout"]
 gittorrent = ["dep:gittorrent", "git2db/gittorrent-transport"]  # Enable P2P model sharing via gittorrent transport
+download-libtorch = ["tch/download-libtorch"]
 
 [build-dependencies]
 cc.workspace = true

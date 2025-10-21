@@ -124,7 +124,6 @@ impl Default for StoragePaths {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     #[tokio::test]
     async fn test_storage_paths() {

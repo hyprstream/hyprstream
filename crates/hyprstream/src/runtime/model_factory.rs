@@ -231,9 +231,6 @@ impl ModelFactory {
                         // Copy BF16 data into owned vector (avoids use-after-free)
                         let owned_bytes: Vec<u8> = data.to_vec();
 
-                        // Calculate total number of elements
-                        let numel: i64 = shape.iter().product();
-
                         // Create tensor directly from bytes on CPU with BF16 dtype
                         // This uses tch's internal C++ API to wrap the data
                         let cpu_tensor = unsafe {

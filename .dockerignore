@@ -1,6 +1,7 @@
 # Build artifacts
 target/
 dist/
+**/*.rs.bk
 
 # Git repository
 .git/
@@ -9,32 +10,53 @@ dist/
 # Archives and logs
 *.tar.gz
 *.log
+*.tmp
+temp/
+tmp/
 
 # Environment and secrets
 .env
+.env.*
 *.pem
 *.key
 
 # Documentation (not needed in image)
 *.md
 !README.md
+docs/
 
 # CI/CD
 .github/
 
 # Development files
 *.sh
-!run-hyprstream.sh
 
 # Test files
 tests/
 examples/
+benches/
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
 
 # Package files
-cuda-keyring_*.deb
+*.deb
+
+# Cache directories
+node_modules/
+.cache/
+
+# Rust specific
+Cargo.lock
+*.profraw
+
+# Config directories
+config/

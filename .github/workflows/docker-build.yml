@@ -1,0 +1,129 @@
+name: Build Docker Images
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ 'v*.*.*' ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: hyprstream
+
+jobs:
+  build-docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        variant: [cpu, cuda-129, rocm-6.4]
+        include:
+          - variant: cpu
+            tag_suffix: cpu
+            docker_variant: cpu
+          - variant: cuda-129
+            tag_suffix: cuda-129
+            docker_variant: cuda
+          - variant: rocm-6.4
+            tag_suffix: rocm-6.4
+            docker_variant: rocm
+
+    steps:
+    - name: Clean up disk space before build
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo apt-get clean
+        docker system prune -af --volumes || true
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Cache Cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: cargo-${{ runner.os }}-${{ matrix.variant }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          cargo-${{ runner.os }}-${{ matrix.variant }}-
+          cargo-${{ runner.os }}-
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      if: github.event_name != 'pull_request'
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          # PR builds - tagged as pr-{number}
+          type=ref,event=pr,suffix=-${{ matrix.tag_suffix }},prefix=pr-
+          # Branch builds (excluding main) - tagged as {branch}
+          type=ref,event=branch,suffix=-${{ matrix.tag_suffix }},enable=${{ github.ref_name != 'main' }}
+          # Tag builds (releases) - semantic versioning
+          type=semver,pattern={{version}},suffix=-${{ matrix.tag_suffix }}
+          type=semver,pattern={{major}}.{{minor}},suffix=-${{ matrix.tag_suffix }}
+          # Latest tag for main branch
+          type=raw,value=latest,enable={{is_default_branch}},suffix=-${{ matrix.tag_suffix }}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: ./Dockerfile
+        build-args: |
+          VARIANT=${{ matrix.docker_variant }}
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        platforms: linux/amd64
+        cache-from: type=gha,scope=build-${{ matrix.variant }}
+        cache-to: type=gha,mode=max,scope=build-${{ matrix.variant }}
+
+    - name: Generate SBOM
+      if: github.event_name != 'pull_request'
+      uses: anchore/sbom-action@v0
+      with:
+        image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+        format: spdx-json
+        output-file: sbom-${{ matrix.variant }}.spdx.json
+
+    - name: Upload SBOM
+      if: github.event_name != 'pull_request'
+      uses: actions/upload-artifact@v4
+      with:
+        name: sbom-${{ matrix.variant }}
+        path: sbom-${{ matrix.variant }}.spdx.json
+
+    - name: Clean up disk space after build
+      if: always()
+      run: |
+        echo "=== Cleaning up after ${{ matrix.variant }} build ==="
+        docker system prune -af --volumes || true
+        rm -rf ~/.cargo/registry/cache ~/.cargo/git
+        sudo apt-get autoremove -y || true
+        echo "=== Disk usage after cleanup ==="
+        df -h
