@@ -45,6 +45,49 @@ Hyprstream uses feature flags to select the PyTorch backend:
 - **`tch-cuda`**: NVIDIA GPU acceleration via CUDA
 - **`tch-rocm`**: AMD GPU acceleration via ROCm/HIP
 
+### Run with Docker:
+
+1. Pull model(s):
+
+```
+$ sudo docker --rm -it -v hyprstream-models:/root/.local/share/hyprstream hyprstream:dev clone https://huggingface.co/qwen/qwen3-0.6b
+```
+
+2. Test inference and GPU initialization
+
+```
+$ sudo docker --rm -it -v hyprstream-models:/root/.local/share/hyprstream hyprstream:dev infer --prompt "hello world" qwen3-0.6b
+```
+
+
+3. Deploy openai compatible server:
+
+```
+$ sudo docker --rm -it -v hyprstream-models:/root/.local/share/hyprstream h --device=/dev/kfd --device=/dev/dri hyprstream:dev
+```
+
+Interactive shell:
+
+```
+$ sudo docker --rm -it --device=/dev/kfd --device=/dev/dri --entrypoint=bash hyprstream:dev
+$ hyprstream clone https://huggingface.co/qwen/qwen3-0.6b
+$ hyprstream infer --prompt "hello world" --max-tokens 1024 qwen3-0.6b
+```
+
+### Building Docker images
+
+#### ROCm:
+
+$ docker build -t hyprstream:dev-rocm --build-arg variant=rocm .
+
+#### Nvidia:
+
+$ docker build -t hyprstream:dev-cuda --build-arg variant=cuda .
+
+#### CPU:
+
+$ docker build -t hyprstream:dev-cpu .
+
 ### Building from Source
 
 #### 1. Clone Repository

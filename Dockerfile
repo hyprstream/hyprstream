@@ -5,9 +5,8 @@ ARG VARIANT=cpu
 ARG DEBIAN_VERSION=bookworm
 
 # LibTorch download URLs for manual installation
-ARG LIBTORCH_CUDA_URL=https://download.pytorch.org/libtorch/cu130/libtorch-shared-with-deps-2.9.0%2Bcu130.zip
-#ARG LIBTORCH_CUDA_URL=https://download.pytorch.org/libtorch/cu129/libtorch-shared-with-deps-2.8.0%2Bcu129.zip
-ARG LIBTORCH_ROCM_URL=https://download.pytorch.org/libtorch/nightly/rocm7.0/libtorch-shared-with-deps-latest.zip
+ARG LIBTORCH_CUDA_URL=https://download.pytorch.org/libtorch/cu129/libtorch-shared-with-deps-2.8.0%2Bcu129.zip
+ARG LIBTORCH_ROCM_URL=https://download.pytorch.org/libtorch/rocm6.4/libtorch-shared-with-deps-2.8.0%2Brocm6.4.zip
 ARG LIBTORCH_CPU_URL=https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-2.8.0%2Bcpu.zip
 
 #############################################
@@ -104,6 +103,9 @@ WORKDIR /build
 # Copy project files
 COPY Cargo.toml ./
 COPY crates ./crates
+
+ENV LIBTORCH=/opt/libtorch
+ENV LD_LIBRARY_PATH=/opt/libtorch/lib:$LD_LIBRARY_PATH
 
 # Build the project
 # LIBTORCH is already set in the variant-specific builder stages
