@@ -2,10 +2,10 @@
 name = "gittorrent"
 version = "0.2.0"
 edition = "2021"
-authors = ["Chris Ball <chris@printf.net>"]
+authors = ["Erica Windsich <erica@cyberdione.ai>"]
 description = "Decentralized git hosting using libp2p networking"
 license = "MIT"
-repository = "https://github.com/cjb/gittorrent"
+repository = "https://github.com/hyprstream/hyprstream/tree/main/crates/gittorrent"
 keywords = ["git", "p2p", "libp2p", "decentralized", "networking"]
 categories = ["network-programming", "development-tools"]
 
