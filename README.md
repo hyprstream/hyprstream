@@ -47,29 +47,35 @@ Hyprstream uses feature flags to select the PyTorch backend:
 
 ### Run with Docker:
 
+0. Set the tag
+
+```
+export TAG=latest-cuda-129 # or latest-rocm-6.4, latest-cpu, etc.
+```
+
 1. Pull model(s):
 
 ```
-$ sudo docker --rm -it -v hyprstream-models:/root/.local/share/hyprstream hyprstream:dev clone https://huggingface.co/qwen/qwen3-0.6b
+$ sudo docker run --rm -it -v hyprstream-models:/root/.local/share/hyprstream hyprstream:$TAG clone https://huggingface.co/qwen/qwen3-0.6b
 ```
 
 2. Test inference and GPU initialization
 
 ```
-$ sudo docker --rm -it -v hyprstream-models:/root/.local/share/hyprstream hyprstream:dev infer --prompt "hello world" qwen3-0.6b
+$ sudo docker run --rm -it -v hyprstream-models:/root/.local/share/hyprstream hyprstream:$TAG infer --prompt "hello world" qwen3-0.6b
 ```
 
 
 3. Deploy openai compatible server:
 
 ```
-$ sudo docker --rm -it -v hyprstream-models:/root/.local/share/hyprstream h --device=/dev/kfd --device=/dev/dri hyprstream:dev
+$ sudo docker run --rm -it -v hyprstream-models:/root/.local/share/hyprstream h --device=/dev/kfd --device=/dev/dri hyprstream:$TAG
 ```
 
 Interactive shell:
 
 ```
-$ sudo docker --rm -it --device=/dev/kfd --device=/dev/dri --entrypoint=bash hyprstream:dev
+$ sudo docker run --rm -it --device=/dev/kfd --device=/dev/dri --entrypoint=bash hyprstreamv
 $ hyprstream clone https://huggingface.co/qwen/qwen3-0.6b
 $ hyprstream infer --prompt "hello world" --max-tokens 1024 qwen3-0.6b
 ```
@@ -78,15 +84,15 @@ $ hyprstream infer --prompt "hello world" --max-tokens 1024 qwen3-0.6b
 
 #### ROCm:
 
-$ docker build -t hyprstream:dev-rocm --build-arg variant=rocm .
+$ docker build -t hyprstreamv-rocm --build-arg variant=rocm .
 
 #### Nvidia:
 
-$ docker build -t hyprstream:dev-cuda --build-arg variant=cuda .
+$ docker build -t hyprstreamv-cuda --build-arg variant=cuda .
 
 #### CPU:
 
-$ docker build -t hyprstream:dev-cpu .
+$ docker build -t hyprstreamv-cpu .
 
 ### Building from Source
 
