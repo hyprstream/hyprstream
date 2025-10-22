@@ -10,6 +10,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 #[cfg(feature = "xet-storage")]
+use std::ffi::CString;
+
+#[cfg(feature = "xet-storage")]
+use libc::c_char;
+
+#[cfg(feature = "xet-storage")]
 use crate::ffi::GitFilter;
 
 #[cfg(feature = "xet-storage")]
@@ -34,6 +40,7 @@ pub struct XetFilter<State = Unregistered> {
     inner: Pin<Box<GitFilter>>,
     payload: Option<Box<XetFilterPayload>>,
     name: String,
+    attributes_cstr: Option<CString>,
     _state: PhantomData<State>,
 }
 
@@ -60,10 +67,15 @@ impl XetFilter<Unregistered> {
         // Create payload
         let payload = Box::new(XetFilterPayload { storage, runtime });
 
+        // creating a CString for attributes
+        let attributes_cstr = CString::new("xet")
+            .map_err(|_| XetError::new(XetErrorKind::RuntimeError, "Invalid attribute string"))?;
+        let attributes_ptr = attributes_cstr.as_ptr() as *const c_char;
+
         // Create filter structure
         let filter = Box::pin(GitFilter {
             version: crate::ffi::GIT_FILTER_VERSION,
-            attributes: attrs_cstring.as_ptr(),
+            attributes: attributes_ptr,
             initialize: Some(crate::callbacks::xet_filter_initialize),
             shutdown: Some(crate::callbacks::xet_filter_shutdown),
             check: Some(crate::callbacks::xet_filter_check),
@@ -75,6 +87,7 @@ impl XetFilter<Unregistered> {
             inner: filter,
             payload: Some(payload),
             name: "xet".to_string(),
+            attributes_cstr: Some(attributes_cstr),
             _state: PhantomData,
         })
     }
@@ -83,9 +96,9 @@ impl XetFilter<Unregistered> {
     ///
     /// Transitions to Registered state on success
     pub fn register(mut self, priority: i32) -> Result<XetFilter<Registered>> {
-        use std::ffi::CString;
+        use std::ffi::CString as FfiCString;
 
-        let name_cstr = CString::new(self.name.as_str())
+        let name_cstr = FfiCString::new(self.name.as_str())
             .map_err(|_| XetError::new(XetErrorKind::RuntimeError, "Invalid filter name"))?;
 
         // SAFETY: We're passing a stable pointer to a Pin<Box<GitFilter>>
@@ -123,6 +136,7 @@ impl XetFilter<Unregistered> {
             inner: self.inner,
             payload: None, // Ownership transferred to global registry
             name: self.name,
+            attributes_cstr: self.attributes_cstr,
             _state: PhantomData,
         })
     }
@@ -167,6 +181,7 @@ impl XetFilter<Registered> {
                 inner: self.inner,
                 payload: Some(payload_box),
                 name: self.name,
+                attributes_cstr: self.attributes_cstr,
                 _state: PhantomData,
             })
         }
