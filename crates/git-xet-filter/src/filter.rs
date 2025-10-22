@@ -1,5 +1,7 @@
 //! XET filter implementation with type state pattern
 
+use std::ffi::CString;
+
 #[cfg(feature = "xet-storage")]
 use std::marker::PhantomData;
 
@@ -8,9 +10,6 @@ use std::pin::Pin;
 
 #[cfg(feature = "xet-storage")]
 use std::sync::Arc;
-
-#[cfg(feature = "xet-storage")]
-use std::ffi::CString;
 
 #[cfg(feature = "xet-storage")]
 use libc::c_char;
