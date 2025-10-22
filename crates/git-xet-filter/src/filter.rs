@@ -95,9 +95,7 @@ impl XetFilter<Unregistered> {
     ///
     /// Transitions to Registered state on success
     pub fn register(mut self, priority: i32) -> Result<XetFilter<Registered>> {
-        use std::ffi::CString as FfiCString;
-
-        let name_cstr = FfiCString::new(self.name.as_str())
+        let name_cstr = CString::new(self.name.as_str())
             .map_err(|_| XetError::new(XetErrorKind::RuntimeError, "Invalid filter name"))?;
 
         // SAFETY: We're passing a stable pointer to a Pin<Box<GitFilter>>
@@ -147,8 +145,6 @@ impl XetFilter<Registered> {
     ///
     /// Transitions back to Unregistered state
     pub fn unregister(mut self) -> Result<XetFilter<Unregistered>> {
-        use std::ffi::CString;
-
         let name_cstr = CString::new(self.name.as_str())
             .map_err(|_| XetError::new(XetErrorKind::RuntimeError, "Invalid filter name"))?;
 
