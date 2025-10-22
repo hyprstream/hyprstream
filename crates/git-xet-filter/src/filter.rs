@@ -63,7 +63,7 @@ impl XetFilter<Unregistered> {
         // Create filter structure
         let filter = Box::pin(GitFilter {
             version: crate::ffi::GIT_FILTER_VERSION,
-            attributes: c"xet".as_ptr(),
+            attributes: attrs_cstring.as_ptr(),
             initialize: Some(crate::callbacks::xet_filter_initialize),
             shutdown: Some(crate::callbacks::xet_filter_shutdown),
             check: Some(crate::callbacks::xet_filter_check),
