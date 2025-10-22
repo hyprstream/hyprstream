@@ -67,8 +67,7 @@ impl XetFilter<Unregistered> {
         let payload = Box::new(XetFilterPayload { storage, runtime });
 
         // creating a CString for attributes
-        let attributes_cstr = CString::new("xet")
-            .map_err(|_| XetError::new(XetErrorKind::RuntimeError, "Invalid attribute string"))?;
+        let attributes_cstr = CString::new("xet").unwrap();
         let attributes_ptr = attributes_cstr.as_ptr() as *const c_char;
 
         // Create filter structure
