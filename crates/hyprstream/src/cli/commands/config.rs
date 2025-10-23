@@ -117,21 +117,23 @@ pub struct LoggingConfig {
 impl LoggingConfig {
     pub fn get_effective_level(&self) -> &str {
         match (self.verbose, self.log_level.as_deref()) {
-            (2, _) => "trace",     // -vv flag
-            (1, _) => "debug",     // -v flag
+            (2, _) => "trace",         // -vv flag
+            (1, _) => "debug",         // -v flag
             (0, Some(level)) => level, // Configured level
-            _ => "info",           // Default
+            _ => "info",               // Default
         }
     }
-
 }
 
 impl ConfigSection for LoggingConfig {
     fn options() -> Vec<ConfigOptionDef<String>> {
         vec![
-            ConfigOptionDef::new("logging.level", "Log level (trace, debug, info, warn, error)")
-                .with_env("HYPRSTREAM_LOG_LEVEL")
-                .with_cli("log-level"),
+            ConfigOptionDef::new(
+                "logging.level",
+                "Log level (trace, debug, info, warn, error)",
+            )
+            .with_env("HYPRSTREAM_LOG_LEVEL")
+            .with_cli("log-level"),
             ConfigOptionDef::new("logging.filter", "Log filter directives")
                 .with_env("HYPRSTREAM_LOG_FILTER")
                 .with_cli("log-filter"),

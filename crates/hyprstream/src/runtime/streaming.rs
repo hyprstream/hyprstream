@@ -3,13 +3,13 @@
 //! This module provides async streaming callbacks for real-time token generation,
 //! enabling SSE/WebSocket streaming with proper backpressure and cancellation.
 
+use crate::runtime::FinishReason;
 use anyhow::Result;
 use async_trait::async_trait;
+use serde_json::json;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use std::time::Duration;
-use serde_json::json;
-use crate::runtime::FinishReason;
 
 /// Control flow for generation continuation
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -27,13 +27,13 @@ pub enum ContinueGeneration {
 pub trait StreamingCallback: Send {
     /// Called for each generated token
     async fn on_token(&mut self, token: &str) -> Result<ContinueGeneration>;
-    
+
     /// Called when generation completes
     async fn on_complete(&mut self, reason: FinishReason);
-    
+
     /// Called on error
     async fn on_error(&mut self, error: anyhow::Error);
-    
+
     /// Called at start of generation
     async fn on_start(&mut self) {}
 }
@@ -69,13 +69,13 @@ impl SseStreamingCallback {
             tokens_sent: 0,
         }
     }
-    
+
     /// Flush buffered tokens
     async fn flush(&mut self) -> Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
         }
-        
+
         let response = json!({
             "id": self.stream_id,
             "object": "chat.completion.chunk",
@@ -89,7 +89,7 @@ impl SseStreamingCallback {
                 "finish_reason": null
             }]
         });
-        
+
         // Try to send with backpressure handling
         match self.sender.try_send(Ok(response)) {
             Ok(_) => {
@@ -126,20 +126,21 @@ impl StreamingCallback for SseStreamingCallback {
                 "finish_reason": null
             }]
         });
-        
+
         let _ = self.sender.send(Ok(response)).await;
     }
-    
+
     async fn on_token(&mut self, token: &str) -> Result<ContinueGeneration> {
         self.buffer.push_str(token);
-        
+
         // Check if we should flush
         if self.buffer.len() >= self.chunk_size || 
            token.contains('\n') || // Flush on newlines for better UX
-           token.ends_with('.') || token.ends_with('!') || token.ends_with('?') {
+           token.ends_with('.') || token.ends_with('!') || token.ends_with('?')
+        {
             self.flush().await?;
         }
-        
+
         // Check for backpressure
         if self.sender.capacity() == 0 {
             // Channel is at capacity, pause briefly
@@ -148,11 +149,11 @@ impl StreamingCallback for SseStreamingCallback {
             Ok(ContinueGeneration::Continue)
         }
     }
-    
+
     async fn on_complete(&mut self, reason: FinishReason) {
         // Flush any remaining tokens
         let _ = self.flush().await;
-        
+
         // Send completion message
         let finish_reason = match reason {
             FinishReason::MaxTokens => "length",
@@ -161,7 +162,7 @@ impl StreamingCallback for SseStreamingCallback {
             FinishReason::Stop => "stop",
             FinishReason::Error(_) => "stop",
         };
-        
+
         let response = json!({
             "id": self.stream_id,
             "object": "chat.completion.chunk",
@@ -173,10 +174,10 @@ impl StreamingCallback for SseStreamingCallback {
                 "finish_reason": finish_reason
             }]
         });
-        
+
         let _ = self.sender.send(Ok(response)).await;
     }
-    
+
     async fn on_error(&mut self, error: anyhow::Error) {
         let _ = self.sender.send(Err(error)).await;
     }
@@ -201,9 +202,9 @@ impl StreamingCallback for CollectingCallback {
         self.text.push_str(token);
         Ok(ContinueGeneration::Continue)
     }
-    
+
     async fn on_complete(&mut self, _reason: FinishReason) {}
-    
+
     async fn on_error(&mut self, _error: anyhow::Error) {}
 }
 

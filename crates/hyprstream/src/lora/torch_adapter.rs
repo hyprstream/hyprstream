@@ -1,11 +1,11 @@
 //! PyTorch-native LoRA adapter implementation with full autograd support
 
+use super::{LoRAAdapter, LoRAConfig};
 use anyhow::Result;
-use tch::{nn, Device, Tensor};
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::Path;
-use async_trait::async_trait;
-use super::{LoRAConfig, LoRAAdapter};
+use tch::{nn, Device, Tensor};
 
 /// Extract LoRA components from hierarchical tensor names
 /// e.g., "model.layers.0.q_proj.lora_a.weight" -> Some(("q_proj", "lora_a"))
@@ -24,7 +24,16 @@ pub fn extract_lora_components(tensor_name: &str) -> Option<(String, String)> {
             if i > 0 {
                 let module = parts[i - 1];
                 // Filter to only the modules we care about
-                if matches!(module, "q_proj" | "k_proj" | "v_proj" | "o_proj" | "gate_proj" | "up_proj" | "down_proj") {
+                if matches!(
+                    module,
+                    "q_proj"
+                        | "k_proj"
+                        | "v_proj"
+                        | "o_proj"
+                        | "gate_proj"
+                        | "up_proj"
+                        | "down_proj"
+                ) {
                     return Some((module.to_string(), part.to_string()));
                 }
             }
@@ -95,7 +104,7 @@ impl TorchLoRALayer {
             &[config.rank, config.out_features],
             nn::Init::Const(0.0),
         );
-        
+
         let scaling = config.alpha / config.rank as f64;
 
         Ok(Self {
@@ -105,42 +114,41 @@ impl TorchLoRALayer {
             config,
         })
     }
-    
+
     /// Forward pass through the LoRA layer
     pub fn forward(&self, x: &Tensor, training: bool) -> Result<Tensor> {
         // x shape: [batch_size, seq_len, in_features] or [batch_size * seq_len, in_features]
-        
+
         // Apply LoRA: (x @ A) @ B * scaling
         let mut hidden = x.matmul(&self.lora_a);
-        
+
         // Apply dropout during training
         if training && self.config.dropout > 0.0 {
             hidden = hidden.dropout(self.config.dropout, training);
         }
-        
+
         let output = hidden.matmul(&self.lora_b);
         Ok(&output * self.scaling)
     }
-    
+
     /// Get the effective weight matrix W = A @ B * scaling
     pub fn get_weight_matrix(&self) -> Result<Tensor> {
         let weight = self.lora_a.matmul(&self.lora_b);
         Ok(&weight * self.scaling)
     }
-    
+
     /// Merge LoRA weights into base weights for inference
     pub fn merge_weight(&self, base_weight: &Tensor) -> Result<Tensor> {
         let lora_weight = &self.lora_a.matmul(&self.lora_b) * self.scaling;
         Ok(base_weight + lora_weight.transpose(0, 1))
     }
-    
+
     /// Get number of trainable parameters
     pub fn num_parameters(&self) -> i64 {
         let a_params = self.config.in_features * self.config.rank;
         let b_params = self.config.rank * self.config.out_features;
         a_params + b_params
     }
-    
 }
 
 /// Collection of LoRA layers for a model
@@ -175,13 +183,13 @@ impl LoRAModel {
     ) -> Result<Self> {
         let vs = nn::VarStore::new(device);
         let mut layers = HashMap::new();
-        
+
         for (module_name, (in_features, out_features)) in module_configs {
             // Only create LoRA for target modules
             if !config.target_modules.contains(&module_name) {
                 continue;
             }
-            
+
             let layer_config = LoRALayerConfig {
                 in_features: in_features as i64,
                 out_features: out_features as i64,
@@ -191,18 +199,18 @@ impl LoRAModel {
                 device,
                 module_name: module_name.clone(),
             };
-            
+
             let layer = TorchLoRALayer::new(&vs, layer_config)?;
             layers.insert(module_name, layer);
         }
-        
+
         let total_params: i64 = layers.values().map(|layer| layer.num_parameters()).sum();
         tracing::info!(
             "Created LoRA model with {} layers, {} total parameters",
             layers.len(),
             total_params
         );
-        
+
         Ok(Self {
             layers,
             vs,
@@ -210,7 +218,7 @@ impl LoRAModel {
             device,
         })
     }
-    
+
     /// Apply LoRA to a specific module
     pub fn forward(&self, module_name: &str, x: &Tensor, training: bool) -> Result<Option<Tensor>> {
         if let Some(layer) = self.layers.get(module_name) {
@@ -219,13 +227,13 @@ impl LoRAModel {
             Ok(None)
         }
     }
-    
+
     /// Save all LoRA weights
     pub fn save(&self, path: &str) -> Result<()> {
         self.vs.save(path)?;
         Ok(())
     }
-    
+
     /// Load all LoRA weights with dynamic tensor discovery
     pub fn load(&mut self, path: &str) -> Result<()> {
         // First try the standard VarStore load approach
@@ -235,7 +243,10 @@ impl LoRAModel {
                 return Ok(());
             }
             Err(e) => {
-                tracing::debug!("VarStore::load failed: {}, trying dynamic tensor discovery", e);
+                tracing::debug!(
+                    "VarStore::load failed: {}, trying dynamic tensor discovery",
+                    e
+                );
             }
         }
 
@@ -245,7 +256,10 @@ impl LoRAModel {
 
     /// Load LoRA weights with dynamic tensor name discovery
     fn load_with_dynamic_discovery(&mut self, path: &str) -> Result<()> {
-        tracing::info!("Attempting dynamic tensor discovery from SafeTensors file: {}", path);
+        tracing::info!(
+            "Attempting dynamic tensor discovery from SafeTensors file: {}",
+            path
+        );
 
         // Load the SafeTensors file to discover available tensors
         let safetensors_data = std::fs::read(path)?;
@@ -253,8 +267,15 @@ impl LoRAModel {
             .map_err(|e| anyhow::anyhow!("Failed to deserialize SafeTensors: {}", e))?;
 
         // Get all tensor names in the file
-        let available_tensors: Vec<String> = safetensors.names().into_iter().map(|s| s.to_string()).collect();
-        tracing::debug!("Available tensors in SafeTensors file: {:?}", available_tensors);
+        let available_tensors: Vec<String> = safetensors
+            .names()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        tracing::debug!(
+            "Available tensors in SafeTensors file: {:?}",
+            available_tensors
+        );
 
         // Use the lower-level approach to load tensors
         // Instead of directly loading into VarStore, we'll use the load mechanism with partial loading
@@ -265,63 +286,85 @@ impl LoRAModel {
             // Try to find a VarStore tensor that matches this SafeTensors tensor
             let vs_tensors = self.vs.variables();
 
-            let matching_vs_name = vs_tensors.keys()
-                .find(|vs_name| {
-                    // Exact match
-                    available_name == *vs_name ||
+            let matching_vs_name = vs_tensors.keys().find(|vs_name| {
+                // Exact match
+                available_name == *vs_name ||
                     // Match without module prefix (e.g., "lora_a" matches "q_proj_lora_a")
                     available_name.ends_with(&format!("_{}", vs_name)) ||
                     // Match with different naming conventions
                     self.tensor_names_match(vs_name, available_name)
-                });
+            });
 
             if let Some(vs_name) = matching_vs_name {
                 tracing::debug!("Found tensor match: '{}' -> '{}'", available_name, vs_name);
                 match safetensors.tensor(available_name) {
                     Ok(tensor_data) => {
                         // Convert SafeTensors tensor to raw data for tch loading
-                        let shape: Vec<i64> = tensor_data.shape().iter().map(|&s| s as i64).collect();
+                        let shape: Vec<i64> =
+                            tensor_data.shape().iter().map(|&s| s as i64).collect();
                         let tch_tensor = match tensor_data.dtype() {
                             safetensors::Dtype::F32 => {
-                                let f32_data: Vec<f32> = tensor_data.data().chunks_exact(4)
-                                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                                let f32_data: Vec<f32> = tensor_data
+                                    .data()
+                                    .chunks_exact(4)
+                                    .map(|chunk| {
+                                        f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                                    })
                                     .collect();
-                                Tensor::from_slice(&f32_data).reshape(&shape).to_device(self.device)
+                                Tensor::from_slice(&f32_data)
+                                    .reshape(&shape)
+                                    .to_device(self.device)
                             }
                             safetensors::Dtype::F16 => {
                                 // Convert f16 to f32
                                 let f16_data: &[u8] = tensor_data.data();
-                                let f32_data: Vec<f32> = f16_data.chunks_exact(2)
+                                let f32_data: Vec<f32> = f16_data
+                                    .chunks_exact(2)
                                     .map(|chunk| {
                                         let f16_bits = u16::from_le_bytes([chunk[0], chunk[1]]);
                                         half::f16::from_bits(f16_bits).to_f32()
                                     })
                                     .collect();
-                                Tensor::from_slice(&f32_data).reshape(&shape).to_device(self.device)
+                                Tensor::from_slice(&f32_data)
+                                    .reshape(&shape)
+                                    .to_device(self.device)
                             }
                             _ => {
-                                tracing::warn!("Unsupported tensor dtype for {}: {:?}", available_name, tensor_data.dtype());
+                                tracing::warn!(
+                                    "Unsupported tensor dtype for {}: {:?}",
+                                    available_name,
+                                    tensor_data.dtype()
+                                );
                                 continue;
                             }
                         };
 
                         tensors_to_load.insert(vs_name.clone(), tch_tensor);
-                        tracing::debug!("Prepared tensor '{}' -> '{}' with shape {:?}",
-                                      available_name, vs_name, shape);
+                        tracing::debug!(
+                            "Prepared tensor '{}' -> '{}' with shape {:?}",
+                            available_name,
+                            vs_name,
+                            shape
+                        );
                     }
                     Err(e) => {
                         tracing::warn!("Failed to extract tensor '{}': {}", available_name, e);
                     }
                 }
             } else {
-                tracing::debug!("No VarStore match found for SafeTensors tensor '{}' (expected patterns: {:?})",
-                              available_name, vs_tensors.keys().collect::<Vec<_>>());
+                tracing::debug!(
+                    "No VarStore match found for SafeTensors tensor '{}' (expected patterns: {:?})",
+                    available_name,
+                    vs_tensors.keys().collect::<Vec<_>>()
+                );
             }
         }
 
         // Write matched tensors to a temporary SafeTensors file and load via VarStore
         if tensors_to_load.is_empty() {
-            return Err(anyhow::anyhow!("No matching tensors found between SafeTensors file and LoRA model"));
+            return Err(anyhow::anyhow!(
+                "No matching tensors found between SafeTensors file and LoRA model"
+            ));
         }
 
         let temp_file = format!("{}.temp", path);
@@ -340,22 +383,33 @@ impl LoRAModel {
         // Load via VarStore
         match self.vs.load(&temp_file) {
             Ok(()) => {
-                tracing::debug!("Successfully loaded {} tensors via temporary file", loaded_count);
+                tracing::debug!(
+                    "Successfully loaded {} tensors via temporary file",
+                    loaded_count
+                );
                 // Clean up temporary file
                 let _ = std::fs::remove_file(&temp_file);
             }
             Err(e) => {
                 // Clean up temporary file on error
                 let _ = std::fs::remove_file(&temp_file);
-                return Err(anyhow::anyhow!("Failed to load tensors via VarStore: {}", e));
+                return Err(anyhow::anyhow!(
+                    "Failed to load tensors via VarStore: {}",
+                    e
+                ));
             }
         }
 
         if loaded_count == 0 {
-            return Err(anyhow::anyhow!("No tensors were successfully loaded from SafeTensors file"));
+            return Err(anyhow::anyhow!(
+                "No tensors were successfully loaded from SafeTensors file"
+            ));
         }
 
-        tracing::info!("Successfully loaded {} tensors using dynamic discovery", loaded_count);
+        tracing::info!(
+            "Successfully loaded {} tensors using dynamic discovery",
+            loaded_count
+        );
         Ok(())
     }
 
@@ -385,13 +439,15 @@ impl LoRAModel {
         // Handle patterns like "lora_a" matching "lora_a__2"
         (safetensors_name.starts_with(&format!("{}_", vs_name)) || safetensors_name.starts_with(&format!("{}__", vs_name)))
     }
-    
+
     /// Get total number of trainable parameters
     pub fn num_parameters(&self) -> i64 {
-        self.layers.values().map(|layer| layer.num_parameters()).sum()
+        self.layers
+            .values()
+            .map(|layer| layer.num_parameters())
+            .sum()
     }
-    
-    
+
     /// Get configuration for layer
     pub fn get_layer_config(&self, module_name: &str) -> Option<LoRALayerConfig> {
         self.layers.get(module_name).map(|layer| layer.get_config())
@@ -410,12 +466,12 @@ impl LoRAAdapter for LoRAModel {
     fn config(&self) -> &LoRAConfig {
         &self.config
     }
-    
+
     async fn save(&self, path: &Path) -> Result<()> {
         self.vs.save(path)?;
         Ok(())
     }
-    
+
     async fn load(&mut self, path: &Path) -> Result<()> {
         self.vs.load(path)?;
         Ok(())
@@ -431,9 +487,12 @@ impl LoRAAdapter for LoRAModel {
     }
 
     fn num_parameters(&self) -> i64 {
-        self.layers.values()
-            .map(|layer| layer.lora_a.size().iter().product::<i64>() +
-                        layer.lora_b.size().iter().product::<i64>())
+        self.layers
+            .values()
+            .map(|layer| {
+                layer.lora_a.size().iter().product::<i64>()
+                    + layer.lora_b.size().iter().product::<i64>()
+            })
             .sum()
     }
 }

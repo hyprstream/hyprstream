@@ -26,7 +26,11 @@ async fn test_transaction_commit_clone() {
     println!("Queued clone operation with ID: {}", id);
 
     // Repository shouldn't exist yet
-    assert_eq!(registry.list().count(), 0, "Repository shouldn't exist before commit");
+    assert_eq!(
+        registry.list().count(),
+        0,
+        "Repository shouldn't exist before commit"
+    );
 
     // Commit the transaction
     println!("Committing transaction...");
@@ -64,7 +68,11 @@ async fn test_transaction_rollback() {
     tx.rollback().await.unwrap();
 
     // Repository should NOT exist
-    assert_eq!(registry.list().count(), 0, "Repository should not exist after rollback");
+    assert_eq!(
+        registry.list().count(),
+        0,
+        "Repository should not exist after rollback"
+    );
 
     println!("✓ Transaction rolled back successfully");
 }
@@ -101,10 +109,7 @@ async fn test_transaction_multiple_operations() {
     let repos: Vec<_> = registry.list().collect();
     assert_eq!(repos.len(), 2, "Should have 2 repositories");
 
-    assert!(
-        repos.iter().any(|r| r.id == id1),
-        "First repo should exist"
-    );
+    assert!(repos.iter().any(|r| r.id == id1), "First repo should exist");
     assert!(
         repos.iter().any(|r| r.id == id2),
         "Second repo should exist"
@@ -149,7 +154,11 @@ async fn test_transaction_ensure_idempotent() {
     tx2.commit_to(&mut registry).await.unwrap();
 
     // Still only one repository
-    assert_eq!(registry.list().count(), 1, "Should still have only 1 repository");
+    assert_eq!(
+        registry.list().count(),
+        1,
+        "Should still have only 1 repository"
+    );
 
     println!("✓ ensure() is idempotent");
 }

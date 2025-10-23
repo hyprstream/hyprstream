@@ -239,7 +239,7 @@ hyprstream clone https://huggingface.co/Qwen/Qwen3-0.6B
 # Clone with a custom name
 hyprstream clone https://huggingface.co/Qwen/Qwen3-0.6B --name qwen3-small
 
-# Import a shared model from Git
+# Clone from any Git repository (supports all Git transports including gittorrent://)
 hyprstream clone https://github.com/user/custom-model.git --name my-custom-model
 ```
 
@@ -319,21 +319,23 @@ hyprstream lt qwen3-small \
 
 #### Git Integration for LoRA Training
 
-LoRA adapters are automatically managed with git:
+LoRA adapters are stored as files and version-controlled with git:
 
 ```bash
-# Check training status and git state
+# Training creates adapter files in model/adapters/ directory
+hyprstream lt qwen3-small --adapter coding_assistant
+
+# Check status shows new adapter files
 hyprstream status qwen3-small
 
 # Commit trained adapter to git
 hyprstream commit qwen3-small -m "Add coding assistant adapter"
 
-# Create branches for different training experiments
-hyprstream branch qwen3-small experiment-1
-hyprstream checkout qwen3-small:experiment-1
-
-# Train on the experimental branch
-hyprstream lt qwen3-small:experiment-1 --adapter test_model
+# Use git branches for experimental work (standard git workflow)
+# This uses git2db's branch management
+hyprstream checkout qwen3-small -b experiment-1
+hyprstream lt qwen3-small --adapter experimental_model
+hyprstream commit qwen3-small -m "Experimental adapter"
 ```
 
 #### Training Data Format
@@ -372,13 +374,13 @@ graph TD
    - Full version control and rollback
    - Efficient large file handling via XET
    - Compatible with Hugging Face Hub
-   - Seamless model sharing
+   - P2P model distribution via GitTorrent transport
 
-2. **Branch-based Adapters**: Each LoRA adapter is a Git branch:
-   - UUID-based branch names for stability
-   - Human-friendly tags for usability
-   - Isolated training in worktrees
-   - Parallel adapter development
+2. **File-based Adapters**: LoRA adapters are stored as files within model repositories:
+   - Adapters live in `model/adapters/` directory as `.safetensors` files
+   - Simple indexed naming (e.g., `00_base.safetensors`, `01_coding.safetensors`)
+   - Committed to git for full version control
+   - Stackable and composable for model customization
 
 3. **Checkpoint Management**: Training progress is tracked through Git:
    - Automatic commits at intervals

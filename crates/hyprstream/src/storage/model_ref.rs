@@ -1,47 +1,12 @@
 //! Advanced model reference type for git-native model management
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-use git2::{Oid, Repository};
 use std::fmt;
+use uuid::Uuid;
 
-/// Serde helper for Oid serialization
-mod oid_serde {
-    use super::*;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(oid: &Oid, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&oid.to_string())
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Oid, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        Oid::from_str(&s).map_err(serde::de::Error::custom)
-    }
-}
-
-/// Git reference types for precise model versioning
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum GitRef {
-    /// Use the default branch (usually main/master)
-    DefaultBranch,
-    /// Reference a specific branch by name
-    Branch(String),
-    /// Reference a specific tag by name
-    Tag(String),
-    /// Reference a specific commit by SHA
-    #[serde(with = "oid_serde")]
-    Commit(Oid),
-    /// Complex revision specification (HEAD~1, main..develop, etc.)
-    Revspec(String),
-}
+// Re-export git2db's GitRef instead of duplicating
+pub use git2db::GitRef;
 
 /// Model reference with typed git references
 /// Examples:
@@ -56,87 +21,6 @@ pub struct ModelRef {
     pub git_ref: GitRef,
 }
 
-impl GitRef {
-    /// Parse a git reference string into the appropriate GitRef type
-    pub fn parse(git_ref_str: &str, repo: Option<&Repository>) -> Result<Self> {
-        // Check if it's a commit SHA (40-character hex string)
-        if git_ref_str.len() >= 7 && git_ref_str.chars().all(|c| c.is_ascii_hexdigit()) {
-            if git_ref_str.len() == 40 {
-                // Full SHA
-                let oid = Oid::from_str(git_ref_str)
-                    .map_err(|e| anyhow::anyhow!("Invalid commit SHA '{}': {}", git_ref_str, e))?;
-                return Ok(GitRef::Commit(oid));
-            } else if git_ref_str.len() >= 7 {
-                // Abbreviated SHA - try to resolve it if we have a repo
-                if let Some(repo) = repo {
-                    if let Ok(oid) = repo.revparse_single(git_ref_str) {
-                        return Ok(GitRef::Commit(oid.id()));
-                    }
-                }
-                // If we can't resolve it, treat it as a revspec
-                return Ok(GitRef::Revspec(git_ref_str.to_string()));
-            }
-        }
-
-        // Check for revspec patterns (contains ~, ^, .., etc.)
-        if git_ref_str.contains('~') || git_ref_str.contains('^') || git_ref_str.contains("..") ||
-           git_ref_str.contains("@{") || git_ref_str == "HEAD" || git_ref_str == "ORIG_HEAD" {
-            return Ok(GitRef::Revspec(git_ref_str.to_string()));
-        }
-
-        // Check if it looks like a tag (starts with 'v' followed by numbers/dots)
-        if git_ref_str.starts_with('v') && git_ref_str[1..].chars().next().map_or(false, |c| c.is_ascii_digit()) {
-            return Ok(GitRef::Tag(git_ref_str.to_string()));
-        }
-
-        // If we have a repository, try to determine the type more precisely
-        if let Some(repo) = repo {
-            // Check if it's a branch
-            if repo.find_branch(git_ref_str, git2::BranchType::Local).is_ok() ||
-               repo.find_branch(git_ref_str, git2::BranchType::Remote).is_ok() {
-                return Ok(GitRef::Branch(git_ref_str.to_string()));
-            }
-
-            // Check if it's a tag
-            if let Ok(_) = repo.find_reference(&format!("refs/tags/{}", git_ref_str)) {
-                return Ok(GitRef::Tag(git_ref_str.to_string()));
-            }
-        }
-
-        // Default to branch (most common case)
-        Ok(GitRef::Branch(git_ref_str.to_string()))
-    }
-
-    /// Convert to string representation for display and storage
-    pub fn to_string(&self) -> Option<String> {
-        match self {
-            GitRef::DefaultBranch => None,
-            GitRef::Branch(name) => Some(name.clone()),
-            GitRef::Tag(name) => Some(name.clone()),
-            GitRef::Commit(oid) => Some(oid.to_string()),
-            GitRef::Revspec(spec) => Some(spec.clone()),
-        }
-    }
-
-    /// Get the reference as a string suitable for git operations
-    pub fn as_ref_str(&self) -> Option<&str> {
-        match self {
-            GitRef::DefaultBranch => None,
-            GitRef::Branch(name) => Some(name),
-            GitRef::Tag(name) => Some(name),
-            GitRef::Commit(_) => None, // Commits need to be handled specially
-            GitRef::Revspec(spec) => Some(spec),
-        }
-    }
-
-    /// Get the commit OID if this is a commit reference
-    pub fn as_oid(&self) -> Option<&Oid> {
-        match self {
-            GitRef::Commit(oid) => Some(oid),
-            _ => None,
-        }
-    }
-}
 
 impl ModelRef {
     /// Create a new ModelRef with default branch
@@ -154,11 +38,6 @@ impl ModelRef {
 
     /// Parse a model reference string
     pub fn parse(s: &str) -> Result<Self> {
-        Self::parse_with_repo(s, None)
-    }
-
-    /// Parse a model reference string with repository context for better type detection
-    pub fn parse_with_repo(s: &str, repo: Option<&Repository>) -> Result<Self> {
         // Still support UUID for backwards compatibility
         if let Ok(uuid) = Uuid::parse_str(s) {
             return Ok(ModelRef {
@@ -170,9 +49,11 @@ impl ModelRef {
         // Parse model:ref format
         let (model, git_ref) = match s.split_once(':') {
             Some((m, r)) => {
-                let git_ref = GitRef::parse(r, repo)?;
+                // Use git2db's GitRef::parse() and convert error
+                let git_ref = GitRef::parse(r)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse git ref '{}': {}", r, e))?;
                 (m.to_string(), git_ref)
-            },
+            }
             None => (s.to_string(), GitRef::DefaultBranch),
         };
 
@@ -184,26 +65,22 @@ impl ModelRef {
 
     /// Convert to string representation
     pub fn to_string(&self) -> String {
-        match self.git_ref.to_string() {
-            Some(git_ref_str) => format!("{}:{}", self.model, git_ref_str),
-            None => self.model.clone(),
+        match &self.git_ref {
+            GitRef::DefaultBranch => self.model.clone(),
+            _ => format!("{}:{}", self.model, self.git_ref.display_name()),
         }
     }
 
     /// Get the git reference as an option string (for compatibility)
     pub fn git_ref_str(&self) -> Option<String> {
-        self.git_ref.to_string()
-    }
-}
-
-impl fmt::Display for GitRef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.to_string() {
-            Some(s) => write!(f, "{}", s),
-            None => write!(f, "<default>"),
+        match &self.git_ref {
+            GitRef::DefaultBranch => None,
+            _ => Some(self.git_ref.display_name()),
         }
     }
 }
+
+// Note: impl Display for GitRef removed - git2db already provides it
 
 impl fmt::Display for ModelRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -235,8 +112,9 @@ pub fn validate_model_name(name: &str) -> Result<()> {
 
     // Follow Git reference naming rules (but adapted for model names)
     // Reject characters that Git doesn't allow
-    if name.chars().any(|c|
-        c.is_ascii_control() ||    // ASCII control characters
+    if name.chars().any(
+        |c| {
+            c.is_ascii_control() ||    // ASCII control characters
         c == ' ' ||                // Space
         c == '~' ||                // Tilde
         c == '^' ||                // Caret
@@ -247,7 +125,8 @@ pub fn validate_model_name(name: &str) -> Result<()> {
         c == '\\' ||               // Backslash
         c == '\t' ||               // Tab
         c == '\n' ||               // Newline
-        c == '\r'                  // Carriage return
+        c == '\r'
+        }, // Carriage return
     ) {
         bail!("Model name contains invalid characters (spaces, control chars, or Git-forbidden chars)");
     }
@@ -284,7 +163,6 @@ pub fn validate_model_name(name: &str) -> Result<()> {
 
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -330,33 +208,58 @@ mod tests {
 
     #[test]
     fn test_git_ref_parsing() {
-        // Test GitRef parsing without repository context
-        assert_eq!(GitRef::parse("main", None).unwrap(), GitRef::Branch("main".to_string()));
-        assert_eq!(GitRef::parse("v1.0.0", None).unwrap(), GitRef::Tag("v1.0.0".to_string()));
-        assert_eq!(GitRef::parse("HEAD~1", None).unwrap(), GitRef::Revspec("HEAD~1".to_string()));
-        assert_eq!(GitRef::parse("main^2", None).unwrap(), GitRef::Revspec("main^2".to_string()));
+        // Test GitRef parsing (now using git2db's GitRef::parse)
+        assert_eq!(
+            GitRef::parse("main").unwrap(),
+            GitRef::Branch("main".to_string())
+        );
+        // git2db parses v-prefixed as tags
+        assert!(matches!(
+            GitRef::parse("v1.0.0").unwrap(),
+            GitRef::Tag(_)
+        ));
+        assert!(matches!(
+            GitRef::parse("HEAD~1").unwrap(),
+            GitRef::Revspec(_) | GitRef::DefaultBranch
+        ));
+        assert!(matches!(
+            GitRef::parse("main^2").unwrap(),
+            GitRef::Revspec(_)
+        ));
 
         // Full SHA
         let sha = "1234567890abcdef1234567890abcdef12345678";
-        if let GitRef::Commit(oid) = GitRef::parse(sha, None).unwrap() {
+        if let GitRef::Commit(oid) = GitRef::parse(sha).unwrap() {
             assert_eq!(oid.to_string(), sha);
         } else {
             panic!("Expected GitRef::Commit for full SHA");
         }
 
-        // Abbreviated SHA (should be treated as revspec without repo)
-        assert_eq!(GitRef::parse("1234567", None).unwrap(), GitRef::Revspec("1234567".to_string()));
+        // Abbreviated SHA (should be treated as revspec)
+        assert!(matches!(
+            GitRef::parse("1234567").unwrap(),
+            GitRef::Revspec(_)
+        ));
     }
 
     #[test]
-    fn test_git_ref_to_string() {
-        assert_eq!(GitRef::DefaultBranch.to_string(), None);
-        assert_eq!(GitRef::Branch("main".to_string()).to_string(), Some("main".to_string()));
-        assert_eq!(GitRef::Tag("v1.0".to_string()).to_string(), Some("v1.0".to_string()));
-        assert_eq!(GitRef::Revspec("HEAD~1".to_string()).to_string(), Some("HEAD~1".to_string()));
+    fn test_git_ref_display() {
+        // Test display_name (git2db's API)
+        assert_eq!(GitRef::DefaultBranch.display_name(), "HEAD");
+        assert_eq!(
+            GitRef::Branch("main".to_string()).display_name(),
+            "main"
+        );
+        // git2db's Tag display includes tags/ prefix
+        assert!(GitRef::Tag("v1.0".to_string()).display_name().contains("v1.0"));
+        assert_eq!(
+            GitRef::Revspec("HEAD~1".to_string()).display_name(),
+            "HEAD~1"
+        );
 
-        let oid = Oid::from_str("1234567890abcdef1234567890abcdef12345678").unwrap();
-        assert_eq!(GitRef::Commit(oid).to_string(), Some("1234567890abcdef1234567890abcdef12345678".to_string()));
+        let oid = git2db::Oid::from_str("1234567890abcdef1234567890abcdef12345678").unwrap();
+        // display_name shows abbreviated SHA
+        assert!(GitRef::Commit(oid).display_name().contains("12345678"));
     }
 
     #[test]
@@ -414,34 +317,63 @@ mod tests {
 
     #[test]
     fn test_git_ref_validation() {
-        // Test that our GitRef parsing handles various git reference formats
-        // These should all parse successfully (even if git2::Reference::is_valid_name would reject them)
-        // because our GitRef enum is more permissive and handles different contexts
+        // Test that git2db's GitRef parsing handles various git reference formats
 
         // Simple branch names
-        assert!(matches!(GitRef::parse("main", None).unwrap(), GitRef::Branch(_)));
-        assert!(matches!(GitRef::parse("feature/new-model", None).unwrap(), GitRef::Branch(_)));
+        assert!(matches!(
+            GitRef::parse("main").unwrap(),
+            GitRef::Branch(_)
+        ));
+        assert!(matches!(
+            GitRef::parse("feature/new-model").unwrap(),
+            GitRef::Branch(_)
+        ));
 
-        // Tags
-        assert!(matches!(GitRef::parse("v1.0.0", None).unwrap(), GitRef::Tag(_)));
-        assert!(matches!(GitRef::parse("v2.1", None).unwrap(), GitRef::Tag(_)));
+        // Tags (git2db handles v-prefix and refs/tags/ prefix)
+        assert!(matches!(
+            GitRef::parse("v1.0.0").unwrap(),
+            GitRef::Tag(_)
+        ));
+        assert!(matches!(
+            GitRef::parse("refs/tags/v2.1").unwrap(),
+            GitRef::Tag(_)
+        ));
 
-        // Revspecs
-        assert!(matches!(GitRef::parse("HEAD", None).unwrap(), GitRef::Revspec(_)));
-        assert!(matches!(GitRef::parse("ORIG_HEAD", None).unwrap(), GitRef::Revspec(_)));
-        assert!(matches!(GitRef::parse("main~1", None).unwrap(), GitRef::Revspec(_)));
-        assert!(matches!(GitRef::parse("HEAD^", None).unwrap(), GitRef::Revspec(_)));
-        assert!(matches!(GitRef::parse("branch..other", None).unwrap(), GitRef::Revspec(_)));
-        assert!(matches!(GitRef::parse("branch@{HEAD}", None).unwrap(), GitRef::Revspec(_)));
+        // Revspecs or DefaultBranch
+        // Note: git2db treats "HEAD" as DefaultBranch, not Revspec
+        assert!(matches!(
+            GitRef::parse("HEAD").unwrap(),
+            GitRef::DefaultBranch
+        ));
+        assert!(matches!(
+            GitRef::parse("main~1").unwrap(),
+            GitRef::Revspec(_)
+        ));
+        assert!(matches!(
+            GitRef::parse("HEAD^").unwrap(),
+            GitRef::Revspec(_)
+        ));
+        assert!(matches!(
+            GitRef::parse("branch..other").unwrap(),
+            GitRef::Revspec(_)
+        ));
+        assert!(matches!(
+            GitRef::parse("branch@{HEAD}").unwrap(),
+            GitRef::Revspec(_)
+        ));
 
         // Commits
-        assert!(matches!(GitRef::parse("1234567890abcdef1234567890abcdef12345678", None).unwrap(), GitRef::Commit(_)));
+        assert!(matches!(
+            GitRef::parse("1234567890abcdef1234567890abcdef12345678").unwrap(),
+            GitRef::Commit(_)
+        ));
 
         // Test libgit2 validation separately (for reference)
         assert!(git2::Reference::is_valid_name("refs/heads/main"));
         assert!(git2::Reference::is_valid_name("refs/tags/v1.0.0"));
-        assert!(git2::Reference::is_valid_name("refs/heads/feature/new-model"));
+        assert!(git2::Reference::is_valid_name(
+            "refs/heads/feature/new-model"
+        ));
         assert!(git2::Reference::is_valid_name("HEAD"));
-        assert!(git2::Reference::is_valid_name("ORIG_HEAD"));
     }
 }

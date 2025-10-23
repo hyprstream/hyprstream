@@ -654,6 +654,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "caps"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "190baaad529bcfbde9e1a19022c42781bdb6ff9de25721abdb8fd98c0807730b"
+dependencies = [
+ "libc",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "cas_client"
 version = "0.14.5"
 source = "git+https://github.com/huggingface/xet-core?branch=main#15942e295ee2b45bd96029bfe53debc131719437"
@@ -2208,6 +2218,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "caps",
  "cas_client",
  "cas_object",
  "chrono",
@@ -2220,6 +2231,7 @@ dependencies = [
  "libc",
  "lru 0.16.1",
  "merklehash",
+ "nix 0.27.1",
  "once_cell",
  "parking_lot 0.12.4",
  "proptest",
@@ -2734,6 +2746,7 @@ dependencies = [
  "indicatif",
  "json-threat-protection",
  "lazy_static",
+ "libc",
  "lru 0.16.1",
  "memmap2",
  "merklehash",
@@ -2764,6 +2777,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "shellexpand",
  "sqlparser 0.39.0",
  "tch",

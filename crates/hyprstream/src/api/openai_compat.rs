@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 pub use ChatCompletionRequest as OpenAIRequest;
 pub use ChatCompletionResponse as OpenAIResponse;
 
-/// Chat completion streaming response 
+/// Chat completion streaming response
 pub type ChatCompletionStreamResponse = OpenAIStreamResponse;
 
 /// OpenAI Chat Completion Request

@@ -16,4 +16,3 @@ impl fmt::Display for StatusWrapper {
         self.0.fmt(f)
     }
 }
-

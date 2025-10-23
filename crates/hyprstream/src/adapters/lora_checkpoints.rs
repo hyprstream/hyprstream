@@ -1,5 +1,5 @@
 //! LoRA checkpoint management system
-//! 
+//!
 //! Handles conversion from VDB sparse storage to checkpoints for inference
 
 use anyhow::Result;
@@ -39,7 +39,7 @@ pub struct LoRAWeightsData {
     pub config: LoRAConfig,
     /// A matrix weights (input → low-rank)
     pub a_weights: HashMap<String, Vec<Vec<f32>>>,
-    /// B matrix weights (low-rank → output) 
+    /// B matrix weights (low-rank → output)
     pub b_weights: HashMap<String, Vec<Vec<f32>>>,
     /// Target module names
     pub target_modules: Vec<String>,
@@ -90,44 +90,46 @@ impl LoRACheckpointManager {
     pub async fn new() -> Result<Self> {
         let storage_paths = StoragePaths::new()?;
         let checkpoint_dir = storage_paths.cache_dir()?.join("lora_checkpoints");
-        
+
         // Ensure checkpoint directory exists
         fs::create_dir_all(&checkpoint_dir).await?;
-        
+
         let mut manager = Self {
             storage_paths,
             checkpoint_cache: HashMap::new(),
             checkpoint_dir,
         };
-        
+
         // Load existing checkpoints
         manager.load_checkpoint_metadata().await?;
-        
+
         Ok(manager)
     }
-    
-    
+
     /// List all checkpoints for a LoRA UUID
     pub fn list_checkpoints(&self, lora_uuid: Uuid) -> Vec<&LoRACheckpoint> {
-        self.checkpoint_cache.values()
+        self.checkpoint_cache
+            .values()
             .filter(|cp| cp.lora_uuid == lora_uuid)
             .collect()
     }
-    
+
     /// Get checkpoint by tag (returns latest if multiple)
     pub fn get_checkpoint_by_tag(&self, lora_uuid: Uuid, tag: &str) -> Option<&LoRACheckpoint> {
-        self.checkpoint_cache.values()
+        self.checkpoint_cache
+            .values()
             .filter(|cp| cp.lora_uuid == lora_uuid && cp.tag == tag)
             .max_by_key(|cp| cp.created_at)
     }
-    
+
     /// Get latest checkpoint for a LoRA UUID
     pub fn get_latest_checkpoint(&self, lora_uuid: Uuid) -> Option<&LoRACheckpoint> {
-        self.checkpoint_cache.values()
+        self.checkpoint_cache
+            .values()
             .filter(|cp| cp.lora_uuid == lora_uuid)
             .max_by_key(|cp| cp.created_at)
     }
-    
+
     /// Delete a checkpoint
     pub async fn delete_checkpoint(&mut self, checkpoint_id: &str) -> Result<()> {
         if let Some(checkpoint) = self.checkpoint_cache.remove(checkpoint_id) {
@@ -135,16 +137,16 @@ impl LoRACheckpointManager {
             if checkpoint.weights_path.exists() {
                 fs::remove_file(&checkpoint.weights_path).await?;
             }
-            
+
             // Delete metadata file
             let metadata_path = self.get_metadata_path(&checkpoint.checkpoint_id);
             if metadata_path.exists() {
                 fs::remove_file(&metadata_path).await?;
             }
-            
+
             tracing::info!("🗑️ Deleted checkpoint: {}", checkpoint_id);
         }
-        
+
         Ok(())
     }
 
@@ -152,48 +154,49 @@ impl LoRACheckpointManager {
     async fn load_checkpoint_metadata(&mut self) -> Result<()> {
         let mut entries = fs::read_dir(&self.checkpoint_dir).await?;
         let mut loaded_count = 0;
-        
+
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
             if path.extension().map_or(false, |ext| ext == "json") {
                 if let Ok(data) = fs::read_to_string(&path).await {
                     if let Ok(checkpoint) = serde_json::from_str::<LoRACheckpoint>(&data) {
-                        self.checkpoint_cache.insert(checkpoint.checkpoint_id.clone(), checkpoint);
+                        self.checkpoint_cache
+                            .insert(checkpoint.checkpoint_id.clone(), checkpoint);
                         loaded_count += 1;
                     }
                 }
             }
         }
-        
+
         if loaded_count > 0 {
             tracing::info!("📚 Loaded {} LoRA checkpoints from disk", loaded_count);
         }
-        
+
         Ok(())
     }
-    
+
     /// Get metadata file path for checkpoint
     fn get_metadata_path(&self, checkpoint_id: &str) -> PathBuf {
         self.checkpoint_dir.join(format!("{}.json", checkpoint_id))
     }
-    
+
     /// Get checkpoint directory
     pub fn checkpoint_dir(&self) -> &Path {
         &self.checkpoint_dir
     }
-    
+
     /// Get checkpoint statistics
     pub fn get_stats(&self) -> CheckpointManagerStats {
         let total_checkpoints = self.checkpoint_cache.len();
-        let unique_lora_count = self.checkpoint_cache.values()
+        let unique_lora_count = self
+            .checkpoint_cache
+            .values()
             .map(|cp| cp.lora_uuid)
             .collect::<std::collections::HashSet<_>>()
             .len();
-        
-        let total_size_bytes = self.checkpoint_cache.values()
-            .map(|cp| cp.file_size)
-            .sum();
-        
+
+        let total_size_bytes = self.checkpoint_cache.values().map(|cp| cp.file_size).sum();
+
         CheckpointManagerStats {
             total_checkpoints,
             unique_lora_count,
@@ -215,4 +218,3 @@ impl CheckpointManagerStats {
         self.total_size_bytes as f64 / 1024.0 / 1024.0
     }
 }
-

@@ -3,10 +3,10 @@
 //! This module handles the storage, discovery, and composition of LoRA adapters
 //! within the git-versioned model repositories.
 
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 /// Information about a discovered adapter
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,27 +57,25 @@ impl Default for AdapterConfig {
 
 /// Manages LoRA adapters within a model's git repository
 pub struct AdapterManager {
-    #[allow(dead_code)]
-    model_path: PathBuf,
     pub adapters_dir: PathBuf,
 }
 
 impl AdapterManager {
     /// Create a new adapter manager for a model
     pub fn new(model_path: impl AsRef<Path>) -> Self {
-        let model_path = model_path.as_ref().to_path_buf();
-        let adapters_dir = model_path.join("adapters");
-        Self {
-            model_path,
-            adapters_dir,
-        }
+        let adapters_dir = model_path.as_ref().join("adapters");
+        Self { adapters_dir }
     }
 
     /// Ensure the adapters directory exists
     pub fn ensure_adapters_dir(&self) -> Result<()> {
         if !self.adapters_dir.exists() {
-            std::fs::create_dir_all(&self.adapters_dir)
-                .with_context(|| format!("Failed to create adapters directory: {:?}", self.adapters_dir))?;
+            std::fs::create_dir_all(&self.adapters_dir).with_context(|| {
+                format!(
+                    "Failed to create adapters directory: {:?}",
+                    self.adapters_dir
+                )
+            })?;
         }
         Ok(())
     }
@@ -177,10 +175,14 @@ impl AdapterManager {
         };
 
         let adapter_name = format!("{:02}_{}", idx, name);
-        let adapter_path = self.adapters_dir.join(format!("{}.safetensors", adapter_name));
+        let adapter_path = self
+            .adapters_dir
+            .join(format!("{}.safetensors", adapter_name));
 
         // Save configuration file
-        let config_path = self.adapters_dir.join(format!("{}.config.json", adapter_name));
+        let config_path = self
+            .adapters_dir
+            .join(format!("{}.config.json", adapter_name));
         let config_json = serde_json::to_string_pretty(&config)
             .with_context(|| "Failed to serialize adapter config")?;
         std::fs::write(&config_path, config_json)
@@ -201,7 +203,9 @@ impl AdapterManager {
 
     /// Load configuration for a specific adapter
     pub fn load_adapter_config(&self, adapter_name: &str) -> Result<AdapterConfig> {
-        let config_path = self.adapters_dir.join(format!("{}.config.json", adapter_name));
+        let config_path = self
+            .adapters_dir
+            .join(format!("{}.config.json", adapter_name));
         let config_str = std::fs::read_to_string(&config_path)
             .with_context(|| format!("Failed to read adapter config: {:?}", config_path))?;
         let config: AdapterConfig = serde_json::from_str(&config_str)?;
@@ -210,8 +214,7 @@ impl AdapterManager {
 
     /// Check if any adapters exist for this model
     pub fn has_adapters(&self) -> bool {
-        self.adapters_dir.exists() &&
-        self.list_adapters().unwrap_or_default().len() > 0
+        self.adapters_dir.exists() && self.list_adapters().unwrap_or_default().len() > 0
     }
 
     /// Get total size of all adapters
@@ -229,7 +232,9 @@ impl AdapterManager {
             adapters.iter().find(|a| a.index == idx)
         } else {
             // Otherwise match by name
-            adapters.iter().find(|a| a.name == identifier || a.filename.starts_with(identifier))
+            adapters
+                .iter()
+                .find(|a| a.name == identifier || a.filename.starts_with(identifier))
         };
 
         if let Some(adapter) = to_remove {
@@ -298,12 +303,16 @@ mod tests {
         config.model_ref = "test_model".to_string();
 
         // Initialize adapter with auto-index
-        let adapter_path = manager.initialize_adapter("test", None, config.clone()).unwrap();
+        let adapter_path = manager
+            .initialize_adapter("test", None, config.clone())
+            .unwrap();
         assert!(adapter_path.exists());
         assert!(adapter_path.to_str().unwrap().contains("00_test"));
 
         // Initialize adapter with specific index
-        let adapter_path = manager.initialize_adapter("custom", Some(5), config).unwrap();
+        let adapter_path = manager
+            .initialize_adapter("custom", Some(5), config)
+            .unwrap();
         assert!(adapter_path.exists());
         assert!(adapter_path.to_str().unwrap().contains("05_custom"));
 

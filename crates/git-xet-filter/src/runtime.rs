@@ -4,6 +4,7 @@
 
 use crate::error::{Result, XetError, XetErrorKind};
 use std::future::Future;
+use std::mem::ManuallyDrop;
 use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
 
@@ -13,7 +14,9 @@ use tokio::runtime::{Builder, Runtime};
 /// for all async operations. It's single-threaded to avoid complexity
 /// and is separate from any user-created runtimes.
 pub struct XetRuntime {
-    runtime: Runtime,
+    // Use ManuallyDrop to control when the runtime is dropped
+    // This prevents tokio from panicking when dropped in async context
+    runtime: ManuallyDrop<Runtime>,
     timeout: Duration,
 }
 
@@ -44,7 +47,7 @@ impl XetRuntime {
             })?;
 
         Ok(Self {
-            runtime,
+            runtime: ManuallyDrop::new(runtime),
             timeout: Duration::from_secs(300), // 5 minute timeout
         })
     }
@@ -71,6 +74,27 @@ impl XetRuntime {
         F: Future,
     {
         self.runtime.block_on(future)
+    }
+}
+
+impl Drop for XetRuntime {
+    fn drop(&mut self) {
+        // Shutdown the runtime in a blocking context to avoid panics
+        // SAFETY: We're in Drop, so this is the last use of the runtime
+        unsafe {
+            // If we're in an async context, spawn a thread to drop the runtime
+            // Otherwise, drop it directly
+            if tokio::runtime::Handle::try_current().is_ok() {
+                // We're in an async context - need to drop in a separate thread
+                let runtime = ManuallyDrop::take(&mut self.runtime);
+                std::thread::spawn(move || {
+                    drop(runtime);
+                });
+            } else {
+                // Safe to drop directly
+                ManuallyDrop::drop(&mut self.runtime);
+            }
+        }
     }
 }
 

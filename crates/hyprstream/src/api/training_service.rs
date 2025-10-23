@@ -1,43 +1,58 @@
 //! Auto-regressive training service for LoRA adapters
 
-use crate::api::TrainingSample;
-pub use crate::api::TrainingStatus;
 use crate::runtime::inference::{InferenceRequest, InferenceResult};
 
-use std::collections::HashMap;
-use tracing::{info, warn};
-use std::sync::Arc;
-use tokio::sync::{RwLock, mpsc, Mutex};
-use serde::{Deserialize, Serialize};
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex, RwLock};
+use tracing::{info, warn};
+
+/// Training sample for LoRA fine-tuning
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainingSample {
+    pub input: String,
+    pub output: String,
+}
+
+/// Training status response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainingStatus {
+    pub is_training: bool,
+    pub total_samples_processed: usize,
+    pub current_loss: f32,
+    pub learning_rate: f32,
+    pub last_update: i64,
+}
 
 /// Configuration for auto-regressive training
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainingConfig {
     /// Learning rate for training
     pub learning_rate: f32,
-    
+
     /// Batch size for gradient updates
     pub batch_size: usize,
-    
+
     /// Minimum samples before training starts
     pub min_samples_before_training: usize,
-    
+
     /// Maximum training queue size
     pub max_queue_size: usize,
-    
+
     /// Training frequency (train every N samples)
     pub training_frequency: usize,
-    
+
     /// Enable gradient accumulation
     pub gradient_accumulation: bool,
-    
+
     /// L2 regularization strength
     pub weight_decay: f32,
-    
+
     /// Sparsity target during training
     pub sparsity_target: f32,
-    
+
     /// Use mixed precision training
     pub mixed_precision: bool,
 }
@@ -72,20 +87,15 @@ pub struct TrainingSession {
 
 /// Training service for auto-regressive LoRA learning
 pub struct TrainingService {
-
-    /// Runtime engine for generating training targets
-    #[allow(dead_code)]
-    runtime_engine: Arc<dyn crate::runtime::RuntimeEngine>,
-
     /// Active training sessions
     sessions: Arc<RwLock<HashMap<String, TrainingSession>>>,
-    
+
     /// Training sample queues per LoRA
     sample_queues: Arc<RwLock<HashMap<String, mpsc::UnboundedSender<TrainingSample>>>>,
-    
+
     /// Training statistics
     stats: Arc<RwLock<TrainingStats>>,
-    
+
     /// Task handles for background training
     task_handles: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
 }
@@ -102,27 +112,19 @@ pub struct TrainingStats {
 
 impl TrainingService {
     /// Create new training service
-    pub fn new(
-        runtime_engine: Arc<dyn crate::runtime::RuntimeEngine>,
-    ) -> Self {
+    pub fn new() -> Self {
         Self {
-
-            runtime_engine,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             sample_queues: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(RwLock::new(TrainingStats::default())),
             task_handles: Arc::new(Mutex::new(HashMap::new())),
         }
     }
-    
+
     /// Start auto-regressive training for a LoRA adapter
-    pub async fn start_auto_training(
-        &self,
-        lora_id: &str,
-        config: TrainingConfig,
-    ) -> Result<()> {
+    pub async fn start_auto_training(&self, lora_id: &str, config: TrainingConfig) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        
+
         // Create training session
         let session = TrainingSession {
             lora_id: lora_id.to_string(),
@@ -133,69 +135,62 @@ impl TrainingService {
             started_at: now,
             last_update: now,
         };
-        
+
         // Register session
         {
             let mut sessions = self.sessions.write().await;
             sessions.insert(lora_id.to_string(), session);
         }
-        
+
         // Create sample queue
         let (tx, mut rx) = mpsc::unbounded_channel::<TrainingSample>();
         {
             let mut queues = self.sample_queues.write().await;
             queues.insert(lora_id.to_string(), tx);
         }
-        
+
         // Start background training task
         let lora_id_clone = lora_id.to_string();
-        
+
         let sessions = self.sessions.clone();
         let stats = self.stats.clone();
-        
+
         let handle = tokio::spawn(async move {
             let mut sample_batch = Vec::new();
-            
+
             while let Some(sample) = rx.recv().await {
                 sample_batch.push(sample);
-                
+
                 // Train when we have enough samples
                 if sample_batch.len() >= config.batch_size {
-                    if let Err(e) = Self::train_batch(
-                        &lora_id_clone,
-                        &sample_batch,
-                        &config,
-                        &sessions,
-                        &stats,
-                    ).await {
+                    if let Err(e) =
+                        Self::train_batch(&lora_id_clone, &sample_batch, &config, &sessions, &stats)
+                            .await
+                    {
                         warn!("Training error for {}: {}", lora_id_clone, e);
                     }
-                    
+
                     sample_batch.clear();
                 }
             }
-            
+
             // Process remaining samples
             if !sample_batch.is_empty() {
-                let _ = Self::train_batch(
-                    &lora_id_clone,
-                    &sample_batch,
-                    &config,
-                    &sessions,
-                    &stats,
-                ).await;
+                let _ =
+                    Self::train_batch(&lora_id_clone, &sample_batch, &config, &sessions, &stats)
+                        .await;
             }
         });
-        
+
         // Store task handle
         {
             let mut handles = self.task_handles.lock().await;
             handles.insert(lora_id.to_string(), handle);
         }
-        
+
         Ok(())
     }
-    
+
     /// Stop auto-regressive training
     pub async fn stop_auto_training(&self, lora_id: &str) -> Result<()> {
         // Mark session as inactive
@@ -205,13 +200,13 @@ impl TrainingService {
                 session.is_active = false;
             }
         }
-        
+
         // Remove sample queue
         {
             let mut queues = self.sample_queues.write().await;
             queues.remove(lora_id);
         }
-        
+
         // Cancel background task
         {
             let mut handles = self.task_handles.lock().await;
@@ -219,23 +214,19 @@ impl TrainingService {
                 handle.abort();
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Queue a training sample for auto-regressive learning
-    pub async fn queue_training_sample(
-        &self,
-        lora_id: &str,
-        sample: TrainingSample,
-    ) -> Result<()> {
+    pub async fn queue_training_sample(&self, lora_id: &str, sample: TrainingSample) -> Result<()> {
         let queues = self.sample_queues.read().await;
         if let Some(sender) = queues.get(lora_id) {
             sender.send(sample)?;
         }
         Ok(())
     }
-    
+
     /// Train a batch of samples
     async fn train_batch(
         lora_id: &str,
@@ -244,27 +235,32 @@ impl TrainingService {
         _sessions: &Arc<RwLock<HashMap<String, TrainingSession>>>,
         _stats: &Arc<RwLock<TrainingStats>>,
     ) -> Result<()> {
-        info!("🎯 Training LoRA {} with {} samples", lora_id, samples.len());
+        info!(
+            "🎯 Training LoRA {} with {} samples",
+            lora_id,
+            samples.len()
+        );
 
         // TODO: Implement actual training logic
         return Err(anyhow::anyhow!("Training not available"));
     }
-    
+
     /// Get training status for a LoRA
     pub async fn get_training_status(&self, lora_id: &str) -> Result<TrainingStatus> {
         let sessions = self.sessions.read().await;
-        let session = sessions.get(lora_id)
+        let session = sessions
+            .get(lora_id)
             .ok_or_else(|| anyhow::anyhow!("Training session not found"))?;
-        
+
         Ok(TrainingStatus {
             is_training: session.is_active,
-            total_samples_processed: session.samples_processed,
+            total_samples_processed: session.samples_processed as usize,
             current_loss: session.current_loss,
             learning_rate: session.config.learning_rate,
             last_update: session.last_update,
         })
     }
-    
+
     /// Create inference session (delegated to inference API)
     pub async fn create_inference_session(
         &self,
@@ -273,7 +269,7 @@ impl TrainingService {
     ) -> Result<String> {
         Ok(format!("lora-session-{}", lora_id))
     }
-    
+
     /// Run inference (delegated to inference API)
     pub async fn infer(
         &self,
@@ -286,43 +282,37 @@ impl TrainingService {
             latency_ms: 0,
         })
     }
-    
+
     /// Close inference session (delegated to inference API)
     pub async fn close_inference_session(&self, _session_id: &str) -> Result<()> {
         Ok(())
     }
-    
+
     /// Generate embedding (simplified implementation)
-    pub async fn generate_embedding(
-        &self,
-        lora_id: &str,
-        _input: &str,
-    ) -> Result<Vec<f32>> {
+    pub async fn generate_embedding(&self, lora_id: &str, _input: &str) -> Result<Vec<f32>> {
         // Create temporary inference session
-        let session_id = self.create_inference_session(
-            lora_id,
-            vec![lora_id.to_string()],
-        ).await?;
-        
+        let session_id = self
+            .create_inference_session(lora_id, vec![lora_id.to_string()])
+            .await?;
+
         // Generate embedding (simplified - would use actual model)
         let embedding = vec![0.1; 768]; // Placeholder embedding
-        
+
         // Close session
         let _ = self.close_inference_session(&session_id).await;
-        
+
         Ok(embedding)
     }
-    
+
     /// Get overall training statistics
     pub async fn get_stats(&self) -> TrainingStats {
         let stats = self.stats.read().await;
         let sessions = self.sessions.read().await;
-        
+
         let mut stats_clone = stats.clone();
-        stats_clone.active_training_sessions = sessions.values()
-            .filter(|s| s.is_active)
-            .count() as u64;
-        
+        stats_clone.active_training_sessions =
+            sessions.values().filter(|s| s.is_active).count() as u64;
+
         stats_clone
     }
 }
@@ -431,6 +421,4 @@ impl TrainingService {
 // }
 
 // TODO: Re-add sparsity computation utilities when implementing training
-
-
 use chrono;

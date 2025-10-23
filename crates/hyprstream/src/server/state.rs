@@ -1,24 +1,21 @@
 //! Server state management
 
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use super::model_cache::ModelCache;
 use crate::{
-    api::{adapter_storage::AdapterStorage, training_service::TrainingService},
+    api::training_service::TrainingService,
     storage::ModelStorage,
 };
-use super::model_cache::ModelCache;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 // Re-export config types so other server modules can access them via server::state
-pub use crate::config::{ServerConfig, CorsConfig, GenerationDefaults};
+pub use crate::config::{CorsConfig, GenerationDefaults, ServerConfig};
 
 /// Shared server state
 #[derive(Clone)]
 pub struct ServerState {
     /// Model cache for UUID-based model caching with LRU eviction
     pub model_cache: Arc<ModelCache>,
-
-    /// Adapter storage manager
-    pub adapter_storage: Arc<AdapterStorage>,
 
     /// Model storage for managing downloaded models
     pub model_storage: Arc<ModelStorage>,
@@ -87,27 +84,20 @@ impl ServerState {
         };
 
         tracing::info!("Initializing model storage at: {:?}", models_dir);
-        let model_storage = Arc::new(ModelStorage::create_with_config(models_dir.clone(), git2db_config).await?);
+        let model_storage =
+            Arc::new(ModelStorage::create_with_config(models_dir.clone(), git2db_config).await?);
 
-        // Initialize adapter storage
-        tracing::info!("Initializing adapter storage at: {:?}", models_dir);
-        let adapter_storage = Arc::new(AdapterStorage::new(models_dir.clone()).await?);
-
-        // Initialize training service with a runtime engine
-        use crate::runtime::{RuntimeEngine, TorchEngine, RuntimeConfig};
-        let runtime_engine: Arc<dyn RuntimeEngine> = Arc::new(TorchEngine::new(RuntimeConfig::default())?);
-        let training_service = Arc::new(TrainingService::new(runtime_engine));
+        // Initialize training service
+        let training_service = Arc::new(TrainingService::new());
 
         // Initialize model cache
         let checkout_base = models_dir.join("checkouts");
         std::fs::create_dir_all(&checkout_base)?;
 
-        // Get the registry from model_storage
-        let registry = model_storage.registry();
-
+        // Pass model_storage directly to ModelCache
         let model_cache = Arc::new(ModelCache::new(
             config.max_cached_models,
-            registry,
+            model_storage.clone(),
             checkout_base,
         )?);
 
@@ -123,23 +113,11 @@ impl ServerState {
             }
         }
 
-        // Start cache refresher if enabled
-        let refresher_config = super::cache_refresher::CacheRefresherConfig::from_env();
-        if refresher_config.enabled {
-            let refresher = super::cache_refresher::CacheRefresher::new(
-                Arc::clone(&model_cache),
-                refresher_config.interval_secs,
-            );
-            let _handle = refresher.start();
-            tracing::info!("Cache refresher started");
-        }
-
         // Initialize metrics
         let metrics = Arc::new(Metrics::default());
 
         Ok(Self {
             model_cache,
-            adapter_storage,
             model_storage,
             training_service,
             config: Arc::new(config),

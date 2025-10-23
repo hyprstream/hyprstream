@@ -11,7 +11,7 @@ use std::path::Path;
 use tracing::{debug, trace};
 
 /// Git reference types
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GitRef {
     /// Default branch (HEAD)
@@ -363,18 +363,12 @@ impl ReferenceResolver {
 
             // Iterate through all references
             let refs = repo.references().map_err(|e| {
-                Git2DBError::repository(
-                    &repo_path,
-                    format!("Failed to list references: {}", e),
-                )
+                Git2DBError::repository(&repo_path, format!("Failed to list references: {}", e))
             })?;
 
             for reference in refs {
                 let reference = reference.map_err(|e| {
-                    Git2DBError::repository(
-                        &repo_path,
-                        format!("Failed to read reference: {}", e),
-                    )
+                    Git2DBError::repository(&repo_path, format!("Failed to read reference: {}", e))
                 })?;
 
                 if let Some(name) = reference.shorthand() {
@@ -432,18 +426,12 @@ impl ReferenceResolver {
 
             // Fallback: get the first branch
             let mut branches = repo.branches(Some(git2::BranchType::Local)).map_err(|e| {
-                Git2DBError::repository(
-                    &repo_path,
-                    format!("Failed to list branches: {}", e),
-                )
+                Git2DBError::repository(&repo_path, format!("Failed to list branches: {}", e))
             })?;
 
             if let Some(Ok((branch, _))) = branches.next() {
                 if let Some(name) = branch.name().map_err(|e| {
-                    Git2DBError::repository(
-                        &repo_path,
-                        format!("Failed to get branch name: {}", e),
-                    )
+                    Git2DBError::repository(&repo_path, format!("Failed to get branch name: {}", e))
                 })? {
                     return Ok(name.to_string());
                 }
@@ -471,9 +459,7 @@ fn resolve_in_repo(repo: &Repository, git_ref: &GitRef) -> Git2DBResult<Oid> {
             .head()
             .and_then(|head| head.peel_to_commit())
             .map(|commit| commit.id())
-            .map_err(|e| {
-                Git2DBError::reference("HEAD", format!("Failed to resolve HEAD: {}", e))
-            }),
+            .map_err(|e| Git2DBError::reference("HEAD", format!("Failed to resolve HEAD: {}", e))),
 
         GitRef::Commit(oid) => {
             // Verify the commit exists

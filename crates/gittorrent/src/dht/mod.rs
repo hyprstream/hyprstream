@@ -17,6 +17,16 @@ pub mod storage;
 pub use behaviour::GitTorrentBehaviour;
 pub use storage::GitObjectStore;
 
+/// DHT operation mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum DhtMode {
+    /// Client mode - can query DHT but won't store records for others
+    Client,
+    /// Server mode - full DHT participant that stores records and serves queries
+    #[default]
+    Server,
+}
+
 /// Git SHA256 hash as a DHT key
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GitObjectKey(pub Sha256Hash);
@@ -106,7 +116,7 @@ enum PendingQuery {
         response: oneshot::Sender<Result<Option<GitObjectRecord>>>,
     },
     GetProviders {
-        key: GitObjectKey,
+        _key: GitObjectKey,
         response: oneshot::Sender<Result<Vec<PeerId>>>,
     },
 }
@@ -119,7 +129,7 @@ pub struct GitTorrentDht {
 
 impl GitTorrentDht {
     /// Create a new DHT service
-    pub async fn new(p2p_port: u16) -> Result<Self> {
+    pub async fn new(p2p_port: u16, mode: DhtMode) -> Result<Self> {
         let (command_tx, mut command_rx) = mpsc::unbounded_channel();
 
         // Create swarm with SwarmBuilder
@@ -130,7 +140,7 @@ impl GitTorrentDht {
                 libp2p::noise::Config::new,
                 libp2p::yamux::Config::default,
             )?
-            .with_behaviour(|key| GitTorrentBehaviour::new_with_keypair(key).unwrap())?
+            .with_behaviour(|key| GitTorrentBehaviour::new_with_keypair(key, mode).unwrap())?
             .build();
 
         let local_peer_id = *swarm.local_peer_id();
@@ -375,7 +385,7 @@ impl GitTorrentDht {
             DhtCommand::GetProviders { key, response } => {
                 let query_id = swarm.behaviour_mut().kademlia.get_providers(key.to_record_key());
                 // Store the pending query for later completion
-                pending_queries.insert(query_id, PendingQuery::GetProviders { key, response });
+                pending_queries.insert(query_id, PendingQuery::GetProviders { _key: key, response });
             }
 
             DhtCommand::Bootstrap { peers, response } => {

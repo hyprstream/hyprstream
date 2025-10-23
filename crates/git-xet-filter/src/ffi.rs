@@ -33,6 +33,9 @@ pub struct OpaqueGitWriteStream {
 pub const GIT_FILTER_CLEAN: c_int = 0;
 pub const GIT_FILTER_SMUDGE: c_int = 1;
 
+// Filter return codes
+pub const GIT_PASSTHROUGH: c_int = -30; // Filter doesn't want to process this file
+
 // Filter version
 pub const GIT_FILTER_VERSION: c_uint = 1;
 
@@ -46,13 +49,21 @@ pub type FilterCheckFn = extern "C" fn(
     *const *const c_char,
 ) -> c_int;
 pub type FilterStreamFn = extern "C" fn(
-    *mut OpaqueGitWriteStream,
-    *mut OpaqueGitFilter,
-    *mut *mut c_void,
-    *const OpaqueGitFilterSource,
-    *mut OpaqueGitWriteStream,
+    *mut *mut OpaqueGitWriteStream,  // out (pointer to pointer)
+    *mut OpaqueGitFilter,             // self
+    *mut *mut c_void,                 // payload
+    *const OpaqueGitFilterSource,    // src
+    *mut OpaqueGitWriteStream,        // next
 ) -> c_int;
 pub type FilterCleanupFn = extern "C" fn(*mut OpaqueGitFilter, *mut c_void);
+
+/// Apply function for use with git_filter_buffered_stream_new
+pub type FilterApplyFn = extern "C" fn(
+    *mut GitBuf,                    // to (output)
+    *const GitBuf,                  // from (input)
+    *const OpaqueGitFilterSource,  // src (source info)
+    *mut *mut c_void,              // payload (user data)
+) -> c_int;
 
 /// Filter structure (must match libgit2's git_filter)
 #[repr(C)]
@@ -62,6 +73,9 @@ pub struct GitFilter {
     pub initialize: Option<FilterInitializeFn>,
     pub shutdown: Option<FilterShutdownFn>,
     pub check: Option<FilterCheckFn>,
+    /// Reserved field (or apply callback in older versions)
+    /// This field exists for ABI compatibility with libgit2
+    pub reserved: *mut c_void,
     pub stream: Option<FilterStreamFn>,
     pub cleanup: Option<FilterCleanupFn>,
 }
@@ -73,11 +87,16 @@ unsafe impl Sync for GitFilter {}
 // Re-export git_buf from libgit2-sys as GitBuf for compatibility
 pub type GitBuf = git_buf;
 
-// Link to vendored libgit2 from libgit2-sys
 // These functions are part of libgit2's filter API
-#[link(name = "git2", kind = "static")]
+// They're available via libgit2-sys's vendored libgit2
 #[allow(improper_ctypes)] // Opaque types are intentionally zero-sized for type safety
 extern "C" {
+    /// Initialize the global filter registry (internal libgit2 function)
+    pub fn git_filter_global_init() -> c_int;
+
+    /// Initialize a git_filter with default values
+    pub fn git_filter_init(filter: *mut GitFilter, version: c_uint) -> c_int;
+
     /// Register a filter with libgit2
     pub fn git_filter_register(
         name: *const c_char,
@@ -90,6 +109,12 @@ extern "C" {
 
     /// Get filter source mode (clean or smudge)
     pub fn git_filter_source_mode(src: *const OpaqueGitFilterSource) -> c_int;
+
+    /// Get filter source flags (e.g., GIT_FILTER_TO_WORKTREE)
+    pub fn git_filter_source_flags(src: *const OpaqueGitFilterSource) -> u32;
+
+    /// Get filter source buffer (input data to filter)
+    pub fn git_filter_source_buffer(src: *const OpaqueGitFilterSource) -> *const git_buf;
 
     /// Get filter source path
     pub fn git_filter_source_path(src: *const OpaqueGitFilterSource) -> *const c_char;
@@ -110,16 +135,45 @@ extern "C" {
 
     /// Free an ODB stream (substitute for writestream_free)
     pub fn git_odb_stream_free(stream: *mut c_void);
+
+    /// Create a buffered stream for filter processing
+    /// This is a helper function that handles the streaming API for us
+    pub fn git_filter_buffered_stream_new(
+        out: *mut *mut OpaqueGitWriteStream,
+        filter: *mut OpaqueGitFilter,
+        apply_fn: FilterApplyFn,
+        temp_buf: *mut GitBuf,  // Pass NULL for auto allocation
+        payload: *mut *mut c_void,
+        src: *const OpaqueGitFilterSource,
+        next: *mut OpaqueGitWriteStream,
+    ) -> c_int;
+
+    /// Set git_buf from bytes
+    pub fn git_buf_set(
+        buf: *mut GitBuf,
+        data: *const c_void,
+        len: size_t,
+    ) -> c_int;
 }
 
-// Stub implementations for missing filter source buffer function
-// TODO: Implement proper buffered reading using git_filter_buffered_stream_new
-#[no_mangle]
-pub unsafe extern "C" fn git_filter_source_buffer(
-    _src: *const OpaqueGitFilterSource,
-) -> *const GitBuf {
-    // Return null for now - filter will need refactoring to use proper APIs
-    std::ptr::null()
+/// Helper functions for git_buf (implemented as inline accessors)
+/// These are not actual libgit2 functions but inline macros in C
+#[inline]
+pub unsafe fn git_buf_ptr(buf: *const GitBuf) -> *const c_char {
+    if buf.is_null() {
+        std::ptr::null()
+    } else {
+        (*buf).ptr
+    }
+}
+
+#[inline]
+pub unsafe fn git_buf_len(buf: *const GitBuf) -> size_t {
+    if buf.is_null() {
+        0
+    } else {
+        (*buf).size
+    }
 }
 
 /// RAII wrapper for git writestream

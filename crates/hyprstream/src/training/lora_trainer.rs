@@ -1,10 +1,10 @@
 //! LoRA training implementation with PyTorch backend
 
-use anyhow::{Result, Context};
-use tch::Device;
+use super::{ChatTemplateDataLoader, TrainingDataset};
+use crate::storage::{AdapterConfig, AdapterManager};
+use anyhow::{Context, Result};
 use std::path::Path;
-use super::{TrainingDataset, ChatTemplateDataLoader};
-use crate::storage::{AdapterManager, AdapterConfig};
+use tch::Device;
 
 /// LoRA training configuration
 #[derive(Debug, Clone)]
@@ -16,8 +16,8 @@ pub struct LoRATrainingConfig {
     pub warmup_steps: usize,
     pub max_grad_norm: f64,
     pub weight_decay: f64,
-    pub save_every: usize,  // Save checkpoint every N steps
-    pub eval_every: usize,  // Evaluate every N steps
+    pub save_every: usize, // Save checkpoint every N steps
+    pub eval_every: usize, // Evaluate every N steps
 }
 
 impl Default for LoRATrainingConfig {
@@ -46,10 +46,7 @@ pub struct LoRATrainer {
 
 impl LoRATrainer {
     /// Create new LoRA trainer
-    pub fn new(
-        model_path: &Path,
-        config: LoRATrainingConfig,
-    ) -> Result<Self> {
+    pub fn new(model_path: &Path, config: LoRATrainingConfig) -> Result<Self> {
         let adapter_manager = AdapterManager::new(model_path);
         let device = Device::cuda_if_available();
 
@@ -73,8 +70,11 @@ impl LoRATrainer {
 
         // Split dataset
         let (train_dataset, val_dataset) = dataset.train_test_split(0.9);
-        tracing::info!("Train: {} samples, Validation: {} samples",
-                 train_dataset.len(), val_dataset.len());
+        tracing::info!(
+            "Train: {} samples, Validation: {} samples",
+            train_dataset.len(),
+            val_dataset.len()
+        );
 
         // Store dataset length before moving
         let train_dataset_len = train_dataset.len();
@@ -84,11 +84,12 @@ impl LoRATrainer {
 
         // Initialize LoRA weights if adapter doesn't exist
         let adapter_paths = self.adapter_manager.get_adapter_paths()?;
-        let adapter_exists = adapter_paths.iter()
-            .any(|path| path.file_stem()
-                 .and_then(|s| s.to_str())
-                 .map(|s| s.contains(adapter_name))
-                 .unwrap_or(false));
+        let adapter_exists = adapter_paths.iter().any(|path| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.contains(adapter_name))
+                .unwrap_or(false)
+        });
 
         if !adapter_exists {
             tracing::info!("Initializing new adapter weights...");
@@ -96,16 +97,21 @@ impl LoRATrainer {
                 model_ref: "current".to_string(),
                 ..Default::default()
             };
-            self.adapter_manager.initialize_adapter(adapter_name, None, adapter_config)?;
+            self.adapter_manager
+                .initialize_adapter(adapter_name, None, adapter_config)?;
         }
 
         // Load adapter into engine
-        let adapter_path = self.adapter_manager.get_adapter_paths()?
+        let adapter_path = self
+            .adapter_manager
+            .get_adapter_paths()?
             .into_iter()
-            .find(|path| path.file_stem()
-                  .and_then(|s| s.to_str())
-                  .map(|s| s.contains(adapter_name))
-                  .unwrap_or(false))
+            .find(|path| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.contains(adapter_name))
+                    .unwrap_or(false)
+            })
             .context("Failed to find adapter after initialization")?;
 
         engine.load_lora_from_file(&adapter_path).await?;
@@ -214,7 +220,11 @@ impl LoRATrainer {
             }
         }
 
-        Ok(if num_batches > 0 { total_loss / num_batches as f64 } else { 0.0 })
+        Ok(if num_batches > 0 {
+            total_loss / num_batches as f64
+        } else {
+            0.0
+        })
     }
 
     /// Single evaluation step

@@ -20,7 +20,7 @@ pub struct GitTorrentBehaviour {
 
 impl GitTorrentBehaviour {
     /// Create a new GitTorrent behaviour
-    pub fn new_with_keypair(keypair: &libp2p::identity::Keypair) -> Result<Self> {
+    pub fn new_with_keypair(keypair: &libp2p::identity::Keypair, mode: crate::dht::DhtMode) -> Result<Self> {
         let local_peer_id = PeerId::from(keypair.public());
         // Create custom Git object store
         let store = GitObjectStore::new();
@@ -31,7 +31,13 @@ impl GitTorrentBehaviour {
         kad_config.set_replication_factor(std::num::NonZeroUsize::new(3).unwrap());
 
         // Create Kademlia DHT
-        let kademlia = kad::Behaviour::with_config(local_peer_id, store, kad_config);
+        let mut kademlia = kad::Behaviour::with_config(local_peer_id, store, kad_config);
+
+        // Set DHT mode (Client or Server)
+        kademlia.set_mode(Some(match mode {
+            crate::dht::DhtMode::Client => kad::Mode::Client,
+            crate::dht::DhtMode::Server => kad::Mode::Server,
+        }));
 
         // Create mDNS for local discovery
         let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;

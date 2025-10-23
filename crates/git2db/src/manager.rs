@@ -14,13 +14,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 use crate::clone_options::CloneOptions;
 use crate::config::Git2DBConfig;
 use crate::errors::{Git2DBError, Git2DBResult};
 use crate::repository::{CacheStats, RepositoryCache};
 use crate::transport_registry::TransportRegistry;
+use crate::worktree::WorktreeHandle;
+
+// Import storage driver system
+use crate::storage::{DriverOpts, DriverRegistry, StorageDriver};
 
 /// Global GitManager instance - singleton pattern from hyprstream
 static GLOBAL_GIT_MANAGER: OnceCell<GitManager> = OnceCell::new();
@@ -63,6 +67,8 @@ pub struct GitManager {
     active_operations: Arc<RwLock<HashMap<String, Instant>>>,
     /// Thread-safe transport registry for URL schemes
     transport_registry: Arc<TransportRegistry>,
+    /// Storage driver registry (Docker's graphdriver pattern)
+    driver_registry: Arc<DriverRegistry>,
     /// Background cleanup task handle (kept alive for the lifetime of GitManager)
     #[allow(dead_code)]
     cleanup_handle: Option<tokio::task::JoinHandle<()>>,
@@ -83,12 +89,16 @@ impl GitManager {
             None
         };
 
+        // Create driver registry (Docker pattern)
+        let driver_registry = Arc::new(DriverRegistry::new());
+
         Self {
             operation_semaphore: Arc::new(Semaphore::new(config.performance.max_concurrent_ops)),
             config,
             repo_cache,
             active_operations: Arc::new(RwLock::new(HashMap::new())),
             transport_registry: Arc::new(TransportRegistry::new()),
+            driver_registry,
             cleanup_handle,
         }
     }
@@ -121,7 +131,10 @@ impl GitManager {
                 }
 
                 if !expired.is_empty() {
-                    debug!("Cleaned up {} expired repository cache entries", expired.len());
+                    debug!(
+                        "Cleaned up {} expired repository cache entries",
+                        expired.len()
+                    );
                 }
 
                 // Evict oldest if over max size
@@ -235,8 +248,10 @@ impl GitManager {
         let token = token_from_config.or(token_from_env);
 
         if let Some(ref token_value) = token {
-            tracing::info!("Using token authentication (token starts with: {})",
-                &token_value.chars().take(10).collect::<String>());
+            tracing::info!(
+                "Using token authentication (token starts with: {})",
+                &token_value.chars().take(10).collect::<String>()
+            );
             callback_builder = callback_builder.auth(AuthStrategy::Token {
                 token: token_value.clone(),
             });
@@ -354,8 +369,10 @@ impl GitManager {
 
             oldest_created = Some(oldest_created.map_or(created, |old: Instant| old.min(created)));
             newest_created = Some(newest_created.map_or(created, |new: Instant| new.max(created)));
-            oldest_accessed = Some(oldest_accessed.map_or(accessed, |old: Instant| old.min(accessed)));
-            newest_accessed = Some(newest_accessed.map_or(accessed, |new: Instant| new.max(accessed)));
+            oldest_accessed =
+                Some(oldest_accessed.map_or(accessed, |old: Instant| old.min(accessed)));
+            newest_accessed =
+                Some(newest_accessed.map_or(accessed, |new: Instant| new.max(accessed)));
         }
 
         CacheStats {
@@ -394,7 +411,10 @@ impl GitManager {
             self.repo_cache.remove(path);
         }
 
-        debug!("Manually cleaned up {} expired cache entries", expired.len());
+        debug!(
+            "Manually cleaned up {} expired cache entries",
+            expired.len()
+        );
     }
 
     /// Clone a repository with Send-safe async support
@@ -528,65 +548,6 @@ impl GitManager {
             .map_err(|e| Git2DBError::internal(format!("Failed to create signature: {}", e)))
     }
 
-    /// Create a worktree (from hyprstream pattern)
-    pub fn create_worktree(
-        &self,
-        base_repo_path: &Path,
-        worktree_path: &Path,
-        branch_name: &str,
-        base_dir: Option<&Path>,
-    ) -> Git2DBResult<()> {
-        // Validate paths
-        let base_repo_path = if let Some(base) = base_dir {
-            self.validate_path(base, base_repo_path)
-                .map_err(|e| Git2DBError::internal(format!("Invalid base repo path: {}", e)))?
-        } else {
-            base_repo_path.to_path_buf()
-        };
-
-        let worktree_path = if let Some(base) = base_dir {
-            self.validate_path(base, worktree_path)
-                .map_err(|e| Git2DBError::internal(format!("Invalid worktree path: {}", e)))?
-        } else {
-            worktree_path.to_path_buf()
-        };
-
-        debug!(
-            "Creating worktree at {:?} for branch {}",
-            worktree_path, branch_name
-        );
-
-        // Open repository
-        let repo_cache = self.get_repository(&base_repo_path)?;
-        let repo = repo_cache.open()?;
-
-        // Create branch for worktree
-        let head = repo.head().map_err(|e| {
-            Git2DBError::repository(&base_repo_path, format!("Failed to get HEAD: {}", e))
-        })?;
-
-        let commit = head.peel_to_commit().map_err(|e| {
-            Git2DBError::repository(&base_repo_path, format!("Failed to get commit: {}", e))
-        })?;
-
-        repo.branch(branch_name, &commit, false).map_err(|e| {
-            Git2DBError::repository(&base_repo_path, format!("Failed to create branch: {}", e))
-        })?;
-
-        // Add worktree
-        repo.worktree(
-            branch_name,
-            &worktree_path,
-            Some(&git2::WorktreeAddOptions::new()),
-        )
-        .map_err(|e| {
-            Git2DBError::repository(&base_repo_path, format!("Failed to create worktree: {}", e))
-        })?;
-
-        info!("Successfully created worktree at {:?}", worktree_path);
-        Ok(())
-    }
-
     /// Remove a worktree with cleanup
     pub fn remove_worktree(
         &self,
@@ -716,6 +677,128 @@ impl GitManager {
     /// Get transport registry statistics
     pub fn transport_stats(&self) -> crate::transport_registry::RegistryStats {
         self.transport_registry.stats()
+    }
+
+    // ===== Worktree Management =====
+
+    /// Select worktree strategy based on configuration and platform
+    ///
+    /// This is called once during GitManager::new() and the strategy is cached.
+
+    /// Create a worktree using the configured storage driver
+    ///
+    /// Supports any git ref: branches, commits, tags, symbolic refs, etc.
+    /// Storage driver selection is automatic and transparent based on Git2DBConfig.
+    ///
+    /// # Arguments
+    /// * `base_repo` - Path to the base repository
+    /// * `worktree_path` - Path where worktree should be created
+    /// * `ref_spec` - Git ref (branch, commit SHA, tag, HEAD~3, etc.)
+    ///
+    /// # Returns
+    /// A handle to the created worktree. Cleanup is automatic on drop.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use git2db::{GitManager, Git2DBConfig};
+    ///
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let manager = GitManager::new(Git2DBConfig::default());
+    ///
+    /// // Branch worktree (with tracking)
+    /// let wt1 = manager.create_worktree("/repos/project", "/work/feature", "feature-branch").await?;
+    ///
+    /// // Commit worktree (detached HEAD)
+    /// let wt2 = manager.create_worktree("/repos/project", "/work/v1", "a1b2c3d4").await?;
+    ///
+    /// // Tag worktree
+    /// let wt3 = manager.create_worktree("/repos/project", "/work/release", "v1.0.0").await?;
+    ///
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn create_worktree(
+        &self,
+        base_repo: impl AsRef<Path>,
+        worktree_path: impl AsRef<Path>,
+        ref_spec: &str,
+    ) -> Git2DBResult<Box<dyn WorktreeHandle>> {
+        let base_repo = base_repo.as_ref();
+        let worktree_path = worktree_path.as_ref();
+
+        // Parse driver selection from config
+        let driver_selection = self
+            .config
+            .worktree
+            .driver
+            .parse::<StorageDriver>()
+            .map_err(|e| Git2DBError::internal(format!("Invalid driver selection: {}", e)))?;
+
+        // Get driver from registry
+        let driver = match self.driver_registry.get_driver(driver_selection) {
+            Ok(driver) => driver,
+            Err(e) if self.config.worktree.fallback => {
+                // Fallback to vfs
+                warn!("Driver not available, falling back to vfs: {}", e);
+                self.driver_registry
+                    .get_driver(StorageDriver::Vfs)
+                    .map_err(|e| Git2DBError::internal(format!("VFS fallback failed: {}", e)))?
+            }
+            Err(e) => return Err(Git2DBError::internal(format!("Driver error: {}", e))),
+        };
+
+        if self.config.worktree.log_driver {
+            info!(
+                "Creating worktree with {} driver: base={}, path={}, ref={}",
+                driver.name(),
+                base_repo.display(),
+                worktree_path.display(),
+                ref_spec
+            );
+        }
+
+        // Create driver options
+        let opts = DriverOpts {
+            base_repo: base_repo.to_path_buf(),
+            worktree_path: worktree_path.to_path_buf(),
+            ref_spec: ref_spec.to_string(),
+            force_backend: self.config.worktree.force_backend.clone(),
+        };
+
+        // Create worktree using driver
+        let result = driver.create_worktree(&opts).await;
+
+        match &result {
+            Ok(_handle) => {
+                // Already logged above
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to create worktree at {}: {}",
+                    worktree_path.display(),
+                    e
+                );
+
+                // Provide helpful hints
+                #[cfg(feature = "overlayfs")]
+                {
+                    if driver.name() == "overlay2" {
+                        tracing::error!(
+                            "Hint: Install fuse-overlayfs or enable fallback:\n  \
+                             sudo apt install fuse-overlayfs\n  \
+                             OR set worktree.fallback = true in config"
+                        );
+                    }
+                }
+            }
+        }
+
+        result.map(|h| Box::new(h) as Box<dyn WorktreeHandle>)
+    }
+
+    /// Get the driver registry
+    pub fn driver_registry(&self) -> &Arc<DriverRegistry> {
+        &self.driver_registry
     }
 }
 

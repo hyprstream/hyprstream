@@ -1,6 +1,6 @@
+use anyhow::{anyhow, Result};
 /// Helper functions for Tch tensor operations
-use tch::{Tensor, Kind as DType, Device};
-use anyhow::{Result, anyhow};
+use tch::{Device, Kind as DType, Tensor};
 
 /// Helper trait to convert usize arrays to i64 for IntList compatibility
 pub trait ToIntList {
@@ -25,7 +25,12 @@ impl ToIntList for [usize; 3] {
 impl ToIntList for [usize; 4] {
     type Output = [i64; 4];
     fn to_intlist(&self) -> Self::Output {
-        [self[0] as i64, self[1] as i64, self[2] as i64, self[3] as i64]
+        [
+            self[0] as i64,
+            self[1] as i64,
+            self[2] as i64,
+            self[3] as i64,
+        ]
     }
 }
 
@@ -86,11 +91,11 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
 pub fn to_vec1<T: tch::kind::Element>(tensor: &Tensor) -> Result<Vec<T>> {
     // Convert to CPU and correct type
     let cpu_tensor = tensor.to_kind(T::KIND).to(Device::Cpu);
-    
+
     // Get the data as a slice and convert to vec
     let numel = cpu_tensor.numel() as usize;
     let _result: Vec<T> = Vec::with_capacity(numel);
-    
+
     // Use tensor's data pointer to extract values
     // This is a placeholder - actual implementation would use tensor.data_ptr() or similar
     // For now, we'll return an error since direct conversion is not available

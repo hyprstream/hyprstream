@@ -4,10 +4,10 @@
 //! allowing configuration and storage to be passed to command handlers
 //! in an idiomatic Rust way.
 
-use std::sync::{Arc, Mutex};
 use crate::config::HyprConfig;
 use crate::storage::ModelStorage;
-use anyhow::{Result, Context as _};
+use anyhow::{Context as _, Result};
+use std::sync::{Arc, Mutex};
 
 /// Application context passed to all command handlers
 ///
@@ -63,7 +63,9 @@ impl AppContext {
         }
 
         // Slow path: initialize with lock to prevent race conditions
-        let _guard = self.init_lock.lock()
+        let _guard = self
+            .init_lock
+            .lock()
             .map_err(|e| anyhow::anyhow!("Failed to acquire initialization lock: {}", e))?;
 
         // Double-check after acquiring lock (double-checked locking pattern)
@@ -77,7 +79,8 @@ impl AppContext {
             .context("Failed to create model storage")?;
 
         // Store in OnceCell (this will only succeed once)
-        self.storage.set(storage)
+        self.storage
+            .set(storage)
             .map_err(|_| anyhow::anyhow!("Storage was already initialized by another thread"))?;
 
         // Return reference to the newly initialized storage
@@ -100,6 +103,9 @@ mod tests {
         let config = HyprConfig::default();
         let ctx = AppContext::new(config);
 
-        assert_eq!(ctx.config().models_dir(), HyprConfig::default().models_dir());
+        assert_eq!(
+            ctx.config().models_dir(),
+            HyprConfig::default().models_dir()
+        );
     }
 }

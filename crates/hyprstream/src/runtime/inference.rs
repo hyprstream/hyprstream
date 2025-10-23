@@ -4,8 +4,8 @@
 //! request/response structures and clear separation of concerns.
 
 use anyhow::Result;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tracing::instrument;
 
 use super::TorchEngine;
@@ -82,42 +82,44 @@ impl InferenceExt for TorchEngine {
     ))]
     async fn run_inference(&mut self, request: InferenceRequest) -> Result<InferenceResult> {
         let start_time = std::time::Instant::now();
-        
+
         // Apply LoRA weights if provided
         if let Some(lora_weights) = &request.lora_weights {
             apply_lora_to_engine(self, lora_weights).await?;
         }
-        
+
         let token_counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = token_counter.clone();
-        
+
         // Generate text using the engine's streaming API with custom parameters
-        let generated_text = self.generate_streaming_with_params(
-            &request.prompt,
-            request.max_tokens,
-            request.temperature,
-            request.top_p,
-            request.top_k,
-            request.repeat_penalty,
-            |_token| {
-                counter_clone.fetch_add(1, Ordering::Relaxed);
-            }
-        ).await?;
-        
+        let generated_text = self
+            .generate_streaming_with_params(
+                &request.prompt,
+                request.max_tokens,
+                request.temperature,
+                request.top_p,
+                request.top_k,
+                request.repeat_penalty,
+                |_token| {
+                    counter_clone.fetch_add(1, Ordering::Relaxed);
+                },
+            )
+            .await?;
+
         let tokens_generated = token_counter.load(Ordering::Relaxed);
         let latency_ms = start_time.elapsed().as_millis() as u64;
-        
+
         Ok(InferenceResult {
             text: generated_text.clone(),
-            tokens_generated: if tokens_generated > 0 { 
-                tokens_generated 
-            } else { 
-                generated_text.split_whitespace().count() 
+            tokens_generated: if tokens_generated > 0 {
+                tokens_generated
+            } else {
+                generated_text.split_whitespace().count()
             },
             latency_ms,
         })
     }
-    
+
     async fn run_inference_streaming<F>(
         &mut self,
         request: InferenceRequest,
@@ -127,38 +129,40 @@ impl InferenceExt for TorchEngine {
         F: FnMut(&str) + Send,
     {
         let start_time = std::time::Instant::now();
-        
+
         // Apply LoRA weights if provided
         if let Some(lora_weights) = &request.lora_weights {
             apply_lora_to_engine(self, lora_weights).await?;
         }
-        
+
         let token_counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = token_counter.clone();
-        
+
         // Generate text with streaming callback and custom parameters
-        let generated_text = self.generate_streaming_with_params(
-            &request.prompt,
-            request.max_tokens,
-            request.temperature,
-            request.top_p,
-            request.top_k,
-            request.repeat_penalty,
-            |token| {
-                on_token(token);
-                counter_clone.fetch_add(1, Ordering::Relaxed);
-            }
-        ).await?;
-        
+        let generated_text = self
+            .generate_streaming_with_params(
+                &request.prompt,
+                request.max_tokens,
+                request.temperature,
+                request.top_p,
+                request.top_k,
+                request.repeat_penalty,
+                |token| {
+                    on_token(token);
+                    counter_clone.fetch_add(1, Ordering::Relaxed);
+                },
+            )
+            .await?;
+
         let tokens_generated = token_counter.load(Ordering::Relaxed);
         let latency_ms = start_time.elapsed().as_millis() as u64;
-        
+
         Ok(InferenceResult {
             text: generated_text.clone(),
-            tokens_generated: if tokens_generated > 0 { 
-                tokens_generated 
-            } else { 
-                generated_text.split_whitespace().count() 
+            tokens_generated: if tokens_generated > 0 {
+                tokens_generated
+            } else {
+                generated_text.split_whitespace().count()
             },
             latency_ms,
         })
@@ -173,6 +177,6 @@ async fn apply_lora_to_engine(_engine: &mut TorchEngine, weights: &LoRAWeightsDa
         weights.config.rank,
         weights.config.alpha,
     );
-    
+
     Ok(())
 }

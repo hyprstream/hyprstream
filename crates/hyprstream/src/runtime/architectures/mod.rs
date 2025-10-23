@@ -1,21 +1,21 @@
 //! Architecture-specific model implementations
-//! 
+//!
 //! This module provides abstractions and implementations for different
 //! transformer architectures (Llama, Gemma, Qwen, etc.) with proper
 //! tensor shape handling and LoRA compatibility.
 
 use anyhow::Result;
-use tch::{Tensor, nn};
+use tch::{nn, Tensor};
 
-pub mod detector;
-pub mod llama;
-pub mod gemma;
-pub mod qwen;
 pub mod config;
+pub mod detector;
+pub mod gemma;
+pub mod llama;
+pub mod qwen;
 // LoRA adapter moved to lora module
 
-pub use detector::ArchitectureDetector;
 pub use config::{ArchitectureConfig, AttentionConfig};
+pub use detector::ArchitectureDetector;
 // pub use lora_adapter::ArchitectureAwareLoRAAdapter; // Module removed
 
 /// Supported model architectures
@@ -26,7 +26,7 @@ pub enum ModelArchitecture {
     /// Google's Gemma
     Gemma,
     /// Alibaba's Qwen (including Qwen3 with GQA and sparse attention)
-    Qwen { 
+    Qwen {
         version: u8,
         /// Qwen3 MoE variant (30B-A3B, 235B-A22B)
         is_moe: bool,
@@ -44,7 +44,7 @@ pub enum ModelArchitecture {
     /// EleutherAI's GPT-NeoX
     GPTNeoX,
     /// OpenAI GPT-OSS (120B/20B MoE models)
-    GPTOSS { 
+    GPTOSS {
         /// Total parameters in billions (120 or 20)
         total_params_b: u16,
         /// Active parameters in billions (5.1 or 3.6)
@@ -66,13 +66,17 @@ impl ModelArchitecture {
         match self {
             Self::Llama { version } => format!("Llama{}", version),
             Self::Gemma => "Gemma".to_string(),
-            Self::Qwen { version, is_moe, context_length } => {
+            Self::Qwen {
+                version,
+                is_moe,
+                context_length,
+            } => {
                 if *is_moe {
                     format!("Qwen{}-MoE-{}K", version, context_length / 1000)
                 } else {
                     format!("Qwen{}-{}K", version, context_length / 1000)
                 }
-            },
+            }
             Self::Phi { version } => format!("Phi{}", version),
             Self::Mistral => "Mistral".to_string(),
             Self::Starcoder => "Starcoder".to_string(),
@@ -83,38 +87,34 @@ impl ModelArchitecture {
             Self::Custom(name) => name.clone(),
         }
     }
-    
+
     /// Check if architecture supports multi-query attention
     pub fn supports_mqa(&self) -> bool {
         matches!(self, Self::Gemma | Self::Falcon)
     }
-    
+
     /// Check if architecture supports grouped-query attention
     pub fn supports_gqa(&self) -> bool {
         matches!(
-            self, 
+            self,
             Self::Llama { version: 3 } | 
             Self::Mistral | 
             Self::Qwen { version: 3, .. } |  // Qwen3 uses GQA
-            Self::GPTOSS { .. }  // GPT-OSS uses GQA in MoE
+            Self::GPTOSS { .. } // GPT-OSS uses GQA in MoE
         )
     }
-    
+
     /// Check if architecture uses Mixture of Experts
     pub fn supports_moe(&self) -> bool {
-        matches!(
-            self,
-            Self::Qwen { is_moe: true, .. } |
-            Self::GPTOSS { .. }
-        )
+        matches!(self, Self::Qwen { is_moe: true, .. } | Self::GPTOSS { .. })
     }
-    
+
     /// Check if architecture supports sparse attention
     pub fn supports_sparse_attention(&self) -> bool {
         matches!(
             self,
             Self::Qwen { version: 3, .. } |  // Qwen3 uses MInference sparse attention
-            Self::GPTOSS { .. }  // GPT-OSS optimized for long context
+            Self::GPTOSS { .. } // GPT-OSS optimized for long context
         )
     }
 }
@@ -152,26 +152,26 @@ pub trait ModelOperations: Send {
     fn var_store_mut(&mut self) -> Option<&mut nn::VarStore> {
         None // Default implementation returns None
     }
-    
+
     /// Forward pass with position information for KV caching
     fn forward_with_cache(&self, input: &Tensor, _start_pos: usize) -> Result<Tensor> {
         // Default implementation just calls regular forward
         // Models that support KV caching should override this
         self.forward(input, None)
     }
-    
+
     /// Reshape tensor for attention computation
     fn reshape_for_attention(&self, tensor: &Tensor, is_key_value: bool) -> Result<Tensor>;
-    
+
     /// Apply RoPE (Rotary Position Embeddings) if supported
     fn apply_rope(&self, tensor: &Tensor, position_ids: &Tensor) -> Result<Tensor>;
-    
+
     /// Apply architecture-specific normalization (RMSNorm, LayerNorm, etc.)
     fn normalize(&self, tensor: &Tensor) -> Result<Tensor>;
-    
+
     /// Get attention mask for the architecture
     fn get_attention_mask(&self, seq_len: usize, past_kv_len: usize) -> Result<Tensor>;
-    
+
     /// Apply LoRA adapter with architecture-specific handling (for cache/storage only)
     fn apply_lora(&mut self, adapter: &crate::lora::torch_adapter::LoRAModel) -> Result<()>;
 }
@@ -190,18 +190,21 @@ pub enum AttentionType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_architecture_properties() {
         assert!(ModelArchitecture::Gemma.supports_mqa());
         assert!(!ModelArchitecture::Gemma.supports_gqa());
         assert!(ModelArchitecture::Llama { version: 3 }.supports_gqa());
     }
-    
+
     #[test]
     fn test_architecture_names() {
         assert_eq!(ModelArchitecture::Llama { version: 2 }.name(), "Llama2");
         assert_eq!(ModelArchitecture::Gemma.name(), "Gemma");
-        assert_eq!(ModelArchitecture::Custom("MyModel".to_string()).name(), "MyModel");
+        assert_eq!(
+            ModelArchitecture::Custom("MyModel".to_string()).name(),
+            "MyModel"
+        );
     }
 }

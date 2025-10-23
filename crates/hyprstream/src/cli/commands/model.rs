@@ -18,42 +18,42 @@ pub enum ModelAction {
     Pull {
         /// Git repository URL (e.g., https://huggingface.co/microsoft/DialoGPT-medium)
         uri: String,
-        
+
         /// Force re-download even if cached
         #[arg(long)]
         force: bool,
-        
+
         /// Specific files to download
         #[arg(long, value_delimiter = ',')]
         files: Option<Vec<String>>,
-        
+
         /// Preferred format (safetensors, pytorch)
         #[arg(long, default_value = "safetensors")]
         format: String,
-        
+
         /// Auto-convert to SafeTensors if not available
         #[arg(long, default_value = "true")]
         auto_convert: bool,
-        
+
         /// Show download progress
         #[arg(long, default_value = "true")]
         progress: bool,
     },
-    
+
     /// Clone a model using Git
     Clone {
         /// Git repository URL (supports all Git URL formats)
         repo_url: String,
-        
+
         /// Git ref (branch, tag, commit) to clone
         #[arg(long)]
         git_ref: Option<String>,
-        
+
         /// Model ID to use (auto-generated if not provided)
         #[arg(long)]
         model_id: Option<String>,
     },
-    
+
     /// List available models
     List {
         /// Filter by registry type (hf, custom)
@@ -92,7 +92,7 @@ pub enum ModelAction {
         #[arg(long)]
         dirty_only: bool,
     },
-    
+
     /// Get detailed information about a model
     Inspect {
         /// Model URI
@@ -102,122 +102,98 @@ pub enum ModelAction {
         #[arg(long, default_value = "json")]
         format: String,
     },
-    
-    /// Share a model with the network
-    Share {
-        /// Model name to share
-        model_name: String,
-        
-        /// Include performance metrics
-        #[arg(long)]
-        include_metrics: bool,
-        
-        /// Push to remote repository
-        #[arg(long)]
-        push_to: Option<String>,
-    },
-    
-    /// Import a shared model from peer
-    Import {
-        /// Git URL of the shared model
-        git_url: String,
-        
-        /// Local name for the imported model
-        #[arg(long)]
-        name: Option<String>,
-        
-        /// Verify signature
-        #[arg(long)]
-        verify: bool,
-    },
-    
+
+    // Share and Import commands removed - redundant with Clone/Push
+    // P2P is handled transparently at git transport layer (GitTorrent)
+    // Use: hyprstream clone <url> (works with gittorrent:// URLs)
+    // Use: hyprstream push <remote> <branch>
+
     /// Remove a model from local cache
     Remove {
         /// Model name or reference (e.g., "gitignore", "qwen/qwen-2b")
         uri: String,
-        
+
         /// Keep metadata but remove files
         #[arg(long)]
         keep_metadata: bool,
-        
+
         /// Confirm removal without prompting
         #[arg(long)]
         yes: bool,
     },
 
     // Search functionality has been removed - use 'model list' with search filter instead
-
     /// Repair model metadata and fix inconsistencies
     Repair {
         /// Perform automatic repairs without confirmation
         #[arg(long)]
         yes: bool,
-        
+
         /// Show detailed repair information
         #[arg(long)]
         verbose: bool,
     },
-    
+
     /// Show cache status and statistics
     Cache {
         #[command(subcommand)]
         action: CacheAction,
     },
-    
+
     /// Convert model between formats
     Convert {
         /// Source model path or URI
         source: String,
-        
+
         /// Target format (safetensors)
         #[arg(long, default_value = "safetensors")]
         to: String,
-        
+
         /// Output path (optional, defaults to same directory)
         #[arg(long)]
         output: Option<String>,
-        
+
         /// Target precision (bf16, fp16, fp32)
         #[arg(long, default_value = "bf16")]
         precision: String,
-        
+
         /// Verify conversion accuracy
         #[arg(long)]
         verify: bool,
     },
-    
+
     /// List available registries
     Registries,
-    
+
     /// Run pure base model inference without any LoRA adapters
     Infer {
         /// Model reference (e.g., "Qwen3-4B", "qwen/qwen-2b", "model:branch")
         model: String,
-        
+
         /// Prompt text
         #[arg(short, long)]
         prompt: String,
-        
+
         /// Maximum tokens to generate (overrides model default)
         #[arg(short = 'm', long)]
         max_tokens: Option<usize>,
-        
+
         /// Temperature for sampling (overrides model default)
         #[arg(short = 't', long)]
         temperature: Option<f32>,
-        
+
         /// Top-p (nucleus) sampling (overrides model default)
         #[arg(long)]
         top_p: Option<f32>,
-        
+
         /// Top-k sampling (overrides model default)
         #[arg(long)]
         top_k: Option<usize>,
-        
+
         /// Stream output tokens as they're generated
         #[arg(short = 's', long)]
         stream: bool,
-        
+
         /// Force re-download even if cached
         #[arg(long)]
         force_download: bool,
@@ -229,14 +205,14 @@ pub enum ModelAction {
 pub enum CacheAction {
     /// Show cache status
     Status,
-    
+
     /// Clean up old cached models
     Cleanup {
         /// Confirm cleanup without prompting
         #[arg(long)]
         yes: bool,
     },
-    
+
     /// Verify integrity of cached models
     Verify {
         /// Model URI to verify (optional, verifies all if not specified)
@@ -345,7 +321,7 @@ impl ModelDisplayInfo {
             None => "Unknown".to_string(),
         }
     }
-    
+
     /// Format parameters for display
     pub fn format_parameters(&self) -> String {
         match &self.parameters {
@@ -353,7 +329,7 @@ impl ModelDisplayInfo {
             None => "Unknown".to_string(),
         }
     }
-    
+
     /// Format last accessed time
     pub fn format_last_accessed(&self) -> String {
         match &self.last_accessed {
@@ -376,7 +352,13 @@ impl ModelDisplayInfo {
     /// Format git status for display
     pub fn format_git_status(&self) -> String {
         match &self.git_info {
-            Some(git) => if git.is_dirty { "dirty".to_string() } else { "clean".to_string() },
+            Some(git) => {
+                if git.is_dirty {
+                    "dirty".to_string()
+                } else {
+                    "clean".to_string()
+                }
+            }
             None => "n/a".to_string(),
         }
     }
@@ -415,19 +397,26 @@ impl GitInfo {
         let (commit, short_commit) = match repo.head().ok()?.peel_to_commit() {
             Ok(commit) => {
                 let full = commit.id().to_string();
-                let short = if full.len() > 7 { full[..7].to_string() } else { full.clone() };
+                let short = if full.len() > 7 {
+                    full[..7].to_string()
+                } else {
+                    full.clone()
+                };
                 (Some(full), Some(short))
             }
             Err(_) => (None, None),
         };
 
         // Check if repository is dirty
-        let is_dirty = repo.statuses(None)
+        let is_dirty = repo
+            .statuses(None)
             .map(|statuses| !statuses.is_empty())
             .unwrap_or(false);
 
         // Get last commit date
-        let last_commit_date = repo.head().ok()
+        let last_commit_date = repo
+            .head()
+            .ok()
             .and_then(|head| head.peel_to_commit().ok())
             .map(|commit| {
                 let seconds = commit.time().seconds();

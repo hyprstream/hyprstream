@@ -133,7 +133,9 @@ indicatif = "0.17"
 fastrand = "2.0"
 xdg = "2.5"
 blake3 = "1.5"
+sha2 = "0.10"  # SHA256 validation for LFS files
 shellexpand = "3.1.1"
+caps = "0.5"  # Linux capabilities for privilege detection
 
 # Dev dependencies
 proptest = "1.0"

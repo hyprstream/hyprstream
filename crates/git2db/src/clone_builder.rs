@@ -234,13 +234,14 @@ impl<'a> CloneBuilder<'a> {
 
         // Register in Git2DB with full configuration
         self.registry
-            .register_repository_full(
+            .register_repository_internal(
                 repo_id.clone(),
                 self.name.clone(),
                 self.url,
                 target_path,
                 self.reference,
                 remote_configs,
+                std::collections::HashMap::new(), // No metadata for cloned repos by default
             )
             .await?;
 
@@ -278,9 +279,7 @@ impl<'a> CloneBuilder<'a> {
             .current_dir(repo_path)
             .output()
             .await
-            .map_err(|e| {
-                Git2DBError::internal(format!("Failed to run 'git lfs pull': {}", e))
-            })?;
+            .map_err(|e| Git2DBError::internal(format!("Failed to run 'git lfs pull': {}", e)))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

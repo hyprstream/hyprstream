@@ -41,6 +41,7 @@ tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 tempfile.workspace = true
+async-trait.workspace = true
 
 # Optional gittorrent support
 gittorrent = { workspace = true, optional = true }
@@ -53,7 +54,10 @@ data = { workspace = true, optional = true }
 cas_client = { workspace = true, optional = true }
 cas_object = { workspace = true, optional = true }
 merklehash = { workspace = true, optional = true }
-async-trait = { workspace = true, optional = true }
+
+# Overlayfs support (Linux-specific)
+nix = { workspace = true, optional = true, features = ["mount", "sched"] }
+caps = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -73,4 +77,6 @@ tracing-detail = []
 # Enable gittorrent transport support
 gittorrent-transport = ["gittorrent"]
 # Enable XET large file storage support
-xet-storage = ["git-xet-filter/xet-storage", "data", "cas_client", "cas_object", "merklehash", "async-trait"]
+xet-storage = ["git-xet-filter/xet-storage", "data", "cas_client", "cas_object", "merklehash"]
+# Enable overlayfs worktree support (Linux-only, space-efficient CoW)
+overlayfs = ["nix/mount", "nix/sched", "dep:caps"]

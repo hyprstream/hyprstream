@@ -1,18 +1,15 @@
 //! Model management endpoints
 
+use crate::{server::state::ServerState, storage::paths::StoragePaths};
 use axum::{
-    Router,
-    routing::{get, post},
-    extract::{State, Path, Json},
-    response::IntoResponse,
+    extract::{Json, Path, State},
     http::StatusCode,
-};
-use serde::{Deserialize, Serialize};
-use crate::{
-    server::state::ServerState,
-    storage::paths::StoragePaths,
+    response::IntoResponse,
+    routing::{get, post},
+    Router,
 };
 use chrono;
+use serde::{Deserialize, Serialize};
 
 /// Create model management router
 pub fn create_router() -> Router<ServerState> {
@@ -55,9 +52,7 @@ struct ModelListItem {
 }
 
 /// List all available models
-async fn list_models(
-    State(state): State<ServerState>,
-) -> impl IntoResponse {
+async fn list_models(State(state): State<ServerState>) -> impl IntoResponse {
     match state.model_storage.list_models().await {
         Ok(models) => {
             // Transform the raw model data into a cleaner response format
@@ -68,7 +63,9 @@ async fn list_models(
 
                     ModelListItem {
                         id: model_ref.model.clone(),
-                        name: metadata.display_name.clone()
+                        name: metadata
+                            .display_name
+                            .clone()
                             .unwrap_or_else(|| metadata.name.clone()),
                         display_name: metadata.display_name,
                         architecture: metadata.model_type.clone(),
@@ -78,14 +75,16 @@ async fn list_models(
                     }
                 })
                 .collect();
-            
+
             Json(model_list).into_response()
-        },
-        Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": format!("Failed to list models: {}", e)
-            }))).into_response()
         }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to list models: {}", e)
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -114,10 +113,14 @@ async fn get_model_info(
             Err(_) => {}
         }
     }
-    
-    (StatusCode::NOT_FOUND, Json(serde_json::json!({
-        "error": "Model not found"
-    }))).into_response()
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": "Model not found"
+        })),
+    )
+        .into_response()
 }
 
 /// Download a model from a registry
@@ -128,60 +131,75 @@ async fn download_model(
     // Basic validation - must be a non-empty string
     let uri = request.uri.clone();
     if uri.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Model URI cannot be empty"
-        }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Model URI cannot be empty"
+            })),
+        )
+            .into_response();
     }
-    
+
     // Get storage paths and token
     let storage_paths = match StoragePaths::new() {
         Ok(paths) => paths,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": format!("Failed to get storage paths: {}", e)
-            }))).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("Failed to get storage paths: {}", e)
+                })),
+            )
+                .into_response();
         }
     };
-    
+
     let _models_dir = match storage_paths.models_dir() {
         Ok(dir) => dir,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": format!("Failed to get models directory: {}", e)
-            }))).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("Failed to get models directory: {}", e)
+                })),
+            )
+                .into_response();
         }
     };
-    
+
     // Use shared operation
-    match crate::storage::operations::clone_model(&request.uri, request.name.as_deref(), None).await {
-        Ok(cloned) => {
-            Json(DownloadModelResponse {
-                id: cloned.model_id.to_string(),
-                name: cloned.model_name,
-                status: "downloaded".to_string(),
-                path: cloned.model_path.to_string_lossy().to_string(),
-            }).into_response()
-        }
-        Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+    match crate::storage::operations::clone_model(&request.uri, request.name.as_deref(), None).await
+    {
+        Ok(cloned) => Json(DownloadModelResponse {
+            id: cloned.model_id.to_string(),
+            name: cloned.model_name,
+            status: "downloaded".to_string(),
+            path: cloned.model_path.to_string_lossy().to_string(),
+        })
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
                 "error": format!("Failed to download model: {}", e)
-            }))).into_response()
-        }
+            })),
+        )
+            .into_response(),
     }
 }
 
 /// Load a model into the engine pool
-async fn load_model(
-    State(state): State<ServerState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn load_model(State(state): State<ServerState>, Path(id): Path<String>) -> impl IntoResponse {
     // Parse model reference
     let model_ref = match crate::storage::ModelRef::parse(&id) {
         Ok(model_ref) => model_ref,
         Err(_) => {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                "error": format!("Invalid model reference: '{}'", id)
-            }))).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Invalid model reference: '{}'", id)
+                })),
+            )
+                .into_response();
         }
     };
 
@@ -189,18 +207,23 @@ async fn load_model(
     let model_path = match state.model_storage.get_model_path(&model_ref).await {
         Ok(path) => path,
         Err(e) => {
-            return (StatusCode::NOT_FOUND, Json(serde_json::json!({
-                "error": format!("Model not found: {}", e)
-            }))).into_response();
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("Model not found: {}", e)
+                })),
+            )
+                .into_response();
         }
     };
-    
+
     // Load into engine pool
     Json(serde_json::json!({
         "status": "loaded",
         "id": id,
         "path": model_path.to_string_lossy()
-    })).into_response()
+    }))
+    .into_response()
 }
 
 /// Unload a model from the engine pool
@@ -211,27 +234,26 @@ async fn unload_model(
     Json(serde_json::json!({
         "status": "unloaded",
         "id": id
-    })).into_response()
+    }))
+    .into_response()
 }
 
 /// Refresh the model cache (rescans disk for models)
-async fn refresh_cache(
-    State(_state): State<ServerState>,
-) -> impl IntoResponse {
+async fn refresh_cache(State(_state): State<ServerState>) -> impl IntoResponse {
     // Cache is automatically maintained
     Json(serde_json::json!({
         "status": "success",
         "message": "Model cache is automatically maintained"
-    })).into_response()
+    }))
+    .into_response()
 }
 
 /// Get cache statistics
-async fn cache_stats(
-    State(state): State<ServerState>,
-) -> impl IntoResponse {
+async fn cache_stats(State(state): State<ServerState>) -> impl IntoResponse {
     let stats = state.model_cache.stats().await;
     Json(serde_json::json!({
         "cached_models": stats.cached_models,
         "max_size": stats.max_size
-    })).into_response()
+    }))
+    .into_response()
 }

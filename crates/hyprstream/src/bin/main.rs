@@ -9,33 +9,29 @@ use tracing::info;
 
 // Core application imports
 use hyprstream_core::cli::commands::Commands;
+use hyprstream_core::cli::handlers::{handle_chat_command, handle_model_command, handle_server};
 use hyprstream_core::cli::{
-    AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
-    handle_branch, handle_checkout, handle_status, handle_commit,
-    handle_lora_train, handle_serve, handle_infer,
-    handle_push, handle_pull, handle_merge, handle_remove,
-    handle_list, handle_info, handle_clone
-};
-use hyprstream_core::cli::handlers::{
-    handle_server, handle_model_command, handle_chat_command
+    handle_branch, handle_checkout, handle_clone, handle_commit, handle_infer, handle_info,
+    handle_list, handle_lora_train, handle_merge, handle_pull, handle_push, handle_remove,
+    handle_serve, handle_status, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
 };
 use hyprstream_core::config::HyprConfig;
-use hyprstream_core::storage::{ModelRef, GitRef};
+use hyprstream_core::storage::{GitRef, ModelRef};
 // Tracing imports (feature-gated)
 #[cfg(feature = "otel")]
-use opentelemetry::KeyValue;
-#[cfg(feature = "otel")]
 use opentelemetry::trace::TracerProvider;
+#[cfg(feature = "otel")]
+use opentelemetry::KeyValue;
 #[cfg(feature = "otel")]
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
 #[cfg(feature = "otel")]
 use opentelemetry_sdk::Resource;
 #[cfg(feature = "otel")]
 use tracing_opentelemetry::OpenTelemetryLayer;
-#[cfg(feature = "otel")]
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 #[cfg(not(feature = "otel"))]
 use tracing_subscriber::EnvFilter;
+#[cfg(feature = "otel")]
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[derive(Parser)]
 #[command(
@@ -52,7 +48,6 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 }
-
 
 /// Load HyprConfig from file path or default locations
 fn load_config(path: Option<&std::path::Path>) -> Result<HyprConfig> {
@@ -85,10 +80,11 @@ where
     if matches!(config.device.preference, DevicePreference::RequireGPU) {
         // Early GPU check - this is a simplified check
         // The actual GPU initialization happens in the engines
-        if std::env::var("CUDA_VISIBLE_DEVICES").is_err() &&
-           std::env::var("HIP_VISIBLE_DEVICES").is_err() &&
-           !std::path::Path::new("/usr/local/cuda").exists() &&
-           !std::path::Path::new("/opt/rocm").exists() {
+        if std::env::var("CUDA_VISIBLE_DEVICES").is_err()
+            && std::env::var("HIP_VISIBLE_DEVICES").is_err()
+            && !std::path::Path::new("/usr/local/cuda").exists()
+            && !std::path::Path::new("/opt/rocm").exists()
+        {
             anyhow::bail!("GPU required but no CUDA or ROCm installation detected. Set CUDA_VISIBLE_DEVICES or HIP_VISIBLE_DEVICES, or install CUDA/ROCm.");
         }
     }
@@ -106,8 +102,8 @@ where
     // Create appropriate runtime
     if config.multi_threaded {
         // Multi-threaded runtime for GPU workloads and server
-        let rt = tokio::runtime::Runtime::new()
-            .context("Failed to create multi-threaded runtime")?;
+        let rt =
+            tokio::runtime::Runtime::new().context("Failed to create multi-threaded runtime")?;
         rt.block_on(handler())
     } else {
         // Single-threaded runtime for lightweight operations
@@ -121,19 +117,28 @@ where
 
 /// Server command handler - requires multi-threaded runtime for GPU
 async fn handle_server_cmd(ctx: AppContext) -> Result<()> {
-    handle_server(ctx).await
+    handle_server(ctx)
+        .await
         .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
 /// Model command handler - GPU requirements depend on action
-async fn handle_model_cmd(cmd: hyprstream_core::cli::commands::model::ModelCommand, server_url: String) -> Result<()> {
-    handle_model_command(cmd, server_url).await
+async fn handle_model_cmd(
+    cmd: hyprstream_core::cli::commands::model::ModelCommand,
+    server_url: String,
+) -> Result<()> {
+    handle_model_command(cmd, server_url)
+        .await
         .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
 /// Chat command handler - requires multi-threaded runtime for GPU
-async fn handle_chat_cmd(cmd: hyprstream_core::cli::commands::chat::ChatCommand, server_url: String) -> Result<()> {
-    handle_chat_command(cmd, server_url).await
+async fn handle_chat_cmd(
+    cmd: hyprstream_core::cli::commands::chat::ChatCommand,
+    server_url: String,
+) -> Result<()> {
+    handle_chat_command(cmd, server_url)
+        .await
         .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
@@ -150,8 +155,8 @@ enum TelemetryProvider {
 #[cfg(feature = "otel")]
 /// Initialize OpenTelemetry with the specified provider
 fn init_telemetry(provider: TelemetryProvider) -> Result<()> {
-    let service_name = std::env::var("OTEL_SERVICE_NAME")
-        .unwrap_or_else(|_| "hyprstream".to_string());
+    let service_name =
+        std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "hyprstream".to_string());
 
     // Create resource with service information
     let resource = Resource::builder()
@@ -160,7 +165,6 @@ fn init_telemetry(provider: TelemetryProvider) -> Result<()> {
         .build();
 
     // Create the appropriate exporter based on provider type
-    
 
     let tracer_provider = match provider {
         TelemetryProvider::Otlp => {
@@ -203,8 +207,7 @@ fn init_telemetry(provider: TelemetryProvider) -> Result<()> {
     };
 
     let filter = EnvFilter::builder()
-        .parse_lossy(std::env::var("RUST_LOG")
-            .unwrap_or_else(|_| default_log_level.to_string()));
+        .parse_lossy(std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_string()));
 
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(true)
@@ -229,7 +232,8 @@ fn main() -> Result<()> {
     let config = load_config(cli.config.as_deref())?;
 
     // Validate configuration
-    config.validate()
+    config
+        .validate()
         .context("Configuration validation failed")?;
 
     // Create application context
@@ -239,13 +243,13 @@ fn main() -> Result<()> {
     {
         // Determine telemetry provider based on command
         let telemetry_provider = match &cli.command {
-            Commands::Server(_) => TelemetryProvider::Otlp,  // Server uses OTLP
-            _ => TelemetryProvider::Stdout,                  // All CLI commands use stdout
+            Commands::Server(_) => TelemetryProvider::Otlp, // Server uses OTLP
+            _ => TelemetryProvider::Stdout,                 // All CLI commands use stdout
         };
 
         // Initialize OpenTelemetry based on environment
         let otel_enabled = std::env::var("HYPRSTREAM_OTEL_ENABLE")
-            .unwrap_or_else(|_| "false".to_string())  // Default to disabled
+            .unwrap_or_else(|_| "false".to_string()) // Default to disabled
             .parse::<bool>()
             .unwrap_or(false);
 
@@ -259,11 +263,9 @@ fn main() -> Result<()> {
             };
 
             tracing_subscriber::fmt()
-                .with_env_filter(
-                    EnvFilter::builder()
-                        .parse_lossy(std::env::var("RUST_LOG")
-                            .unwrap_or_else(|_| default_log_level.to_string()))
-                )
+                .with_env_filter(EnvFilter::builder().parse_lossy(
+                    std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_string()),
+                ))
                 .with_target(true)
                 .with_file(true)
                 .with_line_number(true)
@@ -280,17 +282,15 @@ fn main() -> Result<()> {
         };
 
         tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::builder()
-                    .parse_lossy(std::env::var("RUST_LOG")
-                        .unwrap_or_else(|_| default_log_level.to_string()))
-            )
+            .with_env_filter(EnvFilter::builder().parse_lossy(
+                std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_string()),
+            ))
             .with_target(true)
             .with_file(true)
             .with_line_number(true)
             .init();
     }
-    
+
     info!("Hyprstream v{} starting up", env!("CARGO_PKG_VERSION"));
 
     // Handle commands with appropriate runtime configuration
@@ -300,22 +300,25 @@ fn main() -> Result<()> {
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_gpu(),
-                    multi_threaded: true
+                    multi_threaded: true,
                 },
-                || handle_server_cmd(ctx)
+                || handle_server_cmd(ctx),
             )?
         }
         Commands::Model(cmd) => {
             let server_url = "http://127.0.0.1:50051".to_string();
             let device_config = cmd.action.device_config();
-            let multi_threaded = matches!(device_config.preference, DevicePreference::RequestGPU | DevicePreference::RequireGPU);
+            let multi_threaded = matches!(
+                device_config.preference,
+                DevicePreference::RequestGPU | DevicePreference::RequireGPU
+            );
 
             with_runtime(
                 RuntimeConfig {
                     device: device_config,
-                    multi_threaded
+                    multi_threaded,
                 },
-                || handle_model_cmd(cmd, server_url)
+                || handle_model_cmd(cmd, server_url),
             )?
         }
         Commands::Chat(cmd) => {
@@ -324,9 +327,9 @@ fn main() -> Result<()> {
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_gpu(),
-                    multi_threaded: true
+                    multi_threaded: true,
                 },
-                || handle_chat_cmd(cmd, server_url)
+                || handle_chat_cmd(cmd, server_url),
             )?
         }
 
@@ -341,11 +344,16 @@ fn main() -> Result<()> {
                 || async move {
                     let storage = ctx.storage().await?;
                     handle_branch(storage, &model, &name, from).await
-                }
+                },
             )?;
         }
 
-        Commands::Checkout { model, git_ref, create_branch, force } => {
+        Commands::Checkout {
+            model,
+            git_ref,
+            create_branch,
+            force,
+        } => {
             let ctx = ctx.clone();
             with_runtime(
                 RuntimeConfig {
@@ -357,13 +365,13 @@ fn main() -> Result<()> {
 
                     // Build ModelRef from separate components
                     let git_ref_parsed = match git_ref {
-                        Some(ref r) => GitRef::parse(r, None)?,
+                        Some(ref r) => GitRef::parse(r)?,
                         None => GitRef::DefaultBranch,
                     };
                     let model_ref = ModelRef::with_ref(model, git_ref_parsed);
 
                     handle_checkout(storage, &model_ref.to_string(), create_branch, force).await
-                }
+                },
             )?;
         }
 
@@ -377,11 +385,15 @@ fn main() -> Result<()> {
                 || async move {
                     let storage = ctx.storage().await?;
                     handle_status(storage, model, verbose).await
-                }
+                },
             )?;
         }
 
-        Commands::Commit { model, message, all } => {
+        Commands::Commit {
+            model,
+            message,
+            all,
+        } => {
             let ctx = ctx.clone();
             with_runtime(
                 RuntimeConfig {
@@ -391,59 +403,114 @@ fn main() -> Result<()> {
                 || async move {
                     let storage = ctx.storage().await?;
                     handle_commit(storage, &model, &message, all).await
-                                        }
+                },
             )?;
         }
 
-        Commands::LoraTrain { model, adapter, index, rank, learning_rate,
-                              batch_size, epochs, data, interactive, config } => {
+        Commands::LoraTrain {
+            model,
+            adapter,
+            index,
+            rank,
+            learning_rate,
+            batch_size,
+            epochs,
+            data,
+            interactive,
+            config,
+        } => {
             let ctx = ctx.clone();
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_gpu(),
-                    multi_threaded: true
+                    multi_threaded: true,
                 },
                 || async move {
                     let storage = ctx.storage().await?;
-                    handle_lora_train(storage, &model, adapter, index, rank, learning_rate,
-                                     batch_size, epochs, data, interactive, config).await
-                                        }
+                    handle_lora_train(
+                        storage,
+                        &model,
+                        adapter,
+                        index,
+                        rank,
+                        learning_rate,
+                        batch_size,
+                        epochs,
+                        data,
+                        interactive,
+                        config,
+                    )
+                    .await
+                },
             )?;
         }
 
         Commands::FineTune { model, config } => {
-            anyhow::bail!("Fine-tuning is not yet implemented. Model: {}, Config: {:?}", model, config);
+            anyhow::bail!(
+                "Fine-tuning is not yet implemented. Model: {}, Config: {:?}",
+                model,
+                config
+            );
         }
 
         Commands::PreTrain { model, config } => {
-            anyhow::bail!("Pre-training is not yet implemented. Model: {}, Config: {:?}", model, config);
+            anyhow::bail!(
+                "Pre-training is not yet implemented. Model: {}, Config: {:?}",
+                model,
+                config
+            );
         }
 
         Commands::Serve { model, port, host } => {
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_gpu(),
-                    multi_threaded: true
+                    multi_threaded: true,
                 },
-                || async { handle_serve(model, port, &host).await.map_err(|e| e.into()) }
+                || async { handle_serve(model, port, &host).await.map_err(|e| e.into()) },
             )?;
         }
 
-        Commands::Infer { model, prompt, max_tokens, temperature, top_p, top_k, stream, force_download } => {
+        Commands::Infer {
+            model,
+            prompt,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            stream,
+            force_download,
+        } => {
             let ctx = ctx.clone();
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_gpu(),
-                    multi_threaded: true
+                    multi_threaded: true,
                 },
                 || async move {
                     let storage = ctx.storage().await?;
-                    handle_infer(storage, &model, &prompt, max_tokens, temperature, top_p, top_k, stream, force_download).await
-                                        }
+                    handle_infer(
+                        storage,
+                        &model,
+                        &prompt,
+                        max_tokens,
+                        temperature,
+                        top_p,
+                        top_k,
+                        stream,
+                        force_download,
+                    )
+                    .await
+                },
             )?;
         }
 
-        Commands::List { branch, tag, dirty, verbose } => {
+        Commands::List {
+            branch,
+            tag,
+            dirty,
+            verbose,
+        } => {
             let ctx = ctx.clone();
             with_runtime(
                 RuntimeConfig {
@@ -453,11 +520,15 @@ fn main() -> Result<()> {
                 || async move {
                     let storage = ctx.storage().await?;
                     handle_list(storage, branch, tag, dirty, verbose).await
-                                        }
+                },
             )?;
         }
 
-        Commands::Inspect { model, verbose, adapters_only } => {
+        Commands::Inspect {
+            model,
+            verbose,
+            adapters_only,
+        } => {
             let ctx = ctx.clone();
             with_runtime(
                 RuntimeConfig {
@@ -467,7 +538,7 @@ fn main() -> Result<()> {
                 || async move {
                     let storage = ctx.storage().await?;
                     handle_info(storage, &model, verbose, adapters_only).await
-                                        }
+                },
             )?;
         }
 
@@ -481,11 +552,17 @@ fn main() -> Result<()> {
                 || async move {
                     let storage = ctx.storage().await?;
                     handle_clone(storage, &repo_url, name).await
-                                        }
+                },
             )?;
         }
 
-        Commands::Push { model, remote, branch, set_upstream, force } => {
+        Commands::Push {
+            model,
+            remote,
+            branch,
+            set_upstream,
+            force,
+        } => {
             let ctx = ctx.clone();
             with_runtime(
                 RuntimeConfig {
@@ -495,11 +572,16 @@ fn main() -> Result<()> {
                 || async move {
                     let storage = ctx.storage().await?;
                     handle_push(storage, &model, remote, branch, set_upstream, force).await
-                                        }
+                },
             )?;
         }
 
-        Commands::Pull { model, remote, branch, rebase } => {
+        Commands::Pull {
+            model,
+            remote,
+            branch,
+            rebase,
+        } => {
             let ctx = ctx.clone();
             with_runtime(
                 RuntimeConfig {
@@ -509,11 +591,16 @@ fn main() -> Result<()> {
                 || async move {
                     let storage = ctx.storage().await?;
                     handle_pull(storage, &model, remote, branch, rebase).await
-                                        }
+                },
             )?;
         }
 
-        Commands::Merge { model, branch, ff_only, no_ff } => {
+        Commands::Merge {
+            model,
+            branch,
+            ff_only,
+            no_ff,
+        } => {
             let ctx = ctx.clone();
             with_runtime(
                 RuntimeConfig {
@@ -523,10 +610,15 @@ fn main() -> Result<()> {
                 || async move {
                     let storage = ctx.storage().await?;
                     handle_merge(storage, &model, &branch, ff_only, no_ff).await
-                                        }
+                },
             )?;
         }
-        Commands::Remove { model, force, registry_only, files_only } => {
+        Commands::Remove {
+            model,
+            force,
+            registry_only,
+            files_only,
+        } => {
             let ctx = ctx.clone();
             with_runtime(
                 RuntimeConfig {
@@ -536,7 +628,7 @@ fn main() -> Result<()> {
                 || async move {
                     let storage = ctx.storage().await?;
                     handle_remove(storage, &model, force, registry_only, files_only).await
-                                        }
+                },
             )?;
         }
     };

@@ -1,6 +1,6 @@
 //! Training data loading and processing for LoRA fine-tuning
 
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -72,7 +72,7 @@ impl TrainingDataset {
                             current_input.push('\n');
                         }
                         current_input.push_str(content);
-                    },
+                    }
                     "assistant" | "ai" => {
                         if !current_input.is_empty() {
                             samples.push(TrainingSample {
@@ -83,7 +83,7 @@ impl TrainingDataset {
                             });
                         }
                         current_input.clear();
-                    },
+                    }
                     _ => {} // ignore system messages for now
                 }
             }
@@ -125,8 +125,12 @@ impl TrainingDataset {
         let test_samples = self.samples[split_point..].to_vec();
 
         (
-            TrainingDataset { samples: train_samples },
-            TrainingDataset { samples: test_samples },
+            TrainingDataset {
+                samples: train_samples,
+            },
+            TrainingDataset {
+                samples: test_samples,
+            },
         )
     }
 }
@@ -147,7 +151,10 @@ impl ChatTemplateDataLoader {
     }
 
     /// Set chat template engine
-    pub fn with_template(mut self, template_engine: crate::runtime::template_engine::TemplateEngine) -> Self {
+    pub fn with_template(
+        mut self,
+        template_engine: crate::runtime::template_engine::TemplateEngine,
+    ) -> Self {
         self.template_engine = Some(template_engine);
         self
     }
@@ -193,9 +200,13 @@ impl ChatTemplateDataLoader {
     }
 
     /// Get formatted batches for training
-    pub fn formatted_batches(&self, batch_size: usize) -> impl Iterator<Item = Result<Vec<(String, String)>>> + '_ {
+    pub fn formatted_batches(
+        &self,
+        batch_size: usize,
+    ) -> impl Iterator<Item = Result<Vec<(String, String)>>> + '_ {
         self.dataset.batches(batch_size).map(|batch| {
-            batch.iter()
+            batch
+                .iter()
                 .map(|sample| self.format_sample(sample))
                 .collect::<Result<Vec<_>>>()
         })
@@ -226,10 +237,30 @@ mod tests {
     #[test]
     fn test_train_test_split() {
         let samples = vec![
-            TrainingSample { input: "1".to_string(), output: "a".to_string(), system: None, metadata: None },
-            TrainingSample { input: "2".to_string(), output: "b".to_string(), system: None, metadata: None },
-            TrainingSample { input: "3".to_string(), output: "c".to_string(), system: None, metadata: None },
-            TrainingSample { input: "4".to_string(), output: "d".to_string(), system: None, metadata: None },
+            TrainingSample {
+                input: "1".to_string(),
+                output: "a".to_string(),
+                system: None,
+                metadata: None,
+            },
+            TrainingSample {
+                input: "2".to_string(),
+                output: "b".to_string(),
+                system: None,
+                metadata: None,
+            },
+            TrainingSample {
+                input: "3".to_string(),
+                output: "c".to_string(),
+                system: None,
+                metadata: None,
+            },
+            TrainingSample {
+                input: "4".to_string(),
+                output: "d".to_string(),
+                system: None,
+                metadata: None,
+            },
         ];
 
         let dataset = TrainingDataset { samples };

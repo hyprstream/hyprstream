@@ -17,6 +17,7 @@ pub mod daemon;
 // Re-export commonly used types
 pub use error::{Error, Result};
 pub use types::*;
+pub use dht::DhtMode;
 
 // Re-export transport functionality for consuming applications
 pub use git::transport::{GittorrentTransportFactory, TransportFactory, register_gittorrent_transport};

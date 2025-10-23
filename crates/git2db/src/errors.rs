@@ -235,6 +235,17 @@ impl Git2DBError {
         }
     }
 
+    /// Create a merge conflict error
+    pub fn merge_conflict<S: Into<String>>(message: S) -> Self {
+        Self::GitOperation {
+            class: ErrorClass::Merge,
+            code: ErrorCode::Conflict,
+            message: message.into(),
+            recoverable: true,
+            retry_suggested: false,
+        }
+    }
+
     /// Check if the error is recoverable
     pub fn is_recoverable(&self) -> bool {
         match self {

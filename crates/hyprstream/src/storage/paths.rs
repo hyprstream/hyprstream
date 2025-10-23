@@ -20,7 +20,7 @@ impl StoragePaths {
     pub fn new() -> Result<Self> {
         let base_dirs = BaseDirectories::with_prefix(APP_NAME)
             .map_err(|e| anyhow!("Failed to create XDG base directories: {}", e))?;
-        
+
         Ok(Self { base_dirs })
     }
 
@@ -56,7 +56,6 @@ impl StoragePaths {
     pub fn hf_token_path(&self) -> Result<PathBuf> {
         Ok(self.config_dir()?.join("hf_token"))
     }
-
 
     /// Get the temporary download directory
     pub fn temp_download_dir(&self) -> Result<PathBuf> {
@@ -128,14 +127,13 @@ mod tests {
     #[tokio::test]
     async fn test_storage_paths() {
         let storage = StoragePaths::new().unwrap();
-        
+
         // Test directory creation
         let models_dir = storage.models_dir().unwrap();
         let loras_dir = storage.loras_dir().unwrap();
-        
+
         assert!(models_dir.exists());
         assert!(loras_dir.exists());
         assert!(models_dir != loras_dir);
     }
-
 }

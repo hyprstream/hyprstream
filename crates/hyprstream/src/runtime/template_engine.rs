@@ -1,7 +1,7 @@
 //! Jinja2 template engine for chat templates using minijinja
 
-use anyhow::{Result, anyhow};
-use minijinja::{Environment, Value, context};
+use anyhow::{anyhow, Result};
+use minijinja::{context, Environment, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -64,11 +64,11 @@ impl TemplateEngine {
     /// Create a new template engine with the given configuration
     pub fn new(config: TemplateConfig) -> Result<Self> {
         let mut env = Environment::new();
-        
+
         // Register common filters that HuggingFace templates might use
         env.add_filter("length", length_filter);
         env.add_filter("tojson", tojson_filter);
-        
+
         // Add custom tests for string operations
         // These can be used as: {% if value is startswith("prefix") %}
         env.add_test("startswith", |value: &str, prefix: &str| -> bool {
@@ -77,7 +77,7 @@ impl TemplateEngine {
         env.add_test("endswith", |value: &str, suffix: &str| -> bool {
             value.ends_with(suffix)
         });
-        
+
         // Also add as filters for compatibility: {{ value|startswith("prefix") }}
         env.add_filter("startswith", |value: &str, prefix: &str| -> bool {
             value.starts_with(prefix)
@@ -85,13 +85,13 @@ impl TemplateEngine {
         env.add_filter("endswith", |value: &str, suffix: &str| -> bool {
             value.ends_with(suffix)
         });
-        
+
         // We'll add the template dynamically when applying it
         // to avoid lifetime issues
-        
+
         Ok(Self { env, config })
     }
-    
+
     /// Apply chat template to messages
     pub fn apply_chat_template(
         &self,
@@ -99,22 +99,25 @@ impl TemplateEngine {
         add_generation_prompt: Option<bool>,
     ) -> Result<String> {
         // Use provided template or fall back to a default
-        let template_str = self.config.chat_template.as_ref()
+        let template_str = self
+            .config
+            .chat_template
+            .as_ref()
             .ok_or_else(|| anyhow!("No chat template configured"))?;
-        
+
         // Transform Python-style method calls to minijinja syntax if needed
         // HuggingFace templates use Python/Jinja2 syntax but minijinja uses test syntax
         let transformed = template_str
             .replace(".startswith(", " is startswith(")
             .replace(".endswith(", " is endswith(");
-        
+
         // Compile the template
         let tmpl = self.env.template_from_str(&transformed)
             .map_err(|e| anyhow!("Template compilation failed: {}. Original template may use unsupported Python syntax.", e))?;
-        
+
         // Prepare context with all special tokens and variables
         let add_gen = add_generation_prompt.unwrap_or(self.config.add_generation_prompt);
-        
+
         // Render the template
         let rendered = tmpl.render(context! {
             messages => messages,
@@ -127,10 +130,10 @@ impl TemplateEngine {
             additional_special_tokens => &self.config.additional_special_tokens,
             add_generation_prompt => add_gen,
         })?;
-        
+
         Ok(rendered)
     }
-    
+
     /// Get a fallback template for common model architectures
     pub fn get_fallback_template(model_type: &str) -> String {
         match model_type.to_lowercase().as_str() {
@@ -143,7 +146,8 @@ impl TemplateEngine {
 
 {% elif message['role'] == 'assistant' %}### Assistant: {{ message['content'] }}
 
-{% endif %}{% endfor %}{% if add_generation_prompt %}### Assistant: {% endif %}"#.to_string()
+{% endif %}{% endfor %}{% if add_generation_prompt %}### Assistant: {% endif %}"#
+                    .to_string()
             }
             "qwen" | "qwen2" => {
                 // Qwen2-style template with special tokens
@@ -160,14 +164,16 @@ impl TemplateEngine {
 {% endif %}
 {% endfor %}
 {% if add_generation_prompt %}<|im_start|>assistant
-{% endif %}"#.to_string()
+{% endif %}"#
+                    .to_string()
             }
             "mistral" | "mixtral" => {
                 // Mistral/Mixtral template
                 r#"{% for message in messages %}
 {% if message['role'] == 'user' %}[INST] {{ message['content'] }} [/INST]
 {% elif message['role'] == 'assistant' %}{{ message['content'] }}</s>
-{% endif %}{% endfor %}"#.to_string()
+{% endif %}{% endfor %}"#
+                    .to_string()
             }
             "gemma" | "gemma2" => {
                 // Gemma-style template
@@ -178,7 +184,8 @@ impl TemplateEngine {
 {{ message['content'] }}<end_of_turn>
 {% endif %}{% endfor %}
 {% if add_generation_prompt %}<start_of_turn>model
-{% endif %}"#.to_string()
+{% endif %}"#
+                    .to_string()
             }
             "chatml" | "chatgpt" => {
                 // ChatML format (GPT-style)
@@ -187,27 +194,29 @@ impl TemplateEngine {
 {{ message['content'] }}<|im_end|>
 {% endfor %}
 {% if add_generation_prompt %}<|im_start|>assistant
-{% endif %}"#.to_string()
+{% endif %}"#
+                    .to_string()
             }
             _ => {
                 // Default simple template
                 r#"{% for message in messages %}
 {{ message['role'] }}: {{ message['content'] }}
 {% endfor %}
-{% if add_generation_prompt %}assistant: {% endif %}"#.to_string()
+{% if add_generation_prompt %}assistant: {% endif %}"#
+                    .to_string()
             }
         }
     }
-    
+
     /// Parse template configuration from tokenizer_config.json
     pub fn from_tokenizer_config(config_json: &serde_json::Value) -> Result<TemplateConfig> {
         let mut template_config = TemplateConfig::default();
-        
+
         // Extract chat template
         if let Some(template) = config_json.get("chat_template").and_then(|v| v.as_str()) {
             template_config.chat_template = Some(template.to_string());
         }
-        
+
         // Extract special tokens
         if let Some(bos) = config_json.get("bos_token") {
             template_config.bos_token = extract_token_value(bos);
@@ -227,7 +236,7 @@ impl TemplateEngine {
         if let Some(cls) = config_json.get("cls_token") {
             template_config.cls_token = extract_token_value(cls);
         }
-        
+
         // Extract additional special tokens
         if let Some(additional) = config_json.get("additional_special_tokens") {
             if let Some(arr) = additional.as_array() {
@@ -238,20 +247,27 @@ impl TemplateEngine {
                 }
             }
         }
-        
+
         // Check for add_generation_prompt setting
-        if let Some(add_gen) = config_json.get("add_generation_prompt").and_then(|v| v.as_bool()) {
+        if let Some(add_gen) = config_json
+            .get("add_generation_prompt")
+            .and_then(|v| v.as_bool())
+        {
             template_config.add_generation_prompt = add_gen;
         }
-        
+
         // Build special tokens map for convenience
         if let Some(ref bos) = template_config.bos_token {
-            template_config.special_tokens.insert("bos_token".to_string(), bos.clone());
+            template_config
+                .special_tokens
+                .insert("bos_token".to_string(), bos.clone());
         }
         if let Some(ref eos) = template_config.eos_token {
-            template_config.special_tokens.insert("eos_token".to_string(), eos.clone());
+            template_config
+                .special_tokens
+                .insert("eos_token".to_string(), eos.clone());
         }
-        
+
         Ok(template_config)
     }
 }
@@ -261,7 +277,9 @@ fn extract_token_value(value: &serde_json::Value) -> Option<String> {
     if let Some(s) = value.as_str() {
         Some(s.to_string())
     } else if let Some(obj) = value.as_object() {
-        obj.get("content").and_then(|v| v.as_str()).map(|s| s.to_string())
+        obj.get("content")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
     } else {
         None
     }
@@ -282,43 +300,44 @@ fn length_filter(value: &Value) -> Result<Value, minijinja::Error> {
 
 /// Custom filter for JSON serialization
 fn tojson_filter(value: &Value) -> Result<Value, minijinja::Error> {
-    let json_str = serde_json::to_string(&value)
-        .map_err(|e| minijinja::Error::new(
+    let json_str = serde_json::to_string(&value).map_err(|e| {
+        minijinja::Error::new(
             minijinja::ErrorKind::InvalidOperation,
-            format!("Failed to serialize to JSON: {}", e)
-        ))?;
+            format!("Failed to serialize to JSON: {}", e),
+        )
+    })?;
     Ok(Value::from(json_str))
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_qwen_template() {
         let config = TemplateConfig {
-            chat_template: Some(r#"{% for message in messages %}{{'<|im_start|>' + message['role'] + '
+            chat_template: Some(
+                r#"{% for message in messages %}{{'<|im_start|>' + message['role'] + '
 ' + message['content'] + '<|im_end|>' + '
 '}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant
-' }}{% endif %}"#.to_string()),
+' }}{% endif %}"#
+                    .to_string(),
+            ),
             ..Default::default()
         };
-        
+
         let engine = TemplateEngine::new(config).unwrap();
-        let messages = vec![
-            ChatMessage {
-                role: "user".to_string(),
-                content: "Hello".to_string(),
-            },
-        ];
-        
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "Hello".to_string(),
+        }];
+
         let result = engine.apply_chat_template(&messages, Some(true)).unwrap();
         assert!(result.contains("<|im_start|>user"));
         assert!(result.contains("Hello"));
         assert!(result.contains("<|im_start|>assistant"));
     }
-    
+
     #[test]
     fn test_fallback_templates() {
         for model_type in &["llama", "qwen", "mistral", "gemma", "chatml"] {
@@ -326,19 +345,22 @@ mod tests {
             assert!(!template.is_empty());
         }
     }
-    
+
     #[test]
     fn test_huggingface_template_with_python_methods() {
         // Real HuggingFace template that uses Python-style .startswith() method
         let config = TemplateConfig {
-            chat_template: Some(r#"{% for message in messages %}
+            chat_template: Some(
+                r#"{% for message in messages %}
 {% if message['role'].startswith('sys') %}System: {{ message['content'] }}
 {% elif message['role'].endswith('er') %}User: {{ message['content'] }}
 {% elif message['role'].startswith('assist') %}Assistant: {{ message['content'] }}
-{% endif %}{% endfor %}{% if add_generation_prompt %}Assistant: {% endif %}"#.to_string()),
+{% endif %}{% endfor %}{% if add_generation_prompt %}Assistant: {% endif %}"#
+                    .to_string(),
+            ),
             ..Default::default()
         };
-        
+
         let engine = TemplateEngine::new(config).unwrap();
         let messages = vec![
             ChatMessage {
@@ -354,21 +376,22 @@ mod tests {
                 content: "Hi there!".to_string(),
             },
         ];
-        
+
         let result = engine.apply_chat_template(&messages, Some(true)).unwrap();
-        
+
         // Verify the template was processed correctly
         assert!(result.contains("System: You are a helpful assistant."));
         assert!(result.contains("User: Hello!"));
         assert!(result.contains("Assistant: Hi there!"));
         assert!(result.ends_with("Assistant: "));
     }
-    
+
     #[test]
     fn test_complex_template_with_conditions() {
         // Complex template with nested conditions and multiple Python methods
         let config = TemplateConfig {
-            chat_template: Some(r#"{% for message in messages %}
+            chat_template: Some(
+                r#"{% for message in messages %}
 {% if message['role'].startswith('sys') and message['content'] != 'test' %}
 [SYSTEM] {{ message['content'] }}
 {% elif message['role'].startswith('u') %}
@@ -376,10 +399,12 @@ mod tests {
 {% elif message['role'].endswith('ant') %}
 [ASSISTANT] {{ message['content'] }}
 {% endif %}
-{% endfor %}"#.to_string()),
+{% endfor %}"#
+                    .to_string(),
+            ),
             ..Default::default()
         };
-        
+
         let engine = TemplateEngine::new(config).unwrap();
         let messages = vec![
             ChatMessage {
@@ -395,7 +420,7 @@ mod tests {
                 content: "4".to_string(),
             },
         ];
-        
+
         let result = engine.apply_chat_template(&messages, Some(false)).unwrap();
         assert!(result.contains("[SYSTEM] Configure the model"));
         assert!(result.contains("[USER] What's 2+2?"));

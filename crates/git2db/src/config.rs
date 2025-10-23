@@ -56,6 +56,9 @@ pub struct Git2DBConfig {
     pub performance: PerformanceConfig,
     /// Default signature for commits
     pub signature: GitSignature,
+    /// Worktree strategy configuration
+    #[serde(default)]
+    pub worktree: WorktreeConfig,
     /// GitTorrent P2P transport configuration (optional, requires gittorrent-transport feature)
     #[cfg(feature = "gittorrent-transport")]
     #[serde(default)]
@@ -73,6 +76,7 @@ impl Default for Git2DBConfig {
             network: NetworkConfig::default(),
             performance: PerformanceConfig::default(),
             signature: GitSignature::default(),
+            worktree: WorktreeConfig::default(),
             #[cfg(feature = "gittorrent-transport")]
             gittorrent: gittorrent::service::GitTorrentConfig::default(),
             #[cfg(feature = "xet-storage")]
@@ -190,9 +194,11 @@ impl Git2DBConfig {
             .context("Failed to deserialize configuration")?;
 
         // Debug log
-        tracing::info!("Loaded git2db config: token present = {}, use_cred_helper = {}",
+        tracing::info!(
+            "Loaded git2db config: token present = {}, use_cred_helper = {}",
             deserialized.network.access_token.is_some(),
-            deserialized.network.use_credential_helper);
+            deserialized.network.use_credential_helper
+        );
 
         Ok(deserialized)
     }
@@ -522,6 +528,117 @@ mod tests {
         let email = "user3@example.com".to_string();
         let sig3 = GitSignature::new(&name, &email);
         assert_eq!(sig3.name, "User3");
+    }
+}
+
+/// Worktree storage driver configuration (Docker's graphdriver pattern)
+///
+/// Default behavior:
+/// - Uses "auto" driver selection (overlay2 on Linux, vfs otherwise)
+/// - Falls back to vfs if selected driver unavailable
+/// - Logs driver selection
+///
+/// # Example
+///
+/// ```toml
+/// [worktree]
+/// driver = "overlay2"  # or "auto", "vfs", etc.
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeConfig {
+    /// Storage driver selection (Docker-style)
+    ///
+    /// Options:
+    /// - "auto" (default): Auto-select best available driver
+    /// - "overlay2": Linux overlayfs (~80% space savings)
+    /// - "vfs": Plain directories (always works, no optimization)
+    /// - Future: "btrfs", "reflink", "hardlink"
+    ///
+    /// Default: "auto"
+    #[serde(default = "default_driver")]
+    pub driver: String,
+
+    /// Fallback to vfs if selected driver unavailable
+    ///
+    /// Default: true (graceful degradation)
+    ///
+    /// When true, falls back to vfs if selected driver not available.
+    /// When false, create_worktree() fails if driver unavailable.
+    #[serde(default = "default_true")]
+    pub fallback: bool,
+
+    /// Force specific backend for overlay2 driver (advanced)
+    ///
+    /// Options: "fuse", "userns", "kernel"
+    /// Default: None (automatic backend selection)
+    #[serde(default)]
+    pub force_backend: Option<String>,
+
+    /// Log driver selection decisions
+    ///
+    /// Default: true
+    #[serde(default = "default_true")]
+    pub log_driver: bool,
+}
+
+fn default_driver() -> String {
+    "auto".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for WorktreeConfig {
+    fn default() -> Self {
+        Self {
+            driver: "auto".to_string(),
+            fallback: true,
+            force_backend: None,
+            log_driver: true,
+        }
+    }
+}
+
+impl WorktreeConfig {
+    /// Require overlay2 driver (fail if unavailable)
+    pub fn overlay2_only() -> Self {
+        Self {
+            driver: "overlay2".to_string(),
+            fallback: false,
+            force_backend: None,
+            log_driver: true,
+        }
+    }
+
+    /// Use only vfs driver (plain git worktrees, no optimization)
+    pub fn vfs_only() -> Self {
+        Self {
+            driver: "vfs".to_string(),
+            fallback: true,
+            force_backend: None,
+            log_driver: true,
+        }
+    }
+
+    /// Force specific driver
+    pub fn with_driver(driver: impl Into<String>) -> Self {
+        Self {
+            driver: driver.into(),
+            fallback: true,
+            force_backend: None,
+            log_driver: true,
+        }
+    }
+
+    /// Force specific overlay2 backend
+    pub fn with_overlay2_backend(backend: impl Into<String>) -> Self {
+        Self {
+            driver: "overlay2".to_string(),
+            fallback: true,
+            force_backend: Some(backend.into()),
+            log_driver: true,
+        }
     }
 }
 

@@ -2,12 +2,11 @@
 
 use crate::cli::commands::model::ModelAction;
 use crate::config::RuntimeConfig;
-use crate::git::BranchManager;
-use crate::runtime::{RuntimeEngine, TorchEngine, InferenceExt};
-use crate::runtime::sampling::{SamplingConfig, load_sampling_config};
+use crate::runtime::sampling::{load_sampling_config, SamplingConfig};
 use crate::runtime::template_engine::ChatMessage;
-use crate::storage::{ModelStorage, ModelMetadata};
-use crate::training::{CheckpointManager, WeightSnapshot, WeightFormat};
+use crate::runtime::{InferenceExt, RuntimeEngine, TorchEngine};
+use crate::storage::{ModelMetadata, ModelStorage};
+use crate::training::{CheckpointManager, WeightFormat, WeightSnapshot};
 use ::config::{Config, File};
 use chrono::{DateTime, Utc};
 use reqwest::Client;
@@ -38,45 +37,41 @@ pub async fn execute_sparse_query(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let addr = addr.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 3000)));
     let base_url = format!("http://{}", addr);
-    
+
     if verbose {
         info!("Executing sparse query: {}", query);
         debug!("Connecting to REST API at: {}", base_url);
     }
-    
+
     // Parse the query as JSON for embedding operations
     let embedding_query: serde_json::Value = serde_json::from_str(&query)?;
-    
+
     if verbose {
         debug!("Parsed embedding query: {:?}", embedding_query);
     }
-    
+
     let client = Client::new();
-    
+
     // Extract LoRA ID from query (assuming it's in the query structure)
     let lora_id = embedding_query
         .get("lora_id")
         .and_then(|v| v.as_str())
         .unwrap_or("default");
-    
+
     // Make REST API call for embeddings
     let url = format!("{}/v1/inference/{}/embeddings", base_url, lora_id);
     let request_body = json!({
         "input": embedding_query.get("input").unwrap_or(&json!("")),
         "model": "text-embedding-ada-002"
     });
-    
+
     if verbose {
         debug!("Making request to: {}", url);
         debug!("Request body: {}", request_body);
     }
-    
-    let response = client
-        .post(&url)
-        .json(&request_body)
-        .send()
-        .await?;
-    
+
+    let response = client.post(&url).json(&request_body).send().await?;
+
     if response.status().is_success() {
         let result: Value = response.json().await?;
         if verbose {
@@ -86,28 +81,26 @@ pub async fn execute_sparse_query(
     } else {
         let status_code = response.status();
         let error_text = response.text().await?;
-        error!("❌ Query failed with status {}: {}", status_code, error_text);
+        error!(
+            "❌ Query failed with status {}: {}",
+            status_code, error_text
+        );
     }
-    
+
     Ok(())
 }
 
-
-pub async fn handle_server(
-    ctx: crate::cli::AppContext,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn handle_server(ctx: crate::cli::AppContext) -> Result<(), Box<dyn std::error::Error>> {
     let config = ctx.config();
 
     // Clone git2db config and set DHT mode to Server for full P2P participation
     let git2db_config = {
         let mut cfg = config.git2db.clone();
-
         #[cfg(feature = "gittorrent")]
         {
             cfg.gittorrent.dht_mode = gittorrent::DhtMode::Server;
             info!("DHT mode set to Server for full P2P participation");
         }
-
         cfg
     };
 
@@ -120,10 +113,8 @@ pub async fn handle_server(
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
 
     // Create server state with git2db config (DHT mode set to Server)
-    let server_state = crate::server::state::ServerState::new_with_git2db(
-        server_config,
-        git2db_config
-    ).await?;
+    let server_state =
+        crate::server::state::ServerState::new_with_git2db(server_config, git2db_config).await?;
 
     info!("Starting Hyprstream HTTP server on {}", addr);
     info!("OpenAI-compatible API available at http://{}/oai/v1", addr);
@@ -169,10 +160,7 @@ pub async fn handle_embedding_query(
         return Err("Invalid address format. Expected host:port".into());
     }
 
-    let socket_addr = SocketAddr::new(
-        addr_parts[0].parse()?,
-        addr_parts[1].parse()?
-    );
+    let socket_addr = SocketAddr::new(addr_parts[0].parse()?, addr_parts[1].parse()?);
 
     // Execute embedding query
     execute_sparse_query(
@@ -180,7 +168,8 @@ pub async fn handle_embedding_query(
         query.to_string(),
         config.as_ref(),
         verbose,
-    ).await?;
+    )
+    .await?;
 
     Ok(())
 }
@@ -205,7 +194,6 @@ pub async fn handle_model_command(
     cmd: crate::cli::commands::ModelCommand,
     _server_url: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    
     match cmd.action {
         ModelAction::List {
             registry,
@@ -216,16 +204,17 @@ pub async fn handle_model_command(
             show_status,
             branch,
             tag,
-            dirty_only
+            dirty_only,
         } => {
             info!("📋 Listing available models...");
-            
+
             // Use model storage directly
             let storage_paths = crate::storage::paths::StoragePaths::new()?;
-            let model_storage = crate::storage::ModelStorage::create(storage_paths.models_dir()?).await?;
-            
+            let model_storage =
+                crate::storage::ModelStorage::create(storage_paths.models_dir()?).await?;
+
             let models = model_storage.list_models().await?;
-            
+
             // Get remote models if requested
             if remote {
                 if let Some(_) = &registry {
@@ -235,12 +224,14 @@ pub async fn handle_model_command(
                     eprintln!("   • hyprstream model pull git@github.com:user/model.git");
                 }
             }
-            
+
             // Determine if git info should be extracted
-            let extract_git_info = show_git_ref || show_status || branch.is_some() || tag.is_some() || dirty_only;
+            let extract_git_info =
+                show_git_ref || show_status || branch.is_some() || tag.is_some() || dirty_only;
 
             // Extract git information if needed
-            let models_with_git: Vec<_> = models.into_iter()
+            let models_with_git: Vec<_> = models
+                .into_iter()
                 .map(|(model_ref, metadata)| {
                     let git_info = if extract_git_info {
                         // Get model path
@@ -255,13 +246,15 @@ pub async fn handle_model_command(
                 .collect();
 
             // Apply git-based filters
-            let filtered_models: Vec<_> = models_with_git.into_iter()
+            let filtered_models: Vec<_> = models_with_git
+                .into_iter()
                 .filter(|(model_ref, metadata, git_info)| {
                     // Apply search filter
                     if let Some(query) = &search {
                         let query_lower = query.to_lowercase();
-                        if !(model_ref.model.to_lowercase().contains(&query_lower) ||
-                             metadata.name.to_lowercase().contains(&query_lower)) {
+                        if !(model_ref.model.to_lowercase().contains(&query_lower)
+                            || metadata.name.to_lowercase().contains(&query_lower))
+                        {
                             return false;
                         }
                     }
@@ -305,10 +298,11 @@ pub async fn handle_model_command(
                     true
                 })
                 .collect();
-            
+
             match format.as_str() {
                 "json" => {
-                    let json_models: Vec<_> = filtered_models.iter()
+                    let json_models: Vec<_> = filtered_models
+                        .iter()
                         .map(|(model_ref, metadata, git_info)| {
                             let mut model_json = serde_json::json!({
                                 "name": model_ref.model,
@@ -324,13 +318,19 @@ pub async fn handle_model_command(
                             model_json
                         })
                         .collect();
-                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                        "models": json_models
-                    }))?);
-                },
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "models": json_models
+                        }))?
+                    );
+                }
                 _ => {
                     // Always use enhanced table format
-                    println!("{:<30} {:<15} {:<8} {:<6} {:<10}", "MODEL NAME", "REF", "COMMIT", "STATUS", "SIZE");
+                    println!(
+                        "{:<30} {:<15} {:<8} {:<6} {:<10}",
+                        "MODEL NAME", "REF", "COMMIT", "STATUS", "SIZE"
+                    );
                     println!("{}", "-".repeat(75));
 
                     for (model_ref, metadata, git_info) in &filtered_models {
@@ -342,15 +342,21 @@ pub async fn handle_model_command(
 
                         let (git_ref, commit, status) = match git_info {
                             Some(git) => (
-                                git.current_ref.clone().unwrap_or_else(|| "detached".to_string()),
-                                git.short_commit.clone().unwrap_or_else(|| "unknown".to_string()),
-                                if git.is_dirty { "dirty" } else { "clean" }
+                                git.current_ref
+                                    .clone()
+                                    .unwrap_or_else(|| "detached".to_string()),
+                                git.short_commit
+                                    .clone()
+                                    .unwrap_or_else(|| "unknown".to_string()),
+                                if git.is_dirty { "dirty" } else { "clean" },
                             ),
-                            None => ("n/a".to_string(), "n/a".to_string(), "n/a")
+                            None => ("n/a".to_string(), "n/a".to_string(), "n/a"),
                         };
 
-                        println!("{:<30} {:<15} {:<8} {:<6} {:<10}",
-                            model_ref.model, git_ref, commit, status, size_str);
+                        println!(
+                            "{:<30} {:<15} {:<8} {:<6} {:<10}",
+                            model_ref.model, git_ref, commit, status, size_str
+                        );
                     }
 
                     if filtered_models.is_empty() {
@@ -360,16 +366,21 @@ pub async fn handle_model_command(
                 }
             }
         }
-        ModelAction::Clone { repo_url, git_ref, model_id: _ } => {
+        ModelAction::Clone {
+            repo_url,
+            git_ref,
+            model_id: _,
+        } => {
             info!("📦 Cloning model from Git repository...");
 
             // Use shared operation (model_id parameter is deprecated, ignore it)
             let cloned = crate::storage::operations::clone_model(
                 &repo_url,
-                None,  // name - will be derived from URL
-                git_ref.as_deref()
-            ).await?;
-            
+                None, // name - will be derived from URL
+                git_ref.as_deref(),
+            )
+            .await?;
+
             println!();
             println!("✅ Model cloned successfully!");
             println!("   Model ID: {}", cloned.model_id);
@@ -377,121 +388,49 @@ pub async fn handle_model_command(
             println!("   Location: {}", cloned.model_path.display());
             println!();
             println!("📚 Next steps:");
-            println!("   • Create adapter: hyprstream lora create --base-model {}", cloned.model_id);
-            println!("   • Run inference: hyprstream model infer {} --prompt \"...\"", cloned.model_id);
+            println!(
+                "   • Create adapter: hyprstream lora create --base-model {}",
+                cloned.model_id
+            );
+            println!(
+                "   • Run inference: hyprstream model infer {} --prompt \"...\"",
+                cloned.model_id
+            );
         }
-        ModelAction::Pull { uri,  .. } => {
+        ModelAction::Pull { uri, .. } => {
             info!("📥 Pulling model: {}", uri);
-            
-            // Get storage paths
-            let storage_paths = crate::storage::paths::StoragePaths::new()?;
-            let models_dir = storage_paths.models_dir()?;
-            
-            // Initialize GitModelSource with XET support for LFS files
-            let git_source = crate::storage::GitModelSource::new(models_dir.clone());
 
-            match git_source.clone_model(&uri).await {
-                Ok((model_id, model_path)) => {
-                    println!();
-                    println!("✅ Model downloaded successfully!");
-                    println!("   Model ID: {}", model_id);
-                    println!("   Location: {}", model_path.display());
-                    
-                    let model_storage = crate::storage::ModelStorage::create(models_dir).await?;
-                    let model_name = uri.split('/').last().unwrap_or(&uri);
-                    if let Err(e) = model_storage.register_with_git_registry(
-                        &model_id, 
-                        model_name,
-                        Some(uri.clone())
-                    ).await {
-                        tracing::warn!("Failed to register with Git registry: {}", e);
-                    }
-                    
-                    println!();
-                    println!("📚 Next steps:");
-                    println!("   • Create adapter: hyprstream lora create --base-model {}", model_id);
-                    println!("   • Run inference: hyprstream model infer {} --prompt \"...\"", model_id);
-                }
-                Err(e) => {
-                    eprintln!("❌ Download failed: {}", e);
-                    return Err(e.into());
-                }
-            }
-        }
-        
-        ModelAction::Share { model_name, include_metrics, push_to } => {
-            info!("📤 Sharing model: {}", model_name);
-            
-            let storage_paths = crate::storage::paths::StoragePaths::new()?;
-            let models_dir = storage_paths.models_dir()?;
-            
-            let sharing = crate::storage::sharing::ModelSharing::new(models_dir).await?;
-            
-            // Create shareable reference
-            let share_ref = sharing.create_share_ref(&model_name, include_metrics).await?;
-            
-            println!("📋 Shareable Model Reference:");
-            println!("   Name: {}", share_ref.name);
-            println!("   Type: {:?}", share_ref.model_type);
-            println!("   Commit: {}", share_ref.commit);
-            println!("   Size: {:.2} GB", share_ref.size_bytes as f64 / 1_073_741_824.0);
-            
-            if let Some(metrics) = &share_ref.metrics {
-                println!("   Performance:");
-                println!("     Loss: {:.4}", metrics.loss);
-                if let Some(acc) = metrics.accuracy {
-                    println!("     Accuracy: {:.2}%", acc * 100.0);
-                }
-                println!("     Training Steps: {}", metrics.training_steps);
-            }
-            
-            // Optionally push to remote
-            if let Some(remote_url) = push_to {
-                println!();
-                println!("📤 Pushing to remote: {}", remote_url);
-                sharing.push_to_remote(&model_name, &remote_url, None).await?;
-            }
-            
-            // Output as JSON for easy sharing
+            // Use atomic clone+register operation (no race condition window)
+            let cloned = crate::storage::operations::clone_model(&uri, None, None).await?;
+
             println!();
-            println!("📦 Share this with peers:");
-            println!("{}", serde_json::to_string_pretty(&share_ref)?);
-        }
-        
-        ModelAction::Import { git_url, name, verify: _ } => {
-            info!("📥 Importing shared model from: {}", git_url);
-            
-            let storage_paths = crate::storage::paths::StoragePaths::new()?;
-            let models_dir = storage_paths.models_dir()?;
-            
-            let mut sharing = crate::storage::sharing::ModelSharing::new(models_dir).await?;
-            
-            // Parse share reference if provided as JSON
-            let share_ref = if git_url.starts_with('{') {
-                // Assume it's JSON share reference
-                serde_json::from_str(&git_url)?
-            } else {
-                // Create minimal share ref
-                crate::storage::sharing::ShareableModelRef {
-                    name: name.clone().unwrap_or_else(|| "imported-model".to_string()),
-                    model_type: crate::storage::sharing::ModelType::Base,
-                    git_url: Some(git_url.clone()),
-                    commit: "HEAD".to_string(),
-                    size_bytes: 0,
-                    metrics: None,
-                    signature: None,
-                }
-            };
-            
-            // Import the model
-            let model_id = sharing.import_shared_model(share_ref, &git_url, name).await?;
-            
+            println!("✅ Model downloaded successfully!");
+            println!("   Model ID: {}", cloned.model_id);
+            println!("   Name: {}", cloned.model_name);
+            println!("   Location: {}", cloned.model_path.display());
+
             println!();
-            println!("✅ Model imported successfully!");
-            println!("   Model ID: {}", model_id);
+            println!("📚 Next steps:");
+            println!(
+                "   • Create adapter: hyprstream lora create --base-model {}",
+                cloned.model_id
+            );
+            println!(
+                "   • Run inference: hyprstream model infer {} --prompt \"...\"",
+                cloned.model_id
+            );
         }
-        
-        ModelAction::Remove { uri, keep_metadata, yes } => {
+
+        // Share and Import commands removed - architectural layering violation
+        // P2P is handled transparently at git transport layer (GitTorrent)
+        // Use: hyprstream clone <url> (works with gittorrent:// URLs)
+        // Use: hyprstream push <remote> <branch>
+
+        ModelAction::Remove {
+            uri,
+            keep_metadata,
+            yes,
+        } => {
             // Parse model reference (e.g., "gitignore", "Qwen3-4B", "qwen/qwen-2b")
             let model_ref = crate::storage::ModelRef::parse(&uri)
                 .map_err(|e| anyhow::anyhow!("Invalid model reference '{}': {}. Use 'hyprstream model list' to see available models", uri, e))?;
@@ -500,7 +439,10 @@ pub async fn handle_model_command(
 
             // Check if confirmation is needed
             if !yes {
-                println!("⚠️  Are you sure you want to remove model '{}'?", model_ref.model);
+                println!(
+                    "⚠️  Are you sure you want to remove model '{}'?",
+                    model_ref.model
+                );
                 println!("This action cannot be undone.");
                 println!("");
                 println!("Type 'yes' to confirm, or use --yes flag to skip confirmation:");
@@ -540,11 +482,12 @@ pub async fn handle_model_command(
 
             // Use registry's remove_model to properly clean up submodule metadata and directories
             // Note: git2db manages tracked repositories, not submodules within a parent repo.
-            // ModelRegistry uses submodules, which is outside git2db's scope.
-            let registry = model_storage.registry();
-            if let Err(e) = registry.remove_model(&model_ref).await {
+            if let Err(e) = model_storage.remove_model(&model_ref).await {
                 eprintln!("❌ Failed to remove model: {}", e);
-                eprintln!("   You may need to manually clean up: {}", model_path.display());
+                eprintln!(
+                    "   You may need to manually clean up: {}",
+                    model_path.display()
+                );
                 return Err(e.into());
             }
 
@@ -566,7 +509,8 @@ pub async fn handle_model_command(
             info!("ℹ️ Getting model info: {}", model_ref.model);
 
             let storage_paths = crate::storage::paths::StoragePaths::new()?;
-            let model_storage = crate::storage::ModelStorage::create(storage_paths.models_dir()?).await?;
+            let model_storage =
+                crate::storage::ModelStorage::create(storage_paths.models_dir()?).await?;
 
             // Check if model exists and get path
             let model_path = match model_storage.get_model_path(&model_ref).await {
@@ -623,7 +567,7 @@ pub async fn handle_model_command(
         }
         ModelAction::Repair { yes, verbose } => {
             info!("🔧 Repairing model metadata...");
-            
+
             // Confirm repair action if not auto-confirmed
             if !yes {
                 println!("⚠️  This will scan and repair all model metadata.");
@@ -634,70 +578,69 @@ pub async fn handle_model_command(
                 println!("  - Rebuild metadata cache from directories");
                 println!("");
                 println!("Type 'yes' to confirm:");
-                
+
                 let stdin = io::stdin();
                 let mut line = String::new();
                 stdin.lock().read_line(&mut line)?;
-                
+
                 if line.trim().to_lowercase() != "yes" {
                     println!("❌ Repair cancelled");
                     return Ok(());
                 }
             }
-            
+
             let storage_paths = crate::storage::paths::StoragePaths::new()?;
-            let model_storage = crate::storage::ModelStorage::create(storage_paths.models_dir()?).await?;
-            
+            let model_storage =
+                crate::storage::ModelStorage::create(storage_paths.models_dir()?).await?;
+
+            // Note: repair_metadata() was removed - git2db manages metadata automatically
+            println!("✅ No repair needed - git2db manages metadata automatically");
+
             if verbose {
-                println!("📂 Models directory: {}", storage_paths.models_dir()?.display());
+                println!(
+                    "📂 Models directory: {}",
+                    storage_paths.models_dir()?.display()
+                );
                 println!("🔍 Scanning for models...");
-            }
-            
-            // Run the repair
-            match model_storage.repair_metadata().await {
-                Ok(()) => {
-                    println!("✅ Metadata repair completed successfully!");
-                    
-                    // List repaired models
-                    if verbose {
-                        if let Ok(models) = model_storage.list_models().await {
-                            println!("\n📋 {} models found after repair:", models.len());
-                            for (model_ref, metadata) in models.iter() {
-                                println!("  📁 {} ({})", model_ref.model, metadata.name);
-                                if let Some(display_name) = &metadata.display_name {
-                                    println!("     Display: {}", display_name);
-                                }
-                                if let Some(size) = metadata.size_bytes {
-                                    println!("     Size: {:.2} GB", size as f64 / 1_073_741_824.0);
-                                }
-                            }
+
+                if let Ok(models) = model_storage.list_models().await {
+                    println!("\n📋 {} models found:", models.len());
+                    for (model_ref, metadata) in models.iter() {
+                        println!("  📁 {} ({})", model_ref.model, metadata.name);
+                        if let Some(display_name) = &metadata.display_name {
+                            println!("     Display: {}", display_name);
+                        }
+                        if let Some(size) = metadata.size_bytes {
+                            println!("     Size: {:.2} GB", size as f64 / 1_073_741_824.0);
                         }
                     }
-                }
-                Err(e) => {
-                    eprintln!("❌ Repair failed: {}", e);
-                    return Err(e.into());
                 }
             }
         }
         // Search variant has been removed from the enum - use List with search filter
-        ModelAction::Convert { source, to, output, precision, verify: _ } => {
+        ModelAction::Convert {
+            source,
+            to,
+            output,
+            precision,
+            verify: _,
+        } => {
             info!("🔄 Converting model from {} to {}", source, to);
-            
-            
+
             // Parse source path
             let source_path = PathBuf::from(&source);
             if !source_path.exists() {
                 eprintln!("❌ Source file not found: {}", source);
                 return Ok(());
             }
-            
+
             // Determine output path
             let output_path = if let Some(out) = output {
                 PathBuf::from(out)
             } else {
                 // Generate output filename based on format
-                let stem = source_path.file_stem()
+                let stem = source_path
+                    .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("model");
                 let ext = match to.as_str() {
@@ -706,14 +649,14 @@ pub async fn handle_model_command(
                 };
                 source_path.with_file_name(format!("{}_{}.{}", stem, precision, ext))
             };
-            
+
             // Parse precision
             let target_dtype = Some(precision.clone());
-            
+
             println!("📂 Source: {}", source_path.display());
             println!("📂 Output: {}", output_path.display());
             println!("🎯 Target precision: {:?}", target_dtype);
-            
+
             // Model conversion is no longer supported
             eprintln!("❌ Model conversion has been removed.");
             eprintln!("   Please download models directly in SafeTensors format.");
@@ -721,19 +664,23 @@ pub async fn handle_model_command(
         }
         ModelAction::Cache { action: _ } => {
             info!("🗄️ Managing model cache");
-            
+
             // Use real model management system for cache info
             let storage_paths = crate::storage::paths::StoragePaths::new()?;
-            let model_storage = crate::storage::ModelStorage::create(storage_paths.models_dir()?).await?;
+            let model_storage =
+                crate::storage::ModelStorage::create(storage_paths.models_dir()?).await?;
             let cached_models = model_storage.list_local_models().await?;
             let cache_stats = model_storage.get_cache_stats().await?;
-            
+
             println!("Model Cache Status:");
             println!("📊 Cache location: ./models");
-            println!("💾 Total size: {:.1} GB", cache_stats.total_size_bytes as f64 / (1024.0 * 1024.0 * 1024.0));
+            println!(
+                "💾 Total size: {:.1} GB",
+                cache_stats.total_size_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
             println!("📦 Cached models: {}", cached_models.len());
             println!();
-            
+
             if cached_models.is_empty() {
                 println!("No models in cache.");
                 println!("Try: hyprstream model pull hf://Qwen/Qwen2-1.5B-Instruct");
@@ -742,21 +689,22 @@ pub async fn handle_model_command(
                 for (model_ref, model_metadata) in cached_models {
                     let accessed_dt = DateTime::<Utc>::from_timestamp(model_metadata.updated_at, 0)
                         .unwrap_or_else(|| Utc::now());
-                    println!("  📁 {} ({:.1} GB) - Last accessed: {}",
+                    println!(
+                        "  📁 {} ({:.1} GB) - Last accessed: {}",
                         model_ref.model,
                         model_metadata.size_bytes.unwrap_or(0) as f64 / (1024.0 * 1024.0 * 1024.0),
                         accessed_dt.format("%Y-%m-%d %H:%M:%S")
                     );
                 }
             }
-            
+
             println!();
             println!("Use 'hyprstream model cache clear' to clear cache");
             println!("Use 'hyprstream model cache prune' to remove unused models");
         }
         ModelAction::Registries => {
             info!("📋 Listing registries");
-            
+
             println!("Available Model Registries:");
             println!();
             println!("🤗 HuggingFace Hub");
@@ -767,11 +715,22 @@ pub async fn handle_model_command(
             println!();
             println!("Configure registries with 'hyprstream config' command");
         }
-        ModelAction::Infer { model, prompt, max_tokens, temperature, top_p, top_k, stream, force_download: _ } => {
-            info!("Running base model inference: model={}, prompt_len={}", model, prompt.len());
-            
-            
-            
+        ModelAction::Infer {
+            model,
+            prompt,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            stream,
+            force_download: _,
+        } => {
+            info!(
+                "Running base model inference: model={}, prompt_len={}",
+                model,
+                prompt.len()
+            );
+
             debug!("Looking up model: {}", model);
 
             // Parse model reference (e.g., "Qwen3-4B", "qwen/qwen-2b", "model:branch")
@@ -798,9 +757,9 @@ pub async fn handle_model_command(
                 eprintln!("   Use 'hyprstream model list' to see available models");
                 return Err(anyhow::anyhow!("Model '{}' not found", model_ref.model).into());
             };
-            
+
             info!("Using model at: {}", model_path.display());
-            
+
             // Load model configuration from model card
             let sampling_config = if model_path.join("config.json").exists() {
                 debug!("Loading model configuration from config.json");
@@ -818,11 +777,11 @@ pub async fn handle_model_command(
                 debug!("No config.json found. Using default sampling configuration.");
                 SamplingConfig::for_model(&model)
             };
-            
+
             debug!("Initializing inference engine");
             let runtime_config = RuntimeConfig::default();
             let mut engine = TorchEngine::new(runtime_config)?;
-            
+
             // Apply overrides to sampling config
             let mut final_config = sampling_config;
             if let Some(t) = temperature {
@@ -835,7 +794,7 @@ pub async fn handle_model_command(
                 final_config.top_k = Some(k);
             }
             final_config.do_sample = final_config.temperature > 0.0;
-            
+
             debug!("Loading base model (no LoRA)");
 
             // Time the model loading
@@ -857,28 +816,26 @@ pub async fn handle_model_command(
                     return Ok(());
                 }
             }
-            
+
             // Use model defaults or overrides
             let max_tokens = max_tokens.unwrap_or(100);
-            
+
             info!(
                 "Generating response: max_tokens={}, temperature={}, top_p={:?}, top_k={:?}",
                 max_tokens, final_config.temperature, final_config.top_p, final_config.top_k
             );
             debug!("Prompt: {}", prompt);
-            
+
             // Use clean inference interface
-            
+
             // Apply chat template to the prompt
             let formatted_prompt = {
                 // Create a user message
-                let messages = vec![
-                    ChatMessage {
-                        role: "user".to_string(),
-                        content: prompt.clone(),
-                    }
-                ];
-                
+                let messages = vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: prompt.clone(),
+                }];
+
                 // Try to apply the model's chat template
                 match engine.apply_chat_template(&messages, true) {
                     Ok(formatted) => {
@@ -891,7 +848,7 @@ pub async fn handle_model_command(
                     }
                 }
             };
-            
+
             let request = crate::runtime::InferenceRequest {
                 prompt: formatted_prompt,
                 max_tokens,
@@ -902,18 +859,20 @@ pub async fn handle_model_command(
                 stream,
                 lora_weights: None, // No LoRA for model infer
             };
-            
+
             let result = if stream {
-                engine.run_inference_streaming(request, |token| {
-                    print!("{}", token);
-                    io::stdout().flush().ok();
-                }).await?
+                engine
+                    .run_inference_streaming(request, |token| {
+                        print!("{}", token);
+                        io::stdout().flush().ok();
+                    })
+                    .await?
             } else {
                 let result = engine.run_inference(request).await?;
                 println!("{}", result.text);
                 result
             };
-            
+
             let seconds = result.latency_ms as f64 / 1000.0;
             let tokens_per_sec = if seconds > 0.0 {
                 result.tokens_generated as f64 / seconds
@@ -922,18 +881,13 @@ pub async fn handle_model_command(
             };
             info!(
                 "Generation: {} tokens in {:.2}s ({:.2} tokens/sec)",
-                result.tokens_generated,
-                seconds,
-                tokens_per_sec
+                result.tokens_generated, seconds, tokens_per_sec
             );
         }
     }
 
     Ok(())
 }
-
-
-
 
 /// Create HTTP client for REST API communication
 pub fn create_http_client() -> Client {
@@ -955,7 +909,7 @@ pub async fn create_lora_via_api(
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let client = create_http_client();
     let url = format!("{}/v1/lora/create", base_url);
-    
+
     let request_body = json!({
         "name": name,
         "base_model": base_model,
@@ -965,16 +919,20 @@ pub async fn create_lora_via_api(
         "sparsity_ratio": sparsity,
         "auto_regressive": true
     });
-    
+
     let response = client.post(&url).json(&request_body).send().await?;
-    
+
     if response.status().is_success() {
         let result: Value = response.json().await?;
         Ok(result)
     } else {
         let status_code = response.status();
         let error_text = response.text().await?;
-        Err(format!("Failed to create LoRA: HTTP {} - {}", status_code, error_text).into())
+        Err(format!(
+            "Failed to create LoRA: HTTP {} - {}",
+            status_code, error_text
+        )
+        .into())
     }
 }
 
@@ -982,16 +940,20 @@ pub async fn create_lora_via_api(
 pub async fn list_lora_via_api(base_url: &str) -> Result<Value, Box<dyn std::error::Error>> {
     let client = create_http_client();
     let url = format!("{}/v1/lora/list", base_url);
-    
+
     let response = client.get(&url).send().await?;
-    
+
     if response.status().is_success() {
         let result: Value = response.json().await?;
         Ok(result)
     } else {
         let status_code = response.status();
         let error_text = response.text().await?;
-        Err(format!("Failed to list LoRA adapters: HTTP {} - {}", status_code, error_text).into())
+        Err(format!(
+            "Failed to list LoRA adapters: HTTP {} - {}",
+            status_code, error_text
+        )
+        .into())
     }
 }
 
@@ -1002,16 +964,20 @@ pub async fn get_lora_info_via_api(
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let client = create_http_client();
     let url = format!("{}/v1/lora/{}/info", base_url, lora_id);
-    
+
     let response = client.get(&url).send().await?;
-    
+
     if response.status().is_success() {
         let result: Value = response.json().await?;
         Ok(result)
     } else {
         let status_code = response.status();
         let error_text = response.text().await?;
-        Err(format!("Failed to get LoRA info: HTTP {} - {}", status_code, error_text).into())
+        Err(format!(
+            "Failed to get LoRA info: HTTP {} - {}",
+            status_code, error_text
+        )
+        .into())
     }
 }
 
@@ -1024,23 +990,27 @@ pub async fn start_training_via_api(
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let client = create_http_client();
     let url = format!("{}/v1/training/{}/start", base_url, lora_id);
-    
+
     let request_body = json!({
         "learning_rate": learning_rate,
         "batch_size": batch_size,
         "gradient_accumulation": true,
         "mixed_precision": true
     });
-    
+
     let response = client.post(&url).json(&request_body).send().await?;
-    
+
     if response.status().is_success() {
         let result: Value = response.json().await?;
         Ok(result)
     } else {
         let status_code = response.status();
         let error_text = response.text().await?;
-        Err(format!("Failed to start training: HTTP {} - {}", status_code, error_text).into())
+        Err(format!(
+            "Failed to start training: HTTP {} - {}",
+            status_code, error_text
+        )
+        .into())
     }
 }
 
@@ -1051,16 +1021,20 @@ pub async fn get_training_status_via_api(
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let client = create_http_client();
     let url = format!("{}/v1/training/{}/status", base_url, lora_id);
-    
+
     let response = client.get(&url).send().await?;
-    
+
     if response.status().is_success() {
         let result: Value = response.json().await?;
         Ok(result)
     } else {
         let status_code = response.status();
         let error_text = response.text().await?;
-        Err(format!("Failed to get training status: HTTP {} - {}", status_code, error_text).into())
+        Err(format!(
+            "Failed to get training status: HTTP {} - {}",
+            status_code, error_text
+        )
+        .into())
     }
 }
 
@@ -1075,7 +1049,7 @@ pub async fn chat_completion_via_api(
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let client = create_http_client();
     let url = format!("{}/v1/inference/{}/chat/completions", base_url, lora_id);
-    
+
     let request_body = json!({
         "model": format!("lora-{}", lora_id),
         "messages": messages,
@@ -1083,16 +1057,20 @@ pub async fn chat_completion_via_api(
         "temperature": temperature,
         "stream": stream
     });
-    
+
     let response = client.post(&url).json(&request_body).send().await?;
-    
+
     if response.status().is_success() {
         let result: Value = response.json().await?;
         Ok(result)
     } else {
         let status_code = response.status();
         let error_text = response.text().await?;
-        Err(format!("Failed to perform chat completion: HTTP {} - {}", status_code, error_text).into())
+        Err(format!(
+            "Failed to perform chat completion: HTTP {} - {}",
+            status_code, error_text
+        )
+        .into())
     }
 }
 
@@ -1102,7 +1080,7 @@ pub async fn handle_chat_command(
     _server_url: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("💬 Starting chat with model: {}", cmd.model_id);
-    
+
     if cmd.train {
         println!("📚 Training mode enabled - will adapt model during conversation");
         println!("   → Inference runs on base model");
@@ -1110,11 +1088,11 @@ pub async fn handle_chat_command(
     } else {
         println!("🧠 Inference mode - no training");
     }
-    
+
     // Single prompt mode
     if let Some(prompt) = cmd.prompt {
         println!("\n🤖 Processing prompt: {}", prompt);
-        
+
         // Try to run actual inference with TorchEngine
         match run_chat_inference(&cmd.model_id, &prompt, cmd.max_tokens, cmd.temperature).await {
             Ok(response) => {
@@ -1122,16 +1100,17 @@ pub async fn handle_chat_command(
                 println!("========");
                 println!("{}", response);
                 println!("========");
-                
+
                 // If training mode is enabled, apply temporal LoRA training
                 if cmd.train {
                     println!("\n🎓 Training mode: Applying temporal LoRA updates...");
-                    
+
                     // For training, we need an expected response
                     // In interactive mode, we'd get this from user feedback
                     // For now, use a simple training example
-                    let expected_response = format!("Hello! I'm a helpful AI assistant. How can I help you today?");
-                    
+                    let expected_response =
+                        format!("Hello! I'm a helpful AI assistant. How can I help you today?");
+
                     match run_temporal_training(&cmd.model_id, &prompt, &expected_response).await {
                         Ok(()) => {
                             println!("✅ Training completed successfully");
@@ -1145,16 +1124,16 @@ pub async fn handle_chat_command(
             Err(e) => {
                 println!("⚠️ Inference error: {}", e);
                 println!("📤 Response: [Inference error occurred]");
-                
+
                 if cmd.train {
                     println!("📈 Training skipped due to inference failure");
                 }
             }
         }
-        
+
         return Ok(());
     }
-    
+
     // Interactive chat mode
     println!("\n💬 Interactive Chat Mode");
     println!("📋 Configuration:");
@@ -1167,9 +1146,9 @@ pub async fn handle_chat_command(
     println!();
     println!("Type 'quit' or 'exit' to end the conversation");
     println!("---");
-    
+
     println!("💡 Interactive chat mode will be implemented in future versions");
-    
+
     Ok(())
 }
 
@@ -1180,38 +1159,36 @@ async fn run_chat_inference(
     max_tokens: usize,
     temperature: f32,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    
-    
     // Create runtime config
     let runtime_config = RuntimeConfig::default();
     // Temperature will be used in generation request, not runtime config
-    
+
     // Create TorchEngine
     let mut engine = TorchEngine::new_async(runtime_config).await?;
-    
+
     // Find and load the model
     let storage_paths = crate::storage::StoragePaths::new()?;
     let models_dir = storage_paths.models_dir()?;
-    
+
     // Try to find the model file
     let model_filename = if model_id.ends_with(".safetensors") {
         model_id.to_string()
     } else {
         format!("{}.safetensors", model_id)
     };
-    
+
     // Look for model in various locations
     let possible_filenames = vec![
         model_filename.clone(),
         format!("{}.safetensors", model_id),
         format!("model.safetensors"),
     ];
-    
+
     let mut possible_paths = Vec::new();
     for filename in &possible_filenames {
         possible_paths.push(models_dir.join(filename));
     }
-    
+
     let mut model_path = None;
     for path in possible_paths {
         if path.exists() {
@@ -1219,33 +1196,36 @@ async fn run_chat_inference(
             break;
         }
     }
-    
+
     let model_path = model_path.ok_or_else(|| {
-        format!("Model '{}' not found. Try: hyprstream model download {}", model_id, model_id)
+        format!(
+            "Model '{}' not found. Try: hyprstream model download {}",
+            model_id, model_id
+        )
     })?;
-    
+
     println!("📂 Loading model from: {}", model_path.display());
-    
+
     // Load the model
     engine.load_model(&model_path).await?;
-    
+
     // Use clean inference interface
-    
+
     println!("🔮 Generating response...");
-    
+
     let request = crate::runtime::InferenceRequest {
         prompt: prompt.to_string(),
         max_tokens,
         temperature,
         top_p: 0.95,
         top_k: Some(40),
-        repeat_penalty: 1.1,  // Default for composed model
+        repeat_penalty: 1.1, // Default for composed model
         stream: false,
         lora_weights: None,
     };
-    
+
     let result = engine.run_inference(request).await?;
-    
+
     Ok(result.text)
 }
 
@@ -1255,36 +1235,35 @@ async fn run_temporal_training(
     prompt: &str,
     expected_response: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    
     tracing::info!("🎓 Starting temporal LoRA training for model: {}", model_id);
-    
+
     // Create runtime config
     let runtime_config = RuntimeConfig::default();
-    
+
     // Create TorchEngine
     let mut engine = TorchEngine::new_async(runtime_config).await?;
-    
+
     // Find and load the model (reuse same logic as run_candle_inference)
     let storage_paths = crate::storage::StoragePaths::new()?;
     let models_dir = storage_paths.models_dir()?;
-    
+
     let model_filename = if model_id.ends_with(".safetensors") {
         model_id.to_string()
     } else {
         format!("{}.safetensors", model_id)
     };
-    
+
     let possible_filenames = vec![
         model_filename.clone(),
         format!("{}.safetensors", model_id),
         format!("model.safetensors"),
     ];
-    
+
     let mut possible_paths = Vec::new();
     for filename in &possible_filenames {
         possible_paths.push(models_dir.join(filename));
     }
-    
+
     let mut model_path = None;
     for path in possible_paths {
         if path.exists() {
@@ -1292,40 +1271,51 @@ async fn run_temporal_training(
             break;
         }
     }
-    
-    let model_path = model_path.ok_or_else(|| {
-        format!("Model '{}' not found for training", model_id)
-    })?;
-    
+
+    let model_path =
+        model_path.ok_or_else(|| format!("Model '{}' not found for training", model_id))?;
+
     // Load the model
     engine.load_model(&model_path).await?;
-    
+
     // Run temporal LoRA training
     let learning_rate = 0.001; // Default learning rate
-    engine.train_temporal_lora(prompt, expected_response, learning_rate).await?;
-    
+    engine
+        .train_temporal_lora(prompt, expected_response, learning_rate)
+        .await?;
+
     tracing::info!("✅ Temporal LoRA training completed");
 
     Ok(())
 }
 
 /// Extract model metadata directly from git repository
-fn extract_model_metadata(model_path: &std::path::Path, model_name: &str) -> Result<ModelMetadata, Box<dyn std::error::Error>> {
+fn extract_model_metadata(
+    model_path: &std::path::Path,
+    model_name: &str,
+) -> Result<ModelMetadata, Box<dyn std::error::Error>> {
     // Calculate directory size
     let size_bytes = calculate_directory_size(model_path).unwrap_or(0);
 
     // Get git metadata if available
     let (created_at, updated_at) = if let Ok(repo) = crate::git::get_repository(model_path) {
         // Get first commit time as created_at
-        let created_at = repo.head().ok()
+        let created_at = repo
+            .head()
+            .ok()
             .and_then(|head| head.peel_to_commit().ok())
             .map(|commit| commit.time().seconds())
-            .unwrap_or_else(|| std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap().as_secs() as i64);
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64
+            });
 
         // Get last commit time as updated_at
-        let updated_at = repo.head().ok()
+        let updated_at = repo
+            .head()
+            .ok()
             .and_then(|head| head.peel_to_commit().ok())
             .map(|commit| commit.time().seconds())
             .unwrap_or(created_at);
@@ -1334,7 +1324,8 @@ fn extract_model_metadata(model_path: &std::path::Path, model_name: &str) -> Res
     } else {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap().as_secs() as i64;
+            .unwrap()
+            .as_secs() as i64;
         (now, now)
     };
 
@@ -1422,7 +1413,6 @@ pub async fn handle_write_checkpoint(
     _name: Option<String>,
     step: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-
     info!("Writing checkpoint for model: {}", model_id);
 
     // Load model storage
@@ -1451,11 +1441,7 @@ pub async fn handle_write_checkpoint(
     };
 
     // Write checkpoint
-    let checkpoint_path = checkpoint_mgr.write_checkpoint(
-        weights,
-        step,
-        None,
-    ).await?;
+    let checkpoint_path = checkpoint_mgr.write_checkpoint(weights, step, None).await?;
 
     info!("✅ Checkpoint written to: {}", checkpoint_path.display());
 
@@ -1469,7 +1455,6 @@ pub async fn handle_commit_checkpoint(
     branch: Option<String>,
     tag: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-
     info!("Committing checkpoint: {}", checkpoint_path);
 
     let checkpoint_path = PathBuf::from(&checkpoint_path);
@@ -1477,10 +1462,12 @@ pub async fn handle_commit_checkpoint(
     // Get model path (parent of .checkpoints directory)
     let model_path = checkpoint_path
         .parent()
-        .and_then(|p| if p.file_name() == Some(std::ffi::OsStr::new(".checkpoints")) {
-            p.parent()
-        } else {
-            Some(p)
+        .and_then(|p| {
+            if p.file_name() == Some(std::ffi::OsStr::new(".checkpoints")) {
+                p.parent()
+            } else {
+                Some(p)
+            }
         })
         .ok_or("Invalid checkpoint path")?;
 
@@ -1488,18 +1475,15 @@ pub async fn handle_commit_checkpoint(
     let checkpoint_mgr = CheckpointManager::new(model_path.to_path_buf())?;
 
     // Commit checkpoint
-    let commit_id = checkpoint_mgr.commit_checkpoint(
-        &checkpoint_path,
-        message,
-        branch,
-    ).await?;
+    let commit_id = checkpoint_mgr
+        .commit_checkpoint(&checkpoint_path, message, branch)
+        .await?;
 
     info!("✅ Checkpoint committed: {}", commit_id);
 
     // Create tag if requested
     if let Some(tag_name) = tag {
-        let branch_mgr = BranchManager::new(model_path)?;
-        branch_mgr.create_tag(&tag_name, "HEAD")?;
+        crate::git::helpers::create_tag(model_path, &tag_name)?;
         info!("✅ Tag created: {}", tag_name);
     }
 

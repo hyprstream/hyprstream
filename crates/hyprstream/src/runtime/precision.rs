@@ -1,12 +1,12 @@
 //! Precision management for BF16 and future FP8 support
-//! 
+//!
 //! This module handles dtype selection, conversion, and optimization
 //! for different hardware targets and use cases.
 
-use anyhow::{Result, anyhow};
-use tch::{Kind as DType, Device, Tensor};
+use super::fp8::{FP8Config, FP8Format, FP8Scaler};
+use anyhow::{anyhow, Result};
 use std::fmt;
-use super::fp8::{FP8Format, FP8Config, FP8Scaler};
+use tch::{Device, Kind as DType, Tensor};
 
 /// Precision modes for different use cases
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -75,13 +75,17 @@ impl PrecisionConfig {
                 compute_dtype: DType::Float,
                 scaling_manager: None,
             }),
-            PrecisionMode::FP8Mixed { forward, backward, master } => {
+            PrecisionMode::FP8Mixed {
+                forward,
+                backward,
+                master,
+            } => {
                 // Check if FP8 is actually supported
                 let fp8_config = FP8Config::training();
                 if !fp8_config.is_fully_supported() {
                     tracing::warn!("FP8 not fully supported, using fallback configuration");
                 }
-                
+
                 Ok(Self {
                     base_model_dtype: forward.to_dtype().unwrap_or(DType::Half),
                     lora_adapter_dtype: master, // LoRA stays in higher precision!
@@ -98,7 +102,7 @@ impl PrecisionConfig {
     pub fn auto_detect(device: &Device) -> Self {
         // Check if FP8 is supported (requires H100+)
         let fp8_config = super::fp8::optimal_fp8_config(device);
-        
+
         if fp8_config.is_fully_supported() {
             // Use FP8 if fully supported
             Self::from_mode(
@@ -108,7 +112,8 @@ impl PrecisionConfig {
                     master: DType::Half,
                 },
                 device,
-            ).unwrap_or_else(|_| Self::bf16_default())
+            )
+            .unwrap_or_else(|_| Self::bf16_default())
         } else if FP8Format::E4M3.is_supported() {
             // Use partial FP8 (E4M3 only)
             Self::from_mode(
@@ -118,7 +123,8 @@ impl PrecisionConfig {
                     master: DType::Half,
                 },
                 device,
-            ).unwrap_or_else(|_| Self::bf16_default())
+            )
+            .unwrap_or_else(|_| Self::bf16_default())
         } else if Self::supports_bf16(device) {
             Self::bf16_default()
         } else {
@@ -160,7 +166,7 @@ impl PrecisionConfig {
                 // This is a simplified check - real implementation would query device
                 true // Assume modern GPU for now
             }
-            Device::Mps => true, // M1/M2/M3 support BF16
+            Device::Mps => true,     // M1/M2/M3 support BF16
             Device::Vulkan => false, // Vulkan support varies by implementation
         }
     }
@@ -220,7 +226,7 @@ impl ScalingManager {
         // 3. Apply scaling
         // 4. Convert to FP8
         // 5. Store scale factor for backward pass
-        
+
         Ok(tensor.to_dtype(target_dtype, false, false))
     }
 
@@ -265,7 +271,7 @@ impl HardwareCapabilities {
                     supports_bf16: true,
                     supports_fp8: false, // H100+ only
                     supports_int8: true,
-                    memory_gb: 24.0, // Placeholder
+                    memory_gb: 24.0,                  // Placeholder
                     compute_capability: Some((8, 6)), // Example: RTX 3090
                 }
             }

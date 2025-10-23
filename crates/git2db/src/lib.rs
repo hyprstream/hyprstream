@@ -20,6 +20,7 @@ pub mod branch;
 pub mod clone_builder;
 pub mod manager;
 pub mod references;
+pub mod registration_builder;
 pub mod registry;
 pub mod remote;
 pub mod repo_accessor;
@@ -27,6 +28,10 @@ pub mod repository;
 pub mod repository_handle;
 pub mod stage;
 pub mod transaction;
+pub mod worktree;
+
+// Storage drivers (Docker's graphdriver pattern)
+pub mod storage;
 
 // Optional gittorrent integration
 #[cfg(feature = "gittorrent-transport")]
@@ -36,28 +41,54 @@ pub mod gittorrent_integration;
 #[cfg(feature = "xet-storage")]
 pub mod xet_filter;
 
+// Public XET module with high-level API
+#[cfg(feature = "xet-storage")]
+pub mod xet {
+    //! XET large file storage integration
+    //!
+    //! Provides high-level XET storage operations for model files and large data.
+
+    pub use git_xet_filter::config::XetConfig;
+    pub use git_xet_filter::storage::{StorageBackend, XetStorage};
+    pub use crate::xet_filter::{initialize, is_initialized, last_error, clear_last_error};
+}
+
 // Re-export main types
-pub use config::{Git2DBConfig, GitSignature};
+pub use config::{Git2DBConfig, GitSignature, WorktreeConfig};
 pub use errors::{Git2DBError, Git2DBResult};
 
-// Re-export XetConfig even when xet-storage feature is disabled (for API compatibility)
+// Re-export git2 types for cleaner API boundary
+// Consumers should use git2db::Oid and git2db::Repository instead of git2::Oid and git2::Repository
+// This maintains a clean abstraction layer while allowing low-level access when needed
+pub use git2::{Oid, Repository};
+
+// Re-export XetConfig only when xet-storage feature is enabled
+// This prevents API confusion - if you can import XetConfig, XET functionality is available
 #[cfg(feature = "xet-storage")]
 pub use config::XetConfig;
-
-#[cfg(not(feature = "xet-storage"))]
-pub use git_xet_filter::XetConfig;
 
 // Enhanced exports with git-native API (v2)
 pub use branch::{Branch, BranchKind, BranchManager};
 pub use clone_builder::CloneBuilder;
 pub use manager::GitManager;
 pub use references::{GitRef, IntoGitRef};
+pub use registration_builder::RegistrationBuilder;
 pub use registry::{Git2DB, RemoteConfig, RepoId, TrackedRepository};
 pub use remote::{Remote, RemoteManager};
 pub use repository_handle::{RepositoryHandle, RepositoryStatus};
 pub use stage::{StageManager, StagedFile};
 pub use transaction::{IsolationMode, TransactionHandle};
 pub use transport::TransportFactory;
+
+// Worktree exports
+pub use worktree::{WorktreeHandle, WorktreeMetadata};
+
+// Overlayfs exports (feature-gated)
+#[cfg(feature = "overlayfs")]
+pub use worktree::overlayfs_available;
+
+// Storage driver exports
+pub use storage::{Driver, DriverRegistry, StorageDriver};
 
 /// Version of git2db library
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -141,9 +172,13 @@ pub mod ops {
         manager().get_repository(path)?.open()
     }
 
-    /// Create a worktree
-    pub fn create_worktree(base_repo: &Path, worktree: &Path, branch: &str) -> Git2DBResult<()> {
-        manager().create_worktree(base_repo, worktree, branch, None)
+    /// Create a worktree (async)
+    pub async fn create_worktree(
+        base_repo: &Path,
+        worktree: &Path,
+        branch: &str,
+    ) -> Git2DBResult<Box<dyn crate::worktree::WorktreeHandle>> {
+        manager().create_worktree(base_repo, worktree, branch).await
     }
 
     /// Remove a worktree
