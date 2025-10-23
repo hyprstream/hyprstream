@@ -397,8 +397,8 @@ impl GitRemoteHelper {
     async fn clone_from_dht(
         &self,
         commit_hash: &crate::types::Sha256Hash,
-        target_path: &Path,
-        include_refs: bool,
+        _target_path: &Path,
+        _include_refs: bool,
     ) -> Result<()> {
         // This would use the DHT service to perform the actual clone
         // For now, we'll create a placeholder since we need the actual DHT connection

@@ -96,13 +96,11 @@ pub async fn handle_server(ctx: crate::cli::AppContext) -> Result<(), Box<dyn st
     // Clone git2db config and set DHT mode to Server for full P2P participation
     let git2db_config = {
         let mut cfg = config.git2db.clone();
-
         #[cfg(feature = "gittorrent")]
         {
             cfg.gittorrent.dht_mode = gittorrent::DhtMode::Server;
             info!("DHT mode set to Server for full P2P participation");
         }
-
         cfg
     };
 

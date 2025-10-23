@@ -7,7 +7,7 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::Path;
 use tch::{Device, Kind as DType, Tensor};
-use tracing::{debug, info, instrument};
+use tracing::{info, instrument};
 
 use super::architectures::{gemma::GemmaModel, llama::LlamaModel, ModelOperations};
 use super::model_config::{ModelArchitecture, ModelConfig};

@@ -117,10 +117,12 @@ impl SmartSubtransport for GittorrentTransport {
 }
 
 /// GitTorrent stream for handling Git protocol communications
+///
+/// Note: This is a placeholder implementation. The full Git protocol
+/// implementation would require the URL and service for:
+/// - URL: Identifying which repository to interact with
+/// - Service: Accessing the DHT and P2P network for git objects
 pub struct GittorrentStream {
-    url: GitTorrentUrl,
-    service: Arc<GitTorrentService>,
-    service_type: Service,
     buffer: Vec<u8>,
     position: usize,
     finished: bool,
@@ -128,11 +130,9 @@ pub struct GittorrentStream {
 
 impl GittorrentStream {
     /// Create a new stream for upload-pack (fetch) operations
-    fn new_upload_pack(url: GitTorrentUrl, service: Arc<GitTorrentService>) -> Result<Self> {
+    fn new_upload_pack(_url: GitTorrentUrl, _service: Arc<GitTorrentService>) -> Result<Self> {
+        // TODO: Use url and service for actual Git protocol implementation
         Ok(Self {
-            url,
-            service,
-            service_type: Service::UploadPack,
             buffer: Vec::new(),
             position: 0,
             finished: false,
@@ -140,44 +140,13 @@ impl GittorrentStream {
     }
 
     /// Create a new stream for receive-pack (push) operations
-    fn new_receive_pack(url: GitTorrentUrl, service: Arc<GitTorrentService>) -> Result<Self> {
+    fn new_receive_pack(_url: GitTorrentUrl, _service: Arc<GitTorrentService>) -> Result<Self> {
+        // TODO: Use url and service for actual Git protocol implementation
         Ok(Self {
-            url,
-            service,
-            service_type: Service::ReceivePack,
             buffer: Vec::new(),
             position: 0,
             finished: false,
         })
-    }
-
-    /// Handle upload-pack protocol (fetch operations)
-    async fn handle_upload_pack(&mut self) -> Result<()> {
-        // This should implement the Git upload-pack protocol
-        // For now, we'll return an error indicating it's not fully implemented
-
-        tracing::info!("Upload-pack requested for {:?}", self.url);
-
-        // In a full implementation, this would:
-        // 1. Query the P2P network for repository metadata
-        // 2. Handle Git protocol negotiation (capabilities, want/have, etc.)
-        // 3. Stream pack data from distributed objects
-        // 4. Handle references advertisement
-
-        Err(Error::other("Upload-pack not fully implemented in transport layer"))
-    }
-
-    /// Handle receive-pack protocol (push operations)
-    async fn handle_receive_pack(&mut self) -> Result<()> {
-        tracing::info!("Receive-pack requested for {:?}", self.url);
-
-        // In a full implementation, this would:
-        // 1. Handle Git protocol negotiation
-        // 2. Receive and parse pack data
-        // 3. Distribute new objects to P2P network
-        // 4. Update repository metadata in DHT
-
-        Err(Error::other("Receive-pack not fully implemented in transport layer"))
     }
 }
 

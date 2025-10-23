@@ -9,13 +9,13 @@ use tokio::time::timeout;
 #[tokio::test]
 async fn test_bootstrap_with_peer_id() {
     // Start first node
-    let node1 = GitTorrentDht::new(0).await.expect("Failed to create node1");
+    let node1 = GitTorrentDht::new(0, gittorrent::DhtMode::Server).await.expect("Failed to create node1");
 
     // Give it time to start listening
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Start second node
-    let node2 = GitTorrentDht::new(0).await.expect("Failed to create node2");
+    let node2 = GitTorrentDht::new(0, gittorrent::DhtMode::Server).await.expect("Failed to create node2");
 
     // In a real test, we would:
     // 1. Get the actual listen address and peer ID from node1
@@ -28,7 +28,7 @@ async fn test_bootstrap_with_peer_id() {
 
 #[tokio::test]
 async fn test_bootstrap_without_peer_id_fails() {
-    let dht = GitTorrentDht::new(0).await.expect("Failed to create DHT");
+    let dht = GitTorrentDht::new(0, gittorrent::DhtMode::Server).await.expect("Failed to create DHT");
 
     // Bootstrap with address lacking peer ID should handle gracefully
     let bootstrap_peers = vec![
@@ -48,7 +48,7 @@ async fn test_bootstrap_without_peer_id_fails() {
 
 #[tokio::test]
 async fn test_bootstrap_with_unreachable_peer() {
-    let dht = GitTorrentDht::new(0).await.expect("Failed to create DHT");
+    let dht = GitTorrentDht::new(0, gittorrent::DhtMode::Server).await.expect("Failed to create DHT");
 
     // Use a peer ID that doesn't exist
     let bootstrap_peers = vec![
@@ -73,8 +73,8 @@ async fn test_bootstrap_with_unreachable_peer() {
 #[tokio::test]
 async fn test_mdns_discovery() {
     // Start two nodes on the same network
-    let node1 = GitTorrentDht::new(0).await.expect("Failed to create node1");
-    let node2 = GitTorrentDht::new(0).await.expect("Failed to create node2");
+    let node1 = GitTorrentDht::new(0, gittorrent::DhtMode::Server).await.expect("Failed to create node1");
+    let node2 = GitTorrentDht::new(0, gittorrent::DhtMode::Server).await.expect("Failed to create node2");
 
     // Give them time to discover each other via mDNS
     tokio::time::sleep(Duration::from_secs(2)).await;

@@ -25,8 +25,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting GitTorrent DHT Bootstrap Example");
     println!("==========================================\n");
 
-    // Create DHT instance on a random port (0)
-    let dht = GitTorrentDht::new(0).await?;
+    // Create DHT instance on a random port (0) in Server mode
+    let dht = GitTorrentDht::new(0, gittorrent::DhtMode::Server).await?;
 
     // Example bootstrap addresses with peer IDs
     // Format: /ip4/<ip>/tcp/<port>/p2p/<peer_id>

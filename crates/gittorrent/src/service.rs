@@ -32,6 +32,8 @@ pub struct GitTorrentConfig {
     pub bind_port: u16,
     /// P2P/DHT listen port (0 = random port)
     pub p2p_port: u16,
+    /// DHT mode (Client or Server)
+    pub dht_mode: crate::dht::DhtMode,
 }
 
 impl Default for GitTorrentConfig {
@@ -48,6 +50,7 @@ impl Default for GitTorrentConfig {
             bind_address: "127.0.0.1".to_string(),
             bind_port: 8080,
             p2p_port: 0, // 0 = random port
+            dht_mode: crate::dht::DhtMode::Server, // Server mode by default
         }
     }
 }
@@ -205,8 +208,6 @@ pub struct ObjectStats {
 
 /// Main GitTorrent service
 pub struct GitTorrentService {
-    /// Service configuration
-    config: GitTorrentConfig,
     /// DHT service for P2P networking
     dht: Arc<GitTorrentDht>,
     /// Local repository metadata
@@ -222,7 +223,7 @@ impl GitTorrentService {
         tokio::fs::create_dir_all(&config.storage_dir).await?;
 
         // Initialize DHT with configured port
-        let dht = Arc::new(GitTorrentDht::new(config.p2p_port).await?);
+        let dht = Arc::new(GitTorrentDht::new(config.p2p_port, config.dht_mode).await?);
 
         // Bootstrap DHT with known peers
         let bootstrap_addrs: Vec<Multiaddr> = config
@@ -245,7 +246,6 @@ impl GitTorrentService {
         }
 
         Ok(Self {
-            config,
             dht,
             repositories: Arc::new(RwLock::new(HashMap::new())),
             object_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -514,10 +514,10 @@ impl GitTorrentService {
                     return Err(Error::not_found(format!("Repository metadata not found for hash {}", hash)));
                 }
             }
-            GitTorrentUrl::GitServer { server, repo } => {
+            GitTorrentUrl::GitServer { server: _, repo: _ } => {
                 return Err(Error::other("Git server URLs not yet supported"));
             }
-            GitTorrentUrl::Username { username } => {
+            GitTorrentUrl::Username { username: _ } => {
                 return Err(Error::other("Username URLs not yet supported"));
             }
         }
