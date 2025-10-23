@@ -162,12 +162,15 @@ impl ModelCache {
     }
 
     /// Get or create a checkout for a specific commit
+    ///
+    /// SECURITY: This method now refuses to create worktrees automatically during inference.
+    /// Worktrees must be explicitly created beforehand through model management operations.
     async fn get_or_create_checkout(
         &self,
         model_ref: &ModelRef,
         commit_id: git2db::Oid,
     ) -> Result<PathBuf> {
-        // Check if we already have this checkout
+        // Check if we already have this checkout cached
         {
             let checkouts = self.checkouts.read().await;
             if let Some(path) = checkouts.get(&commit_id) {
@@ -176,35 +179,46 @@ impl ModelCache {
             }
         }
 
-        // Create worktree checkout for this commit
+        // Check for existing worktree - DO NOT CREATE NEW ONES
         let checkout_dir = self.checkout_base.join(format_oid(&commit_id));
 
         if !checkout_dir.exists() {
-            info!("Creating worktree checkout at {:?}", checkout_dir);
-
-            // Get model path from registry
-            let model_path = self.registry.get_model_path(&model_ref).await?;
-
-            // Create worktree for specific commit using storage drivers
-            // This automatically applies CoW optimization (overlay2 on Linux, vfs elsewhere)
-            let model_path_clone = model_path.clone();
-            let checkout_dir_clone = checkout_dir.clone();
-            let commit_sha = commit_id.to_string();
-
-            // Use git2db's unified ref API - supports commits, branches, tags, etc.
-            GitManager::global()
-                .create_worktree(&model_path_clone, &checkout_dir_clone, &commit_sha)
-                .await
-                .context("Failed to create worktree for commit")?;
-
-            debug!(
-                "Created worktree for commit {} with storage driver",
-                commit_id
+            // SECURITY: Refuse to create worktrees during inference
+            // Worktrees must be explicitly created through model management operations
+            warn!(
+                "Worktree not found for commit {} at {:?}",
+                format_oid(&commit_id),
+                checkout_dir
             );
+            return Err(anyhow::anyhow!(
+                "Model worktree not found for {} at commit {}. \
+                Worktrees must be created explicitly through model management operations, \
+                not during inference. Please use 'hyprstream model checkout' command.",
+                model_ref.model,
+                format_oid(&commit_id)
+            ));
         }
 
-        // LFS/XET files automatically smudged by git-xet-filter during worktree creation
-        debug!("Worktree ready at {:?}", checkout_dir);
+        // Worktree exists, verify it's valid
+        debug!("Using existing worktree at {:?}", checkout_dir);
+
+        // Verify the worktree contains expected model files
+        let model_file_checks = [
+            "config.json",
+            "model.safetensors",
+            "pytorch_model.bin",
+            "model.bin",
+        ];
+
+        let has_model = model_file_checks.iter().any(|f| checkout_dir.join(f).exists());
+
+        if !has_model {
+            return Err(anyhow::anyhow!(
+                "Worktree at {:?} does not contain valid model files. \
+                Please ensure the worktree was created properly.",
+                checkout_dir
+            ));
+        }
 
         // Cache the checkout path
         {
