@@ -24,7 +24,9 @@ pub struct XetConfig {
 impl Default for XetConfig {
     fn default() -> Self {
         Self {
-            endpoint: "https://cas.xet.dev".to_string(),
+            // Empty endpoint = XET disabled by default (experimental feature)
+            // Set GIT2DB_XET_ENDPOINT env var or config file to enable
+            endpoint: String::new(),
             token: std::env::var("XETHUB_TOKEN").ok(),
             compression: None,
         }
@@ -61,7 +63,8 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = XetConfig::default();
-        assert_eq!(config.endpoint, "https://cas.xet.dev");
+        // XET is disabled by default (empty endpoint)
+        assert_eq!(config.endpoint, "");
     }
 
     #[test]
