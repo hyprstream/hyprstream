@@ -6,7 +6,6 @@ use crate::config::{
 use crate::runtime::gpu_sampling::GpuSampler;
 use crate::runtime::template_engine::{ChatMessage, TemplateEngine};
 use crate::runtime::RuntimeEngine;
-use crate::storage::{XetConfig, XetNativeStorage};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use json_threat_protection as jtp;
@@ -112,10 +111,8 @@ pub struct TorchEngine {
     gpu_sampler: GpuSampler,
     /// Qwen special tokens for proper conversation handling - immutable after construction
     special_tokens: QwenSpecialTokens,
-    /// Optional XET storage for LFS/XET pointer handling - thread safe after initialization
-    xet_storage: Option<Arc<XetNativeStorage>>,
-    // Note: Pre-training is not supported because persistent_model doesn't expose VarStore
-    // Only LoRA training is supported (which has its own VarStore)
+    // Note: XET/LFS handled by git-xet-filter + ModelFactory::load_file_with_pointer_detection()
+    // Note: Pre-training not supported (persistent_model doesn't expose VarStore), LoRA only
 }
 
 /// Helper functions for tensor operations
@@ -202,7 +199,6 @@ impl TorchEngine {
             sampling_config: config,
             gpu_sampler: GpuSampler::new(device),
             special_tokens: QwenSpecialTokens::default(),
-            xet_storage: None,
         })
     }
 
@@ -314,25 +310,6 @@ impl TorchEngine {
     }
 
     /// Initialize XET storage with default configuration
-    async fn initialize_xet_storage(&mut self) {
-        match self.try_initialize_xet_storage().await {
-            Ok(storage) => {
-                info!("🔗 XET storage initialized successfully");
-                self.xet_storage = Some(Arc::new(storage));
-            }
-            Err(e) => {
-                info!("XET storage not available: {}", e);
-                self.xet_storage = None;
-            }
-        }
-    }
-
-    /// Try to initialize XET storage, returning an error if it fails
-    async fn try_initialize_xet_storage(&self) -> Result<XetNativeStorage> {
-        let config = XetConfig::default();
-        XetNativeStorage::new(config).await
-    }
-
     /// Initialize the persistent model instance using ModelFactory
     async fn initialize_persistent_model(&mut self, model_path: &Path) -> Result<()> {
         use crate::runtime::model_config::ModelConfig;
@@ -340,11 +317,7 @@ impl TorchEngine {
 
         info!("Initializing model");
 
-        // Initialize XET storage if not already done
-        if self.xet_storage.is_none() {
-            self.initialize_xet_storage().await;
-        }
-
+        // XET/LFS handled automatically by git-xet-filter + ModelFactory fallback
         // Load model config first to get model parameters
         let empty_weights = HashMap::new();
         let config = ModelConfig::load(model_path, &empty_weights)?;
@@ -1829,7 +1802,6 @@ impl Drop for TorchEngine {
 
         // Drop our Arc references (NOT the contents)
         self.persistent_model = None; // Drops our Option<Arc<...>> reference
-        self.xet_storage = None; // Drops our Option<Arc<...>> reference
 
         // Arc<Mutex<...>> fields are automatically cleaned up via Arc reference counting
         // when the last TorchEngine clone drops. No manual intervention needed.

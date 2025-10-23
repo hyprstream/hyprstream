@@ -54,7 +54,7 @@ config.workspace = true
 toml.workspace = true
 serde_yaml.workspace = true
 git2.workspace = true  # Still needed by git2db internally
-git2db = { path = "../git2db", features = ["xet-storage", "overlayfs"] }  # High-level git library with XET support and overlayfs
+git2db = { path = "../git2db", features = ["overlayfs"] }  # High-level git library with overlayfs
 gittorrent = { workspace = true, optional = true }  # P2P transport
 clap.workspace = true
 tracing.workspace = true
@@ -78,6 +78,7 @@ hex.workspace = true
 chrono.workspace = true
 async-stream.workspace = true
 anyhow.workspace = true
+sha2.workspace = true  # SHA256 validation for LFS files
 daemonize.workspace = true
 prost.workspace = true
 # Arrow JSON removed - focused on ML inference only
@@ -136,6 +137,9 @@ half.workspace = true
 shellexpand.workspace = true
 
 [features]
+default = ["gittorrent"]
+cuda = []
+xet = ["git2db/xet-storage"]  # Enable XET large file storage (EXPERIMENTAL - has known bugs, disabled by default)
 otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:opentelemetry-semantic-conventions", "dep:opentelemetry-stdout"]
 gittorrent = ["dep:gittorrent", "git2db/gittorrent-transport"]  # Enable P2P model sharing via gittorrent transport
 download-libtorch = ["tch/download-libtorch"]

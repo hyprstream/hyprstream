@@ -2777,6 +2777,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "shellexpand",
  "sqlparser 0.39.0",
  "tch",

@@ -16,9 +16,7 @@ use tracing::{info, warn};
 
 // Re-export overlay backends from worktree module
 #[cfg(feature = "overlayfs")]
-use crate::worktree::overlay::{
-    select_best_backend, FuseBackend, KernelBackend, OverlayBackend, UserNamespaceBackend,
-};
+use crate::worktree::overlay::{select_best_backend, OverlayBackend};
 
 /// Configuration for overlay2 driver
 #[derive(Debug, Clone)]
@@ -65,33 +63,6 @@ impl Overlay2Driver {
         Self {
             config: Overlay2Config::default(),
         }
-    }
-
-    /// Create with custom configuration
-    #[cfg(feature = "overlayfs")]
-    pub fn with_config(config: Overlay2Config) -> Self {
-        let backend =
-            if let Some(ref name) = config.force_backend {
-                match name.as_str() {
-                    "fuse" => std::sync::Arc::new(FuseBackend::new())
-                        as std::sync::Arc<dyn OverlayBackend>,
-                    "userns" => std::sync::Arc::new(UserNamespaceBackend::new())
-                        as std::sync::Arc<dyn OverlayBackend>,
-                    "kernel" => std::sync::Arc::new(KernelBackend::new())
-                        as std::sync::Arc<dyn OverlayBackend>,
-                    _ => select_best_backend(),
-                }
-            } else {
-                select_best_backend()
-            };
-
-        Self { backend, config }
-    }
-
-    /// Create with custom configuration (stub without overlayfs)
-    #[cfg(not(feature = "overlayfs"))]
-    pub fn with_config(config: Overlay2Config) -> Self {
-        Self { config }
     }
 }
 
@@ -351,17 +322,6 @@ mod tests {
         let driver = Overlay2Driver::new();
         // May or may not be available depending on system
         println!("Overlay2 available: {}", driver.is_available());
-    }
-
-    #[test]
-    #[cfg(feature = "overlayfs")]
-    fn test_with_config() {
-        // Test public API for custom configuration
-        let config = Overlay2Config {
-            force_backend: Some("userns".to_string()),
-        };
-        let driver = Overlay2Driver::with_config(config);
-        assert_eq!(driver.name(), "overlay2");
     }
 
     #[test]

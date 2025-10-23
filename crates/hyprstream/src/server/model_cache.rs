@@ -12,7 +12,6 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, instrument, warn};
 
 use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
-use crate::storage::xet_native::XetNativeStorage;
 use crate::storage::{ModelRef, ModelStorage};
 
 /// Cached model entry
@@ -40,8 +39,6 @@ pub struct ModelCache {
     checkouts: Arc<RwLock<HashMap<git2db::Oid, PathBuf>>>,
     /// Maximum cache size
     max_size: usize,
-    /// Optional XET storage for LFS processing
-    xet_storage: Option<Arc<XetNativeStorage>>,
     /// Git service for repository operations
     git_manager: Arc<GitManager>,
 }
@@ -53,13 +50,7 @@ impl ModelCache {
         registry: Arc<ModelStorage>,
         checkout_base: PathBuf,
     ) -> Result<Self> {
-        Self::new_with_config(
-            max_size,
-            registry,
-            checkout_base,
-            None,
-            GitConfig::default(),
-        )
+        Self::new_with_config(max_size, registry, checkout_base, GitConfig::default())
     }
 
     /// Create a new model cache with custom Git configuration
@@ -67,7 +58,6 @@ impl ModelCache {
         max_size: usize,
         registry: Arc<ModelStorage>,
         checkout_base: PathBuf,
-        xet_storage: Option<Arc<XetNativeStorage>>,
         git_config: GitConfig,
     ) -> Result<Self> {
         let cache_size =
@@ -84,25 +74,8 @@ impl ModelCache {
             checkout_base,
             checkouts: Arc::new(RwLock::new(HashMap::new())),
             max_size,
-            xet_storage,
             git_manager,
         })
-    }
-
-    /// Create a new model cache with XET storage for LFS processing
-    pub fn new_with_xet(
-        max_size: usize,
-        registry: Arc<ModelStorage>,
-        checkout_base: PathBuf,
-        xet_storage: Arc<XetNativeStorage>,
-    ) -> Result<Self> {
-        Self::new_with_config(
-            max_size,
-            registry,
-            checkout_base,
-            Some(xet_storage),
-            GitConfig::default(),
-        )
     }
 
     /// Get or load a model by reference
@@ -230,21 +203,8 @@ impl ModelCache {
             );
         }
 
-        // Process LFS files if XET storage is available
-        if let Some(xet_storage) = &self.xet_storage {
-            info!("Processing LFS files in worktree: {:?}", checkout_dir);
-            match xet_storage.process_worktree_lfs(&checkout_dir).await {
-                Ok(processed_files) => {
-                    if !processed_files.is_empty() {
-                        info!("Successfully processed {} LFS files", processed_files.len());
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to process LFS files in worktree: {}", e);
-                    // Continue anyway - the worktree is still usable even if LFS processing failed
-                }
-            }
-        }
+        // LFS/XET files automatically smudged by git-xet-filter during worktree creation
+        debug!("Worktree ready at {:?}", checkout_dir);
 
         // Cache the checkout path
         {

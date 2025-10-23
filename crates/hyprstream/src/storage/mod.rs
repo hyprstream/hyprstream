@@ -5,23 +5,26 @@
 //! - LoRA adapters
 //! - Model checkpoints
 //! - Memory-mapped disk persistence
-//! - Xet-based content-addressable storage
+//! - XET-based content-addressable storage (via git2db, requires `xet` feature)
+//! - Git LFS to XET translation for Hugging Face models (requires `xet` feature)
 //! - Git-native model registry
 pub mod adapter_manager;
 pub mod errors;
+#[cfg(feature = "xet")]
+pub mod lfs_xet;
 pub mod model_ref;
 pub mod model_storage;
 pub mod operations;
 pub mod paths;
-pub mod xet_native;
 
 // Re-export types for backward compatibility
 pub use adapter_manager::{AdapterConfig, AdapterInfo, AdapterManager};
 pub use errors::{ModelRefError, ModelRefResult};
+#[cfg(feature = "xet")]
+pub use lfs_xet::{LfsPointer, LfsXetBridge, XetConfig};
 pub use model_ref::{validate_model_name, GitRef, ModelRef};
 pub use model_storage::{ModelId, ModelMetadata, ModelStorage};
 pub use paths::StoragePaths;
-pub use xet_native::{XetConfig, XetNativeStorage};
 
 // Compatibility types (moved from model_registry)
 /// Options for checkout operations

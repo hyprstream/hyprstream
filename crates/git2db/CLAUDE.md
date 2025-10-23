@@ -461,6 +461,229 @@ If you have custom git wrappers (like hyprstream's old BranchManager):
 
 ---
 
+## XET Large File Storage
+
+git2db provides integrated support for XET large file storage via the `xet` module (requires `xet-storage` feature).
+
+### **Overview**
+
+XET is a content-addressable storage system for large files (like model weights) that integrates with git. Unlike Git LFS which requires external servers, XET uses a distributed CAS (Content-Addressable Storage) architecture.
+
+**Key Features**:
+- ✅ Content-addressable storage (deduplication)
+- ✅ Automatic compression
+- ✅ Hash-based retrieval (for LFS compatibility)
+- ✅ Async I/O throughout
+- ✅ Direct file writes (no intermediate copies)
+- ✅ Libgit2 filter integration (automatic smudge/clean)
+
+### **API Reference**
+
+```rust
+use git2db::xet::{XetStorage, XetConfig};
+
+// Initialize XET storage
+let config = XetConfig::default(); // Uses XETHUB_TOKEN env var
+let xet = XetStorage::new(&config).await?;
+
+// Upload file → get XET pointer
+let pointer = xet.clean_file(path).await?;
+// Returns JSON: {"version": "1.0", "filesize": 1024, ...}
+
+// Download XET pointer → file
+xet.smudge_file(&pointer, output_path).await?;
+
+// Upload from memory → get XET pointer
+let data = vec![1, 2, 3, 4];
+let pointer = xet.clean_bytes(&data).await?;
+
+// Download XET pointer → memory
+let data = xet.smudge_bytes(&pointer).await?;
+
+// Hash-based downloads (for LFS compatibility)
+use merklehash::MerkleHash;
+let hash = MerkleHash::from_hex(&sha256)?;
+let data = xet.smudge_from_hash(&hash).await?;
+xet.smudge_from_hash_to_file(&hash, output_path).await?;
+
+// Check if content is XET pointer
+if xet.is_pointer(&content) {
+    let data = xet.smudge_bytes(&content).await?;
+}
+```
+
+### **Configuration**
+
+**Environment Variables**:
+```bash
+# XET CAS endpoint
+export XETHUB_TOKEN="your-token-here"
+
+# Custom endpoint (optional)
+# Default: https://cas.xet.dev
+```
+
+**Programmatic**:
+```rust
+use git2db::XetConfig;
+
+let config = XetConfig::new("https://custom.cas.endpoint")
+    .with_token("your-token")
+    .with_compression(cas_object::CompressionScheme::Zstd);
+
+let xet = XetStorage::new(&config).await?;
+```
+
+### **Libgit2 Filter Integration**
+
+XET can automatically handle large files during git operations:
+
+```rust
+use git2db::xet;
+
+// Initialize filter once (idempotent)
+xet::initialize(XetConfig::default()).await?;
+
+// Now git operations automatically use XET for large files
+let registry = Git2DB::open(path).await?;
+// Files matching .gitattributes "filter=xet" are automatically smudged
+```
+
+**`.gitattributes` setup**:
+```
+*.safetensors filter=xet
+*.bin filter=xet
+```
+
+### **Use Cases**
+
+#### **1. Model Weights Storage**
+```rust
+// Upload model weights
+let weights = tch::Tensor::randn(&[1000, 1000], ...);
+let bytes = weights.to_bytes();
+let pointer = xet.clean_bytes(&bytes).await?;
+
+// Save pointer in git (small!)
+std::fs::write("model.safetensors", pointer)?;
+
+// Load model weights
+let pointer = std::fs::read_to_string("model.safetensors")?;
+let bytes = xet.smudge_bytes(&pointer).await?;
+let weights = tch::Tensor::from_bytes(&bytes)?;
+```
+
+#### **2. LFS Pointer Translation**
+```rust
+// Convert Git LFS pointer to XET
+let lfs_content = r#"
+version https://git-lfs.github.com/spec/v1
+oid sha256:abc123...
+size 1024
+"#;
+
+// Extract SHA256, convert to MerkleHash
+let hash = MerkleHash::from_hex(&sha256_from_lfs)?;
+
+// Download from XET using hash
+let data = xet.smudge_from_hash(&hash).await?;
+```
+
+#### **3. Efficient File Copying**
+```rust
+// Traditional: download to memory, write to disk
+let data = xet.smudge_bytes(&pointer).await?;
+std::fs::write(output, data)?; // Extra copy!
+
+// Efficient: direct write
+xet.smudge_file(&pointer, output).await?; // One copy only
+```
+
+### **Performance Tips**
+
+1. **Use direct file methods when possible**:
+   ```rust
+   // Good: Direct file write
+   xet.smudge_file(&pointer, path).await?;
+
+   // Slower: Memory → disk
+   let data = xet.smudge_bytes(&pointer).await?;
+   tokio::fs::write(path, data).await?;
+   ```
+
+2. **Batch operations** for multiple files:
+   ```rust
+   let handles: Vec<_> = pointers.iter()
+       .map(|p| xet.smudge_file(p, path))
+       .collect();
+
+   futures::future::join_all(handles).await;
+   ```
+
+3. **Use hash-based downloads** for LFS compatibility (avoids JSON parsing):
+   ```rust
+   // Faster: Direct hash download
+   xet.smudge_from_hash(&hash).await?;
+
+   // Slower: Pointer → parse → hash → download
+   xet.smudge_bytes(&pointer).await?;
+   ```
+
+### **Error Handling**
+
+```rust
+use git2db::xet::XetError;
+
+match xet.smudge_bytes(&pointer).await {
+    Ok(data) => { /* use data */ },
+    Err(e) => match e.kind() {
+        XetErrorKind::InvalidPointer => {
+            // Not a valid XET pointer
+        },
+        XetErrorKind::DownloadFailed => {
+            // Network or CAS issue
+        },
+        XetErrorKind::UploadFailed => {
+            // Upload to CAS failed
+        },
+        _ => { /* other errors */ }
+    }
+}
+```
+
+### **Testing**
+
+```bash
+# Build with XET support
+cargo build -p git2db --features xet-storage
+
+# Run XET tests (requires XETHUB_TOKEN)
+export XETHUB_TOKEN="your-token"
+cargo test -p git2db --features xet-storage xet
+
+# Test libgit2 filter
+cargo test -p git-xet-filter --features xet-storage
+```
+
+### **Architecture**
+
+```
+Application (your code)
+    ↓ uses
+git2db::xet::XetStorage
+    ↓ uses
+git-xet-filter crate
+    ↓ uses
+xet-core (cas_client, data, merklehash)
+```
+
+**Layers**:
+- **git2db::xet**: High-level API, async/await
+- **git-xet-filter**: Libgit2 filter callbacks, FFI safety
+- **xet-core**: Low-level CAS operations
+
+---
+
 ## Common Issues
 
 ### **"Repository not registered"**

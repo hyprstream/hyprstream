@@ -1041,7 +1041,7 @@ pub async fn handle_push(
     remote: Option<String>,
     branch: Option<String>,
     set_upstream: bool,
-    force: bool,
+    _force: bool,
 ) -> Result<()> {
     info!("Pushing model {} to remote", model);
 

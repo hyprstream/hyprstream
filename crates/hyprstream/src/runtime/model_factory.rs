@@ -7,10 +7,12 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::Path;
 use tch::{Device, Kind as DType, Tensor};
-use tracing::{info, instrument};
+use tracing::{debug, info, instrument};
 
 use super::architectures::{gemma::GemmaModel, llama::LlamaModel, ModelOperations};
 use super::model_config::{ModelArchitecture, ModelConfig};
+#[cfg(feature = "xet")]
+use crate::storage::{LfsXetBridge, XetConfig};
 
 /// Factory for creating models with proper configuration management
 pub struct ModelFactory;
@@ -188,10 +190,52 @@ impl ModelFactory {
             return Ok(());
         }
 
-        // Standard approach - load entire file into RAM
-        let tensor_data = tokio::fs::read(&path_buf).await?;
+        // Standard approach - load file with LFS/XET pointer detection
+        // This handles both:
+        // 1. Already-smudged files (fast path via git-xet-filter)
+        // 2. Un-smudged pointers (fallback via explicit load_file)
+        let tensor_data = Self::load_file_with_pointer_detection(&path_buf).await?;
         let tensors = safetensors::SafeTensors::deserialize(&tensor_data)?;
         Self::create_tensors_from_safetensors(tensors, weights, device, dtype)
+    }
+
+    /// Load file with automatic LFS/XET pointer detection
+    ///
+    /// Fast path for already-smudged files, fallback for un-smudged pointers.
+    async fn load_file_with_pointer_detection(path: &Path) -> Result<Vec<u8>> {
+        let metadata = tokio::fs::metadata(path).await?;
+
+        // Large files cannot be LFS pointers (which are < 1KB)
+        if metadata.len() >= 1024 {
+            return tokio::fs::read(path).await.map_err(Into::into);
+        }
+
+        let data = tokio::fs::read(path).await?;
+
+        // Check for LFS pointer header
+        if data.len() < 1024 {
+            if let Ok(text) = String::from_utf8(data.clone()) {
+                if text.starts_with("version https://git-lfs") {
+                    #[cfg(feature = "xet")]
+                    {
+                        debug!("Un-smudged LFS pointer, using XET fallback: {}", path.display());
+                        let bridge = LfsXetBridge::new(XetConfig::default()).await?;
+                        return bridge.load_file(path).await;
+                    }
+
+                    #[cfg(not(feature = "xet"))]
+                    {
+                        anyhow::bail!(
+                            "Un-smudged LFS pointer at {} but XET feature disabled. \
+                             Enable with --features xet or ensure files are smudged during checkout.",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(data)
     }
 
     /// Create tensors from deserialized safetensors

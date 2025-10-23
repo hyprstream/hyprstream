@@ -87,22 +87,43 @@ pub extern "C" fn xet_filter_shutdown(_filter: *mut OpaqueGitFilter) {
 pub extern "C" fn xet_filter_check(
     _filter: *mut OpaqueGitFilter,
     _payload_out: *mut *mut libc::c_void,
-    _source: *const OpaqueGitFilterSource,
+    source: *const OpaqueGitFilterSource,
     _attr_values: *const *const libc::c_char,
 ) -> c_int {
-    // Always apply if .gitattributes says filter=xet
-    // libgit2 already checked the attributes
+    // Get the filter mode to determine the operation
+    let mode = unsafe { git_filter_source_mode(source) };
+
+    // CRITICAL: During clone/checkout, libgit2 should ONLY call SMUDGE (ODB → workdir)
+    // NEVER CLEAN (workdir → ODB). If CLEAN is being called during checkout, something
+    // is wrong with how libgit2 is invoking the filter.
+    //
+    // Refuse to CLEAN during checkout to prevent uploading files during clone.
+    if mode == GIT_FILTER_CLEAN {
+        // Check if this is a checkout operation (TO_WORKDIR flag)
+        let flags = unsafe { git_filter_source_flags(source) };
+        const GIT_FILTER_TO_WORKTREE: u32 = 1 << 0;
+
+        if (flags & GIT_FILTER_TO_WORKTREE) != 0 {
+            tracing::warn!(
+                "XET filter: Refusing CLEAN during checkout (this indicates a libgit2 bug)"
+            );
+            // Return GIT_PASSTHROUGH to skip this filter
+            return GIT_PASSTHROUGH;
+        }
+    }
+
+    // Apply filter if libgit2 matched our attributes
     0
 }
 
 /// Stream callback (performs actual filtering)
 #[cfg(feature = "xet-storage")]
 pub extern "C" fn xet_filter_stream(
-    out: *mut OpaqueGitWriteStream,
+    _out: *mut *mut OpaqueGitWriteStream,
     filter: *mut OpaqueGitFilter,
     _payload_ptr: *mut *mut libc::c_void,
     source: *const OpaqueGitFilterSource,
-    _next: *mut OpaqueGitWriteStream,
+    next: *mut OpaqueGitWriteStream,
 ) -> c_int {
     // Get filter mode
     let mode = unsafe { git_filter_source_mode(source) };
@@ -136,11 +157,11 @@ pub extern "C" fn xet_filter_stream(
     match mode {
         GIT_FILTER_CLEAN => {
             tracing::debug!("XET clean: {}", path);
-            xet_clean_stream(&payload, source, out, path).to_ffi_code()
+            xet_clean_stream(&payload, source, next, path).to_ffi_code()
         }
         GIT_FILTER_SMUDGE => {
             tracing::debug!("XET smudge: {}", path);
-            xet_smudge_stream(&payload, source, out, path).to_ffi_code()
+            xet_smudge_stream(&payload, source, next, path).to_ffi_code()
         }
         _ => XetError::new(XetErrorKind::RuntimeError, "Unknown filter mode").to_ffi_code(),
     }

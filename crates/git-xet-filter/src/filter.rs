@@ -1,6 +1,6 @@
 //! XET filter implementation with type state pattern
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 
 #[cfg(feature = "xet-storage")]
 use std::marker::PhantomData;
@@ -54,14 +54,16 @@ pub struct XetFilterPayload {
 impl XetFilter<Unregistered> {
     /// Create a new unregistered filter
     pub async fn new(config: crate::config::XetConfig) -> Result<Self> {
-        // Create runtime in a blocking context to avoid nested runtime errors
-        let (runtime, storage) = tokio::task::spawn_blocking(move || {
+        // Create runtime in a separate thread to avoid nested runtime errors
+        // We use std::thread::spawn instead of tokio::spawn_blocking because
+        // tokio's blocking thread pool has access to the runtime handle
+        let (runtime, storage) = std::thread::spawn(move || {
             let runtime = XetRuntime::new()?;
-            let storage = runtime.block_on(XetStorage::new(&config))??;
+            let storage = runtime.block_on_unchecked(async { XetStorage::new(&config).await })?;
             Ok::<_, XetError>((Arc::new(runtime), Arc::new(storage) as Arc<dyn StorageBackend>))
         })
-        .await
-        .map_err(|e| XetError::new(XetErrorKind::RuntimeError, format!("Task join error: {}", e)))??;
+        .join()
+        .map_err(|e| XetError::new(XetErrorKind::RuntimeError, format!("Thread join error: {:?}", e)))??;
 
         // Create payload
         let payload = Box::new(XetFilterPayload { storage, runtime });
@@ -77,6 +79,7 @@ impl XetFilter<Unregistered> {
             initialize: Some(crate::callbacks::xet_filter_initialize),
             shutdown: Some(crate::callbacks::xet_filter_shutdown),
             check: Some(crate::callbacks::xet_filter_check),
+            reserved: std::ptr::null_mut(),
             stream: Some(crate::callbacks::xet_filter_stream),
             cleanup: Some(crate::callbacks::xet_filter_cleanup),
         });
@@ -94,13 +97,35 @@ impl XetFilter<Unregistered> {
     ///
     /// Transitions to Registered state on success
     pub fn register(mut self, priority: i32) -> Result<XetFilter<Registered>> {
+        // Ensure libgit2 is initialized by accessing git2::Version
+        // This forces the git2 crate to initialize libgit2
+        let _ = git2::Version::get();
+
         let name_cstr = CString::new(self.name.as_str())
             .map_err(|_| XetError::new(XetErrorKind::RuntimeError, "Invalid filter name"))?;
 
         // SAFETY: We're passing a stable pointer to a Pin<Box<GitFilter>>
         // which will not move. The payload is also boxed and won't move.
         unsafe {
+            // Initialize the global filter registry if not already done
+            // This is idempotent - safe to call multiple times
+            let global_init_result = crate::ffi::git_filter_global_init();
+            if global_init_result < 0 {
+                tracing::debug!("git_filter_global_init returned {} (might already be initialized)", global_init_result);
+            } else {
+                tracing::info!("Initialized libgit2 filter registry");
+            }
+
+            // Try to unregister first in case it's already registered
+            let unregister_result = crate::ffi::git_filter_unregister(name_cstr.as_ptr());
+            if unregister_result == 0 {
+                tracing::debug!("Unregistered existing '{}' filter before re-registering", self.name);
+            }
+
             let filter_ptr = Pin::as_mut(&mut self.inner).get_unchecked_mut() as *mut GitFilter;
+
+            // Don't call git_filter_init - it might overwrite our callbacks
+            // Our struct is already properly initialized in XetFilter::new()
 
             // Store payload in global registry using filter instance pointer
             // Cast to OpaqueGitFilter for the registry
@@ -116,14 +141,35 @@ impl XetFilter<Unregistered> {
             );
 
             if result < 0 {
-                // Clean up payload on failure
-                let _ = crate::callbacks::unregister_payload(
-                    filter_ptr as *const crate::ffi::OpaqueGitFilter
-                );
-                return Err(XetError::new(
-                    XetErrorKind::RuntimeError,
-                    "git_filter_register failed",
-                ));
+                // Get detailed error from libgit2
+                let git_error = git2::Error::last_error(result);
+
+                // Check if it's GIT_EEXISTS (-4) which means filter already registered
+                // In that case, we'll consider it a success
+                const GIT_EEXISTS: i32 = -4;
+                if result == GIT_EEXISTS {
+                    tracing::warn!("XET filter was already registered, continuing anyway");
+                    // Don't clean up payload - keep it registered
+                } else {
+                    // Clean up payload on other failures
+                    let _ = crate::callbacks::unregister_payload(
+                        filter_ptr as *const crate::ffi::OpaqueGitFilter
+                    );
+
+                    // Log for debugging
+                    tracing::error!(
+                        "git_filter_register failed: result={}, error={:?}, version={}, attributes={:?}",
+                        result,
+                        git_error,
+                        (*filter_ptr).version,
+                        CStr::from_ptr((*filter_ptr).attributes)
+                    );
+
+                    return Err(XetError::new(
+                        XetErrorKind::RuntimeError,
+                        format!("git_filter_register failed (code {}): {:?}", result, git_error),
+                    ));
+                }
             }
         }
 
