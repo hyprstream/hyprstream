@@ -56,7 +56,7 @@ pub fn extract_repo_name(url: &str) -> String {
         .trim_end_matches('/')
         .trim_end_matches(".git")
         .split('/')
-        .last()
+        .next_back()
         .unwrap_or("unknown");
 
     // If we get an empty string, use the fallback

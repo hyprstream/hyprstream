@@ -282,7 +282,7 @@ impl ModelConfig {
 
             // Try different head dimensions
             for head_dim in &[256, 128, 64, 32] {
-                if q_out % head_dim == 0 && k_out % head_dim == 0 {
+                if q_out.is_multiple_of(*head_dim) && k_out.is_multiple_of(*head_dim) {
                     config.num_attention_heads = q_out / head_dim;
                     config.num_key_value_heads = k_out / head_dim;
                     config.head_dim = *head_dim;

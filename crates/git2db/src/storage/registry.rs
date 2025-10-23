@@ -4,8 +4,9 @@
 //! daemon/graphdriver/driver_linux.go
 
 use super::driver::{Driver, DriverError, StorageDriver};
-use super::overlay2::Overlay2Driver;
 use super::vfs::VfsDriver;
+#[cfg(all(target_os = "linux", feature = "overlayfs"))]
+use super::overlay2::Overlay2Driver;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;

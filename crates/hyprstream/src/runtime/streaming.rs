@@ -188,6 +188,12 @@ pub struct CollectingCallback {
     pub text: String,
 }
 
+impl Default for CollectingCallback {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CollectingCallback {
     pub fn new() -> Self {
         Self {

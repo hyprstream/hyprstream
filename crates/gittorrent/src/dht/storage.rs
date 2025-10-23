@@ -59,7 +59,7 @@ impl GitObjectStore {
         for hash in object_hashes {
             self.object_repositories
                 .entry(hash.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(repo_name.to_string());
         }
 
@@ -159,7 +159,7 @@ impl RecordStore for GitObjectStore {
     }
 
     fn add_provider(&mut self, record: ProviderRecord) -> StoreResult<()> {
-        let providers = self.providers.entry(record.key.clone()).or_insert_with(HashMap::new);
+        let providers = self.providers.entry(record.key.clone()).or_default();
 
         // Check provider limit per key
         if providers.len() >= self.max_providers_per_key && !providers.contains_key(&record.provider) {

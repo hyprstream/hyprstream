@@ -149,7 +149,7 @@ impl<'a> RegistrationBuilder<'a> {
 
         if !worktree_path.exists() {
             return Err(Git2DBError::invalid_repository(
-                &self.repo_id.to_string(),
+                self.repo_id.to_string(),
                 format!("Worktree path does not exist: {}", worktree_path.display()),
             ));
         }

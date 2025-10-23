@@ -592,13 +592,12 @@ impl GitManager {
 
         Ok(worktrees
             .into_iter()
-            .filter_map(|w| w)
+            .flatten()
             .map(|s| s.to_string())
             .collect())
     }
 
     /// Get statistics about cached paths
-
     /// Get active operations
     pub fn active_operations(&self) -> Vec<(String, Duration)> {
         let ops = self.active_operations.read();
@@ -684,7 +683,6 @@ impl GitManager {
     /// Select worktree strategy based on configuration and platform
     ///
     /// This is called once during GitManager::new() and the strategy is cached.
-
     /// Create a worktree using the configured storage driver
     ///
     /// Supports any git ref: branches, commits, tags, symbolic refs, etc.

@@ -160,7 +160,7 @@ impl CheckpointManager {
             weights,
             metrics,
             timestamp: Utc::now(),
-            commit_to_git: step % 10000 == 0, // Commit every 10k steps by default
+            commit_to_git: step.is_multiple_of(10000), // Commit every 10k steps by default
         }
     }
 
@@ -193,7 +193,7 @@ impl CheckpointManager {
                 {
                     use std::process::Command;
                     let result = Command::new("cp")
-                        .args(&[
+                        .args([
                             "--reflink=auto",
                             source.to_str().unwrap(),
                             checkpoint_path.to_str().unwrap(),
@@ -455,7 +455,7 @@ impl CheckpointManager {
                 {
                     use std::process::Command;
                     let result = Command::new("cp")
-                        .args(&[
+                        .args([
                             "--reflink=auto",
                             source.to_str().unwrap(),
                             dest.to_str().unwrap(),
@@ -571,7 +571,7 @@ impl CheckpointManager {
         repo.commit(Some("HEAD"), &sig, &sig, &message, &tree, &[&parent_commit])?;
 
         // For major checkpoints, create human-friendly tags
-        if step % 50000 == 0 {
+        if step.is_multiple_of(50000) {
             let tag_name = if let Some(branch) = branch_name {
                 format!("checkpoint-{}-step-{}", branch, step)
             } else {

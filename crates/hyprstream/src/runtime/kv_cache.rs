@@ -53,11 +53,11 @@ impl LayerKVCache {
 
             // Allocate cache tensors
             self.keys = Some(Tensor::zeros(
-                &[batch_size, self.max_seq_len as i64, num_heads, head_dim],
+                [batch_size, self.max_seq_len as i64, num_heads, head_dim],
                 (dtype, device),
             ));
             self.values = Some(Tensor::zeros(
-                &[batch_size, self.max_seq_len as i64, num_heads, head_dim],
+                [batch_size, self.max_seq_len as i64, num_heads, head_dim],
                 (dtype, device),
             ));
         }
@@ -84,12 +84,12 @@ impl LayerKVCache {
         let end_pos = start_pos + seq_len;
 
         // Update keys: cached_keys[:, start_pos:end_pos] = new_keys
-        let _ = cached_keys
+        cached_keys
             .narrow(1, start_pos as i64, seq_len as i64)
             .copy_(new_keys);
 
         // Update values: cached_values[:, start_pos:end_pos] = new_values
-        let _ = cached_values
+        cached_values
             .narrow(1, start_pos as i64, seq_len as i64)
             .copy_(new_values);
 

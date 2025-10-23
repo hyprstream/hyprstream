@@ -20,6 +20,7 @@ use crate::worktree::overlay::{select_best_backend, OverlayBackend};
 
 /// Configuration for overlay2 driver
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct Overlay2Config {
     /// Force a specific backend (fuse, userns, kernel)
     pub force_backend: Option<String>,
@@ -28,14 +29,6 @@ pub struct Overlay2Config {
     pub overlay_dir: Option<PathBuf>,
 }
 
-impl Default for Overlay2Config {
-    fn default() -> Self {
-        Self {
-            force_backend: None,
-            overlay_dir: None,
-        }
-    }
-}
 
 /// Overlay2 storage driver
 ///

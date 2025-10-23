@@ -214,7 +214,7 @@ impl AdapterManager {
 
     /// Check if any adapters exist for this model
     pub fn has_adapters(&self) -> bool {
-        self.adapters_dir.exists() && self.list_adapters().unwrap_or_default().len() > 0
+        self.adapters_dir.exists() && !self.list_adapters().unwrap_or_default().is_empty()
     }
 
     /// Get total size of all adapters

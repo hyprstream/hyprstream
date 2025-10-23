@@ -1157,7 +1157,7 @@ impl TorchEngine {
         let persistent_ready = self.persistent_model.is_some();
         let context_ready = self
             .handle_poison(self.context_state.lock())
-            .map(|guard| guard.as_ref().map_or(false, |c| c.initialized))
+            .map(|guard| guard.as_ref().is_some_and(|c| c.initialized))
             .unwrap_or(false);
 
         persistent_ready && context_ready

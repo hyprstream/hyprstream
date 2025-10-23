@@ -216,14 +216,13 @@ pub async fn handle_model_command(
             let models = model_storage.list_models().await?;
 
             // Get remote models if requested
-            if remote {
-                if let Some(_) = &registry {
+            if remote
+                && registry.is_some() {
                     eprintln!("⚠️  Remote model search is no longer supported");
                     eprintln!("   Use 'hyprstream model pull' with a git URL instead:");
                     eprintln!("   • hyprstream model pull https://huggingface.co/Qwen/Qwen2-0.5B-Instruct");
                     eprintln!("   • hyprstream model pull git@github.com:user/model.git");
                 }
-            }
 
             // Determine if git info should be extracted
             let extract_git_info =
@@ -444,7 +443,7 @@ pub async fn handle_model_command(
                     model_ref.model
                 );
                 println!("This action cannot be undone.");
-                println!("");
+                println!();
                 println!("Type 'yes' to confirm, or use --yes flag to skip confirmation:");
 
                 let stdin = io::stdin();
@@ -576,7 +575,7 @@ pub async fn handle_model_command(
                 println!("  - Migrate model files to data/ subdirectories");
                 println!("  - Remove orphaned directories");
                 println!("  - Rebuild metadata cache from directories");
-                println!("");
+                println!();
                 println!("Type 'yes' to confirm:");
 
                 let stdin = io::stdin();
@@ -688,7 +687,7 @@ pub async fn handle_model_command(
                 println!("Cached Models:");
                 for (model_ref, model_metadata) in cached_models {
                     let accessed_dt = DateTime::<Utc>::from_timestamp(model_metadata.updated_at, 0)
-                        .unwrap_or_else(|| Utc::now());
+                        .unwrap_or_else(Utc::now);
                     println!(
                         "  📁 {} ({:.1} GB) - Last accessed: {}",
                         model_ref.model,
@@ -1109,7 +1108,7 @@ pub async fn handle_chat_command(
                     // In interactive mode, we'd get this from user feedback
                     // For now, use a simple training example
                     let expected_response =
-                        format!("Hello! I'm a helpful AI assistant. How can I help you today?");
+                        "Hello! I'm a helpful AI assistant. How can I help you today?".to_string();
 
                     match run_temporal_training(&cmd.model_id, &prompt, &expected_response).await {
                         Ok(()) => {

@@ -62,6 +62,6 @@ impl GitTorrentBehaviour {
 
     /// Get routing table information
     pub fn routing_table_info(&mut self) -> Vec<PeerId> {
-        self.kademlia.kbuckets().map(|bucket| bucket.iter().map(|entry| *entry.node.key.preimage()).collect::<Vec<_>>()).flatten().collect()
+        self.kademlia.kbuckets().flat_map(|bucket| bucket.iter().map(|entry| *entry.node.key.preimage()).collect::<Vec<_>>()).collect()
     }
 }

@@ -15,6 +15,12 @@ use super::model_ref::{validate_model_name, ModelRef};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ModelId(pub Uuid);
 
+impl Default for ModelId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ModelId {
     pub fn new() -> Self {
         ModelId(Uuid::new_v4())
@@ -128,7 +134,7 @@ impl ModelStorage {
     /// Get default worktree path (main or master)
     pub async fn get_model_path(&self, model_ref: &ModelRef) -> Result<PathBuf> {
         // For compatibility, return the default worktree path
-        let bare_repo_path = self.get_bare_repo_path(model_ref).await?;
+        let _bare_repo_path = self.get_bare_repo_path(model_ref).await?;
 
         // Try to detect the default branch
         let default_branch = self.get_default_branch(model_ref).await?;

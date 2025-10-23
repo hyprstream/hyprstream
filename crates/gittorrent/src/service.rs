@@ -40,7 +40,7 @@ impl Default for GitTorrentConfig {
     fn default() -> Self {
         Self {
             storage_dir: dirs::cache_dir()
-                .unwrap_or_else(|| std::env::temp_dir())
+                .unwrap_or_else(std::env::temp_dir)
                 .join("gittorrent"),
             bootstrap_nodes: vec![
                 // No default bootstrap nodes - user must specify them
@@ -661,11 +661,7 @@ impl GitTorrentService {
         for (branch_name, commit_hash) in &metadata.branches {
             // Convert SHA256 back to git2::Oid (will fail until git2 supports SHA256)
             if let Ok(oid) = crate::git::objects::sha256_to_oid(commit_hash) {
-                let ref_name = if branch_name == "main" || branch_name == "master" {
-                    format!("refs/heads/{}", branch_name)
-                } else {
-                    format!("refs/heads/{}", branch_name)
-                };
+                let ref_name = format!("refs/heads/{}", branch_name);
 
                 // Create the reference
                 if let Err(e) = repo.reference(&ref_name, oid, false, "Initial clone") {

@@ -35,7 +35,7 @@ impl<'a> RepositoryHandle<'a> {
     pub fn metadata(&self) -> Git2DBResult<&TrackedRepository> {
         self.registry.get_by_id(&self.repo_id).ok_or_else(|| {
             Git2DBError::invalid_repository(
-                &self.repo_id.to_string(),
+                self.repo_id.to_string(),
                 "Repository not found in registry",
             )
         })

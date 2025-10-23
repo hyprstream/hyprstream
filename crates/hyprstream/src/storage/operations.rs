@@ -32,7 +32,7 @@ pub async fn clone_model(
         // Extract model name from URL
         let extracted = repo_url
             .split('/')
-            .last()
+            .next_back()
             .unwrap_or("")
             .trim_end_matches(".git");
 

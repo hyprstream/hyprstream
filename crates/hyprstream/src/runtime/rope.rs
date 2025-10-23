@@ -107,7 +107,7 @@ impl RoPE {
             let exponents = &positions * 2.0 / (self.dim as f64);
             // Correct: base^(-2i/dim) = 1 / (base^(2i/dim))
             // Create a tensor filled with the base value that matches the shape of exponents
-            let base_tensor = Tensor::full(&[half_dim], self.base, (self.dtype, self.device));
+            let base_tensor = Tensor::full([half_dim], self.base, (self.dtype, self.device));
             // Now both tensors have the same shape [half_dim], so pow will work
             base_tensor.pow(&(-exponents))
         };
@@ -270,6 +270,12 @@ impl RoPE {
 /// RoPE cache manager for multiple model layers
 pub struct RoPEManager {
     ropes: HashMap<String, RoPE>,
+}
+
+impl Default for RoPEManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RoPEManager {

@@ -47,6 +47,7 @@ use std::time::Duration;
 
 /// Main configuration for git2db operations
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct Git2DBConfig {
     /// Repository management configuration
     pub repository: RepositoryConfig,
@@ -69,21 +70,6 @@ pub struct Git2DBConfig {
     pub xet: XetConfig,
 }
 
-impl Default for Git2DBConfig {
-    fn default() -> Self {
-        Self {
-            repository: RepositoryConfig::default(),
-            network: NetworkConfig::default(),
-            performance: PerformanceConfig::default(),
-            signature: GitSignature::default(),
-            worktree: WorktreeConfig::default(),
-            #[cfg(feature = "gittorrent-transport")]
-            gittorrent: gittorrent::service::GitTorrentConfig::default(),
-            #[cfg(feature = "xet-storage")]
-            xet: XetConfig::default(),
-        }
-    }
-}
 
 impl Git2DBConfig {
     /// Create a configuration builder with git2db defaults

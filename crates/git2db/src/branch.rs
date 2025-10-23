@@ -80,45 +80,41 @@ impl<'a> BranchManager<'a> {
                 .map(|s| s.to_string());
 
             // List local branches
-            for branch_result in repo.branches(Some(BranchType::Local)).map_err(|e| {
+            for (branch, _) in (repo.branches(Some(BranchType::Local)).map_err(|e| {
                 Git2DBError::internal(format!("Failed to list local branches: {}", e))
-            })? {
-                if let Ok((branch, _)) = branch_result {
-                    if let Some(name) = branch.name().ok().flatten() {
-                        let is_head = head_name.as_deref() == Some(name);
-                        let oid = branch.get().target();
+            })?).flatten() {
+            if let Some(name) = branch.name().ok().flatten() {
+                let is_head = head_name.as_deref() == Some(name);
+                let oid = branch.get().target();
 
-                        branches.push(Branch {
-                            name: name.to_string(),
-                            branch_type: BranchKind::Local,
-                            is_head,
-                            oid,
-                            tracking: branch
-                                .upstream()
-                                .ok()
-                                .and_then(|u| u.name().ok().flatten().map(|s| s.to_string())),
-                        });
-                    }
-                }
+                branches.push(Branch {
+                    name: name.to_string(),
+                    branch_type: BranchKind::Local,
+                    is_head,
+                    oid,
+                    tracking: branch
+                        .upstream()
+                        .ok()
+                        .and_then(|u| u.name().ok().flatten().map(|s| s.to_string())),
+                });
+            }
             }
 
             // List remote branches
-            for branch_result in repo.branches(Some(BranchType::Remote)).map_err(|e| {
+            for (branch, _) in (repo.branches(Some(BranchType::Remote)).map_err(|e| {
                 Git2DBError::internal(format!("Failed to list remote branches: {}", e))
-            })? {
-                if let Ok((branch, _)) = branch_result {
-                    if let Some(name) = branch.name().ok().flatten() {
-                        let oid = branch.get().target();
+            })?).flatten() {
+            if let Some(name) = branch.name().ok().flatten() {
+                let oid = branch.get().target();
 
-                        branches.push(Branch {
-                            name: name.to_string(),
-                            branch_type: BranchKind::Remote,
-                            is_head: false,
-                            oid,
-                            tracking: None,
-                        });
-                    }
-                }
+                branches.push(Branch {
+                    name: name.to_string(),
+                    branch_type: BranchKind::Remote,
+                    is_head: false,
+                    oid,
+                    tracking: None,
+                });
+            }
             }
 
             Ok(branches)

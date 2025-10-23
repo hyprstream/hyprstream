@@ -157,7 +157,7 @@ impl LoRACheckpointManager {
 
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "json") {
+            if path.extension().is_some_and(|ext| ext == "json") {
                 if let Ok(data) = fs::read_to_string(&path).await {
                     if let Ok(checkpoint) = serde_json::from_str::<LoRACheckpoint>(&data) {
                         self.checkpoint_cache

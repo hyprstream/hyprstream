@@ -176,13 +176,13 @@ impl GitRemoteHelper {
         for cap in &self.capabilities {
             response.push_str(&format!("{}\n", cap));
         }
-        response.push_str("\n"); // End with empty line
+        response.push('\n'); // End with empty line
         response
     }
 
     /// Handle list command - list remote references
     async fn handle_list(&mut self, args: &[&str]) -> Result<Option<String>> {
-        let for_push = args.get(0).map(|&s| s == "for-push").unwrap_or(false);
+        let for_push = args.first().map(|&s| s == "for-push").unwrap_or(false);
         tracing::debug!("List command, for_push: {}", for_push);
 
         let url = self.remote_url.as_ref()
@@ -198,12 +198,12 @@ impl GitRemoteHelper {
 
         // Set HEAD to point to main or master if available
         if refs.contains_key("refs/heads/main") {
-            response.push_str(&format!("@refs/heads/main HEAD\n"));
+            response.push_str("@refs/heads/main HEAD\n");
         } else if refs.contains_key("refs/heads/master") {
-            response.push_str(&format!("@refs/heads/master HEAD\n"));
+            response.push_str("@refs/heads/master HEAD\n");
         }
 
-        response.push_str("\n"); // End with empty line
+        response.push('\n'); // End with empty line
 
         tracing::info!("Listed {} references for {}",
                       refs.len(),
@@ -277,7 +277,7 @@ impl GitRemoteHelper {
             let src = &refspec[..colon_pos];
             let dst = &refspec[colon_pos + 1..];
             // Handle force push prefix
-            let src = if src.starts_with('+') { &src[1..] } else { src };
+            let src = src.strip_prefix('+').unwrap_or(src);
             (src, dst)
         } else {
             // If no colon, assume same ref name for both src and dst
@@ -482,7 +482,7 @@ impl GitRemoteHelper {
                 References: {}\n\
                 LFS Files: {}\n\
                 Last Updated: {}\n",
-                url.to_string(),
+                url,
                 metadata.publisher.as_deref().unwrap_or("Unknown"),
                 metadata.size_bytes,
                 metadata.refs.len(),
@@ -545,7 +545,7 @@ impl GitRemoteHelper {
 
             // Add a README file to make it a non-empty repository
             let readme_content = format!("# GitTorrent Repository\n\nThis repository is hosted via GitTorrent.\n\nURL: {}\n",
-                url.to_string());
+                url);
 
             let readme_oid = repo.blob(readme_content.as_bytes()).map_err(Error::from)?;
             tree_builder.insert("README.md", readme_oid, 0o100644).map_err(Error::from)?;

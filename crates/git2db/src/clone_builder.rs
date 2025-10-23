@@ -322,7 +322,7 @@ impl<'a> CloneBuilder<'a> {
 
         // Run git lfs pull - it shows progress by default when stdout is a TTY
         let mut child = Command::new("git")
-            .args(&["lfs", "pull"])
+            .args(["lfs", "pull"])
             .current_dir(repo_path)
             .stdout(std::process::Stdio::inherit())  // Show progress to user
             .stderr(std::process::Stdio::inherit())  // Show errors to user
@@ -358,13 +358,6 @@ fn validate_repo_name(name: &str) -> Git2DBResult<()> {
     }
 
     Ok(())
-}
-
-/// Get branch name for worktree path (Git already sanitizes branch names)
-fn get_worktree_branch_path(branch: &str) -> &str {
-    // Git already ensures branch names are safe (no .., no control chars, etc.)
-    // We can use them as-is to preserve the hierarchy
-    branch
 }
 
 /// Get the default branch from a bare repository

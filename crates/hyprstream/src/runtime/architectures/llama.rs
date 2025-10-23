@@ -263,7 +263,7 @@ impl LlamaAttention {
         kv_cache: Option<&mut crate::runtime::kv_cache::LayerKVCache>,
         start_pos: usize,
     ) -> Result<Tensor> {
-        let (batch_size, seq_len, hidden_size) = dims3(&hidden_states)?;
+        let (batch_size, seq_len, hidden_size) = dims3(hidden_states)?;
 
         tracing::debug!("LlamaAttention forward: batch_size={}, seq_len={}, hidden_size={}, start_pos={}, has_cache={}", 
                       batch_size, seq_len, hidden_size, start_pos, kv_cache.is_some());
@@ -273,7 +273,7 @@ impl LlamaAttention {
         // tracing::debug!("Attention forward - q_proj shape: {:?}, dtype: {:?}", self.q_proj.size(), self.q_proj.kind());
 
         // Reshape hidden_states for matmul: [batch*seq, hidden_size]
-        let hidden_states_2d = hidden_states.reshape(&[batch_size * seq_len, hidden_size]);
+        let hidden_states_2d = hidden_states.reshape([batch_size * seq_len, hidden_size]);
         // tracing::debug!("Reshaped hidden_states_2d shape: {:?}, dtype: {:?}", hidden_states_2d.size(), hidden_states_2d.kind());
 
         // Project to Q, K, V using 2D matmul
@@ -319,15 +319,15 @@ impl LlamaAttention {
 
         // Reshape for attention
         // Q: [batch, seq, num_heads, head_dim]
-        let mut q = q.reshape(&[
+        let mut q = q.reshape([
             batch_size,
             seq_len,
             self.num_heads as i64,
             self.head_dim as i64,
         ]);
         // K, V: [batch, seq, num_kv_heads, head_dim] - use actual kv_heads
-        let mut k = k.reshape(&[batch_size, seq_len, kv_heads as i64, self.head_dim as i64]);
-        let v = v.reshape(&[batch_size, seq_len, kv_heads as i64, self.head_dim as i64]);
+        let mut k = k.reshape([batch_size, seq_len, kv_heads as i64, self.head_dim as i64]);
+        let v = v.reshape([batch_size, seq_len, kv_heads as i64, self.head_dim as i64]);
 
         // Apply QK-norm if configured (Gemma3)
         if let Some(q_norm) = &self.q_norm {
@@ -382,10 +382,10 @@ impl LlamaAttention {
 
         // Reshape to combine heads: [batch, seq, heads*dim]
         let attn_output =
-            attn_output.reshape(&[batch_size, seq_len, (self.num_heads * self.head_dim) as i64]);
+            attn_output.reshape([batch_size, seq_len, (self.num_heads * self.head_dim) as i64]);
 
         // Reshape for output projection: [batch*seq, heads*dim]
-        let attn_output_2d = attn_output.reshape(&[
+        let attn_output_2d = attn_output.reshape([
             batch_size * seq_len,
             (self.num_heads * self.head_dim) as i64,
         ]);
@@ -394,14 +394,14 @@ impl LlamaAttention {
         let attn_output = attn_output_2d.matmul(&self.o_proj);
 
         // Reshape back to 3D: [batch, seq, hidden_size]
-        let attn_output = attn_output.reshape(&[batch_size, seq_len, hidden_size]);
+        let attn_output = attn_output.reshape([batch_size, seq_len, hidden_size]);
 
         Ok(attn_output)
     }
 
     /// Expand KV tensors for GQA with explicit head count
     fn expand_kv_for_gqa_with_heads(&self, kv: &Tensor, actual_kv_heads: usize) -> Result<Tensor> {
-        let (batch_size, seq_len, _detected_heads, head_dim) = dims4(&kv)?;
+        let (batch_size, seq_len, _detected_heads, head_dim) = dims4(kv)?;
         let repeat_factor = self.num_heads / actual_kv_heads;
 
         if repeat_factor == 1 {
@@ -415,7 +415,7 @@ impl LlamaAttention {
         Ok(kv
             .unsqueeze(3) // [batch, seq, num_kv_heads, 1, head_dim]
             .expand(
-                &[
+                [
                     batch_size,
                     seq_len,
                     actual_kv_heads as i64,
@@ -424,7 +424,7 @@ impl LlamaAttention {
                 ],
                 false,
             )
-            .reshape(&[batch_size, seq_len, self.num_heads as i64, head_dim]))
+            .reshape([batch_size, seq_len, self.num_heads as i64, head_dim]))
     }
 
     /// Apply Rotary Position Embeddings with optional scaling
@@ -446,7 +446,7 @@ impl LlamaAttention {
             );
 
             // Get or create RoPE instance
-            if !cache.contains_key(&key) {
+            if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(key) {
                 // Use appropriate base frequency for layer type
                 let base = if self.layer_type == "local" {
                     // Local layers in Gemma3 use different base
@@ -474,7 +474,7 @@ impl LlamaAttention {
                     anyhow!("Failed to create RoPE for layer {}: {}", self.layer_idx, e)
                 })?;
 
-                cache.insert(key, rope);
+                e.insert(rope);
             }
 
             let rope = cache.get_mut(&key).unwrap();
@@ -494,7 +494,7 @@ impl LlamaAttention {
         // QK-norm normalizes each head separately
         // tensor shape: [batch, seq, heads, dim]
         // norm_weight shape: [heads * dim] where heads could be Q heads or KV heads
-        let (_batch_size, _seq_len, tensor_heads, head_dim) = dims4(&tensor)?;
+        let (_batch_size, _seq_len, tensor_heads, head_dim) = dims4(tensor)?;
 
         // Debug logging
         tracing::debug!(
@@ -515,7 +515,7 @@ impl LlamaAttention {
             if norm_elements == (actual_heads * head_dim as usize) as i64 {
                 // Standard case: reshape from [heads * dim] to [1, 1, heads, dim]
                 norm_weight
-                    .reshape(&[actual_heads as i64, head_dim])
+                    .reshape([actual_heads as i64, head_dim])
                     .unsqueeze(0) // Add batch dimension
                     .unsqueeze(0) // Add seq dimension
             } else if norm_elements == head_dim {
@@ -544,10 +544,10 @@ impl LlamaAttention {
         let rrms = (mean + eps).reciprocal().sqrt();
 
         // Apply normalization and scale with norm weights
-        Ok(broadcast_mul(
+        broadcast_mul(
             &broadcast_mul(tensor, &rrms)?,
             &norm_weight_reshaped,
-        )?)
+        )
     }
 
     /// Compute scaled dot-product attention scores with causal masking
@@ -576,10 +576,10 @@ impl LlamaAttention {
             // where all positions are allowed (since they're all past positions)
             let mask = if q_len == 1 && k_len > 1 {
                 // Single query attending to all past keys - all positions valid
-                Tensor::ones(&[q_len, k_len], (tch::Kind::Float, scores.device()))
+                Tensor::ones([q_len, k_len], (tch::Kind::Float, scores.device()))
             } else {
                 // Standard causal mask for multiple queries
-                Tensor::ones(&[q_len, k_len], (tch::Kind::Float, scores.device())).tril(0)
+                Tensor::ones([q_len, k_len], (tch::Kind::Float, scores.device())).tril(0)
                 // Lower triangular (1s at and below diagonal, 0s above)
             };
 
@@ -606,7 +606,7 @@ impl LlamaAttention {
 
     /// Apply sliding window mask for local attention layers
     fn apply_sliding_window_mask(&self, scores: &Tensor, window_size: usize) -> Result<Tensor> {
-        let (batch_size, num_heads, seq_len, _) = dims4(&scores)?;
+        let (batch_size, num_heads, seq_len, _) = dims4(scores)?;
         let device = scores.device();
         let dtype = scores.kind();
 
@@ -628,15 +628,15 @@ impl LlamaAttention {
 
         // Create mask tensor and broadcast to match scores shape
         let mask = Tensor::from_slice(&mask_values)
-            .reshape(&[seq_len, seq_len])
+            .reshape([seq_len, seq_len])
             .to(device)
             .to_dtype(dtype, false, false)
             .unsqueeze(0) // [1, seq, seq]
             .unsqueeze(0) // [1, 1, seq, seq]
-            .expand(&[batch_size, num_heads, seq_len, seq_len], false);
+            .expand([batch_size, num_heads, seq_len, seq_len], false);
 
         // Add mask to scores (masked positions get large negative values)
-        Ok(broadcast_add(&scores, &mask)?)
+        broadcast_add(scores, &mask)
     }
 }
 
@@ -663,7 +663,7 @@ impl LlamaMLP {
         };
 
         // Reshape to 2D for matmul
-        let hidden_2d = hidden_states.reshape(&[batch_size * seq_len, hidden_size]);
+        let hidden_2d = hidden_states.reshape([batch_size * seq_len, hidden_size]);
 
         // Apply activation based on config
         let gate_pre = hidden_2d.matmul(&self.gate_proj);
@@ -673,7 +673,7 @@ impl LlamaMLP {
 
         // Reshape back to 3D
         let out_size = output.size()[1];
-        Ok(output.reshape(&[batch_size, seq_len, out_size]))
+        Ok(output.reshape([batch_size, seq_len, out_size]))
     }
 
     fn forward_2d(&self, hidden_states: &Tensor) -> Result<Tensor> {
@@ -734,7 +734,7 @@ impl LlamaMLP {
 
         // 0.5 * x * (1 + tanh(...))
         let half_tensor = scalar_tensor(0.5_f32, x.device());
-        Ok(broadcast_mul(&(x * &one_plus_tanh), &half_tensor)?)
+        broadcast_mul(&(x * &one_plus_tanh), &half_tensor)
     }
 }
 
@@ -751,12 +751,12 @@ impl RMSNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // Compute RMS, preserving the original dtype
         let original_dtype = x.kind();
-        let x2 = square_tensor(&x)?;
+        let x2 = square_tensor(x)?;
         let mean = x2.mean_dim(&[-1i64][..], true, original_dtype); // Keep original dtype
         let rrms = (mean + self.eps as f64).reciprocal().sqrt();
 
         // Apply normalization and scaling
-        Ok(broadcast_mul(&broadcast_mul(&x, &rrms)?, &self.weight)?)
+        broadcast_mul(&broadcast_mul(x, &rrms)?, &self.weight)
     }
 }
 
@@ -960,7 +960,7 @@ impl LlamaModel {
                 let mut found_config = false;
 
                 for &head_dim in &possible_head_dims {
-                    if q_proj_out_dim % head_dim == 0 && k_proj_out_dim % head_dim == 0 {
+                    if q_proj_out_dim.is_multiple_of(head_dim) && k_proj_out_dim % head_dim == 0 {
                         config.num_attention_heads = q_proj_out_dim / head_dim;
                         config.num_key_value_heads = k_proj_out_dim / head_dim;
                         config.head_dim = head_dim;
@@ -1089,7 +1089,7 @@ impl LlamaModel {
             config.layer_types[layer_idx].clone()
         } else if config.layer_types.is_empty() && config.use_qk_norm {
             // Gemma3 pattern: every 6th layer is global, others are local
-            if (layer_idx + 1) % 6 == 0 {
+            if (layer_idx + 1).is_multiple_of(6) {
                 "global".to_string()
             } else {
                 "local".to_string()
@@ -1217,11 +1217,11 @@ impl LlamaModel {
                         .and_then(|v| v.as_u64())
                         .unwrap_or(4096) as usize;
                     // Common head_dim values are 64, 128, 256
-                    if hidden % (heads * 256) == 0 {
+                    if hidden.is_multiple_of(heads * 256) {
                         256
-                    } else if hidden % (heads * 128) == 0 {
+                    } else if hidden.is_multiple_of(heads * 128) {
                         128
-                    } else if hidden % (heads * 64) == 0 {
+                    } else if hidden.is_multiple_of(heads * 64) {
                         64
                     } else {
                         128 // Default fallback
@@ -1345,7 +1345,7 @@ impl ModelOperations for LlamaModel {
                                                             // tracing::debug!("Embeddings shape after lookup: {:?}, hidden_size: {}", emb_dims, hidden_size);
 
             // Reshape back to [batch_size, seq_len, hidden_size]
-            let mut embeddings = embeddings.reshape(&[batch_size, seq_len, hidden_size]);
+            let mut embeddings = embeddings.reshape([batch_size, seq_len, hidden_size]);
 
             // Scale embeddings by sqrt(hidden_size) for Gemma3
             if self.config.scale_embeddings {
@@ -1457,11 +1457,11 @@ impl ModelOperations for LlamaModel {
             if hs_shape.len() == 3 {
                 let (batch_size, seq_len, hidden_size) = (hs_shape[0], hs_shape[1], hs_shape[2]);
                 // Reshape to 2D for matmul: [batch * seq_len, hidden_size]
-                let hidden_2d = hidden_states.reshape(&[batch_size * seq_len, hidden_size]);
+                let hidden_2d = hidden_states.reshape([batch_size * seq_len, hidden_size]);
                 // Perform matmul: [batch * seq_len, hidden_size] x [hidden_size, vocab_size] = [batch * seq_len, vocab_size]
                 let logits_2d = hidden_2d.matmul(&output_proj);
                 // Reshape back to 3D: [batch, seq_len, vocab_size]
-                hidden_states = logits_2d.reshape(&[batch_size, seq_len, output_proj.size()[1]]);
+                hidden_states = logits_2d.reshape([batch_size, seq_len, output_proj.size()[1]]);
             } else {
                 hidden_states = hidden_states.matmul(&output_proj);
             }
@@ -1473,11 +1473,11 @@ impl ModelOperations for LlamaModel {
     }
 
     fn reshape_for_attention(&self, tensor: &Tensor, is_key_value: bool) -> Result<Tensor> {
-        let (batch_size, seq_len, _hidden_size) = dims3(&tensor)?;
+        let (batch_size, seq_len, _hidden_size) = dims3(tensor)?;
 
         if is_key_value {
             // For K,V: reshape to [batch, seq, num_kv_heads, head_dim]
-            Ok(tensor.reshape(&[
+            Ok(tensor.reshape([
                 batch_size,
                 seq_len,
                 self.config.num_key_value_heads as i64,
@@ -1485,7 +1485,7 @@ impl ModelOperations for LlamaModel {
             ]))
         } else {
             // For Q: reshape to [batch, seq, num_attention_heads, head_dim]
-            Ok(tensor.reshape(&[
+            Ok(tensor.reshape([
                 batch_size,
                 seq_len,
                 self.config.num_attention_heads as i64,
@@ -1508,14 +1508,14 @@ impl ModelOperations for LlamaModel {
         let x2 = square_tensor(tensor)?;
         let mean = x2.mean_dim(&[-1i64][..], true, original_dtype);
         let rrms = (mean + self.config.rms_norm_eps as f64).reciprocal().sqrt();
-        Ok(broadcast_mul(tensor, &rrms)?)
+        broadcast_mul(tensor, &rrms)
     }
 
     fn get_attention_mask(&self, seq_len: usize, past_kv_len: usize) -> Result<Tensor> {
         // Create causal attention mask using model dtype
         let total_len = seq_len + past_kv_len;
         let mask = Tensor::ones(
-            &[seq_len as i64, total_len as i64],
+            [seq_len as i64, total_len as i64],
             (self.dtype, self.device),
         );
 

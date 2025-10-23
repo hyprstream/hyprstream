@@ -172,10 +172,10 @@ unsafe impl Sync for GemmaAttention {}
 impl GemmaAttention {
     /// Apply Multi-Query Attention with optional QK-norm and sliding window
     fn forward(&self, hidden_states: &Tensor, position_ids: Option<&Tensor>) -> Result<Tensor> {
-        let (batch_size, seq_len, hidden_size) = dims3(&hidden_states)?;
+        let (batch_size, seq_len, hidden_size) = dims3(hidden_states)?;
 
         // Reshape for 2D matmul
-        let hidden_states_2d = hidden_states.reshape(&[batch_size * seq_len, hidden_size]);
+        let hidden_states_2d = hidden_states.reshape([batch_size * seq_len, hidden_size]);
 
         // Project to Q, K, V - weights are [out, in] so transpose for matmul
         let q = hidden_states_2d.matmul(&self.q_proj.transpose(0, 1));
@@ -184,20 +184,20 @@ impl GemmaAttention {
 
         // Reshape for attention
         // Q: [batch, seq, num_heads, head_dim]
-        let mut q = q.reshape(&[
+        let mut q = q.reshape([
             batch_size,
             seq_len,
             self.num_heads as i64,
             self.head_dim as i64,
         ]);
         // K, V: [batch, seq, num_kv_heads, head_dim]
-        let mut k = k.reshape(&[
+        let mut k = k.reshape([
             batch_size,
             seq_len,
             self.num_kv_heads as i64,
             self.head_dim as i64,
         ]);
-        let v = v.reshape(&[
+        let v = v.reshape([
             batch_size,
             seq_len,
             self.num_kv_heads as i64,
@@ -247,20 +247,20 @@ impl GemmaAttention {
 
         // Reshape and project output - transpose o_proj for matmul
         let attn_output = attn_output
-            .reshape(&[batch_size, seq_len, (self.num_heads * self.head_dim) as i64])
-            .reshape(&[
+            .reshape([batch_size, seq_len, (self.num_heads * self.head_dim) as i64])
+            .reshape([
                 batch_size * seq_len,
                 (self.num_heads * self.head_dim) as i64,
             ])
             .matmul(&self.o_proj.transpose(0, 1))
-            .reshape(&[batch_size, seq_len, hidden_size]);
+            .reshape([batch_size, seq_len, hidden_size]);
 
         Ok(attn_output)
     }
 
     /// Expand KV heads to match Q heads for MQA
     fn expand_kv_for_mqa(&self, kv: &Tensor) -> Result<Tensor> {
-        let (batch_size, seq_len, num_kv_heads, head_dim) = dims4(&kv)?;
+        let (batch_size, seq_len, num_kv_heads, head_dim) = dims4(kv)?;
         let repeat_factor = (self.num_heads as i64) / num_kv_heads;
 
         if repeat_factor == 1 {
@@ -271,22 +271,22 @@ impl GemmaAttention {
         Ok(kv
             .unsqueeze(3) // [batch, seq, num_kv_heads, 1, head_dim]
             .expand(
-                &[
+                [
                     batch_size,
                     seq_len,
                     num_kv_heads,
-                    repeat_factor as i64,
+                    repeat_factor,
                     head_dim,
                 ],
                 false,
             )
-            .reshape(&[batch_size, seq_len, self.num_heads as i64, head_dim]))
+            .reshape([batch_size, seq_len, self.num_heads as i64, head_dim]))
     }
 
     /// Apply Rotary Position Embeddings
     fn apply_rope(&self, tensor: &Tensor, _position_ids: &Tensor) -> Result<Tensor> {
         // tensor shape: [batch, seq, heads, dim]
-        let (_batch_size, seq_len, _num_heads, head_dim) = dims4(&tensor)?;
+        let (_batch_size, seq_len, _num_heads, head_dim) = dims4(tensor)?;
 
         // Generate position embeddings
         let theta = self.rope_theta;
@@ -299,7 +299,7 @@ impl GemmaAttention {
             .collect::<Vec<_>>();
 
         // Create position indices
-        let _positions = Tensor::arange(seq_len as i64, (DType::Int64, device)).to_dtype(
+        let _positions = Tensor::arange(seq_len, (DType::Int64, device)).to_dtype(
             DType::Float,
             false,
             false,
@@ -319,11 +319,11 @@ impl GemmaAttention {
 
         // Create sin and cos tensors
         let sin = Tensor::from_slice(&sin_vals)
-            .reshape(&[seq_len, head_dim / 2])
+            .reshape([seq_len, head_dim / 2])
             .to(device)
             .to_dtype(dtype, false, false);
         let cos = Tensor::from_slice(&cos_vals)
-            .reshape(&[seq_len, head_dim / 2])
+            .reshape([seq_len, head_dim / 2])
             .to(device)
             .to_dtype(dtype, false, false);
 
@@ -348,28 +348,28 @@ impl GemmaAttention {
     ) -> Result<Tensor> {
         // tensor shape: [batch, seq, heads, dim]
         // norm_weight shape: [heads * dim] or [dim] for single head
-        let (batch_size, seq_len, _tensor_heads, head_dim) = dims4(&tensor)?;
+        let (batch_size, seq_len, _tensor_heads, head_dim) = dims4(tensor)?;
 
         // Reshape norm_weight to match tensor dimensions
-        let norm_weight = if norm_weight.size()[0] == head_dim as i64 {
+        let norm_weight = if norm_weight.size()[0] == head_dim {
             // Single head normalization (K in Gemma3)
             norm_weight
                 .unsqueeze(0) // [1, dim]
-                .expand(&[num_heads as i64, head_dim], false) // [heads, dim]
-                .reshape(&[(num_heads * head_dim as usize) as i64])
+                .expand([num_heads as i64, head_dim], false) // [heads, dim]
+                .reshape([(num_heads * head_dim as usize) as i64])
         } else {
             norm_weight.shallow_clone()
         };
 
         // Reshape tensor for normalization
         let tensor_flat =
-            tensor.reshape(&[batch_size * seq_len, (num_heads * head_dim as usize) as i64]);
+            tensor.reshape([batch_size * seq_len, (num_heads * head_dim as usize) as i64]);
 
         // Apply normalization
         let normalized = broadcast_mul(&tensor_flat, &norm_weight)?;
 
         // Reshape back
-        Ok(normalized.reshape(&[batch_size, seq_len, num_heads as i64, head_dim]))
+        Ok(normalized.reshape([batch_size, seq_len, num_heads as i64, head_dim]))
     }
 
     /// Compute scaled dot-product attention scores with optional sliding window
@@ -404,7 +404,7 @@ impl GemmaAttention {
 
     /// Apply sliding window mask for local attention layers
     fn apply_sliding_window_mask(&self, scores: &Tensor, window_size: usize) -> Result<Tensor> {
-        let (batch_size, num_heads, seq_len, _) = dims4(&scores)?;
+        let (batch_size, num_heads, seq_len, _) = dims4(scores)?;
         let device = scores.device();
         let dtype = scores.kind();
 
@@ -422,15 +422,15 @@ impl GemmaAttention {
 
         // Create mask tensor and broadcast to match scores shape
         let mask = Tensor::from_slice(&mask_values)
-            .reshape(&[seq_len, seq_len])
+            .reshape([seq_len, seq_len])
             .to(device)
             .to_dtype(dtype, false, false)
             .unsqueeze(0) // [1, seq, seq]
             .unsqueeze(0) // [1, 1, seq, seq]
-            .expand(&[batch_size, num_heads, seq_len, seq_len], false);
+            .expand([batch_size, num_heads, seq_len, seq_len], false);
 
         // Add mask to scores
-        Ok(broadcast_add(&scores, &mask)?)
+        broadcast_add(scores, &mask)
     }
 }
 
@@ -459,7 +459,7 @@ impl GemmaMLP {
 
         // Reshape to 2D for matmul if needed
         let hidden_2d = if needs_reshape {
-            hidden_states.reshape(&[batch_size * seq_len, hidden_size])
+            hidden_states.reshape([batch_size * seq_len, hidden_size])
         } else {
             hidden_states.shallow_clone()
         };
@@ -479,7 +479,7 @@ impl GemmaMLP {
         // Reshape back to 3D if input was 3D
         if needs_reshape {
             let output_hidden_size = output.size()[1];
-            Ok(output.reshape(&[batch_size, seq_len, output_hidden_size]))
+            Ok(output.reshape([batch_size, seq_len, output_hidden_size]))
         } else {
             Ok(output)
         }
@@ -514,7 +514,7 @@ impl GemmaMLP {
 
         // 0.5 * x * (1 + tanh(...))
         let half_tensor = scalar_tensor(0.5_f32, x.device());
-        Ok(broadcast_mul(&(x * &one_plus_tanh), &half_tensor)?)
+        broadcast_mul(&(x * &one_plus_tanh), &half_tensor)
     }
 }
 
@@ -699,7 +699,7 @@ impl GemmaModel {
 
         Ok(Self {
             config,
-            device: device.clone(),
+            device: *device,
             dtype,
             embed_tokens,
             layers,
@@ -809,7 +809,7 @@ impl GemmaModel {
             config.layer_types[layer_idx].clone()
         } else if config.sliding_window.is_some() {
             // Fallback: Every 6th layer is global, others are local
-            if (layer_idx + 1) % 6 == 0 {
+            if (layer_idx + 1).is_multiple_of(6) {
                 "global".to_string()
             } else {
                 "local".to_string()
@@ -1015,7 +1015,7 @@ impl ModelOperations for GemmaModel {
             let hidden_size = emb_dims[emb_dims.len() - 1]; // Last dimension is hidden size
 
             // Reshape back to [batch_size, seq_len, hidden_size]
-            let mut embeddings = embeddings.reshape(&[batch_size, seq_len, hidden_size]);
+            let mut embeddings = embeddings.reshape([batch_size, seq_len, hidden_size]);
 
             // Apply embedding scaling for Gemma - scale by sqrt(hidden_size)
             let scale = (hidden_size as f32).sqrt();
@@ -1061,42 +1061,42 @@ impl ModelOperations for GemmaModel {
             // Use explicit lm_head if available
             // lm_head is [vocab_size, hidden_size], need to transpose for matmul
             let (batch_size, seq_len, hidden_size) = dims3(&hidden_states)?;
-            let hidden_2d = hidden_states.reshape(&[batch_size * seq_len, hidden_size]);
+            let hidden_2d = hidden_states.reshape([batch_size * seq_len, hidden_size]);
             let logits = hidden_2d.matmul(&lm_head.transpose(0, 1));
             let vocab_size = logits.size()[1];
-            hidden_states = logits.reshape(&[batch_size, seq_len, vocab_size]);
+            hidden_states = logits.reshape([batch_size, seq_len, vocab_size]);
         } else if let Some(embed) = &self.embed_tokens {
             // Gemma uses weight tying: lm_head = embed_tokens.T
             // embed_tokens is [vocab_size, hidden_size], use it directly as lm_head
             let (batch_size, seq_len, hidden_size) = dims3(&hidden_states)?;
-            let hidden_2d = hidden_states.reshape(&[batch_size * seq_len, hidden_size]);
+            let hidden_2d = hidden_states.reshape([batch_size * seq_len, hidden_size]);
 
             // For weight tying, embed_tokens already acts as the transposed lm_head
             let logits = hidden_2d.matmul(&embed.transpose(0, 1));
             let vocab_size = logits.size()[1];
-            hidden_states = logits.reshape(&[batch_size, seq_len, vocab_size]);
+            hidden_states = logits.reshape([batch_size, seq_len, vocab_size]);
         }
 
         Ok(hidden_states)
     }
 
     fn reshape_for_attention(&self, tensor: &Tensor, is_key_value: bool) -> Result<Tensor> {
-        let (batch_size, seq_len, _hidden_size) = dims3(&tensor)?;
+        let (batch_size, seq_len, _hidden_size) = dims3(tensor)?;
 
         if is_key_value {
             // For Gemma MQA: reshape to [batch, seq, num_kv_heads, head_dim]
             // This is the key fix for the shape mismatch issue!
-            Ok(tensor.reshape(&[
-                batch_size as i64,
-                seq_len as i64,
+            Ok(tensor.reshape([
+                batch_size,
+                seq_len,
                 self.config.num_key_value_heads as i64,
                 self.config.head_dim as i64,
             ]))
         } else {
             // For queries: standard reshape
-            Ok(tensor.reshape(&[
-                batch_size as i64,
-                seq_len as i64,
+            Ok(tensor.reshape([
+                batch_size,
+                seq_len,
                 self.config.num_attention_heads as i64,
                 self.config.head_dim as i64,
             ]))
@@ -1119,14 +1119,14 @@ impl ModelOperations for GemmaModel {
         let x2 = square_tensor(tensor)?;
         let mean = x2.mean_dim(&[-1i64][..], true, DType::Float);
         let rrms = (mean + self.config.rms_norm_eps as f64).reciprocal().sqrt();
-        Ok(broadcast_mul(tensor, &rrms)?)
+        broadcast_mul(tensor, &rrms)
     }
 
     fn get_attention_mask(&self, seq_len: usize, past_kv_len: usize) -> Result<Tensor> {
         // Create causal attention mask
         let total_len = seq_len + past_kv_len;
         let mask = Tensor::ones(
-            &[seq_len as i64, total_len as i64],
+            [seq_len as i64, total_len as i64],
             (DType::Float, self.device),
         );
 
@@ -1205,7 +1205,7 @@ impl GemmaModel {
 
         // Return random logits with correct shape [batch_size, seq_len, vocab_size]
         let logits = Tensor::randn(
-            &[batch_size, seq_len, self.config.vocab_size as i64],
+            [batch_size, seq_len, self.config.vocab_size as i64],
             (DType::Float, input.device()),
         );
 

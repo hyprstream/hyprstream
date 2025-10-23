@@ -25,7 +25,7 @@ pub trait RepositoryAccessor {
             .get_worktree_path(self.repo_id())
             .ok_or_else(|| {
                 Git2DBError::invalid_repository(
-                    &self.repo_id().to_string(),
+                    self.repo_id().to_string(),
                     "Repository not found in registry",
                 )
             })
