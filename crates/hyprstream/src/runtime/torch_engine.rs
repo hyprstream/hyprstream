@@ -805,13 +805,29 @@ impl RuntimeEngine for TorchEngine {
 
                 tracing::debug!("Sampled token ID: {}", next_token);
 
+                // Validate token is within vocabulary bounds
+                let vocab_size = {
+                    let model_info = self_clone.handle_poison(self_clone.model_info.lock())?;
+                    model_info.vocab_size as usize
+                }; // Lock is dropped here
+
+                if next_token >= vocab_size {
+                    tracing::warn!(
+                        "Invalid token ID {} sampled (vocab_size={}), skipping",
+                        next_token,
+                        vocab_size
+                    );
+                    // Don't add invalid tokens to the sequence or KV cache
+                    continue;
+                }
+
                 // Check EOS BEFORE decoding or adding to sequence
                 if self_clone.is_eos_token(next_token) {
                     tracing::debug!("EOS token detected: {}", next_token);
                     break;
                 }
 
-                // Add to sequence
+                // Add to sequence (now guaranteed to be valid)
                 input_ids.push(next_token as i64);
                 tokens_generated += 1;
 
@@ -1116,13 +1132,29 @@ impl TorchEngine {
                 &input_ids,
             )?;
 
+            // Validate token is within vocabulary bounds
+            let vocab_size = {
+                let model_info = self.handle_poison(self.model_info.lock())?;
+                model_info.vocab_size as usize
+            }; // Lock is dropped here
+
+            if next_token >= vocab_size {
+                tracing::warn!(
+                    "Invalid token ID {} sampled (vocab_size={}), skipping",
+                    next_token,
+                    vocab_size
+                );
+                // Don't add invalid tokens to the sequence or KV cache
+                continue;
+            }
+
             // Check EOS BEFORE decoding or adding to sequence
             if self.is_eos_token(next_token) {
                 tracing::debug!("EOS token detected: {}", next_token);
                 break;
             }
 
-            // Add to sequence
+            // Add to sequence (now guaranteed to be valid)
             input_ids.push(next_token as i64);
 
             // Decode token and stream it immediately
@@ -1215,13 +1247,29 @@ impl TorchEngine {
                     &input_ids,
                 )?;
 
+                // Validate token is within vocabulary bounds
+                let vocab_size = {
+                    let model_info = self.handle_poison(self.model_info.lock())?;
+                    model_info.vocab_size as usize
+                }; // Lock is dropped here
+
+                if next_token >= vocab_size {
+                    tracing::warn!(
+                        "Invalid token ID {} sampled (vocab_size={}), skipping",
+                        next_token,
+                        vocab_size
+                    );
+                    // Don't add invalid tokens to the sequence or KV cache
+                    continue;
+                }
+
                 // Check EOS BEFORE decoding or adding to sequence
                 if self.is_eos_token(next_token) {
                     tracing::debug!("EOS token detected: {}", next_token);
                     break;
                 }
 
-                // Add to sequence
+                // Add to sequence (now guaranteed to be valid)
                 input_ids.push(next_token as i64);
                 tokens_generated += 1;
 

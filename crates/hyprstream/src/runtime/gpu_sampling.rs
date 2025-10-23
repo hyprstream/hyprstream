@@ -44,10 +44,19 @@ impl GpuSampler {
             self.apply_repetition_penalty(&logits, repeat_penalty, previous_tokens)?;
 
         // Step 2: Apply temperature scaling on GPU
-        let scaled_logits = if temperature > 0.0 && temperature != 1.0 {
-            &penalized_logits / temperature as f64
-        } else {
+        let scaled_logits = if temperature <= 0.0 || temperature.is_nan() || temperature.is_infinite() {
+            // Invalid temperature: use greedy decoding (temperature → 0 means argmax)
             penalized_logits
+        } else if (temperature - 1.0).abs() < 1e-6 {
+            // Temperature is effectively 1.0, no scaling needed
+            penalized_logits
+        } else if temperature < 0.01 {
+            // Very low temperature: scale but clamp to avoid numerical issues
+            let scale_factor = 100.0_f64; // Equivalent to temperature = 0.01
+            &penalized_logits * scale_factor
+        } else {
+            // Normal temperature scaling
+            &penalized_logits / temperature as f64
         };
 
         // Step 3: Convert to probabilities with numerical stability
@@ -141,12 +150,22 @@ impl GpuSampler {
         // Create mask for top-k positions
         let mut filtered_probs = Tensor::zeros([vocab_size as i64], (probs.kind(), self.device));
 
-        // Set top-k probabilities
-        let _ = filtered_probs.index_put_(&[Some(top_indices)], &top_values, false);
+        // Set top-k probabilities (clone indices to reuse later if needed)
+        let _ = filtered_probs.index_put_(&[Some(top_indices.shallow_clone())], &top_values, false);
 
-        // Renormalize
+        // Renormalize (with safety check for zero sum)
         let sum = filtered_probs.sum(filtered_probs.kind());
-        Ok(&filtered_probs / &sum)
+        let sum_scalar = sum.double_value(&[]);
+
+        if sum_scalar <= 0.0 || sum_scalar.is_nan() || sum_scalar.is_infinite() {
+            // If filtering removed all probability mass, return uniform distribution over top-k
+            let uniform_prob = 1.0 / k as f64;
+            let mut uniform_probs = Tensor::zeros([vocab_size as i64], (probs.kind(), self.device));
+            let _ = uniform_probs.index_put_(&[Some(top_indices)], &Tensor::full(&[k as i64], uniform_prob, (probs.kind(), self.device)), false);
+            Ok(uniform_probs)
+        } else {
+            Ok(&filtered_probs / &sum)
+        }
     }
 
     /// Apply top-p (nucleus) sampling on GPU
@@ -176,17 +195,56 @@ impl GpuSampler {
         let mut filtered_probs = Tensor::zeros_like(probs);
         let _ = filtered_probs.scatter_(-1, &sorted_indices, &filtered_sorted);
 
-        // Renormalize
+        // Renormalize (with safety check for zero sum)
         let sum = filtered_probs.sum(filtered_probs.kind());
-        Ok(&filtered_probs / &sum)
+        let sum_scalar = sum.double_value(&[]);
+
+        if sum_scalar <= 0.0 || sum_scalar.is_nan() || sum_scalar.is_infinite() {
+            // If filtering removed all probability mass, keep original distribution
+            // This can happen with very small top_p values
+            Ok(probs.shallow_clone())
+        } else {
+            Ok(&filtered_probs / &sum)
+        }
     }
 
     /// Sample from multinomial distribution on GPU
     fn multinomial_sample(&self, probs: &Tensor) -> Result<usize> {
+        let vocab_size = probs.size()[0] as usize;
+
+        // Check if probabilities are valid
+        let sum = probs.sum(probs.kind());
+        let sum_scalar = sum.double_value(&[]);
+
+        if sum_scalar <= 0.0 || sum_scalar.is_nan() || sum_scalar.is_infinite() {
+            // Fallback: return the most likely token (argmax)
+            let (_, max_idx) = probs.max_dim(0, false);
+            let token_id = max_idx.int64_value(&[]) as usize;
+
+            // Ensure it's within bounds
+            if token_id >= vocab_size {
+                return Ok(0); // Return first token as ultimate fallback
+            }
+            return Ok(token_id);
+        }
+
         // Use PyTorch's multinomial sampling (GPU accelerated)
         let sample = probs.multinomial(1, false); // Sample 1 token
         let token_id = sample.int64_value(&[0]) as usize;
 
-        Ok(token_id)
+        // Validate the sampled token is within vocabulary bounds
+        if token_id >= vocab_size {
+            // This shouldn't happen with valid probabilities, but if it does,
+            // fall back to argmax
+            let (_, max_idx) = probs.max_dim(0, false);
+            let safe_token_id = max_idx.int64_value(&[]) as usize;
+            if safe_token_id < vocab_size {
+                Ok(safe_token_id)
+            } else {
+                Ok(0) // Ultimate fallback to first token
+            }
+        } else {
+            Ok(token_id)
+        }
     }
 }
