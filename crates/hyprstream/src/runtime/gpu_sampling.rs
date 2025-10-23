@@ -28,16 +28,44 @@ impl GpuSampler {
         top_k: Option<usize>,
         repeat_penalty: f32,
         previous_tokens: &[i64],
+        tokenizer_vocab_size: Option<usize>,
     ) -> Result<usize> {
         // Ensure logits are on the correct device and squeezed to 1D
         // Convert to Float for sampling operations
-        let logits = if logits_tensor.dim() > 1 {
+        let mut logits = if logits_tensor.dim() > 1 {
             logits_tensor.squeeze_dim(0) // [vocab_size]
         } else {
             logits_tensor.shallow_clone()
         }
         .to_device(self.device)
         .to_kind(Kind::Float);
+
+        // Step 0: Mask invalid tokens BEFORE any processing
+        // This ensures invalid tokens can never be sampled
+        if let Some(vocab_size) = tokenizer_vocab_size {
+            let model_vocab_size = logits.size()[0] as usize;
+            if vocab_size < model_vocab_size {
+                // Create a mask for valid tokens (1.0 for valid, 0.0 for invalid)
+                let mut mask_values = vec![1.0f32; vocab_size];
+                mask_values.extend(vec![0.0f32; model_vocab_size - vocab_size]);
+
+                let mask = Tensor::from_slice(&mask_values)
+                    .to_device(self.device)
+                    .to_kind(Kind::Float);
+
+                // Apply mask: valid tokens keep their logits, invalid tokens get -inf
+                // where_self: if mask is true (1.0), keep original; else use -inf
+                let neg_inf = Tensor::from(-1e10f32).to_device(self.device).expand_as(&logits);
+                logits = mask.to_kind(Kind::Bool).where_self(&logits, &neg_inf);
+
+                tracing::debug!(
+                    "Masked {} invalid tokens (tokenizer vocab: {}, model vocab: {})",
+                    model_vocab_size - vocab_size,
+                    vocab_size,
+                    model_vocab_size
+                );
+            }
+        }
 
         // Step 1: Apply repetition penalty on GPU
         let penalized_logits =

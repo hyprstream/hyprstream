@@ -363,6 +363,21 @@ impl TorchEngine {
             let tokenizer = Tokenizer::from_file(&tokenizer_path)
                 .map_err(|e| anyhow!("Failed to load tokenizer: {}", e))?;
 
+            // Log vocabulary size information for debugging Unicode issues
+            let tokenizer_vocab_size = tokenizer.get_vocab_size(true);
+            info!("Tokenizer vocabulary size: {}", tokenizer_vocab_size);
+
+            // Compare with model's configured vocab size
+            {
+                let model_info = self.handle_poison(self.model_info.lock())?;
+                if model_info.vocab_size as usize != tokenizer_vocab_size {
+                    tracing::warn!(
+                        "Vocabulary size mismatch! Model config: {}, Tokenizer: {}. This may cause Unicode replacement characters.",
+                        model_info.vocab_size, tokenizer_vocab_size
+                    );
+                }
+            }
+
             // Thread safe assignment
             let mut tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
             *tokenizer_guard = Some(tokenizer);
@@ -631,6 +646,16 @@ impl TorchEngine {
         repeat_penalty: f32,
         previous_tokens: &[i64],
     ) -> Result<usize> {
+        // Get the tokenizer vocabulary size to mask invalid tokens
+        let tokenizer_vocab_size = {
+            let tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
+            if let Some(ref tokenizer) = *tokenizer_guard {
+                Some(tokenizer.get_vocab_size(true))
+            } else {
+                None
+            }
+        };
+
         self.gpu_sampler.sample_token(
             logits_tensor,
             temperature,
@@ -638,6 +663,7 @@ impl TorchEngine {
             top_k,
             repeat_penalty,
             previous_tokens,
+            tokenizer_vocab_size,
         )
     }
 }
@@ -806,14 +832,22 @@ impl RuntimeEngine for TorchEngine {
                 tracing::debug!("Sampled token ID: {}", next_token);
 
                 // Validate token is within vocabulary bounds
+                // Use tokenizer's vocabulary size as the authoritative source
                 let vocab_size = {
-                    let model_info = self_clone.handle_poison(self_clone.model_info.lock())?;
-                    model_info.vocab_size as usize
+                    let tokenizer_guard = self_clone.handle_poison(self_clone.tokenizer.lock())?;
+                    if let Some(ref tokenizer) = *tokenizer_guard {
+                        tokenizer.get_vocab_size(true)
+                    } else {
+                        // Fallback to model config if tokenizer not available (shouldn't happen)
+                        let model_info = self_clone.handle_poison(self_clone.model_info.lock())?;
+                        tracing::warn!("Using model config vocab_size as fallback (tokenizer not available)");
+                        model_info.vocab_size as usize
+                    }
                 }; // Lock is dropped here
 
                 if next_token >= vocab_size {
                     tracing::warn!(
-                        "Invalid token ID {} sampled (vocab_size={}), skipping",
+                        "Invalid token ID {} sampled (tokenizer vocab_size={}), skipping",
                         next_token,
                         vocab_size
                     );
@@ -1133,14 +1167,22 @@ impl TorchEngine {
             )?;
 
             // Validate token is within vocabulary bounds
+            // Use tokenizer's vocabulary size as the authoritative source
             let vocab_size = {
-                let model_info = self.handle_poison(self.model_info.lock())?;
-                model_info.vocab_size as usize
+                let tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
+                if let Some(ref tokenizer) = *tokenizer_guard {
+                    tokenizer.get_vocab_size(true)
+                } else {
+                    // Fallback to model config if tokenizer not available (shouldn't happen)
+                    let model_info = self.handle_poison(self.model_info.lock())?;
+                    tracing::warn!("Using model config vocab_size as fallback (tokenizer not available)");
+                    model_info.vocab_size as usize
+                }
             }; // Lock is dropped here
 
             if next_token >= vocab_size {
                 tracing::warn!(
-                    "Invalid token ID {} sampled (vocab_size={}), skipping",
+                    "Invalid token ID {} sampled (tokenizer vocab_size={}), skipping",
                     next_token,
                     vocab_size
                 );
@@ -1248,14 +1290,22 @@ impl TorchEngine {
                 )?;
 
                 // Validate token is within vocabulary bounds
+                // Use tokenizer's vocabulary size as the authoritative source
                 let vocab_size = {
-                    let model_info = self.handle_poison(self.model_info.lock())?;
-                    model_info.vocab_size as usize
+                    let tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
+                    if let Some(ref tokenizer) = *tokenizer_guard {
+                        tokenizer.get_vocab_size(true)
+                    } else {
+                        // Fallback to model config if tokenizer not available (shouldn't happen)
+                        let model_info = self.handle_poison(self.model_info.lock())?;
+                        tracing::warn!("Using model config vocab_size as fallback (tokenizer not available)");
+                        model_info.vocab_size as usize
+                    }
                 }; // Lock is dropped here
 
                 if next_token >= vocab_size {
                     tracing::warn!(
-                        "Invalid token ID {} sampled (vocab_size={}), skipping",
+                        "Invalid token ID {} sampled (tokenizer vocab_size={}), skipping",
                         next_token,
                         vocab_size
                     );
