@@ -80,16 +80,16 @@ impl CloneOptions {
     /// Convert to legacy git2 options for use within spawn_blocking
     /// This is called inside spawn_blocking where lifetime constraints are satisfied
     pub(crate) fn to_git2_options(&self) -> LegacyCloneOptions<'_> {
-        let mut options = LegacyCloneOptions::default();
-
-        // Copy all the simple fields
-        options.shallow = self.shallow;
-        options.depth = self.depth;
-        options.branch = self.branch.clone();
-        options.refspecs = self.refspecs.clone();
-        options.update_submodules = self.update_submodules;
-        options.proxy_url = self.proxy_url.clone();
-        options.timeout_seconds = self.timeout_seconds;
+        let mut options = LegacyCloneOptions {
+            _shallow: self.shallow,
+            depth: self.depth,
+            branch: self.branch.clone(),
+            _refspecs: self.refspecs.clone(),
+            _update_submodules: self.update_submodules,
+            proxy_url: self.proxy_url.clone(),
+            _timeout_seconds: self.timeout_seconds,
+            ..Default::default()
+        };
 
         // Create callbacks from config if present
         if let Some(ref config) = self.callback_config {
@@ -105,13 +105,13 @@ impl CloneOptions {
 #[derive(Default)]
 pub(crate) struct LegacyCloneOptions<'cb> {
     pub callbacks: Option<RemoteCallbacks<'cb>>,
-    pub shallow: bool,
+    pub _shallow: bool,
     pub depth: Option<i32>,
     pub branch: Option<String>,
-    pub refspecs: Vec<String>,
-    pub update_submodules: bool,
+    pub _refspecs: Vec<String>,
+    pub _update_submodules: bool,
     pub proxy_url: Option<String>,
-    pub timeout_seconds: Option<u32>,
+    pub _timeout_seconds: Option<u32>,
 }
 
 impl<'cb> LegacyCloneOptions<'cb> {

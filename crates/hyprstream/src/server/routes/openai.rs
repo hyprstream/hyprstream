@@ -127,7 +127,7 @@ fn validate_chat_request(
 
     // Validate n (number of completions)
     if let Some(n) = request.n {
-        if n < 1 || n > 10 {
+        if !(1..=10).contains(&n) {
             return Err(format!("n must be between 1 and 10, got {}", n));
         }
     }
@@ -229,7 +229,7 @@ async fn chat_completions(
             } else {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorResponse::internal_error(&e.to_string()),
+                    ErrorResponse::internal_error(e.to_string()),
                 )
             };
 
@@ -501,7 +501,7 @@ async fn stream_chat(state: ServerState, request: ChatCompletionRequest) -> impl
                 } else {
                     // Send data chunk
                     Ok(axum::response::sse::Event::default()
-                        .data(format!("{}", serde_json::to_string(&json).unwrap())))
+                        .data(&serde_json::to_string(&json).unwrap()))
                 }
             }
             Err(e) => {

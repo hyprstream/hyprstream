@@ -266,7 +266,7 @@ impl TransactionHandle {
         // Validate repository exists in snapshot
         if !state.snapshot.repositories.contains_key(&id.0) {
             return Err(Git2DBError::invalid_repository(
-                &id.to_string(),
+                id.to_string(),
                 "Repository not found",
             ));
         }
@@ -289,7 +289,7 @@ impl TransactionHandle {
         // Validate repository exists in snapshot
         if !state.snapshot.repositories.contains_key(&id.0) {
             return Err(Git2DBError::invalid_repository(
-                &id.to_string(),
+                id.to_string(),
                 "Repository not found",
             ));
         }

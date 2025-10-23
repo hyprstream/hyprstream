@@ -210,6 +210,12 @@ pub struct ScalingManager {
     fp8_scaler: std::sync::Arc<FP8Scaler>,
 }
 
+impl Default for ScalingManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ScalingManager {
     pub fn new() -> Self {
         Self {

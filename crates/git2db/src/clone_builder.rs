@@ -132,90 +132,136 @@ impl<'a> CloneBuilder<'a> {
         // Generate repository ID
         let repo_id = RepoId::new();
 
-        // Determine target path
-        let target_path = if let Some(name) = &self.name {
-            self.registry.base_dir().join(name)
-        } else {
-            self.registry.base_dir().join(repo_id.to_string())
-        };
+        // Determine repository name
+        let repo_name = self
+            .name
+            .clone()
+            .unwrap_or_else(|| repo_id.to_string());
+
+        // Validate repository name for security
+        validate_repo_name(&repo_name)?;
+
+        // Build paths using safe_path to prevent traversal
+        let models_dir = self.registry.base_dir();
+
+        // models/{name}/
+        let repo_dir = safe_path::scoped_join(models_dir, &repo_name)
+            .map_err(|e| Git2DBError::configuration(format!("Invalid repository name: {}", e)))?;
 
         // Validate target doesn't exist
-        if target_path.exists() {
+        if repo_dir.exists() {
             return Err(Git2DBError::configuration(format!(
-                "Target path already exists: {}",
-                target_path.display()
+                "Target directory already exists: {}",
+                repo_dir.display()
             )));
         }
 
-        // Perform the clone using GitManager
-        let manager = crate::manager::GitManager::global();
+        // Create directory structure first
+        std::fs::create_dir_all(&repo_dir).map_err(|e| {
+            Git2DBError::repository(&repo_dir, format!("Failed to create repo directory: {}", e))
+        })?;
 
-        // Start with default options (includes auth callbacks)
-        let mut options = manager.default_clone_options();
+        // Now we can safely join paths since repo_dir exists
+        // models/{name}/{name}.git/ (bare repo)
+        let bare_repo_name = format!("{}.git", &repo_name);
+        let bare_repo_path = safe_path::scoped_join(&repo_dir, &bare_repo_name)
+            .map_err(|e| Git2DBError::configuration(format!("Invalid bare repo path: {}", e)))?;
 
-        // Override with builder-specific settings
-        if let Some(depth) = self.depth {
-            options.shallow = true;
-            options.depth = Some(depth as i32);
-        }
+        // models/{name}/worktrees/
+        let worktrees_dir = safe_path::scoped_join(&repo_dir, "worktrees")
+            .map_err(|e| Git2DBError::configuration(format!("Invalid worktrees path: {}", e)))?;
 
-        // Set branch for initial checkout if specified
-        if let GitRef::Branch(ref branch_name) = self.reference {
-            options.branch = Some(branch_name.clone());
-        }
+        std::fs::create_dir_all(&worktrees_dir).map_err(|e| {
+            Git2DBError::repository(&worktrees_dir, format!("Failed to create worktrees directory: {}", e))
+        })?;
 
-        // Clone the repository
-        let repo = manager
-            .clone_repository(&self.url, &target_path, Some(options))
-            .await
-            .map_err(|e| {
-                Git2DBError::repository(&target_path, format!("Failed to clone repository: {}", e))
-            })?;
+        // Perform the clone using git2 directly for bare repos
+        tracing::info!("Cloning repository '{}' as bare to {:?}", repo_name, bare_repo_path);
 
-        // Checkout the specified reference if not default
-        if !matches!(self.reference, GitRef::DefaultBranch) {
-            let reference_str = match &self.reference {
-                GitRef::Branch(b) => b.clone(),
-                GitRef::Tag(t) => t.clone(),
-                GitRef::Commit(oid) => oid.to_string(),
-                GitRef::Revspec(spec) => spec.clone(),
-                GitRef::DefaultBranch => unreachable!(),
-            };
+        // Clone as bare repository using git2 directly
+        let url_clone = self.url.clone();
+        let bare_path_clone = bare_repo_path.clone();
 
-            // Use libgit2 to checkout
-            let obj = repo.revparse_single(&reference_str).map_err(|e| {
-                Git2DBError::reference(&reference_str, format!("Failed to resolve: {}", e))
-            })?;
+        let bare_repo = tokio::task::spawn_blocking(move || -> Git2DBResult<git2::Repository> {
+            let mut builder = git2::build::RepoBuilder::new();
 
-            repo.checkout_tree(&obj, None)
-                .map_err(|e| Git2DBError::internal(format!("Failed to checkout tree: {}", e)))?;
+            // Set up bare clone
+            builder.bare(true);
 
-            // Update HEAD
-            match &self.reference {
-                GitRef::Branch(branch) => {
-                    repo.set_head(&format!("refs/heads/{}", branch))
-                        .map_err(|e| {
-                            Git2DBError::internal(format!("Failed to update HEAD: {}", e))
-                        })?;
-                }
-                _ => {
-                    repo.set_head_detached(obj.id()).map_err(|e| {
-                        Git2DBError::internal(format!("Failed to detach HEAD: {}", e))
-                    })?;
-                }
-            }
-        }
+            // TODO: Add authentication callbacks from GitManager if needed
 
-        // Add additional remotes
+            // Perform the clone
+            let repo = builder.clone(&url_clone, &bare_path_clone)
+                .map_err(|e| Git2DBError::repository(
+                    &bare_path_clone,
+                    format!("Failed to clone bare repository: {}", e)
+                ))?;
+
+            Ok(repo)
+        })
+        .await
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))??;
+
+        // Add additional remotes to bare repo
         for (remote_name, remote_url) in &self.remotes {
-            repo.remote(remote_name, remote_url).map_err(|e| {
+            bare_repo.remote(remote_name, remote_url).map_err(|e| {
                 Git2DBError::configuration(format!("Failed to add remote '{}': {}", remote_name, e))
             })?;
         }
 
-        // Fetch LFS files if the repository uses LFS
-        // Since XET is disabled, fallback to standard Git LFS
-        Self::fetch_lfs_files(&target_path).await?;
+        // Get the default branch from bare repo
+        let default_branch = get_default_branch(&bare_repo)?;
+        tracing::debug!("Default branch detected: {}", default_branch);
+
+        // Create initial worktree for the default branch
+        let initial_worktree = safe_path::scoped_join(&worktrees_dir, &default_branch)
+            .map_err(|e| Git2DBError::configuration(format!("Invalid worktree path: {}", e)))?;
+
+        // Create parent directories if default branch has hierarchy
+        if let Some(parent) = initial_worktree.parent() {
+            if parent != worktrees_dir {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    Git2DBError::configuration(format!("Failed to create worktree parent directories: {}", e))
+                })?;
+            }
+        }
+
+        tracing::info!("Creating default worktree '{}' at {:?}", default_branch, initial_worktree);
+
+        // Create worktree from bare repo
+        create_worktree(&bare_repo_path, &initial_worktree, &default_branch).await?;
+
+        // If a specific reference was requested and it's different from default, create another worktree
+        let checkout_ref = match &self.reference {
+            GitRef::DefaultBranch => default_branch.clone(),
+            GitRef::Branch(b) => b.clone(),
+            GitRef::Tag(t) => t.clone(),
+            GitRef::Commit(oid) => oid.to_string(),
+            GitRef::Revspec(spec) => spec.clone(),
+        };
+
+        if checkout_ref != default_branch && !matches!(self.reference, GitRef::DefaultBranch) {
+            // Create additional worktree for the requested reference
+            let ref_worktree_path = safe_path::scoped_join(&worktrees_dir, &checkout_ref)
+                .map_err(|e| Git2DBError::configuration(format!("Invalid worktree path: {}", e)))?;
+
+            // Create parent directories for hierarchical branches
+            if let Some(parent) = ref_worktree_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    Git2DBError::configuration(format!("Failed to create worktree parent directories: {}", e))
+                })?;
+            }
+
+            tracing::info!("Creating worktree for ref '{}'", checkout_ref);
+            create_worktree(&bare_repo_path, &ref_worktree_path, &checkout_ref).await?;
+        }
+
+        // Fetch LFS files if the repository uses LFS (in default worktree)
+        // This is optional - if it fails, we'll just log a warning
+        if let Err(e) = Self::fetch_lfs_files(&initial_worktree).await {
+            tracing::warn!("Failed to fetch LFS files: {}. You may need to run 'git lfs pull' manually.", e);
+            // Don't fail the entire clone operation just because LFS pull failed
+        }
 
         // Build remote configs (origin + additional)
         let mut remote_configs = vec![RemoteConfig {
@@ -232,13 +278,13 @@ impl<'a> CloneBuilder<'a> {
             });
         }
 
-        // Register in Git2DB with full configuration
+        // Register in Git2DB with full configuration (registry tracks the bare repo)
         self.registry
             .register_repository_internal(
                 repo_id.clone(),
                 self.name.clone(),
                 self.url,
-                target_path,
+                bare_repo_path, // Registry tracks bare repo, not worktree
                 self.reference,
                 remote_configs,
                 std::collections::HashMap::new(), // No metadata for cloned repos by default
@@ -271,28 +317,97 @@ impl<'a> CloneBuilder<'a> {
             return Ok(());
         }
 
-        tracing::info!("Repository uses Git LFS, fetching LFS files...");
+        tracing::info!("Repository uses Git LFS, fetching LFS files (this may take a while for large files)...");
+        println!("📥 Downloading LFS files... (this may take a while for large models)");
 
-        // Run git lfs pull
-        let output = Command::new("git")
-            .args(&["lfs", "pull"])
+        // Run git lfs pull - it shows progress by default when stdout is a TTY
+        let mut child = Command::new("git")
+            .args(["lfs", "pull"])
             .current_dir(repo_path)
-            .output()
-            .await
+            .stdout(std::process::Stdio::inherit())  // Show progress to user
+            .stderr(std::process::Stdio::inherit())  // Show errors to user
+            .spawn()
             .map_err(|e| Git2DBError::internal(format!("Failed to run 'git lfs pull': {}", e)))?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::warn!("git lfs pull failed: {}", stderr);
+        let status = child.wait().await
+            .map_err(|e| Git2DBError::internal(format!("Failed to wait for 'git lfs pull': {}", e)))?;
+
+        if !status.success() {
+            tracing::warn!("git lfs pull failed with exit code: {:?}", status.code());
             return Err(Git2DBError::internal(format!(
-                "git lfs pull failed: {}",
-                stderr
+                "git lfs pull failed with exit code: {:?}",
+                status.code()
             )));
         }
 
         tracing::info!("Successfully fetched LFS files");
         Ok(())
     }
+}
+
+/// Validate repository name to prevent path traversal
+fn validate_repo_name(name: &str) -> Git2DBResult<()> {
+    // Check for empty name
+    if name.is_empty() {
+        return Err(Git2DBError::configuration("Repository name cannot be empty"));
+    }
+
+    // Check for path separators and parent directory references
+    if name.contains('/') || name.contains("..") {
+        return Err(Git2DBError::configuration("Repository name cannot contain path separators or parent references"));
+    }
+
+    Ok(())
+}
+
+/// Get the default branch from a bare repository
+fn get_default_branch(repo: &git2::Repository) -> Git2DBResult<String> {
+    // Try to get from HEAD
+    if let Ok(head) = repo.head() {
+        if let Some(name) = head.shorthand() {
+            return Ok(name.to_string());
+        }
+    }
+
+    // Try to get from remote HEAD
+    if let Ok(remote) = repo.find_remote("origin") {
+        if let Ok(buf) = remote.default_branch() {
+            if let Some(s) = buf.as_str() {
+                // Remove refs/heads/ prefix
+                let branch = s.strip_prefix("refs/heads/").unwrap_or(s);
+                return Ok(branch.to_string());
+            }
+        }
+    }
+
+    // Fallback to common defaults
+    for default in &["main", "master"] {
+        if repo.find_branch(default, git2::BranchType::Local).is_ok() {
+            return Ok(default.to_string());
+        }
+    }
+
+    // Last resort
+    Ok("main".to_string())
+}
+
+/// Create a worktree from a bare repository
+async fn create_worktree(bare_repo_path: &std::path::PathBuf, worktree_path: &std::path::PathBuf, branch: &str) -> Git2DBResult<()> {
+    // Use git2db's GitManager for worktree creation
+    let manager = crate::manager::GitManager::global();
+
+    manager
+        .create_worktree(bare_repo_path, worktree_path, branch)
+        .await
+        .map_err(|e| {
+            Git2DBError::repository(
+                worktree_path,
+                format!("Failed to create worktree for branch '{}': {}", branch, e)
+            )
+        })?;
+
+    tracing::info!("Created worktree at {:?} for branch '{}'", worktree_path, branch);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -310,5 +425,31 @@ mod tests {
                 .remote("backup", "https://backup.com/repo.git")
                 .depth(1);
         }
+    }
+
+    #[test]
+    fn test_validate_repo_name() {
+        // Valid names
+        assert!(validate_repo_name("my-repo").is_ok());
+        assert!(validate_repo_name("repo_123").is_ok());
+        assert!(validate_repo_name("MyRepo").is_ok());
+        assert!(validate_repo_name(".hidden").is_ok()); // Hidden files are fine on Linux
+
+        // Invalid names - only path traversal concerns
+        assert!(validate_repo_name("").is_err());
+        assert!(validate_repo_name("my/repo").is_err());
+        assert!(validate_repo_name("../etc").is_err());
+        assert!(validate_repo_name("repo..name").is_err());
+    }
+
+    #[test]
+    fn test_branch_hierarchy_preserved() {
+        // Git already validates branch names, so we preserve the hierarchy
+        assert_eq!(get_worktree_branch_path("main"), "main");
+        assert_eq!(get_worktree_branch_path("feature/new-ui"), "feature/new-ui");
+        assert_eq!(get_worktree_branch_path("bugfix/issue-123"), "bugfix/issue-123");
+
+        // Git wouldn't allow these anyway, but we just pass through
+        assert_eq!(get_worktree_branch_path("some-branch"), "some-branch");
     }
 }

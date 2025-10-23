@@ -406,7 +406,7 @@ impl Git2DB {
         let repo_path = self.base_dir.join(repo_id.0.to_string());
         if !repo_path.exists() {
             return Err(Git2DBError::invalid_repository(
-                &repo_id.to_string(),
+                repo_id.to_string(),
                 "Repository directory does not exist",
             ));
         }
@@ -429,7 +429,7 @@ impl Git2DB {
             )
             .map_err(|e| {
                 Git2DBError::submodule(
-                    &repo_id.to_string(),
+                    repo_id.to_string(),
                     format!("Failed to add submodule: {}", e),
                 )
             })?;
@@ -485,7 +485,7 @@ impl Git2DB {
         // Verify path exists
         if !worktree_path.exists() {
             return Err(Git2DBError::invalid_repository(
-                &repo_id.to_string(),
+                repo_id.to_string(),
                 "Repository directory does not exist",
             ));
         }
@@ -512,7 +512,7 @@ impl Git2DB {
             )
             .map_err(|e| {
                 Git2DBError::submodule(
-                    &repo_id.to_string(),
+                    repo_id.to_string(),
                     format!("Failed to add submodule: {}", e),
                 )
             })?;
@@ -569,7 +569,7 @@ impl Git2DB {
         let repo_info = self
             .get_by_id(id)
             .ok_or_else(|| {
-                Git2DBError::invalid_repository(&id.to_string(), "Repository not found")
+                Git2DBError::invalid_repository(id.to_string(), "Repository not found")
             })?
             .clone();
 
@@ -764,7 +764,7 @@ impl Git2DB {
     ) -> Git2DBResult<()> {
         // Get mutable reference to repository metadata
         let repo = self.metadata.repositories.get_mut(&id.0).ok_or_else(|| {
-            Git2DBError::invalid_repository(&id.to_string(), "Repository not found")
+            Git2DBError::invalid_repository(id.to_string(), "Repository not found")
         })?;
 
         // Update URL if provided
@@ -876,7 +876,7 @@ impl Git2DB {
     pub fn repo(&self, id: &RepoId) -> Git2DBResult<RepositoryHandle<'_>> {
         if self.get_by_id(id).is_none() {
             return Err(Git2DBError::invalid_repository(
-                &id.to_string(),
+                id.to_string(),
                 "Repository not found",
             ));
         }

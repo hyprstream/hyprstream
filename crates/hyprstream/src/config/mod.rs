@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 /// Unified configuration for the Hyprstream system
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct HyprConfig {
     /// HTTP server configuration
     #[serde(default)]
@@ -204,19 +205,6 @@ impl Default for LoRAConfig {
     }
 }
 
-impl Default for HyprConfig {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            model: ModelConfig::default(),
-            runtime: RuntimeConfig::default(),
-            generation: GenerationConfig::default(),
-            lora: LoRAConfig::default(),
-            storage: StorageConfig::default(),
-            git2db: git2db::config::Git2DBConfig::default(),
-        }
-    }
-}
 
 /// Builder for Hyprstream configuration
 pub struct HyprConfigBuilder {

@@ -90,6 +90,12 @@ pub struct FP8Scaler {
     margin: f32,
 }
 
+impl Default for FP8Scaler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FP8Scaler {
     /// Create new FP8 scaler with default settings
     pub fn new() -> Self {
@@ -163,7 +169,7 @@ impl FP8Scaler {
         }
 
         // Update scales periodically
-        if *counter % self.update_frequency == 0 {
+        if (*counter).is_multiple_of(self.update_frequency) {
             // Forward scale update (more stable)
             {
                 let mut scale = self.forward_scale.write();
@@ -361,7 +367,7 @@ impl FP8Engine {
 
         // Apply LoRA if present
         if let Some(lora_weights) = &self.lora_weights {
-            let lora_output = self.apply_lora(&input, lora_weights)?;
+            let lora_output = self.apply_lora(input, lora_weights)?;
             output = &output + &lora_output;
         }
 

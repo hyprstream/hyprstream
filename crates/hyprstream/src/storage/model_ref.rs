@@ -63,13 +63,6 @@ impl ModelRef {
         Ok(ModelRef { model, git_ref })
     }
 
-    /// Convert to string representation
-    pub fn to_string(&self) -> String {
-        match &self.git_ref {
-            GitRef::DefaultBranch => self.model.clone(),
-            _ => format!("{}:{}", self.model, self.git_ref.display_name()),
-        }
-    }
 
     /// Get the git reference as an option string (for compatibility)
     pub fn git_ref_str(&self) -> Option<String> {
@@ -84,7 +77,10 @@ impl ModelRef {
 
 impl fmt::Display for ModelRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.to_string())
+        match &self.git_ref {
+            GitRef::DefaultBranch => write!(f, "{}", self.model),
+            _ => write!(f, "{}:{}", self.model, self.git_ref.display_name()),
+        }
     }
 }
 

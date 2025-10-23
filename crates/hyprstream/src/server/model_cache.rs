@@ -1,6 +1,6 @@
 //! Git-native model cache using commit SHA for consistency
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use git2;
 use git2db::{Git2DBConfig as GitConfig, GitManager};
 use lru::LruCache;
@@ -33,9 +33,7 @@ pub struct ModelCache {
     cache: Arc<Mutex<LruCache<git2db::Oid, CachedModel>>>,
     /// Registry for resolving model references
     registry: Arc<ModelStorage>,
-    /// Sparse checkouts directory
-    checkout_base: PathBuf,
-    /// Reuse checkouts for same commit
+    /// Cache of worktree paths for specific commits
     checkouts: Arc<RwLock<HashMap<git2db::Oid, PathBuf>>>,
     /// Maximum cache size
     max_size: usize,
@@ -48,30 +46,24 @@ impl ModelCache {
     pub fn new(
         max_size: usize,
         registry: Arc<ModelStorage>,
-        checkout_base: PathBuf,
     ) -> Result<Self> {
-        Self::new_with_config(max_size, registry, checkout_base, GitConfig::default())
+        Self::new_with_config(max_size, registry, GitConfig::default())
     }
 
     /// Create a new model cache with custom Git configuration
     pub fn new_with_config(
         max_size: usize,
         registry: Arc<ModelStorage>,
-        checkout_base: PathBuf,
         git_config: GitConfig,
     ) -> Result<Self> {
         let cache_size =
             NonZeroUsize::new(max_size).unwrap_or_else(|| NonZeroUsize::new(5).unwrap());
-
-        // Ensure checkout directory exists
-        std::fs::create_dir_all(&checkout_base)?;
 
         let git_manager = Arc::new(GitManager::new(git_config));
 
         Ok(Self {
             cache: Arc::new(Mutex::new(LruCache::new(cache_size))),
             registry,
-            checkout_base,
             checkouts: Arc::new(RwLock::new(HashMap::new())),
             max_size,
             git_manager,
@@ -162,57 +154,80 @@ impl ModelCache {
     }
 
     /// Get or create a checkout for a specific commit
+    ///
+    /// Uses git2db's worktree management to find the appropriate worktree
     async fn get_or_create_checkout(
         &self,
         model_ref: &ModelRef,
         commit_id: git2db::Oid,
     ) -> Result<PathBuf> {
-        // Check if we already have this checkout
+        // Check if we already have this path cached
         {
             let checkouts = self.checkouts.read().await;
             if let Some(path) = checkouts.get(&commit_id) {
-                debug!("Reusing existing checkout at {:?}", path);
+                debug!("Reusing cached worktree path at {:?}", path);
                 return Ok(path.clone());
             }
         }
 
-        // Create worktree checkout for this commit
-        let checkout_dir = self.checkout_base.join(format_oid(&commit_id));
+        // Get the branch that contains this commit (usually main/master)
+        // For now, we'll use the default branch worktree
+        // TODO: In the future, we could check which branch contains this commit
+        let default_branch = self.registry.get_default_branch(model_ref).await?;
+        let worktree_path = self.registry.get_worktree_path(model_ref, &default_branch).await?;
 
-        if !checkout_dir.exists() {
-            info!("Creating worktree checkout at {:?}", checkout_dir);
+        if !worktree_path.exists() {
+            // Try to get the model path (which might be the default worktree)
+            let model_path = self.registry.get_model_path(model_ref).await
+                .unwrap_or_else(|_| worktree_path.clone());
 
-            // Get model path from registry
-            let model_path = self.registry.get_model_path(&model_ref).await?;
+            if !model_path.exists() {
+                warn!(
+                    "Worktree not found for model {} at {:?} or {:?}",
+                    model_ref.model,
+                    worktree_path,
+                    model_path
+                );
+                return Err(anyhow::anyhow!(
+                    "Model worktree not found for {}. \
+                    Please ensure the model is properly cloned with 'hyprstream clone'.",
+                    model_ref.model
+                ));
+            }
 
-            // Create worktree for specific commit using storage drivers
-            // This automatically applies CoW optimization (overlay2 on Linux, vfs elsewhere)
-            let model_path_clone = model_path.clone();
-            let checkout_dir_clone = checkout_dir.clone();
-            let commit_sha = commit_id.to_string();
-
-            // Use git2db's unified ref API - supports commits, branches, tags, etc.
-            GitManager::global()
-                .create_worktree(&model_path_clone, &checkout_dir_clone, &commit_sha)
-                .await
-                .context("Failed to create worktree for commit")?;
-
-            debug!(
-                "Created worktree for commit {} with storage driver",
-                commit_id
-            );
+            // Use the model path if it exists
+            debug!("Using model path at {:?}", model_path);
+            return Ok(model_path);
         }
 
-        // LFS/XET files automatically smudged by git-xet-filter during worktree creation
-        debug!("Worktree ready at {:?}", checkout_dir);
+        // Worktree exists, verify it's valid
+        debug!("Using existing worktree at {:?}", worktree_path);
 
-        // Cache the checkout path
+        // Verify the worktree contains expected model files
+        let model_file_checks = [
+            "config.json",
+            "model.safetensors",
+            "pytorch_model.bin",
+            "model.bin",
+        ];
+
+        let has_model = model_file_checks.iter().any(|f| worktree_path.join(f).exists());
+
+        if !has_model {
+            return Err(anyhow::anyhow!(
+                "Worktree at {:?} does not contain valid model files. \
+                Please ensure the model was properly cloned.",
+                worktree_path
+            ));
+        }
+
+        // Cache the worktree path for this commit
         {
             let mut checkouts = self.checkouts.write().await;
-            checkouts.insert(commit_id, checkout_dir.clone());
+            checkouts.insert(commit_id, worktree_path.clone());
         }
 
-        Ok(checkout_dir)
+        Ok(worktree_path)
     }
 
     /// Check if a model is cached by name
@@ -250,12 +265,8 @@ impl ModelCache {
         let mut checkouts = self.checkouts.write().await;
         checkouts.clear();
 
-        // Clean up checkout directory
-        if let Ok(entries) = std::fs::read_dir(&self.checkout_base) {
-            for entry in entries.flatten() {
-                let _ = std::fs::remove_dir_all(entry.path());
-            }
-        }
+        // Note: Worktrees are now managed by git2db and cleaned up through
+        // its mechanisms. We only clear the checkout tracking here.
 
         info!("Model cache cleared");
     }
@@ -271,9 +282,8 @@ impl ModelCache {
 
         // Get all model paths that have worktrees to clean
         let mut model_paths = std::collections::HashSet::new();
-        if let Ok(entries) =
-            std::fs::read_dir(&self.checkout_base.parent().unwrap_or(&self.checkout_base))
-        {
+        let models_dir = self.registry.get_models_dir();
+        if let Ok(entries) = std::fs::read_dir(&models_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() && path.join(".git").exists() {

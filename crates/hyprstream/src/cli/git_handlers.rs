@@ -234,7 +234,7 @@ pub async fn handle_lora_train(
 
     println!(
         "Starting LoRA adapter initialization for {}",
-        model_ref.to_string()
+        model_ref
     );
     println!(
         "Current branch: {}",
@@ -774,7 +774,7 @@ pub async fn handle_infer(
             }
         }
     } else {
-        SamplingConfig::for_model(&model_ref_str)
+        SamplingConfig::for_model(model_ref_str)
     };
 
     // Initialize inference engine
@@ -995,7 +995,7 @@ pub async fn handle_infer(
 
     if stream {
         // Stream tokens as they're generated
-        print!("\n");
+        println!();
         let result = engine
             .generate_streaming_with_params(
                 &request.prompt,

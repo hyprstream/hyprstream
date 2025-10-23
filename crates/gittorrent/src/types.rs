@@ -138,35 +138,18 @@ impl GitTorrentUrl {
             let (server, repo) = main_part.split_at(slash_pos);
             let repo = &repo[1..]; // Remove leading slash
 
-            return Ok(GitTorrentUrl::GitServer {
+            Ok(GitTorrentUrl::GitServer {
                 server: server.to_string(),
                 repo: repo.to_string(),
-            });
+            })
         } else {
             // No slash, assume it's a username
-            return Ok(GitTorrentUrl::Username {
+            Ok(GitTorrentUrl::Username {
                 username: main_part.to_string(),
-            });
+            })
         }
     }
 
-    /// Convert back to URL string
-    pub fn to_string(&self) -> String {
-        match self {
-            GitTorrentUrl::Commit { hash } => {
-                format!("gittorrent://{}", hash)
-            }
-            GitTorrentUrl::CommitWithRefs { hash } => {
-                format!("gittorrent://{}?refs", hash)
-            }
-            GitTorrentUrl::GitServer { server, repo } => {
-                format!("gittorrent://{}/{}", server, repo)
-            }
-            GitTorrentUrl::Username { username } => {
-                format!("gittorrent://{}", username)
-            }
-        }
-    }
 
     /// Get the commit hash if this is a commit-based URL
     pub fn commit_hash(&self) -> Option<&Sha256Hash> {
@@ -182,6 +165,24 @@ impl GitTorrentUrl {
     }
 }
 
+impl std::fmt::Display for GitTorrentUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GitTorrentUrl::Commit { hash } => {
+                write!(f, "gittorrent://{}", hash)
+            }
+            GitTorrentUrl::CommitWithRefs { hash } => {
+                write!(f, "gittorrent://{}?refs", hash)
+            }
+            GitTorrentUrl::GitServer { server, repo } => {
+                write!(f, "gittorrent://{}/{}", server, repo)
+            }
+            GitTorrentUrl::Username { username } => {
+                write!(f, "gittorrent://{}", username)
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

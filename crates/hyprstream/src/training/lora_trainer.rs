@@ -127,7 +127,7 @@ impl LoRATrainer {
 
             let batches = data_loader.formatted_batches(self.config.batch_size);
 
-            for (_batch_idx, batch_result) in batches.enumerate() {
+            for batch_result in batches {
                 let batch = batch_result?;
 
                 // Simple training step simulation

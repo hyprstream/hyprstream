@@ -308,7 +308,7 @@ impl LoRATrainer {
         forward_fn: impl Fn(&Tensor, Option<&Tensor>, bool) -> Result<Tensor>,
     ) -> Result<f64> {
         // Disable gradients for evaluation
-        let _no_grad = tch::no_grad(|| {});
+        tch::no_grad(|| {});
 
         // Forward pass without dropout
         let logits = forward_fn(input_ids, None, false)?;

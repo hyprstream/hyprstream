@@ -110,6 +110,12 @@ pub struct TrainingStats {
     pub total_training_time_ms: u64,
 }
 
+impl Default for TrainingService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TrainingService {
     /// Create new training service
     pub fn new() -> Self {
@@ -242,7 +248,7 @@ impl TrainingService {
         );
 
         // TODO: Implement actual training logic
-        return Err(anyhow::anyhow!("Training not available"));
+        Err(anyhow::anyhow!("Training not available"))
     }
 
     /// Get training status for a LoRA

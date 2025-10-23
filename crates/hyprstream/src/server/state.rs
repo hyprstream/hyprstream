@@ -90,15 +90,10 @@ impl ServerState {
         // Initialize training service
         let training_service = Arc::new(TrainingService::new());
 
-        // Initialize model cache
-        let checkout_base = models_dir.join("checkouts");
-        std::fs::create_dir_all(&checkout_base)?;
-
-        // Pass model_storage directly to ModelCache
+        // Initialize model cache using git2db's worktree management
         let model_cache = Arc::new(ModelCache::new(
             config.max_cached_models,
             model_storage.clone(),
-            checkout_base,
         )?);
 
         // Preload models for faster first request

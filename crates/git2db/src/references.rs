@@ -159,7 +159,7 @@ impl IntoGitRef for &str {
 
 impl IntoGitRef for String {
     fn into_git_ref(self) -> GitRef {
-        GitRef::parse(&self).unwrap_or_else(|_| GitRef::Revspec(self))
+        GitRef::parse(&self).unwrap_or(GitRef::Revspec(self))
     }
 }
 
@@ -199,6 +199,12 @@ pub struct ReferenceResolver {
 struct CachedReference {
     oid: Oid,
     cached_at: std::time::Instant,
+}
+
+impl Default for ReferenceResolver {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ReferenceResolver {
@@ -284,7 +290,7 @@ impl ReferenceResolver {
                 GitRef::DefaultBranch => match repo.head() {
                     Ok(head_ref) => {
                         let name = head_ref.shorthand().unwrap_or("HEAD").to_string();
-                        let target = head_ref.target().unwrap_or_else(|| Oid::zero());
+                        let target = head_ref.target().unwrap_or_else(Oid::zero);
                         let ref_type = head_ref.kind().unwrap_or(git2::ReferenceType::Direct);
                         Ok(Some(ReferenceInfo {
                             name,
@@ -300,7 +306,7 @@ impl ReferenceResolver {
                     let ref_name = format!("refs/heads/{}", branch_name);
                     match repo.find_reference(&ref_name) {
                         Ok(reference) => {
-                            let target = reference.target().unwrap_or_else(|| Oid::zero());
+                            let target = reference.target().unwrap_or_else(Oid::zero);
                             let ref_type = reference.kind().unwrap_or(git2::ReferenceType::Direct);
 
                             // Check if this is the current HEAD
@@ -324,7 +330,7 @@ impl ReferenceResolver {
                     let ref_name = format!("refs/tags/{}", tag_name);
                     match repo.find_reference(&ref_name) {
                         Ok(reference) => {
-                            let target = reference.target().unwrap_or_else(|| Oid::zero());
+                            let target = reference.target().unwrap_or_else(Oid::zero);
                             let ref_type = reference.kind().unwrap_or(git2::ReferenceType::Direct);
                             Ok(Some(ReferenceInfo {
                                 name: tag_name.clone(),
@@ -372,7 +378,7 @@ impl ReferenceResolver {
                 })?;
 
                 if let Some(name) = reference.shorthand() {
-                    let target = reference.target().unwrap_or_else(|| Oid::zero());
+                    let target = reference.target().unwrap_or_else(Oid::zero);
                     let ref_type = reference.kind().unwrap_or(git2::ReferenceType::Direct);
 
                     // Check if this is the current HEAD
@@ -464,7 +470,7 @@ fn resolve_in_repo(repo: &Repository, git_ref: &GitRef) -> Git2DBResult<Oid> {
         GitRef::Commit(oid) => {
             // Verify the commit exists
             repo.find_commit(*oid).map(|_| *oid).map_err(|e| {
-                Git2DBError::reference(&oid.to_string(), format!("Commit not found: {}", e))
+                Git2DBError::reference(oid.to_string(), format!("Commit not found: {}", e))
             })
         }
 

@@ -107,7 +107,7 @@ impl GpuSampler {
 
                 // Update tensor (this creates a small GPU operation per token)
                 let penalty_tensor = Tensor::from(new_logit).to_device(self.device);
-                let _ = penalized_logits
+                penalized_logits
                     .narrow(0, token_id as i64, 1)
                     .copy_(&penalty_tensor);
             }
@@ -139,7 +139,7 @@ impl GpuSampler {
         let (top_values, top_indices) = probs.topk(k as i64, -1, true, true);
 
         // Create mask for top-k positions
-        let mut filtered_probs = Tensor::zeros(&[vocab_size as i64], (probs.kind(), self.device));
+        let mut filtered_probs = Tensor::zeros([vocab_size as i64], (probs.kind(), self.device));
 
         // Set top-k probabilities
         let _ = filtered_probs.index_put_(&[Some(top_indices)], &top_values, false);

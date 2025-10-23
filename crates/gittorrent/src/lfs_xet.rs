@@ -55,17 +55,20 @@ impl LfsPointer {
         Ok(LfsPointer { version, oid, size })
     }
 
-    /// Convert to text format
-    pub fn to_string(&self) -> String {
-        format!(
-            "version {}\noid sha256:{}\nsize {}\n",
-            self.version, self.oid, self.size
-        )
-    }
 
     /// Check if content looks like an LFS pointer
     pub fn is_lfs_pointer(content: &str) -> bool {
         content.starts_with("version https://git-lfs.github.com/spec/v1")
+    }
+}
+
+impl std::fmt::Display for LfsPointer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "version {}\noid sha256:{}\nsize {}\n",
+            self.version, self.oid, self.size
+        )
     }
 }
 

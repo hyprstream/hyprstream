@@ -268,6 +268,12 @@ pub struct CallbackConfigBuilder {
     config: CallbackConfig,
 }
 
+impl Default for CallbackConfigBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CallbackConfigBuilder {
     /// Create a new builder
     pub fn new() -> Self {

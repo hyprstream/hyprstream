@@ -96,21 +96,18 @@ async fn get_model_info(
     // Parse model reference
     use crate::storage::model_ref::ModelRef;
     if let Ok(model_ref) = ModelRef::parse(&id) {
-        match state.model_storage.get_model_path(&model_ref).await {
-            Ok(_path) => {
-                // Create metadata for the found model
-                let metadata = crate::storage::ModelMetadata {
-                    name: model_ref.model.clone(),
-                    display_name: Some(id.clone()),
-                    model_type: "language_model".to_string(),
-                    created_at: chrono::Utc::now().timestamp(),
-                    updated_at: chrono::Utc::now().timestamp(),
-                    size_bytes: None,
-                    tags: vec![],
-                };
-                return Json(metadata).into_response();
-            }
-            Err(_) => {}
+        if let Ok(_path) = state.model_storage.get_model_path(&model_ref).await {
+            // Create metadata for the found model
+            let metadata = crate::storage::ModelMetadata {
+                name: model_ref.model.clone(),
+                display_name: Some(id.clone()),
+                model_type: "language_model".to_string(),
+                created_at: chrono::Utc::now().timestamp(),
+                updated_at: chrono::Utc::now().timestamp(),
+                size_bytes: None,
+                tags: vec![],
+            };
+            return Json(metadata).into_response();
         }
     }
 

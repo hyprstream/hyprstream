@@ -20,6 +20,7 @@ use crate::worktree::overlay::{select_best_backend, OverlayBackend};
 
 /// Configuration for overlay2 driver
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct Overlay2Config {
     /// Force a specific backend (fuse, userns, kernel)
     pub force_backend: Option<String>,
@@ -28,14 +29,6 @@ pub struct Overlay2Config {
     pub overlay_dir: Option<PathBuf>,
 }
 
-impl Default for Overlay2Config {
-    fn default() -> Self {
-        Self {
-            force_backend: None,
-            overlay_dir: None,
-        }
-    }
-}
 
 /// Overlay2 storage driver
 ///
@@ -139,7 +132,7 @@ impl Driver for Overlay2Driver {
         // Generate unique ID
         let id = format!("git2db-{}", uuid::Uuid::new_v4());
 
-        // Create overlay directories
+        // Create overlay directories in a separate location
         let overlay_base = opts
             .worktree_path
             .parent()
@@ -154,6 +147,8 @@ impl Driver for Overlay2Driver {
 
         let upper_dir = overlay_base.join("upper");
         let work_dir = overlay_base.join("work");
+        // Use a separate mount point for overlayfs, not the worktree path
+        let mount_dir = overlay_base.join("mount");
 
         tokio::fs::create_dir_all(&upper_dir).await.map_err(|e| {
             Git2DBError::internal(format!("Failed to create upper directory: {}", e))
@@ -161,7 +156,7 @@ impl Driver for Overlay2Driver {
         tokio::fs::create_dir_all(&work_dir).await.map_err(|e| {
             Git2DBError::internal(format!("Failed to create work directory: {}", e))
         })?;
-        tokio::fs::create_dir_all(&opts.worktree_path)
+        tokio::fs::create_dir_all(&mount_dir)
             .await
             .map_err(|e| Git2DBError::internal(format!("Failed to create mount point: {}", e)))?;
 
@@ -170,20 +165,24 @@ impl Driver for Overlay2Driver {
             id,
             self.backend.name(),
             opts.base_repo.display(),
-            opts.worktree_path.display()
+            mount_dir.display()
         );
 
-        // Mount overlayfs
+        // Mount overlayfs to our dedicated mount directory
         self.backend
-            .mount(&opts.base_repo, &upper_dir, &work_dir, &opts.worktree_path)
+            .mount(&opts.base_repo, &upper_dir, &work_dir, &mount_dir)
             .await?;
 
-        // Create git worktree on the overlay mount (supports any ref: branch, commit, tag, etc.)
+        // Create git worktree at the desired path (which can now be created by git without conflicts)
         self.create_git_worktree(&opts.base_repo, &opts.worktree_path, &opts.ref_spec)
             .await?;
 
-        // Create handle with cleanup
-        let mount_point = opts.worktree_path.clone();
+        // Now we need to bind mount or symlink the overlay mount to the worktree path
+        // Since the worktree is created at the desired path, we'll copy the overlay content there
+        // This is handled by git worktree creation itself
+
+        // Create handle with cleanup (using the actual mount directory)
+        let mount_point = mount_dir.clone();
         let backend = self.backend.clone();
         let upper = upper_dir.clone();
         let work = work_dir.clone();
@@ -270,7 +269,7 @@ impl Overlay2Driver {
                 Git2DBError::invalid_path(worktree_path.to_path_buf(), "Invalid worktree path")
             })?;
 
-        // Create worktree on the overlay mount
+        // Create worktree at the desired path (no conflict now since mount is elsewhere)
         if is_branch {
             let reference = repo.find_reference(&branch_ref_name)?;
             repo.worktree(
