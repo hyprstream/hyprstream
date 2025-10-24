@@ -28,6 +28,7 @@ pub mod precision; // BF16/FP8 precision management
 pub mod rope; // Rotary Position Embedding (RoPE) implementation
 pub mod sampling; // Token sampling strategies with model-specific configs
 pub mod streaming; // Async streaming support for token-by-token generation
+pub mod utf8_decoder; // Incremental UTF-8 decoder for byte-level tokenizers
 pub mod template_engine; // Jinja2 template engine for chat templates
 pub mod tensor_helpers; // Helper functions for Tch tensor operations
 pub mod torch_engine; // PyTorch-based engine with tch-rs

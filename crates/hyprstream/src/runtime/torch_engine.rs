@@ -12,7 +12,10 @@ use json_threat_protection as jtp;
 use serde_json;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex, PoisonError,
+};
 use tch::{nn::VarStore, Device, Tensor};
 use tokenizers::Tokenizer;
 use tracing::{info, instrument};
@@ -111,6 +114,9 @@ pub struct TorchEngine {
     gpu_sampler: GpuSampler,
     /// Qwen special tokens for proper conversation handling - immutable after construction
     special_tokens: QwenSpecialTokens,
+    /// Cached tokenizer vocabulary size for lock-free access
+    /// 0 means not yet initialized
+    tokenizer_vocab_size: Arc<AtomicUsize>,
     // Note: XET/LFS handled by git-xet-filter + ModelFactory::load_file_with_pointer_detection()
     // Note: Pre-training not supported (persistent_model doesn't expose VarStore), LoRA only
 }
@@ -125,6 +131,20 @@ impl TorchEngine {
                 tracing::warn!("Mutex poisoned, recovering by taking inner value");
                 Ok(poisoned.into_inner())
             }
+        }
+    }
+
+    /// Get cached vocabulary size without locking
+    fn get_vocab_size(&self) -> usize {
+        let size = self.tokenizer_vocab_size.load(Ordering::Relaxed);
+        if size > 0 {
+            size
+        } else {
+            // Fallback: try to get from tokenizer (shouldn't happen after load_tokenizer)
+            self.handle_poison(self.tokenizer.lock())
+                .ok()
+                .and_then(|guard| guard.as_ref().map(|t| t.get_vocab_size(true)))
+                .unwrap_or(32000)  // Ultimate fallback
         }
     }
 
@@ -199,6 +219,7 @@ impl TorchEngine {
             sampling_config: config,
             gpu_sampler: GpuSampler::new(device),
             special_tokens: QwenSpecialTokens::default(),
+            tokenizer_vocab_size: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -366,6 +387,9 @@ impl TorchEngine {
             // Log vocabulary size information for debugging Unicode issues
             let tokenizer_vocab_size = tokenizer.get_vocab_size(true);
             info!("Tokenizer vocabulary size: {}", tokenizer_vocab_size);
+
+            // Cache the vocabulary size for lock-free access
+            self.tokenizer_vocab_size.store(tokenizer_vocab_size, Ordering::Relaxed);
 
             // Compare with model's configured vocab size
             {
@@ -646,14 +670,12 @@ impl TorchEngine {
         repeat_penalty: f32,
         previous_tokens: &[i64],
     ) -> Result<usize> {
-        // Get the tokenizer vocabulary size to mask invalid tokens
-        let tokenizer_vocab_size = {
-            let tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
-            if let Some(ref tokenizer) = *tokenizer_guard {
-                Some(tokenizer.get_vocab_size(true))
-            } else {
-                None
-            }
+        // Get the cached tokenizer vocabulary size to mask invalid tokens
+        let vocab_size = self.get_vocab_size();
+        let tokenizer_vocab_size = if vocab_size > 0 {
+            Some(vocab_size)
+        } else {
+            None
         };
 
         self.gpu_sampler.sample_token(
@@ -832,18 +854,8 @@ impl RuntimeEngine for TorchEngine {
                 tracing::debug!("Sampled token ID: {}", next_token);
 
                 // Validate token is within vocabulary bounds
-                // Use tokenizer's vocabulary size as the authoritative source
-                let vocab_size = {
-                    let tokenizer_guard = self_clone.handle_poison(self_clone.tokenizer.lock())?;
-                    if let Some(ref tokenizer) = *tokenizer_guard {
-                        tokenizer.get_vocab_size(true)
-                    } else {
-                        // Fallback to model config if tokenizer not available (shouldn't happen)
-                        let model_info = self_clone.handle_poison(self_clone.model_info.lock())?;
-                        tracing::warn!("Using model config vocab_size as fallback (tokenizer not available)");
-                        model_info.vocab_size as usize
-                    }
-                }; // Lock is dropped here
+                // Use cached tokenizer vocabulary size for lock-free access
+                let vocab_size = self_clone.get_vocab_size();
 
                 if next_token >= vocab_size {
                     tracing::warn!(
@@ -1172,18 +1184,8 @@ impl TorchEngine {
             )?;
 
             // Validate token is within vocabulary bounds
-            // Use tokenizer's vocabulary size as the authoritative source
-            let vocab_size = {
-                let tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
-                if let Some(ref tokenizer) = *tokenizer_guard {
-                    tokenizer.get_vocab_size(true)
-                } else {
-                    // Fallback to model config if tokenizer not available (shouldn't happen)
-                    let model_info = self.handle_poison(self.model_info.lock())?;
-                    tracing::warn!("Using model config vocab_size as fallback (tokenizer not available)");
-                    model_info.vocab_size as usize
-                }
-            }; // Lock is dropped here
+            // Use cached tokenizer vocabulary size for lock-free access
+            let vocab_size = self.get_vocab_size();
 
             if next_token >= vocab_size {
                 tracing::warn!(
@@ -1310,18 +1312,8 @@ impl TorchEngine {
                 )?;
 
                 // Validate token is within vocabulary bounds
-                // Use tokenizer's vocabulary size as the authoritative source
-                let vocab_size = {
-                    let tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
-                    if let Some(ref tokenizer) = *tokenizer_guard {
-                        tokenizer.get_vocab_size(true)
-                    } else {
-                        // Fallback to model config if tokenizer not available (shouldn't happen)
-                        let model_info = self.handle_poison(self.model_info.lock())?;
-                        tracing::warn!("Using model config vocab_size as fallback (tokenizer not available)");
-                        model_info.vocab_size as usize
-                    }
-                }; // Lock is dropped here
+                // Use cached tokenizer vocabulary size for lock-free access
+                let vocab_size = self.get_vocab_size();
 
                 if next_token >= vocab_size {
                     tracing::warn!(
