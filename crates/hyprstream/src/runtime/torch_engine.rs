@@ -5,6 +5,7 @@ use crate::config::{
 };
 use crate::runtime::gpu_sampling::GpuSampler;
 use crate::runtime::template_engine::{ChatMessage, TemplateEngine};
+use crate::runtime::utf8_decoder::{IncrementalUtf8Decoder, InvalidTokenCircuitBreaker};
 use crate::runtime::RuntimeEngine;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -827,9 +828,12 @@ impl RuntimeEngine for TorchEngine {
 
             // Tokenize input
             let mut input_ids = self_clone.tokenize(&request.prompt)?;
-            let mut generated_text = String::new();
             let mut tokens_generated = 0;
             let prompt_len = input_ids.len();
+
+            // Initialize incremental decoder and circuit breaker
+            let mut decoder = IncrementalUtf8Decoder::new();
+            let mut circuit_breaker = InvalidTokenCircuitBreaker::new(10);
 
             for i in 0..request.max_tokens {
                 // Use KV cached forward pass after first iteration
@@ -858,14 +862,13 @@ impl RuntimeEngine for TorchEngine {
                 let vocab_size = self_clone.get_vocab_size();
 
                 if next_token >= vocab_size {
-                    tracing::warn!(
-                        "Invalid token ID {} sampled (tokenizer vocab_size={}), skipping",
-                        next_token,
-                        vocab_size
-                    );
+                    circuit_breaker.record_invalid(next_token, vocab_size)?;
                     // Don't add invalid tokens to the sequence or KV cache
                     continue;
                 }
+
+                // Valid token - reset circuit breaker
+                circuit_breaker.record_valid();
 
                 // Check EOS BEFORE decoding or adding to sequence
                 if self_clone.is_eos_token(next_token) {
@@ -877,21 +880,24 @@ impl RuntimeEngine for TorchEngine {
                 input_ids.push(next_token as i64);
                 tokens_generated += 1;
 
-                // For byte-level tokenizers like Qwen, decode the entire sequence
-                // to properly handle multi-byte UTF-8 sequences
-                // Only decode the newly generated tokens (skip the original prompt)
-                let generated_ids = &input_ids[prompt_len..];
-                let new_generated_text = self_clone.detokenize(generated_ids)?;
+                // Use incremental decoder for efficient UTF-8 handling
+                let new_text = decoder.push_token_simple(next_token as i64, |tokens| {
+                    // Decode just the generated tokens (not the prompt)
+                    let mut full_ids = Vec::with_capacity(prompt_len + tokens.len());
+                    full_ids.extend(&input_ids[..prompt_len]);
+                    full_ids.extend(tokens);
+                    self_clone.detokenize(&full_ids[prompt_len..])
+                })?;
 
-                // Update the generated text (this replaces the previous partial decoding)
-                generated_text = new_generated_text;
-                tracing::debug!("Generated text so far: '{}'", generated_text);
+                if !new_text.is_empty() {
+                    tracing::debug!("New text: '{}'", new_text);
+                }
 
                 // Check stop tokens
                 if request
                     .stop_tokens
                     .iter()
-                    .any(|stop| generated_text.contains(stop))
+                    .any(|stop| decoder.get_text().contains(stop))
                 {
                     break;
                 }
@@ -900,7 +906,7 @@ impl RuntimeEngine for TorchEngine {
             let generation_time = start_time.elapsed();
 
             Ok(GenerationResult {
-                text: generated_text,
+                text: decoder.get_text().to_string(),
                 tokens_generated,
                 finish_reason: if tokens_generated >= request.max_tokens {
                     FinishReason::MaxTokens
@@ -1156,8 +1162,11 @@ impl TorchEngine {
 
         // Tokenize input
         let mut input_ids = self.tokenize(prompt)?;
-        let mut generated_text = String::new();
         let prompt_len = input_ids.len();
+
+        // Initialize incremental decoder and circuit breaker
+        let mut decoder = IncrementalUtf8Decoder::new();
+        let mut circuit_breaker = InvalidTokenCircuitBreaker::new(10);
 
         tracing::info!("Starting generation with prompt of {} tokens", prompt_len);
         tracing::debug!("Initial token IDs: {:?}", &input_ids[..prompt_len.min(20)]);
@@ -1188,14 +1197,13 @@ impl TorchEngine {
             let vocab_size = self.get_vocab_size();
 
             if next_token >= vocab_size {
-                tracing::warn!(
-                    "Invalid token ID {} sampled (tokenizer vocab_size={}), skipping",
-                    next_token,
-                    vocab_size
-                );
+                circuit_breaker.record_invalid(next_token, vocab_size)?;
                 // Don't add invalid tokens to the sequence or KV cache
                 continue;
             }
+
+            // Valid token - reset circuit breaker
+            circuit_breaker.record_valid();
 
             // Check EOS BEFORE decoding or adding to sequence
             if self.is_eos_token(next_token) {
@@ -1206,46 +1214,37 @@ impl TorchEngine {
             // Add to sequence (now guaranteed to be valid)
             input_ids.push(next_token as i64);
 
-            // For byte-level tokenizers, decode the entire generated sequence
-            // to properly handle multi-byte UTF-8 sequences
-            let generated_ids = &input_ids[prompt_len..];
-            let new_generated_text = self.detokenize(generated_ids)?;
+            // Use incremental decoder for efficient UTF-8 handling
+            let new_text = decoder.push_token_simple(next_token as i64, |tokens| {
+                // Decode just the generated tokens (not the prompt)
+                let mut full_ids = Vec::with_capacity(prompt_len + tokens.len());
+                full_ids.extend(&input_ids[..prompt_len]);
+                full_ids.extend(tokens);
+                self.detokenize(&full_ids[prompt_len..])
+            })?;
 
-            // Calculate what's new since last decode (for streaming)
-            let token_text = if new_generated_text.len() > generated_text.len() {
-                new_generated_text[generated_text.len()..].to_string()
-            } else {
-                // In rare cases with byte-level tokenizers, the text might not grow
-                // if we're in the middle of a multi-byte sequence
-                String::new()
-            };
-
-            tracing::debug!(
-                "Iteration {}: generated token {} -> '{}'",
-                i,
-                next_token,
-                token_text
-            );
-
-            // Update the full generated text
-            generated_text = new_generated_text;
-
-            // Stream the new text (might be empty for incomplete UTF-8 sequences)
-            if !token_text.is_empty() {
-                callback(&token_text);
+            if !new_text.is_empty() {
+                tracing::debug!(
+                    "Iteration {}: generated token {} -> '{}'",
+                    i,
+                    next_token,
+                    new_text
+                );
+                // Stream the new text
+                callback(&new_text);
             }
 
             // Check stop tokens
             if request
                 .stop_tokens
                 .iter()
-                .any(|stop| generated_text.contains(stop))
+                .any(|stop| decoder.get_text().contains(stop))
             {
                 break;
             }
         }
 
-        Ok(generated_text)
+        Ok(decoder.get_text().to_string())
     }
 
     /// Check if persistent model is initialized - thread safe
@@ -1276,9 +1275,12 @@ impl TorchEngine {
 
         // Tokenize input
         let mut input_ids = self.tokenize(&request.prompt)?;
-        let mut generated_text = String::new();
         let mut tokens_generated = 0;
         let prompt_len = input_ids.len();
+
+        // Initialize incremental decoder and circuit breaker
+        let mut decoder = IncrementalUtf8Decoder::new();
+        let mut circuit_breaker = InvalidTokenCircuitBreaker::new(10);
 
         tracing::info!(
             "Starting async generation with prompt of {} tokens",
@@ -1316,14 +1318,13 @@ impl TorchEngine {
                 let vocab_size = self.get_vocab_size();
 
                 if next_token >= vocab_size {
-                    tracing::warn!(
-                        "Invalid token ID {} sampled (tokenizer vocab_size={}), skipping",
-                        next_token,
-                        vocab_size
-                    );
+                    circuit_breaker.record_invalid(next_token, vocab_size)?;
                     // Don't add invalid tokens to the sequence or KV cache
                     continue;
                 }
+
+                // Valid token - reset circuit breaker
+                circuit_breaker.record_valid();
 
                 // Check EOS BEFORE decoding or adding to sequence
                 if self.is_eos_token(next_token) {
@@ -1335,26 +1336,18 @@ impl TorchEngine {
                 input_ids.push(next_token as i64);
                 tokens_generated += 1;
 
-                // For byte-level tokenizers, decode the entire generated sequence
-                // to properly handle multi-byte UTF-8 sequences
-                let generated_ids = &input_ids[prompt_len..];
-                let new_generated_text = self.detokenize(generated_ids)?;
-
-                // Calculate what's new since last decode (for streaming)
-                let token_text = if new_generated_text.len() > generated_text.len() {
-                    new_generated_text[generated_text.len()..].to_string()
-                } else {
-                    // In rare cases with byte-level tokenizers, the text might not grow
-                    // if we're in the middle of a multi-byte sequence
-                    String::new()
-                };
-
-                // Update the full generated text
-                generated_text = new_generated_text;
+                // Use incremental decoder for efficient UTF-8 handling
+                let new_text = decoder.push_token_simple(next_token as i64, |tokens| {
+                    // Decode just the generated tokens (not the prompt)
+                    let mut full_ids = Vec::with_capacity(prompt_len + tokens.len());
+                    full_ids.extend(&input_ids[..prompt_len]);
+                    full_ids.extend(tokens);
+                    self.detokenize(&full_ids[prompt_len..])
+                })?;
 
                 // Stream token via callback (only if there's actual text)
-                let continue_generation = if !token_text.is_empty() {
-                    callback.on_token(&token_text).await
+                let continue_generation = if !new_text.is_empty() {
+                    callback.on_token(&new_text).await
                 } else {
                     // No text to stream yet (incomplete UTF-8 sequence)
                     Ok(ContinueGeneration::Continue)
@@ -1379,7 +1372,7 @@ impl TorchEngine {
                 if request
                     .stop_tokens
                     .iter()
-                    .any(|stop| generated_text.contains(stop))
+                    .any(|stop| decoder.get_text().contains(stop))
                 {
                     break;
                 }
@@ -1403,7 +1396,7 @@ impl TorchEngine {
                 callback.on_complete(finish_reason.clone()).await;
 
                 Ok(GenerationResult {
-                    text: generated_text,
+                    text: decoder.get_text().to_string(),
                     tokens_generated,
                     finish_reason,
                     generation_time_ms: start_time.elapsed().as_millis() as u64,

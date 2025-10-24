@@ -7,6 +7,12 @@ use anyhow::Result;
 use std::collections::HashMap;
 use tch::{Device, Kind, Tensor};
 
+/// Large negative value to effectively mask invalid logits.
+/// This value is large enough to make probability ~0 after softmax,
+/// but not so large as to cause numerical overflow in exp() computation.
+/// -1e10 ensures exp(-1e10) ≈ 0 without triggering underflow exceptions.
+const LOGIT_MASK_VALUE: f64 = -1e10;
+
 /// GPU-based token sampler
 #[derive(Clone)]
 pub struct GpuSampler {
@@ -51,9 +57,8 @@ impl GpuSampler {
                 let invalid_count = (model_vocab_size - vocab_size) as i64;
 
                 if invalid_count > 0 {
-                    // Set logits for invalid tokens to -inf
-                    let neg_inf_value = -1e10f64;  // Use f64 for Scalar trait
-                    let neg_inf_tensor = Tensor::full(&[invalid_count], neg_inf_value, (Kind::Float, self.device));
+                    // Set logits for invalid tokens to mask value
+                    let neg_inf_tensor = Tensor::full(&[invalid_count], LOGIT_MASK_VALUE, (Kind::Float, self.device));
 
                     // Use narrow and copy_ to update the invalid token range
                     logits.narrow(0, invalid_start, invalid_count).copy_(&neg_inf_tensor);
