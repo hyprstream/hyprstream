@@ -3,8 +3,10 @@
 use crate::config::{
     FinishReason, GenerationConfig, GenerationRequest, GenerationResult, ModelInfo, RuntimeConfig,
 };
-use crate::runtime::gpu_sampling::GpuSampler;
+use crate::runtime::generation_core::{self, GenerationCore, SamplingParams, CallbackControl};
+use crate::runtime::tensor_sampling::TensorSampler;
 use crate::runtime::template_engine::{ChatMessage, TemplateEngine};
+use crate::runtime::utf8_decoder::IncrementalUtf8Decoder;
 use crate::runtime::RuntimeEngine;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -12,7 +14,10 @@ use json_threat_protection as jtp;
 use serde_json;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex, PoisonError,
+};
 use tch::{nn::VarStore, Device, Tensor};
 use tokenizers::Tokenizer;
 use tracing::{info, instrument};
@@ -36,6 +41,9 @@ pub struct QwenSpecialTokens {
     pub vision_pad: u32,
     pub image_pad: u32,
     pub video_pad: u32,
+    /// Chain-of-thought reasoning tokens (Qwen 2.5+)
+    pub thinking_start: u32,  // "<|thinking_start|>"
+    pub thinking_end: u32,    // "<|thinking_end|>"
 }
 
 impl Default for QwenSpecialTokens {
@@ -53,6 +61,8 @@ impl Default for QwenSpecialTokens {
             vision_pad: 151654,
             image_pad: 151655,
             video_pad: 151656,
+            thinking_start: 151667,  // "<|thinking_start|>"
+            thinking_end: 151668,    // "<|thinking_end|>"
         }
     }
 }
@@ -108,9 +118,12 @@ pub struct TorchEngine {
     #[allow(dead_code)]
     sampling_config: RuntimeConfig,
     /// GPU sampler for efficient token sampling - thread safe after initialization
-    gpu_sampler: GpuSampler,
+    sampler: TensorSampler,  // Renamed from gpu_sampler - works on both CPU and GPU
     /// Qwen special tokens for proper conversation handling - immutable after construction
     special_tokens: QwenSpecialTokens,
+    /// Cached tokenizer vocabulary size for lock-free access
+    /// 0 means not yet initialized
+    tokenizer_vocab_size: Arc<AtomicUsize>,
     // Note: XET/LFS handled by git-xet-filter + ModelFactory::load_file_with_pointer_detection()
     // Note: Pre-training not supported (persistent_model doesn't expose VarStore), LoRA only
 }
@@ -125,6 +138,20 @@ impl TorchEngine {
                 tracing::warn!("Mutex poisoned, recovering by taking inner value");
                 Ok(poisoned.into_inner())
             }
+        }
+    }
+
+    /// Get cached vocabulary size without locking
+    pub fn get_vocab_size(&self) -> usize {
+        let size = self.tokenizer_vocab_size.load(Ordering::Relaxed);
+        if size > 0 {
+            size
+        } else {
+            // Fallback: try to get from tokenizer (shouldn't happen after load_tokenizer)
+            self.handle_poison(self.tokenizer.lock())
+                .ok()
+                .and_then(|guard| guard.as_ref().map(|t| t.get_vocab_size(true)))
+                .unwrap_or(32000)  // Ultimate fallback
         }
     }
 
@@ -197,8 +224,9 @@ impl TorchEngine {
             lora_model: Arc::new(Mutex::new(None)),
             lora_trainer: Arc::new(Mutex::new(None)),
             sampling_config: config,
-            gpu_sampler: GpuSampler::new(device),
+            sampler: TensorSampler::new(device),
             special_tokens: QwenSpecialTokens::default(),
+            tokenizer_vocab_size: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -363,6 +391,24 @@ impl TorchEngine {
             let tokenizer = Tokenizer::from_file(&tokenizer_path)
                 .map_err(|e| anyhow!("Failed to load tokenizer: {}", e))?;
 
+            // Log vocabulary size information for debugging Unicode issues
+            let tokenizer_vocab_size = tokenizer.get_vocab_size(true);
+            info!("Tokenizer vocabulary size: {}", tokenizer_vocab_size);
+
+            // Cache the vocabulary size for lock-free access
+            self.tokenizer_vocab_size.store(tokenizer_vocab_size, Ordering::Relaxed);
+
+            // Compare with model's configured vocab size
+            {
+                let model_info = self.handle_poison(self.model_info.lock())?;
+                if model_info.vocab_size as usize != tokenizer_vocab_size {
+                    tracing::warn!(
+                        "Vocabulary size mismatch! Model config: {}, Tokenizer: {}. This may cause Unicode replacement characters.",
+                        model_info.vocab_size, tokenizer_vocab_size
+                    );
+                }
+            }
+
             // Thread safe assignment
             let mut tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
             *tokenizer_guard = Some(tokenizer);
@@ -481,14 +527,40 @@ impl TorchEngine {
     }
 
     /// Check if a token ID is a special EOS token for Qwen
-    fn is_eos_token(&self, token_id: usize) -> bool {
+    pub fn is_eos_token(&self, token_id: usize) -> bool {
         let token_id_u32 = token_id as u32;
         // Qwen can end on either im_end (for conversations) or endoftext (for completion)
         token_id_u32 == self.special_tokens.im_end || token_id_u32 == self.special_tokens.endoftext
     }
 
+    /// Check if a token is a special token that should be allowed/blocked
+    /// Returns None if token is normal, Some(true) if allowed, Some(false) if should stop
+    pub fn check_special_token(&self, token_id: usize) -> Option<bool> {
+        let token_id_u32 = token_id as u32;
+
+        // Allow thinking tokens (chain-of-thought reasoning)
+        if token_id_u32 == self.special_tokens.thinking_start
+            || token_id_u32 == self.special_tokens.thinking_end {
+            return Some(true); // Allow
+        }
+
+        // Block vision/multimodal tokens
+        if token_id_u32 >= self.special_tokens.object_ref_start
+            && token_id_u32 < self.special_tokens.thinking_start {
+            return Some(false); // Block
+        }
+
+        // Block tokens beyond thinking_end (if they're in special range)
+        if token_id_u32 > self.special_tokens.thinking_end
+            && token_id_u32 < self.special_tokens.endoftext + 100 {
+            return Some(false); // Block (within special token range)
+        }
+
+        None // Normal token
+    }
+
     /// Detokenize IDs back to text - thread safe
-    fn detokenize(&self, ids: &[i64]) -> Result<String> {
+    pub fn detokenize(&self, ids: &[i64]) -> Result<String> {
         let tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
         let tokenizer = tokenizer_guard
             .as_ref()
@@ -522,7 +594,7 @@ impl TorchEngine {
     }
 
     /// Run inference on the model (supports both TorchScript and VarStore models) - thread safe
-    fn forward(&self, input_ids: &[i64]) -> Result<Tensor> {
+    pub fn forward(&self, input_ids: &[i64]) -> Result<Tensor> {
         // Try VarStore-based inference first (preferred for SafeTensors models)
         if self.has_varstore() {
             return self.forward_varstore(input_ids);
@@ -573,7 +645,7 @@ impl TorchEngine {
     }
 
     /// Run optimized inference with KV caching - only process new tokens
-    fn forward_cached(
+    pub fn forward_cached(
         &self,
         input_ids: &[i64],
         start_pos: usize,
@@ -621,22 +693,19 @@ impl TorchEngine {
         Ok(last_token_logits)
     }
 
-    /// Sample next token from GPU logits tensor
-    fn sample_token_gpu(
+    /// Sample next token using bundled parameters
+    pub fn sample_token_with_params(
         &self,
         logits_tensor: &Tensor,
-        temperature: f32,
-        top_p: f32,
-        top_k: Option<usize>,
-        repeat_penalty: f32,
+        params: &generation_core::SamplingParams,
         previous_tokens: &[i64],
     ) -> Result<usize> {
-        self.gpu_sampler.sample_token(
+        self.sampler.sample_token(
             logits_tensor,
-            temperature,
-            top_p,
-            top_k,
-            repeat_penalty,
+            params.temperature,
+            params.top_p,
+            params.top_k,
+            params.repeat_penalty,
             previous_tokens,
         )
     }
@@ -775,73 +844,19 @@ impl RuntimeEngine for TorchEngine {
                 ));
             }
 
-            let start_time = std::time::Instant::now();
-
             // Tokenize input
-            let mut input_ids = self_clone.tokenize(&request.prompt)?;
-            let mut generated_text = String::new();
-            let mut tokens_generated = 0;
-            let prompt_len = input_ids.len();
+            let input_ids = self_clone.tokenize(&request.prompt)?;
 
-            for i in 0..request.max_tokens {
-                // Use KV cached forward pass after first iteration
-                let logits = if i == 0 {
-                    // First pass: process entire prompt
-                    self_clone.forward(&input_ids)?
-                } else {
-                    // Subsequent passes: only process new token with KV cache
-                    self_clone.forward_cached(&input_ids, prompt_len + i - 1, true)?
-                };
+            // Create sampling parameters from request
+            let params = SamplingParams::from_request(&request);
 
-                // Sample next token with proper parameters
-                let next_token = self_clone.sample_token_gpu(
-                    &logits,
-                    request.temperature,
-                    request.top_p,
-                    request.top_k,
-                    request.repeat_penalty,
-                    &input_ids,
-                )?;
+            // Use the unified GenerationCore
+            let mut core = GenerationCore::new(&self_clone);
 
-                tracing::debug!("Sampled token ID: {}", next_token);
-
-                // Check EOS BEFORE decoding or adding to sequence
-                if self_clone.is_eos_token(next_token) {
-                    tracing::debug!("EOS token detected: {}", next_token);
-                    break;
-                }
-
-                // Add to sequence
-                input_ids.push(next_token as i64);
-                tokens_generated += 1;
-
-                // Decode token
-                let token_text = self_clone.detokenize(&[next_token as i64])?;
-                tracing::debug!("Token text: '{}'", token_text);
-                generated_text.push_str(&token_text);
-
-                // Check stop tokens
-                if request
-                    .stop_tokens
-                    .iter()
-                    .any(|stop| generated_text.contains(stop))
-                {
-                    break;
-                }
-            }
-
-            let generation_time = start_time.elapsed();
-
-            Ok(GenerationResult {
-                text: generated_text,
-                tokens_generated,
-                finish_reason: if tokens_generated >= request.max_tokens {
-                    FinishReason::MaxTokens
-                } else {
-                    FinishReason::EndOfSequence
-                },
-                generation_time_ms: generation_time.as_millis() as u64,
-                tokens_per_second: tokens_generated as f32 / generation_time.as_secs_f32(),
+            // Generate with no-op callback (blocking mode doesn't stream)
+            core.generate_tokens(input_ids, &params, &request, |_text| {
+                // Blocking mode: ignore intermediate text
+                Ok(CallbackControl::Continue)
             })
         });
 
@@ -1069,6 +1084,10 @@ impl TorchEngine {
     }
 
     /// Internal streaming implementation
+    ///
+    /// Note: This method does not track tokens_generated count for performance reasons.
+    /// The token count is implicit in the final decoded text length. The async streaming
+    /// variant does track tokens_generated for metrics reporting.
     async fn generate_streaming_internal<F>(
         &self,
         request: GenerationRequest,
@@ -1077,79 +1096,23 @@ impl TorchEngine {
     where
         F: FnMut(&str),
     {
-        let prompt = &request.prompt;
-        let max_tokens = request.max_tokens;
-        let temperature = request.temperature;
-        let top_p = request.top_p;
-        let top_k = request.top_k;
-        let repeat_penalty = request.repeat_penalty;
-
-        // REAL streaming: generate tokens one by one and call callback for each
-        let _start_time = std::time::Instant::now();
-
         // Tokenize input
-        let mut input_ids = self.tokenize(prompt)?;
-        let mut generated_text = String::new();
-        let prompt_len = input_ids.len();
+        let input_ids = self.tokenize(&request.prompt)?;
 
-        tracing::info!("Starting generation with prompt of {} tokens", prompt_len);
-        tracing::debug!("Initial token IDs: {:?}", &input_ids[..prompt_len.min(20)]);
+        // Create sampling parameters from request
+        let params = SamplingParams::from_request(&request);
 
-        for i in 0..max_tokens {
-            // Use KV cached forward pass after first iteration
-            let logits = if i == 0 {
-                // First pass: process entire prompt
-                self.forward(&input_ids)?
-            } else {
-                // Subsequent passes: only process new token with KV cache
-                // Position is prompt_len + (i-1) since we're processing the token generated in the previous iteration
-                self.forward_cached(&input_ids, prompt_len + i - 1, true)?
-            };
+        // Use the unified GenerationCore
+        let mut core = GenerationCore::new(self);
 
-            // Sample next token
-            let next_token = self.sample_token_gpu(
-                &logits,
-                temperature,
-                top_p,
-                top_k,
-                repeat_penalty,
-                &input_ids,
-            )?;
+        // Generate with streaming callback
+        let result = core.generate_tokens(input_ids, &params, &request, |text| {
+            // Stream each piece of new text
+            callback(text);
+            Ok(CallbackControl::Continue)
+        })?;
 
-            // Check EOS BEFORE decoding or adding to sequence
-            if self.is_eos_token(next_token) {
-                tracing::debug!("EOS token detected: {}", next_token);
-                break;
-            }
-
-            // Add to sequence
-            input_ids.push(next_token as i64);
-
-            // Decode token and stream it immediately
-            let token_text = self.detokenize(&[next_token as i64])?;
-            generated_text.push_str(&token_text);
-
-            tracing::debug!(
-                "Iteration {}: generated token {} -> '{}'",
-                i,
-                next_token,
-                token_text
-            );
-
-            // Stream the token immediately (real streaming)
-            callback(&token_text);
-
-            // Check stop tokens
-            if request
-                .stop_tokens
-                .iter()
-                .any(|stop| generated_text.contains(stop))
-            {
-                break;
-            }
-        }
-
-        Ok(generated_text)
+        Ok(result.text)
     }
 
     /// Check if persistent model is initialized - thread safe
@@ -1164,6 +1127,9 @@ impl TorchEngine {
     }
 
     /// Generate text with async streaming callback
+    ///
+    /// This method handles async callbacks with cancellation support.
+    /// It uses a channel to bridge between the sync generation core and async callbacks.
     pub async fn generate_streaming_async(
         &self,
         request: GenerationRequest,
@@ -1180,9 +1146,11 @@ impl TorchEngine {
 
         // Tokenize input
         let mut input_ids = self.tokenize(&request.prompt)?;
-        let mut generated_text = String::new();
         let mut tokens_generated = 0;
         let prompt_len = input_ids.len();
+
+        // Initialize incremental decoder
+        let mut decoder = IncrementalUtf8Decoder::new();
 
         tracing::info!(
             "Starting async generation with prompt of {} tokens",
@@ -1206,7 +1174,7 @@ impl TorchEngine {
                 };
 
                 // Sample next token
-                let next_token = self.sample_token_gpu(
+                let next_token = self.sampler.sample_token(
                     &logits,
                     request.temperature,
                     request.top_p,
@@ -1215,22 +1183,39 @@ impl TorchEngine {
                     &input_ids,
                 )?;
 
-                // Check EOS BEFORE decoding or adding to sequence
+
+                // NOTE: Special token handling is done in GenerationCore
+                // This method (generate_streaming_async) should eventually be refactored
+                // to use GenerationCore instead of duplicating logic
+
+                // Check EOS token
                 if self.is_eos_token(next_token) {
                     tracing::debug!("EOS token detected: {}", next_token);
                     break;
                 }
 
-                // Add to sequence
+                // Add to sequence (now guaranteed to be valid)
                 input_ids.push(next_token as i64);
                 tokens_generated += 1;
 
-                // Decode token
-                let token_text = self.detokenize(&[next_token as i64])?;
-                generated_text.push_str(&token_text);
+                // Use incremental decoder for efficient UTF-8 handling
+                let new_text = decoder.push_token_simple(next_token as i64, |tokens| {
+                    // Decode just the generated tokens (not the prompt)
+                    let mut full_ids = Vec::with_capacity(prompt_len + tokens.len());
+                    full_ids.extend(&input_ids[..prompt_len]);
+                    full_ids.extend(tokens);
+                    self.detokenize(&full_ids[prompt_len..])
+                })?;
 
-                // Stream token via callback
-                match callback.on_token(&token_text).await {
+                // Stream token via callback (only if there's actual text)
+                let continue_generation = if !new_text.is_empty() {
+                    callback.on_token(&new_text).await
+                } else {
+                    // No text to stream yet (incomplete UTF-8 sequence)
+                    Ok(ContinueGeneration::Continue)
+                };
+
+                match continue_generation {
                     Ok(ContinueGeneration::Continue) => {}
                     Ok(ContinueGeneration::Stop) => {
                         tracing::info!("Generation stopped by callback");
@@ -1249,7 +1234,7 @@ impl TorchEngine {
                 if request
                     .stop_tokens
                     .iter()
-                    .any(|stop| generated_text.contains(stop))
+                    .any(|stop| decoder.get_text().contains(stop))
                 {
                     break;
                 }
@@ -1261,19 +1246,18 @@ impl TorchEngine {
         // Apply timeout
         match timeout(context.timeout, generation_future).await {
             Ok(Ok(())) => {
-                // Success
+                // Success - determine why generation stopped
                 let finish_reason = if tokens_generated >= request.max_tokens {
                     FinishReason::MaxTokens
-                } else if self.is_eos_token(*input_ids.last().unwrap() as u32 as usize) {
-                    FinishReason::Stop
                 } else {
+                    // Generation ended for other reason (EOS, circuit breaker, or natural end)
                     FinishReason::Stop
                 };
 
                 callback.on_complete(finish_reason.clone()).await;
 
                 Ok(GenerationResult {
-                    text: generated_text,
+                    text: decoder.get_text().to_string(),
                     tokens_generated,
                     finish_reason,
                     generation_time_ms: start_time.elapsed().as_millis() as u64,

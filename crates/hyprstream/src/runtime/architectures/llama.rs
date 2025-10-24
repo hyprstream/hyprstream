@@ -11,6 +11,12 @@ use std::collections::HashMap;
 use std::path::Path;
 use tch::{nn, Device, Kind as DType, Tensor};
 
+/// Calculate padded vocabulary size to multiple of 64 (for performance optimization)
+#[inline]
+fn calculate_padded_vocab_size(vocab_size: usize) -> usize {
+    ((vocab_size + 63) / 64) * 64
+}
+
 /// Llama model configuration
 #[derive(Debug, Clone)]
 pub struct LlamaConfig {
@@ -30,8 +36,10 @@ pub struct LlamaConfig {
     pub max_position_embeddings: usize,
     /// RMSNorm epsilon
     pub rms_norm_eps: f32,
-    /// Vocabulary size
+    /// Vocabulary size (may be padded)
     pub vocab_size: usize,
+    /// Original vocabulary size (before padding)
+    pub original_vocab_size: usize,
     /// Number of hidden layers
     pub num_hidden_layers: usize,
     /// RoPE theta
@@ -62,6 +70,7 @@ pub struct RopeScaling {
 impl Default for LlamaConfig {
     fn default() -> Self {
         // Llama 2 7B configuration
+        let vocab_size = 32000;
         Self {
             version: 2,
             num_attention_heads: 32,
@@ -71,7 +80,8 @@ impl Default for LlamaConfig {
             intermediate_size: 11008,
             max_position_embeddings: 4096,
             rms_norm_eps: 1e-5,
-            vocab_size: 32000,
+            vocab_size,
+            original_vocab_size: vocab_size,  // Same as vocab_size initially
             num_hidden_layers: 32,
             rope_theta: 10000.0,
             rope_scaling: None,
@@ -88,6 +98,7 @@ impl Default for LlamaConfig {
 impl LlamaConfig {
     /// Create config for Llama 3 8B
     pub fn llama3_8b() -> Self {
+        let vocab_size = 128256;
         Self {
             version: 3,
             num_attention_heads: 32,
@@ -97,7 +108,8 @@ impl LlamaConfig {
             intermediate_size: 14336,
             max_position_embeddings: 8192,
             rms_norm_eps: 1e-5,
-            vocab_size: 128256,
+            vocab_size,
+            original_vocab_size: vocab_size,
             num_hidden_layers: 32,
             rope_theta: 500000.0,
             rope_scaling: Some(RopeScaling {
@@ -115,6 +127,7 @@ impl LlamaConfig {
 
     /// Create config for Llama 3 70B
     pub fn llama3_70b() -> Self {
+        let vocab_size = 128256;
         Self {
             version: 3,
             num_attention_heads: 64,
@@ -124,7 +137,8 @@ impl LlamaConfig {
             intermediate_size: 28672,
             max_position_embeddings: 8192,
             rms_norm_eps: 1e-5,
-            vocab_size: 128256,
+            vocab_size,
+            original_vocab_size: vocab_size,
             num_hidden_layers: 80,
             rope_theta: 500000.0,
             rope_scaling: Some(RopeScaling {
@@ -807,15 +821,55 @@ impl LlamaModel {
     /// Create Llama model with explicit config (allows Qwen models to override)
     pub fn from_weights_with_config(
         weights: &HashMap<String, Tensor>,
-        config: LlamaConfig,
+        mut config: LlamaConfig,
         device: &Device,
         dtype: DType,
     ) -> Result<Self> {
-        // Extract key tensors
+        // Extract key tensors (with padding for models that need it)
         let embed_tokens = weights
             .get("model.embed_tokens.weight")
             .or_else(|| weights.get("embed_tokens.weight"))
-            .map(|t| t.shallow_clone());
+            .map(|w| {
+                let vocab_size = w.size()[0] as usize;
+                let hidden_size = w.size()[1] as i64;
+
+                // Pad vocabulary size to multiple of 64 for models that need it
+                let padded_vocab_size = calculate_padded_vocab_size(vocab_size);
+
+                if padded_vocab_size > vocab_size {
+                    tracing::info!(
+                        "Padding embedding vocab size from {} to {} (multiple of 64)",
+                        vocab_size, padded_vocab_size
+                    );
+
+                    // Create padded tensor filled with zeros (embeddings can be zero-initialized)
+                    let padded = Tensor::zeros(
+                        &[padded_vocab_size as i64, hidden_size],
+                        (w.kind(), w.device())
+                    );
+
+                    // Copy original weights to the padded tensor
+                    padded.narrow(0, 0, vocab_size as i64).copy_(w);
+                    padded
+                } else {
+                    w.shallow_clone()
+                }
+            });
+
+        // Update config with padded vocab size if needed
+        let original_vocab_size = config.vocab_size;
+        let padded_vocab_size = calculate_padded_vocab_size(original_vocab_size);
+
+        // Store original vocab size before padding
+        config.original_vocab_size = original_vocab_size;
+
+        if padded_vocab_size != original_vocab_size {
+            tracing::info!(
+                "Updating config vocab_size from {} to padded size {}",
+                original_vocab_size, padded_vocab_size
+            );
+            config.vocab_size = padded_vocab_size;
+        }
 
         // Handle lm_head - Gemma models use weight tying (lm_head shares weights with embed_tokens)
         // Try to find explicit lm_head first, otherwise we'll use tied weights from embeddings
@@ -824,8 +878,36 @@ impl LlamaModel {
             .or_else(|| weights.get("model.lm_head.weight"))
             .map(|w| {
                 // LM head is stored as [vocab_size, hidden_size] in HuggingFace
+                let vocab_size = w.size()[0] as usize;
+                let hidden_size = w.size()[1] as i64;
+
+                // Pad vocabulary size to multiple of 64 (like SGLang does for Qwen)
+                // This prevents sampling invalid token IDs
+                let padded_vocab_size = calculate_padded_vocab_size(vocab_size);
+
+                let padded_w = if padded_vocab_size > vocab_size {
+                    tracing::info!(
+                        "Padding lm_head vocab size from {} to {} (multiple of 64)",
+                        vocab_size, padded_vocab_size
+                    );
+
+                    // Create padded tensor filled with zeros
+                    // NOTE: We can't use -1e10 here because this is the weight matrix, not logits
+                    // The actual masking needs to happen after the matmul that produces logits
+                    let padded = Tensor::zeros(
+                        &[padded_vocab_size as i64, hidden_size],
+                        (w.kind(), w.device())
+                    );
+
+                    // Copy original weights to the padded tensor
+                    padded.narrow(0, 0, vocab_size as i64).copy_(w);
+                    padded
+                } else {
+                    w.shallow_clone()
+                };
+
                 // We need [hidden_size, vocab_size] for matmul
-                w.transpose(0, 1).contiguous()
+                padded_w.transpose(0, 1).contiguous()
             });
 
         // Check if this is a model with tied weights (like Gemma)
@@ -895,6 +977,7 @@ impl LlamaModel {
             let shape = embed.size();
             if shape.len() >= 2 {
                 config.vocab_size = shape[0] as usize;
+                config.original_vocab_size = shape[0] as usize;  // Initially same
                 config.hidden_size = shape[1] as usize;
 
                 // Detect Gemma3 by vocab size (262144) and set specific parameters
@@ -1232,6 +1315,7 @@ impl LlamaModel {
                 as usize,
             rms_norm_eps: json["rms_norm_eps"].as_f64().unwrap_or(1e-5) as f32,
             vocab_size: json["vocab_size"].as_u64().unwrap_or(32000) as usize,
+            original_vocab_size: json["vocab_size"].as_u64().unwrap_or(32000) as usize,  // Initially same
             num_hidden_layers: json["num_hidden_layers"].as_u64().unwrap_or(32) as usize,
             rope_theta: json
                 .get("rope_theta")
@@ -1467,6 +1551,61 @@ impl ModelOperations for LlamaModel {
             }
         } else {
             tracing::warn!("No LM head or embedding weights found - returning hidden states!");
+        }
+
+        // Mask padded vocabulary entries if vocab was padded
+        // This ensures padded tokens can never be sampled
+        let original_vocab_size = self.config.original_vocab_size;
+        let padded_vocab_size = self.config.vocab_size;
+        if padded_vocab_size > original_vocab_size && original_vocab_size > 0 {
+            let logits_shape = hidden_states.size();
+            let actual_vocab_size = logits_shape[logits_shape.len() - 1] as usize;
+
+            // Only mask if we actually have padded tokens in the output
+            if actual_vocab_size == padded_vocab_size {
+                // Set logits for padded tokens to -1e10
+                // This makes their probability effectively zero after softmax
+                let mask_start = original_vocab_size as i64;
+                let mask_count = (padded_vocab_size - original_vocab_size) as i64;
+
+                if mask_count > 0 {
+                    // Get the last dimension (vocab dimension) and mask the padded portion
+                    // We need to use narrow + copy to update the values
+                    let mask_values = Tensor::full(
+                        &[mask_count],
+                        -1e10_f64,
+                        (hidden_states.kind(), hidden_states.device())
+                    );
+
+                    // For a multi-dimensional tensor, we need to handle each batch/sequence position
+                    if logits_shape.len() == 3 {
+                        // Shape is [batch, seq_len, vocab]
+                        let batch_size = logits_shape[0];
+                        let seq_len = logits_shape[1];
+                        for b in 0..batch_size {
+                            for s in 0..seq_len {
+                                let slice = hidden_states.select(0, b).select(0, s);
+                                slice.narrow(0, mask_start, mask_count).copy_(&mask_values);
+                            }
+                        }
+                    } else if logits_shape.len() == 2 {
+                        // Shape is [batch*seq_len, vocab] or [seq_len, vocab]
+                        let rows = logits_shape[0];
+                        for i in 0..rows {
+                            let slice = hidden_states.select(0, i);
+                            slice.narrow(0, mask_start, mask_count).copy_(&mask_values);
+                        }
+                    } else {
+                        // 1D tensor [vocab]
+                        hidden_states.narrow(0, mask_start, mask_count).copy_(&mask_values);
+                    }
+
+                    tracing::debug!(
+                        "Masked {} padded tokens (original vocab: {}, padded vocab: {})",
+                        mask_count, original_vocab_size, padded_vocab_size
+                    );
+                }
+            }
         }
 
         Ok(hidden_states)
