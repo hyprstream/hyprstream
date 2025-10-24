@@ -865,10 +865,15 @@ impl RuntimeEngine for TorchEngine {
                 input_ids.push(next_token as i64);
                 tokens_generated += 1;
 
-                // Decode token
-                let token_text = self_clone.detokenize(&[next_token as i64])?;
-                tracing::debug!("Token text: '{}'", token_text);
-                generated_text.push_str(&token_text);
+                // For byte-level tokenizers like Qwen, decode the entire sequence
+                // to properly handle multi-byte UTF-8 sequences
+                // Only decode the newly generated tokens (skip the original prompt)
+                let generated_ids = &input_ids[prompt_len..];
+                let new_generated_text = self_clone.detokenize(generated_ids)?;
+
+                // Update the generated text (this replaces the previous partial decoding)
+                generated_text = new_generated_text;
+                tracing::debug!("Generated text so far: '{}'", generated_text);
 
                 // Check stop tokens
                 if request
@@ -1199,9 +1204,19 @@ impl TorchEngine {
             // Add to sequence (now guaranteed to be valid)
             input_ids.push(next_token as i64);
 
-            // Decode token and stream it immediately
-            let token_text = self.detokenize(&[next_token as i64])?;
-            generated_text.push_str(&token_text);
+            // For byte-level tokenizers, decode the entire generated sequence
+            // to properly handle multi-byte UTF-8 sequences
+            let generated_ids = &input_ids[prompt_len..];
+            let new_generated_text = self.detokenize(generated_ids)?;
+
+            // Calculate what's new since last decode (for streaming)
+            let token_text = if new_generated_text.len() > generated_text.len() {
+                new_generated_text[generated_text.len()..].to_string()
+            } else {
+                // In rare cases with byte-level tokenizers, the text might not grow
+                // if we're in the middle of a multi-byte sequence
+                String::new()
+            };
 
             tracing::debug!(
                 "Iteration {}: generated token {} -> '{}'",
@@ -1210,8 +1225,13 @@ impl TorchEngine {
                 token_text
             );
 
-            // Stream the token immediately (real streaming)
-            callback(&token_text);
+            // Update the full generated text
+            generated_text = new_generated_text;
+
+            // Stream the new text (might be empty for incomplete UTF-8 sequences)
+            if !token_text.is_empty() {
+                callback(&token_text);
+            }
 
             // Check stop tokens
             if request
@@ -1323,12 +1343,32 @@ impl TorchEngine {
                 input_ids.push(next_token as i64);
                 tokens_generated += 1;
 
-                // Decode token
-                let token_text = self.detokenize(&[next_token as i64])?;
-                generated_text.push_str(&token_text);
+                // For byte-level tokenizers, decode the entire generated sequence
+                // to properly handle multi-byte UTF-8 sequences
+                let generated_ids = &input_ids[prompt_len..];
+                let new_generated_text = self.detokenize(generated_ids)?;
 
-                // Stream token via callback
-                match callback.on_token(&token_text).await {
+                // Calculate what's new since last decode (for streaming)
+                let token_text = if new_generated_text.len() > generated_text.len() {
+                    new_generated_text[generated_text.len()..].to_string()
+                } else {
+                    // In rare cases with byte-level tokenizers, the text might not grow
+                    // if we're in the middle of a multi-byte sequence
+                    String::new()
+                };
+
+                // Update the full generated text
+                generated_text = new_generated_text;
+
+                // Stream token via callback (only if there's actual text)
+                let continue_generation = if !token_text.is_empty() {
+                    callback.on_token(&token_text).await
+                } else {
+                    // No text to stream yet (incomplete UTF-8 sequence)
+                    Ok(ContinueGeneration::Continue)
+                };
+
+                match continue_generation {
                     Ok(ContinueGeneration::Continue) => {}
                     Ok(ContinueGeneration::Stop) => {
                         tracing::info!("Generation stopped by callback");
