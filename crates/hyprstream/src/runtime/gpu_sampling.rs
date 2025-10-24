@@ -45,18 +45,17 @@ impl GpuSampler {
         if let Some(vocab_size) = tokenizer_vocab_size {
             let model_vocab_size = logits.size()[0] as usize;
             if vocab_size < model_vocab_size {
-                // Create a mask for valid tokens (1.0 for valid, 0.0 for invalid)
-                let mut mask_values = vec![1.0f32; vocab_size];
-                mask_values.extend(vec![0.0f32; model_vocab_size - vocab_size]);
+                // Create a boolean mask for valid tokens (true for valid, false for invalid)
+                let mut mask_values = vec![true; vocab_size];
+                mask_values.extend(vec![false; model_vocab_size - vocab_size]);
 
                 let mask = Tensor::from_slice(&mask_values)
-                    .to_device(self.device)
-                    .to_kind(Kind::Float);
+                    .to_device(self.device);
 
                 // Apply mask: valid tokens keep their logits, invalid tokens get -inf
-                // where_self: if mask is true (1.0), keep original; else use -inf
+                // where_self: if mask is true, keep original; else use replacement value
                 let neg_inf = Tensor::from(-1e10f32).to_device(self.device).expand_as(&logits);
-                logits = mask.to_kind(Kind::Bool).where_self(&logits, &neg_inf);
+                logits = mask.where_self(&logits, &neg_inf);
 
                 tracing::debug!(
                     "Masked {} invalid tokens (tokenizer vocab: {}, model vocab: {})",
