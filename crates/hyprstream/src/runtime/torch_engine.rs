@@ -546,7 +546,7 @@ impl TorchEngine {
 
         // Block vision/multimodal tokens
         if token_id_u32 >= self.special_tokens.object_ref_start
-            && token_id_u32 <= self.special_tokens.thinking_start - 1 {
+            && token_id_u32 < self.special_tokens.thinking_start {
             return Some(false); // Block
         }
 
