@@ -98,7 +98,7 @@ impl<'a> GenerationCore<'a> {
                 self.engine.forward_cached(&input_ids, prompt_len + i - 1, true)?
             };
 
-            // Step 2: Sample next token using GPU sampling with new params interface
+            // Step 2: Sample next token with new params interface
             let next_token = self.engine.sample_token_with_params(
                 &logits,
                 params,
