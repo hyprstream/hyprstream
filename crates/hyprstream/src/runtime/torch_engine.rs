@@ -1142,6 +1142,10 @@ impl TorchEngine {
     }
 
     /// Internal streaming implementation
+    ///
+    /// Note: This method does not track tokens_generated count for performance reasons.
+    /// The token count is implicit in the final decoded text length. The async streaming
+    /// variant does track tokens_generated for metrics reporting.
     async fn generate_streaming_internal<F>(
         &self,
         request: GenerationRequest,
@@ -1384,12 +1388,11 @@ impl TorchEngine {
         // Apply timeout
         match timeout(context.timeout, generation_future).await {
             Ok(Ok(())) => {
-                // Success
+                // Success - determine why generation stopped
                 let finish_reason = if tokens_generated >= request.max_tokens {
                     FinishReason::MaxTokens
-                } else if self.is_eos_token(*input_ids.last().unwrap() as u32 as usize) {
-                    FinishReason::Stop
                 } else {
+                    // Generation ended for other reason (EOS, circuit breaker, or natural end)
                     FinishReason::Stop
                 };
 
