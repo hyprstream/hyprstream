@@ -365,6 +365,7 @@ impl ModelFactory {
             max_position_embeddings: config.max_position_embeddings,
             rms_norm_eps: config.rms_norm_eps,
             vocab_size: config.vocab_size,
+            original_vocab_size: config.vocab_size,  // Will be updated if padding is applied
             num_hidden_layers: config.num_hidden_layers,
             rope_theta: config.rope_theta,
             rope_scaling: None,

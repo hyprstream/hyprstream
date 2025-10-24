@@ -6,7 +6,7 @@ use crate::config::{
 use crate::runtime::generation_core::{self, GenerationCore, SamplingParams, CallbackControl};
 use crate::runtime::tensor_sampling::TensorSampler;
 use crate::runtime::template_engine::{ChatMessage, TemplateEngine};
-use crate::runtime::utf8_decoder::{IncrementalUtf8Decoder, InvalidTokenCircuitBreaker};
+use crate::runtime::utf8_decoder::IncrementalUtf8Decoder;
 use crate::runtime::RuntimeEngine;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -41,6 +41,9 @@ pub struct QwenSpecialTokens {
     pub vision_pad: u32,
     pub image_pad: u32,
     pub video_pad: u32,
+    /// Chain-of-thought reasoning tokens (Qwen 2.5+)
+    pub thinking_start: u32,  // "<|thinking_start|>"
+    pub thinking_end: u32,    // "<|thinking_end|>"
 }
 
 impl Default for QwenSpecialTokens {
@@ -58,6 +61,8 @@ impl Default for QwenSpecialTokens {
             vision_pad: 151654,
             image_pad: 151655,
             video_pad: 151656,
+            thinking_start: 151667,  // "<|thinking_start|>"
+            thinking_end: 151668,    // "<|thinking_end|>"
         }
     }
 }
@@ -137,7 +142,7 @@ impl TorchEngine {
     }
 
     /// Get cached vocabulary size without locking
-    fn get_vocab_size(&self) -> usize {
+    pub fn get_vocab_size(&self) -> usize {
         let size = self.tokenizer_vocab_size.load(Ordering::Relaxed);
         if size > 0 {
             size
@@ -528,6 +533,32 @@ impl TorchEngine {
         token_id_u32 == self.special_tokens.im_end || token_id_u32 == self.special_tokens.endoftext
     }
 
+    /// Check if a token is a special token that should be allowed/blocked
+    /// Returns None if token is normal, Some(true) if allowed, Some(false) if should stop
+    pub fn check_special_token(&self, token_id: usize) -> Option<bool> {
+        let token_id_u32 = token_id as u32;
+
+        // Allow thinking tokens (chain-of-thought reasoning)
+        if token_id_u32 == self.special_tokens.thinking_start
+            || token_id_u32 == self.special_tokens.thinking_end {
+            return Some(true); // Allow
+        }
+
+        // Block vision/multimodal tokens
+        if token_id_u32 >= self.special_tokens.object_ref_start
+            && token_id_u32 <= self.special_tokens.thinking_start - 1 {
+            return Some(false); // Block
+        }
+
+        // Block tokens beyond thinking_end (if they're in special range)
+        if token_id_u32 > self.special_tokens.thinking_end
+            && token_id_u32 < self.special_tokens.endoftext + 100 {
+            return Some(false); // Block (within special token range)
+        }
+
+        None // Normal token
+    }
+
     /// Detokenize IDs back to text - thread safe
     pub fn detokenize(&self, ids: &[i64]) -> Result<String> {
         let tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
@@ -669,14 +700,6 @@ impl TorchEngine {
         params: &generation_core::SamplingParams,
         previous_tokens: &[i64],
     ) -> Result<usize> {
-        // Get the cached tokenizer vocabulary size to mask invalid tokens
-        let vocab_size = self.get_vocab_size();
-        let tokenizer_vocab_size = if vocab_size > 0 {
-            Some(vocab_size)
-        } else {
-            None
-        };
-
         self.sampler.sample_token(
             logits_tensor,
             params.temperature,
@@ -684,7 +707,6 @@ impl TorchEngine {
             params.top_k,
             params.repeat_penalty,
             previous_tokens,
-            tokenizer_vocab_size,
         )
     }
 }
@@ -826,7 +848,7 @@ impl RuntimeEngine for TorchEngine {
             let input_ids = self_clone.tokenize(&request.prompt)?;
 
             // Create sampling parameters from request
-            let params = SamplingParams::from_request(&request, self_clone.get_vocab_size());
+            let params = SamplingParams::from_request(&request);
 
             // Use the unified GenerationCore
             let mut core = GenerationCore::new(&self_clone);
@@ -1078,7 +1100,7 @@ impl TorchEngine {
         let input_ids = self.tokenize(&request.prompt)?;
 
         // Create sampling parameters from request
-        let params = SamplingParams::from_request(&request, self.get_vocab_size());
+        let params = SamplingParams::from_request(&request);
 
         // Use the unified GenerationCore
         let mut core = GenerationCore::new(self);
@@ -1127,9 +1149,8 @@ impl TorchEngine {
         let mut tokens_generated = 0;
         let prompt_len = input_ids.len();
 
-        // Initialize incremental decoder and circuit breaker
+        // Initialize incremental decoder
         let mut decoder = IncrementalUtf8Decoder::new();
-        let mut circuit_breaker = InvalidTokenCircuitBreaker::new(10);
 
         tracing::info!(
             "Starting async generation with prompt of {} tokens",
@@ -1153,14 +1174,6 @@ impl TorchEngine {
                 };
 
                 // Sample next token
-                // Get the cached tokenizer vocabulary size to mask invalid tokens
-                let vocab_size = self.get_vocab_size();
-                let tokenizer_vocab_size = if vocab_size > 0 {
-                    Some(vocab_size)
-                } else {
-                    None
-                };
-
                 let next_token = self.sampler.sample_token(
                     &logits,
                     request.temperature,
@@ -1168,19 +1181,14 @@ impl TorchEngine {
                     request.top_k,
                     request.repeat_penalty,
                     &input_ids,
-                    tokenizer_vocab_size,
                 )?;
 
-                if next_token >= vocab_size {
-                    circuit_breaker.record_invalid(next_token, vocab_size)?;
-                    // Don't add invalid tokens to the sequence or KV cache
-                    continue;
-                }
 
-                // Valid token - reset circuit breaker
-                circuit_breaker.record_valid();
+                // NOTE: Special token handling is done in GenerationCore
+                // This method (generate_streaming_async) should eventually be refactored
+                // to use GenerationCore instead of duplicating logic
 
-                // Check EOS BEFORE decoding or adding to sequence
+                // Check EOS token
                 if self.is_eos_token(next_token) {
                     tracing::debug!("EOS token detected: {}", next_token);
                     break;

@@ -8,7 +8,7 @@ use anyhow::Result;
 
 use super::{
     torch_engine::TorchEngine,
-    utf8_decoder::{IncrementalUtf8Decoder, InvalidTokenCircuitBreaker},
+    utf8_decoder::IncrementalUtf8Decoder,
     GenerationRequest, GenerationResult, FinishReason,
 };
 
@@ -19,7 +19,6 @@ pub struct SamplingParams {
     pub top_p: f32,
     pub top_k: Option<usize>,
     pub repeat_penalty: f32,
-    pub vocab_size: Option<usize>,
 }
 
 impl SamplingParams {
@@ -35,25 +34,17 @@ impl SamplingParams {
             top_p,
             top_k,
             repeat_penalty,
-            vocab_size: None,
         }
     }
 
-    /// Create from GenerationRequest with vocab size
-    pub fn from_request(req: &GenerationRequest, vocab_size: usize) -> Self {
+    /// Create from GenerationRequest
+    pub fn from_request(req: &GenerationRequest) -> Self {
         Self {
             temperature: req.temperature,
             top_p: req.top_p,
             top_k: req.top_k,
             repeat_penalty: req.repeat_penalty,
-            vocab_size: Some(vocab_size),
         }
-    }
-
-    /// Set the vocabulary size
-    pub fn with_vocab_size(mut self, size: usize) -> Self {
-        self.vocab_size = Some(size);
-        self
     }
 }
 
@@ -68,7 +59,6 @@ pub enum CallbackControl {
 pub struct GenerationCore<'a> {
     engine: &'a TorchEngine,
     decoder: IncrementalUtf8Decoder,
-    circuit_breaker: InvalidTokenCircuitBreaker,
 }
 
 impl<'a> GenerationCore<'a> {
@@ -77,7 +67,6 @@ impl<'a> GenerationCore<'a> {
         Self {
             engine,
             decoder: IncrementalUtf8Decoder::new(),
-            circuit_breaker: InvalidTokenCircuitBreaker::new(10),
         }
     }
 
@@ -116,19 +105,35 @@ impl<'a> GenerationCore<'a> {
                 &input_ids,
             )?;
 
-            // Step 3: Validate token is within vocabulary bounds
-            if let Some(vocab_size) = params.vocab_size {
-                if next_token >= vocab_size {
-                    self.circuit_breaker.record_invalid(next_token, vocab_size)?;
-                    continue;
-                }
-            }
-            self.circuit_breaker.record_valid();
-
             // Step 4: Check for EOS token
             if self.engine.is_eos_token(next_token) {
                 tracing::debug!("EOS token detected: {}", next_token);
                 break;
+            }
+
+            // Step 4b: Check if token is a special token using model-specific rules
+            match self.engine.check_special_token(next_token) {
+                Some(true) => {
+                    // Special token that's allowed (e.g., thinking tokens)
+                    tracing::debug!("Generated allowed special token: {}", next_token);
+                }
+                Some(false) => {
+                    // Special token that should stop generation (e.g., vision tokens)
+                    tracing::warn!("Generated blocked special token {}, stopping generation", next_token);
+                    break;
+                }
+                None => {
+                    // Normal token, continue
+                }
+            }
+
+            // Step 4c: Check if token is beyond the tokenizer's vocabulary
+            // Note: With vocabulary padding, the model may have a larger vocab than the tokenizer
+            // We rely on proper initialization of padded entries with -1e10 to prevent their generation
+            let vocab_size = self.engine.get_vocab_size();
+            if vocab_size > 0 && next_token >= vocab_size {
+                // Log but don't stop - the tokenizer might handle it or return a replacement character
+                tracing::debug!("Generated token {} is beyond tokenizer vocab size {}", next_token, vocab_size);
             }
 
             // Step 5: Add token to sequence
@@ -190,6 +195,5 @@ impl<'a> GenerationCore<'a> {
     /// Reset the generation state for reuse
     pub fn reset(&mut self) {
         self.decoder = IncrementalUtf8Decoder::new();
-        self.circuit_breaker = InvalidTokenCircuitBreaker::new(10);
     }
 }

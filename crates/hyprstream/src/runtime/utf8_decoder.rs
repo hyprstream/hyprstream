@@ -58,9 +58,30 @@ impl IncrementalUtf8Decoder {
         // Decode the full sequence
         let new_full_text = decode_fn(&self.all_tokens)?;
 
-        // Extract the new portion
+        // Extract the new portion (handle UTF-8 char boundaries properly)
         let new_text = if new_full_text.len() > self.previous_text_len {
-            new_full_text[self.previous_text_len..].to_string()
+            // Find a valid UTF-8 boundary at or after previous_text_len
+            let start_byte = if self.previous_text_len <= new_full_text.len() {
+                // Check if we're at a valid boundary
+                if new_full_text.is_char_boundary(self.previous_text_len) {
+                    self.previous_text_len
+                } else {
+                    // Find the next valid boundary
+                    let mut boundary = self.previous_text_len;
+                    while boundary < new_full_text.len() && !new_full_text.is_char_boundary(boundary) {
+                        boundary += 1;
+                    }
+                    boundary
+                }
+            } else {
+                new_full_text.len()
+            };
+
+            if start_byte < new_full_text.len() {
+                new_full_text[start_byte..].to_string()
+            } else {
+                String::new()
+            }
         } else {
             // Text didn't grow - incomplete UTF-8 sequence
             String::new()
@@ -90,69 +111,6 @@ impl Default for IncrementalUtf8Decoder {
     }
 }
 
-/// Circuit breaker for preventing infinite loops from invalid tokens
-#[derive(Debug)]
-pub struct InvalidTokenCircuitBreaker {
-    /// Maximum consecutive invalid tokens before failing
-    max_invalid: usize,
-
-    /// Current count of consecutive invalid tokens
-    consecutive_invalid: usize,
-
-    /// Total invalid tokens seen
-    total_invalid: usize,
-}
-
-impl InvalidTokenCircuitBreaker {
-    /// Create a new circuit breaker
-    pub fn new(max_consecutive: usize) -> Self {
-        Self {
-            max_invalid: max_consecutive,
-            consecutive_invalid: 0,
-            total_invalid: 0,
-        }
-    }
-
-    /// Record a valid token
-    pub fn record_valid(&mut self) {
-        self.consecutive_invalid = 0;
-    }
-
-    /// Record an invalid token and check if we should fail
-    ///
-    /// Returns Err if too many consecutive invalid tokens
-    pub fn record_invalid(&mut self, token_id: usize, vocab_size: usize) -> Result<()> {
-        self.consecutive_invalid += 1;
-        self.total_invalid += 1;
-
-        if self.consecutive_invalid >= self.max_invalid {
-            anyhow::bail!(
-                "Too many consecutive invalid tokens ({} consecutive, {} total). \
-                 Last invalid token: {} (vocab_size: {}). \
-                 Model may be misconfigured or corrupted.",
-                self.consecutive_invalid,
-                self.total_invalid,
-                token_id,
-                vocab_size
-            );
-        }
-
-        tracing::warn!(
-            "Invalid token {} sampled (vocab_size: {}), consecutive: {}, total: {}",
-            token_id,
-            vocab_size,
-            self.consecutive_invalid,
-            self.total_invalid
-        );
-
-        Ok(())
-    }
-
-    /// Get metrics for monitoring
-    pub fn get_metrics(&self) -> (usize, usize) {
-        (self.consecutive_invalid, self.total_invalid)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -186,22 +144,4 @@ mod tests {
         assert_eq!(result, "你好");
     }
 
-    #[test]
-    fn test_circuit_breaker() {
-        let mut breaker = InvalidTokenCircuitBreaker::new(3);
-
-        // Record some invalid tokens
-        breaker.record_invalid(100, 50).unwrap();
-        breaker.record_invalid(101, 50).unwrap();
-
-        // Reset with valid token
-        breaker.record_valid();
-        assert_eq!(breaker.consecutive_invalid, 0);
-
-        // Hit the limit
-        breaker.record_invalid(102, 50).unwrap();
-        breaker.record_invalid(103, 50).unwrap();
-        let result = breaker.record_invalid(104, 50);
-        assert!(result.is_err());
-    }
 }

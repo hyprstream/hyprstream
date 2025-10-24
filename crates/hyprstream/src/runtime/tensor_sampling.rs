@@ -11,12 +11,6 @@ use tch::{Device, Kind, Tensor};
 
 use super::generation_core::SamplingParams;
 
-/// Large negative value to effectively mask invalid logits.
-/// This value is large enough to make probability ~0 after softmax,
-/// but not so large as to cause numerical overflow in exp() computation.
-/// -1e10 ensures exp(-1e10) ≈ 0 without triggering underflow exceptions.
-const LOGIT_MASK_VALUE: f64 = -1e10;
-
 /// Device-agnostic token sampler operating on tensors
 ///
 /// Performs all sampling operations (temperature scaling, top-k filtering,
@@ -46,11 +40,10 @@ impl TensorSampler {
             params.top_k,
             params.repeat_penalty,
             previous_tokens,
-            params.vocab_size,
         )
     }
 
-    /// Sample next token directly from GPU logits tensor (legacy interface)
+    /// Sample next token directly from GPU logits tensor
     pub fn sample_token(
         &self,
         logits_tensor: &Tensor, // [1, vocab_size] tensor on GPU
@@ -59,7 +52,6 @@ impl TensorSampler {
         top_k: Option<usize>,
         repeat_penalty: f32,
         previous_tokens: &[i64],
-        tokenizer_vocab_size: Option<usize>,
     ) -> Result<usize> {
         // Ensure logits are on the correct device and squeezed to 1D
         // Convert to Float for sampling operations
@@ -70,33 +62,6 @@ impl TensorSampler {
         }
         .to_device(self.device)
         .to_kind(Kind::Float);
-
-        // Step 0: Mask invalid tokens BEFORE any processing
-        // This ensures invalid tokens can never be sampled
-        if let Some(vocab_size) = tokenizer_vocab_size {
-            let model_vocab_size = logits.size()[0] as usize;
-            if vocab_size < model_vocab_size {
-                // Simpler approach: directly set invalid token logits to -inf
-                // Create indices for invalid tokens
-                let invalid_start = vocab_size as i64;
-                let invalid_count = (model_vocab_size - vocab_size) as i64;
-
-                if invalid_count > 0 {
-                    // Set logits for invalid tokens to mask value
-                    let neg_inf_tensor = Tensor::full(&[invalid_count], LOGIT_MASK_VALUE, (Kind::Float, self.device));
-
-                    // Use narrow and copy_ to update the invalid token range
-                    logits.narrow(0, invalid_start, invalid_count).copy_(&neg_inf_tensor);
-                }
-
-                tracing::debug!(
-                    "Masked {} invalid tokens (tokenizer vocab: {}, model vocab: {})",
-                    model_vocab_size - vocab_size,
-                    vocab_size,
-                    model_vocab_size
-                );
-            }
-        }
 
         // Step 1: Apply repetition penalty on GPU
         let penalized_logits =
@@ -331,7 +296,6 @@ mod tests {
             None,
             1.0,
             &[],
-            None,
         ).unwrap();
 
         // Should select token 4 (highest logit = 5.0)
@@ -355,25 +319,6 @@ mod tests {
         assert_eq!(filtered_vec[4], 0.0); // masked
     }
 
-    #[test]
-    fn test_invalid_token_masking() {
-        let sampler = TensorSampler::new(Device::Cpu);
-        let logits = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0]);
-
-        let params = SamplingParams {
-            temperature: 1.0,
-            top_p: 1.0,
-            top_k: None,
-            repeat_penalty: 1.0,
-            vocab_size: Some(3), // Only first 3 tokens valid
-        };
-
-        // Run sampling many times to ensure we never get invalid tokens
-        for _ in 0..100 {
-            let token = sampler.sample_with_params(&logits, &params, &[]).unwrap();
-            assert!(token < 3, "Sampled invalid token: {}", token);
-        }
-    }
 
     #[test]
     fn test_repetition_penalty() {
@@ -388,7 +333,6 @@ mod tests {
             None,
             10.0,  // High penalty
             &[4],  // Previous token was 4
-            None,
         ).unwrap();
 
         // Should NOT select token 4 despite it having highest logit
@@ -403,7 +347,7 @@ mod tests {
 
         // Operations should stay on CPU
         let logits = Tensor::randn(&[100], (Kind::Float, Device::Cpu));
-        let _ = cpu_sampler.sample_token(&logits, 1.0, 1.0, None, 1.0, &[], None);
+        let _ = cpu_sampler.sample_token(&logits, 1.0, 1.0, None, 1.0, &[]);
         // No panic = success (tensor device mismatch would panic)
     }
 }
