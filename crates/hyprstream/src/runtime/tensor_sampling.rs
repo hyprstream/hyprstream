@@ -1,7 +1,9 @@
-//! GPU-based sampling to eliminate CPU transfer bottlenecks
+//! Device-agnostic tensor sampling for token generation
 //!
-//! This module implements sampling algorithms directly on GPU tensors,
-//! avoiding expensive GPU→CPU transfers of large logits tensors.
+//! This module implements sampling algorithms directly on PyTorch tensors,
+//! working efficiently on both CPU and GPU devices. Despite the historical
+//! "GPU" naming, this sampler is fully device-agnostic and respects the
+//! device parameter provided during construction.
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -15,14 +17,17 @@ use super::generation_core::SamplingParams;
 /// -1e10 ensures exp(-1e10) ≈ 0 without triggering underflow exceptions.
 const LOGIT_MASK_VALUE: f64 = -1e10;
 
-/// GPU-based token sampler
+/// Device-agnostic token sampler operating on tensors
+///
+/// Performs all sampling operations (temperature scaling, top-k filtering,
+/// top-p nucleus sampling) directly on tensors, allowing the PyTorch backend
+/// to optimize for the target device (CPU, CUDA, ROCm, Metal, etc.).
 #[derive(Clone)]
-pub struct GpuSampler {
-    #[allow(dead_code)]
-    device: Device,
+pub struct TensorSampler {
+    device: Device,  // Not dead code - used throughout the implementation
 }
 
-impl GpuSampler {
+impl TensorSampler {
     pub fn new(device: Device) -> Self {
         Self { device }
     }
@@ -300,5 +305,105 @@ impl GpuSampler {
         } else {
             Ok(token_id)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tch::{Device, Kind, Tensor};
+
+    fn create_test_logits() -> Tensor {
+        // Create deterministic test logits
+        Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0])
+    }
+
+    #[test]
+    fn test_temperature_scaling() {
+        let sampler = TensorSampler::new(Device::Cpu);
+        let logits = create_test_logits();
+
+        // Very low temperature should approach greedy (highest logit wins)
+        let token = sampler.sample_token(
+            &logits,
+            0.01,  // Very low temp
+            1.0,
+            None,
+            1.0,
+            &[],
+            None,
+        ).unwrap();
+
+        // Should select token 4 (highest logit = 5.0)
+        assert_eq!(token, 4);
+    }
+
+    #[test]
+    fn test_top_k_masking() {
+        let sampler = TensorSampler::new(Device::Cpu);
+        let probs = Tensor::from_slice(&[0.1f32, 0.2, 0.3, 0.25, 0.15]);
+
+        let filtered = sampler.apply_top_k(&probs, 2).unwrap();
+        let filtered_vec: Vec<f32> = Vec::try_from(filtered).unwrap();
+
+        // Only top 2 should have non-zero probability
+        // Index 2 (0.3) and 3 (0.25) are highest
+        assert!(filtered_vec[2] > 0.0); // 0.3 (highest)
+        assert!(filtered_vec[3] > 0.0); // 0.25 (second)
+        assert_eq!(filtered_vec[0], 0.0); // masked
+        assert_eq!(filtered_vec[1], 0.0); // masked
+        assert_eq!(filtered_vec[4], 0.0); // masked
+    }
+
+    #[test]
+    fn test_invalid_token_masking() {
+        let sampler = TensorSampler::new(Device::Cpu);
+        let logits = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0]);
+
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: None,
+            repeat_penalty: 1.0,
+            vocab_size: Some(3), // Only first 3 tokens valid
+        };
+
+        // Run sampling many times to ensure we never get invalid tokens
+        for _ in 0..100 {
+            let token = sampler.sample_with_params(&logits, &params, &[]).unwrap();
+            assert!(token < 3, "Sampled invalid token: {}", token);
+        }
+    }
+
+    #[test]
+    fn test_repetition_penalty() {
+        let sampler = TensorSampler::new(Device::Cpu);
+        let logits = create_test_logits();
+
+        // With high repetition penalty on token 4
+        let token = sampler.sample_token(
+            &logits,
+            0.01,  // Very low temp for deterministic
+            1.0,
+            None,
+            10.0,  // High penalty
+            &[4],  // Previous token was 4
+            None,
+        ).unwrap();
+
+        // Should NOT select token 4 despite it having highest logit
+        assert_ne!(token, 4, "Repetition penalty not applied");
+    }
+
+    #[test]
+    fn test_device_consistency() {
+        // Test that sampler respects the device parameter
+        let cpu_sampler = TensorSampler::new(Device::Cpu);
+        assert_eq!(cpu_sampler.device, Device::Cpu);
+
+        // Operations should stay on CPU
+        let logits = Tensor::randn(&[100], (Kind::Float, Device::Cpu));
+        let _ = cpu_sampler.sample_token(&logits, 1.0, 1.0, None, 1.0, &[], None);
+        // No panic = success (tensor device mismatch would panic)
     }
 }

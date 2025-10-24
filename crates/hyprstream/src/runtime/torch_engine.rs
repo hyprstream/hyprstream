@@ -4,7 +4,7 @@ use crate::config::{
     FinishReason, GenerationConfig, GenerationRequest, GenerationResult, ModelInfo, RuntimeConfig,
 };
 use crate::runtime::generation_core::{self, GenerationCore, SamplingParams, CallbackControl};
-use crate::runtime::gpu_sampling::GpuSampler;
+use crate::runtime::tensor_sampling::TensorSampler;
 use crate::runtime::template_engine::{ChatMessage, TemplateEngine};
 use crate::runtime::utf8_decoder::{IncrementalUtf8Decoder, InvalidTokenCircuitBreaker};
 use crate::runtime::RuntimeEngine;
@@ -113,7 +113,7 @@ pub struct TorchEngine {
     #[allow(dead_code)]
     sampling_config: RuntimeConfig,
     /// GPU sampler for efficient token sampling - thread safe after initialization
-    gpu_sampler: GpuSampler,
+    sampler: TensorSampler,  // Renamed from gpu_sampler - works on both CPU and GPU
     /// Qwen special tokens for proper conversation handling - immutable after construction
     special_tokens: QwenSpecialTokens,
     /// Cached tokenizer vocabulary size for lock-free access
@@ -219,7 +219,7 @@ impl TorchEngine {
             lora_model: Arc::new(Mutex::new(None)),
             lora_trainer: Arc::new(Mutex::new(None)),
             sampling_config: config,
-            gpu_sampler: GpuSampler::new(device),
+            sampler: TensorSampler::new(device),
             special_tokens: QwenSpecialTokens::default(),
             tokenizer_vocab_size: Arc::new(AtomicUsize::new(0)),
         })
@@ -662,31 +662,11 @@ impl TorchEngine {
         Ok(last_token_logits)
     }
 
-    /// Sample next token using bundled parameters (new interface)
+    /// Sample next token using bundled parameters
     pub fn sample_token_with_params(
         &self,
         logits_tensor: &Tensor,
         params: &generation_core::SamplingParams,
-        previous_tokens: &[i64],
-    ) -> Result<usize> {
-        self.sample_token_gpu(
-            logits_tensor,
-            params.temperature,
-            params.top_p,
-            params.top_k,
-            params.repeat_penalty,
-            previous_tokens,
-        )
-    }
-
-    /// Sample next token from GPU logits tensor (legacy interface)
-    fn sample_token_gpu(
-        &self,
-        logits_tensor: &Tensor,
-        temperature: f32,
-        top_p: f32,
-        top_k: Option<usize>,
-        repeat_penalty: f32,
         previous_tokens: &[i64],
     ) -> Result<usize> {
         // Get the cached tokenizer vocabulary size to mask invalid tokens
@@ -697,12 +677,12 @@ impl TorchEngine {
             None
         };
 
-        self.gpu_sampler.sample_token(
+        self.sampler.sample_token(
             logits_tensor,
-            temperature,
-            top_p,
-            top_k,
-            repeat_penalty,
+            params.temperature,
+            params.top_p,
+            params.top_k,
+            params.repeat_penalty,
             previous_tokens,
             tokenizer_vocab_size,
         )
@@ -1173,18 +1153,23 @@ impl TorchEngine {
                 };
 
                 // Sample next token
-                let next_token = self.sample_token_gpu(
+                // Get the cached tokenizer vocabulary size to mask invalid tokens
+                let vocab_size = self.get_vocab_size();
+                let tokenizer_vocab_size = if vocab_size > 0 {
+                    Some(vocab_size)
+                } else {
+                    None
+                };
+
+                let next_token = self.sampler.sample_token(
                     &logits,
                     request.temperature,
                     request.top_p,
                     request.top_k,
                     request.repeat_penalty,
                     &input_ids,
+                    tokenizer_vocab_size,
                 )?;
-
-                // Validate token is within vocabulary bounds
-                // Use cached tokenizer vocabulary size for lock-free access
-                let vocab_size = self.get_vocab_size();
 
                 if next_token >= vocab_size {
                     circuit_breaker.record_invalid(next_token, vocab_size)?;
