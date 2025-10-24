@@ -32,7 +32,7 @@ impl GpuSampler {
     ) -> Result<usize> {
         // Ensure logits are on the correct device and squeezed to 1D
         // Convert to Float for sampling operations
-        let mut logits = if logits_tensor.dim() > 1 {
+        let logits = if logits_tensor.dim() > 1 {
             logits_tensor.squeeze_dim(0) // [vocab_size]
         } else {
             logits_tensor.shallow_clone()
@@ -45,17 +45,19 @@ impl GpuSampler {
         if let Some(vocab_size) = tokenizer_vocab_size {
             let model_vocab_size = logits.size()[0] as usize;
             if vocab_size < model_vocab_size {
-                // Create a boolean mask for valid tokens (true for valid, false for invalid)
-                let mut mask_values = vec![true; vocab_size];
-                mask_values.extend(vec![false; model_vocab_size - vocab_size]);
+                // Simpler approach: directly set invalid token logits to -inf
+                // Create indices for invalid tokens
+                let invalid_start = vocab_size as i64;
+                let invalid_count = (model_vocab_size - vocab_size) as i64;
 
-                let mask = Tensor::from_slice(&mask_values)
-                    .to_device(self.device);
+                if invalid_count > 0 {
+                    // Set logits for invalid tokens to -inf
+                    let neg_inf_value = -1e10f64;  // Use f64 for Scalar trait
+                    let neg_inf_tensor = Tensor::full(&[invalid_count], neg_inf_value, (Kind::Float, self.device));
 
-                // Apply mask: valid tokens keep their logits, invalid tokens get -inf
-                // where_self: if mask is true, keep original; else use replacement value
-                let neg_inf = Tensor::from(-1e10f32).to_device(self.device).expand_as(&logits);
-                logits = mask.where_self(&logits, &neg_inf);
+                    // Use narrow and copy_ to update the invalid token range
+                    logits.narrow(0, invalid_start, invalid_count).copy_(&neg_inf_tensor);
+                }
 
                 tracing::debug!(
                     "Masked {} invalid tokens (tokenizer vocab: {}, model vocab: {})",
