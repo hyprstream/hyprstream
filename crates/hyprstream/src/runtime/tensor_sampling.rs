@@ -43,7 +43,7 @@ impl TensorSampler {
         )
     }
 
-    /// Sample next token directly from GPU logits tensor
+    /// Sample next token directly from logits tensor
     pub fn sample_token(
         &self,
         logits_tensor: &Tensor, // [1, vocab_size] tensor on GPU
