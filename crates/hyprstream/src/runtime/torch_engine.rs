@@ -3,6 +3,7 @@
 use crate::config::{
     FinishReason, GenerationConfig, GenerationRequest, GenerationResult, ModelInfo, RuntimeConfig,
 };
+use crate::runtime::generation_core::{self, GenerationCore, SamplingParams, CallbackControl};
 use crate::runtime::gpu_sampling::GpuSampler;
 use crate::runtime::template_engine::{ChatMessage, TemplateEngine};
 use crate::runtime::utf8_decoder::{IncrementalUtf8Decoder, InvalidTokenCircuitBreaker};
@@ -521,14 +522,14 @@ impl TorchEngine {
     }
 
     /// Check if a token ID is a special EOS token for Qwen
-    fn is_eos_token(&self, token_id: usize) -> bool {
+    pub fn is_eos_token(&self, token_id: usize) -> bool {
         let token_id_u32 = token_id as u32;
         // Qwen can end on either im_end (for conversations) or endoftext (for completion)
         token_id_u32 == self.special_tokens.im_end || token_id_u32 == self.special_tokens.endoftext
     }
 
     /// Detokenize IDs back to text - thread safe
-    fn detokenize(&self, ids: &[i64]) -> Result<String> {
+    pub fn detokenize(&self, ids: &[i64]) -> Result<String> {
         let tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
         let tokenizer = tokenizer_guard
             .as_ref()
@@ -562,7 +563,7 @@ impl TorchEngine {
     }
 
     /// Run inference on the model (supports both TorchScript and VarStore models) - thread safe
-    fn forward(&self, input_ids: &[i64]) -> Result<Tensor> {
+    pub fn forward(&self, input_ids: &[i64]) -> Result<Tensor> {
         // Try VarStore-based inference first (preferred for SafeTensors models)
         if self.has_varstore() {
             return self.forward_varstore(input_ids);
@@ -613,7 +614,7 @@ impl TorchEngine {
     }
 
     /// Run optimized inference with KV caching - only process new tokens
-    fn forward_cached(
+    pub fn forward_cached(
         &self,
         input_ids: &[i64],
         start_pos: usize,
@@ -661,7 +662,24 @@ impl TorchEngine {
         Ok(last_token_logits)
     }
 
-    /// Sample next token from GPU logits tensor
+    /// Sample next token using bundled parameters (new interface)
+    pub fn sample_token_with_params(
+        &self,
+        logits_tensor: &Tensor,
+        params: &generation_core::SamplingParams,
+        previous_tokens: &[i64],
+    ) -> Result<usize> {
+        self.sample_token_gpu(
+            logits_tensor,
+            params.temperature,
+            params.top_p,
+            params.top_k,
+            params.repeat_penalty,
+            previous_tokens,
+        )
+    }
+
+    /// Sample next token from GPU logits tensor (legacy interface)
     fn sample_token_gpu(
         &self,
         logits_tensor: &Tensor,
@@ -824,97 +842,19 @@ impl RuntimeEngine for TorchEngine {
                 ));
             }
 
-            let start_time = std::time::Instant::now();
-
             // Tokenize input
-            let mut input_ids = self_clone.tokenize(&request.prompt)?;
-            let mut tokens_generated = 0;
-            let prompt_len = input_ids.len();
+            let input_ids = self_clone.tokenize(&request.prompt)?;
 
-            // Initialize incremental decoder and circuit breaker
-            let mut decoder = IncrementalUtf8Decoder::new();
-            let mut circuit_breaker = InvalidTokenCircuitBreaker::new(10);
+            // Create sampling parameters from request
+            let params = SamplingParams::from_request(&request, self_clone.get_vocab_size());
 
-            for i in 0..request.max_tokens {
-                // Use KV cached forward pass after first iteration
-                let logits = if i == 0 {
-                    // First pass: process entire prompt
-                    self_clone.forward(&input_ids)?
-                } else {
-                    // Subsequent passes: only process new token with KV cache
-                    self_clone.forward_cached(&input_ids, prompt_len + i - 1, true)?
-                };
+            // Use the unified GenerationCore
+            let mut core = GenerationCore::new(&self_clone);
 
-                // Sample next token with proper parameters
-                let next_token = self_clone.sample_token_gpu(
-                    &logits,
-                    request.temperature,
-                    request.top_p,
-                    request.top_k,
-                    request.repeat_penalty,
-                    &input_ids,
-                )?;
-
-                tracing::debug!("Sampled token ID: {}", next_token);
-
-                // Validate token is within vocabulary bounds
-                // Use cached tokenizer vocabulary size for lock-free access
-                let vocab_size = self_clone.get_vocab_size();
-
-                if next_token >= vocab_size {
-                    circuit_breaker.record_invalid(next_token, vocab_size)?;
-                    // Don't add invalid tokens to the sequence or KV cache
-                    continue;
-                }
-
-                // Valid token - reset circuit breaker
-                circuit_breaker.record_valid();
-
-                // Check EOS BEFORE decoding or adding to sequence
-                if self_clone.is_eos_token(next_token) {
-                    tracing::debug!("EOS token detected: {}", next_token);
-                    break;
-                }
-
-                // Add to sequence (now guaranteed to be valid)
-                input_ids.push(next_token as i64);
-                tokens_generated += 1;
-
-                // Use incremental decoder for efficient UTF-8 handling
-                let new_text = decoder.push_token_simple(next_token as i64, |tokens| {
-                    // Decode just the generated tokens (not the prompt)
-                    let mut full_ids = Vec::with_capacity(prompt_len + tokens.len());
-                    full_ids.extend(&input_ids[..prompt_len]);
-                    full_ids.extend(tokens);
-                    self_clone.detokenize(&full_ids[prompt_len..])
-                })?;
-
-                if !new_text.is_empty() {
-                    tracing::debug!("New text: '{}'", new_text);
-                }
-
-                // Check stop tokens
-                if request
-                    .stop_tokens
-                    .iter()
-                    .any(|stop| decoder.get_text().contains(stop))
-                {
-                    break;
-                }
-            }
-
-            let generation_time = start_time.elapsed();
-
-            Ok(GenerationResult {
-                text: decoder.get_text().to_string(),
-                tokens_generated,
-                finish_reason: if tokens_generated >= request.max_tokens {
-                    FinishReason::MaxTokens
-                } else {
-                    FinishReason::EndOfSequence
-                },
-                generation_time_ms: generation_time.as_millis() as u64,
-                tokens_per_second: tokens_generated as f32 / generation_time.as_secs_f32(),
+            // Generate with no-op callback (blocking mode doesn't stream)
+            core.generate_tokens(input_ids, &params, &request, |_text| {
+                // Blocking mode: ignore intermediate text
+                Ok(CallbackControl::Continue)
             })
         });
 
@@ -1154,101 +1094,23 @@ impl TorchEngine {
     where
         F: FnMut(&str),
     {
-        let prompt = &request.prompt;
-        let max_tokens = request.max_tokens;
-        let temperature = request.temperature;
-        let top_p = request.top_p;
-        let top_k = request.top_k;
-        let repeat_penalty = request.repeat_penalty;
-
-        // REAL streaming: generate tokens one by one and call callback for each
-        let _start_time = std::time::Instant::now();
-
         // Tokenize input
-        let mut input_ids = self.tokenize(prompt)?;
-        let prompt_len = input_ids.len();
+        let input_ids = self.tokenize(&request.prompt)?;
 
-        // Initialize incremental decoder and circuit breaker
-        let mut decoder = IncrementalUtf8Decoder::new();
-        let mut circuit_breaker = InvalidTokenCircuitBreaker::new(10);
+        // Create sampling parameters from request
+        let params = SamplingParams::from_request(&request, self.get_vocab_size());
 
-        tracing::info!("Starting generation with prompt of {} tokens", prompt_len);
-        tracing::debug!("Initial token IDs: {:?}", &input_ids[..prompt_len.min(20)]);
+        // Use the unified GenerationCore
+        let mut core = GenerationCore::new(self);
 
-        for i in 0..max_tokens {
-            // Use KV cached forward pass after first iteration
-            let logits = if i == 0 {
-                // First pass: process entire prompt
-                self.forward(&input_ids)?
-            } else {
-                // Subsequent passes: only process new token with KV cache
-                // Position is prompt_len + (i-1) since we're processing the token generated in the previous iteration
-                self.forward_cached(&input_ids, prompt_len + i - 1, true)?
-            };
+        // Generate with streaming callback
+        let result = core.generate_tokens(input_ids, &params, &request, |text| {
+            // Stream each piece of new text
+            callback(text);
+            Ok(CallbackControl::Continue)
+        })?;
 
-            // Sample next token
-            let next_token = self.sample_token_gpu(
-                &logits,
-                temperature,
-                top_p,
-                top_k,
-                repeat_penalty,
-                &input_ids,
-            )?;
-
-            // Validate token is within vocabulary bounds
-            // Use cached tokenizer vocabulary size for lock-free access
-            let vocab_size = self.get_vocab_size();
-
-            if next_token >= vocab_size {
-                circuit_breaker.record_invalid(next_token, vocab_size)?;
-                // Don't add invalid tokens to the sequence or KV cache
-                continue;
-            }
-
-            // Valid token - reset circuit breaker
-            circuit_breaker.record_valid();
-
-            // Check EOS BEFORE decoding or adding to sequence
-            if self.is_eos_token(next_token) {
-                tracing::debug!("EOS token detected: {}", next_token);
-                break;
-            }
-
-            // Add to sequence (now guaranteed to be valid)
-            input_ids.push(next_token as i64);
-
-            // Use incremental decoder for efficient UTF-8 handling
-            let new_text = decoder.push_token_simple(next_token as i64, |tokens| {
-                // Decode just the generated tokens (not the prompt)
-                let mut full_ids = Vec::with_capacity(prompt_len + tokens.len());
-                full_ids.extend(&input_ids[..prompt_len]);
-                full_ids.extend(tokens);
-                self.detokenize(&full_ids[prompt_len..])
-            })?;
-
-            if !new_text.is_empty() {
-                tracing::debug!(
-                    "Iteration {}: generated token {} -> '{}'",
-                    i,
-                    next_token,
-                    new_text
-                );
-                // Stream the new text
-                callback(&new_text);
-            }
-
-            // Check stop tokens
-            if request
-                .stop_tokens
-                .iter()
-                .any(|stop| decoder.get_text().contains(stop))
-            {
-                break;
-            }
-        }
-
-        Ok(decoder.get_text().to_string())
+        Ok(result.text)
     }
 
     /// Check if persistent model is initialized - thread safe
@@ -1263,6 +1125,9 @@ impl TorchEngine {
     }
 
     /// Generate text with async streaming callback
+    ///
+    /// This method handles async callbacks with cancellation support.
+    /// It uses a channel to bridge between the sync generation core and async callbacks.
     pub async fn generate_streaming_async(
         &self,
         request: GenerationRequest,

@@ -7,6 +7,8 @@ use anyhow::Result;
 use std::collections::HashMap;
 use tch::{Device, Kind, Tensor};
 
+use super::generation_core::SamplingParams;
+
 /// Large negative value to effectively mask invalid logits.
 /// This value is large enough to make probability ~0 after softmax,
 /// but not so large as to cause numerical overflow in exp() computation.
@@ -25,7 +27,25 @@ impl GpuSampler {
         Self { device }
     }
 
-    /// Sample next token directly from GPU logits tensor
+    /// Sample next token using bundled parameters (new interface)
+    pub fn sample_with_params(
+        &self,
+        logits_tensor: &Tensor,
+        params: &SamplingParams,
+        previous_tokens: &[i64],
+    ) -> Result<usize> {
+        self.sample_token(
+            logits_tensor,
+            params.temperature,
+            params.top_p,
+            params.top_k,
+            params.repeat_penalty,
+            previous_tokens,
+            params.vocab_size,
+        )
+    }
+
+    /// Sample next token directly from GPU logits tensor (legacy interface)
     pub fn sample_token(
         &self,
         logits_tensor: &Tensor, // [1, vocab_size] tensor on GPU
