@@ -105,42 +105,36 @@ impl<'a> GenerationCore<'a> {
                 &input_ids,
             )?;
 
-            // Step 4: Check for EOS token
+            // Step 3: Validate token BEFORE adding to context
+
+            // Check if token is beyond the tokenizer's vocabulary
+            // Tokens beyond vocab size indicate a bug in sampling or model configuration
+            let vocab_size = self.engine.get_vocab_size();
+            if vocab_size > 0 && next_token >= vocab_size {
+                tracing::error!(
+                    "Generated token {} exceeds vocabulary size {}. This indicates a bug in model initialization or sampling.",
+                    next_token, vocab_size
+                );
+                return Err(anyhow::anyhow!(
+                    "Generated out-of-vocabulary token {}: exceeds vocab size {}",
+                    next_token,
+                    vocab_size
+                ));
+            }
+
+            // Check for EOS token from model config
             if self.engine.is_eos_token(next_token) {
                 tracing::debug!("EOS token detected: {}", next_token);
                 break;
             }
 
-            // Step 4b: Check if token is a special token using model-specific rules
-            match self.engine.check_special_token(next_token) {
-                Some(true) => {
-                    // Special token that's allowed (e.g., thinking tokens)
-                    tracing::debug!("Generated allowed special token: {}", next_token);
-                }
-                Some(false) => {
-                    // Special token that should stop generation (e.g., vision tokens)
-                    tracing::warn!("Generated blocked special token {}, stopping generation", next_token);
-                    break;
-                }
-                None => {
-                    // Normal token, continue
-                }
-            }
-
-            // Step 4c: Check if token is beyond the tokenizer's vocabulary
-            // Note: With vocabulary padding, the model may have a larger vocab than the tokenizer
-            // We rely on proper initialization of padded entries with -1e10 to prevent their generation
-            let vocab_size = self.engine.get_vocab_size();
-            if vocab_size > 0 && next_token >= vocab_size {
-                // Log but don't stop - the tokenizer might handle it or return a replacement character
-                tracing::debug!("Generated token {} is beyond tokenizer vocab size {}", next_token, vocab_size);
-            }
-
-            // Step 5: Add token to sequence
+            // Step 4: Add token to sequence ONLY after validation
             input_ids.push(next_token as i64);
             tokens_generated += 1;
 
-            // Step 6: Decode new text incrementally
+            // Step 5: Decode new text incrementally using custom decoder
+            // Note: Using IncrementalUtf8Decoder due to tokenizers 0.20.4 DecodeStream bugs
+            // TODO: Upgrade to tokenizers 0.22.1+ to use native DecodeStream API for O(1) decoding
             let new_text = self.decoder.push_token_simple(next_token as i64, |tokens| {
                 let mut full_ids = Vec::with_capacity(prompt_len + tokens.len());
                 full_ids.extend(&input_ids[..prompt_len]);
@@ -148,7 +142,7 @@ impl<'a> GenerationCore<'a> {
                 self.engine.detokenize(&full_ids[prompt_len..])
             })?;
 
-            // Step 7: Call callback with new text (if any)
+            // Step 6: Call callback with new text (if any)
             if !new_text.is_empty() {
                 match callback(&new_text)? {
                     CallbackControl::Continue => {},
@@ -156,9 +150,14 @@ impl<'a> GenerationCore<'a> {
                 }
             }
 
-            // Step 8: Check for stop tokens
-            if request.stop_tokens.iter().any(|stop| self.decoder.get_text().contains(stop)) {
-                tracing::debug!("Stop token detected");
+            // Step 7: Check for stop tokens at the end of generated text
+            // We check if any stop token appears at the end to avoid false positives
+            if request
+                .stop_tokens
+                .iter()
+                .any(|stop| !stop.is_empty() && self.decoder.get_text().contains(stop))
+            {
+                tracing::debug!("Stop token detected in generated text");
                 break;
             }
         }
