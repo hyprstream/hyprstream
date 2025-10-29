@@ -214,7 +214,8 @@ impl<'a> CloneBuilder<'a> {
         tracing::debug!("Default branch detected: {}", default_branch);
 
         // Create initial worktree for the default branch
-        let initial_worktree = safe_path::scoped_join(&worktrees_dir, &default_branch)
+        let worktree_branch_path = get_worktree_branch_path(&default_branch);
+        let initial_worktree = safe_path::scoped_join(&worktrees_dir, &worktree_branch_path)
             .map_err(|e| Git2DBError::configuration(format!("Invalid worktree path: {}", e)))?;
 
         // Create parent directories if default branch has hierarchy
@@ -242,7 +243,8 @@ impl<'a> CloneBuilder<'a> {
 
         if checkout_ref != default_branch && !matches!(self.reference, GitRef::DefaultBranch) {
             // Create additional worktree for the requested reference
-            let ref_worktree_path = safe_path::scoped_join(&worktrees_dir, &checkout_ref)
+            let ref_worktree_branch_path = get_worktree_branch_path(&checkout_ref);
+            let ref_worktree_path = safe_path::scoped_join(&worktrees_dir, &ref_worktree_branch_path)
                 .map_err(|e| Git2DBError::configuration(format!("Invalid worktree path: {}", e)))?;
 
             // Create parent directories for hierarchical branches
@@ -389,6 +391,10 @@ fn get_default_branch(repo: &git2::Repository) -> Git2DBResult<String> {
 
     // Last resort
     Ok("main".to_string())
+}
+
+fn get_worktree_branch_path(branch: &str) -> String {
+    branch.to_string()
 }
 
 /// Create a worktree from a bare repository

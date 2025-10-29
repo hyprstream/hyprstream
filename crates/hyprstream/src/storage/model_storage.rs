@@ -11,6 +11,14 @@ use uuid::Uuid;
 
 use super::model_ref::{validate_model_name, ModelRef};
 
+/// Get worktree branch path segment
+///
+/// This should match git2db::get_worktree_branch_path for consistency.
+/// Preserves branch hierarchy as validated by Git.
+fn get_worktree_branch_path(branch: &str) -> String {
+    branch.to_string()
+}
+
 /// Model identifier (kept for backward compatibility)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ModelId(pub Uuid);
@@ -125,8 +133,9 @@ impl ModelStorage {
             .ok_or_else(|| anyhow::anyhow!("Invalid bare repo path"))?;
 
         let worktrees_dir = repo_dir.join("worktrees");
-        // Git already validates branch names, preserve hierarchy
-        let worktree_path = worktrees_dir.join(branch);
+        // Use canonical branch path conversion
+        let worktree_branch_path = get_worktree_branch_path(branch);
+        let worktree_path = worktrees_dir.join(worktree_branch_path);
 
         Ok(worktree_path)
     }
