@@ -155,9 +155,9 @@ impl<'a> GenerationCore<'a> {
             if request
                 .stop_tokens
                 .iter()
-                .any(|stop| !stop.is_empty() && self.decoder.get_text().ends_with(stop))
+                .any(|stop| !stop.is_empty() && self.decoder.get_text().contains(stop))
             {
-                tracing::debug!("Stop token detected at end of text");
+                tracing::debug!("Stop token detected in generated text");
                 break;
             }
         }
