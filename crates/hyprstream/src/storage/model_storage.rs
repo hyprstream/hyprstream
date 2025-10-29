@@ -125,8 +125,8 @@ impl ModelStorage {
             .ok_or_else(|| anyhow::anyhow!("Invalid bare repo path"))?;
 
         let worktrees_dir = repo_dir.join("worktrees");
-        // Git already validates branch names, preserve hierarchy
-        let worktree_path = worktrees_dir.join(branch);
+        // Use canonical branch path conversion
+        let worktree_path = worktrees_dir.join(branch.to_string());
 
         Ok(worktree_path)
     }

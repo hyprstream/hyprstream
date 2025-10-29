@@ -463,6 +463,8 @@ mod tests {
             retry_max_delay: Duration::from_secs(30),
             proxy_url: Some("http://proxy.example.com:8080".to_string()),
             user_agent: "test-agent".to_string(),
+            use_credential_helper: true,
+            access_token: Some("test-token".to_string()),
         };
         assert_eq!(network_config.timeout, Duration::from_secs(120));
         assert_eq!(network_config.max_retries, 5);
@@ -491,8 +493,11 @@ mod tests {
             network: NetworkConfig::default(),
             performance: PerformanceConfig::default(),
             signature: GitSignature::new("Test", "test@example.com"),
+            worktree: WorktreeConfig::default(),
             #[cfg(feature = "gittorrent-transport")]
             gittorrent: gittorrent::service::GitTorrentConfig::default(),
+            #[cfg(feature = "xet-storage")]
+            xet: git_xet_filter::XetConfig::default(),
         };
 
         assert!(!config.repository.prefer_shallow);
