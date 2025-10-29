@@ -8,7 +8,6 @@ use anyhow::Result;
 
 use super::{
     torch_engine::TorchEngine,
-    utf8_decoder::IncrementalUtf8Decoder,
     GenerationRequest, GenerationResult, FinishReason,
 };
 
@@ -58,16 +57,16 @@ pub enum CallbackControl {
 /// Unified generation core that eliminates duplicate loops
 pub struct GenerationCore<'a> {
     engine: &'a TorchEngine,
-    decoder: IncrementalUtf8Decoder,
+    generated_tokens: Vec<i64>, // Store only generated tokens
 }
 
 impl<'a> GenerationCore<'a> {
     /// Create a new generation core
-    pub fn new(engine: &'a TorchEngine) -> Self {
-        Self {
+    pub fn new(engine: &'a TorchEngine) -> Result<Self> {
+        Ok(Self {
             engine,
-            decoder: IncrementalUtf8Decoder::new(),
-        }
+            generated_tokens: Vec::new(),
+        })
     }
 
     /// Core generation loop - single implementation used by all generation methods
@@ -89,6 +88,10 @@ impl<'a> GenerationCore<'a> {
         let start_time = std::time::Instant::now();
         let prompt_len = input_ids.len();
         let mut tokens_generated = 0;
+
+        // Clear and prepare our generated tokens buffer
+        self.generated_tokens.clear();
+        self.generated_tokens.reserve(request.max_tokens);
 
         for i in 0..request.max_tokens {
             // Step 1: Forward pass with KV caching
@@ -128,19 +131,41 @@ impl<'a> GenerationCore<'a> {
                 break;
             }
 
-            // Step 4: Add token to sequence ONLY after validation
+            // Check if token should be blocked from text-only generation
+            if let Some(false) = self.engine.check_special_token(next_token) {
+                // Block this token (e.g., multimodal tokens that shouldn't appear in text)
+                tracing::debug!("Blocked special token: {}", next_token);
+                continue;
+            }
+
+            // Add token to sequence and our generated tokens buffer
             input_ids.push(next_token as i64);
+            self.generated_tokens.push(next_token as i64);
             tokens_generated += 1;
 
-            // Step 5: Decode new text incrementally using custom decoder
-            // Note: Using IncrementalUtf8Decoder due to tokenizers 0.20.4 DecodeStream bugs
-            // TODO: Upgrade to tokenizers 0.22.1+ to use native DecodeStream API for O(1) decoding
-            let new_text = self.decoder.push_token_simple(next_token as i64, |tokens| {
-                let mut full_ids = Vec::with_capacity(prompt_len + tokens.len());
-                full_ids.extend(&input_ids[..prompt_len]);
-                full_ids.extend(tokens);
-                self.engine.detokenize(&full_ids[prompt_len..])
-            })?;
+            // Step 5: Decode only the generated tokens (O(n) cumulative, not O(n²)!)
+            let new_text = match self.engine.detokenize(&self.generated_tokens) {
+                Ok(text) => {
+                    // Extract only the new text by finding what changed
+                    if tokens_generated == 1 {
+                        // First token, return everything
+                        text
+                    } else {
+                        // Find the new part by comparing with previous tokens
+                        let prev_text = self.engine.detokenize(&self.generated_tokens[..tokens_generated-1]).unwrap_or_default();
+                        if text.starts_with(&prev_text) {
+                            text[prev_text.len()..].to_string()
+                        } else {
+                            // Fallback: return current text (shouldn't happen with proper tokenizer)
+                            text
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to decode token {}: {}", next_token, e);
+                    String::new()
+                }
+            };
 
             // Step 6: Call callback with new text (if any)
             if !new_text.is_empty() {
@@ -150,22 +175,28 @@ impl<'a> GenerationCore<'a> {
                 }
             }
 
-            // Step 7: Check for stop tokens at the end of generated text
-            // We check if any stop token appears at the end to avoid false positives
-            if request
-                .stop_tokens
-                .iter()
-                .any(|stop| !stop.is_empty() && self.decoder.get_text().ends_with(stop))
-            {
-                tracing::debug!("Stop token detected at end of text");
-                break;
+            // Step 7: Check for stop tokens in the generated text
+            if !request.stop_tokens.is_empty() {
+                if let Ok(current_text) = self.engine.detokenize(&self.generated_tokens) {
+                    if request.stop_tokens.iter().any(|stop| current_text.ends_with(stop)) {
+                        tracing::debug!("Stop token detected at end of text");
+                        break;
+                    }
+                }
             }
         }
 
         let generation_time = start_time.elapsed();
 
+        // Get the final text by decoding all generated tokens
+        let final_text = if tokens_generated > 0 {
+            self.engine.detokenize(&self.generated_tokens).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
         Ok(GenerationResult {
-            text: self.decoder.get_text().to_string(),
+            text: final_text,
             tokens_generated,
             finish_reason: if tokens_generated >= request.max_tokens {
                 FinishReason::MaxTokens
@@ -179,20 +210,5 @@ impl<'a> GenerationCore<'a> {
                 0.0
             },
         })
-    }
-
-    /// Get the current decoded text
-    pub fn get_text(&self) -> &str {
-        self.decoder.get_text()
-    }
-
-    /// Get the number of tokens in the decoder
-    pub fn get_token_count(&self) -> usize {
-        self.decoder.get_tokens().len()
-    }
-
-    /// Reset the generation state for reuse
-    pub fn reset(&mut self) {
-        self.decoder = IncrementalUtf8Decoder::new();
     }
 }
