@@ -214,8 +214,7 @@ impl<'a> CloneBuilder<'a> {
         tracing::debug!("Default branch detected: {}", default_branch);
 
         // Create initial worktree for the default branch
-        let worktree_branch_path = get_worktree_branch_path(&default_branch);
-        let initial_worktree = safe_path::scoped_join(&worktrees_dir, &worktree_branch_path)
+        let initial_worktree = safe_path::scoped_join(&worktrees_dir, &default_branch.to_string())
             .map_err(|e| Git2DBError::configuration(format!("Invalid worktree path: {}", e)))?;
 
         // Create parent directories if default branch has hierarchy
@@ -243,8 +242,7 @@ impl<'a> CloneBuilder<'a> {
 
         if checkout_ref != default_branch && !matches!(self.reference, GitRef::DefaultBranch) {
             // Create additional worktree for the requested reference
-            let ref_worktree_branch_path = get_worktree_branch_path(&checkout_ref);
-            let ref_worktree_path = safe_path::scoped_join(&worktrees_dir, &ref_worktree_branch_path)
+            let ref_worktree_path = safe_path::scoped_join(&worktrees_dir, &checkout_ref.to_string())
                 .map_err(|e| Git2DBError::configuration(format!("Invalid worktree path: {}", e)))?;
 
             // Create parent directories for hierarchical branches
@@ -393,10 +391,6 @@ fn get_default_branch(repo: &git2::Repository) -> Git2DBResult<String> {
     Ok("main".to_string())
 }
 
-fn get_worktree_branch_path(branch: &str) -> String {
-    branch.to_string()
-}
-
 /// Create a worktree from a bare repository
 async fn create_worktree(bare_repo_path: &std::path::PathBuf, worktree_path: &std::path::PathBuf, branch: &str) -> Git2DBResult<()> {
     // Use git2db's GitManager for worktree creation
@@ -446,16 +440,5 @@ mod tests {
         assert!(validate_repo_name("my/repo").is_err());
         assert!(validate_repo_name("../etc").is_err());
         assert!(validate_repo_name("repo..name").is_err());
-    }
-
-    #[test]
-    fn test_branch_hierarchy_preserved() {
-        // Git already validates branch names, so we preserve the hierarchy
-        assert_eq!(get_worktree_branch_path("main"), "main");
-        assert_eq!(get_worktree_branch_path("feature/new-ui"), "feature/new-ui");
-        assert_eq!(get_worktree_branch_path("bugfix/issue-123"), "bugfix/issue-123");
-
-        // Git wouldn't allow these anyway, but we just pass through
-        assert_eq!(get_worktree_branch_path("some-branch"), "some-branch");
     }
 }
