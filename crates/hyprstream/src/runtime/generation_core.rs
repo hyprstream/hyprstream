@@ -214,15 +214,15 @@ impl<'a> GenerationCore<'a> {
                     }
                 }
 
-                // Step 7: Check for stop tokens in the generated text
-                if !request.stop_tokens.is_empty() {
-                    if let Ok(current_text) = self.engine.detokenize(&self.generated_tokens) {
-                        if request.stop_tokens.iter().any(|stop| current_text.ends_with(stop)) {
-                            tracing::debug!("Stop token detected at end of text");
-                            break;
-                        }
-                    }
-                }
+            // Step 7: Check for stop tokens at the end of generated text
+            // We check if any stop token appears at the end to avoid false positives
+            if request
+                .stop_tokens
+                .iter()
+                .any(|stop| !stop.is_empty() && self.decoder.get_text().contains(stop))
+            {
+                tracing::debug!("Stop token detected in generated text");
+                break;
             }
 
             Ok::<_, anyhow::Error>(())

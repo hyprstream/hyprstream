@@ -564,6 +564,17 @@ impl TorchEngine {
             .ok_or_else(|| anyhow!("Tokenizer not loaded. Call load_tokenizer() first."))
     }
 
+    /// Get the tokenizer for streaming decoding - CoW makes this cheap!
+    ///
+    /// Returns a cloned tokenizer (cheap due to copy-on-write)
+    pub fn get_tokenizer(&self) -> Result<Tokenizer> {
+        let tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
+        tokenizer_guard
+            .as_ref()
+            .cloned() // Cheap clone due to CoW
+            .ok_or_else(|| anyhow!("Tokenizer not loaded. Call load_tokenizer() first."))
+    }
+
     /// Detokenize IDs back to text - thread safe
     pub fn detokenize(&self, ids: &[i64]) -> Result<String> {
         self.detokenize_with_config(ids, &DecodeConfig::default())
