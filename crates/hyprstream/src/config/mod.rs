@@ -474,6 +474,99 @@ pub struct GenerationRequest {
     pub seed: Option<u32>,
 }
 
+impl GenerationRequest {
+    /// Create a builder for ergonomic construction
+    pub fn builder(prompt: impl Into<String>) -> GenerationRequestBuilder {
+        GenerationRequestBuilder::new(prompt)
+    }
+}
+
+/// Builder for GenerationRequest with parameter cascading
+pub struct GenerationRequestBuilder {
+    prompt: String,
+    sampling: crate::runtime::sampling::SamplingConfig,
+}
+
+impl GenerationRequestBuilder {
+    pub fn new(prompt: impl Into<String>) -> Self {
+        Self {
+            prompt: prompt.into(),
+            sampling: crate::runtime::sampling::SamplingConfig::default(),
+        }
+    }
+
+    /// Load model-specific configuration from model path
+    pub async fn with_model_config(
+        mut self,
+        model_path: &std::path::Path,
+    ) -> anyhow::Result<Self> {
+        self.sampling = crate::runtime::sampling::load_sampling_config(model_path).await?;
+        Ok(self)
+    }
+
+    /// Merge with server or system defaults (self takes priority)
+    pub fn with_defaults(mut self, defaults: &crate::runtime::sampling::SamplingConfig) -> Self {
+        self.sampling = self.sampling.merge_with_defaults(defaults);
+        self
+    }
+
+    /// Convenience method to apply server defaults from GenerationDefaults config
+    pub fn with_server_defaults(self, defaults: &GenerationDefaults) -> Self {
+        let server_sampling = crate::runtime::sampling::SamplingConfig {
+            max_tokens: defaults.max_tokens,
+            temperature: defaults.temperature,
+            top_p: Some(defaults.top_p),
+            repeat_penalty: defaults.repeat_penalty,
+            ..Default::default()
+        };
+        self.with_defaults(&server_sampling)
+    }
+
+    /// Apply user overrides
+    pub fn temperature(mut self, temp: Option<f32>) -> Self {
+        self.sampling = self.sampling.apply_temperature(temp);
+        self
+    }
+
+    pub fn top_p(mut self, top_p: Option<f32>) -> Self {
+        self.sampling = self.sampling.apply_top_p(top_p);
+        self
+    }
+
+    pub fn top_k(mut self, top_k: Option<usize>) -> Self {
+        self.sampling = self.sampling.apply_top_k(top_k);
+        self
+    }
+
+    pub fn repeat_penalty(mut self, repeat_penalty: Option<f32>) -> Self {
+        self.sampling = self.sampling.apply_repeat_penalty(repeat_penalty);
+        self
+    }
+
+    pub fn max_tokens(mut self, max_tokens: Option<usize>) -> Self {
+        self.sampling = self.sampling.apply_max_tokens(max_tokens);
+        self
+    }
+
+    pub fn stop_tokens(mut self, stop_tokens: Option<Vec<String>>) -> Self {
+        self.sampling = self.sampling.apply_stop_tokens(stop_tokens);
+        self
+    }
+
+    pub fn build(self) -> GenerationRequest {
+        GenerationRequest {
+            prompt: self.prompt,
+            max_tokens: self.sampling.max_tokens,
+            temperature: self.sampling.temperature,
+            top_p: self.sampling.top_p.unwrap_or(1.0),
+            top_k: self.sampling.top_k,
+            repeat_penalty: self.sampling.repeat_penalty,
+            stop_tokens: self.sampling.stop_tokens,
+            seed: self.sampling.seed.map(|s| s as u32),
+        }
+    }
+}
+
 impl From<&GenerationConfig> for GenerationRequest {
     fn from(config: &GenerationConfig) -> Self {
         Self {

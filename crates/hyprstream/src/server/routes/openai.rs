@@ -238,7 +238,6 @@ async fn chat_completions(
     };
 
     // Create generation request - use template-aware formatting
-    let defaults = &state.config.generation_defaults;
     info!("Formatting messages with template...");
     let formatted_prompt = match format_messages_with_template(&request.messages, &engine).await {
         Ok(prompt) => {
@@ -265,16 +264,78 @@ async fn chat_completions(
                 .into_response();
         }
     };
-    let gen_request = GenerationRequest {
-        prompt: formatted_prompt,
-        max_tokens: request.max_tokens.unwrap_or(defaults.max_tokens),
-        temperature: request.temperature.unwrap_or(defaults.temperature),
-        top_p: request.top_p.unwrap_or(defaults.top_p),
-        top_k: None,
-        repeat_penalty: defaults.repeat_penalty,
-        stop_tokens: request.stop.clone().unwrap_or_default(),
-        seed: None,
+
+    // Get model path for config loading
+    let model_ref = match crate::storage::ModelRef::parse(&request.model) {
+        Ok(r) => r,
+        Err(e) => {
+            state
+                .metrics
+                .active_requests
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    format!("Invalid model reference: {}", e),
+                    "invalid_model_ref",
+                    "parse_error",
+                )),
+            )
+                .into_response();
+        }
     };
+
+    let model_path = match state.model_storage.get_model_path(&model_ref).await {
+        Ok(path) => path,
+        Err(e) => {
+            state
+                .metrics
+                .active_requests
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse::new(
+                    format!("Model path not found: {}", e),
+                    "model_not_found",
+                    "path_error",
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    // Build request with proper cascade: server defaults → model config → user request
+    let gen_request = match GenerationRequest::builder(formatted_prompt.clone())
+        .with_server_defaults(&state.config.generation_defaults)
+        .with_model_config(&model_path)
+        .await
+    {
+        Ok(builder) => builder
+            .temperature(request.temperature)
+            .top_p(request.top_p)
+            .top_k(request.top_k)
+            .repeat_penalty(request.repeat_penalty)
+            .max_tokens(request.max_tokens)
+            .stop_tokens(request.stop.clone())
+            .build(),
+        Err(e) => {
+            info!("Failed to load model config: {}, using defaults", e);
+            GenerationRequest::builder(formatted_prompt)
+                .with_server_defaults(&state.config.generation_defaults)
+                .temperature(request.temperature)
+                .top_p(request.top_p)
+                .top_k(request.top_k)
+                .repeat_penalty(request.repeat_penalty)
+                .max_tokens(request.max_tokens)
+                .stop_tokens(request.stop.clone())
+                .build()
+        }
+    };
+
+    info!(
+        "Using generation config: max_tokens={}, temp={}, top_p={}, top_k={:?}, repeat_penalty={}",
+        gen_request.max_tokens, gen_request.temperature, gen_request.top_p, gen_request.top_k, gen_request.repeat_penalty
+    );
 
     // Generate response
     info!(
@@ -377,9 +438,6 @@ async fn stream_chat(state: ServerState, request: ChatCompletionRequest) -> impl
     let defaults = state.config.generation_defaults.clone();
     let model_name = request.model.clone();
     let messages = request.messages.clone();
-    let max_tokens = request.max_tokens.unwrap_or(defaults.max_tokens);
-    let temperature = request.temperature.unwrap_or(defaults.temperature);
-    let top_p = request.top_p.unwrap_or(defaults.top_p);
     let stop_sequences = request.stop.clone().unwrap_or_default();
 
     // Track active request for proper cleanup
@@ -391,6 +449,24 @@ async fn stream_chat(state: ServerState, request: ChatCompletionRequest) -> impl
     tokio::spawn(async move {
         // Ensure metrics are decremented on all exit paths
         let _metrics_guard = MetricsGuard::new(&state.metrics);
+
+        // Get model path for config loading
+        let model_ref = match crate::storage::ModelRef::parse(&model_name) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(Err(anyhow::anyhow!("Invalid model reference: {}", e))).await;
+                return;
+            }
+        };
+
+        let model_path = match state.model_storage.get_model_path(&model_ref).await {
+            Ok(path) => path,
+            Err(e) => {
+                info!("Could not get model path: {}, using defaults", e);
+                std::path::PathBuf::new()
+            }
+        };
+
         // Get engine from model cache
         let engine_arc = match state.model_cache.get_or_load(&model_name).await {
             Ok(engine) => engine,
@@ -434,16 +510,38 @@ async fn stream_chat(state: ServerState, request: ChatCompletionRequest) -> impl
             model_name.clone(),
         ));
 
-        let gen_request = GenerationRequest {
-            prompt,
-            max_tokens,
-            temperature,
-            top_p,
-            top_k: None,
-            repeat_penalty: defaults.repeat_penalty,
-            stop_tokens: stop_sequences,
-            seed: None,
+        // Build request with proper cascade: server defaults → model config → user request
+        let gen_request = match GenerationRequest::builder(prompt.clone())
+            .with_server_defaults(&defaults)
+            .with_model_config(&model_path)
+            .await
+        {
+            Ok(builder) => builder
+                .temperature(request.temperature)
+                .top_p(request.top_p)
+                .top_k(request.top_k)
+                .repeat_penalty(request.repeat_penalty)
+                .max_tokens(request.max_tokens)
+                .stop_tokens(Some(stop_sequences))
+                .build(),
+            Err(e) => {
+                info!("Failed to load model config: {}, using defaults", e);
+                GenerationRequest::builder(prompt)
+                    .with_server_defaults(&defaults)
+                    .temperature(request.temperature)
+                    .top_p(request.top_p)
+                    .top_k(request.top_k)
+                    .repeat_penalty(request.repeat_penalty)
+                    .max_tokens(request.max_tokens)
+                    .stop_tokens(Some(stop_sequences))
+                    .build()
+            }
         };
+
+        info!(
+            "Streaming: max_tokens={}, temp={}, top_p={}, top_k={:?}, repeat_penalty={}",
+            gen_request.max_tokens, gen_request.temperature, gen_request.top_p, gen_request.top_k, gen_request.repeat_penalty
+        );
 
         // Create generation context
         let context = crate::runtime::streaming::GenerationContext {
@@ -606,16 +704,69 @@ async fn completions(
         }
     };
 
-    let gen_request = GenerationRequest {
-        prompt: formatted_prompt,
-        max_tokens: request.max_tokens.unwrap_or(2048),
-        temperature: request.temperature.unwrap_or(1.0),
-        top_p: request.top_p.unwrap_or(1.0),
-        top_k: None,
-        repeat_penalty: 1.1,
-        stop_tokens: request.stop.clone().unwrap_or_default(),
-        seed: None,
+    // Get model path for config loading
+    let model_ref = match crate::storage::ModelRef::parse(&request.model) {
+        Ok(r) => r,
+        Err(e) => {
+            state
+                .metrics
+                .active_requests
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!("Invalid model reference: {}", e),
+                        "type": "invalid_model_ref",
+                        "code": "parse_error"
+                    }
+                })),
+            )
+                .into_response();
+        }
     };
+
+    let model_path = match state.model_storage.get_model_path(&model_ref).await {
+        Ok(path) => path,
+        Err(e) => {
+            info!("Could not get model path: {}, using defaults", e);
+            // Continue without model-specific config
+            std::path::PathBuf::new()
+        }
+    };
+
+    // Build request with proper cascade: server defaults → model config → user request
+    let gen_request = match GenerationRequest::builder(formatted_prompt.clone())
+        .with_server_defaults(&state.config.generation_defaults)
+        .with_model_config(&model_path)
+        .await
+    {
+        Ok(builder) => builder
+            .temperature(request.temperature)
+            .top_p(request.top_p)
+            .top_k(request.top_k)
+            .repeat_penalty(request.repeat_penalty)
+            .max_tokens(request.max_tokens)
+            .stop_tokens(request.stop.clone())
+            .build(),
+        Err(e) => {
+            info!("Failed to load model config: {}, using defaults", e);
+            GenerationRequest::builder(formatted_prompt)
+                .with_server_defaults(&state.config.generation_defaults)
+                .temperature(request.temperature)
+                .top_p(request.top_p)
+                .top_k(request.top_k)
+                .repeat_penalty(request.repeat_penalty)
+                .max_tokens(request.max_tokens)
+                .stop_tokens(request.stop.clone())
+                .build()
+        }
+    };
+
+    info!(
+        "Completions: max_tokens={}, temp={}, top_p={}, top_k={:?}, repeat_penalty={}",
+        gen_request.max_tokens, gen_request.temperature, gen_request.top_p, gen_request.top_k, gen_request.repeat_penalty
+    );
 
     let result = {
         let engine = engine.lock().await;

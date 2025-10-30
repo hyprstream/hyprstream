@@ -2,7 +2,7 @@
 
 use crate::cli::commands::model::GitInfo;
 use crate::config::GenerationRequest;
-use crate::runtime::sampling::{load_sampling_config, SamplingConfig};
+// Sampling config now loaded via builder pattern
 use crate::runtime::template_engine::ChatMessage;
 use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
 use crate::storage::{CheckoutOptions, ModelRef, ModelStorage};
@@ -702,6 +702,7 @@ pub async fn handle_infer(
     temperature: Option<f32>,
     top_p: Option<f32>,
     top_k: Option<usize>,
+    repeat_penalty: Option<f32>,
     stream: bool,
     _force_download: bool,
 ) -> Result<()> {
@@ -733,35 +734,9 @@ pub async fn handle_infer(
 
     info!("Using model at: {}", model_path.display());
 
-    // Load model configuration
-    let sampling_config = if model_path.join("config.json").exists() {
-        match load_sampling_config(&model_path).await {
-            Ok(config) => config,
-            Err(e) => {
-                tracing::warn!("Could not load model config: {}. Using defaults.", e);
-                SamplingConfig::default()
-            }
-        }
-    } else {
-        SamplingConfig::for_model(model_ref_str)
-    };
-
     // Initialize inference engine
     let runtime_config = RuntimeConfig::default();
     let mut engine = TorchEngine::new(runtime_config)?;
-
-    // Apply overrides to sampling config
-    let mut final_config = sampling_config;
-    if let Some(t) = temperature {
-        final_config.temperature = t;
-    }
-    if let Some(p) = top_p {
-        final_config.top_p = Some(p);
-    }
-    if let Some(k) = top_k {
-        final_config.top_k = Some(k);
-    }
-    final_config.do_sample = final_config.temperature > 0.0;
 
     // Load the model
     let load_start = std::time::Instant::now();
@@ -923,14 +898,6 @@ pub async fn handle_infer(
         *lora_guard = None;
     }
 
-    // Use model defaults or overrides
-    let max_tokens = max_tokens.unwrap_or(100);
-
-    info!(
-        "Generating response: max_tokens={}, temperature={}, top_p={:?}, top_k={:?}",
-        max_tokens, final_config.temperature, final_config.top_p, final_config.top_k
-    );
-
     // Apply chat template to the prompt
     let formatted_prompt = {
         let messages = vec![ChatMessage {
@@ -947,16 +914,21 @@ pub async fn handle_infer(
         }
     };
 
-    let request = GenerationRequest {
-        prompt: formatted_prompt,
-        max_tokens,
-        temperature: final_config.temperature,
-        top_p: final_config.top_p.unwrap_or(1.0),
-        top_k: final_config.top_k,
-        repeat_penalty: 1.0,
-        stop_tokens: vec![],
-        seed: None,
-    };
+    // Build request with proper cascade: model config → CLI overrides
+    let request = GenerationRequest::builder(formatted_prompt)
+        .with_model_config(&model_path)
+        .await?
+        .temperature(temperature)
+        .top_p(top_p)
+        .top_k(top_k)
+        .repeat_penalty(repeat_penalty)
+        .max_tokens(max_tokens)
+        .build();
+
+    info!(
+        "Generating response: max_tokens={}, temperature={}, top_p={}, top_k={:?}, repeat_penalty={}",
+        request.max_tokens, request.temperature, request.top_p, request.top_k, request.repeat_penalty
+    );
 
     if stream {
         // Stream tokens as they're generated

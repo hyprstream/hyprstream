@@ -22,6 +22,8 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<usize>,
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
+    pub repeat_penalty: Option<f32>,
+    pub top_k: Option<usize>,
     pub logit_bias: Option<std::collections::HashMap<String, f32>>,
     pub user: Option<String>,
 }
@@ -76,6 +78,8 @@ pub struct CompletionRequest {
     pub stop: Option<Vec<String>>,
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
+    pub repeat_penalty: Option<f32>,
+    pub top_k: Option<usize>,
     pub best_of: Option<i32>,
     pub logit_bias: Option<std::collections::HashMap<String, f32>>,
     pub user: Option<String>,

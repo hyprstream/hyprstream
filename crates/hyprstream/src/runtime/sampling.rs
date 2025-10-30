@@ -19,7 +19,7 @@ pub struct SamplingConfig {
     pub top_p: Option<f32>,
 
     /// Repetition penalty (1.0 = no penalty)
-    pub repetition_penalty: f32,
+    pub repeat_penalty: f32,
 
     /// Length penalty (1.0 = no penalty)
     pub length_penalty: f32,
@@ -36,8 +36,16 @@ pub struct SamplingConfig {
     /// Epsilon cutoff for truncation sampling
     pub epsilon_cutoff: Option<f32>,
 
-    /// Eta cutoff for truncation sampling  
+    /// Eta cutoff for truncation sampling
     pub eta_cutoff: Option<f32>,
+
+    /// Stop sequences (generation stops if any of these appear)
+    #[serde(default)]
+    pub stop_tokens: Vec<String>,
+
+    /// Maximum tokens to generate (0 = no limit)
+    #[serde(default)]
+    pub max_tokens: usize,
 }
 
 impl Default for SamplingConfig {
@@ -46,13 +54,15 @@ impl Default for SamplingConfig {
             temperature: 1.0,
             top_k: Some(50),
             top_p: Some(0.95),
-            repetition_penalty: 1.0,
+            repeat_penalty: 1.0,
             length_penalty: 1.0,
             seed: None,
             do_sample: true,
             typical_p: None,
             epsilon_cutoff: None,
             eta_cutoff: None,
+            stop_tokens: vec![],
+            max_tokens: 2048,
         }
     }
 }
@@ -88,7 +98,7 @@ impl SamplingConfig {
                 .and_then(|v| v.as_f64())
                 .map(|v| v as f32),
 
-            repetition_penalty: config
+            repeat_penalty: config
                 .get("repetition_penalty")
                 .and_then(|v| v.as_f64())
                 .map(|v| v as f32)
@@ -121,6 +131,13 @@ impl SamplingConfig {
                 .map(|v| v as f32),
 
             seed: None,
+
+            stop_tokens: vec![],
+            max_tokens: config
+                .get("max_length")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(2048),
         }
     }
 
@@ -151,7 +168,7 @@ impl SamplingConfig {
             temperature: 0.7,
             top_k: Some(20),
             top_p: Some(0.8),
-            repetition_penalty: 1.05,
+            repeat_penalty: 1.05,
             do_sample: true,
             ..Default::default()
         }
@@ -163,7 +180,7 @@ impl SamplingConfig {
             temperature: 0.6,
             top_k: Some(40),
             top_p: Some(0.9),
-            repetition_penalty: 1.1,
+            repeat_penalty: 1.1,
             do_sample: true,
             ..Default::default()
         }
@@ -175,7 +192,7 @@ impl SamplingConfig {
             temperature: 0.7,
             top_k: None, // Mistral typically doesn't use top-k
             top_p: Some(0.95),
-            repetition_penalty: 1.0,
+            repeat_penalty: 1.0,
             do_sample: true,
             ..Default::default()
         }
@@ -187,7 +204,7 @@ impl SamplingConfig {
             temperature: 0.8,
             top_k: Some(40),
             top_p: Some(0.95),
-            repetition_penalty: 1.0,
+            repeat_penalty: 1.0,
             do_sample: true,
             ..Default::default()
         }
@@ -199,7 +216,7 @@ impl SamplingConfig {
             temperature: 0.75,
             top_k: Some(50),
             top_p: Some(0.95),
-            repetition_penalty: 1.0,
+            repeat_penalty: 1.0,
             do_sample: true,
             ..Default::default()
         }
@@ -211,10 +228,81 @@ impl SamplingConfig {
             temperature: 0.8,
             top_k: None,
             top_p: Some(0.95),
-            repetition_penalty: 1.0,
+            repeat_penalty: 1.0,
             do_sample: true,
             ..Default::default()
         }
+    }
+
+    /// Merge with defaults, keeping existing values where present
+    /// Self takes priority over defaults
+    pub fn merge_with_defaults(self, defaults: &SamplingConfig) -> Self {
+        Self {
+            temperature: self.temperature,
+            top_k: self.top_k.or(defaults.top_k),
+            top_p: self.top_p.or(defaults.top_p),
+            repeat_penalty: self.repeat_penalty,
+            length_penalty: self.length_penalty,
+            seed: self.seed.or(defaults.seed),
+            do_sample: self.do_sample,
+            typical_p: self.typical_p.or(defaults.typical_p),
+            epsilon_cutoff: self.epsilon_cutoff.or(defaults.epsilon_cutoff),
+            eta_cutoff: self.eta_cutoff.or(defaults.eta_cutoff),
+            stop_tokens: if self.stop_tokens.is_empty() {
+                defaults.stop_tokens.clone()
+            } else {
+                self.stop_tokens
+            },
+            max_tokens: if self.max_tokens == 0 {
+                defaults.max_tokens
+            } else {
+                self.max_tokens
+            },
+        }
+    }
+
+    /// Apply user overrides from request
+    pub fn apply_temperature(mut self, temp: Option<f32>) -> Self {
+        if let Some(t) = temp {
+            self.temperature = t;
+            self.do_sample = t > 0.0;
+        }
+        self
+    }
+
+    pub fn apply_top_p(mut self, top_p: Option<f32>) -> Self {
+        if let Some(p) = top_p {
+            self.top_p = Some(p);
+        }
+        self
+    }
+
+    pub fn apply_top_k(mut self, top_k: Option<usize>) -> Self {
+        if let Some(k) = top_k {
+            self.top_k = Some(k);
+        }
+        self
+    }
+
+    pub fn apply_repeat_penalty(mut self, repeat_penalty: Option<f32>) -> Self {
+        if let Some(rp) = repeat_penalty {
+            self.repeat_penalty = rp;
+        }
+        self
+    }
+
+    pub fn apply_max_tokens(mut self, max_tokens: Option<usize>) -> Self {
+        if let Some(m) = max_tokens {
+            self.max_tokens = m;
+        }
+        self
+    }
+
+    pub fn apply_stop_tokens(mut self, stop_tokens: Option<Vec<String>>) -> Self {
+        if let Some(st) = stop_tokens {
+            self.stop_tokens = st;
+        }
+        self
     }
 }
 

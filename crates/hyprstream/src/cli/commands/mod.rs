@@ -149,6 +149,10 @@ pub enum Commands {
         #[arg(long)]
         top_k: Option<usize>,
 
+        /// Repetition penalty (1.0 = no penalty, >1.0 = penalize)
+        #[arg(short = 'r', long)]
+        repeat_penalty: Option<f32>,
+
         /// Stream output tokens as they're generated
         #[arg(short = 's', long)]
         stream: bool,

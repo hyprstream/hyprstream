@@ -420,6 +420,7 @@ fn main() -> Result<()> {
             temperature,
             top_p,
             top_k,
+            repeat_penalty,
             stream,
             force_download,
         } => {
@@ -439,6 +440,7 @@ fn main() -> Result<()> {
                         temperature,
                         top_p,
                         top_k,
+                        repeat_penalty,
                         stream,
                         force_download,
                     )
