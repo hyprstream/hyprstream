@@ -93,6 +93,10 @@ impl<'a> GenerationCore<'a> {
         self.generated_tokens.clear();
         self.generated_tokens.reserve(request.max_tokens);
 
+        // Create DecodeStream for incremental decoding (O(1) per token!)
+        let tokenizer = self.engine.get_tokenizer()?;
+        let mut decode_stream = tokenizer.decode_stream(false); // Don't skip special tokens
+
         for i in 0..request.max_tokens {
             // Step 1: Forward pass with KV caching
             let logits = if i == 0 {
@@ -143,23 +147,14 @@ impl<'a> GenerationCore<'a> {
             self.generated_tokens.push(next_token as i64);
             tokens_generated += 1;
 
-            // Step 5: Decode only the generated tokens (O(n) cumulative, not O(n²)!)
-            let new_text = match self.engine.detokenize(&self.generated_tokens) {
-                Ok(text) => {
-                    // Extract only the new text by finding what changed
-                    if tokens_generated == 1 {
-                        // First token, return everything
-                        text
-                    } else {
-                        // Find the new part by comparing with previous tokens
-                        let prev_text = self.engine.detokenize(&self.generated_tokens[..tokens_generated-1]).unwrap_or_default();
-                        if text.starts_with(&prev_text) {
-                            text[prev_text.len()..].to_string()
-                        } else {
-                            // Fallback: return current text (shouldn't happen with proper tokenizer)
-                            text
-                        }
-                    }
+            // Step 5: Decode incrementally using DecodeStream (O(1) per token!)
+            // DecodeStream.step() returns Option<String> - None for incomplete UTF-8 sequences
+            let new_text = match decode_stream.step(next_token as u32) {
+                Ok(Some(text)) => text,
+                Ok(None) => {
+                    // Token doesn't produce text yet (e.g., partial UTF-8 byte sequence)
+                    // This is normal for byte-fallback tokenizers - text will come later
+                    String::new()
                 }
                 Err(e) => {
                     tracing::warn!("Failed to decode token {}: {}", next_token, e);
