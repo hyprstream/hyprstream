@@ -139,12 +139,6 @@ impl<'a> GenerationCore<'a> {
                     &self.generated_tokens,
                 )?;
 
-                // Log token generation progress every 50 tokens
-                if tokens_generated % 50 == 0 {
-                    tracing::info!("🔄 Generated {} tokens (repeat penalty applied to {} tokens)",
-                        tokens_generated, self.generated_tokens.len());
-                }
-
                 // Step 3: Validate token BEFORE adding to context
 
                 // Check if token is beyond the tokenizer's vocabulary
