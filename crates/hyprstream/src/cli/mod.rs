@@ -17,7 +17,7 @@ pub use git_handlers::{
     handle_list, handle_lora_train, handle_merge, handle_pull, handle_push, handle_remove,
     handle_serve, handle_status,
 };
-pub use handlers::{handle_chat_command, handle_config, handle_model_command, handle_server};
+pub use handlers::{handle_config, handle_server};
 
 /// Device preference strategy
 #[derive(Debug, Clone, Copy)]

@@ -20,7 +20,6 @@ pub mod conversation_router; // Seamless model evolution and routing
 pub mod fp8; // FP8 (E4M3/E5M2) quantization support
 pub mod generation_core; // Unified generation core to eliminate code duplication
 pub mod tensor_sampling; // Device-agnostic tensor-based sampling
-pub mod inference; // Clean inference interface with request/response patterns
 pub mod kv_cache; // Key-Value caching for efficient autoregressive generation
 pub mod lora_integration; // LoRA integration with gradient bridge
 pub mod model_config; // Unified model configuration management
@@ -35,7 +34,6 @@ pub mod torch_engine; // PyTorch-based engine with tch-rs
 pub mod weight_provider; // Weight provider for streaming large models
 
 // Primary exports - use TorchEngine as default
-pub use inference::{InferenceExt, InferenceRequest, InferenceResult};
 pub use torch_engine::TorchEngine;
 
 #[derive(Debug, Clone)]

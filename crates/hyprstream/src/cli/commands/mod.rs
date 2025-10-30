@@ -4,9 +4,7 @@ pub mod git;
 pub mod model;
 pub mod server;
 
-pub use chat::ChatCommand;
 pub use git::{GitAction, GitCommand};
-pub use model::ModelCommand;
 pub use server::{ServerCliArgs, ServerCommand};
 
 use clap::Subcommand;
@@ -15,10 +13,6 @@ use clap::Subcommand;
 pub enum Commands {
     /// Start the Hyprstream server
     Server(ServerCommand),
-    /// Manage models from registries (HuggingFace, etc.)
-    Model(ModelCommand),
-    /// Chat with a model or composed model
-    Chat(ChatCommand),
 
     // Phase 1: Git-style commands at top level
     /// Create a new branch
