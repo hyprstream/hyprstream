@@ -274,10 +274,6 @@ async fn chat_completions(
         repeat_penalty: defaults.repeat_penalty,
         stop_tokens: request.stop.clone().unwrap_or_default(),
         seed: None,
-        stream: false,
-        active_adapters: None,
-        realtime_adaptation: None,
-        user_feedback: None,
     };
 
     // Generate response
@@ -446,11 +442,7 @@ async fn stream_chat(state: ServerState, request: ChatCompletionRequest) -> impl
             top_k: None,
             repeat_penalty: defaults.repeat_penalty,
             stop_tokens: stop_sequences,
-            stream: true,
             seed: None,
-            active_adapters: None,
-            realtime_adaptation: None,
-            user_feedback: None,
         };
 
         // Create generation context
@@ -623,10 +615,6 @@ async fn completions(
         repeat_penalty: 1.1,
         stop_tokens: request.stop.clone().unwrap_or_default(),
         seed: None,
-        stream: request.stream.unwrap_or(false),
-        active_adapters: None,
-        realtime_adaptation: None,
-        user_feedback: None,
     };
 
     let result = {

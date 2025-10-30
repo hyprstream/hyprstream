@@ -432,6 +432,9 @@ impl TorchEngine {
             .as_ref()
             .ok_or_else(|| anyhow!("Tokenizer not loaded. Call load_tokenizer() first."))?;
 
+        // Log the raw input for debugging prompt issues
+        tracing::info!("📝 Raw prompt before tokenization:\n{}", text);
+
         let encoding = tokenizer
             .encode(text, false)
             .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
@@ -444,7 +447,23 @@ impl TorchEngine {
             ));
         }
 
-        tracing::debug!("Tokenized '{}' -> {:?}", text, token_ids);
+        // Show tokenization details
+        tracing::debug!("Tokenized '{}' -> {} tokens: {:?}",
+            text.chars().take(100).collect::<String>(),
+            token_ids.len(),
+            token_ids
+        );
+
+        // Decode back to verify tokenization is correct
+        if let Ok(decoded) = tokenizer.decode(&token_ids.iter().map(|&id| id as u32).collect::<Vec<_>>(), false) {
+            if decoded != text {
+                tracing::warn!("⚠️  Tokenization roundtrip mismatch!\nOriginal: {}\nDecoded:  {}",
+                    text.chars().take(200).collect::<String>(),
+                    decoded.chars().take(200).collect::<String>()
+                );
+            }
+        }
+
         Ok(token_ids)
     }
 
@@ -913,10 +932,6 @@ impl RuntimeEngine for TorchEngine {
             repeat_penalty: self.generation_config.repeat_penalty,
             stop_tokens: self.generation_config.stop_tokens.clone(),
             seed: None,
-            stream: false,
-            active_adapters: None,
-            realtime_adaptation: None,
-            user_feedback: None,
         };
 
         let result = self.generate_with_params(request).await?;
@@ -934,6 +949,22 @@ impl RuntimeEngine for TorchEngine {
         // Run the CPU-intensive generation in a blocking thread to avoid blocking the async runtime
         let self_clone = self.clone();
         let generation_future = tokio::task::spawn_blocking(move || {
+            use crate::runtime::streaming::{StreamingCallback, ContinueGeneration};
+            use async_trait::async_trait;
+
+            // Inline no-op callback adapter for blocking generation
+            struct NoOpCallback;
+
+            #[async_trait]
+            impl StreamingCallback for NoOpCallback {
+                async fn on_token(&mut self, _token: &str) -> Result<ContinueGeneration> {
+                    Ok(ContinueGeneration::Continue)
+                }
+                async fn on_complete(&mut self, _reason: FinishReason) {}
+                async fn on_error(&mut self, _error: anyhow::Error) {}
+                async fn on_start(&mut self) {}
+            }
+
             // Ensure persistent model is ready
             if !self_clone.is_persistent_model_ready() {
                 return Err(anyhow!(
@@ -951,9 +982,16 @@ impl RuntimeEngine for TorchEngine {
             let mut core = GenerationCore::new(&self_clone)?;
 
             // Generate with no-op callback (blocking mode doesn't stream)
-            core.generate_tokens(input_ids, &params, &request, |_text| {
-                // Blocking mode: ignore intermediate text
-                Ok(CallbackControl::Continue)
+            tokio::runtime::Handle::current().block_on(async {
+                core.generate_tokens_async(
+                    input_ids,
+                    &params,
+                    &request,
+                    Box::new(NoOpCallback),
+                    tokio_util::sync::CancellationToken::new(), // Never cancelled
+                    std::time::Duration::from_secs(u64::MAX), // Effectively no timeout
+                )
+                .await
             })
         });
 
@@ -1117,20 +1155,40 @@ impl TorchEngine {
 
 // Additional methods needed by inference layer
 impl TorchEngine {
-    /// Generate text with streaming callback and custom parameters
-    pub async fn generate_streaming_with_params<F>(
+    /// Generate text with streaming callback
+    ///
+    /// Simplified API: accepts sync callbacks, handles all parameters.
+    /// For advanced use cases (SSE, cancellation), use generate_streaming_async().
+    pub async fn generate_streaming<F>(
         &self,
-        prompt: &str,
-        max_tokens: usize,
-        temperature: f32,
-        top_p: f32,
-        top_k: Option<usize>,
-        repeat_penalty: f32,
-        callback: F,
+        request: GenerationRequest,
+        mut callback: F,
     ) -> Result<String>
     where
-        F: FnMut(&str),
+        F: FnMut(&str) + Send,
     {
+        use crate::runtime::streaming::{StreamingCallback, ContinueGeneration};
+        use async_trait::async_trait;
+
+        // Inline adapter to bridge sync callback to async trait
+        struct SyncStreamCallback<F> {
+            callback: F,
+        }
+
+        #[async_trait]
+        impl<F> StreamingCallback for SyncStreamCallback<F>
+        where
+            F: FnMut(&str) + Send,
+        {
+            async fn on_token(&mut self, token: &str) -> Result<ContinueGeneration> {
+                (self.callback)(token);
+                Ok(ContinueGeneration::Continue)
+            }
+            async fn on_complete(&mut self, _reason: FinishReason) {}
+            async fn on_error(&mut self, _error: anyhow::Error) {}
+            async fn on_start(&mut self) {}
+        }
+
         // Ensure persistent model is ready
         if !self.is_persistent_model_ready() {
             return Err(anyhow!(
@@ -1138,61 +1196,6 @@ impl TorchEngine {
             ));
         }
 
-        let request = GenerationRequest {
-            prompt: prompt.to_string(),
-            max_tokens,
-            temperature,
-            top_p,
-            top_k,
-            repeat_penalty,
-            stop_tokens: self.generation_config.stop_tokens.clone(),
-            seed: None,
-            stream: true,
-            active_adapters: None,
-            realtime_adaptation: None,
-            user_feedback: None,
-        };
-
-        // Use the internal streaming implementation with these parameters
-        self.generate_streaming_internal(request, callback).await
-    }
-
-    /// Generate text with streaming callback (using default parameters)
-    pub async fn generate_streaming<F>(
-        &self,
-        prompt: &str,
-        max_tokens: usize,
-        callback: F,
-    ) -> Result<String>
-    where
-        F: FnMut(&str),
-    {
-        // Use model-specific defaults or fallback to generic defaults
-        self.generate_streaming_with_params(
-            prompt,
-            max_tokens,
-            self.generation_config.temperature,
-            self.generation_config.top_p,
-            self.generation_config.top_k,
-            self.generation_config.repeat_penalty,
-            callback,
-        )
-        .await
-    }
-
-    /// Internal streaming implementation
-    ///
-    /// Note: This method does not track tokens_generated count for performance reasons.
-    /// The token count is implicit in the final decoded text length. The async streaming
-    /// variant does track tokens_generated for metrics reporting.
-    async fn generate_streaming_internal<F>(
-        &self,
-        request: GenerationRequest,
-        mut callback: F,
-    ) -> Result<String>
-    where
-        F: FnMut(&str),
-    {
         // Tokenize input
         let input_ids = self.tokenize(&request.prompt)?;
 
@@ -1202,12 +1205,17 @@ impl TorchEngine {
         // Use the unified GenerationCore
         let mut core = GenerationCore::new(self)?;
 
-        // Generate with streaming callback
-        let result = core.generate_tokens(input_ids, &params, &request, |text| {
-            // Stream each piece of new text
-            callback(text);
-            Ok(CallbackControl::Continue)
-        })?;
+        // Generate with inline adapter
+        let result = core
+            .generate_tokens_async(
+                input_ids,
+                &params,
+                &request,
+                Box::new(SyncStreamCallback { callback }),
+                tokio_util::sync::CancellationToken::new(), // Never cancelled
+                std::time::Duration::from_secs(u64::MAX),   // Effectively no timeout
+            )
+            .await?;
 
         Ok(result.text)
     }
@@ -1225,213 +1233,35 @@ impl TorchEngine {
 
     /// Generate text with async streaming callback
     ///
-    /// This method handles async callbacks with cancellation support.
-    /// It uses a channel to bridge between the sync generation core and async callbacks.
+    /// This method now delegates to the unified GenerationCore::generate_tokens_async,
+    /// eliminating ~170 lines of duplicate code.
     pub async fn generate_streaming_async(
         &self,
         request: GenerationRequest,
-        mut callback: Box<dyn crate::runtime::streaming::StreamingCallback>,
+        callback: Box<dyn crate::runtime::streaming::StreamingCallback>,
         context: crate::runtime::streaming::GenerationContext,
     ) -> Result<GenerationResult> {
-        use crate::runtime::streaming::ContinueGeneration;
-        use tokio::time::timeout;
-
-        let start_time = std::time::Instant::now();
-
-        // Notify start
-        callback.on_start().await;
-
         // Tokenize input
-        let mut input_ids = self.tokenize(&request.prompt)?;
-        let mut tokens_generated = 0;
-        let prompt_len = input_ids.len();
+        let input_ids = self.tokenize(&request.prompt)?;
 
-        // Initialize generated tokens buffer
-        let mut generated_tokens = Vec::with_capacity(request.max_tokens);
+        // Create sampling parameters from request
+        let params = SamplingParams::from_request(&request);
 
-        tracing::info!(
-            "Starting async generation with prompt of {} tokens",
-            prompt_len
-        );
+        // Use the unified GenerationCore for async generation
+        let mut core = GenerationCore::new(self)?;
 
-        // Create timeout future
-        let generation_future = async {
-            for i in 0..request.max_tokens {
-                // Check cancellation
-                if context.cancel_token.is_cancelled() {
-                    tracing::info!("Generation cancelled by client");
-                    break;
-                }
-
-                // Forward pass
-                let logits = if i == 0 {
-                    self.forward(&input_ids)?
-                } else {
-                    self.forward_cached(&input_ids, prompt_len + i - 1, true)?
-                };
-
-                // Sample next token
-                let next_token = self.sampler.sample_token(
-                    &logits,
-                    request.temperature,
-                    request.top_p,
-                    request.top_k,
-                    request.repeat_penalty,
-                    &input_ids,
-                )?;
-
-
-                // Check EOS token
-                if self.is_eos_token(next_token) {
-                    tracing::debug!("EOS token detected: {}", next_token);
-                    break;
-                }
-
-                // Check if token should be blocked from text-only generation
-                if let Some(false) = self.check_special_token(next_token) {
-                    // Block this token (e.g., multimodal tokens that shouldn't appear in text)
-                    tracing::debug!("Blocked special token: {}", next_token);
-                    continue;
-                }
-
-                // Add token to sequence and generated tokens buffer
-                input_ids.push(next_token as i64);
-                generated_tokens.push(next_token as i64);
-                tokens_generated += 1;
-
-                // Simple incremental decoding - much more efficient than O(n²) approach
-                let new_text = match self.detokenize(&generated_tokens) {
-                    Ok(text) => {
-                        // Extract only the new text by finding what changed
-                        if tokens_generated == 1 {
-                            // First token, return everything
-                            text
-                        } else {
-                            // Find the new part by comparing with previous tokens
-                            let prev_text = self.detokenize(&generated_tokens[..tokens_generated-1]).unwrap_or_default();
-                            if text.starts_with(&prev_text) {
-                                text[prev_text.len()..].to_string()
-                            } else {
-                                // Fallback: return current text (shouldn't happen with proper tokenizer)
-                                text
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to decode token {}: {}", next_token, e);
-                        String::new()
-                    }
-                };
-
-                // Stream token via callback (only if there's actual text)
-                let continue_generation = if !new_text.is_empty() {
-                    callback.on_token(&new_text).await
-                } else {
-                    // No text to stream yet (incomplete UTF-8 sequence)
-                    Ok(ContinueGeneration::Continue)
-                };
-
-                match continue_generation {
-                    Ok(ContinueGeneration::Continue) => {}
-                    Ok(ContinueGeneration::Stop) => {
-                        tracing::info!("Generation stopped by callback");
-                        break;
-                    }
-                    Ok(ContinueGeneration::Pause(duration)) => {
-                        tokio::time::sleep(duration).await;
-                    }
-                    Err(e) => {
-                        callback.on_error(anyhow::anyhow!("{}", e)).await;
-                        return Err(e);
-                    }
-                }
-
-                // Check stop conditions
-                if !request.stop_tokens.is_empty() {
-                    if let Ok(current_text) = self.detokenize(&generated_tokens) {
-                        if request.stop_tokens.iter().any(|stop| current_text.ends_with(stop)) {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            Ok::<_, anyhow::Error>(())
-        };
-
-        // Apply timeout
-        match timeout(context.timeout, generation_future).await {
-            Ok(Ok(())) => {
-                // Success - determine why generation stopped
-                let finish_reason = if tokens_generated >= request.max_tokens {
-                    FinishReason::MaxTokens
-                } else {
-                    // Generation ended for other reason (EOS, circuit breaker, or natural end)
-                    FinishReason::Stop
-                };
-
-                callback.on_complete(finish_reason.clone()).await;
-
-                // Get the final text by decoding all generated tokens
-                let final_text = if tokens_generated > 0 {
-                    self.detokenize(&generated_tokens).unwrap_or_default()
-                } else {
-                    String::new()
-                };
-
-                Ok(GenerationResult {
-                    text: final_text,
-                    tokens_generated,
-                    finish_reason,
-                    generation_time_ms: start_time.elapsed().as_millis() as u64,
-                    tokens_per_second: tokens_generated as f32 / start_time.elapsed().as_secs_f32(),
-                })
-            }
-            Ok(Err(e)) => {
-                // Generation error
-                callback.on_error(anyhow::anyhow!("{}", e)).await;
-                Err(e)
-            }
-            Err(_) => {
-                // Timeout
-                let err = anyhow::anyhow!("Generation timeout after {:?}", context.timeout);
-                callback.on_error(anyhow::anyhow!("{}", err)).await;
-                Err(err)
-            }
-        }
+        // Delegate to the unified async implementation
+        core.generate_tokens_async(
+            input_ids,
+            &params,
+            &request,
+            callback,
+            context.cancel_token,
+            context.timeout,
+        )
+        .await
     }
 
-    /// Generate text with raw prompt (no chat formatting)
-    pub async fn generate_raw(&self, prompt: &str, max_tokens: usize) -> Result<String> {
-        let request = GenerationRequest {
-            prompt: prompt.to_string(),
-            max_tokens,
-            temperature: self.generation_config.temperature,
-            top_p: self.generation_config.top_p,
-            top_k: self.generation_config.top_k,
-            repeat_penalty: self.generation_config.repeat_penalty,
-            stop_tokens: self.generation_config.stop_tokens.clone(),
-            seed: None,
-            stream: false,
-            active_adapters: None,
-            realtime_adaptation: None,
-            user_feedback: None,
-        };
-
-        let result = self.generate_with_params(request).await?;
-        Ok(result.text)
-    }
-
-    /// Generate text with custom chat formatting
-    pub async fn generate_chat(
-        &self,
-        system: Option<&str>,
-        user: &str,
-        max_tokens: usize,
-    ) -> Result<String> {
-        let formatted_prompt = self.format_chat_message(system, user);
-        self.generate_raw(&formatted_prompt, max_tokens).await
-    }
 
     /// Enable LoRA training for fine-tuning
     pub fn enable_lora_training(

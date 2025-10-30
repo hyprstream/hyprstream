@@ -987,23 +987,14 @@ pub async fn handle_infer(
         repeat_penalty: 1.0,
         stop_tokens: vec![],
         seed: None,
-        stream,
-        active_adapters: None,
-        realtime_adaptation: None,
-        user_feedback: None,
     };
 
     if stream {
         // Stream tokens as they're generated
         println!();
         let result = engine
-            .generate_streaming_with_params(
-                &request.prompt,
-                request.max_tokens,
-                request.temperature,
-                request.top_p,
-                request.top_k,
-                request.repeat_penalty,
+            .generate_streaming(
+                request.clone(),
                 |token| {
                     print!("{}", token);
                     let _ = io::stdout().flush();
@@ -1016,13 +1007,8 @@ pub async fn handle_infer(
         // Generate all at once using streaming with collection
         let mut response = String::new();
         engine
-            .generate_streaming_with_params(
-                &request.prompt,
-                request.max_tokens,
-                request.temperature,
-                request.top_p,
-                request.top_k,
-                request.repeat_penalty,
+            .generate_streaming(
+                request.clone(),
                 |token| {
                     response.push_str(token);
                 },

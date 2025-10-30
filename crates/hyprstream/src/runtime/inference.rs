@@ -93,13 +93,8 @@ impl InferenceExt for TorchEngine {
 
         // Generate text using the engine's streaming API with custom parameters
         let generated_text = self
-            .generate_streaming_with_params(
-                &request.prompt,
-                request.max_tokens,
-                request.temperature,
-                request.top_p,
-                request.top_k,
-                request.repeat_penalty,
+            .generate_streaming(
+                request.clone(),
                 |_token| {
                     counter_clone.fetch_add(1, Ordering::Relaxed);
                 },
@@ -140,13 +135,8 @@ impl InferenceExt for TorchEngine {
 
         // Generate text with streaming callback and custom parameters
         let generated_text = self
-            .generate_streaming_with_params(
-                &request.prompt,
-                request.max_tokens,
-                request.temperature,
-                request.top_p,
-                request.top_k,
-                request.repeat_penalty,
+            .generate_streaming(
+                request.clone(),
                 |token| {
                     on_token(token);
                     counter_clone.fetch_add(1, Ordering::Relaxed);

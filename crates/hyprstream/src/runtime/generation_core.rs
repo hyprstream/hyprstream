@@ -5,10 +5,13 @@
 //! eliminating ~240 lines of duplicate code.
 
 use anyhow::Result;
+use tokio_util::sync::CancellationToken;
+use std::time::Duration;
 
 use super::{
     torch_engine::TorchEngine,
     GenerationRequest, GenerationResult, FinishReason,
+    streaming::{StreamingCallback, ContinueGeneration},
 };
 
 /// Bundled sampling parameters to reduce parameter passing overhead
@@ -47,13 +50,6 @@ impl SamplingParams {
     }
 }
 
-/// Control flow for generation callbacks
-#[derive(Debug, Clone, Copy)]
-pub enum CallbackControl {
-    Continue,
-    Stop,
-}
-
 /// Unified generation core that eliminates duplicate loops
 pub struct GenerationCore<'a> {
     engine: &'a TorchEngine,
@@ -69,22 +65,27 @@ impl<'a> GenerationCore<'a> {
         })
     }
 
-    /// Core generation loop - single implementation used by all generation methods
+    /// THE unified generation loop - single source of truth
     ///
-    /// This eliminates the duplicate loops in:
-    /// - generate_with_params (blocking)
-    /// - generate_streaming_internal (sync streaming)
-    /// - generate_streaming_async (async streaming)
-    pub fn generate_tokens<C>(
+    /// This is the ONLY place where the generation loop exists.
+    /// All other generation methods eventually delegate to this method.
+    ///
+    /// Supports:
+    /// - Async callbacks (Box<dyn StreamingCallback>)
+    /// - Cancellation via CancellationToken
+    /// - Timeout handling
+    /// - Backpressure/pause support
+    pub async fn generate_tokens_async(
         &mut self,
         mut input_ids: Vec<i64>,
         params: &SamplingParams,
         request: &GenerationRequest,
-        mut callback: C,
-    ) -> Result<GenerationResult>
-    where
-        C: FnMut(&str) -> Result<CallbackControl>,
-    {
+        mut callback: Box<dyn StreamingCallback>,
+        cancel_token: CancellationToken,
+        timeout: Duration,
+    ) -> Result<GenerationResult> {
+        use tokio::time::timeout as tokio_timeout;
+
         let start_time = std::time::Instant::now();
         let prompt_len = input_ids.len();
         let mut tokens_generated = 0;
@@ -100,113 +101,178 @@ impl<'a> GenerationCore<'a> {
         // Clear KV cache before generation to prevent context pollution from previous runs
         self.engine.clear_kv_cache();
 
-        for i in 0..request.max_tokens {
-            // Step 1: Forward pass with KV caching
-            let logits = if i == 0 {
-                self.engine.forward(&input_ids)?
-            } else {
-                self.engine.forward_cached(&input_ids, prompt_len + i - 1, true)?
-            };
+        // Notify callback that generation is starting
+        callback.on_start().await;
 
-            // Step 2: Sample next token with new params interface
-            let next_token = self.engine.sample_token_with_params(
-                &logits,
-                params,
-                &input_ids,
-            )?;
-
-            // Step 3: Validate token BEFORE adding to context
-
-            // Check if token is beyond the tokenizer's vocabulary
-            // Tokens beyond vocab size indicate a bug in sampling or model configuration
-            let vocab_size = self.engine.get_vocab_size();
-            if vocab_size > 0 && next_token >= vocab_size {
-                tracing::error!(
-                    "Generated token {} exceeds vocabulary size {}. This indicates a bug in model initialization or sampling.",
-                    next_token, vocab_size
-                );
-                return Err(anyhow::anyhow!(
-                    "Generated out-of-vocabulary token {}: exceeds vocab size {}",
-                    next_token,
-                    vocab_size
-                ));
-            }
-
-            // Check for EOS token from model config
-            if self.engine.is_eos_token(next_token) {
-                tracing::debug!("EOS token detected: {}", next_token);
-                break;
-            }
-
-            // Check if token should be blocked from text-only generation
-            if let Some(false) = self.engine.check_special_token(next_token) {
-                // Block this token (e.g., multimodal tokens that shouldn't appear in text)
-                tracing::debug!("Blocked special token: {}", next_token);
-                continue;
-            }
-
-            // Add token to sequence and our generated tokens buffer
-            input_ids.push(next_token as i64);
-            self.generated_tokens.push(next_token as i64);
-            tokens_generated += 1;
-
-            // Step 5: Decode incrementally using DecodeStream (O(1) per token!)
-            // DecodeStream.step() returns Option<String> - None for incomplete UTF-8 sequences
-            let new_text = match decode_stream.step(next_token as u32) {
-                Ok(Some(text)) => text,
-                Ok(None) => {
-                    // Token doesn't produce text yet (e.g., partial UTF-8 byte sequence)
-                    // This is normal for byte-fallback tokenizers - text will come later
-                    String::new()
+        // Create the generation future
+        let generation_future = async {
+            for i in 0..request.max_tokens {
+                // Check cancellation
+                if cancel_token.is_cancelled() {
+                    tracing::info!("Generation cancelled by client");
+                    break;
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to decode token {}: {}", next_token, e);
-                    String::new()
-                }
-            };
 
-            // Step 6: Call callback with new text (if any)
-            if !new_text.is_empty() {
-                match callback(&new_text)? {
-                    CallbackControl::Continue => {},
-                    CallbackControl::Stop => break,
-                }
-            }
+                // Step 1: Forward pass with KV caching
+                let logits = if i == 0 {
+                    self.engine.forward(&input_ids)?
+                } else {
+                    self.engine.forward_cached(&input_ids, prompt_len + i - 1, true)?
+                };
 
-            // Step 7: Check for stop tokens in the generated text
-            if !request.stop_tokens.is_empty() {
-                if let Ok(current_text) = self.engine.detokenize(&self.generated_tokens) {
-                    if request.stop_tokens.iter().any(|stop| current_text.ends_with(stop)) {
-                        tracing::debug!("Stop token detected at end of text");
-                        break;
+                // Step 2: Sample next token with new params interface
+                // IMPORTANT: Only apply repeat penalty to generated tokens, not the prompt!
+                // Using full input_ids would penalize words from conversation history
+
+                // DIAGNOSTIC: Log what we're passing to repeat penalty
+                if i == 0 {
+                    tracing::info!("🔍 REPEAT PENALTY DIAGNOSTIC:");
+                    tracing::info!("   Prompt length: {} tokens", prompt_len);
+                    tracing::info!("   Generated tokens so far: {} tokens", self.generated_tokens.len());
+                    tracing::info!("   Full input_ids: {} tokens", input_ids.len());
+                    tracing::info!("   Passing to repeat penalty: {} tokens (generated_tokens)", self.generated_tokens.len());
+                }
+
+                let next_token = self.engine.sample_token_with_params(
+                    &logits,
+                    params,
+                    &self.generated_tokens,
+                )?;
+
+                // Log token generation progress every 50 tokens
+                if tokens_generated % 50 == 0 {
+                    tracing::info!("🔄 Generated {} tokens (repeat penalty applied to {} tokens)",
+                        tokens_generated, self.generated_tokens.len());
+                }
+
+                // Step 3: Validate token BEFORE adding to context
+
+                // Check if token is beyond the tokenizer's vocabulary
+                let vocab_size = self.engine.get_vocab_size();
+                if vocab_size > 0 && next_token >= vocab_size {
+                    tracing::error!(
+                        "Generated token {} exceeds vocabulary size {}. This indicates a bug in model initialization or sampling.",
+                        next_token, vocab_size
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Generated out-of-vocabulary token {}: exceeds vocab size {}",
+                        next_token,
+                        vocab_size
+                    ));
+                }
+
+                // Check for EOS token from model config
+                if self.engine.is_eos_token(next_token) {
+                    tracing::debug!("EOS token detected: {}", next_token);
+                    break;
+                }
+
+                // Check if token should be blocked from text-only generation
+                if let Some(false) = self.engine.check_special_token(next_token) {
+                    tracing::debug!("Blocked special token: {}", next_token);
+                    continue;
+                }
+
+                // Add token to sequence and our generated tokens buffer
+                input_ids.push(next_token as i64);
+                self.generated_tokens.push(next_token as i64);
+                tokens_generated += 1;
+
+                // Step 5: Decode incrementally using DecodeStream (O(1) per token!)
+                let new_text = match decode_stream.step(next_token as u32) {
+                    Ok(Some(text)) => {
+                        // Log any unusual characters
+                        if text.chars().any(|c| (c as u32) > 0x4E00 && (c as u32) < 0x9FFF) {
+                            tracing::info!("⚠️  Token {} decoded to text with CJK character: {:?}", next_token, text);
+                        }
+                        if text.contains('�') {
+                            tracing::info!("⚠️  Token {} decoded to replacement character: {:?}", next_token, text);
+                        }
+                        text
+                    }
+                    Ok(None) => {
+                        tracing::debug!("Token {} produced no text (incomplete UTF-8)", next_token);
+                        String::new()
+                    }
+                    Err(e) => {
+                        tracing::info!("❌ Failed to decode token {}: {}", next_token, e);
+                        String::new()
+                    }
+                };
+
+                // Step 6: Call async callback with new text (if any)
+                if !new_text.is_empty() {
+                    match callback.on_token(&new_text).await? {
+                        ContinueGeneration::Continue => {},
+                        ContinueGeneration::Stop => {
+                            tracing::info!("Generation stopped by callback");
+                            break;
+                        },
+                        ContinueGeneration::Pause(duration) => {
+                            tokio::time::sleep(duration).await;
+                        }
+                    }
+                }
+
+                // Step 7: Check for stop tokens in the generated text
+                if !request.stop_tokens.is_empty() {
+                    if let Ok(current_text) = self.engine.detokenize(&self.generated_tokens) {
+                        if request.stop_tokens.iter().any(|stop| current_text.ends_with(stop)) {
+                            tracing::debug!("Stop token detected at end of text");
+                            break;
+                        }
                     }
                 }
             }
-        }
 
-        let generation_time = start_time.elapsed();
-
-        // Get the final text by decoding all generated tokens
-        let final_text = if tokens_generated > 0 {
-            self.engine.detokenize(&self.generated_tokens).unwrap_or_default()
-        } else {
-            String::new()
+            Ok::<_, anyhow::Error>(())
         };
 
-        Ok(GenerationResult {
-            text: final_text,
-            tokens_generated,
-            finish_reason: if tokens_generated >= request.max_tokens {
-                FinishReason::MaxTokens
-            } else {
-                FinishReason::Stop
-            },
-            generation_time_ms: generation_time.as_millis() as u64,
-            tokens_per_second: if generation_time.as_secs_f32() > 0.0 {
-                tokens_generated as f32 / generation_time.as_secs_f32()
-            } else {
-                0.0
-            },
-        })
+        // Apply timeout
+        let result = match tokio_timeout(timeout, generation_future).await {
+            Ok(Ok(())) => {
+                let generation_time = start_time.elapsed();
+
+                // Determine finish reason
+                let finish_reason = if tokens_generated >= request.max_tokens {
+                    FinishReason::MaxTokens
+                } else {
+                    FinishReason::Stop
+                };
+
+                // Notify completion
+                callback.on_complete(finish_reason.clone()).await;
+
+                // Get the final text by decoding all generated tokens
+                let final_text = if tokens_generated > 0 {
+                    self.engine.detokenize(&self.generated_tokens).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+
+                Ok(GenerationResult {
+                    text: final_text,
+                    tokens_generated,
+                    finish_reason,
+                    generation_time_ms: generation_time.as_millis() as u64,
+                    tokens_per_second: if generation_time.as_secs_f32() > 0.0 {
+                        tokens_generated as f32 / generation_time.as_secs_f32()
+                    } else {
+                        0.0
+                    },
+                })
+            }
+            Ok(Err(e)) => {
+                callback.on_error(anyhow::anyhow!("{}", e)).await;
+                Err(e)
+            }
+            Err(_) => {
+                let err = anyhow::anyhow!("Generation timeout after {:?}", timeout);
+                callback.on_error(anyhow::anyhow!("{}", err)).await;
+                Err(err)
+            }
+        };
+
+        result
     }
 }
