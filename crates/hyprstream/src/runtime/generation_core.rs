@@ -126,11 +126,11 @@ impl<'a> GenerationCore<'a> {
 
                 // DIAGNOSTIC: Log what we're passing to repeat penalty
                 if i == 0 {
-                    tracing::info!("🔍 REPEAT PENALTY DIAGNOSTIC:");
-                    tracing::info!("   Prompt length: {} tokens", prompt_len);
-                    tracing::info!("   Generated tokens so far: {} tokens", self.generated_tokens.len());
-                    tracing::info!("   Full input_ids: {} tokens", input_ids.len());
-                    tracing::info!("   Passing to repeat penalty: {} tokens (generated_tokens)", self.generated_tokens.len());
+                    tracing::debug!("🔍 REPEAT PENALTY DIAGNOSTIC:");
+                    tracing::debug!("   Prompt length: {} tokens", prompt_len);
+                    tracing::debug!("   Generated tokens so far: {} tokens", self.generated_tokens.len());
+                    tracing::debug!("   Full input_ids: {} tokens", input_ids.len());
+                    tracing::debug!("   Passing to repeat penalty: {} tokens (generated_tokens)", self.generated_tokens.len());
                 }
 
                 let next_token = self.engine.sample_token_with_params(

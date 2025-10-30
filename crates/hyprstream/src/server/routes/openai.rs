@@ -462,8 +462,8 @@ async fn stream_chat(state: ServerState, request: ChatCompletionRequest) -> impl
         let model_path = match state.model_storage.get_model_path(&model_ref).await {
             Ok(path) => path,
             Err(e) => {
-                info!("Could not get model path: {}, using defaults", e);
-                std::path::PathBuf::new()
+                let _ = tx.send(Err(anyhow::anyhow!("Could not get model path: {}", e))).await;
+                return;
             }
         };
 
@@ -729,9 +729,22 @@ async fn completions(
     let model_path = match state.model_storage.get_model_path(&model_ref).await {
         Ok(path) => path,
         Err(e) => {
-            info!("Could not get model path: {}, using defaults", e);
-            // Continue without model-specific config
-            std::path::PathBuf::new()
+            error!("Could not get model path: {}", e);
+            state
+                .metrics
+                .active_requests
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!("Could not get model path: {}", e),
+                        "type": "model_path_error",
+                        "code": "model_path_failed"
+                    }
+                })),
+            )
+                .into_response();
         }
     };
 
