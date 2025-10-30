@@ -3,7 +3,7 @@
 use crate::config::{
     FinishReason, GenerationConfig, GenerationRequest, GenerationResult, ModelInfo, RuntimeConfig,
 };
-use crate::runtime::generation_core::{self, GenerationCore, SamplingParams, CallbackControl};
+use crate::runtime::generation_core::{self, GenerationCore, SamplingParams};
 use crate::runtime::tensor_sampling::TensorSampler;
 use crate::runtime::template_engine::{ChatMessage, TemplateEngine};
 use crate::runtime::architectures::ModelOperations;
@@ -1162,10 +1162,10 @@ impl TorchEngine {
     pub async fn generate_streaming<F>(
         &self,
         request: GenerationRequest,
-        mut callback: F,
+        callback: F,
     ) -> Result<String>
     where
-        F: FnMut(&str) + Send,
+        F: FnMut(&str) + Send + 'static,
     {
         use crate::runtime::streaming::{StreamingCallback, ContinueGeneration};
         use async_trait::async_trait;
@@ -1178,7 +1178,7 @@ impl TorchEngine {
         #[async_trait]
         impl<F> StreamingCallback for SyncStreamCallback<F>
         where
-            F: FnMut(&str) + Send,
+            F: FnMut(&str) + Send + 'static,
         {
             async fn on_token(&mut self, token: &str) -> Result<ContinueGeneration> {
                 (self.callback)(token);

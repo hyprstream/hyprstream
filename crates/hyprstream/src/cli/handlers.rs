@@ -1,21 +1,14 @@
 //! CLI handlers for adaptive ML inference server
 
-use crate::cli::commands::model::ModelAction;
-use crate::config::RuntimeConfig;
-use crate::runtime::sampling::{load_sampling_config, SamplingConfig};
-use crate::runtime::template_engine::ChatMessage;
-use crate::runtime::{RuntimeEngine, TorchEngine};
-use crate::storage::{ModelMetadata, ModelStorage};
+use crate::storage::ModelStorage;
 use crate::training::{CheckpointManager, WeightFormat, WeightSnapshot};
 use ::config::{Config, File};
-use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// Response structure for LoRA inference
 #[derive(Debug, Clone)]

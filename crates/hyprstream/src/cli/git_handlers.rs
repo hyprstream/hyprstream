@@ -384,37 +384,6 @@ pub async fn handle_lora_train(
     Ok(())
 }
 
-/// Handle serve command
-pub async fn handle_serve(model: Option<String>, port: u16, host: &str) -> Result<()> {
-    if let Some(ref model_ref_str) = model {
-        println!("Starting server with pre-loaded model: {}", model_ref_str);
-    } else {
-        println!("Starting server in lazy-loading mode");
-        println!("Models will be loaded on demand via API requests");
-    }
-
-    println!("Listening on {}:{}", host, port);
-
-    // TODO: Call the actual server start function
-    // For now, just simulate
-    println!("\n→ Server configuration:");
-    println!(
-        "  Lazy loading: {}",
-        if model.is_none() {
-            "enabled"
-        } else {
-            "disabled"
-        }
-    );
-    println!(
-        "  Pre-loaded models: {}",
-        model.as_deref().unwrap_or("none")
-    );
-    println!("  API endpoint: http://{}:{}/v1/completions", host, port);
-
-    Ok(())
-}
-
 /// Handle list command
 pub async fn handle_list(
     storage: &ModelStorage,
@@ -1005,16 +974,20 @@ pub async fn handle_infer(
         info!("Generated {} tokens", result.split_whitespace().count());
     } else {
         // Generate all at once using streaming with collection
-        let mut response = String::new();
+        let response = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let response_clone = response.clone();
         engine
             .generate_streaming(
                 request.clone(),
-                |token| {
-                    response.push_str(token);
+                move |token| {
+                    if let Ok(mut r) = response_clone.lock() {
+                        r.push_str(token);
+                    }
                 },
             )
             .await?;
-        println!("\n{}", response);
+        let final_response = response.lock().unwrap().clone();
+        println!("\n{}", final_response);
     }
 
     Ok(())

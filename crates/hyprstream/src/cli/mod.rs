@@ -15,7 +15,7 @@ pub use context::AppContext;
 pub use git_handlers::{
     handle_branch, handle_checkout, handle_clone, handle_commit, handle_infer, handle_info,
     handle_list, handle_lora_train, handle_merge, handle_pull, handle_push, handle_remove,
-    handle_serve, handle_status,
+    handle_status,
 };
 pub use handlers::{handle_config, handle_server};
 

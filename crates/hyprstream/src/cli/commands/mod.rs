@@ -124,18 +124,6 @@ pub enum Commands {
         config: Option<String>,
     },
 
-    /// Serve model (shorthand for 'server')
-    Serve {
-        /// Model reference to pre-load (optional)
-        model: Option<String>,
-        /// Port to listen on
-        #[arg(long, default_value = "8080")]
-        port: u16,
-        /// Host to bind to
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-    },
-
     /// Run inference with a model
     Infer {
         /// Model reference (e.g., "Qwen3-4B", "qwen/qwen-2b", "model:branch")

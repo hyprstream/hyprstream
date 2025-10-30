@@ -13,7 +13,7 @@ use hyprstream_core::cli::handlers::handle_server;
 use hyprstream_core::cli::{
     handle_branch, handle_checkout, handle_clone, handle_commit, handle_infer, handle_info,
     handle_list, handle_lora_train, handle_merge, handle_pull, handle_push, handle_remove,
-    handle_serve, handle_status, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
+    handle_status, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
 };
 use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
@@ -411,16 +411,6 @@ fn main() -> Result<()> {
                 model,
                 config
             );
-        }
-
-        Commands::Serve { model, port, host } => {
-            with_runtime(
-                RuntimeConfig {
-                    device: DeviceConfig::request_gpu(),
-                    multi_threaded: true,
-                },
-                || async { handle_serve(model, port, &host).await.map_err(|e| e.into()) },
-            )?;
         }
 
         Commands::Infer {
