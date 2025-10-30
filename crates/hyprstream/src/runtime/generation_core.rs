@@ -181,10 +181,7 @@ impl<'a> GenerationCore<'a> {
                 // Step 5: Decode incrementally using DecodeStream (O(1) per token!)
                 let new_text = match decode_stream.step(next_token as u32) {
                     Ok(Some(text)) => {
-                        // Log any unusual characters
-                        if text.chars().any(|c| (c as u32) > 0x4E00 && (c as u32) < 0x9FFF) {
-                            tracing::info!("⚠️  Token {} decoded to text with CJK character: {:?}", next_token, text);
-                        }
+                        // Log decoding errors (replacement character indicates invalid UTF-8)
                         if text.contains('�') {
                             tracing::info!("⚠️  Token {} decoded to replacement character: {:?}", next_token, text);
                         }
