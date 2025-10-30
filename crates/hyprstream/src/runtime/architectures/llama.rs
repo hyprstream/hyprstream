@@ -1668,6 +1668,10 @@ impl ModelOperations for LlamaModel {
         let _ = adapter;
         Ok(())
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl LlamaModel {

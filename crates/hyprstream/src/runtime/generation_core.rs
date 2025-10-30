@@ -97,6 +97,9 @@ impl<'a> GenerationCore<'a> {
         let tokenizer = self.engine.get_tokenizer()?;
         let mut decode_stream = tokenizer.decode_stream(false); // Don't skip special tokens
 
+        // Clear KV cache before generation to prevent context pollution from previous runs
+        self.engine.clear_kv_cache();
+
         for i in 0..request.max_tokens {
             // Step 1: Forward pass with KV caching
             let logits = if i == 0 {

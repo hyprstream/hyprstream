@@ -769,6 +769,27 @@ impl TorchEngine {
         Ok(last_token_logits)
     }
 
+    /// Clear KV cache before new generation to prevent context pollution
+    pub fn clear_kv_cache(&self) {
+        if let Some(model_arc) = &self.persistent_model {
+            let model = match model_arc.lock() {
+                Ok(m) => m,
+                Err(poisoned) => {
+                    tracing::warn!("Model lock poisoned during cache clear, recovering");
+                    poisoned.into_inner()
+                }
+            };
+
+            // Use downcasting to call clear_kv_cache on LlamaModel
+            // This is safe because we know the model type at runtime
+            let model_any = model.as_any();
+            if let Some(llama_model) = model_any.downcast_ref::<crate::runtime::architectures::llama::LlamaModel>() {
+                llama_model.clear_kv_cache();
+                tracing::debug!("Cleared KV cache before generation");
+            }
+        }
+    }
+
     /// Sample next token using bundled parameters
     pub fn sample_token_with_params(
         &self,
