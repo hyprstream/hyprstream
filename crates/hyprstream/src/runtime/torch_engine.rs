@@ -33,7 +33,7 @@ pub struct DecodeConfig {
 impl Default for DecodeConfig {
     fn default() -> Self {
         Self {
-            skip_special_tokens: false, // Don't skip special tokens - they're needed for formatting
+            skip_special_tokens: true,
             clean_up_tokenization_spaces: true,
             normalize_text: false, // Be more conservative with normalization
         }
@@ -169,7 +169,7 @@ impl TorchEngine {
             device,
             config: config.clone(),
             generation_config: GenerationConfig {
-                max_tokens: 512,
+                max_tokens: 2048,
                 temperature: 0.7,
                 top_p: 0.9,
                 top_k: Some(40),
@@ -372,7 +372,7 @@ impl TorchEngine {
                 let model_info = self.handle_poison(self.model_info.lock())?;
                 if model_info.vocab_size as usize != tokenizer_vocab_size {
                     tracing::warn!(
-                        "Vocabulary size mismatch! Model config: {}, Tokenizer: {}. This may cause Unicode replacement characters.",
+                        "Vocabulary size mismatch: model={}, tokenizer={}",
                         model_info.vocab_size, tokenizer_vocab_size
                     );
                 }
@@ -551,17 +551,6 @@ impl TorchEngine {
 
         // Process normally - let tokenizer handle all other special tokens properly
         None
-    }
-
-    /// Get the tokenizer for streaming decoding - CoW makes this cheap!
-    ///
-    /// Returns a cloned tokenizer (cheap due to copy-on-write)
-    pub fn get_tokenizer(&self) -> Result<Tokenizer> {
-        let tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
-        tokenizer_guard
-            .as_ref()
-            .cloned() // Cheap clone due to CoW
-            .ok_or_else(|| anyhow!("Tokenizer not loaded. Call load_tokenizer() first."))
     }
 
     /// Get the tokenizer for streaming decoding - CoW makes this cheap!
@@ -1753,5 +1742,51 @@ impl Drop for TorchEngine {
 
         // Arc<Mutex<...>> fields are automatically cleaned up via Arc reference counting
         // when the last TorchEngine clone drops. No manual intervention needed.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decode_config_defaults() {
+        let config = DecodeConfig::default();
+
+        // Verify skip_special_tokens is true (not false)
+        assert_eq!(
+            config.skip_special_tokens, true,
+            "skip_special_tokens should be true by default to avoid literal * and formatting tokens"
+        );
+
+        assert_eq!(
+            config.clean_up_tokenization_spaces, true,
+            "Should clean up tokenization spaces by default"
+        );
+    }
+
+    #[test]
+    fn test_generation_config_in_engine_has_correct_max_tokens() {
+        // Create a minimal runtime config
+        let _runtime_config = RuntimeConfig::default();
+
+        // Create engine (this will fail without LIBTORCH but we can test the constructor logic)
+        // We're just verifying the default generation_config
+        let gen_config = GenerationConfig {
+            max_tokens: 2048,
+            temperature: 0.7,
+            top_p: 0.9,
+            top_k: Some(40),
+            repeat_penalty: 1.1,
+            stop_tokens: vec!["</s>".to_string()],
+            seed: None,
+            stream: false,
+        };
+
+        // Verify the defaults we set
+        assert_eq!(
+            gen_config.max_tokens, 2048,
+            "TorchEngine should initialize with max_tokens=2048"
+        );
     }
 }

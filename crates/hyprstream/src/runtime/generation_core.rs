@@ -96,7 +96,10 @@ impl<'a> GenerationCore<'a> {
 
         // Create DecodeStream for incremental decoding (O(1) per token!)
         let tokenizer = self.engine.get_tokenizer()?;
-        let mut decode_stream = tokenizer.decode_stream(false); // Don't skip special tokens
+        let mut decode_stream = tokenizer.decode_stream(true);
+
+        // Accumulate decoded text for stop token detection
+        let mut accumulated_text = String::new();
 
         // Clear KV cache before generation to prevent context pollution from previous runs
         self.engine.clear_kv_cache();
@@ -123,27 +126,11 @@ impl<'a> GenerationCore<'a> {
                 // Step 2: Sample next token with new params interface
                 // IMPORTANT: Only apply repeat penalty to generated tokens, not the prompt!
                 // Using full input_ids would penalize words from conversation history
-
-                // DIAGNOSTIC: Log what we're passing to repeat penalty
-                if i == 0 {
-                    tracing::debug!("🔍 REPEAT PENALTY DIAGNOSTIC:");
-                    tracing::debug!("   Prompt length: {} tokens", prompt_len);
-                    tracing::debug!("   Generated tokens so far: {} tokens", self.generated_tokens.len());
-                    tracing::debug!("   Full input_ids: {} tokens", input_ids.len());
-                    tracing::debug!("   Passing to repeat penalty: {} tokens (generated_tokens)", self.generated_tokens.len());
-                }
-
                 let next_token = self.engine.sample_token_with_params(
                     &logits,
                     params,
                     &self.generated_tokens,
                 )?;
-
-                // Log token generation progress every 50 tokens
-                if tokens_generated % 50 == 0 {
-                    tracing::debug!("🔄 Generated {} tokens (repeat penalty applied to {} tokens)",
-                        tokens_generated, self.generated_tokens.len());
-                }
 
                 // Step 3: Validate token BEFORE adding to context
 
@@ -180,27 +167,26 @@ impl<'a> GenerationCore<'a> {
 
                 // Step 5: Decode incrementally using DecodeStream (O(1) per token!)
                 let new_text = match decode_stream.step(next_token as u32) {
-                    Ok(Some(text)) => {
-                        // Log any unusual characters
-                        if text.chars().any(|c| (c as u32) > 0x4E00 && (c as u32) < 0x9FFF) {
-                            tracing::info!("⚠️  Token {} decoded to text with CJK character: {:?}", next_token, text);
-                        }
-                        if text.contains('�') {
-                            tracing::info!("⚠️  Token {} decoded to replacement character: {:?}", next_token, text);
-                        }
-                        text
-                    }
-                    Ok(None) => {
-                        tracing::debug!("Token {} produced no text (incomplete UTF-8)", next_token);
-                        String::new()
-                    }
-                    Err(e) => {
-                        tracing::info!("❌ Failed to decode token {}: {}", next_token, e);
-                        String::new()
-                    }
+                    Ok(Some(text)) => text,
+                    Ok(None) => String::new(),
+                    Err(_e) => String::new(),
                 };
 
-                // Step 6: Call async callback with new text (if any)
+                // Accumulate text for stop token detection
+                if !new_text.is_empty() {
+                    accumulated_text.push_str(&new_text);
+                }
+
+                // Step 6: Check for stop tokens in accumulated text
+                if !request.stop_tokens.is_empty() {
+                    if let Some(stop_token) = request.stop_tokens.iter()
+                        .find(|stop| !stop.is_empty() && accumulated_text.contains(*stop)) {
+                        tracing::debug!("Stop token '{}' detected in generated text", stop_token);
+                        break;
+                    }
+                }
+
+                // Step 7: Call async callback with new text (if any)
                 if !new_text.is_empty() {
                     match callback.on_token(&new_text).await? {
                         ContinueGeneration::Continue => {},
@@ -213,16 +199,6 @@ impl<'a> GenerationCore<'a> {
                         }
                     }
                 }
-
-            // Step 7: Check for stop tokens at the end of generated text
-            // We check if any stop token appears at the end to avoid false positives
-            if request
-                .stop_tokens
-                .iter()
-                .any(|stop| !stop.is_empty() && self.decoder.get_text().contains(stop))
-            {
-                tracing::debug!("Stop token detected in generated text");
-                break;
             }
 
             Ok::<_, anyhow::Error>(())

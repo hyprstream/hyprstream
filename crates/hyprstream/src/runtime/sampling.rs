@@ -309,13 +309,26 @@ impl SamplingConfig {
 
 /// Load sampling configuration from model's config.json
 pub async fn load_sampling_config(model_path: &std::path::Path) -> Result<SamplingConfig> {
-    let config_path = model_path.join("config.json");
+    // Try to load from generation_config.json first (HuggingFace standard)
+    let gen_config_path = model_path.join("generation_config.json");
+    if gen_config_path.exists() {
+        let gen_config_str = tokio::fs::read_to_string(&gen_config_path).await?;
+        let gen_config: serde_json::Value = serde_json::from_str(&gen_config_str)?;
+        return Ok(SamplingConfig::from_generation_config(&gen_config));
+    }
 
+    // Fall back to config.json with embedded generation_config
+    let config_path = model_path.join("config.json");
     if config_path.exists() {
         let config_str = tokio::fs::read_to_string(&config_path).await?;
         let config_json: serde_json::Value = serde_json::from_str(&config_str)?;
 
-        // Extract model name from path or config
+        // Check for embedded generation_config key
+        if let Some(gen_config) = config_json.get("generation_config") {
+            return Ok(SamplingConfig::from_generation_config(gen_config));
+        }
+
+        // Use model-specific defaults based on model name
         let model_id = config_json
             .get("_name_or_path")
             .and_then(|v| v.as_str())
@@ -326,21 +339,18 @@ pub async fn load_sampling_config(model_path: &std::path::Path) -> Result<Sampli
                     .unwrap_or("unknown")
             });
 
-        Ok(SamplingConfig::from_model_card(model_id, &config_json))
-    } else {
-        // Try to infer from model path
-        let model_name = model_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
-
-        Ok(SamplingConfig::for_model(model_name))
+        return Ok(SamplingConfig::for_model(model_id));
     }
+
+    // No config found - use generic defaults
+    Ok(SamplingConfig::default())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use tempfile::TempDir;
 
     #[test]
     fn test_model_specific_configs() {
@@ -374,5 +384,72 @@ mod tests {
         assert_eq!(config.top_k, Some(30));
         assert_eq!(config.top_p, Some(0.85));
         assert_eq!(config.repeat_penalty, 1.2);
+    }
+
+    #[tokio::test]
+    async fn test_load_generation_config_json() {
+        // Create temporary directory with generation_config.json
+        let temp_dir = TempDir::new().unwrap();
+        let gen_config_path = temp_dir.path().join("generation_config.json");
+
+        let config_content = serde_json::json!({
+            "temperature": 0.6,
+            "top_k": 20,
+            "top_p": 0.95,
+            "do_sample": true
+        });
+
+        let mut file = std::fs::File::create(&gen_config_path).unwrap();
+        file.write_all(config_content.to_string().as_bytes()).unwrap();
+
+        // Load config
+        let config = load_sampling_config(temp_dir.path()).await.unwrap();
+
+        // Verify Qwen3-8B settings are loaded correctly
+        assert_eq!(config.temperature, 0.6, "Should load temperature from generation_config.json");
+        assert_eq!(config.top_k, Some(20), "Should load top_k from generation_config.json");
+        assert_eq!(config.top_p, Some(0.95), "Should load top_p from generation_config.json");
+        assert_eq!(config.do_sample, true, "Should load do_sample from generation_config.json");
+    }
+
+    #[tokio::test]
+    async fn test_fallback_to_config_json() {
+        // Create temporary directory with config.json containing generation_config
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+
+        let config_content = serde_json::json!({
+            "_name_or_path": "test-model",
+            "generation_config": {
+                "temperature": 0.8,
+                "top_k": 50
+            }
+        });
+
+        let mut file = std::fs::File::create(&config_path).unwrap();
+        file.write_all(config_content.to_string().as_bytes()).unwrap();
+
+        // Load config (should fall back to config.json)
+        let config = load_sampling_config(temp_dir.path()).await.unwrap();
+
+        assert_eq!(config.temperature, 0.8, "Should load from embedded generation_config");
+        assert_eq!(config.top_k, Some(50), "Should load from embedded generation_config");
+    }
+
+    #[tokio::test]
+    async fn test_generic_defaults_when_no_config() {
+        // Create empty temporary directory
+        let temp_dir = TempDir::new().unwrap();
+        let model_dir = temp_dir.path().join("some-model");
+        std::fs::create_dir(&model_dir).unwrap();
+
+        // Load config (should use generic defaults, NOT infer from directory name)
+        let config = load_sampling_config(&model_dir).await.unwrap();
+
+        // Should use generic defaults (SamplingConfig::default())
+        let default_config = SamplingConfig::default();
+        assert_eq!(config.temperature, default_config.temperature, "Should use default temperature");
+        assert_eq!(config.top_k, default_config.top_k, "Should use default top_k");
+        assert_eq!(config.top_p, default_config.top_p, "Should use default top_p");
     }
 }

@@ -94,7 +94,7 @@ impl QwenAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::runtime::architectures::llama::LlamaConfig;
 
     #[test]
     fn test_qwen_config_adaptation() {

@@ -169,7 +169,7 @@ pub struct GenerationConfig {
 impl Default for GenerationConfig {
     fn default() -> Self {
         Self {
-            max_tokens: 100,
+            max_tokens: 2048,
             temperature: 0.7,
             top_p: 0.9,
             top_k: Some(40),
@@ -579,6 +579,37 @@ impl From<&GenerationConfig> for GenerationRequest {
             stop_tokens: config.stop_tokens.clone(),
             seed: config.seed,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generation_config_defaults() {
+        let config = GenerationConfig::default();
+
+        // Verify max_tokens is set to 2048 (not 100)
+        assert_eq!(config.max_tokens, 2048, "Default max_tokens should be 2048 for thinking mode support");
+
+        // Verify other reasonable defaults
+        assert!(config.temperature > 0.0, "Temperature should be non-zero");
+        assert!(config.top_p > 0.0 && config.top_p <= 1.0, "top_p should be in valid range");
+    }
+
+    #[test]
+    fn test_generation_request_builder() {
+        let request = GenerationRequest::builder("test prompt")
+            .temperature(Some(0.8))
+            .top_k(Some(30))
+            .max_tokens(Some(1000))
+            .build();
+
+        assert_eq!(request.prompt, "test prompt");
+        assert_eq!(request.temperature, 0.8);
+        assert_eq!(request.top_k, Some(30));
+        assert_eq!(request.max_tokens, 1000);
     }
 }
 

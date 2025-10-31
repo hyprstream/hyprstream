@@ -1241,15 +1241,18 @@ mod tests {
             lm_head: None,
         };
 
-        // Test tensor with shape [1, 21, 1024]
-        let tensor = Tensor::randn(0.0, 1.0, &[1, 21, 1024], &device).unwrap();
+        // Test tensor for key/value with shape [1, 21, 1024] (4 * 256)
+        let kv_tensor = Tensor::randn(&[1, 21, 1024], (DType::Float, device));
 
         // Reshape for key/value (MQA)
-        let reshaped = model.reshape_for_attention(&tensor, true).unwrap();
+        let reshaped = model.reshape_for_attention(&kv_tensor, true).unwrap();
         assert_eq!(reshaped.size(), &[1, 21, 4, 256]); // 4 KV heads, 256 head_dim
 
+        // Test tensor for query with shape [1, 21, 4096] (16 * 256)
+        let q_tensor = Tensor::randn(&[1, 21, 4096], (DType::Float, device));
+
         // Reshape for query
-        let reshaped = model.reshape_for_attention(&tensor, false).unwrap();
+        let reshaped = model.reshape_for_attention(&q_tensor, false).unwrap();
         assert_eq!(reshaped.size(), &[1, 21, 16, 256]); // 16 Q heads, 256 head_dim
     }
 
@@ -1264,10 +1267,16 @@ mod tests {
             num_heads: 16,
             num_kv_heads: 4,
             head_dim: 256,
+            rope_theta: 10000.0,
+            q_norm: None,
+            k_norm: None,
+            query_pre_attn_scalar: None,
+            sliding_window: None,
+            layer_type: "full_attention".to_string(),
         };
 
         // Create KV tensor with 4 heads
-        let kv = Tensor::randn(0.0, 1.0, &[2, 10, 4, 256], &device).unwrap();
+        let kv = Tensor::randn(&[2, 10, 4, 256], (DType::Float, device));
 
         // Expand to match 16 query heads
         let expanded = attn.expand_kv_for_mqa(&kv).unwrap();
