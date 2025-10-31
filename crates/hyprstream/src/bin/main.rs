@@ -9,11 +9,11 @@ use tracing::info;
 
 // Core application imports
 use hyprstream_core::cli::commands::Commands;
-use hyprstream_core::cli::handlers::{handle_chat_command, handle_model_command, handle_server};
+use hyprstream_core::cli::handlers::handle_server;
 use hyprstream_core::cli::{
     handle_branch, handle_checkout, handle_clone, handle_commit, handle_infer, handle_info,
     handle_list, handle_lora_train, handle_merge, handle_pull, handle_push, handle_remove,
-    handle_serve, handle_status, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
+    handle_status, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
 };
 use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
@@ -118,26 +118,6 @@ where
 /// Server command handler - requires multi-threaded runtime for GPU
 async fn handle_server_cmd(ctx: AppContext) -> Result<()> {
     handle_server(ctx)
-        .await
-        .map_err(|e| anyhow::anyhow!("{}", e))
-}
-
-/// Model command handler - GPU requirements depend on action
-async fn handle_model_cmd(
-    cmd: hyprstream_core::cli::commands::model::ModelCommand,
-    server_url: String,
-) -> Result<()> {
-    handle_model_command(cmd, server_url)
-        .await
-        .map_err(|e| anyhow::anyhow!("{}", e))
-}
-
-/// Chat command handler - requires multi-threaded runtime for GPU
-async fn handle_chat_cmd(
-    cmd: hyprstream_core::cli::commands::chat::ChatCommand,
-    server_url: String,
-) -> Result<()> {
-    handle_chat_command(cmd, server_url)
         .await
         .map_err(|e| anyhow::anyhow!("{}", e))
 }
@@ -305,34 +285,6 @@ fn main() -> Result<()> {
                 || handle_server_cmd(ctx),
             )?
         }
-        Commands::Model(cmd) => {
-            let server_url = "http://127.0.0.1:50051".to_string();
-            let device_config = cmd.action.device_config();
-            let multi_threaded = matches!(
-                device_config.preference,
-                DevicePreference::RequestGPU | DevicePreference::RequireGPU
-            );
-
-            with_runtime(
-                RuntimeConfig {
-                    device: device_config,
-                    multi_threaded,
-                },
-                || handle_model_cmd(cmd, server_url),
-            )?
-        }
-        Commands::Chat(cmd) => {
-            let server_url = "http://127.0.0.1:50051".to_string();
-
-            with_runtime(
-                RuntimeConfig {
-                    device: DeviceConfig::request_gpu(),
-                    multi_threaded: true,
-                },
-                || handle_chat_cmd(cmd, server_url),
-            )?
-        }
-
         // Phase 1: Git-style commands
         Commands::Branch { model, name, from } => {
             let ctx = ctx.clone();
@@ -461,16 +413,6 @@ fn main() -> Result<()> {
             );
         }
 
-        Commands::Serve { model, port, host } => {
-            with_runtime(
-                RuntimeConfig {
-                    device: DeviceConfig::request_gpu(),
-                    multi_threaded: true,
-                },
-                || async { handle_serve(model, port, &host).await.map_err(|e| e.into()) },
-            )?;
-        }
-
         Commands::Infer {
             model,
             prompt,
@@ -478,6 +420,7 @@ fn main() -> Result<()> {
             temperature,
             top_p,
             top_k,
+            repeat_penalty,
             stream,
             force_download,
         } => {
@@ -497,6 +440,7 @@ fn main() -> Result<()> {
                         temperature,
                         top_p,
                         top_k,
+                        repeat_penalty,
                         stream,
                         force_download,
                     )

@@ -3,10 +3,10 @@
 use crate::config::{
     FinishReason, GenerationConfig, GenerationRequest, GenerationResult, ModelInfo, RuntimeConfig,
 };
-use crate::runtime::generation_core::{self, GenerationCore, SamplingParams, CallbackControl};
+use crate::runtime::generation_core::{self, GenerationCore, SamplingParams};
 use crate::runtime::tensor_sampling::TensorSampler;
 use crate::runtime::template_engine::{ChatMessage, TemplateEngine};
-use crate::runtime::utf8_decoder::IncrementalUtf8Decoder;
+use crate::runtime::architectures::ModelOperations;
 use crate::runtime::RuntimeEngine;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -22,51 +22,23 @@ use tch::{nn::VarStore, Device, Tensor};
 use tokenizers::Tokenizer;
 use tracing::{info, instrument};
 
-/// Qwen2 special token IDs (based on official HuggingFace implementation)
+/// Decode configuration options (similar to transformers decode_kwargs)
 #[derive(Debug, Clone)]
-pub struct QwenSpecialTokens {
-    /// "<|endoftext|>" - Used as BOS, EOS, and PAD token
-    pub endoftext: u32,
-    /// "<|im_start|>" - Instruction/message start
-    pub im_start: u32,
-    /// "<|im_end|>" - Instruction/message end (primary EOS for conversations)
-    pub im_end: u32,
-    /// Additional special tokens for multimodal support
-    pub object_ref_start: u32,
-    pub object_ref_end: u32,
-    pub box_start: u32,
-    pub box_end: u32,
-    pub vision_start: u32,
-    pub vision_end: u32,
-    pub vision_pad: u32,
-    pub image_pad: u32,
-    pub video_pad: u32,
-    /// Chain-of-thought reasoning tokens (Qwen 2.5+)
-    pub thinking_start: u32,  // "<|thinking_start|>"
-    pub thinking_end: u32,    // "<|thinking_end|>"
+pub struct DecodeConfig {
+    pub skip_special_tokens: bool,
+    pub clean_up_tokenization_spaces: bool,
+    pub normalize_text: bool,
 }
 
-impl Default for QwenSpecialTokens {
+impl Default for DecodeConfig {
     fn default() -> Self {
         Self {
-            endoftext: 151643, // "<|endoftext|>"
-            im_start: 151644,  // "<|im_start|>"
-            im_end: 151645,    // "<|im_end|>"
-            object_ref_start: 151646,
-            object_ref_end: 151647,
-            box_start: 151648,
-            box_end: 151649,
-            vision_start: 151652,
-            vision_end: 151653,
-            vision_pad: 151654,
-            image_pad: 151655,
-            video_pad: 151656,
-            thinking_start: 151667,  // "<|thinking_start|>"
-            thinking_end: 151668,    // "<|thinking_end|>"
+            skip_special_tokens: false, // Don't skip special tokens - they're needed for formatting
+            clean_up_tokenization_spaces: true,
+            normalize_text: false, // Be more conservative with normalization
         }
     }
 }
-use crate::runtime::architectures::ModelOperations;
 
 /// Basic context state for tracking generation state
 #[derive(Debug, Clone)]
@@ -119,8 +91,6 @@ pub struct TorchEngine {
     sampling_config: RuntimeConfig,
     /// GPU sampler for efficient token sampling - thread safe after initialization
     sampler: TensorSampler,  // Renamed from gpu_sampler - works on both CPU and GPU
-    /// Qwen special tokens for proper conversation handling - immutable after construction
-    special_tokens: QwenSpecialTokens,
     /// Cached tokenizer vocabulary size for lock-free access
     /// 0 means not yet initialized
     tokenizer_vocab_size: Arc<AtomicUsize>,
@@ -204,7 +174,7 @@ impl TorchEngine {
                 top_p: 0.9,
                 top_k: Some(40),
                 repeat_penalty: 1.1,
-                stop_tokens: vec!["</s>".to_string(), "<|endoftext|>".to_string()],
+                stop_tokens: vec!["</s>".to_string()],
                 seed: None,
                 stream: false,
             },
@@ -225,7 +195,6 @@ impl TorchEngine {
             lora_trainer: Arc::new(Mutex::new(None)),
             sampling_config: config,
             sampler: TensorSampler::new(device),
-            special_tokens: QwenSpecialTokens::default(),
             tokenizer_vocab_size: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -436,6 +405,8 @@ impl TorchEngine {
 
             let config_json: serde_json::Value = serde_json::from_str(&config_content)?;
 
+            // TODO: Load special tokens configuration using tokenizer's built-in methods
+
             // Parse template configuration
             let template_config = TemplateEngine::from_tokenizer_config(&config_json)?;
 
@@ -461,6 +432,9 @@ impl TorchEngine {
             .as_ref()
             .ok_or_else(|| anyhow!("Tokenizer not loaded. Call load_tokenizer() first."))?;
 
+        // Log the raw input for debugging prompt issues
+        tracing::info!("📝 Raw prompt before tokenization:\n{}", text);
+
         let encoding = tokenizer
             .encode(text, false)
             .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
@@ -473,7 +447,23 @@ impl TorchEngine {
             ));
         }
 
-        tracing::debug!("Tokenized '{}' -> {:?}", text, token_ids);
+        // Show tokenization details
+        tracing::debug!("Tokenized '{}' -> {} tokens: {:?}",
+            text.chars().take(100).collect::<String>(),
+            token_ids.len(),
+            token_ids
+        );
+
+        // Decode back to verify tokenization is correct
+        if let Ok(decoded) = tokenizer.decode(&token_ids.iter().map(|&id| id as u32).collect::<Vec<_>>(), false) {
+            if decoded != text {
+                tracing::warn!("⚠️  Tokenization roundtrip mismatch!\nOriginal: {}\nDecoded:  {}",
+                    text.chars().take(200).collect::<String>(),
+                    decoded.chars().take(200).collect::<String>()
+                );
+            }
+        }
+
         Ok(token_ids)
     }
 
@@ -505,58 +495,73 @@ impl TorchEngine {
             }
         }
 
-        // Fallback to hardcoded Qwen2 template if template engine not available
+        // Generic fallback template (model-agnostic)
         let mut formatted = String::new();
 
         // Add system message if provided
         if let Some(system_msg) = system {
-            formatted.push_str("<|im_start|>system\n");
+            formatted.push_str("System: ");
             formatted.push_str(system_msg);
-            formatted.push_str("<|im_end|>\n");
+            formatted.push_str("\n\n");
         }
 
         // Add user message
-        formatted.push_str("<|im_start|>user\n");
+        formatted.push_str("User: ");
         formatted.push_str(user);
-        formatted.push_str("<|im_end|>\n");
-
-        // Add assistant prompt
-        formatted.push_str("<|im_start|>assistant\n");
+        formatted.push_str("\n\nAssistant: ");
 
         formatted
     }
 
-    /// Check if a token ID is a special EOS token for Qwen
+    /// Check if a token ID is a special EOS token using tokenizer's built-in detection
     pub fn is_eos_token(&self, token_id: usize) -> bool {
-        let token_id_u32 = token_id as u32;
-        // Qwen can end on either im_end (for conversations) or endoftext (for completion)
-        token_id_u32 == self.special_tokens.im_end || token_id_u32 == self.special_tokens.endoftext
+        if let Ok(tokenizer_guard) = self.tokenizer.lock() {
+            if let Some(ref tokenizer) = *tokenizer_guard {
+                // Check if it's the tokenizer's EOS token
+                if let Some(eos_token) = tokenizer.get_added_tokens_decoder().get(&(token_id as u32)) {
+                    return eos_token.content == "<|im_end|>" || eos_token.content == "</s>";
+                }
+            }
+        }
+
+        // Fallback: check if it's a common EOS token
+        token_id as u32 == 2 // Common </s> token ID
     }
 
-    /// Check if a token is a special token that should be allowed/blocked
-    /// Returns None if token is normal, Some(true) if allowed, Some(false) if should stop
+    /// Check if a token should be blocked from text-only generation using tokenizer's knowledge
+    /// Returns Some(false) if token should be blocked, None if process normally
     pub fn check_special_token(&self, token_id: usize) -> Option<bool> {
-        let token_id_u32 = token_id as u32;
+        if let Ok(tokenizer_guard) = self.tokenizer.lock() {
+            if let Some(ref tokenizer) = *tokenizer_guard {
+                // Only block multimodal tokens that truly shouldn't appear in text output
+                if let Some(token) = tokenizer.get_added_tokens_decoder().get(&(token_id as u32)) {
+                    let content = &token.content;
 
-        // Allow thinking tokens (chain-of-thought reasoning)
-        if token_id_u32 == self.special_tokens.thinking_start
-            || token_id_u32 == self.special_tokens.thinking_end {
-            return Some(true); // Allow
+                    // Block actual multimodal tokens (vision, image, video tokens)
+                    if content.contains("vision") || content.contains("image") ||
+                       content.contains("video") || content.contains("box") ||
+                       content.contains("object_ref") || content.contains("quad") ||
+                       content.contains("<|vision_") || content.contains("<|image_") {
+                        tracing::debug!("Blocking multimodal token: {}", content);
+                        return Some(false);
+                    }
+                }
+            }
         }
 
-        // Block vision/multimodal tokens
-        if token_id_u32 >= self.special_tokens.object_ref_start
-            && token_id_u32 < self.special_tokens.thinking_start {
-            return Some(false); // Block
-        }
+        // Process normally - let tokenizer handle all other special tokens properly
+        None
+    }
 
-        // Block tokens beyond thinking_end (if they're in special range)
-        if token_id_u32 > self.special_tokens.thinking_end
-            && token_id_u32 < self.special_tokens.endoftext + 100 {
-            return Some(false); // Block (within special token range)
-        }
-
-        None // Normal token
+    /// Get the tokenizer for streaming decoding - CoW makes this cheap!
+    ///
+    /// Returns a cloned tokenizer (cheap due to copy-on-write)
+    pub fn get_tokenizer(&self) -> Result<Tokenizer> {
+        let tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
+        tokenizer_guard
+            .as_ref()
+            .cloned() // Cheap clone due to CoW
+            .ok_or_else(|| anyhow!("Tokenizer not loaded. Call load_tokenizer() first."))
     }
 
     /// Get the tokenizer for streaming decoding - CoW makes this cheap!
@@ -572,6 +577,11 @@ impl TorchEngine {
 
     /// Detokenize IDs back to text - thread safe
     pub fn detokenize(&self, ids: &[i64]) -> Result<String> {
+        self.detokenize_with_config(ids, &DecodeConfig::default())
+    }
+
+    /// Detokenize with custom configuration
+    pub fn detokenize_with_config(&self, ids: &[i64], config: &DecodeConfig) -> Result<String> {
         let tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
         let tokenizer = tokenizer_guard
             .as_ref()
@@ -586,22 +596,107 @@ impl TorchEngine {
         // Debug tokenizer state
         tracing::debug!("Detokenizing token IDs: {:?}", ids_u32);
 
-        // Decode tokens - skip special tokens for clean output
-        // The tokenizer is already configured with NFC Unicode normalization
+        // Decode tokens with configurable options
         let decoded_text = tokenizer
-            .decode(&ids_u32, true)
+            .decode(&ids_u32, config.skip_special_tokens)
             .map_err(|e| anyhow!("Detokenization failed for token IDs {:?}: {}", ids, e))?;
 
+        // Post-process the text for better formatting
+        let mut cleaned_text = if config.clean_up_tokenization_spaces {
+            self.post_process_decoded_text(&decoded_text)
+        } else {
+            decoded_text
+        };
+
+        // Apply additional normalization if requested
+        if config.normalize_text {
+            cleaned_text = self.normalize_text(&cleaned_text);
+        }
+
         // Log any Unicode replacement characters for debugging
-        if decoded_text.contains('\u{FFFD}') {
+        if cleaned_text.contains('\u{FFFD}') {
             tracing::warn!(
-                "Unicode replacement characters detected in token IDs {:?}",
-                ids_u32
+                "Unicode replacement characters detected in token IDs {:?} - text: '{}'",
+                ids_u32, cleaned_text
             );
         }
 
-        tracing::debug!("Detokenized {:?} -> '{}'", ids_u32, decoded_text);
-        Ok(decoded_text)
+        tracing::debug!("Detokenized {:?} -> '{}'", ids_u32, cleaned_text);
+        Ok(cleaned_text)
+    }
+
+    /// Post-process decoded text to fix formatting issues
+    fn post_process_decoded_text(&self, text: &str) -> String {
+        let mut cleaned = text.to_string();
+
+        // Only remove actual replacement characters, not valid Unicode
+        cleaned = cleaned.replace("�", ""); // Remove replacement chars
+
+        // Clean up excessive whitespace but preserve single spaces
+        while cleaned.contains("  ") {
+            cleaned = cleaned.replace("  ", " ");
+        }
+
+        // Don't trim leading whitespace - it might be intentional
+        // Don't strip special tokens - they're part of the formatting
+
+        cleaned
+    }
+
+    /// Normalize text for better formatting (similar to transformers)
+    fn normalize_text(&self, text: &str) -> String {
+        // Fix common Unicode normalization issues
+        // Handle CJK characters properly (don't add extra spaces)
+        let chars: Vec<char> = text.chars().collect();
+        let mut result = String::new();
+
+        for (i, &c) in chars.iter().enumerate() {
+            // Don't add spaces around CJK characters
+            if self.is_cjk_char(c) {
+                result.push(c);
+                continue;
+            }
+
+            // Handle spacing around punctuation for ASCII
+            if i > 0 && i < chars.len() - 1 {
+                let prev_char = chars[i - 1];
+                let next_char = chars[i + 1];
+
+                // Remove spaces before punctuation (unless it's after CJK)
+                if ".,!?;:".contains(c) && !self.is_cjk_char(prev_char) {
+                    if result.ends_with(' ') {
+                        result.pop();
+                    }
+                    result.push(c);
+                    // Add space after punctuation if next char is ASCII
+                    if next_char.is_ascii() && next_char != ' ' {
+                        result.push(' ');
+                    }
+                    continue;
+                }
+            }
+
+            result.push(c);
+        }
+
+        // Clean up any double spaces created by the process
+        while result.contains("  ") {
+            result = result.replace("  ", " ");
+        }
+
+        result.trim().to_string()
+    }
+
+    /// Check if character is CJK (for proper spacing)
+    fn is_cjk_char(&self, c: char) -> bool {
+        let cp = c as u32;
+        (cp >= 0x4E00 && cp <= 0x9FFF) ||  // CJK Unified Ideographs
+        (cp >= 0x3400 && cp <= 0x4DBF) ||  // Extension A
+        (cp >= 0x20000 && cp <= 0x2A6DF) || // Extension B
+        (cp >= 0xF900 && cp <= 0xFAFF) ||  // Compatibility
+        (cp >= 0x3040 && cp <= 0x309F) ||  // Hiragana
+        (cp >= 0x30A0 && cp <= 0x30FF) ||  // Katakana
+        (cp >= 0xAC00 && cp <= 0xD7AF)     // Korean Hangul
     }
 
     /// Run inference on the model (supports both TorchScript and VarStore models) - thread safe
@@ -702,6 +797,27 @@ impl TorchEngine {
         let last_token_logits = logits.narrow(1, seq_len - 1, 1).squeeze_dim(1);
 
         Ok(last_token_logits)
+    }
+
+    /// Clear KV cache before new generation to prevent context pollution
+    pub fn clear_kv_cache(&self) {
+        if let Some(model_arc) = &self.persistent_model {
+            let model = match model_arc.lock() {
+                Ok(m) => m,
+                Err(poisoned) => {
+                    tracing::warn!("Model lock poisoned during cache clear, recovering");
+                    poisoned.into_inner()
+                }
+            };
+
+            // Use downcasting to call clear_kv_cache on LlamaModel
+            // This is safe because we know the model type at runtime
+            let model_any = model.as_any();
+            if let Some(llama_model) = model_any.downcast_ref::<crate::runtime::architectures::llama::LlamaModel>() {
+                llama_model.clear_kv_cache();
+                tracing::debug!("Cleared KV cache before generation");
+            }
+        }
     }
 
     /// Sample next token using bundled parameters
@@ -812,9 +928,9 @@ impl RuntimeEngine for TorchEngine {
     }
 
     async fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String> {
-        // Format prompt with Qwen2 chat template
+        // Format prompt with model-agnostic chat template
         let formatted_prompt = self.format_chat_message(
-            Some("You are Qwen, created by Alibaba Cloud. You are a helpful assistant."),
+            Some("You are a helpful assistant."),
             prompt,
         );
 
@@ -827,10 +943,6 @@ impl RuntimeEngine for TorchEngine {
             repeat_penalty: self.generation_config.repeat_penalty,
             stop_tokens: self.generation_config.stop_tokens.clone(),
             seed: None,
-            stream: false,
-            active_adapters: None,
-            realtime_adaptation: None,
-            user_feedback: None,
         };
 
         let result = self.generate_with_params(request).await?;
@@ -848,6 +960,22 @@ impl RuntimeEngine for TorchEngine {
         // Run the CPU-intensive generation in a blocking thread to avoid blocking the async runtime
         let self_clone = self.clone();
         let generation_future = tokio::task::spawn_blocking(move || {
+            use crate::runtime::streaming::{StreamingCallback, ContinueGeneration};
+            use async_trait::async_trait;
+
+            // Inline no-op callback adapter for blocking generation
+            struct NoOpCallback;
+
+            #[async_trait]
+            impl StreamingCallback for NoOpCallback {
+                async fn on_token(&mut self, _token: &str) -> Result<ContinueGeneration> {
+                    Ok(ContinueGeneration::Continue)
+                }
+                async fn on_complete(&mut self, _reason: FinishReason) {}
+                async fn on_error(&mut self, _error: anyhow::Error) {}
+                async fn on_start(&mut self) {}
+            }
+
             // Ensure persistent model is ready
             if !self_clone.is_persistent_model_ready() {
                 return Err(anyhow!(
@@ -862,12 +990,19 @@ impl RuntimeEngine for TorchEngine {
             let params = SamplingParams::from_request(&request);
 
             // Use the unified GenerationCore
-            let mut core = GenerationCore::new(&self_clone);
+            let mut core = GenerationCore::new(&self_clone)?;
 
             // Generate with no-op callback (blocking mode doesn't stream)
-            core.generate_tokens(input_ids, &params, &request, |_text| {
-                // Blocking mode: ignore intermediate text
-                Ok(CallbackControl::Continue)
+            tokio::runtime::Handle::current().block_on(async {
+                core.generate_tokens_async(
+                    input_ids,
+                    &params,
+                    &request,
+                    Box::new(NoOpCallback),
+                    tokio_util::sync::CancellationToken::new(), // Never cancelled
+                    std::time::Duration::from_secs(u64::MAX), // Effectively no timeout
+                )
+                .await
             })
         });
 
@@ -1031,20 +1166,40 @@ impl TorchEngine {
 
 // Additional methods needed by inference layer
 impl TorchEngine {
-    /// Generate text with streaming callback and custom parameters
-    pub async fn generate_streaming_with_params<F>(
+    /// Generate text with streaming callback
+    ///
+    /// Simplified API: accepts sync callbacks, handles all parameters.
+    /// For advanced use cases (SSE, cancellation), use generate_streaming_async().
+    pub async fn generate_streaming<F>(
         &self,
-        prompt: &str,
-        max_tokens: usize,
-        temperature: f32,
-        top_p: f32,
-        top_k: Option<usize>,
-        repeat_penalty: f32,
+        request: GenerationRequest,
         callback: F,
     ) -> Result<String>
     where
-        F: FnMut(&str),
+        F: FnMut(&str) + Send + 'static,
     {
+        use crate::runtime::streaming::{StreamingCallback, ContinueGeneration};
+        use async_trait::async_trait;
+
+        // Inline adapter to bridge sync callback to async trait
+        struct SyncStreamCallback<F> {
+            callback: F,
+        }
+
+        #[async_trait]
+        impl<F> StreamingCallback for SyncStreamCallback<F>
+        where
+            F: FnMut(&str) + Send + 'static,
+        {
+            async fn on_token(&mut self, token: &str) -> Result<ContinueGeneration> {
+                (self.callback)(token);
+                Ok(ContinueGeneration::Continue)
+            }
+            async fn on_complete(&mut self, _reason: FinishReason) {}
+            async fn on_error(&mut self, _error: anyhow::Error) {}
+            async fn on_start(&mut self) {}
+        }
+
         // Ensure persistent model is ready
         if !self.is_persistent_model_ready() {
             return Err(anyhow!(
@@ -1052,61 +1207,6 @@ impl TorchEngine {
             ));
         }
 
-        let request = GenerationRequest {
-            prompt: prompt.to_string(),
-            max_tokens,
-            temperature,
-            top_p,
-            top_k,
-            repeat_penalty,
-            stop_tokens: self.generation_config.stop_tokens.clone(),
-            seed: None,
-            stream: true,
-            active_adapters: None,
-            realtime_adaptation: None,
-            user_feedback: None,
-        };
-
-        // Use the internal streaming implementation with these parameters
-        self.generate_streaming_internal(request, callback).await
-    }
-
-    /// Generate text with streaming callback (using default parameters)
-    pub async fn generate_streaming<F>(
-        &self,
-        prompt: &str,
-        max_tokens: usize,
-        callback: F,
-    ) -> Result<String>
-    where
-        F: FnMut(&str),
-    {
-        // Use model-specific defaults or fallback to generic defaults
-        self.generate_streaming_with_params(
-            prompt,
-            max_tokens,
-            self.generation_config.temperature,
-            self.generation_config.top_p,
-            self.generation_config.top_k,
-            self.generation_config.repeat_penalty,
-            callback,
-        )
-        .await
-    }
-
-    /// Internal streaming implementation
-    ///
-    /// Note: This method does not track tokens_generated count for performance reasons.
-    /// The token count is implicit in the final decoded text length. The async streaming
-    /// variant does track tokens_generated for metrics reporting.
-    async fn generate_streaming_internal<F>(
-        &self,
-        request: GenerationRequest,
-        mut callback: F,
-    ) -> Result<String>
-    where
-        F: FnMut(&str),
-    {
         // Tokenize input
         let input_ids = self.tokenize(&request.prompt)?;
 
@@ -1114,14 +1214,19 @@ impl TorchEngine {
         let params = SamplingParams::from_request(&request);
 
         // Use the unified GenerationCore
-        let mut core = GenerationCore::new(self);
+        let mut core = GenerationCore::new(self)?;
 
-        // Generate with streaming callback
-        let result = core.generate_tokens(input_ids, &params, &request, |text| {
-            // Stream each piece of new text
-            callback(text);
-            Ok(CallbackControl::Continue)
-        })?;
+        // Generate with inline adapter
+        let result = core
+            .generate_tokens_async(
+                input_ids,
+                &params,
+                &request,
+                Box::new(SyncStreamCallback { callback }),
+                tokio_util::sync::CancellationToken::new(), // Never cancelled
+                std::time::Duration::from_secs(u64::MAX),   // Effectively no timeout
+            )
+            .await?;
 
         Ok(result.text)
     }
@@ -1139,187 +1244,35 @@ impl TorchEngine {
 
     /// Generate text with async streaming callback
     ///
-    /// This method handles async callbacks with cancellation support.
-    /// It uses a channel to bridge between the sync generation core and async callbacks.
+    /// This method now delegates to the unified GenerationCore::generate_tokens_async,
+    /// eliminating ~170 lines of duplicate code.
     pub async fn generate_streaming_async(
         &self,
         request: GenerationRequest,
-        mut callback: Box<dyn crate::runtime::streaming::StreamingCallback>,
+        callback: Box<dyn crate::runtime::streaming::StreamingCallback>,
         context: crate::runtime::streaming::GenerationContext,
     ) -> Result<GenerationResult> {
-        use crate::runtime::streaming::ContinueGeneration;
-        use tokio::time::timeout;
-
-        let start_time = std::time::Instant::now();
-
-        // Notify start
-        callback.on_start().await;
-
         // Tokenize input
-        let mut input_ids = self.tokenize(&request.prompt)?;
-        let mut tokens_generated = 0;
-        let prompt_len = input_ids.len();
+        let input_ids = self.tokenize(&request.prompt)?;
 
-        // Initialize incremental decoder
-        let mut decoder = IncrementalUtf8Decoder::new();
+        // Create sampling parameters from request
+        let params = SamplingParams::from_request(&request);
 
-        tracing::info!(
-            "Starting async generation with prompt of {} tokens",
-            prompt_len
-        );
+        // Use the unified GenerationCore for async generation
+        let mut core = GenerationCore::new(self)?;
 
-        // Create timeout future
-        let generation_future = async {
-            for i in 0..request.max_tokens {
-                // Check cancellation
-                if context.cancel_token.is_cancelled() {
-                    tracing::info!("Generation cancelled by client");
-                    break;
-                }
-
-                // Forward pass
-                let logits = if i == 0 {
-                    self.forward(&input_ids)?
-                } else {
-                    self.forward_cached(&input_ids, prompt_len + i - 1, true)?
-                };
-
-                // Sample next token
-                let next_token = self.sampler.sample_token(
-                    &logits,
-                    request.temperature,
-                    request.top_p,
-                    request.top_k,
-                    request.repeat_penalty,
-                    &input_ids,
-                )?;
-
-
-                // NOTE: Special token handling is done in GenerationCore
-                // This method (generate_streaming_async) should eventually be refactored
-                // to use GenerationCore instead of duplicating logic
-
-                // Check EOS token
-                if self.is_eos_token(next_token) {
-                    tracing::debug!("EOS token detected: {}", next_token);
-                    break;
-                }
-
-                // Add to sequence (now guaranteed to be valid)
-                input_ids.push(next_token as i64);
-                tokens_generated += 1;
-
-                // Use incremental decoder for efficient UTF-8 handling
-                let new_text = decoder.push_token_simple(next_token as i64, |tokens| {
-                    // Decode just the generated tokens (not the prompt)
-                    let mut full_ids = Vec::with_capacity(prompt_len + tokens.len());
-                    full_ids.extend(&input_ids[..prompt_len]);
-                    full_ids.extend(tokens);
-                    self.detokenize(&full_ids[prompt_len..])
-                })?;
-
-                // Stream token via callback (only if there's actual text)
-                let continue_generation = if !new_text.is_empty() {
-                    callback.on_token(&new_text).await
-                } else {
-                    // No text to stream yet (incomplete UTF-8 sequence)
-                    Ok(ContinueGeneration::Continue)
-                };
-
-                match continue_generation {
-                    Ok(ContinueGeneration::Continue) => {}
-                    Ok(ContinueGeneration::Stop) => {
-                        tracing::info!("Generation stopped by callback");
-                        break;
-                    }
-                    Ok(ContinueGeneration::Pause(duration)) => {
-                        tokio::time::sleep(duration).await;
-                    }
-                    Err(e) => {
-                        callback.on_error(anyhow::anyhow!("{}", e)).await;
-                        return Err(e);
-                    }
-                }
-
-                // Check stop conditions
-                if request
-                    .stop_tokens
-                    .iter()
-                    .any(|stop| decoder.get_text().contains(stop))
-                {
-                    break;
-                }
-            }
-
-            Ok::<_, anyhow::Error>(())
-        };
-
-        // Apply timeout
-        match timeout(context.timeout, generation_future).await {
-            Ok(Ok(())) => {
-                // Success - determine why generation stopped
-                let finish_reason = if tokens_generated >= request.max_tokens {
-                    FinishReason::MaxTokens
-                } else {
-                    // Generation ended for other reason (EOS, circuit breaker, or natural end)
-                    FinishReason::Stop
-                };
-
-                callback.on_complete(finish_reason.clone()).await;
-
-                Ok(GenerationResult {
-                    text: decoder.get_text().to_string(),
-                    tokens_generated,
-                    finish_reason,
-                    generation_time_ms: start_time.elapsed().as_millis() as u64,
-                    tokens_per_second: tokens_generated as f32 / start_time.elapsed().as_secs_f32(),
-                })
-            }
-            Ok(Err(e)) => {
-                // Generation error
-                callback.on_error(anyhow::anyhow!("{}", e)).await;
-                Err(e)
-            }
-            Err(_) => {
-                // Timeout
-                let err = anyhow::anyhow!("Generation timeout after {:?}", context.timeout);
-                callback.on_error(anyhow::anyhow!("{}", err)).await;
-                Err(err)
-            }
-        }
+        // Delegate to the unified async implementation
+        core.generate_tokens_async(
+            input_ids,
+            &params,
+            &request,
+            callback,
+            context.cancel_token,
+            context.timeout,
+        )
+        .await
     }
 
-    /// Generate text with raw prompt (no chat formatting)
-    pub async fn generate_raw(&self, prompt: &str, max_tokens: usize) -> Result<String> {
-        let request = GenerationRequest {
-            prompt: prompt.to_string(),
-            max_tokens,
-            temperature: self.generation_config.temperature,
-            top_p: self.generation_config.top_p,
-            top_k: self.generation_config.top_k,
-            repeat_penalty: self.generation_config.repeat_penalty,
-            stop_tokens: self.generation_config.stop_tokens.clone(),
-            seed: None,
-            stream: false,
-            active_adapters: None,
-            realtime_adaptation: None,
-            user_feedback: None,
-        };
-
-        let result = self.generate_with_params(request).await?;
-        Ok(result.text)
-    }
-
-    /// Generate text with custom chat formatting
-    pub async fn generate_chat(
-        &self,
-        system: Option<&str>,
-        user: &str,
-        max_tokens: usize,
-    ) -> Result<String> {
-        let formatted_prompt = self.format_chat_message(system, user);
-        self.generate_raw(&formatted_prompt, max_tokens).await
-    }
 
     /// Enable LoRA training for fine-tuning
     pub fn enable_lora_training(

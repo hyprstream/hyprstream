@@ -2,7 +2,7 @@
 
 use crate::cli::commands::model::GitInfo;
 use crate::config::GenerationRequest;
-use crate::runtime::sampling::{load_sampling_config, SamplingConfig};
+// Sampling config now loaded via builder pattern
 use crate::runtime::template_engine::ChatMessage;
 use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
 use crate::storage::{CheckoutOptions, ModelRef, ModelStorage};
@@ -384,37 +384,6 @@ pub async fn handle_lora_train(
     Ok(())
 }
 
-/// Handle serve command
-pub async fn handle_serve(model: Option<String>, port: u16, host: &str) -> Result<()> {
-    if let Some(ref model_ref_str) = model {
-        println!("Starting server with pre-loaded model: {}", model_ref_str);
-    } else {
-        println!("Starting server in lazy-loading mode");
-        println!("Models will be loaded on demand via API requests");
-    }
-
-    println!("Listening on {}:{}", host, port);
-
-    // TODO: Call the actual server start function
-    // For now, just simulate
-    println!("\n→ Server configuration:");
-    println!(
-        "  Lazy loading: {}",
-        if model.is_none() {
-            "enabled"
-        } else {
-            "disabled"
-        }
-    );
-    println!(
-        "  Pre-loaded models: {}",
-        model.as_deref().unwrap_or("none")
-    );
-    println!("  API endpoint: http://{}:{}/v1/completions", host, port);
-
-    Ok(())
-}
-
 /// Handle list command
 pub async fn handle_list(
     storage: &ModelStorage,
@@ -733,6 +702,7 @@ pub async fn handle_infer(
     temperature: Option<f32>,
     top_p: Option<f32>,
     top_k: Option<usize>,
+    repeat_penalty: Option<f32>,
     stream: bool,
     _force_download: bool,
 ) -> Result<()> {
@@ -764,35 +734,9 @@ pub async fn handle_infer(
 
     info!("Using model at: {}", model_path.display());
 
-    // Load model configuration
-    let sampling_config = if model_path.join("config.json").exists() {
-        match load_sampling_config(&model_path).await {
-            Ok(config) => config,
-            Err(e) => {
-                tracing::warn!("Could not load model config: {}. Using defaults.", e);
-                SamplingConfig::default()
-            }
-        }
-    } else {
-        SamplingConfig::for_model(model_ref_str)
-    };
-
     // Initialize inference engine
     let runtime_config = RuntimeConfig::default();
     let mut engine = TorchEngine::new(runtime_config)?;
-
-    // Apply overrides to sampling config
-    let mut final_config = sampling_config;
-    if let Some(t) = temperature {
-        final_config.temperature = t;
-    }
-    if let Some(p) = top_p {
-        final_config.top_p = Some(p);
-    }
-    if let Some(k) = top_k {
-        final_config.top_k = Some(k);
-    }
-    final_config.do_sample = final_config.temperature > 0.0;
 
     // Load the model
     let load_start = std::time::Instant::now();
@@ -954,14 +898,6 @@ pub async fn handle_infer(
         *lora_guard = None;
     }
 
-    // Use model defaults or overrides
-    let max_tokens = max_tokens.unwrap_or(100);
-
-    info!(
-        "Generating response: max_tokens={}, temperature={}, top_p={:?}, top_k={:?}",
-        max_tokens, final_config.temperature, final_config.top_p, final_config.top_k
-    );
-
     // Apply chat template to the prompt
     let formatted_prompt = {
         let messages = vec![ChatMessage {
@@ -978,32 +914,28 @@ pub async fn handle_infer(
         }
     };
 
-    let request = GenerationRequest {
-        prompt: formatted_prompt,
-        max_tokens,
-        temperature: final_config.temperature,
-        top_p: final_config.top_p.unwrap_or(1.0),
-        top_k: final_config.top_k,
-        repeat_penalty: 1.0,
-        stop_tokens: vec![],
-        seed: None,
-        stream,
-        active_adapters: None,
-        realtime_adaptation: None,
-        user_feedback: None,
-    };
+    // Build request with proper cascade: model config → CLI overrides
+    let request = GenerationRequest::builder(formatted_prompt)
+        .with_model_config(&model_path)
+        .await?
+        .temperature(temperature)
+        .top_p(top_p)
+        .top_k(top_k)
+        .repeat_penalty(repeat_penalty)
+        .max_tokens(max_tokens)
+        .build();
+
+    info!(
+        "Generating response: max_tokens={}, temperature={}, top_p={}, top_k={:?}, repeat_penalty={}",
+        request.max_tokens, request.temperature, request.top_p, request.top_k, request.repeat_penalty
+    );
 
     if stream {
         // Stream tokens as they're generated
         println!();
         let result = engine
-            .generate_streaming_with_params(
-                &request.prompt,
-                request.max_tokens,
-                request.temperature,
-                request.top_p,
-                request.top_k,
-                request.repeat_penalty,
+            .generate_streaming(
+                request.clone(),
                 |token| {
                     print!("{}", token);
                     let _ = io::stdout().flush();
@@ -1014,21 +946,20 @@ pub async fn handle_infer(
         info!("Generated {} tokens", result.split_whitespace().count());
     } else {
         // Generate all at once using streaming with collection
-        let mut response = String::new();
+        let response = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let response_clone = response.clone();
         engine
-            .generate_streaming_with_params(
-                &request.prompt,
-                request.max_tokens,
-                request.temperature,
-                request.top_p,
-                request.top_k,
-                request.repeat_penalty,
-                |token| {
-                    response.push_str(token);
+            .generate_streaming(
+                request.clone(),
+                move |token| {
+                    if let Ok(mut r) = response_clone.lock() {
+                        r.push_str(token);
+                    }
                 },
             )
             .await?;
-        println!("\n{}", response);
+        let final_response = response.lock().unwrap().clone();
+        println!("\n{}", final_response);
     }
 
     Ok(())

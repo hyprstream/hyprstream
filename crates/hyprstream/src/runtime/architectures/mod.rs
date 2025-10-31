@@ -174,6 +174,9 @@ pub trait ModelOperations: Send {
 
     /// Apply LoRA adapter with architecture-specific handling (for cache/storage only)
     fn apply_lora(&mut self, adapter: &crate::lora::torch_adapter::LoRAModel) -> Result<()>;
+
+    /// Downcast to Any for accessing architecture-specific methods
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// Attention mechanism types

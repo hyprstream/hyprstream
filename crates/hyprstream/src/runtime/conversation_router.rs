@@ -239,8 +239,6 @@ impl ConversationRouter {
             max_tokens: 512,
             temperature: 0.7,
             top_p: 0.9,
-            active_adapters: Some(conversation.model_state.active_lora_checkpoints.clone()),
-            realtime_adaptation: None, // Set to None for now, or create proper RealtimeAdaptationRequest
             ..Default::default()
         };
 

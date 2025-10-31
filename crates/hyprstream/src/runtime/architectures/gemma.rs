@@ -1140,6 +1140,10 @@ impl ModelOperations for GemmaModel {
         // The adapter will handle shape conversions for MQA
         Ok(())
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl GemmaModel {
