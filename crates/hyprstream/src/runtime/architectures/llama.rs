@@ -11,6 +11,58 @@ use std::collections::HashMap;
 use std::path::Path;
 use tch::{nn, Device, Kind as DType, Tensor};
 
+/// Linear projection layer with optional bias
+///
+/// This is a zero-cost abstraction that encapsulates weight matrices
+/// and optional bias vectors for linear transformations.
+struct LinearProjection {
+    weight: Tensor,
+    bias: Option<Tensor>,
+}
+
+impl LinearProjection {
+    /// Create projection from weight only (no bias)
+    #[inline]
+    fn new(weight: Tensor) -> Self {
+        Self { weight, bias: None }
+    }
+
+    /// Create projection with weight and bias
+    #[inline]
+    fn with_bias(weight: Tensor, bias: Tensor) -> Self {
+        Self {
+            weight,
+            bias: Some(bias),
+        }
+    }
+
+    /// Apply projection to input: output = input @ weight + bias
+    ///
+    /// Input shape: [*, in_features]
+    /// Weight shape: [in_features, out_features] (already transposed)
+    /// Bias shape: [out_features] (broadcasted)
+    /// Output shape: [*, out_features]
+    #[inline]
+    fn apply(&self, input: &Tensor) -> Tensor {
+        let output = input.matmul(&self.weight);
+
+        match &self.bias {
+            Some(bias) => output + bias,
+            None => output,
+        }
+    }
+
+    /// Get output dimension
+    #[inline]
+    #[allow(dead_code)]
+    fn out_features(&self) -> i64 {
+        self.weight.size()[1]
+    }
+}
+
+unsafe impl Send for LinearProjection {}
+unsafe impl Sync for LinearProjection {}
+
 /// Calculate padded vocabulary size to multiple of 64 (for performance optimization)
 #[inline]
 fn calculate_padded_vocab_size(vocab_size: usize) -> usize {
@@ -244,10 +296,10 @@ unsafe impl Sync for LlamaLayer {}
 
 /// Llama attention with optional GQA support
 struct LlamaAttention {
-    q_proj: Tensor,
-    k_proj: Tensor,
-    v_proj: Tensor,
-    o_proj: Tensor,
+    q_proj: LinearProjection,
+    k_proj: LinearProjection,
+    v_proj: LinearProjection,
+    o_proj: LinearProjection,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -282,18 +334,17 @@ impl LlamaAttention {
         tracing::debug!("LlamaAttention forward: batch_size={}, seq_len={}, hidden_size={}, start_pos={}, has_cache={}", 
                       batch_size, seq_len, hidden_size, start_pos, kv_cache.is_some());
 
-        // Debug: Check shapes and dtypes before matmul
+        // Debug: Check shapes and dtypes before projection
         // tracing::debug!("Attention forward - hidden_states shape: {:?}, dtype: {:?}", hidden_states.size(), hidden_states.kind());
-        // tracing::debug!("Attention forward - q_proj shape: {:?}, dtype: {:?}", self.q_proj.size(), self.q_proj.kind());
 
         // Reshape hidden_states for matmul: [batch*seq, hidden_size]
         let hidden_states_2d = hidden_states.reshape([batch_size * seq_len, hidden_size]);
         // tracing::debug!("Reshaped hidden_states_2d shape: {:?}, dtype: {:?}", hidden_states_2d.size(), hidden_states_2d.kind());
 
-        // Project to Q, K, V using 2D matmul
-        let q = hidden_states_2d.matmul(&self.q_proj);
-        let k = hidden_states_2d.matmul(&self.k_proj);
-        let v = hidden_states_2d.matmul(&self.v_proj);
+        // Project to Q, K, V using the projection API (handles biases automatically)
+        let q = self.q_proj.apply(&hidden_states_2d);
+        let k = self.k_proj.apply(&hidden_states_2d);
+        let v = self.v_proj.apply(&hidden_states_2d);
 
         // tracing::debug!("After projection - Q shape: {:?}, K shape: {:?}, V shape: {:?}",
         //               q.size(), k.size(), v.size());
@@ -404,8 +455,8 @@ impl LlamaAttention {
             (self.num_heads * self.head_dim) as i64,
         ]);
 
-        // Apply output projection: [batch*seq, heads*dim] x [heads*dim, hidden_size] = [batch*seq, hidden_size]
-        let attn_output = attn_output_2d.matmul(&self.o_proj);
+        // Apply output projection using the projection API
+        let attn_output = self.o_proj.apply(&attn_output_2d);
 
         // Reshape back to 3D: [batch, seq, hidden_size]
         let attn_output = attn_output.reshape([batch_size, seq_len, hidden_size]);
@@ -656,9 +707,9 @@ impl LlamaAttention {
 
 /// Llama MLP/FFN layer
 struct LlamaMLP {
-    gate_proj: Tensor,
-    up_proj: Tensor,
-    down_proj: Tensor,
+    gate_proj: LinearProjection,
+    up_proj: LinearProjection,
+    down_proj: LinearProjection,
     activation: String, // Activation function name
 }
 
@@ -679,11 +730,11 @@ impl LlamaMLP {
         // Reshape to 2D for matmul
         let hidden_2d = hidden_states.reshape([batch_size * seq_len, hidden_size]);
 
-        // Apply activation based on config
-        let gate_pre = hidden_2d.matmul(&self.gate_proj);
+        // Apply SwiGLU: down(act(gate(x)) * up(x))
+        let gate_pre = self.gate_proj.apply(&hidden_2d);
         let gate = self.apply_activation(&gate_pre)?;
-        let up = hidden_2d.matmul(&self.up_proj);
-        let output = (&gate * &up).matmul(&self.down_proj);
+        let up = self.up_proj.apply(&hidden_2d);
+        let output = self.down_proj.apply(&(&gate * &up));
 
         // Reshape back to 3D
         let out_size = output.size()[1];
@@ -691,11 +742,11 @@ impl LlamaMLP {
     }
 
     fn forward_2d(&self, hidden_states: &Tensor) -> Result<Tensor> {
-        // Apply activation based on config
-        let gate_pre = hidden_states.matmul(&self.gate_proj);
+        // Apply SwiGLU: down(act(gate(x)) * up(x))
+        let gate_pre = self.gate_proj.apply(hidden_states);
         let gate = self.apply_activation(&gate_pre)?;
-        let up = hidden_states.matmul(&self.up_proj);
-        Ok((&gate * &up).matmul(&self.down_proj))
+        let up = self.up_proj.apply(hidden_states);
+        Ok(self.down_proj.apply(&(&gate * &up)))
     }
 
     /// Apply the configured activation function
@@ -1103,56 +1154,94 @@ impl LlamaModel {
 
         // Build attention
         let (q_proj, k_proj, v_proj) = if has_separate_qkv {
-            // Standard separate Q, K, V projections (Llama style)
+            // Standard separate Q, K, V projections (Llama/Qwen style)
 
-            // Get and transpose q_proj weight
-            let q_proj_orig = weights
+            // Load Q projection
+            let q_weight = weights
                 .get(&format!("{}.self_attn.q_proj.weight", prefix))
-                .ok_or_else(|| anyhow!("Missing q_proj weight"))?;
-            // tracing::debug!("Layer {} q_proj original shape: {:?}, dtype: {:?}", layer_idx, q_proj_orig.size(), q_proj_orig.kind());
+                .ok_or_else(|| anyhow!("Missing q_proj weight"))?
+                .transpose(0, 1)
+                .contiguous();
 
-            // Transpose from PyTorch format [out, in] to [in, out] for matmul
-            // Make sure to make it contiguous after transpose
-            let q_proj = q_proj_orig.transpose(0, 1).contiguous();
-            // tracing::debug!("Layer {} q_proj transposed shape: {:?}, dtype: {:?}", layer_idx, q_proj.size(), q_proj.kind());
+            let q_proj = if let Some(q_bias) = weights.get(&format!("{}.self_attn.q_proj.bias", prefix)) {
+                tracing::debug!("Layer {}: Loading Q bias (Qwen-style)", layer_idx);
+                LinearProjection::with_bias(q_weight, q_bias.shallow_clone())
+            } else {
+                LinearProjection::new(q_weight)
+            };
 
-            // Get and transpose k_proj weight
-            let k_proj_orig = weights
+            // Load K projection
+            let k_weight = weights
                 .get(&format!("{}.self_attn.k_proj.weight", prefix))
-                .ok_or_else(|| anyhow!("Missing k_proj weight"))?;
-            // tracing::debug!("Layer {} k_proj original shape: {:?}", layer_idx, k_proj_orig.size());
-            let k_proj = k_proj_orig.transpose(0, 1).contiguous();
-            // tracing::debug!("Layer {} k_proj transposed shape: {:?}", layer_idx, k_proj.size());
+                .ok_or_else(|| anyhow!("Missing k_proj weight"))?
+                .transpose(0, 1)
+                .contiguous();
 
-            // Get and transpose v_proj weight
-            let v_proj_orig = weights
+            let k_proj = if let Some(k_bias) = weights.get(&format!("{}.self_attn.k_proj.bias", prefix)) {
+                tracing::debug!("Layer {}: Loading K bias (Qwen-style)", layer_idx);
+                LinearProjection::with_bias(k_weight, k_bias.shallow_clone())
+            } else {
+                LinearProjection::new(k_weight)
+            };
+
+            // Load V projection
+            let v_weight = weights
                 .get(&format!("{}.self_attn.v_proj.weight", prefix))
-                .ok_or_else(|| anyhow!("Missing v_proj weight"))?;
-            // tracing::debug!("Layer {} v_proj original shape: {:?}", layer_idx, v_proj_orig.size());
-            let v_proj = v_proj_orig.transpose(0, 1).contiguous();
-            // tracing::debug!("Layer {} v_proj transposed shape: {:?}", layer_idx, v_proj.size());
+                .ok_or_else(|| anyhow!("Missing v_proj weight"))?
+                .transpose(0, 1)
+                .contiguous();
+
+            let v_proj = if let Some(v_bias) = weights.get(&format!("{}.self_attn.v_proj.bias", prefix)) {
+                tracing::debug!("Layer {}: Loading V bias (Qwen-style)", layer_idx);
+                LinearProjection::with_bias(v_weight, v_bias.shallow_clone())
+            } else {
+                LinearProjection::new(v_weight)
+            };
 
             (q_proj, k_proj, v_proj)
         } else {
             // Combined QKV projection (some Qwen models use c_attn)
-            let c_attn = weights
+            let c_attn_weight = weights
                 .get(&format!("{}.self_attn.c_attn.weight", prefix))
                 .ok_or_else(|| anyhow!("Missing c_attn weight"))?
                 .transpose(0, 1) // Transpose from [out, in] to [in, out]
                 .contiguous();
 
+            // Check for combined bias
+            let c_attn_bias = weights.get(&format!("{}.self_attn.c_attn.bias", prefix));
+
             // Split c_attn into Q, K, V
             // c_attn has shape [hidden_size, 3 * projection_size]
-            let dims = c_attn.size();
+            let dims = c_attn_weight.size();
             let _hidden_size = dims[0];
             let total_proj_size = dims[1];
             let proj_size = total_proj_size / 3;
 
-            let q = c_attn.narrow(1, 0, proj_size);
-            let k = c_attn.narrow(1, proj_size, proj_size);
-            let v = c_attn.narrow(1, proj_size * 2, proj_size);
+            let q_weight = c_attn_weight.narrow(1, 0, proj_size);
+            let k_weight = c_attn_weight.narrow(1, proj_size, proj_size);
+            let v_weight = c_attn_weight.narrow(1, proj_size * 2, proj_size);
 
-            (q, k, v)
+            // Split bias if present
+            let (q_proj, k_proj, v_proj) = if let Some(bias) = c_attn_bias {
+                tracing::debug!("Layer {}: Loading combined QKV bias (Qwen-style)", layer_idx);
+                let q_bias = bias.narrow(0, 0, proj_size);
+                let k_bias = bias.narrow(0, proj_size, proj_size);
+                let v_bias = bias.narrow(0, proj_size * 2, proj_size);
+
+                (
+                    LinearProjection::with_bias(q_weight, q_bias),
+                    LinearProjection::with_bias(k_weight, k_bias),
+                    LinearProjection::with_bias(v_weight, v_bias),
+                )
+            } else {
+                (
+                    LinearProjection::new(q_weight),
+                    LinearProjection::new(k_weight),
+                    LinearProjection::new(v_weight),
+                )
+            };
+
+            (q_proj, k_proj, v_proj)
         };
 
         // Check for QK-norm weights (Gemma3)
@@ -1195,6 +1284,23 @@ impl LlamaModel {
             config.rope_theta
         };
 
+        // Load output projection (typically no bias, but check anyway)
+        let o_weight = weights
+            .get(&format!("{}.self_attn.o_proj.weight", prefix))
+            .or_else(|| weights.get(&format!("{}.self_attn.c_proj.weight", prefix))) // Some models use c_proj for output
+            .ok_or_else(|| anyhow!("Missing o_proj/c_proj weight"))?
+            .transpose(0, 1) // Transpose from [out, in] to [in, out]
+            .contiguous();
+
+        let o_proj = if let Some(o_bias) = weights.get(&format!("{}.self_attn.o_proj.bias", prefix))
+            .or_else(|| weights.get(&format!("{}.self_attn.c_proj.bias", prefix)))
+        {
+            tracing::debug!("Layer {}: Loading O bias", layer_idx);
+            LinearProjection::with_bias(o_weight, o_bias.shallow_clone())
+        } else {
+            LinearProjection::new(o_weight)
+        };
+
         let self_attn = LlamaAttention {
             num_heads: config.num_attention_heads,
             num_kv_heads: config.num_key_value_heads,
@@ -1202,12 +1308,7 @@ impl LlamaModel {
             q_proj,
             k_proj,
             v_proj,
-            o_proj: weights
-                .get(&format!("{}.self_attn.o_proj.weight", prefix))
-                .or_else(|| weights.get(&format!("{}.self_attn.c_proj.weight", prefix))) // Some models use c_proj for output
-                .ok_or_else(|| anyhow!("Missing o_proj/c_proj weight"))?
-                .transpose(0, 1) // Transpose from [out, in] to [in, out]
-                .contiguous(),
+            o_proj,
             rope_theta,
             rope_scaling: config.rope_scaling.clone(),
             q_norm,
@@ -1219,22 +1320,50 @@ impl LlamaModel {
         };
 
         // Build MLP
+        // Build MLP with optional biases
+        let gate_weight = weights
+            .get(&format!("{}.mlp.gate_proj.weight", prefix))
+            .ok_or_else(|| anyhow!("Missing gate_proj weight"))?
+            .transpose(0, 1) // Transpose from [out, in] to [in, out]
+            .contiguous();
+
+        let gate_proj = if let Some(gate_bias) = weights.get(&format!("{}.mlp.gate_proj.bias", prefix)) {
+            tracing::debug!("Layer {}: Loading gate_proj bias", layer_idx);
+            LinearProjection::with_bias(gate_weight, gate_bias.shallow_clone())
+        } else {
+            LinearProjection::new(gate_weight)
+        };
+
+        let up_weight = weights
+            .get(&format!("{}.mlp.up_proj.weight", prefix))
+            .ok_or_else(|| anyhow!("Missing up_proj weight"))?
+            .transpose(0, 1) // Transpose from [out, in] to [in, out]
+            .contiguous();
+
+        let up_proj = if let Some(up_bias) = weights.get(&format!("{}.mlp.up_proj.bias", prefix)) {
+            tracing::debug!("Layer {}: Loading up_proj bias", layer_idx);
+            LinearProjection::with_bias(up_weight, up_bias.shallow_clone())
+        } else {
+            LinearProjection::new(up_weight)
+        };
+
+        let down_weight = weights
+            .get(&format!("{}.mlp.down_proj.weight", prefix))
+            .ok_or_else(|| anyhow!("Missing down_proj weight"))?
+            .transpose(0, 1) // Transpose from [out, in] to [in, out]
+            .contiguous();
+
+        let down_proj = if let Some(down_bias) = weights.get(&format!("{}.mlp.down_proj.bias", prefix)) {
+            tracing::debug!("Layer {}: Loading down_proj bias", layer_idx);
+            LinearProjection::with_bias(down_weight, down_bias.shallow_clone())
+        } else {
+            LinearProjection::new(down_weight)
+        };
+
         let mlp = LlamaMLP {
-            gate_proj: weights
-                .get(&format!("{}.mlp.gate_proj.weight", prefix))
-                .ok_or_else(|| anyhow!("Missing gate_proj weight"))?
-                .transpose(0, 1) // Transpose from [out, in] to [in, out]
-                .contiguous(),
-            up_proj: weights
-                .get(&format!("{}.mlp.up_proj.weight", prefix))
-                .ok_or_else(|| anyhow!("Missing up_proj weight"))?
-                .transpose(0, 1) // Transpose from [out, in] to [in, out]
-                .contiguous(),
-            down_proj: weights
-                .get(&format!("{}.mlp.down_proj.weight", prefix))
-                .ok_or_else(|| anyhow!("Missing down_proj weight"))?
-                .transpose(0, 1) // Transpose from [out, in] to [in, out]
-                .contiguous(),
+            gate_proj,
+            up_proj,
+            down_proj,
             activation: config.hidden_activation.clone(),
         };
 
@@ -1753,10 +1882,10 @@ mod tests {
     fn test_kv_expansion_for_gqa() {
         let device = Device::Cpu;
         let attn = LlamaAttention {
-            q_proj: Tensor::zeros(&[4096, 4096], (DType::Float, device)),
-            k_proj: Tensor::zeros(&[4096, 1024], (DType::Float, device)),
-            v_proj: Tensor::zeros(&[4096, 1024], (DType::Float, device)),
-            o_proj: Tensor::zeros(&[4096, 4096], (DType::Float, device)),
+            q_proj: LinearProjection::new(Tensor::zeros(&[4096, 4096], (DType::Float, device))),
+            k_proj: LinearProjection::new(Tensor::zeros(&[4096, 1024], (DType::Float, device))),
+            v_proj: LinearProjection::new(Tensor::zeros(&[4096, 1024], (DType::Float, device))),
+            o_proj: LinearProjection::new(Tensor::zeros(&[4096, 4096], (DType::Float, device))),
             num_heads: 32,
             num_kv_heads: 8,
             head_dim: 128,

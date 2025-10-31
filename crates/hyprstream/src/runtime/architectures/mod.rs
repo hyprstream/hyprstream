@@ -8,14 +8,12 @@ use anyhow::Result;
 use tch::{nn, Tensor};
 
 pub mod config;
-pub mod detector;
 pub mod gemma;
 pub mod llama;
 pub mod qwen;
 // LoRA adapter moved to lora module
 
 pub use config::{ArchitectureConfig, AttentionConfig};
-pub use detector::ArchitectureDetector;
 // pub use lora_adapter::ArchitectureAwareLoRAAdapter; // Module removed
 
 /// Supported model architectures

@@ -162,13 +162,13 @@ impl SamplingConfig {
         }
     }
 
-    /// Qwen model defaults
+    /// Qwen model defaults (matches official Qwen3 generation_config.json)
     fn qwen_defaults() -> Self {
         Self {
-            temperature: 0.7,
+            temperature: 0.6,  // Official Qwen3 default
             top_k: Some(20),
-            top_p: Some(0.8),
-            repeat_penalty: 1.05,
+            top_p: Some(0.95),  // Official Qwen3 default
+            repeat_penalty: 1.0,  // Official default (disabled)
             do_sample: true,
             ..Default::default()
         }
@@ -355,8 +355,10 @@ mod tests {
     #[test]
     fn test_model_specific_configs() {
         let qwen_config = SamplingConfig::for_model("Qwen/Qwen2-1.5B-Instruct");
-        assert_eq!(qwen_config.temperature, 0.7);
+        assert_eq!(qwen_config.temperature, 0.6);
         assert_eq!(qwen_config.top_k, Some(20));
+        assert_eq!(qwen_config.top_p, Some(0.95));
+        assert_eq!(qwen_config.repeat_penalty, 1.0);
 
         let llama_config = SamplingConfig::for_model("meta-llama/Llama-2-7b");
         assert_eq!(llama_config.temperature, 0.6);

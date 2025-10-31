@@ -178,16 +178,17 @@ mod tests {
     }
     
     #[test]
-    fn test_qwen3_rope_base() {
+    fn test_rope_with_large_base_frequency() {
         let device = Device::Cpu;
-        
-        // Qwen3 uses base=1,000,000
+
+        // Test RoPE with large base frequency (e.g., some Qwen2.5 models use 1,000,000)
+        // Note: Always read rope_theta from model config.json - don't assume values
         let mut rope = RoPE::new(128, 1_000_000.0, 8192, device).unwrap();
-        
+
         // Test tensor
         let x = Tensor::randn(&[1, 10, 4, 128], (tch::Kind::Float, device));
         let result = rope.forward(&x, None).unwrap();
-        
+
         assert_eq!(result.size(), x.size());
         assert_eq!(rope.base(), 1_000_000.0);
     }

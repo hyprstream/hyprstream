@@ -1,11 +1,15 @@
 //! Qwen model adapter that reuses Llama implementation with Qwen-specific configurations
 //!
 //! Qwen models are architecturally similar to Llama but with key differences:
-//! - Standard RoPE base of 10,000 (same as Llama, but supports YARN scaling for longer context)
-//! - Default context window of 32K tokens (can extend via YARN to 131K+)
-//! - Vocabulary size of 151,936 tokens (Qwen3)
+//! - RoPE base (rope_theta) varies by model and version - always read from config.json
+//!   - Qwen2.5 models typically use 1,000,000
+//!   - Qwen3 models typically use 10,000 (standard)
+//! - Context window varies by model (read from max_position_embeddings in config.json)
+//!   - Qwen3-4B: 40,960 tokens
+//!   - Can extend via YARN scaling for longer context in some variants
+//! - Vocabulary size of 151,936 tokens (Qwen2/Qwen3)
 //! - SiLU activation function (same as Llama)
-//! - Most models use same num_attention_heads and num_key_value_heads (no GQA reduction)
+//! - GQA (Grouped-Query Attention) used in Qwen3 models (num_key_value_heads < num_attention_heads)
 
 use super::llama::LlamaModel;
 use super::ModelOperations;
@@ -38,30 +42,34 @@ impl QwenAdapter {
         );
 
         // Apply Qwen-specific overrides based on version
+        // Note: max_position_embeddings is already correctly set from config.json
+        // We only validate and log, not override
         match version {
             3 => {
                 // Qwen3 specific configurations
-                // rope_theta is already correctly set from config.json (typically 5M for Qwen3-4B)
-                config.max_position_embeddings = context_length.min(32_768); // Default 32K
+                // rope_theta is already correctly set from config.json
+                // max_position_embeddings is already set from config.json (e.g., 40,960 for Qwen3-4B)
 
                 // Ensure GQA settings match what's in the weights
                 // The config.json should already have the correct values
             }
             2 => {
                 // Qwen2 configurations
-                config.max_position_embeddings = context_length.min(32_768);
+                // All values already loaded from config.json
             }
             _ => {
-                // Qwen1 or unknown version - use conservative defaults
-                config.max_position_embeddings = context_length.min(8192);
+                // Qwen1 configurations
+                // All values already loaded from config.json
             }
         }
 
-        // Handle MoE configurations if needed
+        // Handle MoE configurations - currently not implemented
         if is_moe {
-            tracing::info!(
-                "Qwen MoE model detected - using dense layers only (MoE not yet implemented)"
-            );
+            return Err(anyhow::anyhow!(
+                "Qwen MoE models (e.g., Qwen3-30B-A3B, Qwen3-235B-A22B) are not yet supported. \
+                 MoE (Mixture of Experts) implementation is deferred for future development. \
+                 Please use a dense Qwen model instead."
+            ));
         }
 
         // Log the configuration being used
