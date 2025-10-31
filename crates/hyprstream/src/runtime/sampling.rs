@@ -373,6 +373,6 @@ mod tests {
         assert_eq!(config.temperature, 0.5);
         assert_eq!(config.top_k, Some(30));
         assert_eq!(config.top_p, Some(0.85));
-        assert_eq!(config.repetition_penalty, 1.2);
+        assert_eq!(config.repeat_penalty, 1.2);
     }
 }
