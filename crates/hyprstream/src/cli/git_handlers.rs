@@ -945,20 +945,32 @@ pub async fn handle_infer(
         println!();
         info!("Generated {} tokens", result.split_whitespace().count());
     } else {
-        // Generate all at once using streaming with collection
-        let response = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let response_clone = response.clone();
+        // Generate all at once using streaming with collection via channel
+        // Use unbounded channel to avoid backpressure - we want all tokens
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        
+        // Spawn task to collect tokens from channel
+        let collector_task = tokio::task::spawn(async move {
+            let mut response = String::new();
+            while let Some(token) = rx.recv().await {
+                response.push_str(&token);
+            }
+            response
+        });
+
+        // Generate with callback that sends tokens through channel
         engine
             .generate_streaming(
                 request.clone(),
                 move |token| {
-                    if let Ok(mut r) = response_clone.lock() {
-                        r.push_str(token);
-                    }
+                    // Send token through channel - this won't fail unless receiver is dropped
+                    let _ = tx.send(token.to_string());
                 },
             )
             .await?;
-        let final_response = response.lock().unwrap().clone();
+
+        // Wait for collector to finish gathering all tokens
+        let final_response = collector_task.await.map_err(|e| anyhow::anyhow!("Collector task failed: {}", e))?;
         println!("\n{}", final_response);
     }
 
