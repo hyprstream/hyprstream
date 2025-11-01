@@ -166,10 +166,23 @@ impl<'a> GenerationCore<'a> {
                 tokens_generated += 1;
 
                 // Step 5: Decode incrementally using DecodeStream (O(1) per token!)
+                // DecodeStream returns:
+                //   - Ok(Some(text)): Valid UTF-8 text ready to send
+                //   - Ok(None): Token is buffered, waiting for more tokens to complete UTF-8 sequence
+                //   - Err(e): Decode error
                 let new_text = match decode_stream.step(next_token as u32) {
                     Ok(Some(text)) => text,
-                    Ok(None) => String::new(),
-                    Err(_e) => String::new(),
+                    Ok(None) => {
+                        // Token is buffered - DecodeStream is waiting for more tokens
+                        // to complete a multi-byte UTF-8 sequence (e.g., emoji)
+                        // Don't send anything yet, continue to next token
+                        tracing::debug!("DecodeStream buffering token {} (incomplete UTF-8 sequence)", next_token);
+                        String::new()
+                    },
+                    Err(e) => {
+                        tracing::warn!("DecodeStream error for token {}: {}", next_token, e);
+                        String::new()
+                    },
                 };
 
                 // Accumulate text for stop token detection
@@ -187,6 +200,7 @@ impl<'a> GenerationCore<'a> {
                 }
 
                 // Step 7: Call async callback with new text (if any)
+                // Only send when DecodeStream has released complete UTF-8 text
                 if !new_text.is_empty() {
                     match callback.on_token(&new_text).await? {
                         ContinueGeneration::Continue => {},
