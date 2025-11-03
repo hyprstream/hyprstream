@@ -23,6 +23,7 @@ pub struct ChatCompletionRequest {
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
     pub repeat_penalty: Option<f32>,
+    pub repeat_last_n: Option<usize>,
     pub top_k: Option<usize>,
     pub logit_bias: Option<std::collections::HashMap<String, f32>>,
     pub user: Option<String>,
@@ -34,6 +35,26 @@ pub struct ChatMessage {
     pub role: String,
     pub content: Option<String>,
     pub function_call: Option<FunctionCall>,
+}
+
+impl From<&ChatCompletionRequest> for crate::config::SamplingParams {
+    fn from(req: &ChatCompletionRequest) -> Self {
+        Self {
+            temperature: req.temperature,
+            top_p: req.top_p,
+            top_k: req.top_k,
+            max_tokens: req.max_tokens,
+            repeat_penalty: req.repeat_penalty,
+            repeat_last_n: req.repeat_last_n,
+            stop_tokens: req.stop.clone(),
+            seed: None,
+            length_penalty: None,
+            typical_p: None,
+            epsilon_cutoff: None,
+            eta_cutoff: None,
+            do_sample: None,
+        }
+    }
 }
 
 /// Function call in chat
@@ -79,10 +100,31 @@ pub struct CompletionRequest {
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
     pub repeat_penalty: Option<f32>,
+    pub repeat_last_n: Option<usize>,
     pub top_k: Option<usize>,
     pub best_of: Option<i32>,
     pub logit_bias: Option<std::collections::HashMap<String, f32>>,
     pub user: Option<String>,
+}
+
+impl From<&CompletionRequest> for crate::config::SamplingParams {
+    fn from(req: &CompletionRequest) -> Self {
+        Self {
+            temperature: req.temperature,
+            top_p: req.top_p,
+            top_k: req.top_k,
+            max_tokens: req.max_tokens,
+            repeat_penalty: req.repeat_penalty,
+            repeat_last_n: req.repeat_last_n,
+            stop_tokens: req.stop.clone(),
+            seed: None,
+            length_penalty: None,
+            typical_p: None,
+            epsilon_cutoff: None,
+            eta_cutoff: None,
+            do_sample: None,
+        }
+    }
 }
 
 /// Completion Response

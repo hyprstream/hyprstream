@@ -914,15 +914,13 @@ pub async fn handle_infer(
         }
     };
 
-    // Build request with proper cascade: model config → CLI overrides
     let request = GenerationRequest::builder(formatted_prompt)
-        .with_model_config(&model_path)
-        .await?
-        .temperature(temperature)
-        .top_p(top_p)
+        .apply_config(&crate::config::SamplingParams::from_model_path(&model_path).await.unwrap_or_default())
+        .temperature(temperature.unwrap_or(0.7))
+        .top_p(top_p.unwrap_or(0.95))
         .top_k(top_k)
-        .repeat_penalty(repeat_penalty)
-        .max_tokens(max_tokens)
+        .repeat_penalty(repeat_penalty.unwrap_or(1.0))
+        .max_tokens(max_tokens.unwrap_or(2048))
         .build();
 
     info!(
@@ -930,36 +928,28 @@ pub async fn handle_infer(
         request.max_tokens, request.temperature, request.top_p, request.top_k, request.repeat_penalty
     );
 
+    use futures::StreamExt;
+
+    let mut text_stream = engine.generate(request)?;
+
     if stream {
-        // Stream tokens as they're generated
         println!();
-        let result = engine
-            .generate_streaming(
-                request.clone(),
-                |token| {
-                    print!("{}", token);
-                    let _ = io::stdout().flush();
-                },
-            )
-            .await?;
+        while let Some(text_chunk) = text_stream.next().await {
+            print!("{}", text_chunk?);
+            let _ = io::stdout().flush();
+        }
         println!();
-        info!("Generated {} tokens", result.split_whitespace().count());
+        let stats = text_stream.stats();
+        info!("Generated {} tokens in {}ms ({:.2} tokens/sec)",
+              stats.tokens_generated, stats.generation_time_ms, stats.tokens_per_second);
     } else {
-        // Generate all at once using streaming with collection
-        let response = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let response_clone = response.clone();
-        engine
-            .generate_streaming(
-                request.clone(),
-                move |token| {
-                    if let Ok(mut r) = response_clone.lock() {
-                        r.push_str(token);
-                    }
-                },
-            )
-            .await?;
-        let final_response = response.lock().unwrap().clone();
-        println!("\n{}", final_response);
+        let mut full_text = String::new();
+        while let Some(text_chunk) = text_stream.next().await {
+            full_text.push_str(&text_chunk?);
+        }
+        println!("\n{}", full_text);
+        let stats = text_stream.stats();
+        info!("Generated {} tokens", stats.tokens_generated);
     }
 
     Ok(())

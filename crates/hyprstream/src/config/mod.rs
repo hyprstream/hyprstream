@@ -8,7 +8,7 @@
 pub mod server;
 
 // Re-export main configuration types
-pub use server::{CorsConfig, GenerationDefaults, ServerConfig, ServerConfigBuilder};
+pub use server::{CorsConfig, SamplingParamDefaults, ServerConfig, ServerConfigBuilder};
 
 // Export root configuration and builder (defined below in this module)
 // Note: HyprConfig and HyprConfigBuilder are exported automatically as pub structs
@@ -470,99 +470,279 @@ pub struct GenerationRequest {
     pub top_p: f32,
     pub top_k: Option<usize>,
     pub repeat_penalty: f32,
+    #[serde(default)]
+    pub repeat_last_n: usize,
     pub stop_tokens: Vec<String>,
     pub seed: Option<u32>,
 }
 
-impl GenerationRequest {
-    /// Create a builder for ergonomic construction
-    pub fn builder(prompt: impl Into<String>) -> GenerationRequestBuilder {
-        GenerationRequestBuilder::new(prompt)
+/// Unified sampling parameters with Option fields for clean precedence merging.
+///
+/// All fields are Option<T> to represent "not specified", enabling clear
+/// precedence: Server defaults → Model defaults → User overrides
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SamplingParams {
+    pub max_tokens: Option<usize>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<usize>,
+    pub repeat_penalty: Option<f32>,
+    pub repeat_last_n: Option<usize>,
+    pub stop_tokens: Option<Vec<String>>,
+    pub seed: Option<u64>,
+
+    // Advanced parameters (HuggingFace transformers compatibility)
+    #[serde(default)]
+    pub length_penalty: Option<f32>,
+    #[serde(default)]
+    pub typical_p: Option<f32>,
+    #[serde(default)]
+    pub epsilon_cutoff: Option<f32>,
+    #[serde(default)]
+    pub eta_cutoff: Option<f32>,
+    #[serde(default)]
+    pub do_sample: Option<bool>,
+}
+
+impl SamplingParams {
+    /// Create system defaults (fallback when nothing else specified)
+    pub fn system_defaults() -> Self {
+        Self {
+            max_tokens: Some(2048),
+            temperature: Some(0.7),
+            top_p: Some(0.95),
+            top_k: Some(40),
+            repeat_penalty: Some(1.0),
+            repeat_last_n: Some(64),
+            stop_tokens: Some(vec![]),
+            seed: None,
+            length_penalty: None,
+            typical_p: None,
+            epsilon_cutoff: None,
+            eta_cutoff: None,
+            do_sample: Some(true),
+        }
+    }
+
+    /// Load model-specific config from a model directory
+    pub async fn from_model_path(model_path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let gen_config_path = model_path.join("generation_config.json");
+        if gen_config_path.exists() {
+            let content = tokio::fs::read_to_string(&gen_config_path).await?;
+            let config: serde_json::Value = serde_json::from_str(&content)?;
+            return Ok(Self::from_generation_config(&config));
+        }
+
+        let config_path = model_path.join("config.json");
+        if config_path.exists() {
+            let content = tokio::fs::read_to_string(&config_path).await?;
+            let config: serde_json::Value = serde_json::from_str(&content)?;
+            if let Some(gen_config) = config.get("generation_config") {
+                return Ok(Self::from_generation_config(gen_config));
+            }
+        }
+
+        Ok(Self::default())
+    }
+
+    /// Parse HuggingFace generation_config.json format
+    fn from_generation_config(config: &serde_json::Value) -> Self {
+        Self {
+            temperature: config.get("temperature").and_then(|v| v.as_f64()).map(|v| v as f32),
+            top_k: config.get("top_k").and_then(|v| v.as_u64()).map(|v| v as usize),
+            top_p: config.get("top_p").and_then(|v| v.as_f64()).map(|v| v as f32),
+            repeat_penalty: config.get("repetition_penalty").and_then(|v| v.as_f64()).map(|v| v as f32),
+            max_tokens: config.get("max_new_tokens").and_then(|v| v.as_u64()).map(|v| v as usize)
+                .or_else(|| config.get("max_length").and_then(|v| v.as_u64()).map(|v| v as usize)),
+            length_penalty: config.get("length_penalty").and_then(|v| v.as_f64()).map(|v| v as f32),
+            typical_p: config.get("typical_p").and_then(|v| v.as_f64()).map(|v| v as f32),
+            epsilon_cutoff: config.get("epsilon_cutoff").and_then(|v| v.as_f64()).map(|v| v as f32),
+            eta_cutoff: config.get("eta_cutoff").and_then(|v| v.as_f64()).map(|v| v as f32),
+            do_sample: config.get("do_sample").and_then(|v| v.as_bool()),
+            stop_tokens: config.get("eos_token_id").and_then(|v| {
+                if let Some(arr) = v.as_array() {
+                    let tokens: Vec<String> = arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect();
+                    if tokens.is_empty() { None } else { Some(tokens) }
+                } else {
+                    None
+                }
+            }),
+            seed: config.get("seed").and_then(|v| v.as_u64()),
+            repeat_last_n: None,
+        }
+    }
+
+    /// Merge with another config. The other config takes precedence for any Some values.
+    /// This enables clear precedence: `base.merge(override)` where override wins.
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            max_tokens: other.max_tokens.or(self.max_tokens),
+            temperature: other.temperature.or(self.temperature),
+            top_p: other.top_p.or(self.top_p),
+            top_k: other.top_k.or(self.top_k),
+            repeat_penalty: other.repeat_penalty.or(self.repeat_penalty),
+            repeat_last_n: other.repeat_last_n.or(self.repeat_last_n),
+            stop_tokens: other.stop_tokens.or(self.stop_tokens),
+            seed: other.seed.or(self.seed),
+            length_penalty: other.length_penalty.or(self.length_penalty),
+            typical_p: other.typical_p.or(self.typical_p),
+            epsilon_cutoff: other.epsilon_cutoff.or(self.epsilon_cutoff),
+            eta_cutoff: other.eta_cutoff.or(self.eta_cutoff),
+            do_sample: other.do_sample.or(self.do_sample),
+        }
+    }
+
+    /// Resolve to concrete values with defaults
+    pub fn resolve(self) -> ResolvedSamplingParams {
+        ResolvedSamplingParams {
+            max_tokens: self.max_tokens.unwrap_or(2048),
+            temperature: self.temperature.unwrap_or(0.7),
+            top_p: self.top_p.unwrap_or(0.95),
+            top_k: self.top_k,
+            repeat_penalty: self.repeat_penalty.unwrap_or(1.0),
+            repeat_last_n: self.repeat_last_n.unwrap_or(64),
+            stop_tokens: self.stop_tokens.unwrap_or_default(),
+            seed: self.seed,
+            length_penalty: self.length_penalty.unwrap_or(1.0),
+            typical_p: self.typical_p,
+            epsilon_cutoff: self.epsilon_cutoff,
+            eta_cutoff: self.eta_cutoff,
+            do_sample: self.do_sample.unwrap_or(true),
+        }
     }
 }
 
-/// Builder for GenerationRequest with parameter cascading
+/// Resolved sampling parameters with concrete values (no Options for required fields)
+#[derive(Debug, Clone)]
+pub struct ResolvedSamplingParams {
+    pub max_tokens: usize,
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: Option<usize>,
+    pub repeat_penalty: f32,
+    pub repeat_last_n: usize,
+    pub stop_tokens: Vec<String>,
+    pub seed: Option<u64>,
+    pub length_penalty: f32,
+    pub typical_p: Option<f32>,
+    pub epsilon_cutoff: Option<f32>,
+    pub eta_cutoff: Option<f32>,
+    pub do_sample: bool,
+}
+
+/// Builder for generation requests using the unified SamplingParams precedence system
 pub struct GenerationRequestBuilder {
     prompt: String,
-    sampling: crate::runtime::sampling::SamplingConfig,
+    params: SamplingParams,
 }
 
 impl GenerationRequestBuilder {
     pub fn new(prompt: impl Into<String>) -> Self {
         Self {
             prompt: prompt.into(),
-            sampling: crate::runtime::sampling::SamplingConfig::default(),
+            params: SamplingParams::default(),
         }
     }
 
-    /// Load model-specific configuration from model path
-    pub async fn with_model_config(
-        mut self,
-        model_path: &std::path::Path,
-    ) -> anyhow::Result<Self> {
-        self.sampling = crate::runtime::sampling::load_sampling_config(model_path).await?;
-        Ok(self)
+    /// Apply a config layer (server defaults, model defaults, or user overrides).
+    /// Later calls take precedence over earlier calls.
+    pub fn apply_config(mut self, config: &SamplingParams) -> Self {
+        self.params = self.params.merge(config.clone());
+        self
     }
-
-    /// Merge with server or system defaults (self takes priority)
-    pub fn with_defaults(mut self, defaults: &crate::runtime::sampling::SamplingConfig) -> Self {
-        self.sampling = self.sampling.merge_with_defaults(defaults);
+    pub fn temperature(mut self, value: f32) -> Self {
+        self.params.temperature = Some(value);
         self
     }
 
-    /// Convenience method to apply server defaults from GenerationDefaults config
-    pub fn with_server_defaults(self, defaults: &GenerationDefaults) -> Self {
-        let server_sampling = crate::runtime::sampling::SamplingConfig {
-            max_tokens: defaults.max_tokens,
-            temperature: defaults.temperature,
-            top_p: Some(defaults.top_p),
-            repeat_penalty: defaults.repeat_penalty,
-            ..Default::default()
-        };
-        self.with_defaults(&server_sampling)
-    }
-
-    /// Apply user overrides
-    pub fn temperature(mut self, temp: Option<f32>) -> Self {
-        self.sampling = self.sampling.apply_temperature(temp);
+    pub fn max_tokens(mut self, value: usize) -> Self {
+        self.params.max_tokens = Some(value);
         self
     }
 
-    pub fn top_p(mut self, top_p: Option<f32>) -> Self {
-        self.sampling = self.sampling.apply_top_p(top_p);
+    pub fn top_p(mut self, value: f32) -> Self {
+        self.params.top_p = Some(value);
         self
     }
 
-    pub fn top_k(mut self, top_k: Option<usize>) -> Self {
-        self.sampling = self.sampling.apply_top_k(top_k);
+    pub fn top_k(mut self, value: Option<usize>) -> Self {
+        self.params.top_k = value;
         self
     }
 
-    pub fn repeat_penalty(mut self, repeat_penalty: Option<f32>) -> Self {
-        self.sampling = self.sampling.apply_repeat_penalty(repeat_penalty);
+    pub fn repeat_penalty(mut self, value: f32) -> Self {
+        self.params.repeat_penalty = Some(value);
         self
     }
 
-    pub fn max_tokens(mut self, max_tokens: Option<usize>) -> Self {
-        self.sampling = self.sampling.apply_max_tokens(max_tokens);
+    pub fn repeat_last_n(mut self, value: usize) -> Self {
+        self.params.repeat_last_n = Some(value);
         self
     }
 
-    pub fn stop_tokens(mut self, stop_tokens: Option<Vec<String>>) -> Self {
-        self.sampling = self.sampling.apply_stop_tokens(stop_tokens);
+    pub fn stop_tokens(mut self, value: Vec<String>) -> Self {
+        self.params.stop_tokens = Some(value);
         self
+    }
+
+    pub fn seed(mut self, value: Option<u64>) -> Self {
+        self.params.seed = value;
+        self
+    }
+
+    pub fn build_v2(self) -> GenerationRequestV2 {
+        GenerationRequestV2 {
+            prompt: self.prompt,
+            params: self.params.resolve(),
+        }
     }
 
     pub fn build(self) -> GenerationRequest {
+        let resolved = self.params.resolve();
         GenerationRequest {
             prompt: self.prompt,
-            max_tokens: self.sampling.max_tokens,
-            temperature: self.sampling.temperature,
-            top_p: self.sampling.top_p.unwrap_or(1.0),
-            top_k: self.sampling.top_k,
-            repeat_penalty: self.sampling.repeat_penalty,
-            stop_tokens: self.sampling.stop_tokens,
-            seed: self.sampling.seed.map(|s| s as u32),
+            max_tokens: resolved.max_tokens,
+            temperature: resolved.temperature,
+            top_p: resolved.top_p,
+            top_k: resolved.top_k,
+            repeat_penalty: resolved.repeat_penalty,
+            repeat_last_n: resolved.repeat_last_n,
+            stop_tokens: resolved.stop_tokens,
+            seed: resolved.seed.map(|s| s as u32),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GenerationRequestV2 {
+    pub prompt: String,
+    pub params: ResolvedSamplingParams,
+}
+
+impl GenerationRequest {
+    pub fn builder(prompt: impl Into<String>) -> GenerationRequestBuilder {
+        GenerationRequestBuilder::new(prompt)
+    }
+}
+
+impl From<&SamplingParamDefaults> for SamplingParams {
+    fn from(defaults: &SamplingParamDefaults) -> Self {
+        Self {
+            max_tokens: Some(defaults.max_tokens),
+            temperature: Some(defaults.temperature),
+            top_p: Some(defaults.top_p),
+            repeat_penalty: Some(defaults.repeat_penalty),
+            top_k: None,
+            repeat_last_n: None,
+            stop_tokens: None,
+            seed: None,
+            length_penalty: None,
+            typical_p: None,
+            epsilon_cutoff: None,
+            eta_cutoff: None,
+            do_sample: None,
         }
     }
 }
@@ -576,6 +756,7 @@ impl From<&GenerationConfig> for GenerationRequest {
             top_p: config.top_p,
             top_k: config.top_k,
             repeat_penalty: config.repeat_penalty,
+            repeat_last_n: 64, // Default repeat_last_n
             stop_tokens: config.stop_tokens.clone(),
             seed: config.seed,
         }
@@ -601,15 +782,97 @@ mod tests {
     #[test]
     fn test_generation_request_builder() {
         let request = GenerationRequest::builder("test prompt")
-            .temperature(Some(0.8))
+            .temperature(0.8)
             .top_k(Some(30))
-            .max_tokens(Some(1000))
+            .max_tokens(1000)
             .build();
 
         assert_eq!(request.prompt, "test prompt");
         assert_eq!(request.temperature, 0.8);
         assert_eq!(request.top_k, Some(30));
         assert_eq!(request.max_tokens, 1000);
+    }
+
+    #[test]
+    fn test_clean_config_precedence() {
+        let server_defaults = SamplingParams {
+            max_tokens: Some(1024),
+            temperature: Some(0.5),
+            top_p: Some(0.9),
+            top_k: Some(50),
+            repeat_penalty: Some(1.1),
+            ..Default::default()
+        };
+
+        let model_defaults = SamplingParams {
+            temperature: Some(0.7),
+            top_k: Some(40),
+            typical_p: Some(0.95),
+            ..Default::default()
+        };
+
+        let user_overrides = SamplingParams {
+            temperature: Some(0.9),
+            max_tokens: Some(512),
+            ..Default::default()
+        };
+
+        let final_config = server_defaults
+            .merge(model_defaults)
+            .merge(user_overrides);
+
+        assert_eq!(final_config.temperature, Some(0.9));
+        assert_eq!(final_config.max_tokens, Some(512));
+        assert_eq!(final_config.top_k, Some(40));
+        assert_eq!(final_config.top_p, Some(0.9));
+        assert_eq!(final_config.repeat_penalty, Some(1.1));
+        assert_eq!(final_config.typical_p, Some(0.95));
+    }
+
+    #[test]
+    fn test_builder_flow() {
+        let server_params = SamplingParams {
+            max_tokens: Some(2048),
+            temperature: Some(0.7),
+            top_p: Some(0.95),
+            ..Default::default()
+        };
+
+        let model_params = SamplingParams {
+            temperature: Some(0.6),
+            repeat_penalty: Some(1.2),
+            ..Default::default()
+        };
+
+        let request = GenerationRequest::builder("test prompt")
+            .apply_config(&server_params)
+            .apply_config(&model_params)
+            .temperature(0.8)
+            .max_tokens(512)
+            .build();
+
+        assert_eq!(request.prompt, "test prompt");
+        assert_eq!(request.temperature, 0.8);
+        assert_eq!(request.max_tokens, 512);
+        assert_eq!(request.top_p, 0.95);
+        assert_eq!(request.repeat_penalty, 1.2);
+    }
+
+    #[test]
+    fn test_resolved_params() {
+        let params = SamplingParams {
+            temperature: Some(0.5),
+            max_tokens: None,
+            ..Default::default()
+        };
+
+        let resolved = params.resolve();
+
+        assert_eq!(resolved.temperature, 0.5);
+        assert_eq!(resolved.max_tokens, 2048);
+        assert_eq!(resolved.top_p, 0.95);
+        assert_eq!(resolved.repeat_penalty, 1.0);
+        assert_eq!(resolved.do_sample, true);
     }
 }
 

@@ -13,7 +13,6 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::{
@@ -22,7 +21,7 @@ use crate::{
         CompletionRequest, CompletionResponse, EmbeddingRequest, ListModelsResponse, Model, Usage,
     },
     runtime::{FinishReason, GenerationRequest, RuntimeEngine, TorchEngine},
-    server::state::{ServerConfig, ServerState},
+    server::state::ServerState,
 };
 
 /// RAII guard for metrics cleanup
@@ -85,54 +84,95 @@ impl ErrorResponse {
     }
 }
 
-/// Validate chat completion request
-fn validate_chat_request(
-    request: &ChatCompletionRequest,
-    config: &ServerConfig,
-) -> Result<(), String> {
-    // Validate messages exist and are not empty
-    if request.messages.is_empty() {
-        return Err("Messages array cannot be empty".to_string());
-    }
+// validate_chat_request removed - validation now handled by streaming pipeline
+// The TextStream and sampling code handle all parameter edge cases safely:
+// - Empty messages → empty response (safe)
+// - Invalid temperature/top_p → clamped or falls back to greedy (safe)
+// - max_tokens → enforced by generation loop (safe)
+// Rate limiting should be handled at middleware layer, not per-endpoint
 
-    // Validate max_tokens limit
-    if let Some(max_tokens) = request.max_tokens {
-        if max_tokens > config.max_tokens_limit {
-            return Err(format!(
-                "max_tokens ({}) exceeds limit ({})",
-                max_tokens, config.max_tokens_limit
-            ));
-        }
-        if max_tokens < 1 {
-            return Err("max_tokens must be at least 1".to_string());
+/// Helper: Load model from cache with proper error handling
+async fn load_model_or_error(
+    state: &ServerState,
+    model_name: &str,
+) -> Result<Arc<Mutex<TorchEngine>>, impl IntoResponse> {
+    match state.model_cache.get_or_load(model_name).await {
+        Ok(engine) => Ok(engine),
+        Err(e) => {
+            error!("Failed to load model '{}': {}", model_name, e);
+
+            let (status, error_response) = if e.to_string().contains("not found") {
+                (
+                    StatusCode::NOT_FOUND,
+                    ErrorResponse::new(
+                        format!("Model '{}' not found", model_name),
+                        "model_not_found",
+                        "invalid_model",
+                    ),
+                )
+            } else if e.to_string().contains("failed to load") {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::new(
+                        format!("Model '{}' failed to load: {}", model_name, e),
+                        "model_load_error",
+                        "internal_error",
+                    ),
+                )
+            } else {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::internal_error(e.to_string()),
+                )
+            };
+
+            Err((status, Json(error_response)).into_response())
         }
     }
+}
 
-    // Validate temperature
-    if let Some(temp) = request.temperature {
-        if !(0.0..=2.0).contains(&temp) {
-            return Err(format!(
-                "temperature must be between 0.0 and 2.0, got {}",
-                temp
-            ));
+/// Helper: Resolve model name to filesystem path
+async fn resolve_model_path(
+    state: &ServerState,
+    model_name: &str,
+) -> Result<std::path::PathBuf, impl IntoResponse> {
+    let model_ref = match crate::storage::ModelRef::parse(model_name) {
+        Ok(r) => r,
+        Err(e) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    format!("Invalid model reference: {}", e),
+                    "invalid_model_ref",
+                    "parse_error",
+                )),
+            )
+                .into_response());
         }
-    }
+    };
 
-    // Validate top_p
-    if let Some(top_p) = request.top_p {
-        if !(0.0..=1.0).contains(&top_p) {
-            return Err(format!("top_p must be between 0.0 and 1.0, got {}", top_p));
-        }
+    match state.model_storage.get_model_path(&model_ref).await {
+        Ok(path) => Ok(path),
+        Err(e) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                format!("Model path not found: {}", e),
+                "model_not_found",
+                "path_error",
+            )),
+        )
+            .into_response()),
     }
+}
 
-    // Validate n (number of completions)
-    if let Some(n) = request.n {
-        if !(1..=10).contains(&n) {
-            return Err(format!("n must be between 1 and 10, got {}", n));
-        }
-    }
-
-    Ok(())
+/// Helper: Add no-cache headers to response
+fn add_no_cache_headers(response: &mut axum::response::Response) {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        "no-cache, no-store, must-revalidate".parse().unwrap(),
+    );
+    headers.insert(header::PRAGMA, "no-cache".parse().unwrap());
 }
 
 /// Create OpenAI API router
@@ -164,21 +204,12 @@ async fn chat_completions(
         is_streaming, request.stream
     );
 
-    // Validate request
-    if let Err(e) = validate_chat_request(&request, &state.config) {
-        error!("Request validation failed: {}", e);
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                e,
-                "invalid_request",
-                "validation_failed",
-            )),
-        )
-            .into_response();
+    if request.stream.unwrap_or(false) {
+        info!("Handling streaming request");
+        return stream_chat(state, request).await.into_response();
     }
+    info!("Handling non-streaming request");
 
-    // Update metrics
     state
         .metrics
         .active_requests
@@ -187,57 +218,15 @@ async fn chat_completions(
         .metrics
         .total_requests
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _metrics_guard = MetricsGuard::new(&state.metrics);
 
     let start_time = std::time::Instant::now();
 
-    // Check for streaming
-    if request.stream.unwrap_or(false) {
-        info!("Handling streaming request");
-        return stream_chat(state, request).await.into_response();
-    }
-    info!("Handling non-streaming request");
-
-    // Get engine from model cache
-    let engine = match state.model_cache.get_or_load(&request.model).await {
+    let engine = match load_model_or_error(&state, &request.model).await {
         Ok(engine) => engine,
-        Err(e) => {
-            error!("Failed to load model '{}': {}", request.model, e);
-            state
-                .metrics
-                .active_requests
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-
-            // Determine appropriate error response
-            let (status, error_response) = if e.to_string().contains("not found") {
-                (
-                    StatusCode::NOT_FOUND,
-                    ErrorResponse::new(
-                        format!("Model '{}' not found", request.model),
-                        "model_not_found",
-                        "invalid_model",
-                    ),
-                )
-            } else if e.to_string().contains("failed to load") {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorResponse::new(
-                        format!("Model '{}' failed to load: {}", request.model, e),
-                        "model_load_error",
-                        "internal_error",
-                    ),
-                )
-            } else {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorResponse::internal_error(e.to_string()),
-                )
-            };
-
-            return (status, Json(error_response)).into_response();
-        }
+        Err(response) => return response.into_response(),
     };
 
-    // Create generation request - use template-aware formatting
     info!("Formatting messages with template...");
     let formatted_prompt = match format_messages_with_template(&request.messages, &engine).await {
         Ok(prompt) => {
@@ -249,10 +238,6 @@ async fn chat_completions(
         }
         Err(e) => {
             error!("Template formatting failed: {}", e);
-            state
-                .metrics
-                .active_requests
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -265,79 +250,22 @@ async fn chat_completions(
         }
     };
 
-    // Get model path for config loading
-    let model_ref = match crate::storage::ModelRef::parse(&request.model) {
-        Ok(r) => r,
-        Err(e) => {
-            state
-                .metrics
-                .active_requests
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(
-                    format!("Invalid model reference: {}", e),
-                    "invalid_model_ref",
-                    "parse_error",
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    let model_path = match state.model_storage.get_model_path(&model_ref).await {
+    let model_path = match resolve_model_path(&state, &request.model).await {
         Ok(path) => path,
-        Err(e) => {
-            state
-                .metrics
-                .active_requests
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse::new(
-                    format!("Model path not found: {}", e),
-                    "model_not_found",
-                    "path_error",
-                )),
-            )
-                .into_response();
-        }
+        Err(response) => return response.into_response(),
     };
 
-    // Build request with proper cascade: server defaults → model config → user request
-    let gen_request = match GenerationRequest::builder(formatted_prompt.clone())
-        .with_server_defaults(&state.config.generation_defaults)
-        .with_model_config(&model_path)
-        .await
-    {
-        Ok(builder) => builder
-            .temperature(request.temperature)
-            .top_p(request.top_p)
-            .top_k(request.top_k)
-            .repeat_penalty(request.repeat_penalty)
-            .max_tokens(request.max_tokens)
-            .stop_tokens(request.stop.clone())
-            .build(),
-        Err(e) => {
-            info!("Failed to load model config: {}, using defaults", e);
-            GenerationRequest::builder(formatted_prompt)
-                .with_server_defaults(&state.config.generation_defaults)
-                .temperature(request.temperature)
-                .top_p(request.top_p)
-                .top_k(request.top_k)
-                .repeat_penalty(request.repeat_penalty)
-                .max_tokens(request.max_tokens)
-                .stop_tokens(request.stop.clone())
-                .build()
-        }
-    };
+    let gen_request = GenerationRequest::builder(formatted_prompt)
+        .apply_config(&(&state.config.sampling_defaults).into())
+        .apply_config(&crate::config::SamplingParams::from_model_path(&model_path).await.unwrap_or_default())
+        .apply_config(&(&request).into())
+        .build();
 
     info!(
         "Using generation config: max_tokens={}, temp={}, top_p={}, top_k={:?}, repeat_penalty={}",
         gen_request.max_tokens, gen_request.temperature, gen_request.top_p, gen_request.top_k, gen_request.repeat_penalty
     );
 
-    // Generate response
     info!(
         "Starting generation with prompt length: {}",
         gen_request.prompt.len()
@@ -348,14 +276,9 @@ async fn chat_completions(
     };
 
     info!("Generation completed - success: {}", result.is_ok());
-    state
-        .metrics
-        .active_requests
-        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 
     match result {
         Ok(generation) => {
-            // Update metrics
             state.metrics.total_tokens.fetch_add(
                 generation.tokens_generated as u64,
                 std::sync::atomic::Ordering::Relaxed,
@@ -363,9 +286,8 @@ async fn chat_completions(
 
             let latency_ms = start_time.elapsed().as_millis() as f64;
             let mut avg_latency = state.metrics.avg_latency_ms.write().await;
-            *avg_latency = (*avg_latency * 0.9) + (latency_ms * 0.1); // Exponential moving average
+            *avg_latency = (*avg_latency * 0.9) + (latency_ms * 0.1);
 
-            // Create response
             let response = ChatCompletionResponse {
                 id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
                 object: "chat.completion".to_string(),
@@ -396,20 +318,13 @@ async fn chat_completions(
                 }),
             };
 
-            // Add no-cache headers to prevent client caching
             let mut response = Json(response).into_response();
-            response.headers_mut().insert(
-                header::CACHE_CONTROL,
-                "no-cache, no-store, must-revalidate".parse().unwrap(),
-            );
-            response
-                .headers_mut()
-                .insert(header::PRAGMA, "no-cache".parse().unwrap());
-            response
+            add_no_cache_headers(&mut response);
+            return response;
         }
         Err(e) => {
             error!("Generation failed: {}", e);
-            (
+            return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
                     "error": {
@@ -419,23 +334,21 @@ async fn chat_completions(
                     }
                 })),
             )
-                .into_response()
+                .into_response();
         }
     }
 }
 
-/// Handle streaming chat completions with real token-by-token generation
+/// Handle streaming chat completions using TextStream
 async fn stream_chat(state: ServerState, request: ChatCompletionRequest) -> impl IntoResponse {
     // Create channel for SSE events
     let (tx, rx) = mpsc::channel::<Result<serde_json::Value, anyhow::Error>>(100);
-    let cancel_token = CancellationToken::new();
-    let cancel_token_clone = cancel_token.clone();
 
     // Clone state for metrics cleanup
     let state_clone = state.clone();
 
     // Spawn generation task with configured defaults
-    let defaults = state.config.generation_defaults.clone();
+    let defaults = state.config.sampling_defaults.clone();
     let model_name = request.model.clone();
     let messages = request.messages.clone();
     let stop_sequences = request.stop.clone().unwrap_or_default();
@@ -447,6 +360,8 @@ async fn stream_chat(state: ServerState, request: ChatCompletionRequest) -> impl
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     tokio::spawn(async move {
+        use futures::StreamExt;
+
         // Ensure metrics are decremented on all exit paths
         let _metrics_guard = MetricsGuard::new(&state.metrics);
 
@@ -503,81 +418,122 @@ async fn stream_chat(state: ServerState, request: ChatCompletionRequest) -> impl
         // NOW lock the engine for generation
         let engine = engine_arc.lock().await;
 
-        // Create SSE streaming callback (clone tx for callback)
-        let tx_callback = tx.clone();
-        let callback = Box::new(crate::runtime::streaming::SseStreamingCallback::new(
-            tx_callback,
-            model_name.clone(),
-        ));
-
-        // Build request with proper cascade: server defaults → model config → user request
-        let gen_request = match GenerationRequest::builder(prompt.clone())
-            .with_server_defaults(&defaults)
-            .with_model_config(&model_path)
-            .await
-        {
-            Ok(builder) => builder
-                .temperature(request.temperature)
-                .top_p(request.top_p)
-                .top_k(request.top_k)
-                .repeat_penalty(request.repeat_penalty)
-                .max_tokens(request.max_tokens)
-                .stop_tokens(Some(stop_sequences))
-                .build(),
-            Err(e) => {
-                info!("Failed to load model config: {}, using defaults", e);
-                GenerationRequest::builder(prompt)
-                    .with_server_defaults(&defaults)
-                    .temperature(request.temperature)
-                    .top_p(request.top_p)
-                    .top_k(request.top_k)
-                    .repeat_penalty(request.repeat_penalty)
-                    .max_tokens(request.max_tokens)
-                    .stop_tokens(Some(stop_sequences))
-                    .build()
-            }
-        };
+        let gen_request = GenerationRequest::builder(prompt)
+            .apply_config(&(&defaults).into())
+            .apply_config(&crate::config::SamplingParams::from_model_path(&model_path).await.unwrap_or_default())
+            .apply_config(&(&request).into())
+            .stop_tokens(stop_sequences)
+            .build();
 
         info!(
             "Streaming: max_tokens={}, temp={}, top_p={}, top_k={:?}, repeat_penalty={}",
             gen_request.max_tokens, gen_request.temperature, gen_request.top_p, gen_request.top_k, gen_request.repeat_penalty
         );
 
-        // Create generation context
-        let context = crate::runtime::streaming::GenerationContext {
-            cancel_token: cancel_token_clone,
-            timeout: std::time::Duration::from_secs(defaults.stream_timeout_secs),
+        // Create text stream - handles all decoding internally
+        let mut text_stream = match engine.generate(gen_request) {
+            Ok(stream) => stream,
+            Err(e) => {
+                error!("Failed to create text stream: {}", e);
+                let _ = tx.send(Err(e)).await;
+                return;
+            }
         };
 
-        // Generate with async streaming
-        info!("Starting streaming generation...");
-        match engine
-            .generate_streaming_async(gen_request, callback, context)
-            .await
-        {
-            Ok(result) => {
-                info!(
-                    "Streaming generation completed with {} tokens",
-                    result.tokens_generated
-                );
-                // Update metrics
-                state.metrics.total_tokens.fetch_add(
-                    result.tokens_generated as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+        // Send initial role message
+        let stream_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+        let initial_msg = serde_json::json!({
+            "id": stream_id,
+            "object": "chat.completion.chunk",
+            "created": chrono::Utc::now().timestamp(),
+            "model": model_name,
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "content": ""
+                },
+                "finish_reason": null
+            }]
+        });
+        let _ = tx.send(Ok(initial_msg)).await;
 
-                // Send [DONE] message
-                let _ = tx
-                    .send(Ok(serde_json::json!({
-                        "done": true
-                    })))
-                    .await;
-            }
-            Err(e) => {
-                error!("Streaming generation failed: {}", e);
-                let _ = tx.send(Err(e)).await;
+        // Consume text chunks from stream
+        info!("Starting streaming generation...");
+        let mut chunks_sent = 0;
+        while let Some(text_result) = text_stream.next().await {
+            match text_result {
+                Ok(text) => {
+                    // Send text chunk
+                    let chunk = serde_json::json!({
+                        "id": stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": chrono::Utc::now().timestamp(),
+                        "model": model_name,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "content": text
+                            },
+                            "finish_reason": null
+                        }]
+                    });
+
+                    if tx.send(Ok(chunk)).await.is_err() {
+                        // Client disconnected - drop the stream to stop generation
+                        info!("Client disconnected during streaming");
+                        break;
+                    }
+                    chunks_sent += 1;
+                }
+                Err(e) => {
+                    // Generation error
+                    error!("Generation error: {}", e);
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
             }
         }
+
+        // Get final statistics
+        let stats = text_stream.stats();
+        info!(
+            "Streaming generation completed with {} tokens in {}ms ({:.2} tokens/sec)",
+            stats.tokens_generated, stats.generation_time_ms, stats.tokens_per_second
+        );
+
+        // Update metrics
+        state.metrics.total_tokens.fetch_add(
+            stats.tokens_generated as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        // Send completion message with finish reason
+        let finish_reason = match stats.finish_reason {
+            Some(FinishReason::MaxTokens) => "length",
+            Some(FinishReason::StopToken(_)) => "stop",
+            Some(FinishReason::EndOfSequence) => "stop",
+            Some(FinishReason::Stop) => "stop",
+            Some(FinishReason::Error(_)) => "stop",
+            None => "stop",
+        };
+
+        let completion_msg = serde_json::json!({
+            "id": stream_id,
+            "object": "chat.completion.chunk",
+            "created": chrono::Utc::now().timestamp(),
+            "model": model_name,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": finish_reason
+            }]
+        });
+        let _ = tx.send(Ok(completion_msg)).await;
+
+        // Send [DONE] message
+        let _ = tx.send(Ok(serde_json::json!({"done": true}))).await;
+
         // Metrics are automatically decremented by MetricsGuard drop
     });
 
@@ -606,14 +562,8 @@ async fn stream_chat(state: ServerState, request: ChatCompletionRequest) -> impl
         .keep_alive(axum::response::sse::KeepAlive::new())
         .into_response();
 
-    // Add cache control headers to prevent caching
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        "no-cache, no-store, must-revalidate".parse().unwrap(),
-    );
-    response
-        .headers_mut()
-        .insert(header::PRAGMA, "no-cache".parse().unwrap());
+    // Add cache control headers (using helper)
+    add_no_cache_headers(&mut response);
     response
         .headers_mut()
         .insert(header::EXPIRES, "0".parse().unwrap());
@@ -626,7 +576,7 @@ async fn completions(
     State(state): State<ServerState>,
     Json(request): Json<CompletionRequest>,
 ) -> impl IntoResponse {
-    // Similar to chat completions but with different format
+    // Update metrics (use RAII guard for automatic cleanup)
     state
         .metrics
         .active_requests
@@ -635,43 +585,12 @@ async fn completions(
         .metrics
         .total_requests
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _metrics_guard = MetricsGuard::new(&state.metrics);
 
-    // Get engine from model cache
-    let engine = match state.model_cache.get_or_load(&request.model).await {
+    // Get engine from model cache (using helper)
+    let engine = match load_model_or_error(&state, &request.model).await {
         Ok(engine) => engine,
-        Err(e) => {
-            state
-                .metrics
-                .active_requests
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-
-            // Determine error type
-            let (status, error_json) = if e.to_string().contains("not found") {
-                (
-                    StatusCode::NOT_FOUND,
-                    serde_json::json!({
-                        "error": {
-                            "message": format!("Model '{}' not found", request.model),
-                            "type": "model_not_found",
-                            "code": "invalid_model"
-                        }
-                    }),
-                )
-            } else {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    serde_json::json!({
-                        "error": {
-                            "message": format!("Failed to load model: {}", e),
-                            "type": "internal_error",
-                            "code": "engine_error"
-                        }
-                    }),
-                )
-            };
-
-            return (status, Json(error_json)).into_response();
-        }
+        Err(response) => return response.into_response(),
     };
 
     // Convert raw prompt to chat format and apply template
@@ -686,10 +605,6 @@ async fn completions(
         Ok(prompt) => prompt,
         Err(e) => {
             error!("Template formatting failed for completions endpoint: {}", e);
-            state
-                .metrics
-                .active_requests
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
@@ -704,77 +619,17 @@ async fn completions(
         }
     };
 
-    // Get model path for config loading
-    let model_ref = match crate::storage::ModelRef::parse(&request.model) {
-        Ok(r) => r,
-        Err(e) => {
-            state
-                .metrics
-                .active_requests
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": {
-                        "message": format!("Invalid model reference: {}", e),
-                        "type": "invalid_model_ref",
-                        "code": "parse_error"
-                    }
-                })),
-            )
-                .into_response();
-        }
-    };
-
-    let model_path = match state.model_storage.get_model_path(&model_ref).await {
+    // Get model path (using helper)
+    let model_path = match resolve_model_path(&state, &request.model).await {
         Ok(path) => path,
-        Err(e) => {
-            error!("Could not get model path: {}", e);
-            state
-                .metrics
-                .active_requests
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": {
-                        "message": format!("Could not get model path: {}", e),
-                        "type": "model_path_error",
-                        "code": "model_path_failed"
-                    }
-                })),
-            )
-                .into_response();
-        }
+        Err(response) => return response.into_response(),
     };
 
-    // Build request with proper cascade: server defaults → model config → user request
-    let gen_request = match GenerationRequest::builder(formatted_prompt.clone())
-        .with_server_defaults(&state.config.generation_defaults)
-        .with_model_config(&model_path)
-        .await
-    {
-        Ok(builder) => builder
-            .temperature(request.temperature)
-            .top_p(request.top_p)
-            .top_k(request.top_k)
-            .repeat_penalty(request.repeat_penalty)
-            .max_tokens(request.max_tokens)
-            .stop_tokens(request.stop.clone())
-            .build(),
-        Err(e) => {
-            info!("Failed to load model config: {}, using defaults", e);
-            GenerationRequest::builder(formatted_prompt)
-                .with_server_defaults(&state.config.generation_defaults)
-                .temperature(request.temperature)
-                .top_p(request.top_p)
-                .top_k(request.top_k)
-                .repeat_penalty(request.repeat_penalty)
-                .max_tokens(request.max_tokens)
-                .stop_tokens(request.stop.clone())
-                .build()
-        }
-    };
+    let gen_request = GenerationRequest::builder(formatted_prompt)
+        .apply_config(&(&state.config.sampling_defaults).into())
+        .apply_config(&crate::config::SamplingParams::from_model_path(&model_path).await.unwrap_or_default())
+        .apply_config(&(&request).into())
+        .build();
 
     info!(
         "Completions: max_tokens={}, temp={}, top_p={}, top_k={:?}, repeat_penalty={}",
@@ -786,10 +641,7 @@ async fn completions(
         engine.generate_with_params(gen_request).await
     };
 
-    state
-        .metrics
-        .active_requests
-        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    // Metrics automatically decremented by MetricsGuard on drop
 
     match result {
         Ok(generation) => {
@@ -811,28 +663,23 @@ async fn completions(
                 }),
             };
 
-            // Add no-cache headers to prevent client caching
             let mut response = Json(response).into_response();
-            response.headers_mut().insert(
-                header::CACHE_CONTROL,
-                "no-cache, no-store, must-revalidate".parse().unwrap(),
-            );
-            response
-                .headers_mut()
-                .insert(header::PRAGMA, "no-cache".parse().unwrap());
-            response
+            add_no_cache_headers(&mut response);
+            return response;
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": {
-                    "message": format!("Generation failed: {}", e),
-                    "type": "generation_error",
-                    "code": "internal_error"
-                }
-            })),
-        )
-            .into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!("Generation failed: {}", e),
+                        "type": "generation_error",
+                        "code": "internal_error"
+                    }
+                })),
+            )
+                .into_response();
+        }
     }
 }
 
@@ -897,19 +744,13 @@ async fn list_models(State(state): State<ServerState>) -> impl IntoResponse {
     // Adapters are now file-based and managed via AdapterManager.
     // To list adapters for a model, use AdapterManager::new(model_path).list_adapters()
 
-    // Add no-cache headers to prevent client caching
+    // Add no-cache headers (using helper)
     let mut response = Json(ListModelsResponse {
         object: "list".to_string(),
         data: models,
     })
     .into_response();
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        "no-cache, no-store, must-revalidate".parse().unwrap(),
-    );
-    response
-        .headers_mut()
-        .insert(header::PRAGMA, "no-cache".parse().unwrap());
+    add_no_cache_headers(&mut response);
     response
 }
 

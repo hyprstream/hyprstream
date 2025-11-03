@@ -32,6 +32,7 @@ use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::EnvFilter;
 #[cfg(feature = "otel")]
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
 
 #[derive(Parser)]
 #[command(
@@ -219,6 +220,10 @@ fn main() -> Result<()> {
     // Create application context
     let ctx = AppContext::new(config);
 
+    // Keep the guard alive for the entire program lifetime
+    // Dropping the guard stops the background logging thread
+    let _log_guard: Option<tracing_appender::non_blocking::WorkerGuard>;
+
     #[cfg(feature = "otel")]
     {
         // Determine telemetry provider based on command
@@ -242,14 +247,40 @@ fn main() -> Result<()> {
                 TelemetryProvider::Stdout => "hyprstream=debug",
             };
 
-            tracing_subscriber::fmt()
-                .with_env_filter(EnvFilter::builder().parse_lossy(
-                    std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_string()),
-                ))
-                .with_target(true)
-                .with_file(true)
-                .with_line_number(true)
-                .init();
+            // Check if file logging is enabled via environment variable
+            if let Ok(log_dir) = std::env::var("HYPRSTREAM_LOG_DIR") {
+                // Create rolling file appender (daily rotation)
+                let file_appender = RollingFileAppender::new(
+                    Rotation::DAILY,
+                    &log_dir,
+                    "hyprstream.log"
+                );
+                let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+                _log_guard = Some(guard);
+
+                tracing_subscriber::fmt()
+                    .with_env_filter(EnvFilter::builder().parse_lossy(
+                        std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_string()),
+                    ))
+                    .with_target(true)
+                    .with_file(true)
+                    .with_line_number(true)
+                    .with_writer(non_blocking)
+                    .init();
+
+                info!("File logging enabled to {}/hyprstream.log", log_dir);
+            } else {
+                _log_guard = None;
+                // Console logging only
+                tracing_subscriber::fmt()
+                    .with_env_filter(EnvFilter::builder().parse_lossy(
+                        std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_string()),
+                    ))
+                    .with_target(true)
+                    .with_file(true)
+                    .with_line_number(true)
+                    .init();
+            }
         }
     }
 
@@ -261,14 +292,40 @@ fn main() -> Result<()> {
             _ => "hyprstream=debug",
         };
 
-        tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::builder().parse_lossy(
-                std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_string()),
-            ))
-            .with_target(true)
-            .with_file(true)
-            .with_line_number(true)
-            .init();
+        // Check if file logging is enabled via environment variable
+        if let Ok(log_dir) = std::env::var("HYPRSTREAM_LOG_DIR") {
+            // Create rolling file appender (daily rotation)
+            let file_appender = RollingFileAppender::new(
+                Rotation::DAILY,
+                &log_dir,
+                "hyprstream.log"
+            );
+            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+            _log_guard = Some(guard);
+
+            tracing_subscriber::fmt()
+                .with_env_filter(EnvFilter::builder().parse_lossy(
+                    std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_string()),
+                ))
+                .with_target(true)
+                .with_file(true)
+                .with_line_number(true)
+                .with_writer(non_blocking)
+                .init();
+
+            info!("File logging enabled to {}/hyprstream.log", log_dir);
+        } else {
+            _log_guard = None;
+            // Console logging only
+            tracing_subscriber::fmt()
+                .with_env_filter(EnvFilter::builder().parse_lossy(
+                    std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_string()),
+                ))
+                .with_target(true)
+                .with_file(true)
+                .with_line_number(true)
+                .init();
+        }
     }
 
     info!("Hyprstream v{} starting up", env!("CARGO_PKG_VERSION"));

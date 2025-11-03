@@ -1,28 +1,21 @@
-# hyprstream-torch Development Guide
+# hyprstream Development Guide
 
-**Claude AI Assistant Guide** - Updated Oct 2025 after adapter architecture simplification
+**Claude AI Assistant Guide** - Updated Oct 31, 2025
 
 ---
 
-## 🚧 Current Status (Oct 2025)
+## Current Status
 
-### XET Feature Status
+**Production Ready** ✅
+- PyTorch-based inference with multi-backend support (CPU, CUDA, ROCm)
+- Git-native model management via git2db
+- File-based LoRA adapters
+- OpenAI-compatible REST API
+- Proper UTF-8 streaming (emojis, multi-byte characters)
 
-**XET Integration**: ⚠️ **EXPERIMENTAL** (optional feature, disabled by default)
-- Feature flag implemented and working correctly
-- Optional in git2db, disabled by default in hyprstream
-- LFS pointer detection implemented (with graceful degradation when XET disabled)
-- Architecture designed for automatic smudging via git-xet-filter
-- **Known Issue**: Filter implementation needs refactoring (see below)
-
-### Recent Refactoring ✅
-
-**Architecture Simplification**:
-- ✅ Removed duplicate XetNativeStorage (863 lines deleted)
-- ✅ Consolidated to lfs_xet.rs with git2db integration
-- ✅ Removed XET storage fields from TorchEngine and ModelCache
-- ✅ Added load_file_with_pointer_detection() for LFS fallback
-- ✅ Feature flags properly implemented across all crates
+**Experimental Features** ⚠️
+- XET large file storage (disabled by default, filter needs refactoring)
+- LoRA training system (functional but evolving)
 
 ---
 
@@ -30,27 +23,36 @@
 
 ```bash
 # Set libtorch path (required)
-export LIBTORCH=/mnt/hyprstream/libtorch
+export LIBTORCH=/path/to/libtorch
 export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
 
-# Basic build (XET disabled by default - has known bugs)
-cargo check
+# CPU backend (default)
 cargo build
 
-# With XET support (EXPERIMENTAL - currently broken)
-cargo build --features xet
+# CUDA backend
+cargo build --no-default-features --features tch-cuda
+
+# ROCm backend (uses tch-rs fork with HIP support)
+cargo build --no-default-features --features tch-rocm
 
 # With OpenTelemetry support
 cargo build --features otel
 
-# ROCm (AMD GPU) build
-cargo build --release --features rocm
+# With XET support (EXPERIMENTAL - disabled by default)
+cargo build --features xet
 
 # Run tests
 cargo test --workspace
+
+# Run examples (used for GPU testing)
+cargo run --example test_cuda
 ```
 
 **Note**: Building requires libtorch (PyTorch C++ library). See README.md for download/installation instructions.
+
+**Backend Selection**:
+- CPU and CUDA use standard tch-rs
+- ROCm uses tch-rs fork from github.com/hyprstream/tch-rs (branch: hip) for HIP support
 
 ---
 
@@ -69,7 +71,7 @@ hyprstream is a high-performance LLM inference and training engine built on PyTo
 ## Component Architecture
 
 ```
-hyprstream-torch/
+hyprstream/
 ├── crates/
 │   ├── hyprstream/          # Main application
 │   │   ├── src/
@@ -148,21 +150,11 @@ handle.branch().create("experiment", None).await?;
 
 ---
 
-#### **Adapters** - File-Based (NOT Branch-Based) ⭐
+#### **Adapters** - File-Based ⭐
 **Key Files**:
-- `adapter_manager.rs` - Production adapter system (file-based)
+- `adapter_manager.rs` - File-based adapter system
 
-**IMPORTANT**: As of Oct 2025, hyprstream uses **file-based adapters**, not branch-based:
-
-**What We Removed** ❌:
-- `api/adapter_storage.rs` (~600 lines) - Branch-based adapter system
-- `git/branch_manager.rs` (~387 lines) - Custom UUID branch manager
-- UUID adapter branches (`adapter/{uuid}`)
-- Tag alias resolution for adapters
-- Adapter worktree isolation
-
-**What We Use** ✅:
-- `storage/adapter_manager.rs` (~200 lines) - File-based adapter system
+**Design**:
 - Adapters stored in `model/adapters/` as `.safetensors` files
 - Simple indexed naming: `00_base.safetensors`, `01_coding.safetensors`
 - Config files: `00_base.config.json`
@@ -184,12 +176,10 @@ for adapter in adapters {
 }
 ```
 
-**Why File-Based**:
-- ✅ Simple and proven
-- ✅ Fast loading
-- ✅ Easy composition (stack multiple adapters)
-- ✅ Standard git workflows
-- ✅ No complexity overhead
+**Benefits**:
+- Simple and proven architecture
+- Fast loading, easy composition (stack multiple adapters)
+- Standard git workflows
 
 ---
 
@@ -320,11 +310,12 @@ let repo = Repository::open(path)?;   // ❌ Use GitManager::global()
 ### **3. Runtime System** (`crates/hyprstream/src/runtime/`)
 
 **Key Files**:
-- `torch_engine.rs` - Main PyTorch inference engine
-- `inference.rs` - Inference pipeline
-- `architectures/` - Model architectures (Qwen, Llama, etc.)
+- `torch_engine.rs` - Main PyTorch inference engine with Stream-based generation
+- `architectures/` - Model architectures (Qwen, Llama, Gemma, etc.)
 - `kv_cache.rs` - KV cache management
-- `sampling.rs` - Token sampling strategies
+- `tensor_sampling.rs` - Device-agnostic tensor sampling
+- `template_engine.rs` - Chat template formatting
+- `model_factory.rs` - Model loading and initialization
 
 **Design**: PyTorch (libtorch) via tch-rs bindings
 
@@ -332,15 +323,65 @@ let repo = Repository::open(path)?;   // ❌ Use GitManager::global()
 ```rust
 pub struct TorchEngine {
     device: Device,
-    models: Arc<RwLock<HashMap<String, Arc<LoadedModel>>>>,
+    persistent_model: Option<Arc<Mutex<Box<dyn ModelOperations>>>>,
+    tokenizer: Arc<Mutex<Option<Tokenizer>>>,
     config: RuntimeConfig,
 }
 
 impl TorchEngine {
-    pub async fn load_model(&self, model_ref: &str) -> Result<()>;
-    pub async fn infer(&self, request: InferenceRequest) -> Result<InferenceResult>;
+    pub fn generate(&self, request: GenerationRequest) -> Result<TextStream>;
+    pub async fn generate_with_params(&self, request: GenerationRequest) -> Result<GenerationResult>;
 }
 ```
+
+**Stream-Based Generation API** (Oct 31, 2025):
+
+The runtime uses a `TextStream` that implements `futures::Stream` for clean, composable streaming:
+
+```rust
+// torch_engine.rs - Stream-based generation with proper UTF-8 handling
+use futures::StreamExt;
+
+let mut stream = engine.generate(request)?;
+
+while let Some(text_chunk) = stream.next().await {
+    print!("{}", text_chunk?);  // Already decoded UTF-8
+}
+
+let stats = stream.stats();
+println!("Generated {} tokens in {}ms", stats.tokens_generated, stats.generation_time_ms);
+```
+
+**Internal UTF-8 Handling**:
+
+The `TextStream` internally uses `tokenizers::DecodeStream` for proper multi-byte UTF-8 handling:
+
+```rust
+// Inside TextStream::poll_next
+match self.decode_stream.step(next_token) {
+    Ok(Some(text)) => {
+        // Complete UTF-8 sequence - emit to stream
+        return Poll::Ready(Some(Ok(text)));
+    }
+    Ok(None) => {
+        // Buffering incomplete UTF-8, continue to next token
+        continue;
+    }
+    Err(e) => return Poll::Ready(Some(Err(e.into()))),
+}
+```
+
+**How it works**:
+- `Ok(Some(text))` = Complete UTF-8 character, ready to emit
+- `Ok(None)` = Buffering incomplete byte sequence (e.g., multi-byte emoji)
+- Example: 🏀 emoji requires 2 tokens
+  - Token 1 (0xF0 0x9F): `step()` returns `None` (buffered)
+  - Token 2 (0x8F 0x80): `step()` returns `Some("🏀")` (complete emoji)
+
+**Why this matters**:
+- Prevents Unicode corruption in streaming output
+- Ensures only valid UTF-8 strings are sent to clients
+- Handles emojis, CJK characters, and other multi-byte sequences correctly
 
 ---
 
@@ -510,9 +551,15 @@ RUST_LOG=debug cargo test
 # Test specific module
 cargo test -p hyprstream storage::adapter_manager
 
-# Integration tests
-cargo test --test '*'
+# Integration tests (git2db)
+cargo test -p git2db --test '*'
+
+# Examples (used for GPU/inference testing)
+cargo run --example test_cuda
+cargo run --example qwen_chat
 ```
+
+**Note**: Main hyprstream application uses examples for GPU/inference testing rather than unit tests in tests/ directory.
 
 ---
 
@@ -608,6 +655,64 @@ let wt = GitManager::global()
 ---
 
 ## Architecture Decisions Log
+
+### **Oct 31, 2025: Stream-Based Generation API**
+
+**Decision**: Replace callback-based generation with Rust's `Stream` trait
+
+**Changes**:
+- Implemented `TextStream` that implements `futures::Stream<Item = Result<String>>`
+- Removed callback-based `generate_streaming()` API
+- Integrated DecodeStream buffering into the Stream implementation
+- Added generation statistics accessible via `stream.stats()`
+
+**Benefits**:
+- Composable with standard Rust async ecosystem (futures, tokio-stream, etc.)
+- Automatic resource cleanup (drop stops generation)
+- Clean, idiomatic Rust API
+- Proper UTF-8 handling built into the stream
+
+**Implementation** (`torch_engine.rs:1711-1928`):
+```rust
+// TextStream implements Stream trait
+impl<'a> Stream for TextStream<'a> {
+    type Item = Result<String>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        // ... sample token, check stop conditions ...
+
+        match self.decode_stream.step(next_token) {
+            Ok(Some(text)) => return Poll::Ready(Some(Ok(text))),
+            Ok(None) => continue,  // Buffering incomplete UTF-8
+            Err(e) => return Poll::Ready(Some(Err(e.into()))),
+        }
+    }
+}
+```
+
+**Impact**:
+- Fixed Unicode corruption in streaming responses
+- Proper multi-byte UTF-8 support (emojis, CJK, etc.)
+- More composable and testable code
+- Matches Rust ecosystem conventions
+
+---
+
+### **Oct 31, 2025: Sampling Refactor**
+
+**Decision**: Improve tensor-based sampling implementation
+
+**Changes**:
+- Better separation of sampling strategies in `tensor_sampling.rs`
+- Improved clarity and maintainability
+- Net +46 lines (132 insertions, 86 deletions)
+
+**Impact**:
+- Cleaner sampling implementation
+- Better abstraction for device-agnostic sampling
+- Easier to add new sampling strategies
+
+---
 
 ### **Oct 2025: Adapter Architecture Simplification**
 
@@ -715,10 +820,14 @@ Filter Layer (git-xet-filter)
 ## Additional Resources
 
 - **README.md** - User-facing documentation
+- **ARCHITECTURE.md** - Visual architecture diagrams and component relationships
+- **TOKEN_STREAM_EXAMPLES.md** - Future TokenStream API design (WIP - not yet implemented)
 - **crates/git2db/CLAUDE.md** - git2db AI guide
 - **docs/COW_ARCHITECTURE.md** - Worktree CoW mechanisms
 - **docs/GIT2DB-*.md** - git2db design documents
 - **docs/** - Historical planning documents
+
+**Note on TOKEN_STREAM_EXAMPLES.md**: This file contains the original design documentation for the Stream-based API. The Stream API has been fully implemented in `torch_engine.rs` (see `TextStream`). The examples file remains as historical reference for the design process.
 
 ---
 

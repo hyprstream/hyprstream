@@ -18,7 +18,6 @@ pub use crate::config::{
 pub mod architectures; // Architecture-specific model implementations
 pub mod conversation_router; // Seamless model evolution and routing
 pub mod fp8; // FP8 (E4M3/E5M2) quantization support
-pub mod generation_core; // Unified generation core to eliminate code duplication
 pub mod tensor_sampling; // Device-agnostic tensor-based sampling
 pub mod kv_cache; // Key-Value caching for efficient autoregressive generation
 pub mod lora_integration; // LoRA integration with gradient bridge
@@ -26,15 +25,13 @@ pub mod model_config; // Unified model configuration management
 pub mod model_factory; // Single factory for model creation
 pub mod precision; // BF16/FP8 precision management
 pub mod rope; // Rotary Position Embedding (RoPE) implementation
-pub mod sampling; // Token sampling strategies with model-specific configs
-pub mod streaming; // Async streaming support for token-by-token generation
 pub mod template_engine; // Jinja2 template engine for chat templates
 pub mod tensor_helpers; // Helper functions for Tch tensor operations
 pub mod torch_engine; // PyTorch-based engine with tch-rs
 pub mod weight_provider; // Weight provider for streaming large models
 
 // Primary exports - use TorchEngine as default
-pub use torch_engine::TorchEngine;
+pub use torch_engine::{TorchEngine, TextStream, GenerationStats};
 
 #[derive(Debug, Clone)]
 pub struct MistralEngine;

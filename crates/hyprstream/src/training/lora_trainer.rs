@@ -195,7 +195,13 @@ impl LoRATrainer {
                 repeat_penalty: 1.1,
                 ..Default::default()
             };
-            let _output = engine.generate_streaming(request, |_| {}).await?;
+            // Use TextStream - just drain the stream
+            use futures::StreamExt;
+
+            let mut stream = engine.generate(request)?;
+            while let Some(text_chunk) = stream.next().await {
+                text_chunk?;
+            }
 
             // Placeholder loss computation
             let loss = 2.0 - (batch.len() as f64 * 0.1); // Decreasing loss simulation
@@ -256,7 +262,13 @@ impl LoRATrainer {
                 repeat_penalty: 1.1,
                 ..Default::default()
             };
-            let _output = engine.generate_streaming(request, |_| {}).await?;
+            // Use TextStream - just drain the stream
+            use futures::StreamExt;
+
+            let mut stream = engine.generate(request)?;
+            while let Some(text_chunk) = stream.next().await {
+                text_chunk?;
+            }
 
             // Placeholder loss - would compute perplexity in real implementation
             total_loss += 1.5;

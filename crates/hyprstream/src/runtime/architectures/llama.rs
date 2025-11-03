@@ -331,7 +331,7 @@ impl LlamaAttention {
     ) -> Result<Tensor> {
         let (batch_size, seq_len, hidden_size) = dims3(hidden_states)?;
 
-        tracing::debug!("LlamaAttention forward: batch_size={}, seq_len={}, hidden_size={}, start_pos={}, has_cache={}", 
+        tracing::trace!("LlamaAttention forward: batch_size={}, seq_len={}, hidden_size={}, start_pos={}, has_cache={}",
                       batch_size, seq_len, hidden_size, start_pos, kv_cache.is_some());
 
         // Debug: Check shapes and dtypes before projection
@@ -562,7 +562,7 @@ impl LlamaAttention {
         let (_batch_size, _seq_len, tensor_heads, head_dim) = dims4(tensor)?;
 
         // Debug logging
-        tracing::debug!(
+        tracing::trace!(
             "apply_qk_norm: tensor heads={}, head_dim={}, actual_heads={}, norm_weight shape={:?}",
             tensor_heads,
             head_dim,
@@ -1524,7 +1524,7 @@ impl ModelOperations for LlamaModel {
     }
 
     fn forward_with_cache(&self, input: &Tensor, start_pos: usize) -> Result<Tensor> {
-        tracing::debug!("LlamaModel forward_with_cache: input shape={:?}, start_pos={}, config: hidden_size={}, num_layers={}", 
+        tracing::trace!("LlamaModel forward_with_cache: input shape={:?}, start_pos={}, config: hidden_size={}, num_layers={}",
                      input.size(), start_pos, self.config.hidden_size, self.layers.len());
 
         // Input should be token IDs with shape [batch_size, seq_len]
@@ -1577,7 +1577,7 @@ impl ModelOperations for LlamaModel {
         };
 
         // Apply transformer layers
-        tracing::debug!("Total layers to process: {}", self.layers.len());
+        tracing::trace!("Total layers to process: {}", self.layers.len());
 
         // Generate position_ids based on start_pos (for proper KV cache usage)
         let seq_len = hidden_states.size()[1];
@@ -1604,7 +1604,7 @@ impl ModelOperations for LlamaModel {
             let attn_output = if let Some(cache_ref) = self.kv_cache.as_ref() {
                 let mut cache_manager = cache_ref.borrow_mut();
                 if let Some(layer_cache) = cache_manager.get_layer_cache(idx) {
-                    tracing::debug!(
+                    tracing::trace!(
                         "Layer {}: Using KV cache, cache_pos={}",
                         idx,
                         layer_cache.seq_pos

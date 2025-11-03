@@ -9,8 +9,6 @@ use anyhow::Result;
 use std::collections::HashMap;
 use tch::{Device, Kind, Tensor};
 
-use super::generation_core::SamplingParams;
-
 /// Device-agnostic token sampler operating on tensors
 ///
 /// Performs all sampling operations (temperature scaling, top-k filtering,
@@ -24,23 +22,6 @@ pub struct TensorSampler {
 impl TensorSampler {
     pub fn new(device: Device) -> Self {
         Self { device }
-    }
-
-    /// Sample next token using bundled parameters (new interface)
-    pub fn sample_with_params(
-        &self,
-        logits_tensor: &Tensor,
-        params: &SamplingParams,
-        previous_tokens: &[i64],
-    ) -> Result<usize> {
-        self.sample_token(
-            logits_tensor,
-            params.temperature,
-            params.top_p,
-            params.top_k,
-            params.repeat_penalty,
-            previous_tokens,
-        )
     }
 
     /// Sample next token directly from logits tensor
@@ -113,9 +94,9 @@ impl TensorSampler {
 
         let vocab_size = logits.size()[0] as usize;
 
-        // Create frequency map for recent tokens (last 64)
+        // Create frequency map for all provided tokens (already bounded by repeat_last_n)
         let mut token_counts = HashMap::new();
-        for &token_id in previous_tokens.iter().rev().take(64) {
+        for &token_id in previous_tokens.iter().rev() {
             if token_id >= 0 && (token_id as usize) < vocab_size {
                 *token_counts.entry(token_id as usize).or_insert(0) += 1;
             }
