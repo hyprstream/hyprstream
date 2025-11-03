@@ -1611,7 +1611,7 @@ impl<'a> TextStream<'a> {
             // - TextStream is not Clone/Copy
             // - We maintain ownership via the raw pointer
             let tokenizer_ref: &'a Tokenizer = std::mem::transmute(tokenizer_static);
-            tokenizer_ref.decode_stream(false) // skip_special_tokens=false - don't skip, prevents UTF-8 corruption
+            tokenizer_ref.decode_stream(true) // skip_special_tokens=true
         };
 
         // Store the raw pointer so we can deallocate in Drop
@@ -1656,7 +1656,7 @@ impl<'a> TextStream<'a> {
     }
 
     fn sample_next_token(&mut self) -> Result<u32> {
-        let logits = if self.tokens_generated == 0 {
+        let mut logits = if self.tokens_generated == 0 {
             self.engine.forward(&self.prompt_tokens)?
         } else {
             let last_token = self.last_generated.expect("last_generated should be set");
@@ -1666,6 +1666,23 @@ impl<'a> TextStream<'a> {
                 true,
             )?
         };
+
+        // Check if we need to rerank for UTF-8 completion
+        if let Some(last) = self.last_generated {
+            // Tokens 94-255 are single-byte tokens in ByteLevel BPE
+            if (94..=255).contains(&last) {
+                // Map token ID to byte value using ByteLevel BPE mapping
+                let byte_val = self.token_to_byte(last as usize);
+
+                // Check if this is a UTF-8 multi-byte start or continuation
+                if byte_val >= 0x80 {
+                    tracing::debug!("Token {} maps to byte 0x{:02X} (UTF-8 multi-byte)", last, byte_val);
+
+                    // Rerank logits to prioritize valid UTF-8 completions
+                    logits = self.rerank_for_utf8_completion(&logits, byte_val)?;
+                }
+            }
+        }
 
         let params = SamplingParams {
             temperature: self.temperature,
@@ -1692,6 +1709,90 @@ impl<'a> TextStream<'a> {
         }
 
         Ok(next_token as u32)
+    }
+
+    /// Map token ID to byte value for ByteLevel BPE (tokens 94-255 → bytes 0x80-0xFF)
+    fn token_to_byte(&self, token_id: usize) -> u8 {
+        // ByteLevel BPE mapping:
+        // Tokens 0-93: ASCII (0x21-0x7E) and special chars
+        // Tokens 94-221: bytes 0xA1-0xFF (directly)
+        // Tokens 222-255: bytes 0x00-0x20, 0x7F-0xA0 (via U+0100 offset)
+
+        if token_id >= 94 && token_id <= 221 {
+            // Direct mapping to 0xA1-0xFF
+            (token_id - 94 + 0xA1) as u8
+        } else if token_id >= 222 && token_id <= 255 {
+            // These map to bytes 0x80-0xA0 via U+0100 offset
+            // Token 222 → 0x80, 223 → 0x81, ..., 255 → 0xB3
+            (token_id - 222 + 0x80) as u8
+        } else {
+            // Not a single-byte token in the problematic range
+            0
+        }
+    }
+
+    /// Rerank logits to prioritize tokens that complete valid UTF-8 sequences
+    fn rerank_for_utf8_completion(&self, logits: &Tensor, incomplete_byte: u8) -> Result<Tensor> {
+        let reranked = logits.shallow_clone();
+
+        // Determine what bytes are needed to complete the UTF-8 sequence
+        let needs_continuation = if incomplete_byte >= 0x80 && incomplete_byte <= 0xBF {
+            // This is a continuation byte - we shouldn't have sampled it alone!
+            // Penalize all single-byte tokens heavily
+            tracing::warn!("Sampled orphaned UTF-8 continuation byte 0x{:02X}!", incomplete_byte);
+            false
+        } else if incomplete_byte >= 0xC0 && incomplete_byte <= 0xDF {
+            // 2-byte sequence start (110xxxxx) - needs 1 continuation byte
+            tracing::debug!("2-byte UTF-8 sequence start (0x{:02X}) - needs 1 continuation", incomplete_byte);
+            true
+        } else if incomplete_byte >= 0xE0 && incomplete_byte <= 0xEF {
+            // 3-byte sequence start (1110xxxx) - needs 2 continuation bytes
+            tracing::debug!("3-byte UTF-8 sequence start (0x{:02X}) - needs 2 continuations", incomplete_byte);
+            true
+        } else if incomplete_byte >= 0xF0 && incomplete_byte <= 0xF7 {
+            // 4-byte sequence start (11110xxx) - needs 3 continuation bytes
+            tracing::debug!("4-byte UTF-8 sequence start (0x{:02X}) - needs 3 continuations", incomplete_byte);
+            true
+        } else {
+            false
+        };
+
+        if needs_continuation {
+            // Boost tokens that represent continuation bytes (0x80-0xBF)
+            // Penalize tokens that represent invalid bytes or would break the sequence
+
+            let boost_factor = 5.0; // Add to logits to boost probability
+            let penalty_factor = -10.0; // Subtract to reduce probability
+
+            // Create adjustment tensor
+            let vocab_size = logits.size()[0];
+            let adjustments = Tensor::zeros(&[vocab_size], (logits.kind(), logits.device()));
+
+            // Check all single-byte tokens (94-255)
+            for token_id in 94..=255 {
+                let byte_val = self.token_to_byte(token_id);
+
+                let adjustment = if byte_val >= 0x80 && byte_val <= 0xBF {
+                    // This is a continuation byte - BOOST it
+                    boost_factor
+                } else if byte_val >= 0x80 {
+                    // This is another multi-byte start - PENALIZE it
+                    penalty_factor
+                } else {
+                    0.0
+                };
+
+                if adjustment != 0.0 {
+                    adjustments.narrow(0, token_id as i64, 1).fill_(adjustment);
+                }
+            }
+
+            let reranked = &reranked + &adjustments;
+            tracing::debug!("Reranked logits: boosted continuation bytes (0x80-0xBF), penalized multi-byte starts");
+            return Ok(reranked);
+        }
+
+        Ok(reranked)
     }
 }
 
@@ -1783,13 +1884,17 @@ impl<'a> Stream for TextStream<'a> {
                     // DecodeStream returned text - this is a flush point!
                     // Check if text contains replacement character (indicates broken UTF-8)
                     if text.contains('�') {
+                        // Log previous tokens to understand context
+                        let prev_tokens: Vec<_> = self.recent_tokens.iter().rev().take(5).copied().collect();
                         tracing::warn!(
-                            "Token {} (raw: {:?}) -> text chunk (len={}) CONTAINS REPLACEMENT CHAR: {:?}",
+                            "Token {} (raw: {:?}) -> text chunk CONTAINS REPLACEMENT CHAR: {:?} - SKIPPING | Previous 5 tokens: {:?}",
                             next_token,
                             token_str,
-                            text.len(),
-                            text
+                            text,
+                            prev_tokens
                         );
+                        // Skip this text chunk, continue to next token
+                        continue;
                     } else {
                         tracing::debug!(
                             "Token {} -> text chunk (len={}): {:?}",

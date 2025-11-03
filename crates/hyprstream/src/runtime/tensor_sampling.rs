@@ -267,6 +267,7 @@ impl TensorSampler {
             Ok(token_id)
         }
     }
+
 }
 
 #[cfg(test)]
@@ -334,6 +335,11 @@ mod tests {
         // Should NOT select token 4 despite it having highest logit
         assert_ne!(token, 4, "Repetition penalty not applied");
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     #[test]
     fn test_repetition_penalty_values() {
