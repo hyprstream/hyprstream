@@ -157,19 +157,40 @@ impl StreamingWeightProvider {
             let shape: Vec<i64> = tensor_view.shape().iter().map(|&x| x as i64).collect();
             let data = tensor_view.data();
 
-            // Create tensor based on dtype (simplified)
+            // Only BF16 is supported
             let tensor = match tensor_view.dtype() {
-                safetensors::Dtype::F32 => {
-                    let slice = unsafe {
-                        std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4)
+                safetensors::Dtype::BF16 => {
+                    if self.dtype != tch::Kind::BFloat16 {
+                        return Err(anyhow::anyhow!(
+                            "Only BF16 models are supported (target dtype: {:?})",
+                            self.dtype
+                        ));
+                    }
+
+                    let cpu_tensor = unsafe {
+                        Tensor::from_blob(
+                            data.as_ptr(),
+                            &shape,
+                            &[],
+                            tch::Kind::BFloat16,
+                            Device::Cpu,
+                        )
                     };
-                    Tensor::from_slice(slice)
-                        .reshape(&shape)
-                        .to_device(self.device)
-                        .to_kind(self.dtype)
+
+                    if self.device != Device::Cpu {
+                        let gpu_tensor = cpu_tensor.to_device(self.device);
+                        drop(cpu_tensor);
+                        gpu_tensor
+                    } else {
+                        cpu_tensor
+                    }
                 }
-                // ... handle other dtypes
-                _ => continue,
+                dtype => {
+                    return Err(anyhow::anyhow!(
+                        "Tensor '{}' has unsupported dtype {:?}. Only BF16 models are supported.",
+                        name, dtype
+                    ));
+                }
             };
 
             weights.insert(name.to_string(), tensor);

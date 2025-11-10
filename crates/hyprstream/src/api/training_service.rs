@@ -1,6 +1,6 @@
 //! Auto-regressive training service for LoRA adapters
 
-use crate::runtime::inference::{InferenceRequest, InferenceResult};
+use crate::config::{GenerationRequest, GenerationResult};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -280,12 +280,14 @@ impl TrainingService {
     pub async fn infer(
         &self,
         _session_id: &str,
-        _input: InferenceRequest,
-    ) -> Result<InferenceResult> {
-        Ok(InferenceResult {
+        _input: GenerationRequest,
+    ) -> Result<GenerationResult> {
+        Ok(GenerationResult {
             text: "Inference not yet implemented".to_string(),
             tokens_generated: 0,
-            latency_ms: 0,
+            finish_reason: crate::config::FinishReason::Stop,
+            generation_time_ms: 0,
+            tokens_per_second: 0.0,
         })
     }
 

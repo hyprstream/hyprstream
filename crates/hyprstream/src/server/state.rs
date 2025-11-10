@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 // Re-export config types so other server modules can access them via server::state
-pub use crate::config::{CorsConfig, GenerationDefaults, ServerConfig};
+pub use crate::config::{CorsConfig, SamplingParamDefaults, ServerConfig};
 
 /// Shared server state
 #[derive(Clone)]

@@ -213,7 +213,7 @@ mod tests {
         let mut store = GitObjectStore::new();
 
         // Test put and get
-        let key = RecordKey::new(&b"test-key"[..]);
+        let key = RecordKey::new(b"test-key");
         let record = Record {
             key: key.clone(),
             value: b"test-value".to_vec(),
@@ -232,7 +232,7 @@ mod tests {
     #[test]
     fn test_provider_operations() {
         let mut store = GitObjectStore::new();
-        let key = RecordKey::new(&b"test-key"[..]);
+        let key = RecordKey::new(b"test-key");
         let peer_id = PeerId::random();
 
         let provider_record = ProviderRecord {

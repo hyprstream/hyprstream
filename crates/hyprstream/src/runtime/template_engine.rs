@@ -68,6 +68,7 @@ impl TemplateEngine {
         // Register common filters that HuggingFace templates might use
         env.add_filter("length", length_filter);
         env.add_filter("tojson", tojson_filter);
+        env.add_filter("strip", strip_filter);
 
         // Add custom tests for string operations
         // These can be used as: {% if value is startswith("prefix") %}
@@ -109,7 +110,8 @@ impl TemplateEngine {
         // HuggingFace templates use Python/Jinja2 syntax but minijinja uses test syntax
         let transformed = template_str
             .replace(".startswith(", " is startswith(")
-            .replace(".endswith(", " is endswith(");
+            .replace(".endswith(", " is endswith(")
+            .replace(".strip()", "|strip");
 
         // Compile the template
         let tmpl = self.env.template_from_str(&transformed)
@@ -309,6 +311,16 @@ fn tojson_filter(value: &Value) -> Result<Value, minijinja::Error> {
     Ok(Value::from(json_str))
 }
 
+/// Custom filter for stripping whitespace (like Python's .strip())
+fn strip_filter(value: &Value) -> Result<Value, minijinja::Error> {
+    if let Some(s) = value.as_str() {
+        Ok(Value::from(s.trim()))
+    } else {
+        // If not a string, return as-is
+        Ok(value.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +437,31 @@ mod tests {
         assert!(result.contains("[SYSTEM] Configure the model"));
         assert!(result.contains("[USER] What's 2+2?"));
         assert!(result.contains("[ASSISTANT] 4"));
+    }
+
+    #[test]
+    fn test_strip_filter() {
+        // Test template with .strip() method (Python-style)
+        let config = TemplateConfig {
+            chat_template: Some(
+                r#"{% for message in messages %}
+{{ message['content'].strip() }}
+{% endfor %}"#
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+
+        let engine = TemplateEngine::new(config).unwrap();
+        let messages = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: "  Hello World  ".to_string(),
+            },
+        ];
+
+        let result = engine.apply_chat_template(&messages, Some(false)).unwrap();
+        assert!(result.contains("Hello World"));
+        assert!(!result.contains("  Hello World  "));
     }
 }

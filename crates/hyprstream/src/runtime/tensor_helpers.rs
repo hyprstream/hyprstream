@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 /// Helper functions for Tch tensor operations
-use tch::{Device, Kind as DType, Tensor};
+use tch::{Device, Kind, Tensor};
+use tch::Kind as DType;
 
 /// Helper trait to convert usize arrays to i64 for IntList compatibility
 pub trait ToIntList {
@@ -102,9 +103,9 @@ pub fn to_vec1<T: tch::kind::Element>(tensor: &Tensor) -> Result<Vec<T>> {
     Err(anyhow!("Direct tensor to vec conversion not yet implemented for tch. Use tensor operations instead."))
 }
 
-/// Create a scalar tensor from a value
-pub fn scalar_tensor(value: f32, device: Device) -> Tensor {
-    Tensor::from_slice(&[value]).to(device)
+/// Create a scalar tensor from a value with specified dtype
+pub fn scalar_tensor(value: f32, device: Device, dtype: Kind) -> Tensor {
+    Tensor::from_slice(&[value]).to_device(device).to_kind(dtype)
 }
 
 /// Get dimensions as 3-tuple

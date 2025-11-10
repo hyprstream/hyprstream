@@ -223,7 +223,7 @@ impl GemmaAttention {
         // Scale by scalar^(-0.5) which is 1/sqrt(scalar)
         let q = if let Some(scalar) = self.query_pre_attn_scalar {
             let scale = scalar.powf(-0.5); // scalar^(-0.5) = 1/sqrt(scalar)
-            let scale_tensor = scalar_tensor(scale, q.device());
+            let scale_tensor = scalar_tensor(scale, q.device(), q.kind());
             broadcast_mul(&q, &scale_tensor)?
         } else {
             q
@@ -498,22 +498,22 @@ impl GemmaMLP {
         let x_cubed = x.pow_tensor_scalar(3.0);
 
         // x + 0.044715 * x^3
-        let coeff_tensor = scalar_tensor(coeff, x.device());
+        let coeff_tensor = scalar_tensor(coeff, x.device(), x.kind());
         let inner = x + broadcast_mul(&x_cubed, &coeff_tensor)?;
 
         // sqrt(2/π) * (x + 0.044715 * x^3)
-        let sqrt_tensor = scalar_tensor(sqrt_2_over_pi, x.device());
+        let sqrt_tensor = scalar_tensor(sqrt_2_over_pi, x.device(), x.kind());
         let scaled = broadcast_mul(&inner, &sqrt_tensor)?;
 
         // tanh(sqrt(2/π) * (x + 0.044715 * x^3))
         let tanh_result = scaled.tanh();
 
         // 1 + tanh(...)
-        let one_tensor = scalar_tensor(1.0_f32, x.device());
+        let one_tensor = scalar_tensor(1.0_f32, x.device(), x.kind());
         let one_plus_tanh = broadcast_add(&tanh_result, &one_tensor)?;
 
         // 0.5 * x * (1 + tanh(...))
-        let half_tensor = scalar_tensor(0.5_f32, x.device());
+        let half_tensor = scalar_tensor(0.5_f32, x.device(), x.kind());
         broadcast_mul(&(x * &one_plus_tanh), &half_tensor)
     }
 }
@@ -1117,7 +1117,7 @@ impl ModelOperations for GemmaModel {
     fn normalize(&self, tensor: &Tensor) -> Result<Tensor> {
         // Gemma uses RMSNorm
         let x2 = square_tensor(tensor)?;
-        let mean = x2.mean_dim(&[-1i64][..], true, DType::Float);
+        let mean = x2.mean_dim(&[-1i64][..], true, tensor.kind());  // Preserve input precision
         let rrms = (mean + self.config.rms_norm_eps as f64).reciprocal().sqrt();
         broadcast_mul(tensor, &rrms)
     }
@@ -1127,7 +1127,7 @@ impl ModelOperations for GemmaModel {
         let total_len = seq_len + past_kv_len;
         let mask = Tensor::ones(
             [seq_len as i64, total_len as i64],
-            (DType::Float, self.device),
+            (DType::BFloat16, self.device),
         );
 
         // Apply causal masking
@@ -1139,6 +1139,10 @@ impl ModelOperations for GemmaModel {
         // Apply LoRA weights with Gemma-specific adaptations
         // The adapter will handle shape conversions for MQA
         Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -1237,15 +1241,18 @@ mod tests {
             lm_head: None,
         };
 
-        // Test tensor with shape [1, 21, 1024]
-        let tensor = Tensor::randn(0.0, 1.0, &[1, 21, 1024], &device).unwrap();
+        // Test tensor for key/value with shape [1, 21, 1024] (4 * 256)
+        let kv_tensor = Tensor::randn(&[1, 21, 1024], (DType::Float, device));
 
         // Reshape for key/value (MQA)
-        let reshaped = model.reshape_for_attention(&tensor, true).unwrap();
+        let reshaped = model.reshape_for_attention(&kv_tensor, true).unwrap();
         assert_eq!(reshaped.size(), &[1, 21, 4, 256]); // 4 KV heads, 256 head_dim
 
+        // Test tensor for query with shape [1, 21, 4096] (16 * 256)
+        let q_tensor = Tensor::randn(&[1, 21, 4096], (DType::Float, device));
+
         // Reshape for query
-        let reshaped = model.reshape_for_attention(&tensor, false).unwrap();
+        let reshaped = model.reshape_for_attention(&q_tensor, false).unwrap();
         assert_eq!(reshaped.size(), &[1, 21, 16, 256]); // 16 Q heads, 256 head_dim
     }
 
@@ -1260,10 +1267,16 @@ mod tests {
             num_heads: 16,
             num_kv_heads: 4,
             head_dim: 256,
+            rope_theta: 10000.0,
+            q_norm: None,
+            k_norm: None,
+            query_pre_attn_scalar: None,
+            sliding_window: None,
+            layer_type: "full_attention".to_string(),
         };
 
         // Create KV tensor with 4 heads
-        let kv = Tensor::randn(0.0, 1.0, &[2, 10, 4, 256], &device).unwrap();
+        let kv = Tensor::randn(&[2, 10, 4, 256], (DType::Float, device));
 
         // Expand to match 16 query heads
         let expanded = attn.expand_kv_for_mqa(&kv).unwrap();

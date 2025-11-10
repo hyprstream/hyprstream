@@ -176,8 +176,8 @@ mod tests {
         assert_eq!(ref2.model, "llama3");
         assert_eq!(ref2.git_ref, GitRef::Branch("main".to_string()));
 
-        // Model with tag
-        let ref3 = ModelRef::parse("llama3:v2.0").unwrap();
+        // Model with tag (must use explicit tag syntax)
+        let ref3 = ModelRef::parse("llama3:tags/v2.0").unwrap();
         assert_eq!(ref3.model, "llama3");
         assert_eq!(ref3.git_ref, GitRef::Tag("v2.0".to_string()));
 
@@ -209,9 +209,9 @@ mod tests {
             GitRef::parse("main").unwrap(),
             GitRef::Branch("main".to_string())
         );
-        // git2db parses v-prefixed as tags
+        // Explicit tag syntax required
         assert!(matches!(
-            GitRef::parse("v1.0.0").unwrap(),
+            GitRef::parse("tags/v1.0.0").unwrap(),
             GitRef::Tag(_)
         ));
         assert!(matches!(
@@ -325,9 +325,9 @@ mod tests {
             GitRef::Branch(_)
         ));
 
-        // Tags (git2db handles v-prefix and refs/tags/ prefix)
+        // Tags (explicit tag syntax required)
         assert!(matches!(
-            GitRef::parse("v1.0.0").unwrap(),
+            GitRef::parse("tags/v1.0.0").unwrap(),
             GitRef::Tag(_)
         ));
         assert!(matches!(

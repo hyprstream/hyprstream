@@ -249,44 +249,21 @@ impl ModelFactory {
             let shape: Vec<i64> = tensor_view.shape().iter().map(|&x| x as i64).collect();
             let data = tensor_view.data();
 
-            // Create tensor optimized for GPU memory usage
+            // Only BF16 is supported
             let tensor = match tensor_view.dtype() {
-                safetensors::Dtype::F32 => {
-                    let slice = unsafe {
-                        std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4)
-                    };
-                    // Create directly on target device to avoid CPU copy
-                    Tensor::from_slice(slice)
-                        .reshape(&shape)
-                        .to_device(*device)
-                        .to_kind(dtype)
-                }
-                safetensors::Dtype::F16 => {
-                    // F16 requires conversion to F32 first
-                    let slice = unsafe {
-                        std::slice::from_raw_parts(
-                            data.as_ptr() as *const half::f16,
-                            data.len() / 2,
-                        )
-                    };
-                    let f32_vec: Vec<f32> = slice.iter().map(|x| x.to_f32()).collect();
-                    // Create and immediately transfer to GPU
-                    Tensor::from_slice(&f32_vec)
-                        .reshape(&shape)
-                        .to_device(*device)
-                        .to_kind(dtype)
-                }
                 safetensors::Dtype::BF16 => {
-                    // BF16 - must create on CPU first due to from_blob limitations
+                    // Verify target dtype matches
                     if dtype != tch::Kind::BFloat16 {
                         return Err(anyhow!(
-                            "Model requires BF16 but target dtype is {:?}",
+                            "Only BF16 models are supported (target dtype: {:?})",
                             dtype
                         ));
                     }
 
-                    // Create on CPU then immediately transfer to GPU
-                    let cpu_tensor = unsafe {
+                    // Create tensor from borrowed data, then make an owned copy
+                    // IMPORTANT: from_blob only borrows the data pointer, so we must
+                    // copy the tensor to own the data before the source buffer is freed
+                    let borrowed_tensor = unsafe {
                         Tensor::from_blob(
                             data.as_ptr(),
                             &shape,
@@ -296,7 +273,10 @@ impl ModelFactory {
                         )
                     };
 
-                    // Transfer to GPU if needed
+                    // Make an owned copy to prevent use-after-free
+                    let cpu_tensor = borrowed_tensor.copy();
+
+                    // Transfer to target device if needed
                     if *device != Device::Cpu {
                         let gpu_tensor = cpu_tensor.to_device(*device);
                         drop(cpu_tensor); // Explicitly free CPU memory
@@ -305,9 +285,11 @@ impl ModelFactory {
                         cpu_tensor
                     }
                 }
-                _ => {
-                    info!("⚠️ Skipping tensor {} with unsupported dtype", name);
-                    continue;
+                dtype => {
+                    return Err(anyhow!(
+                        "Tensor '{}' has unsupported dtype {:?}. Only BF16 models are supported.",
+                        name, dtype
+                    ));
                 }
             };
 
@@ -377,12 +359,14 @@ impl ModelFactory {
             rope_local_base_freq: None,
         };
 
-        Ok(Box::new(LlamaModel::from_weights_with_config(
+        let model = LlamaModel::from_weights_with_config(
             &weights,
             llama_config,
             device,
             dtype,
-        )?))
+        )?;
+
+        Ok(Box::new(model))
     }
 
     fn create_qwen_model(
