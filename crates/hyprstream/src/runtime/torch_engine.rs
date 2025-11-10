@@ -1698,7 +1698,7 @@ impl<'a> TextStream<'a> {
             self.kv_cache_position
         };
 
-        let mut logits = if self.tokens_generated == 0 {
+        let logits = if self.tokens_generated == 0 {
             tracing::debug!("🔵 Initial forward: prompt_len={}", self.prompt_len);
             self.engine.forward(&self.prompt_tokens)?
         } else {

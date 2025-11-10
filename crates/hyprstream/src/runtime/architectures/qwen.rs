@@ -27,12 +27,12 @@ impl QwenAdapter {
         config_json: &str,
         version: u8,
         is_moe: bool,
-        context_length: usize,
+        _context_length: usize,
         device: &Device,
         dtype: DType,
     ) -> Result<Box<dyn ModelOperations>> {
         // Parse the config.json to get proper rope_theta and other settings
-        let mut config = LlamaModel::parse_config(config_json)?;
+        let config = LlamaModel::parse_config(config_json)?;
 
         tracing::info!(
             "Parsed config from config.json: rope_theta={}, vocab_size={}, hidden_size={}",

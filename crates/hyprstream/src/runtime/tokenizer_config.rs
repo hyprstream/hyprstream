@@ -6,7 +6,6 @@
 
 use anyhow::Result;
 use tokenizers::{AddedToken, Tokenizer};
-use tokenizers::processors::PostProcessor;
 
 /// Trait for model-specific tokenizer configuration
 ///
@@ -39,7 +38,7 @@ pub trait TokenizerConfig: Send + Sync {
     ///
     /// # Returns
     /// * Vector of `AddedToken` objects to add to the tokenizer
-    fn get_special_tokens(&self, model_vocab_size: usize, tokenizer_vocab_size: usize) -> Vec<AddedToken> {
+    fn get_special_tokens(&self, _model_vocab_size: usize, _tokenizer_vocab_size: usize) -> Vec<AddedToken> {
         Vec::new() // Default: no special tokens
     }
 
@@ -51,7 +50,7 @@ pub trait TokenizerConfig: Send + Sync {
     ///
     /// # Returns
     /// * `true` if this is a special token, `false` otherwise
-    fn is_special_token(&self, token_id: usize, vocab_size: usize) -> bool {
+    fn is_special_token(&self, _token_id: usize, _vocab_size: usize) -> bool {
         false // Default: no special tokens
     }
 
@@ -65,7 +64,7 @@ pub trait TokenizerConfig: Send + Sync {
     ///
     /// # Returns
     /// * `Some(String)` with the formatted token, or `None` if no special formatting
-    fn format_special_token(&self, token_id: usize, vocab_size: usize) -> Option<String> {
+    fn format_special_token(&self, _token_id: usize, _vocab_size: usize) -> Option<String> {
         None // Default: no special formatting
     }
 

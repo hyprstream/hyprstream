@@ -460,7 +460,6 @@ async fn stream_chat(state: ServerState, request: ChatCompletionRequest) -> impl
 
         // Consume text chunks from stream
         info!("Starting streaming generation...");
-        let mut chunks_sent = 0;
         while let Some(text_result) = text_stream.next().await {
             match text_result {
                 Ok(text) => {
@@ -484,7 +483,6 @@ async fn stream_chat(state: ServerState, request: ChatCompletionRequest) -> impl
                         info!("Client disconnected during streaming");
                         break;
                     }
-                    chunks_sent += 1;
                 }
                 Err(e) => {
                     // Generation error
