@@ -1,6 +1,7 @@
 //! LoRA training implementation with PyTorch backend
 
 use super::{ChatTemplateDataLoader, TrainingDataset};
+use crate::config::GenerationRequest;
 use crate::storage::{AdapterConfig, AdapterManager};
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -185,7 +186,22 @@ impl LoRATrainer {
         for (input, _target) in batch {
             // Simulate forward pass - in reality this would generate logits
             // and compute cross-entropy loss against target tokens
-            let _output = engine.generate_streaming(input, 50, |_| {}).await?;
+            let request = GenerationRequest {
+                prompt: input.to_string(),
+                max_tokens: 50,
+                temperature: 0.7,
+                top_p: 0.9,
+                top_k: Some(40),
+                repeat_penalty: 1.1,
+                ..Default::default()
+            };
+            // Use TextStream - just drain the stream
+            use futures::StreamExt;
+
+            let mut stream = engine.generate(request)?;
+            while let Some(text_chunk) = stream.next().await {
+                text_chunk?;
+            }
 
             // Placeholder loss computation
             let loss = 2.0 - (batch.len() as f64 * 0.1); // Decreasing loss simulation
@@ -237,7 +253,22 @@ impl LoRATrainer {
 
         for (input, _target) in batch {
             // Generate without updating weights
-            let _output = engine.generate_streaming(input, 50, |_| {}).await?;
+            let request = GenerationRequest {
+                prompt: input.to_string(),
+                max_tokens: 50,
+                temperature: 0.7,
+                top_p: 0.9,
+                top_k: Some(40),
+                repeat_penalty: 1.1,
+                ..Default::default()
+            };
+            // Use TextStream - just drain the stream
+            use futures::StreamExt;
+
+            let mut stream = engine.generate(request)?;
+            while let Some(text_chunk) = stream.next().await {
+                text_chunk?;
+            }
 
             // Placeholder loss - would compute perplexity in real implementation
             total_loss += 1.5;

@@ -76,9 +76,9 @@ impl CorsConfig {
     }
 }
 
-/// Default generation parameters
+/// Default sampling parameters for generation
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GenerationDefaults {
+pub struct SamplingParamDefaults {
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
 
@@ -111,7 +111,7 @@ fn default_stream_timeout_secs() -> u64 {
     300
 }
 
-impl Default for GenerationDefaults {
+impl Default for SamplingParamDefaults {
     fn default() -> Self {
         Self {
             max_tokens: default_max_tokens(),
@@ -159,9 +159,9 @@ pub struct ServerConfig {
     #[serde(default)]
     pub cors: CorsConfig,
 
-    // Default generation parameters
+    // Default sampling parameters
     #[serde(default)]
-    pub generation_defaults: GenerationDefaults,
+    pub sampling_defaults: SamplingParamDefaults,
 
     // TLS settings
     #[serde(default)]
@@ -226,7 +226,7 @@ impl Default for ServerConfig {
             max_tokens_limit: default_max_tokens_limit(),
             request_timeout_secs: default_request_timeout_secs(),
             cors: CorsConfig::default(),
-            generation_defaults: GenerationDefaults::default(),
+            sampling_defaults: SamplingParamDefaults::default(),
             tls_cert: None,
             tls_key: None,
             tls_client_ca: None,
@@ -336,9 +336,9 @@ impl ServerConfigBuilder {
         self
     }
 
-    // Generation defaults
-    pub fn generation_defaults(mut self, defaults: GenerationDefaults) -> Self {
-        self.config.generation_defaults = defaults;
+    // Sampling defaults
+    pub fn sampling_defaults(mut self, defaults: SamplingParamDefaults) -> Self {
+        self.config.sampling_defaults = defaults;
         self
     }
 

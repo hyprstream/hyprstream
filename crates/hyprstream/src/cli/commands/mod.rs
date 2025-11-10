@@ -4,9 +4,7 @@ pub mod git;
 pub mod model;
 pub mod server;
 
-pub use chat::ChatCommand;
 pub use git::{GitAction, GitCommand};
-pub use model::ModelCommand;
 pub use server::{ServerCliArgs, ServerCommand};
 
 use clap::Subcommand;
@@ -15,10 +13,6 @@ use clap::Subcommand;
 pub enum Commands {
     /// Start the Hyprstream server
     Server(ServerCommand),
-    /// Manage models from registries (HuggingFace, etc.)
-    Model(ModelCommand),
-    /// Chat with a model or composed model
-    Chat(ChatCommand),
 
     // Phase 1: Git-style commands at top level
     /// Create a new branch
@@ -130,18 +124,6 @@ pub enum Commands {
         config: Option<String>,
     },
 
-    /// Serve model (shorthand for 'server')
-    Serve {
-        /// Model reference to pre-load (optional)
-        model: Option<String>,
-        /// Port to listen on
-        #[arg(long, default_value = "8080")]
-        port: u16,
-        /// Host to bind to
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-    },
-
     /// Run inference with a model
     Infer {
         /// Model reference (e.g., "Qwen3-4B", "qwen/qwen-2b", "model:branch")
@@ -166,6 +148,14 @@ pub enum Commands {
         /// Top-k sampling
         #[arg(long)]
         top_k: Option<usize>,
+
+        /// Repetition penalty (1.0 = no penalty, >1.0 = penalize)
+        #[arg(short = 'r', long)]
+        repeat_penalty: Option<f32>,
+
+        /// Random seed for deterministic generation (for debugging)
+        #[arg(long)]
+        seed: Option<u32>,
 
         /// Stream output tokens as they're generated
         #[arg(short = 's', long)]

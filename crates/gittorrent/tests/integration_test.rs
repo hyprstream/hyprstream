@@ -21,7 +21,7 @@ mod tests {
         // Test simple commit URL
         let url = GitTorrentUrl::parse(&format!("gittorrent://{}", test_hash)).unwrap();
         match url {
-            GitTorrentUrl::Commit { hash } => {
+            GitTorrentUrl::Commit { ref hash } => {
                 assert_eq!(hash.as_str(), test_hash);
                 assert_eq!(url.to_string(), format!("gittorrent://{}", test_hash));
             }
@@ -31,7 +31,7 @@ mod tests {
         // Test commit with refs URL
         let url_with_refs = GitTorrentUrl::parse(&format!("gittorrent://{}?refs", test_hash)).unwrap();
         match url_with_refs {
-            GitTorrentUrl::CommitWithRefs { hash } => {
+            GitTorrentUrl::CommitWithRefs { ref hash } => {
                 assert_eq!(hash.as_str(), test_hash);
                 assert!(url_with_refs.includes_refs());
                 assert_eq!(url_with_refs.to_string(), format!("gittorrent://{}?refs", test_hash));
@@ -183,7 +183,7 @@ mod tests {
         let parsed = GitTorrentUrl::parse(&url).unwrap();
 
         match parsed {
-            GitTorrentUrl::Commit { hash } => {
+            GitTorrentUrl::Commit { ref hash } => {
                 assert_eq!(hash.as_str(), commit_hash);
             }
             _ => panic!("Should parse as Commit variant"),

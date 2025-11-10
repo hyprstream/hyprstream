@@ -8,14 +8,12 @@ use anyhow::Result;
 use tch::{nn, Tensor};
 
 pub mod config;
-pub mod detector;
 pub mod gemma;
 pub mod llama;
 pub mod qwen;
 // LoRA adapter moved to lora module
 
 pub use config::{ArchitectureConfig, AttentionConfig};
-pub use detector::ArchitectureDetector;
 // pub use lora_adapter::ArchitectureAwareLoRAAdapter; // Module removed
 
 /// Supported model architectures
@@ -127,6 +125,22 @@ pub trait ModelOperations: Send {
     /// Get architecture configuration
     fn config(&self) -> &dyn ArchitectureConfig;
 
+    /// Get the tokenizer configuration for this model
+    ///
+    /// Returns a boxed TokenizerConfig trait object that provides
+    /// model-specific tokenizer configuration logic.
+    fn get_tokenizer_config(&self) -> Box<dyn crate::runtime::tokenizer_config::TokenizerConfig> {
+        use crate::runtime::tokenizer_config::{DefaultTokenizerConfig, QwenTokenizerConfig, LlamaTokenizerConfig, GemmaTokenizerConfig};
+
+        // Return appropriate config based on architecture
+        match self.architecture() {
+            ModelArchitecture::Qwen { .. } => Box::new(QwenTokenizerConfig),
+            ModelArchitecture::Llama { .. } => Box::new(LlamaTokenizerConfig),
+            ModelArchitecture::Gemma => Box::new(GemmaTokenizerConfig),
+            _ => Box::new(DefaultTokenizerConfig),
+        }
+    }
+
     /// Forward pass through the model
     fn forward(&self, input: &Tensor, past_kv: Option<&Tensor>) -> Result<Tensor>;
 
@@ -174,6 +188,9 @@ pub trait ModelOperations: Send {
 
     /// Apply LoRA adapter with architecture-specific handling (for cache/storage only)
     fn apply_lora(&mut self, adapter: &crate::lora::torch_adapter::LoRAModel) -> Result<()>;
+
+    /// Downcast to Any for accessing architecture-specific methods
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// Attention mechanism types

@@ -11,7 +11,7 @@ use tch::{Device, Kind, Tensor};
 pub struct RoPE {
     /// Dimension of the embeddings (typically head_dim)
     dim: i64,
-    /// Base frequency for the rotary embeddings (10000 for most models, 1000000 for Qwen3)
+    /// Base frequency for the rotary embeddings (default 10000, but model-specific - read from config.json)
     base: f64,
     /// Maximum sequence length to precompute
     #[allow(dead_code)]
@@ -39,7 +39,7 @@ impl RoPE {
             base,
             max_seq_len,
             device,
-            dtype: Kind::Float, // Default to Float32 for backward compatibility
+            dtype: Kind::BFloat16, // Default to BF16 to match model precision
             cache: None,
             cached_seq_len: 0,
         })
@@ -69,16 +69,17 @@ impl RoPE {
     }
 
     /// Create RoPE for standard models (base=10000)
+    ///
+    /// Note: For model-specific configurations, always read rope_theta from config.json
+    /// and use `new()` or `new_with_dtype()` with the actual value instead of hardcoding.
     pub fn new_standard(dim: i64, max_seq_len: i64, device: Device) -> Result<Self> {
-        Self::new(dim, 10000.0, max_seq_len, device)
-    }
-
-    /// Create RoPE for Qwen3 models (base=1000000 for long context)
-    pub fn new_qwen3(dim: i64, max_seq_len: i64, device: Device) -> Result<Self> {
-        Self::new(dim, 1000000.0, max_seq_len, device)
+        Self::new_with_dtype(dim, 10000.0, max_seq_len, device, Kind::BFloat16)
     }
 
     /// Create RoPE for standard models with dtype
+    ///
+    /// Note: For model-specific configurations, always read rope_theta from config.json
+    /// and use `new()` or `new_with_dtype()` with the actual value instead of hardcoding.
     pub fn new_standard_with_dtype(
         dim: i64,
         max_seq_len: i64,
@@ -86,16 +87,6 @@ impl RoPE {
         dtype: Kind,
     ) -> Result<Self> {
         Self::new_with_dtype(dim, 10000.0, max_seq_len, device, dtype)
-    }
-
-    /// Create RoPE for Qwen3 models with dtype
-    pub fn new_qwen3_with_dtype(
-        dim: i64,
-        max_seq_len: i64,
-        device: Device,
-        dtype: Kind,
-    ) -> Result<Self> {
-        Self::new_with_dtype(dim, 1000000.0, max_seq_len, device, dtype)
     }
 
     /// Generate sin/cos embeddings for the given sequence length
@@ -174,7 +165,18 @@ impl RoPE {
         }
 
         // Get sin/cos embeddings
-        let (sin_full, cos_full) = self.get_embeddings(seq_len)?;
+        // CRITICAL FIX: When using position_ids, we need to ensure the cache is large enough
+        // to contain the MAX position, not just seq_len tokens
+        let required_len = if let Some(pos_ids) = position_ids {
+            // Find the maximum position ID to ensure cache is large enough
+            let max_pos = pos_ids.max().int64_value(&[]) + 1; // +1 because positions are 0-indexed
+            let final_len = max_pos.max(seq_len);
+            tracing::debug!("🔵 RoPE cache sizing: seq_len={}, max_pos={}, required_len={}", seq_len, max_pos, final_len);
+            final_len
+        } else {
+            seq_len
+        };
+        let (sin_full, cos_full) = self.get_embeddings(required_len)?;
 
         // Handle custom position_ids or use default sequence
         let (sin, cos) = if let Some(pos_ids) = position_ids {
@@ -355,11 +357,12 @@ mod tests {
     }
 
     #[test]
-    fn test_rope_qwen3() {
+    fn test_rope_with_large_base() {
         let device = Device::Cpu;
-        let mut rope = RoPE::new_qwen3(128, 4096, device).unwrap();
+        // Test with a large base value (e.g., for models with extended context)
+        let mut rope = RoPE::new(128, 1000000.0, 4096, device).unwrap();
 
-        // Create test tensor for Qwen3: [batch=1, seq=16, heads=32, dim=128]
+        // Create test tensor: [batch=1, seq=16, heads=32, dim=128]
         let x = Tensor::randn(&[1, 16, 32, 128], (Kind::Float, device));
         let result = rope.forward(&x, None).unwrap();
 

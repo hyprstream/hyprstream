@@ -9,11 +9,11 @@ use tracing::info;
 
 // Core application imports
 use hyprstream_core::cli::commands::Commands;
-use hyprstream_core::cli::handlers::{handle_chat_command, handle_model_command, handle_server};
+use hyprstream_core::cli::handlers::handle_server;
 use hyprstream_core::cli::{
     handle_branch, handle_checkout, handle_clone, handle_commit, handle_infer, handle_info,
     handle_list, handle_lora_train, handle_merge, handle_pull, handle_push, handle_remove,
-    handle_serve, handle_status, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
+    handle_status, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
 };
 use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
@@ -32,6 +32,7 @@ use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::EnvFilter;
 #[cfg(feature = "otel")]
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
 
 #[derive(Parser)]
 #[command(
@@ -118,26 +119,6 @@ where
 /// Server command handler - requires multi-threaded runtime for GPU
 async fn handle_server_cmd(ctx: AppContext) -> Result<()> {
     handle_server(ctx)
-        .await
-        .map_err(|e| anyhow::anyhow!("{}", e))
-}
-
-/// Model command handler - GPU requirements depend on action
-async fn handle_model_cmd(
-    cmd: hyprstream_core::cli::commands::model::ModelCommand,
-    server_url: String,
-) -> Result<()> {
-    handle_model_command(cmd, server_url)
-        .await
-        .map_err(|e| anyhow::anyhow!("{}", e))
-}
-
-/// Chat command handler - requires multi-threaded runtime for GPU
-async fn handle_chat_cmd(
-    cmd: hyprstream_core::cli::commands::chat::ChatCommand,
-    server_url: String,
-) -> Result<()> {
-    handle_chat_command(cmd, server_url)
         .await
         .map_err(|e| anyhow::anyhow!("{}", e))
 }
@@ -239,6 +220,10 @@ fn main() -> Result<()> {
     // Create application context
     let ctx = AppContext::new(config);
 
+    // Keep the guard alive for the entire program lifetime
+    // Dropping the guard stops the background logging thread
+    let _log_guard: Option<tracing_appender::non_blocking::WorkerGuard>;
+
     #[cfg(feature = "otel")]
     {
         // Determine telemetry provider based on command
@@ -262,14 +247,40 @@ fn main() -> Result<()> {
                 TelemetryProvider::Stdout => "hyprstream=debug",
             };
 
-            tracing_subscriber::fmt()
-                .with_env_filter(EnvFilter::builder().parse_lossy(
-                    std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_string()),
-                ))
-                .with_target(true)
-                .with_file(true)
-                .with_line_number(true)
-                .init();
+            // Check if file logging is enabled via environment variable
+            if let Ok(log_dir) = std::env::var("HYPRSTREAM_LOG_DIR") {
+                // Create rolling file appender (daily rotation)
+                let file_appender = RollingFileAppender::new(
+                    Rotation::DAILY,
+                    &log_dir,
+                    "hyprstream.log"
+                );
+                let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+                _log_guard = Some(guard);
+
+                tracing_subscriber::fmt()
+                    .with_env_filter(EnvFilter::builder().parse_lossy(
+                        std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_string()),
+                    ))
+                    .with_target(true)
+                    .with_file(true)
+                    .with_line_number(true)
+                    .with_writer(non_blocking)
+                    .init();
+
+                info!("File logging enabled to {}/hyprstream.log", log_dir);
+            } else {
+                _log_guard = None;
+                // Console logging only
+                tracing_subscriber::fmt()
+                    .with_env_filter(EnvFilter::builder().parse_lossy(
+                        std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_string()),
+                    ))
+                    .with_target(true)
+                    .with_file(true)
+                    .with_line_number(true)
+                    .init();
+            }
         }
     }
 
@@ -281,14 +292,40 @@ fn main() -> Result<()> {
             _ => "hyprstream=debug",
         };
 
-        tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::builder().parse_lossy(
-                std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_string()),
-            ))
-            .with_target(true)
-            .with_file(true)
-            .with_line_number(true)
-            .init();
+        // Check if file logging is enabled via environment variable
+        if let Ok(log_dir) = std::env::var("HYPRSTREAM_LOG_DIR") {
+            // Create rolling file appender (daily rotation)
+            let file_appender = RollingFileAppender::new(
+                Rotation::DAILY,
+                &log_dir,
+                "hyprstream.log"
+            );
+            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+            _log_guard = Some(guard);
+
+            tracing_subscriber::fmt()
+                .with_env_filter(EnvFilter::builder().parse_lossy(
+                    std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_string()),
+                ))
+                .with_target(true)
+                .with_file(true)
+                .with_line_number(true)
+                .with_writer(non_blocking)
+                .init();
+
+            info!("File logging enabled to {}/hyprstream.log", log_dir);
+        } else {
+            _log_guard = None;
+            // Console logging only
+            tracing_subscriber::fmt()
+                .with_env_filter(EnvFilter::builder().parse_lossy(
+                    std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_string()),
+                ))
+                .with_target(true)
+                .with_file(true)
+                .with_line_number(true)
+                .init();
+        }
     }
 
     info!("Hyprstream v{} starting up", env!("CARGO_PKG_VERSION"));
@@ -305,34 +342,6 @@ fn main() -> Result<()> {
                 || handle_server_cmd(ctx),
             )?
         }
-        Commands::Model(cmd) => {
-            let server_url = "http://127.0.0.1:50051".to_string();
-            let device_config = cmd.action.device_config();
-            let multi_threaded = matches!(
-                device_config.preference,
-                DevicePreference::RequestGPU | DevicePreference::RequireGPU
-            );
-
-            with_runtime(
-                RuntimeConfig {
-                    device: device_config,
-                    multi_threaded,
-                },
-                || handle_model_cmd(cmd, server_url),
-            )?
-        }
-        Commands::Chat(cmd) => {
-            let server_url = "http://127.0.0.1:50051".to_string();
-
-            with_runtime(
-                RuntimeConfig {
-                    device: DeviceConfig::request_gpu(),
-                    multi_threaded: true,
-                },
-                || handle_chat_cmd(cmd, server_url),
-            )?
-        }
-
         // Phase 1: Git-style commands
         Commands::Branch { model, name, from } => {
             let ctx = ctx.clone();
@@ -461,16 +470,6 @@ fn main() -> Result<()> {
             );
         }
 
-        Commands::Serve { model, port, host } => {
-            with_runtime(
-                RuntimeConfig {
-                    device: DeviceConfig::request_gpu(),
-                    multi_threaded: true,
-                },
-                || async { handle_serve(model, port, &host).await.map_err(|e| e.into()) },
-            )?;
-        }
-
         Commands::Infer {
             model,
             prompt,
@@ -478,6 +477,8 @@ fn main() -> Result<()> {
             temperature,
             top_p,
             top_k,
+            repeat_penalty,
+            seed,
             stream,
             force_download,
         } => {
@@ -497,6 +498,8 @@ fn main() -> Result<()> {
                         temperature,
                         top_p,
                         top_k,
+                        repeat_penalty,
+                        seed,
                         stream,
                         force_download,
                     )

@@ -94,6 +94,7 @@ impl ModelConfig {
         info!("   Vocab size: {}", config.vocab_size);
         info!("   RoPE theta: {}", config.rope_theta);
         info!("   Max position: {}", config.max_position_embeddings);
+        info!("   RMSNorm eps: {}", config.rms_norm_eps);
 
         Ok(config)
     }
@@ -224,8 +225,22 @@ impl ModelConfig {
     }
 
     fn detect_version(json: &serde_json::Value, architecture: &ModelArchitecture) -> u32 {
-        // Try to extract version from model_type or name
+        // Try to extract version from model_type field (e.g., "qwen2", "llama3")
         if let Some(model_type) = json["model_type"].as_str() {
+            let lower = model_type.to_lowercase();
+
+            // Look for explicit version numbers in model_type
+            if lower.contains("qwen3") || lower.contains("qwen-3") {
+                return 3;
+            } else if lower.contains("qwen2") || lower.contains("qwen-2") {
+                return 2;
+            } else if lower.contains("llama3") || lower.contains("llama-3") {
+                return 3;
+            } else if lower.contains("llama2") || lower.contains("llama-2") {
+                return 2;
+            }
+
+            // Try generic number extraction as fallback
             if let Some(captures) = regex::Regex::new(r"(\d+)").unwrap().captures(model_type) {
                 if let Ok(version) = captures[1].parse::<u32>() {
                     return version;
@@ -233,15 +248,29 @@ impl ModelConfig {
             }
         }
 
-        // Architecture-specific version detection
-        match architecture {
-            ModelArchitecture::Qwen => {
-                // Check for Qwen-specific version indicators
-                if json["rope_theta"].as_f64().unwrap_or(10_000.0) > 100_000.0 {
-                    return 3; // Qwen3 uses large rope_theta
+        // Try architectures field (e.g., ["Qwen3ForCausalLM"])
+        if let Some(architectures) = json["architectures"].as_array() {
+            if let Some(first_arch) = architectures.first().and_then(|v| v.as_str()) {
+                let lower = first_arch.to_lowercase();
+
+                if lower.contains("qwen3") {
+                    return 3;
+                } else if lower.contains("qwen2") {
+                    return 2;
+                } else if lower.contains("llama3") {
+                    return 3;
+                } else if lower.contains("llama2") {
+                    return 2;
                 }
-                2 // Default to Qwen2
             }
+        }
+
+        // Architecture-specific defaults (conservative)
+        // Note: DO NOT use rope_theta or other config values to detect version
+        // as these are not reliable indicators
+        match architecture {
+            ModelArchitecture::Qwen => 2,  // Default to Qwen2 if unknown
+            ModelArchitecture::Llama => 2, // Default to Llama2 if unknown
             _ => 1,
         }
     }
