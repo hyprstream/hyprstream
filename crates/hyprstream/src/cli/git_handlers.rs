@@ -409,8 +409,24 @@ pub async fn handle_list(
     // Collect models with git info
     let mut models_with_git = Vec::new();
     for (model_ref, metadata) in models {
-        let model_path = models_dir.join(&model_ref.model);
-        let git_info = GitInfo::from_repo_path(&model_path);
+        // Get git info from the bare repository
+        // The bare repo is at: models/{name}/{name}.git/
+        let bare_repo_path = models_dir
+            .join(&model_ref.model)
+            .join(format!("{}.git", model_ref.model));
+
+        let git_info = if bare_repo_path.exists() {
+            GitInfo::from_bare_repo(&bare_repo_path)
+        } else {
+            // Fall back to trying storage.status() for compatibility
+            match storage.status(&model_ref).await {
+                Ok(status) => Some(GitInfo::from_status(&status)),
+                Err(e) => {
+                    tracing::debug!("Failed to get git info for {}: {}", model_ref.model, e);
+                    None
+                }
+            }
+        };
 
         // Apply filters
         if dirty {
