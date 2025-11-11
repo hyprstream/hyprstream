@@ -318,9 +318,18 @@ impl TorchEngine {
             model_info.architecture = config.model_type.clone();
         }
 
-        // Use the factory to create the model
+        // Detect the model's native dtype
+        let model_dtype = ModelFactory::detect_model_dtype(model_path).await
+            .unwrap_or_else(|e| {
+                info!("Could not detect model dtype: {}, defaulting to BF16", e);
+                tch::Kind::BFloat16
+            });
+
+        info!("Using dtype: {:?}", model_dtype);
+
+        // Use the factory to create the model with detected dtype
         let factory_start = std::time::Instant::now();
-        let model = ModelFactory::create(model_path, &self.device, tch::Kind::BFloat16).await?;
+        let model = ModelFactory::create(model_path, &self.device, model_dtype).await?;
         let factory_time = factory_start.elapsed();
         info!("Model weights loaded in {:.2}s", factory_time.as_secs_f64());
 

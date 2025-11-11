@@ -18,6 +18,56 @@ use crate::storage::{LfsXetBridge, XetConfig};
 pub struct ModelFactory;
 
 impl ModelFactory {
+    /// Detect the dtype of a model by examining its tensors
+    pub async fn detect_model_dtype(model_path: &Path) -> Result<DType> {
+        // Check for single file first
+        let single_file = model_path.join("model.safetensors");
+        let file_to_check = if single_file.exists() {
+            single_file
+        } else {
+            // Look for first shard file
+            let shard_files = Self::find_shard_files(model_path)?;
+            if shard_files.is_empty() {
+                return Err(anyhow!("No model weights found in {}", model_path.display()));
+            }
+            shard_files[0].clone()
+        };
+
+        // Load just the metadata to check dtype
+        let file_content = std::fs::read(&file_to_check)?;
+        let tensors = safetensors::SafeTensors::deserialize(&file_content)?;
+
+        // Check the first few tensors to determine predominant dtype
+        let mut f16_count = 0;
+        let mut bf16_count = 0;
+        let mut f32_count = 0;
+        let mut other_count = 0;
+
+        for (_, tensor) in tensors.tensors().into_iter().take(10) {
+            match tensor.dtype() {
+                safetensors::Dtype::F16 => f16_count += 1,
+                safetensors::Dtype::BF16 => bf16_count += 1,
+                safetensors::Dtype::F32 => f32_count += 1,
+                _ => other_count += 1,
+            }
+        }
+
+        // Return the most common dtype
+        if f16_count > bf16_count && f16_count > f32_count {
+            info!("Detected F16 model");
+            Ok(tch::Kind::Half)
+        } else if bf16_count >= f16_count && bf16_count >= f32_count {
+            info!("Detected BF16 model");
+            Ok(tch::Kind::BFloat16)
+        } else if f32_count > 0 {
+            info!("Detected F32 model");
+            Ok(tch::Kind::Float)
+        } else {
+            info!("Could not detect model dtype, defaulting to BF16");
+            Ok(tch::Kind::BFloat16)
+        }
+    }
+
     /// Create a model from a directory containing weights and optionally config.json
     /// This is the ONLY way models should be created to ensure consistency
     #[instrument(name = "model_factory.create", skip(device, dtype), fields(model_path = %model_path.display()))]
@@ -249,13 +299,13 @@ impl ModelFactory {
             let shape: Vec<i64> = tensor_view.shape().iter().map(|&x| x as i64).collect();
             let data = tensor_view.data();
 
-            // Only BF16 is supported
+            // Support both F16 and BF16 models
             let tensor = match tensor_view.dtype() {
                 safetensors::Dtype::BF16 => {
                     // Verify target dtype matches
-                    if dtype != tch::Kind::BFloat16 {
+                    if dtype != tch::Kind::BFloat16 && dtype != tch::Kind::Half {
                         return Err(anyhow!(
-                            "Only BF16 models are supported (target dtype: {:?})",
+                            "Model dtype BF16 but target dtype is {:?}",
                             dtype
                         ));
                     }
@@ -276,6 +326,89 @@ impl ModelFactory {
                     // Make an owned copy to prevent use-after-free
                     let cpu_tensor = borrowed_tensor.copy();
 
+                    // Convert dtype if needed
+                    let cpu_tensor = if dtype == tch::Kind::Half {
+                        cpu_tensor.to_kind(tch::Kind::Half)
+                    } else {
+                        cpu_tensor
+                    };
+
+                    // Transfer to target device if needed
+                    if *device != Device::Cpu {
+                        let gpu_tensor = cpu_tensor.to_device(*device);
+                        drop(cpu_tensor); // Explicitly free CPU memory
+                        gpu_tensor
+                    } else {
+                        cpu_tensor
+                    }
+                }
+                safetensors::Dtype::F16 => {
+                    // Verify target dtype matches
+                    if dtype != tch::Kind::Half && dtype != tch::Kind::BFloat16 {
+                        return Err(anyhow!(
+                            "Model dtype F16 but target dtype is {:?}",
+                            dtype
+                        ));
+                    }
+
+                    // Create tensor from borrowed data
+                    let borrowed_tensor = unsafe {
+                        Tensor::from_blob(
+                            data.as_ptr(),
+                            &shape,
+                            &[],
+                            tch::Kind::Half,
+                            Device::Cpu,
+                        )
+                    };
+
+                    // Make an owned copy to prevent use-after-free
+                    let cpu_tensor = borrowed_tensor.copy();
+
+                    // Convert dtype if needed
+                    let cpu_tensor = if dtype == tch::Kind::BFloat16 {
+                        cpu_tensor.to_kind(tch::Kind::BFloat16)
+                    } else {
+                        cpu_tensor
+                    };
+
+                    // Transfer to target device if needed
+                    if *device != Device::Cpu {
+                        let gpu_tensor = cpu_tensor.to_device(*device);
+                        drop(cpu_tensor); // Explicitly free CPU memory
+                        gpu_tensor
+                    } else {
+                        cpu_tensor
+                    }
+                }
+                safetensors::Dtype::F32 => {
+                    // Support F32 as well for completeness
+                    let borrowed_tensor = unsafe {
+                        Tensor::from_blob(
+                            data.as_ptr(),
+                            &shape,
+                            &[],
+                            tch::Kind::Float,
+                            Device::Cpu,
+                        )
+                    };
+
+                    // Make an owned copy
+                    let cpu_tensor = borrowed_tensor.copy();
+
+                    // Convert to target dtype
+                    let cpu_tensor = match dtype {
+                        tch::Kind::Half => cpu_tensor.to_kind(tch::Kind::Half),
+                        tch::Kind::BFloat16 => cpu_tensor.to_kind(tch::Kind::BFloat16),
+                        tch::Kind::Float => cpu_tensor,
+                        _ => {
+                            return Err(anyhow!(
+                                "Cannot convert F32 to target dtype {:?}",
+                                dtype
+                            ))
+                        }
+                    };
+
                     // Transfer to target device if needed
                     if *device != Device::Cpu {
                         let gpu_tensor = cpu_tensor.to_device(*device);
@@ -287,7 +420,7 @@ impl ModelFactory {
                 }
                 dtype => {
                     return Err(anyhow!(
-                        "Tensor '{}' has unsupported dtype {:?}. Only BF16 models are supported.",
+                        "Tensor '{}' has unsupported dtype {:?}. Supported: F16, BF16, F32",
                         name, dtype
                     ));
                 }
