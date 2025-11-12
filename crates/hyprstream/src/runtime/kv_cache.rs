@@ -6,6 +6,9 @@
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use tch::{Kind as DType, Tensor};
+use tracing::info;
+
+use super::torch_utils::{safe_zeros, estimate_tensor_size_mb};
 
 /// KV cache for a single attention layer
 #[derive(Debug)]
@@ -51,15 +54,42 @@ impl LayerKVCache {
             let device = new_keys.device();
             let dtype = new_keys.kind();
 
-            // Allocate cache tensors
-            self.keys = Some(Tensor::zeros(
-                [batch_size, self.max_seq_len as i64, num_heads, head_dim],
+            // Calculate cache sizes for logging
+            let cache_shape = &[batch_size, self.max_seq_len as i64, num_heads, head_dim];
+            let cache_size_mb = estimate_tensor_size_mb(cache_shape, dtype);
+
+            info!(
+                "Initializing KV cache: shape={:?}, size={:.2} MB per tensor ({:.2} MB total)",
+                cache_shape,
+                cache_size_mb,
+                cache_size_mb * 2.0
+            );
+
+            // Allocate cache tensors with OOM handling
+            let keys_cache = safe_zeros(
+                cache_shape,
                 (dtype, device),
-            ));
-            self.values = Some(Tensor::zeros(
-                [batch_size, self.max_seq_len as i64, num_heads, head_dim],
+            ).map_err(|e| {
+                anyhow!(
+                    "GPU OOM allocating KV cache keys: {} | Size: {:.1} MB | max_seq_len: {} | Try: reduce max_position_embeddings in config.json",
+                    e, cache_size_mb * 2.0, self.max_seq_len
+                )
+            })?;
+
+            let values_cache = safe_zeros(
+                cache_shape,
                 (dtype, device),
-            ));
+            ).map_err(|e| {
+                anyhow!(
+                    "GPU OOM allocating KV cache values (keys succeeded, critically low memory): {} | Size: {:.1} MB | Try: reduce max_position_embeddings",
+                    e, cache_size_mb * 2.0
+                )
+            })?;
+
+            self.keys = Some(keys_cache);
+            self.values = Some(values_cache);
+
+            info!("✅ KV cache allocated successfully");
         }
 
         // Get mutable references to cache tensors

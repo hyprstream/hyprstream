@@ -27,6 +27,7 @@ pub mod template_engine; // Jinja2 template engine for chat templates
 pub mod tensor_helpers; // Helper functions for Tch tensor operations
 pub mod tokenizer_config; // Trait-based tokenizer configuration for models
 pub mod torch_engine; // PyTorch-based engine with tch-rs
+pub mod torch_utils; // Utilities for safe PyTorch operations with OOM handling
 pub mod weight_provider; // Weight provider for streaming large models
 
 // Primary exports - use TorchEngine as default

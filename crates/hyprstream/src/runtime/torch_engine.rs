@@ -19,7 +19,7 @@ use std::sync::{
 };
 use tch::{nn::VarStore, Device, Tensor};
 use tokenizers::Tokenizer;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 /// Basic context state for tracking generation state
 #[derive(Debug, Clone)]
@@ -298,6 +298,7 @@ impl TorchEngine {
     async fn initialize_persistent_model(&mut self, model_path: &Path) -> Result<()> {
         use crate::runtime::model_config::ModelConfig;
         use crate::runtime::model_factory::ModelFactory;
+        use crate::runtime::torch_utils::preflight_gpu_check;
 
         info!("Initializing model");
 
@@ -305,6 +306,49 @@ impl TorchEngine {
         // Load model config first to get model parameters
         let empty_weights = HashMap::new();
         let config = ModelConfig::load(model_path, &empty_weights)?;
+
+        // Estimate model memory requirements
+        let estimated_weights_mb = {
+            // Rough estimate: vocab_size * hidden_size (embeddings)
+            //                 + num_layers * hidden_size * intermediate_size * 3 (MLP)
+            //                 + num_layers * hidden_size * hidden_size * 4 (attention)
+            let embedding_params = config.vocab_size * config.hidden_size;
+            let mlp_params_per_layer = config.hidden_size * config.intermediate_size * 3;
+            let attn_params_per_layer = config.hidden_size * config.hidden_size * 4;
+            let params_per_layer = mlp_params_per_layer + attn_params_per_layer;
+            let total_params = embedding_params + (config.num_hidden_layers * params_per_layer);
+
+            // BF16 = 2 bytes per parameter
+            (total_params * 2) as f64 / (1024.0 * 1024.0)
+        };
+
+        let kv_cache_mb = {
+            // KV cache: 2 (keys+values) * num_layers * batch_size * max_seq_len * num_heads * head_dim * 2 (BF16)
+            let batch_size = 1;
+            let kv_per_layer = 2 * batch_size * config.max_position_embeddings
+                * config.num_attention_heads * config.head_dim * 2;
+            let total_kv = config.num_hidden_layers * kv_per_layer;
+            total_kv as f64 / (1024.0 * 1024.0)
+        };
+
+        let total_estimated_mb = estimated_weights_mb + kv_cache_mb;
+
+        info!(
+            "Model memory estimate:\n\
+             - Weights: {:.2} MB\n\
+             - KV cache: {:.2} MB (max_seq_len={})\n\
+             - Total: {:.2} MB",
+            estimated_weights_mb,
+            kv_cache_mb,
+            config.max_position_embeddings,
+            total_estimated_mb
+        );
+
+        // Pre-flight GPU memory check (best-effort)
+        if let Err(e) = preflight_gpu_check(self.device, total_estimated_mb) {
+            warn!("GPU memory pre-flight check failed: {}", e);
+            // Continue anyway - the check might not be accurate
+        }
 
         // Update ModelInfo with actual values from config
         {
@@ -322,7 +366,7 @@ impl TorchEngine {
         let factory_start = std::time::Instant::now();
         let model = ModelFactory::create(model_path, &self.device, tch::Kind::BFloat16).await?;
         let factory_time = factory_start.elapsed();
-        info!("Model weights loaded in {:.2}s", factory_time.as_secs_f64());
+        info!("✅ Model weights loaded in {:.2}s", factory_time.as_secs_f64());
 
         self.persistent_model = Some(Arc::new(Mutex::new(model)));
         Ok(())

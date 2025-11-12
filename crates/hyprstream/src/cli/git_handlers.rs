@@ -605,7 +605,7 @@ pub async fn handle_info(
     let model_ref = ModelRef::parse(model)?;
 
     // Try to get git2db metadata
-    let repo_metadata = if let Ok(repo_id) = storage.resolve_repo_id(&model_ref) {
+    let repo_metadata = if let Ok(_repo_id) = storage.resolve_repo_id(&model_ref) {
         // Access registry through storage method
         match storage.get_bare_repo_path(&model_ref).await {
             Ok(_) => {
