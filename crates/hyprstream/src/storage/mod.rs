@@ -24,6 +24,7 @@ pub use errors::{ModelRefError, ModelRefResult};
 pub use lfs_xet::{LfsPointer, LfsXetBridge, XetConfig};
 pub use model_ref::{validate_model_name, GitRef, ModelRef};
 pub use model_storage::{ModelId, ModelMetadata, ModelStorage};
+pub use operations::CloneOptions;
 pub use paths::StoragePaths;
 
 // Compatibility types (moved from model_registry)

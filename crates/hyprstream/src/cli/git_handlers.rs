@@ -8,7 +8,7 @@ use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
 use crate::storage::{CheckoutOptions, ModelRef, ModelStorage};
 use anyhow::Result;
 use std::io::{self, Write};
-use tracing::info;
+use tracing::{debug, info};
 
 /// Handle branch command
 pub async fn handle_branch(
@@ -543,19 +543,52 @@ pub async fn handle_clone(
     _storage: &ModelStorage,
     repo_url: &str,
     name: Option<String>,
+    branch: Option<String>,
+    depth: u32,
+    full: bool,
+    quiet: bool,
+    verbose: bool,
 ) -> Result<()> {
-    info!("Cloning model from {}", repo_url);
+    if !quiet {
+        info!("Cloning model from {}", repo_url);
+        println!("📦 Cloning model from: {}", repo_url);
 
-    println!("📦 Cloning model from: {}", repo_url);
+        if let Some(ref b) = branch {
+            println!("   Branch: {}", b);
+        }
+
+        if full {
+            println!("   Mode: Full history");
+        } else if depth > 0 {
+            println!("   Depth: {} commits", depth);
+        }
+
+        if verbose {
+            println!("   Verbose output enabled");
+        }
+    }
+
+    // Create clone options struct to pass to storage layer
+    let clone_opts = crate::storage::CloneOptions {
+        branch,
+        depth: if full { 0 } else { depth },
+        quiet,
+        verbose,
+    };
 
     // Use the existing working implementation that handles LFS properly
-    let cloned = crate::storage::operations::clone_model(repo_url, name.as_deref(), None).await?;
+    let cloned = crate::storage::operations::clone_model_with_options(
+        repo_url,
+        name.as_deref(),
+        None,  // model_id
+        clone_opts
+    ).await?;
 
-    println!("✅ Model '{}' cloned successfully!", cloned.model_name);
-    println!("   Model ID: {}", cloned.model_id);
-    println!("   Location: {}", cloned.model_path.display());
-
-    // The model is already registered by clone_model, so we're done
+    if !quiet {
+        println!("✅ Model '{}' cloned successfully!", cloned.model_name);
+        println!("   Model ID: {}", cloned.model_id);
+        println!("   Location: {}", cloned.model_path.display());
+    }
 
     Ok(())
 }
@@ -571,40 +604,258 @@ pub async fn handle_info(
 
     let model_ref = ModelRef::parse(model)?;
 
-    // Get model path
-    let model_path = storage.get_model_path(&model_ref).await?;
+    // Try to get git2db metadata
+    let repo_metadata = if let Ok(repo_id) = storage.resolve_repo_id(&model_ref) {
+        // Access registry through storage method
+        match storage.get_bare_repo_path(&model_ref).await {
+            Ok(_) => {
+                // We know the model exists, try to get its metadata via the bare repo
+                // Since we can't easily access git2db internals, we'll get info from git directly
+                let bare_repo_path = storage.get_models_dir()
+                    .join(&model_ref.model)
+                    .join(format!("{}.git", &model_ref.model));
+
+                if let Ok(bare_repo) = git2::Repository::open(&bare_repo_path) {
+                    // Get remote URL
+                    let url = bare_repo.find_remote("origin")
+                        .ok()
+                        .and_then(|r| r.url().map(|s| s.to_string()))
+                        .unwrap_or_else(|| "unknown".to_string());
+
+                    // Get current HEAD
+                    let current_oid = bare_repo.head()
+                        .ok()
+                        .and_then(|h| h.target())
+                        .map(|oid| oid.to_string());
+
+                    Some((
+                        Some(model_ref.model.clone()),
+                        url,
+                        model_ref.git_ref.to_string(),
+                        current_oid,
+                    ))
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    // Get model path - this may fail for bare repos due to git2db bug
+    let model_path = match storage.get_model_path(&model_ref).await {
+        Ok(path) => path,
+        Err(e) => {
+            debug!("Failed to get model path via storage: {}", e);
+            // Fallback: construct the path manually for bare repos
+            let models_dir = storage.get_models_dir();
+            let worktree_path = models_dir
+                .join(&model_ref.model)
+                .join("worktrees")
+                .join("master"); // Try master first
+
+            if !worktree_path.exists() {
+                // Try main if master doesn't exist
+                models_dir
+                    .join(&model_ref.model)
+                    .join("worktrees")
+                    .join("main")
+            } else {
+                worktree_path
+            }
+        }
+    };
 
     // If adapters_only is true, skip the general model info
     if !adapters_only {
         println!("Model: {}", model_ref.model);
+
+        // Show git2db metadata if available
+        if let Some((name, url, tracking_ref, current_oid)) = &repo_metadata {
+            if let Some(n) = name {
+                if n != &model_ref.model {
+                    println!("  Registry name: {}", n);
+                }
+            }
+            println!("  Origin URL: {}", url);
+            println!("  Tracking ref: {}", tracking_ref);
+            if let Some(oid) = current_oid {
+                println!("  Current OID: {}", &oid[..8.min(oid.len())]);
+            }
+        }
+
+        // Get display ref - avoid calling get_default_branch which fails on bare repos
         let display_ref = match &model_ref.git_ref {
             crate::storage::GitRef::DefaultBranch => {
-                storage.get_default_branch(&model_ref).await?
+                // Try to determine default branch from worktree directory names
+                let worktrees_dir = storage.get_models_dir()
+                    .join(&model_ref.model)
+                    .join("worktrees");
+
+                if worktrees_dir.join("main").exists() {
+                    "main".to_string()
+                } else if worktrees_dir.join("master").exists() {
+                    "master".to_string()
+                } else {
+                    // Fallback
+                    "unknown".to_string()
+                }
             }
             _ => model_ref.git_ref.to_string(),
         };
+
         println!("Reference: {}", display_ref);
         println!("Path: {}", model_path.display());
     }
 
-    // Get git status
-    let status = storage.status(&model_ref).await?;
-    println!("\nGit Status:");
-    println!(
-        "  Current branch/ref: {}",
-        status.branch.as_deref().unwrap_or("detached")
-    );
+    // Get bare repository information
+    let bare_repo_path = storage.get_models_dir()
+        .join(&model_ref.model)
+        .join(format!("{}.git", &model_ref.model));
 
-    if !status.is_clean {
-        println!("  Working tree: dirty");
-        println!("  Modified files: {}", status.modified_files.len());
-        if verbose {
-            for file in &status.modified_files {
-                println!("    M {}", file.display());
+    if bare_repo_path.exists() {
+        println!("\nBare Repository:");
+        println!("  Path: {}", bare_repo_path.display());
+
+        // Try to open the bare repo to get more information
+        if let Ok(bare_repo) = git2::Repository::open(&bare_repo_path) {
+            // Get remote information
+            if let Ok(remotes) = bare_repo.remotes() {
+                for remote_name in remotes.iter().flatten() {
+                    if let Ok(remote) = bare_repo.find_remote(remote_name) {
+                        if let Some(url) = remote.url() {
+                            println!("  Remote '{}': {}", remote_name, url);
+                        }
+                    }
+                }
+            }
+
+            // Get branches
+            if let Ok(branches) = bare_repo.branches(Some(git2::BranchType::Local)) {
+                let branch_names: Vec<String> = branches
+                    .filter_map(|b| b.ok())
+                    .filter_map(|(branch, _)| branch.name().ok().flatten().map(|s| s.to_string()))
+                    .collect();
+
+                if !branch_names.is_empty() {
+                    println!("  Local branches: {}", branch_names.join(", "));
+                }
+            }
+
+            // Get tags
+            if let Ok(tag_names) = bare_repo.tag_names(None) {
+                let tags: Vec<&str> = tag_names.iter().flatten().collect();
+                if !tags.is_empty() {
+                    println!("  Tags: {}", tags.join(", "));
+                }
+            }
+
+            // Repository size (approximate)
+            if let Ok(metadata) = std::fs::metadata(&bare_repo_path) {
+                if metadata.is_dir() {
+                    let mut total_size = 0u64;
+                    if let Ok(entries) = walkdir::WalkDir::new(&bare_repo_path)
+                        .into_iter()
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                    {
+                        for entry in entries {
+                            if entry.file_type().is_file() {
+                                if let Ok(meta) = entry.metadata() {
+                                    total_size += meta.len();
+                                }
+                            }
+                        }
+                    }
+                    println!("  Repository size: {:.2} MB", total_size as f64 / 1_048_576.0);
+                }
+            }
+        } else {
+            println!("  (Unable to inspect bare repository)");
+        }
+    }
+
+    // Get git status from the worktree directly
+    // Note: storage.status() currently fails for bare repos, so we get status from worktree
+    println!("\nWorktree Status:");
+
+    // Try to open the worktree as a repository to get its status
+    match git2::Repository::open(&model_path) {
+        Ok(repo) => {
+        // Get current branch/HEAD info
+        if let Ok(head) = repo.head() {
+            let branch_name = head.shorthand().unwrap_or("detached");
+            println!("  Current branch/ref: {}", branch_name);
+
+            if let Some(oid) = head.target() {
+                println!("  HEAD commit: {}", &oid.to_string()[..8]);
+            }
+        } else {
+            println!("  Current branch/ref: detached");
+        }
+
+        // Get working tree status
+        if let Ok(statuses) = repo.statuses(None) {
+            if statuses.is_empty() {
+                println!("  Working tree: clean");
+            } else {
+                println!("  Working tree: dirty");
+                let modified_count = statuses.iter().count();
+                println!("  Modified files: {}", modified_count);
+
+                if verbose {
+                    for entry in statuses.iter() {
+                        if let Some(path) = entry.path() {
+                            let status = entry.status();
+                            let prefix = if status.contains(git2::Status::INDEX_NEW) ||
+                                           status.contains(git2::Status::WT_NEW) {
+                                "A"
+                            } else if status.contains(git2::Status::INDEX_MODIFIED) ||
+                                      status.contains(git2::Status::WT_MODIFIED) {
+                                "M"
+                            } else if status.contains(git2::Status::INDEX_DELETED) ||
+                                      status.contains(git2::Status::WT_DELETED) {
+                                "D"
+                            } else {
+                                "?"
+                            };
+                            println!("    {} {}", prefix, path);
+                        }
+                    }
+                }
+            }
+        } else {
+            println!("  Working tree: unable to get status");
+        }
+        }
+        Err(_) => {
+            // Fallback: try to use storage.status() which may work for non-bare repos
+            match storage.status(&model_ref).await {
+            Ok(status) => {
+                println!(
+                    "  Current branch/ref: {}",
+                    status.branch.as_deref().unwrap_or("detached")
+                );
+
+                if !status.is_clean {
+                    println!("  Working tree: dirty");
+                    println!("  Modified files: {}", status.modified_files.len());
+                    if verbose {
+                        for file in &status.modified_files {
+                            println!("    M {}", file.display());
+                        }
+                    }
+                } else {
+                    println!("  Working tree: clean");
+                }
+            }
+            Err(e) => {
+                println!("  Unable to get status: {}", e);
+                debug!("Status error details: {:?}", e);
             }
         }
-    } else {
-        println!("  Working tree: clean");
+        }
     }
 
     // Show model size if we can
@@ -1194,12 +1445,45 @@ pub async fn handle_remove(
 
     // Remove files (if requested and exist)
     if files_exist && !registry_only {
+        // First, try to clean up any worktrees which might have overlay mounts
+        // This is important to avoid permission errors from mounted filesystems
+        let worktrees_dir = model_path.join("worktrees");
+        if worktrees_dir.exists() {
+            // Try to clean up overlay mounts gracefully
+            debug!("Cleaning up worktrees at: {}", worktrees_dir.display());
+
+            // git2db overlay mounts are typically in .git2db-overlay subdirectories
+            // We'll attempt cleanup but continue on error since some may not be mounted
+            if let Ok(entries) = std::fs::read_dir(&worktrees_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        // Attempt to remove directory - overlays should auto-unmount on cleanup
+                        if let Err(e) = std::fs::remove_dir_all(&path) {
+                            debug!("Failed to remove worktree dir {}: {} (may have been unmounted)",
+                                   path.display(), e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Now remove the main model directory
         match std::fs::remove_dir_all(&model_path) {
             Ok(_) => {
                 println!("✓ Removed model files from: {}", model_path.display());
             }
             Err(e) => {
-                eprintln!("❌ Failed to remove model files: {}", e);
+                // Check if it's a permission error and provide helpful message
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    eprintln!("❌ Failed to remove model files: {}", e);
+                    eprintln!("   This may be due to overlay filesystem mounts.");
+                    eprintln!("   Try running with sudo or manually unmount any overlayfs mounts:");
+                    eprintln!("   $ mount | grep {}", model_path.display());
+                    eprintln!("   $ sudo umount <mount_path>");
+                } else {
+                    eprintln!("❌ Failed to remove model files: {}", e);
+                }
                 return Err(anyhow::anyhow!("Failed to remove model files: {}", e));
             }
         }

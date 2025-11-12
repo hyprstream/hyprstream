@@ -40,20 +40,6 @@ pub enum ModelAction {
         progress: bool,
     },
 
-    /// Clone a model using Git
-    Clone {
-        /// Git repository URL (supports all Git URL formats)
-        repo_url: String,
-
-        /// Git ref (branch, tag, commit) to clone
-        #[arg(long)]
-        git_ref: Option<String>,
-
-        /// Model ID to use (auto-generated if not provided)
-        #[arg(long)]
-        model_id: Option<String>,
-    },
-
     /// List available models
     List {
         /// Filter by registry type (hf, custom)
