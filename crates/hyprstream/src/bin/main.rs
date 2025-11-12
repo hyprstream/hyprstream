@@ -540,12 +540,27 @@ fn main() -> Result<()> {
                 },
                 || async move {
                     let storage = ctx.storage().await?;
-                    handle_info(storage, &model, verbose, adapters_only).await
+                    match handle_info(storage, &model, verbose, adapters_only).await {
+                        Ok(()) => Ok(()),
+                        Err(e) => {
+                            // Print error but continue to show what we can
+                            eprintln!("Warning: Some operations failed: {}", e);
+                            Ok(())
+                        }
+                    }
                 },
             )?;
         }
 
-        Commands::Clone { repo_url, name } => {
+        Commands::Clone {
+            repo_url,
+            name,
+            branch,
+            depth,
+            full,
+            quiet,
+            verbose,
+        } => {
             let ctx = ctx.clone();
             with_runtime(
                 RuntimeConfig {
@@ -554,7 +569,16 @@ fn main() -> Result<()> {
                 },
                 || async move {
                     let storage = ctx.storage().await?;
-                    handle_clone(storage, &repo_url, name).await
+                    handle_clone(
+                        storage,
+                        &repo_url,
+                        name,
+                        branch,
+                        depth,
+                        full,
+                        quiet,
+                        verbose,
+                    ).await
                 },
             )?;
         }

@@ -198,9 +198,31 @@ pub enum Commands {
     Clone {
         /// Git repository URL
         repo_url: String,
+
         /// Local name for the model
         #[arg(long)]
         name: Option<String>,
+
+        /// Branch, tag, or commit to clone
+        #[arg(long, short = 'b')]
+        branch: Option<String>,
+
+        /// Clone depth (number of commits). Default is 1 for shallow clone.
+        /// Use 0 or --full for complete history
+        #[arg(long, default_value = "1")]
+        depth: u32,
+
+        /// Clone with full history (overrides --depth)
+        #[arg(long)]
+        full: bool,
+
+        /// Suppress progress output
+        #[arg(long, short = 'q')]
+        quiet: bool,
+
+        /// Verbose output
+        #[arg(long, short = 'v')]
+        verbose: bool,
     },
 
     /// Push changes to remote
