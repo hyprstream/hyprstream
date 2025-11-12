@@ -131,7 +131,7 @@ impl XetFilter<Unregistered> {
             // Cast to OpaqueGitFilter for the registry
             crate::callbacks::register_payload(
                 filter_ptr as *const crate::ffi::OpaqueGitFilter,
-                self.payload.take().unwrap(),
+                *self.payload.take().unwrap(),
             );
 
             let result = crate::ffi::git_filter_register(

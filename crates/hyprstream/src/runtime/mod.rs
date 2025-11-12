@@ -15,9 +15,10 @@ pub use crate::config::{
     ModelConfig, ModelInfo, RuntimeConfig,
 };
 
-pub mod architectures; // Architecture-specific model implementations
+pub mod architectures; // Architecture-specific model implementations (includes Janus placeholder utils)
 pub mod conversation_router; // Seamless model evolution and routing
 pub mod tensor_sampling; // Device-agnostic tensor-based sampling
+pub mod image_utils; // Image loading and preprocessing for multimodal models
 pub mod kv_cache; // Key-Value caching for efficient autoregressive generation
 pub mod lora_integration; // LoRA integration with gradient bridge
 pub mod model_config; // Unified model configuration management

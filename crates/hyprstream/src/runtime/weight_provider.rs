@@ -157,16 +157,9 @@ impl StreamingWeightProvider {
             let shape: Vec<i64> = tensor_view.shape().iter().map(|&x| x as i64).collect();
             let data = tensor_view.data();
 
-            // Only BF16 is supported
+            // Support F16, BF16, and F32 models
             let tensor = match tensor_view.dtype() {
                 safetensors::Dtype::BF16 => {
-                    if self.dtype != tch::Kind::BFloat16 {
-                        return Err(anyhow::anyhow!(
-                            "Only BF16 models are supported (target dtype: {:?})",
-                            self.dtype
-                        ));
-                    }
-
                     let cpu_tensor = unsafe {
                         Tensor::from_blob(
                             data.as_ptr(),
@@ -175,6 +168,70 @@ impl StreamingWeightProvider {
                             tch::Kind::BFloat16,
                             Device::Cpu,
                         )
+                    };
+
+                    // Convert dtype if needed
+                    let cpu_tensor = if self.dtype == tch::Kind::Half {
+                        cpu_tensor.to_kind(tch::Kind::Half)
+                    } else if self.dtype != tch::Kind::BFloat16 {
+                        cpu_tensor.to_kind(self.dtype)
+                    } else {
+                        cpu_tensor
+                    };
+
+                    if self.device != Device::Cpu {
+                        let gpu_tensor = cpu_tensor.to_device(self.device);
+                        drop(cpu_tensor);
+                        gpu_tensor
+                    } else {
+                        cpu_tensor
+                    }
+                }
+                safetensors::Dtype::F16 => {
+                    let cpu_tensor = unsafe {
+                        Tensor::from_blob(
+                            data.as_ptr(),
+                            &shape,
+                            &[],
+                            tch::Kind::Half,
+                            Device::Cpu,
+                        )
+                    };
+
+                    // Convert dtype if needed
+                    let cpu_tensor = if self.dtype == tch::Kind::BFloat16 {
+                        cpu_tensor.to_kind(tch::Kind::BFloat16)
+                    } else if self.dtype != tch::Kind::Half {
+                        cpu_tensor.to_kind(self.dtype)
+                    } else {
+                        cpu_tensor
+                    };
+
+                    if self.device != Device::Cpu {
+                        let gpu_tensor = cpu_tensor.to_device(self.device);
+                        drop(cpu_tensor);
+                        gpu_tensor
+                    } else {
+                        cpu_tensor
+                    }
+                }
+                safetensors::Dtype::F32 => {
+                    let cpu_tensor = unsafe {
+                        Tensor::from_blob(
+                            data.as_ptr(),
+                            &shape,
+                            &[],
+                            tch::Kind::Float,
+                            Device::Cpu,
+                        )
+                    };
+
+                    // Convert to target dtype
+                    let cpu_tensor = match self.dtype {
+                        tch::Kind::Half => cpu_tensor.to_kind(tch::Kind::Half),
+                        tch::Kind::BFloat16 => cpu_tensor.to_kind(tch::Kind::BFloat16),
+                        tch::Kind::Float => cpu_tensor,
+                        _ => cpu_tensor.to_kind(self.dtype),
                     };
 
                     if self.device != Device::Cpu {
@@ -187,7 +244,7 @@ impl StreamingWeightProvider {
                 }
                 dtype => {
                     return Err(anyhow::anyhow!(
-                        "Tensor '{}' has unsupported dtype {:?}. Only BF16 models are supported.",
+                        "Tensor '{}' has unsupported dtype {:?}. Supported: F16, BF16, F32",
                         name, dtype
                     ));
                 }
