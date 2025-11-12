@@ -133,6 +133,10 @@ pub enum Commands {
         #[arg(short, long)]
         prompt: String,
 
+        /// Image file path for multimodal models (e.g., --image /path/to/image.jpg)
+        #[arg(short = 'i', long)]
+        image: Option<String>,
+
         /// Maximum tokens to generate
         #[arg(short = 'm', long)]
         max_tokens: Option<usize>,

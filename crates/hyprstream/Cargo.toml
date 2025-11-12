@@ -97,6 +97,7 @@ tch = { git = "https://github.com/hyprstream/tch-rs", branch = "hip" }
 # candle-examples = "0.9.1"
 tokenizers.workspace = true
 safetensors.workspace = true
+image.workspace = true
 regex.workspace = true
 minijinja.workspace = true
 

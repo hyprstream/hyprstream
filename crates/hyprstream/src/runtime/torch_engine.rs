@@ -797,6 +797,7 @@ impl RuntimeEngine for TorchEngine {
             repeat_last_n: 64, // Default
             stop_tokens: self.generation_config.stop_tokens.clone(),
             seed: None,
+            images: vec![],  // No images for simple text generation
         };
 
         let result = self.generate_with_params(request).await?;
@@ -1603,6 +1604,9 @@ pub struct TextStream<'a> {
     start_time: std::time::Instant,
     finished: bool,
     finish_reason: Option<FinishReason>,
+    /// Pre-computed multimodal embeddings for the first forward pass (if multimodal)
+    /// After the first forward, this is cleared and we use regular token IDs
+    multimodal_embeddings: Option<Tensor>,
 }
 
 impl<'a> TextStream<'a> {
@@ -1636,6 +1640,10 @@ impl<'a> TextStream<'a> {
             64
         };
 
+        // Extract Janus placeholder config BEFORE moving tokenizer
+        use crate::runtime::architectures::janus::JanusPlaceholderConfig;
+        let placeholder_config = JanusPlaceholderConfig::from_tokenizer(&tokenizer).ok();
+
         // We need to use Box::leak to create a 'static reference that we can then downcast to 'a
         // This is safe because:
         // 1. We're leaking the tokenizer to get a stable 'static reference
@@ -1659,6 +1667,125 @@ impl<'a> TextStream<'a> {
         // Store the raw pointer so we can deallocate in Drop
         let tokenizer_ptr = tokenizer_static as *const Tokenizer as *mut Tokenizer;
 
+        // Check if model is multimodal and prepare embeddings if needed
+        let multimodal_embeddings = if let Some(model_arc) = &engine.persistent_model {
+            let model_guard = engine.handle_poison(model_arc.lock())?;
+            if model_guard.is_multimodal() {
+                tracing::info!("Detected multimodal model, preparing vision embeddings");
+
+                // Load images or create fallback
+                let images = if request.images.is_empty() {
+                    tracing::warn!("No images provided for multimodal model, using fallback");
+                    // Create fallback image (1x1 random pixel expanded to 384x384)
+                    use crate::runtime::image_utils::{ImageInput, ImagePreprocessConfig};
+                    vec![ImageInput::fallback(&ImagePreprocessConfig::siglip(), engine.device)?]
+                } else {
+                    use crate::runtime::image_utils::{ImageInput, ImagePreprocessConfig};
+                    use std::path::Path;
+                    let config = ImagePreprocessConfig::siglip();  // Janus uses SigLIP
+                    request.images.iter()
+                        .map(|path| ImageInput::from_path(Path::new(path), &config, engine.device))
+                        .collect::<Result<Vec<_>>>()?
+                };
+
+                // Batch images into tensor [batch, channels, height, width]
+                use crate::runtime::image_utils::batch_images;
+                let image_tensor = batch_images(&images)?;
+
+                // Detect and replace Janus image placeholder tokens
+                use crate::runtime::architectures::janus::replace_janus_placeholders;
+
+                // Try to detect placeholders using pre-extracted config
+                let placeholder_result = if let Some(ref config) = placeholder_config {
+                    replace_janus_placeholders(&prompt_tokens, config, engine.device)
+                } else {
+                    Err(anyhow::anyhow!("Janus placeholder config not available (tokenizer missing special tokens)"))
+                };
+
+                let (input_ids, seq_mask, emb_mask, num_images) = match placeholder_result {
+                    Ok(replacement) => {
+                        tracing::info!(
+                            "Detected {} image placeholder(s), expanded sequence to {} tokens",
+                            replacement.num_images,
+                            replacement.input_ids.size()[1]
+                        );
+                        (
+                            replacement.input_ids,
+                            replacement.images_seq_mask,
+                            replacement.images_emb_mask,
+                            replacement.num_images,
+                        )
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to detect image placeholders: {}. Using fallback injection.",
+                            e
+                        );
+                        // Fallback: create simple masks (inject at position 0)
+                        let num_images = images.len();
+                        let seq_len = prompt_len as i64;
+
+                        let input_ids = Tensor::from_slice(&prompt_tokens)
+                            .to_kind(tch::Kind::Int64)
+                            .to_device(engine.device)
+                            .unsqueeze(0); // [1, seq_len]
+
+                        let mut seq_mask = Tensor::zeros(&[1, seq_len], (tch::Kind::Bool, engine.device));
+                        let _ = seq_mask.narrow(1, 0, 1).fill_(1.0); // Mark position 0
+
+                        let vision_seq_len = 576 * num_images as i64; // 576 tokens per image
+                        let emb_mask = Tensor::ones(
+                            &[1, num_images as i64, 576],
+                            (tch::Kind::Bool, engine.device)
+                        );
+
+                        (input_ids, seq_mask, emb_mask, num_images)
+                    }
+                };
+
+                // Verify we have the right number of images
+                if num_images != images.len() {
+                    tracing::warn!(
+                        "Mismatch: detected {} placeholder(s) but have {} image(s)",
+                        num_images,
+                        images.len()
+                    );
+                }
+
+                // Prepare multimodal embeddings
+                let embeddings = model_guard.prepare_multimodal_inputs(
+                    &input_ids,
+                    Some(&image_tensor),
+                    Some(&seq_mask),
+                    Some(&emb_mask),
+                )?;
+
+                tracing::info!(
+                    "Prepared multimodal embeddings: shape={:?}",
+                    embeddings.size()
+                );
+
+                Some(embeddings)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Update prompt_len to reflect expanded sequence length for multimodal models
+        let actual_prompt_len = if let Some(ref embeddings) = multimodal_embeddings {
+            let emb_shape = embeddings.size();
+            emb_shape[1] as usize  // [batch, seq_len, hidden_size] -> seq_len
+        } else {
+            prompt_len
+        };
+
+        tracing::debug!(
+            "TextStream initialized: original_prompt_len={}, actual_prompt_len={}, has_multimodal={}",
+            prompt_len, actual_prompt_len, multimodal_embeddings.is_some()
+        );
+
         Ok(Self {
             engine,
             prompt_tokens,
@@ -1673,13 +1800,14 @@ impl<'a> TextStream<'a> {
             stop_token_ids,
             tokenizer: tokenizer_ptr,
             decode_stream,
-            prompt_len,
+            prompt_len: actual_prompt_len,  // Use expanded length for multimodal
             // KV cache starts with prompt already in it after first forward
-            kv_cache_position: prompt_len,
+            kv_cache_position: actual_prompt_len,  // Use expanded length
             tokens_generated: 0,
             start_time: std::time::Instant::now(),
             finished: false,
             finish_reason: None,
+            multimodal_embeddings,
         })
     }
 
@@ -1709,23 +1837,63 @@ impl<'a> TextStream<'a> {
 
         let logits = if self.tokens_generated == 0 {
             tracing::debug!("🔵 Initial forward: prompt_len={}", self.prompt_len);
-            self.engine.forward(&self.prompt_tokens)?
+
+            // Check if we have pre-computed multimodal embeddings
+            let result = if let Some(ref embeddings) = self.multimodal_embeddings {
+                tracing::info!("Using pre-computed multimodal embeddings for initial forward");
+                // Use forward_from_embeddings for multimodal models
+                if let Some(model_arc) = &self.engine.persistent_model {
+                    let model_guard = self.engine.handle_poison(model_arc.lock())?;
+                    let logits = model_guard.forward_from_embeddings(embeddings, 0)?;
+
+                    // CRITICAL FIX: Initialize KV cache position to prompt length
+                    // For multimodal models, the prompt_len includes expanded image tokens
+                    // The KV cache now contains keys/values for all prompt_len positions
+                    // Next token generation should start at position prompt_len
+                    self.kv_cache_position = self.prompt_len;
+                    tracing::debug!(
+                        "Initialized KV cache position to {} after multimodal forward",
+                        self.kv_cache_position
+                    );
+
+                    logits
+                } else {
+                    return Err(anyhow::anyhow!("Persistent model not available for multimodal forward"));
+                }
+            } else {
+                // Regular text-only forward
+                let logits = self.engine.forward(&self.prompt_tokens)?;
+
+                // Initialize KV cache position for text-only models
+                self.kv_cache_position = self.prompt_len;
+
+                logits
+            };
+
+            result
         } else {
             let last_token = self.last_generated.expect("last_generated should be set");
 
-            if self.tokens_generated % 50 == 0 {
-                tracing::debug!(
-                    "🔵 KV cache position: {}, tokens_generated: {}, last_token: {}",
-                    self.kv_cache_position, self.tokens_generated, last_token
-                );
-            }
+            tracing::debug!(
+                "🔵 Autoregressive forward: kv_pos={}, tokens_gen={}, last_token={}",
+                current_kv_pos, self.tokens_generated, last_token
+            );
 
             // Use kv_cache_position directly - this is where the next token will be written
-            self.engine.forward_cached(
+            let logits = self.engine.forward_cached(
                 &[last_token],
                 current_kv_pos,
                 true,
-            )?
+            )?;
+
+            tracing::debug!(
+                "Logits from forward_cached: shape={:?}, min={:.4}, max={:.4}",
+                logits.size(),
+                logits.min().double_value(&[]),
+                logits.max().double_value(&[])
+            );
+
+            logits
         };
 
         // NOTE: Logits truncation has been DISABLED (Nov 6, 2025)
@@ -1898,6 +2066,12 @@ impl<'a> Stream for TextStream<'a> {
                     self.last_generated = Some(token_i64);
                     self.tokens_generated += 1;
 
+                    // Clear multimodal embeddings after first token (they're only used for initial forward)
+                    if self.tokens_generated == 1 && self.multimodal_embeddings.is_some() {
+                        tracing::debug!("Clearing multimodal embeddings after first token");
+                        self.multimodal_embeddings = None;
+                    }
+
                     self.recent_tokens.push_back(token_i64);
                     if self.recent_tokens.len() > self.repeat_last_n {
                         self.recent_tokens.pop_front();
@@ -1917,6 +2091,12 @@ impl<'a> Stream for TextStream<'a> {
                     let token_i64 = next_token as i64;
                     self.last_generated = Some(token_i64);
                     self.tokens_generated += 1;
+
+                    // Clear multimodal embeddings after first token (they're only used for initial forward)
+                    if self.tokens_generated == 1 && self.multimodal_embeddings.is_some() {
+                        tracing::debug!("Clearing multimodal embeddings after first token");
+                        self.multimodal_embeddings = None;
+                    }
 
                     self.recent_tokens.push_back(token_i64);
                     if self.recent_tokens.len() > self.repeat_last_n {

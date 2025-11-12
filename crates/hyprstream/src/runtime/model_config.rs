@@ -62,6 +62,7 @@ pub enum ModelArchitecture {
     Qwen,
     Gemma,
     Mistral,
+    Janus,
     Unknown(String),
 }
 
@@ -80,6 +81,7 @@ impl ModelConfig {
             info!("⚠️ No config.json found, detecting from weights");
             Self::detect_from_weights(weights)?
         };
+
 
         // Step 2: Validate against weights
         config.validate_with_weights(weights)?;
@@ -183,6 +185,7 @@ impl ModelConfig {
         // Check model_type field
         if let Some(model_type) = json["model_type"].as_str() {
             return match model_type.to_lowercase().as_str() {
+                "janus" => ModelArchitecture::Janus,  // Explicit Janus type
                 "llama" => ModelArchitecture::Llama,
                 "qwen" | "qwen2" | "qwen3" => ModelArchitecture::Qwen,
                 "gemma" => ModelArchitecture::Gemma,
@@ -196,6 +199,7 @@ impl ModelConfig {
             if let Some(first) = architectures.first() {
                 if let Some(arch_str) = first.as_str() {
                     return match arch_str.to_lowercase().as_str() {
+                        s if s.contains("janus") => ModelArchitecture::Janus,  // Janus in architecture name
                         s if s.contains("llama") => ModelArchitecture::Llama,
                         s if s.contains("qwen") => ModelArchitecture::Qwen,
                         s if s.contains("gemma") => ModelArchitecture::Gemma,
@@ -211,6 +215,20 @@ impl ModelConfig {
 
     fn detect_architecture_from_weights(weights: &HashMap<String, Tensor>) -> ModelArchitecture {
         // Check for architecture-specific weight patterns
+
+        // Check for Janus multimodal components first
+        let has_vision_model = weights.keys().any(|k| k.starts_with("vision_model.") || k.starts_with("vision_encoder."));
+        let has_aligner = weights.keys().any(|k| k.starts_with("aligner.") || k.starts_with("vision_aligner."));
+        let has_language_model = weights.keys().any(|k| k.starts_with("language_model."));
+
+        if has_vision_model || has_aligner || has_language_model {
+            info!("Detected Janus multimodal model from weight patterns");
+            info!("  has_vision_model: {}", has_vision_model);
+            info!("  has_aligner: {}", has_aligner);
+            info!("  has_language_model: {}", has_language_model);
+            return ModelArchitecture::Janus;
+        }
+
         for key in weights.keys() {
             if key.contains("q_norm") || key.contains("k_norm") {
                 return ModelArchitecture::Qwen;

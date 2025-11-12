@@ -7,7 +7,7 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::Path;
 use tch::{Device, Kind as DType, Tensor};
-use tracing::{info, instrument};
+use tracing::{debug, info, instrument};
 
 use super::architectures::{gemma::GemmaModel, llama::LlamaModel, ModelOperations};
 use super::model_config::{ModelArchitecture, ModelConfig};
@@ -457,6 +457,10 @@ impl ModelFactory {
                 // For now, Mistral uses Llama architecture
                 Self::create_llama_model(config, weights, device, dtype)
             }
+            ModelArchitecture::Janus => {
+                info!("Creating Janus multimodal model");
+                Self::create_janus_model(config, weights, device, dtype)
+            }
             ModelArchitecture::Unknown(arch) => Err(anyhow!("Unknown architecture: {}", arch)),
         }
     }
@@ -523,5 +527,74 @@ impl ModelFactory {
     ) -> Result<Box<dyn ModelOperations>> {
         // Gemma has its own implementation
         Ok(Box::new(GemmaModel::from_weights(&weights, device, dtype)?))
+    }
+
+    fn create_janus_model(
+        config: ModelConfig,
+        weights: HashMap<String, Tensor>,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Box<dyn ModelOperations>> {
+        use super::architectures::janus::{
+            JanusModel, JanusConfig, VisionEncoderConfig, ProjectorConfig,
+        };
+        use super::architectures::VisionEncoderType;
+
+        // For now, create a simplified Janus config
+        // In practice, this would be derived from the model's config.json
+        let janus_config = JanusConfig {
+            // Use Llama config for the language model
+            language_config: Box::new(super::architectures::llama::LlamaConfig {
+                version: 3,
+                num_attention_heads: config.num_attention_heads,
+                num_key_value_heads: config.num_key_value_heads,
+                hidden_size: config.hidden_size,
+                head_dim: config.head_dim,
+                intermediate_size: config.intermediate_size,
+                max_position_embeddings: config.max_position_embeddings,
+                rms_norm_eps: config.rms_norm_eps,
+                vocab_size: config.vocab_size,
+                original_vocab_size: config.vocab_size,
+                num_hidden_layers: config.num_hidden_layers,
+                rope_theta: config.rope_theta,
+                rope_scaling: None,  // TODO: Convert from config.rope_scaling
+                hidden_activation: config.hidden_activation.clone(),
+                query_pre_attn_scalar: config.query_pre_attn_scalar,
+                use_qk_norm: config.use_qk_norm,
+                scale_embeddings: config.scale_embeddings,
+                layer_types: vec!["global".to_string(); config.num_hidden_layers],
+                rope_local_base_freq: None,
+            }),
+            vision_config: VisionEncoderConfig {
+                encoder_type: VisionEncoderType::SigLIP {
+                    hidden_size: 1024,  // From config: vision_config.hidden_size
+                    image_size: 384,
+                    patch_size: 16,
+                    num_layers: 24,
+                },
+                hidden_size: 1024,
+                image_size: 384,
+                patch_size: 16,
+                num_layers: 24,
+                num_patches: (384 / 16) * (384 / 16),  // 576 patches
+                num_attention_heads: Some(16),  // From config: vision_config.num_attention_heads
+                intermediate_size: Some(4096),  // From config: vision_config.intermediate_size
+            },
+            aligner_config: ProjectorConfig {
+                input_dim: 1024,  // Vision hidden size (matches vision_config.hidden_size)
+                output_dim: config.hidden_size,  // Language model hidden size
+                hidden_dim: Some(config.hidden_size),  // 2-layer MLP
+            },
+            generation_config: None,  // No image generation for now
+            device: *device,
+            dtype,
+        };
+
+        Ok(Box::new(JanusModel::from_weights(
+            weights,
+            janus_config,
+            *device,
+            dtype,
+        )?))
     }
 }

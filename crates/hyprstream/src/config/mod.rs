@@ -474,6 +474,9 @@ pub struct GenerationRequest {
     pub repeat_last_n: usize,
     pub stop_tokens: Vec<String>,
     pub seed: Option<u32>,
+    /// Optional image paths for multimodal models
+    #[serde(default)]
+    pub images: Vec<String>,
 }
 
 /// Unified sampling parameters with Option fields for clean precedence merging.
@@ -636,6 +639,7 @@ pub struct ResolvedSamplingParams {
 pub struct GenerationRequestBuilder {
     prompt: String,
     params: SamplingParams,
+    images: Vec<String>,
 }
 
 impl GenerationRequestBuilder {
@@ -643,6 +647,7 @@ impl GenerationRequestBuilder {
         Self {
             prompt: prompt.into(),
             params: SamplingParams::default(),
+            images: vec![],
         }
     }
 
@@ -692,6 +697,16 @@ impl GenerationRequestBuilder {
         self
     }
 
+    pub fn image_path(mut self, value: std::path::PathBuf) -> Self {
+        self.images.push(value.to_string_lossy().to_string());
+        self
+    }
+
+    pub fn images(mut self, value: Vec<String>) -> Self {
+        self.images = value;
+        self
+    }
+
     pub fn build_v2(self) -> GenerationRequestV2 {
         GenerationRequestV2 {
             prompt: self.prompt,
@@ -711,6 +726,7 @@ impl GenerationRequestBuilder {
             repeat_last_n: resolved.repeat_last_n,
             stop_tokens: resolved.stop_tokens,
             seed: resolved.seed.map(|s| s as u32),
+            images: self.images,
         }
     }
 }
@@ -758,6 +774,7 @@ impl From<&GenerationConfig> for GenerationRequest {
             repeat_penalty: config.repeat_penalty,
             repeat_last_n: 64, // Default repeat_last_n
             stop_tokens: config.stop_tokens.clone(),
+            images: vec![],  // No images in conversion
             seed: config.seed,
         }
     }
