@@ -256,12 +256,8 @@ impl<'a> CloneBuilder<'a> {
             create_worktree(&bare_repo_path, &ref_worktree_path, &checkout_ref).await?;
         }
 
-        // Fetch LFS files if the repository uses LFS (in default worktree)
-        // This is optional - if it fails, we'll just log a warning
-        if let Err(e) = Self::fetch_lfs_files(&initial_worktree).await {
-            tracing::warn!("Failed to fetch LFS files: {}. You may need to run 'git lfs pull' manually.", e);
-            // Don't fail the entire clone operation just because LFS pull failed
-        }
+        // Note: LFS files are automatically fetched by GitManager::create_worktree()
+        // Fetch is always atomic - failures trigger automatic worktree rollback
 
         // Build remote configs (origin + additional)
         let mut remote_configs = vec![RemoteConfig {
@@ -292,56 +288,6 @@ impl<'a> CloneBuilder<'a> {
             .await?;
 
         Ok(repo_id)
-    }
-
-    /// Fetch LFS files if the repository uses Git LFS
-    ///
-    /// This checks for .gitattributes with LFS configuration and runs `git lfs pull`
-    async fn fetch_lfs_files(repo_path: &std::path::Path) -> Git2DBResult<()> {
-        use tokio::process::Command;
-
-        // Check if repository uses LFS by looking for .gitattributes with "filter=lfs"
-        let gitattributes_path = repo_path.join(".gitattributes");
-
-        let uses_lfs = if gitattributes_path.exists() {
-            tokio::fs::read_to_string(&gitattributes_path)
-                .await
-                .map(|content| content.contains("filter=lfs"))
-                .unwrap_or(false)
-        } else {
-            false
-        };
-
-        if !uses_lfs {
-            tracing::debug!("Repository does not use Git LFS, skipping LFS fetch");
-            return Ok(());
-        }
-
-        tracing::info!("Repository uses Git LFS, fetching LFS files (this may take a while for large files)...");
-        println!("📥 Downloading LFS files... (this may take a while for large models)");
-
-        // Run git lfs pull - it shows progress by default when stdout is a TTY
-        let mut child = Command::new("git")
-            .args(["lfs", "pull"])
-            .current_dir(repo_path)
-            .stdout(std::process::Stdio::inherit())  // Show progress to user
-            .stderr(std::process::Stdio::inherit())  // Show errors to user
-            .spawn()
-            .map_err(|e| Git2DBError::internal(format!("Failed to run 'git lfs pull': {}", e)))?;
-
-        let status = child.wait().await
-            .map_err(|e| Git2DBError::internal(format!("Failed to wait for 'git lfs pull': {}", e)))?;
-
-        if !status.success() {
-            tracing::warn!("git lfs pull failed with exit code: {:?}", status.code());
-            return Err(Git2DBError::internal(format!(
-                "git lfs pull failed with exit code: {:?}",
-                status.code()
-            )));
-        }
-
-        tracing::info!("Successfully fetched LFS files");
-        Ok(())
     }
 }
 

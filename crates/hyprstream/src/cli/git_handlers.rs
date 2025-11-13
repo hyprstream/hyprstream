@@ -27,13 +27,21 @@ pub async fn handle_branch(
     let handle = registry.repo(&repo_id)?;
     handle.branch().create(branch_name, from_ref.as_deref()).await?;
 
-    println!("✓ Created branch {} for model {}", branch_name, model);
+    println!("✓ Created branch {}", branch_name);
 
-    if let Some(from) = from_ref {
+    if let Some(ref from) = from_ref {
         println!("  Branch created from: {}", from);
     }
 
-    // Branch created successfully
+    // Create worktree for the branch
+    let worktree_path = storage.create_worktree(&model_ref, branch_name).await?;
+    println!("✓ Created worktree at {}", worktree_path.display());
+
+    // Show helpful next steps
+    println!("\n→ Next steps:");
+    println!("  cd {}", worktree_path.display());
+    println!("  hyprstream status {}:{}", model, branch_name);
+    println!("  hyprstream lt {}:{} --adapter my-adapter", model, branch_name);
 
     Ok(())
 }
@@ -207,6 +215,7 @@ fn print_model_status(model_name: &str, status: &git2db::RepositoryStatus, verbo
 pub async fn handle_lora_train(
     storage: &ModelStorage,
     model_ref_str: &str,
+    branch_name: Option<String>,
     adapter_name: Option<String>,
     index: Option<u32>,
     rank: Option<u32>,
@@ -216,33 +225,138 @@ pub async fn handle_lora_train(
     data: Option<String>,
     interactive: bool,
     config: Option<String>,
+    auto_commit: bool,
 ) -> Result<()> {
     let model_ref = ModelRef::parse(model_ref_str)?;
 
-    // Check that we're on a branch (not detached HEAD)
-    let status = storage.status(&model_ref).await?;
+    // WORKFLOW 2: New branch + worktree for isolated training
+    if let Some(new_branch) = branch_name {
+        info!("Creating isolated training environment: branch {} from {}", new_branch, model_ref.git_ref.display_name());
 
-    if status.branch.is_none()
-    {
-        println!("Warning: Training on detached HEAD");
-        println!("Consider creating a branch first:");
-        println!(
-            "  hyprstream branch {} training/experiment",
-            model_ref.model
-        );
+        // 1. Create branch from model_ref's git_ref
+        let repo_id = storage.resolve_repo_id(&model_ref)?;
+        let registry = storage.registry().await;
+        let handle = registry.repo(&repo_id)?;
+
+        let from_ref = model_ref.git_ref.to_ref_string();
+        handle.branch().create(&new_branch, from_ref.as_deref()).await?;
+
+        println!("✓ Created branch {} from {}", new_branch, model_ref.git_ref.display_name());
+
+        // 2. Create worktree for new branch
+        let worktree_path = storage.create_worktree(&model_ref, &new_branch).await?;
+        println!("✓ Created worktree at {}", worktree_path.display());
+
+        // 3. Train adapter in worktree
+        let adapter_manager = crate::storage::AdapterManager::new(&worktree_path);
+        adapter_manager.ensure_adapters_dir()?;
+
+        let adapter_base_name = adapter_name.as_deref().unwrap_or("default");
+        let indexed_adapter_name = adapter_manager.create_indexed_name(adapter_base_name, index)?;
+
+        println!("\n→ Training adapter {} in isolated worktree", indexed_adapter_name);
+
+        // Create adapter configuration
+        let adapter_config = crate::storage::AdapterConfig {
+            rank: rank.unwrap_or(16),
+            alpha: 32.0,
+            learning_rate: learning_rate.unwrap_or(1e-4) as f64,
+            batch_size: batch_size.unwrap_or(4),
+            epochs: epochs.unwrap_or(10),
+            model_ref: format!("{}:{}", model_ref.model, new_branch),
+            training_data: data.clone(),
+            ..Default::default()
+        };
+
+        // Load model and train
+        let config = crate::config::RuntimeConfig::default();
+        let mut engine = crate::runtime::TorchEngine::new(config)?;
+        crate::runtime::RuntimeEngine::load_model(&mut engine, &worktree_path).await?;
+
+        let lora_config = crate::lora::LoRAConfig {
+            rank: adapter_config.rank as usize,
+            alpha: adapter_config.alpha,
+            dropout: 0.1,
+            target_modules: vec![
+                "q_proj".to_string(),
+                "k_proj".to_string(),
+                "v_proj".to_string(),
+                "o_proj".to_string(),
+                "gate_proj".to_string(),
+                "up_proj".to_string(),
+                "down_proj".to_string(),
+            ],
+            learning_rate: adapter_config.learning_rate as f32,
+        };
+
+        engine.create_lora(lora_config)?;
+
+        // Save adapter
+        let adapter_path = adapter_manager
+            .adapters_dir
+            .join(format!("{}.safetensors", indexed_adapter_name));
+        engine.save_lora_weights(adapter_path.to_str().unwrap())?;
+
+        let config_path = adapter_manager
+            .adapters_dir
+            .join(format!("{}.config.json", indexed_adapter_name));
+        let config_json = serde_json::to_string_pretty(&adapter_config)?;
+        std::fs::write(&config_path, config_json)?;
+
+        println!("\n✓ Initialized adapter: adapters/{}.safetensors", indexed_adapter_name);
+        println!("✓ Created config: adapters/{}.config.json", indexed_adapter_name);
+
+        // 4. Auto-commit if requested
+        if auto_commit {
+            println!("\n→ Committing adapter to branch {}...", new_branch);
+            handle.staging().add_all().await?;
+            let commit_msg = format!("Add {} adapter\n\nTrained on branch {} with rank={}",
+                indexed_adapter_name, new_branch, adapter_config.rank);
+            let commit_oid = handle.commit(&commit_msg).await?;
+            println!("✓ Committed adapter: {}", commit_oid);
+        }
+
+        println!("\n✓ Isolated training complete!");
+        println!("\n→ Next steps:");
+        println!("  cd {}", worktree_path.display());
+        println!("  hyprstream status {}:{}", model_ref.model, new_branch);
+        if !auto_commit {
+            println!("  hyprstream commit {}:{} -m \"Add {} adapter\"", model_ref.model, new_branch, indexed_adapter_name);
+        }
+
+        return Ok(());
     }
 
-    println!(
-        "Starting LoRA adapter initialization for {}",
-        model_ref
-    );
-    println!(
-        "Current branch: {}",
-        status.branch.as_deref().unwrap_or("detached")
-    );
+    // WORKFLOW 1: Train on existing worktree
 
-    // Get model path and create adapter manager
-    let model_path = storage.get_model_path(&model_ref).await?;
+    // Verify worktree exists for the specified branch
+    let branch_name = match &model_ref.git_ref {
+        git2db::GitRef::Branch(name) => name.clone(),
+        git2db::GitRef::DefaultBranch => {
+            let base_ref = ModelRef::new(model_ref.model.clone());
+            storage.get_default_branch(&base_ref).await?
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "LoRA training requires a branch reference. Use model:branch format (e.g., {}:main)",
+                model_ref.model
+            ));
+        }
+    };
+
+    // Get worktree path (this verifies it exists)
+    let model_path = storage.get_worktree_path(&model_ref, &branch_name).await
+        .map_err(|e| anyhow::anyhow!(
+            "Worktree '{}' does not exist for model '{}'. Create it first with:\n  hyprstream branch {} {}\nError: {}",
+            branch_name, model_ref.model, model_ref.model, branch_name, e
+        ))?;
+
+    println!(
+        "Starting LoRA adapter initialization for {}:{}",
+        model_ref.model, branch_name
+    );
+    println!("Worktree: {}", model_path.display());
+
     let adapter_manager = crate::storage::AdapterManager::new(&model_path);
 
     // Determine adapter name and create indexed name
@@ -264,11 +378,7 @@ pub async fn handle_lora_train(
     // Add metadata
     adapter_config.metadata.insert(
         "branch".to_string(),
-        status
-            .branch
-            .as_deref()
-            .unwrap_or("detached")
-            .to_string(),
+        branch_name.clone(),
     );
     if interactive {
         adapter_config
@@ -391,6 +501,7 @@ pub async fn handle_list(
     tag: Option<String>,
     dirty: bool,
     verbose: bool,
+    worktrees: bool,
 ) -> Result<()> {
     info!("Listing models");
 
@@ -528,6 +639,32 @@ pub async fn handle_list(
                 "{:<30} {:<15} {:<8} {:<6} {:<10}",
                 model_ref.model, git_ref, commit, status, size_str
             );
+
+            // Show worktrees if --worktrees flag is set
+            if worktrees {
+                match storage.list_worktrees_with_metadata(&model_ref).await {
+                    Ok(wt_list) if !wt_list.is_empty() => {
+                        for (wt_name, meta_opt) in wt_list {
+                            if let Some(meta) = meta_opt {
+                                let age_str = crate::storage::format_duration(meta.age());
+                                let saved_str = meta.space_saved_human();
+                                println!(
+                                    "  ├── {} ({}, {}, {} ago)",
+                                    wt_name, meta.storage_driver, saved_str, age_str
+                                );
+                            } else {
+                                println!("  ├── {} (no metadata)", wt_name);
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        // No worktrees
+                    }
+                    Err(e) => {
+                        tracing::debug!("Failed to list worktrees for {}: {}", model_ref.model, e);
+                    }
+                }
+            }
         }
 
         if models_with_git.is_empty() {

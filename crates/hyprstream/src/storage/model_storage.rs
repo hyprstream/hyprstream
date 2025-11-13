@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use dashmap::DashMap;
-use git2db::{Git2DB, RepoId};
+use git2db::{Git2DB, GitRef, RepoId};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -131,56 +131,126 @@ impl ModelStorage {
         Ok(worktree_path)
     }
 
-    /// Get default worktree path (main or master)
+    /// Get worktree path for the model reference
+    /// If the model_ref specifies a branch, returns that branch's worktree path.
+    /// Otherwise, returns the default branch worktree path.
     pub async fn get_model_path(&self, model_ref: &ModelRef) -> Result<PathBuf> {
-        // For compatibility, return the default worktree path
-        let _bare_repo_path = self.get_bare_repo_path(model_ref).await?;
+        // Resolve to branch name (avoiding unnecessary clones)
+        let branch = match &model_ref.git_ref {
+            GitRef::Branch(ref name) => name.as_str(),
+            GitRef::DefaultBranch | _ => {
+                if !matches!(model_ref.git_ref, GitRef::DefaultBranch) {
+                    tracing::warn!(
+                        "Model reference specifies non-branch git ref {:?}, using default branch",
+                        model_ref.git_ref
+                    );
+                }
+                // Need to get default branch (returns owned String)
+                return self.get_worktree_path(
+                    model_ref,
+                    &self.get_default_branch(model_ref).await?
+                ).await;
+            }
+        };
 
-        // Try to detect the default branch
-        let default_branch = self.get_default_branch(model_ref).await?;
-
-        self.get_worktree_path(model_ref, &default_branch).await
+        self.get_worktree_path(model_ref, branch).await
     }
 
-    /// List all models
+    /// List all models as worktree references (model:branch format)
+    ///
+    /// This returns all available worktrees across all models, formatted as
+    /// "model:branch" references. Base models without explicit branches are not included.
     pub async fn list_models(&self) -> Result<Vec<(ModelRef, ModelMetadata)>> {
         let mut result = Vec::new();
         let registry = self.registry.read().await;
 
         for tracked in registry.list() {
             if let Some(name) = &tracked.name {
-                let model_ref = ModelRef::new(name.clone());
+                let base_ref = ModelRef::new(name.clone());
 
-                // Calculate size if model exists
-                let size_bytes = if let Ok(handle) = registry.repo(&tracked.id) {
-                    if let Ok(model_path) = handle.worktree() {
-                        if model_path.exists() {
-                            Self::calculate_dir_size(model_path).ok()
-                        } else {
-                            None
+                // Enumerate all worktrees for this model
+                match self.list_worktrees_with_metadata(&base_ref).await {
+                    Ok(worktrees) => {
+                        for (branch_name, wt_meta_opt) in worktrees {
+                            // Create model:branch reference
+                            let model_ref = ModelRef::with_ref(
+                                name.clone(),
+                                git2db::GitRef::Branch(branch_name.clone())
+                            );
+
+                            // Calculate size from worktree path
+                            let worktree_path = self.get_worktree_path(&base_ref, &branch_name).await.ok();
+                            let size_bytes = if let Some(path) = &worktree_path {
+                                if path.exists() {
+                                    Self::calculate_dir_size(path).ok()
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+
+                            // Build metadata with worktree info
+                            let mut metadata = ModelMetadata {
+                                name: name.clone(),
+                                display_name: Some(format!("{}:{}", name, branch_name)),
+                                model_type: "worktree".to_string(),
+                                created_at: wt_meta_opt.as_ref()
+                                    .map(|m| m.created_at.timestamp())
+                                    .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+                                updated_at: chrono::Utc::now().timestamp(),
+                                size_bytes,
+                                tags: vec![],
+                            };
+
+                            // Enrich with worktree metadata
+                            if let Some(wt_meta) = wt_meta_opt {
+                                // Add storage driver info
+                                metadata.tags.push(format!("driver:{}", wt_meta.storage_driver));
+                                if let Some(backend) = &wt_meta.backend {
+                                    metadata.tags.push(format!("backend:{}", backend));
+                                }
+
+                                // Add space savings info
+                                if let Some(saved) = wt_meta.space_saved_bytes {
+                                    metadata.tags.push(format!("saved:{}", Self::format_bytes(saved)));
+                                }
+
+                                // Add age info
+                                let age = super::format_duration(wt_meta.age());
+                                metadata.tags.push(format!("age:{}", age));
+                            }
+
+                            result.push((model_ref, metadata));
                         }
-                    } else {
-                        None
                     }
-                } else {
-                    None
-                };
-
-                let metadata = ModelMetadata {
-                    name: name.clone(),
-                    display_name: Some(name.clone()),
-                    model_type: "base".to_string(),
-                    created_at: chrono::Utc::now().timestamp(),
-                    updated_at: chrono::Utc::now().timestamp(),
-                    size_bytes,
-                    tags: vec![],
-                };
-
-                result.push((model_ref, metadata));
+                    Err(e) => {
+                        tracing::warn!("Failed to list worktrees for model {}: {}", name, e);
+                        // Continue with other models
+                    }
+                }
             }
         }
 
         Ok(result)
+    }
+
+    /// Helper function to format bytes as human-readable string
+    fn format_bytes(bytes: u64) -> String {
+        const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+        let mut size = bytes as f64;
+        let mut unit_idx = 0;
+
+        while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
+            size /= 1024.0;
+            unit_idx += 1;
+        }
+
+        if unit_idx == 0 {
+            format!("{} {}", bytes, UNITS[unit_idx])
+        } else {
+            format!("{:.1} {}", size, UNITS[unit_idx])
+        }
     }
 
     /// Calculate directory size
@@ -336,12 +406,53 @@ impl ModelStorage {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Create the worktree
-        git2db::GitManager::global()
+        // ATOMIC OPERATION: Create worktree with metadata - rollback on any failure
+        tracing::info!(
+            "Creating worktree for {} at {} (branch: {})",
+            model_ref.model,
+            worktree_path.display(),
+            branch
+        );
+
+        // Create the worktree (this already has rollback for LFS failures)
+        let handle = git2db::GitManager::global()
             .create_worktree(&bare_repo_path, &worktree_path, branch)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create worktree: {}", e))?;
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to create worktree at {}: {}", worktree_path.display(), e)
+            })?;
 
+        // Get worktree metadata from handle
+        let wt_metadata = handle.metadata();
+
+        // Create and save worktree metadata
+        let mut metadata = super::WorktreeMetadata::new(
+            branch.to_string(),
+            model_ref.git_ref.to_ref_string(),
+            wt_metadata.strategy_name.clone(),
+        );
+
+        // Add backend info and space savings from git2db handle
+        metadata.backend = wt_metadata.backend_info;
+        metadata.space_saved_bytes = wt_metadata.space_saved_bytes;
+
+        // ATOMIC: Save metadata - rollback worktree on failure
+        if let Err(e) = metadata.save(&worktree_path) {
+            tracing::error!("Failed to save worktree metadata: {}", e);
+            tracing::info!("Rolling back worktree creation due to metadata save failure");
+
+            // ROLLBACK: Clean up the worktree
+            handle.cleanup().unwrap_or_else(|cleanup_err| {
+                tracing::error!("Failed to cleanup worktree during rollback: {}", cleanup_err);
+            });
+
+            return Err(anyhow::anyhow!(
+                "Failed to save worktree metadata: {}. Worktree has been rolled back.",
+                e
+            ));
+        }
+
+        tracing::info!("Successfully created worktree at {}", worktree_path.display());
         Ok(worktree_path)
     }
 
@@ -363,7 +474,47 @@ impl ModelStorage {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
                 if let Some(name) = entry.file_name().to_str() {
+                    // Skip hidden directories (starting with .)
+                    if name.starts_with('.') {
+                        continue;
+                    }
                     worktrees.push(name.to_string());
+                }
+            }
+        }
+
+        Ok(worktrees)
+    }
+
+    /// List all worktrees for a model with metadata
+    pub async fn list_worktrees_with_metadata(
+        &self,
+        model_ref: &ModelRef,
+    ) -> Result<Vec<(String, Option<super::WorktreeMetadata>)>> {
+        let bare_repo_path = self.get_bare_repo_path(model_ref).await?;
+
+        // Navigate to worktrees directory
+        let repo_dir = bare_repo_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Invalid bare repo path"))?;
+        let worktrees_dir = repo_dir.join("worktrees");
+
+        if !worktrees_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut worktrees = Vec::new();
+        for entry in std::fs::read_dir(worktrees_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    // Skip hidden directories (starting with .)
+                    if name.starts_with('.') {
+                        continue;
+                    }
+                    let worktree_path = entry.path();
+                    let metadata = super::WorktreeMetadata::try_load(&worktree_path);
+                    worktrees.push((name.to_string(), metadata));
                 }
             }
         }

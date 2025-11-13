@@ -16,6 +16,7 @@ pub mod model_ref;
 pub mod model_storage;
 pub mod operations;
 pub mod paths;
+pub mod worktree_metadata;
 
 // Re-export types for backward compatibility
 pub use adapter_manager::{AdapterConfig, AdapterInfo, AdapterManager};
@@ -26,6 +27,7 @@ pub use model_ref::{validate_model_name, GitRef, ModelRef};
 pub use model_storage::{ModelId, ModelMetadata, ModelStorage};
 pub use operations::CloneOptions;
 pub use paths::StoragePaths;
+pub use worktree_metadata::{format_duration, WorktreeMetadata};
 
 // Compatibility types (moved from model_registry)
 /// Options for checkout operations
