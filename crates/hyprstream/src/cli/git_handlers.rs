@@ -129,44 +129,223 @@ pub async fn handle_status(
 /// Handle commit command
 pub async fn handle_commit(
     storage: &ModelStorage,
-    model: &str,
+    model_ref_str: &str,
     message: &str,
-    stage_all: bool,
+    all: bool,
+    all_untracked: bool,
+    amend: bool,
+    author: Option<String>,
+    author_name: Option<String>,
+    author_email: Option<String>,
+    allow_empty: bool,
+    dry_run: bool,
+    verbose: bool,
 ) -> Result<()> {
-    info!("Committing changes to model {}", model);
+    info!("Committing changes to model {}", model_ref_str);
 
-    let model_ref = ModelRef::parse(model)?;
+    // Parse model reference to detect branch
+    let model_ref = ModelRef::parse(model_ref_str)?;
 
-    // Check status first
-    let status = storage.status(&model_ref).await?;
+    // Determine which branch to commit to
+    let branch_name = match &model_ref.git_ref {
+        git2db::GitRef::Branch(name) => name.clone(),
+        git2db::GitRef::DefaultBranch => {
+            let base_ref = ModelRef::new(model_ref.model.clone());
+            storage.get_default_branch(&base_ref).await?
+        }
+        git2db::GitRef::Tag(tag) => {
+            anyhow::bail!(
+                "Cannot commit to a tag reference. Tags are immutable.\nTag: {}\nUse a branch instead: {}:main",
+                tag, model_ref.model
+            );
+        }
+        git2db::GitRef::Commit(oid) => {
+            anyhow::bail!(
+                "Cannot commit to a detached HEAD (commit reference).\nCommit: {}\nCheckout a branch first: hyprstream checkout {}:main",
+                oid, model_ref.model
+            );
+        }
+        git2db::GitRef::Revspec(spec) => {
+            anyhow::bail!(
+                "Cannot commit to a revspec reference. Revspecs are for querying history.\nRevspec: {}\nUse a branch instead: {}:main",
+                spec, model_ref.model
+            );
+        }
+    };
 
-    if status.is_clean {
-        println!("No changes to commit for model {}", model);
+    // Get worktree path (this verifies it exists)
+    let worktree_path = storage.get_worktree_path(&model_ref, &branch_name).await
+        .map_err(|e| anyhow::anyhow!(
+            "Worktree '{}' does not exist for model '{}'.\n\nCreate it first with:\n  hyprstream branch {} {}\n\nError: {}",
+            branch_name, model_ref.model, model_ref.model, branch_name, e
+        ))?;
+
+    info!("Operating on worktree: {}", worktree_path.display());
+
+    // Check for changes if not allowing empty commits
+    // Open the worktree repository directly to check status
+    let worktree_repo = git2::Repository::open(&worktree_path)?;
+    let statuses = worktree_repo.statuses(None)?;
+    let has_changes = !statuses.is_empty();
+
+    if !allow_empty && !amend && !has_changes && !all_untracked {
+        println!("No changes to commit for {}:{}", model_ref.model, branch_name);
+        println!("\nUse --allow-empty to create a commit without changes");
         return Ok(());
     }
 
     // Show what will be committed
-    if stage_all {
-        println!("Staging all changes:");
-        for file_path in &status.modified_files {
-            println!("  M {}", file_path.display());
+    if verbose || dry_run {
+        println!("\n→ Changes to be committed:");
+
+        if all || all_untracked {
+            // Show all working tree changes
+            for entry in statuses.iter() {
+                if let Some(path) = entry.path() {
+                    let status_char = if entry.status().contains(git2::Status::WT_NEW) {
+                        "??"
+                    } else if entry.status().contains(git2::Status::WT_MODIFIED) {
+                        "M"
+                    } else if entry.status().contains(git2::Status::WT_DELETED) {
+                        "D"
+                    } else {
+                        "?"
+                    };
+                    println!("  {} {}", status_char, path);
+                }
+            }
+        } else {
+            // Show only staged files (index)
+            for entry in statuses.iter() {
+                if let Some(path) = entry.path() {
+                    let status = entry.status();
+                    if status.intersects(git2::Status::INDEX_NEW | git2::Status::INDEX_MODIFIED | git2::Status::INDEX_DELETED | git2::Status::INDEX_RENAMED) {
+                        let status_char = if status.contains(git2::Status::INDEX_NEW) {
+                            "A"
+                        } else if status.contains(git2::Status::INDEX_DELETED) {
+                            "D"
+                        } else if status.contains(git2::Status::INDEX_RENAMED) {
+                            "R"
+                        } else if status.contains(git2::Status::INDEX_MODIFIED) {
+                            "M"
+                        } else {
+                            "??"
+                        };
+                        println!("  {} {}", status_char, path);
+                    }
+                }
+            }
         }
+        println!();
     }
 
-    // Use git2db API for commit
-    let repo_id = storage.resolve_repo_id(&model_ref)?;
-    let registry = storage.registry().await;
-    let handle = registry.repo(&repo_id)?;
+    // Dry run - show what would be committed
+    if dry_run {
+        println!("→ Dry run mode - no commit will be created\n");
+        println!("Would commit to: {}:{}", model_ref.model, branch_name);
+        println!("Message: {}", message);
 
-    if stage_all {
-        handle.staging().add_all().await?;
+        if let Some(ref auth) = author {
+            println!("Author: {}", auth);
+        } else if author_name.is_some() || author_email.is_some() {
+            println!("Author: {} <{}>",
+                author_name.as_deref().unwrap_or("default"),
+                author_email.as_deref().unwrap_or("default"));
+        }
+
+        if amend {
+            println!("Mode: Amend previous commit");
+        }
+
+        return Ok(());
     }
 
-    let commit_oid = handle.commit(message).await?;
+    // Stage files based on flags
+    // We need to work with the worktree repository directly, not the bare repo
+    let mut index = worktree_repo.index()?;
 
-    println!("✓ Committed changes to {}", model);
+    if all_untracked {
+        // Stage all files including untracked (git add -A)
+        info!("Staging all files including untracked");
+        index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)?;
+    } else if all {
+        // Stage all tracked files only (git add -u)
+        info!("Staging all tracked files");
+        index.update_all(["*"].iter(), None)?;
+    }
+
+    index.write()?;
+
+    // Perform commit operation in worktree
+    let commit_oid = if amend {
+        // Amend the previous commit
+        info!("Amending previous commit");
+
+        let tree_id = index.write_tree()?;
+        let tree = worktree_repo.find_tree(tree_id)?;
+        let head = worktree_repo.head()?;
+        let commit_to_amend = head.peel_to_commit()?;
+
+        // Use commit_amend to properly amend
+        commit_to_amend.amend(
+            Some("HEAD"),               // Update HEAD
+            None,                        // Keep original author
+            None,                        // Keep committer timestamp (update by default)
+            None,                        // Keep encoding
+            Some(message),              // New message
+            Some(&tree),                // New tree
+        )?
+    } else {
+        // Create new commit
+        let tree_id = index.write_tree()?;
+        let tree = worktree_repo.find_tree(tree_id)?;
+        let head = worktree_repo.head()?;
+        let parent_commit = head.peel_to_commit()?;
+
+        // Parse author if provided
+        let signature = if let Some(author_str) = author {
+            // Parse "Name <email>" format
+            let re = regex::Regex::new(r"^(.+?)\s*<(.+?)>$")?;
+            if let Some(captures) = re.captures(&author_str) {
+                let name = captures.get(1).unwrap().as_str().trim();
+                let email = captures.get(2).unwrap().as_str().trim();
+                git2::Signature::now(name, email)?
+            } else {
+                anyhow::bail!(
+                    "Invalid author format. Expected: \"Name <email>\"\nGot: {}",
+                    author_str
+                );
+            }
+        } else if author_name.is_some() || author_email.is_some() {
+            // Use author-name and author-email if provided
+            let name = author_name.as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--author-name required when using --author-email"))?;
+            let email = author_email.as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--author-email required when using --author-name"))?;
+            git2::Signature::now(name, email)?
+        } else {
+            // Default signature from git config
+            worktree_repo.signature()?
+        };
+
+        worktree_repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &[&parent_commit],
+        )?
+    };
+
+    // Success output
+    println!("✓ Committed changes to {}:{}", model_ref.model, branch_name);
     println!("  Message: {}", message);
     println!("  Commit: {}", commit_oid);
+
+    if amend {
+        println!("  ⚠️  Previous commit amended");
+    }
 
     Ok(())
 }
@@ -222,10 +401,7 @@ pub async fn handle_lora_train(
     learning_rate: Option<f32>,
     batch_size: Option<usize>,
     epochs: Option<usize>,
-    data: Option<String>,
-    interactive: bool,
     config: Option<String>,
-    auto_commit: bool,
 ) -> Result<()> {
     let model_ref = ModelRef::parse(model_ref_str)?;
 
@@ -264,7 +440,7 @@ pub async fn handle_lora_train(
             batch_size: batch_size.unwrap_or(4),
             epochs: epochs.unwrap_or(10),
             model_ref: format!("{}:{}", model_ref.model, new_branch),
-            training_data: data.clone(),
+            training_data: None,
             ..Default::default()
         };
 
@@ -306,23 +482,11 @@ pub async fn handle_lora_train(
         println!("\n✓ Initialized adapter: adapters/{}.safetensors", indexed_adapter_name);
         println!("✓ Created config: adapters/{}.config.json", indexed_adapter_name);
 
-        // 4. Auto-commit if requested
-        if auto_commit {
-            println!("\n→ Committing adapter to branch {}...", new_branch);
-            handle.staging().add_all().await?;
-            let commit_msg = format!("Add {} adapter\n\nTrained on branch {} with rank={}",
-                indexed_adapter_name, new_branch, adapter_config.rank);
-            let commit_oid = handle.commit(&commit_msg).await?;
-            println!("✓ Committed adapter: {}", commit_oid);
-        }
-
         println!("\n✓ Isolated training complete!");
         println!("\n→ Next steps:");
         println!("  cd {}", worktree_path.display());
         println!("  hyprstream status {}:{}", model_ref.model, new_branch);
-        if !auto_commit {
-            println!("  hyprstream commit {}:{} -m \"Add {} adapter\"", model_ref.model, new_branch, indexed_adapter_name);
-        }
+        println!("  hyprstream commit {}:{} -a -m \"Add {} adapter\"", model_ref.model, new_branch, indexed_adapter_name);
 
         return Ok(());
     }
@@ -371,7 +535,7 @@ pub async fn handle_lora_train(
         batch_size: batch_size.unwrap_or(4),
         epochs: epochs.unwrap_or(10),
         model_ref: model_ref.to_string(),
-        training_data: data.clone(),
+        training_data: None,
         ..Default::default()
     };
 
@@ -380,11 +544,6 @@ pub async fn handle_lora_train(
         "branch".to_string(),
         branch_name.clone(),
     );
-    if interactive {
-        adapter_config
-            .metadata
-            .insert("mode".to_string(), "interactive".to_string());
-    }
 
     // Display configuration
     println!("\n→ Adapter configuration:");
@@ -401,14 +560,6 @@ pub async fn handle_lora_train(
         for adapter in &existing_adapters {
             println!("  [{}] {}", adapter.index, adapter.name);
         }
-    }
-
-    if interactive {
-        println!("\n  Mode: Interactive learning");
-    } else if let Some(data_file) = &data {
-        println!("\n  Training data: {}", data_file);
-    } else if config.is_none() {
-        println!("\n  Mode: Initialization only (no training data)");
     }
 
     if let Some(cfg) = &config {
@@ -466,21 +617,6 @@ pub async fn handle_lora_train(
         "✓ Created config: adapters/{}.config.json",
         indexed_adapter_name
     );
-
-    if interactive {
-        println!("\n→ Interactive mode enabled");
-        println!("  Start an inference session to begin learning:");
-        println!(
-            "  hyprstream infer {} --prompt \"...\" --learn",
-            model_ref.model
-        );
-    } else if data.is_some() {
-        println!("\n→ Batch training ready");
-        println!(
-            "  Run training with: hyprstream train {} --adapter {}",
-            model_ref.model, indexed_adapter_name
-        );
-    }
 
     println!("\n✓ Adapter initialization complete!");
     println!("\n→ Next steps:");

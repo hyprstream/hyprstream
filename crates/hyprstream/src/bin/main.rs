@@ -403,6 +403,14 @@ fn main() -> Result<()> {
             model,
             message,
             all,
+            all_untracked,
+            amend,
+            author,
+            author_name,
+            author_email,
+            allow_empty,
+            dry_run,
+            verbose,
         } => {
             let ctx = ctx.clone();
             with_runtime(
@@ -412,7 +420,21 @@ fn main() -> Result<()> {
                 },
                 || async move {
                     let storage = ctx.storage().await?;
-                    handle_commit(storage, &model, &message, all).await
+                    handle_commit(
+                        storage,
+                        &model,
+                        &message,
+                        all,
+                        all_untracked,
+                        amend,
+                        author,
+                        author_name,
+                        author_email,
+                        allow_empty,
+                        dry_run,
+                        verbose,
+                    )
+                    .await
                 },
             )?;
         }
@@ -426,10 +448,7 @@ fn main() -> Result<()> {
             learning_rate,
             batch_size,
             epochs,
-            data,
-            interactive,
             config,
-            commit,
         } => {
             let ctx = ctx.clone();
             with_runtime(
@@ -449,30 +468,11 @@ fn main() -> Result<()> {
                         learning_rate,
                         batch_size,
                         epochs,
-                        data,
-                        interactive,
                         config,
-                        commit,
                     )
                     .await
                 },
             )?;
-        }
-
-        Commands::FineTune { model, config } => {
-            anyhow::bail!(
-                "Fine-tuning is not yet implemented. Model: {}, Config: {:?}",
-                model,
-                config
-            );
-        }
-
-        Commands::PreTrain { model, config } => {
-            anyhow::bail!(
-                "Pre-training is not yet implemented. Model: {}, Config: {:?}",
-                model,
-                config
-            );
         }
 
         Commands::Infer {
