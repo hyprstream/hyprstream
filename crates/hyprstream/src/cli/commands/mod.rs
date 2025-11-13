@@ -51,14 +51,48 @@ pub enum Commands {
 
     /// Record changes to the repository
     Commit {
-        /// Model name
+        /// Model reference (e.g., "model:branch")
         model: String,
+
         /// Commit message
         #[arg(short, long)]
         message: String,
+
         /// Stage all tracked files
         #[arg(short = 'a', long)]
         all: bool,
+
+        /// Stage all files including untracked
+        #[arg(short = 'A', long)]
+        all_untracked: bool,
+
+        /// Amend the previous commit
+        #[arg(long)]
+        amend: bool,
+
+        /// Override commit author (format: "Name <email>")
+        #[arg(long)]
+        author: Option<String>,
+
+        /// Override author name (use with --author-email)
+        #[arg(long)]
+        author_name: Option<String>,
+
+        /// Override author email (use with --author-name)
+        #[arg(long)]
+        author_email: Option<String>,
+
+        /// Allow empty commits (no changes)
+        #[arg(long)]
+        allow_empty: bool,
+
+        /// Show what would be committed without committing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Show diff of changes being committed
+        #[arg(short = 'v', long)]
+        verbose: bool,
     },
 
     /// LoRA training (shorthand for 'lora train')
@@ -96,39 +130,7 @@ pub enum Commands {
         #[arg(long, short = 'e')]
         epochs: Option<usize>,
 
-        /// Training data file (JSONL format)
-        #[arg(long)]
-        data: Option<String>,
-
-        /// Enable interactive learning mode
-        #[arg(long)]
-        interactive: bool,
-
         /// Training configuration file (overrides CLI args)
-        #[arg(long)]
-        config: Option<String>,
-
-        /// Auto-commit adapter after training (default: true when --branch used)
-        #[arg(long)]
-        commit: bool,
-    },
-
-    /// Fine-tuning
-    #[command(name = "ft")]
-    FineTune {
-        /// Model reference
-        model: String,
-        /// Training configuration file
-        #[arg(long)]
-        config: Option<String>,
-    },
-
-    /// Pre-training
-    #[command(name = "pt")]
-    PreTrain {
-        /// Model reference
-        model: String,
-        /// Training configuration file
         #[arg(long)]
         config: Option<String>,
     },
