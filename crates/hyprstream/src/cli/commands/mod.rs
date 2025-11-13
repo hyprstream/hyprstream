@@ -67,6 +67,11 @@ pub enum Commands {
         /// Model reference
         model: String,
 
+        /// Create new branch for isolated training
+        /// Creates a new branch from the model ref and trains in a dedicated worktree
+        #[arg(long, short = 'B')]
+        branch: Option<String>,
+
         /// Adapter name (will be auto-prefixed with index)
         #[arg(long)]
         adapter: Option<String>,
@@ -102,6 +107,10 @@ pub enum Commands {
         /// Training configuration file (overrides CLI args)
         #[arg(long)]
         config: Option<String>,
+
+        /// Auto-commit adapter after training (default: true when --branch used)
+        #[arg(long)]
+        commit: bool,
     },
 
     /// Fine-tuning
@@ -180,6 +189,9 @@ pub enum Commands {
         /// Verbose output with detailed info
         #[arg(short, long)]
         verbose: bool,
+        /// Show worktrees for each model (default: true, use --no-worktrees to hide)
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+        worktrees: bool,
     },
 
     /// Get detailed information about a model
@@ -281,5 +293,52 @@ pub enum Commands {
         /// Remove files only, keep registry entry
         #[arg(long)]
         files_only: bool,
+    },
+
+    /// Worktree management commands
+    Worktree {
+        #[command(subcommand)]
+        command: WorktreeCommand,
+    },
+}
+
+/// Worktree subcommands
+#[derive(Subcommand)]
+pub enum WorktreeCommand {
+    /// List all worktrees for a model
+    List {
+        /// Model name
+        model: String,
+    },
+
+    /// Show detailed information about a worktree
+    Info {
+        /// Model name
+        model: String,
+        /// Branch/worktree name
+        branch: String,
+    },
+
+    /// Remove a worktree
+    Remove {
+        /// Model name
+        model: String,
+        /// Branch/worktree name
+        branch: String,
+        /// Force removal without confirmation
+        #[arg(short, long)]
+        force: bool,
+    },
+
+    /// Prune stale worktrees
+    Prune {
+        /// Model name
+        model: String,
+        /// Days of inactivity before pruning (default: 30)
+        #[arg(long, default_value = "30")]
+        days: u32,
+        /// Dry run - show what would be pruned without removing
+        #[arg(long)]
+        dry_run: bool,
     },
 }

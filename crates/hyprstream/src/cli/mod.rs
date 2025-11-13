@@ -10,6 +10,7 @@ pub mod commands;
 pub mod context;
 pub mod git_handlers;
 pub mod handlers;
+pub mod worktree_handlers;
 
 pub use context::AppContext;
 pub use git_handlers::{
@@ -18,6 +19,9 @@ pub use git_handlers::{
     handle_status,
 };
 pub use handlers::{handle_config, handle_server};
+pub use worktree_handlers::{
+    handle_worktree_info, handle_worktree_list, handle_worktree_prune, handle_worktree_remove,
+};
 
 /// Device preference strategy
 #[derive(Debug, Clone, Copy)]

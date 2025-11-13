@@ -13,7 +13,8 @@ use hyprstream_core::cli::handlers::handle_server;
 use hyprstream_core::cli::{
     handle_branch, handle_checkout, handle_clone, handle_commit, handle_infer, handle_info,
     handle_list, handle_lora_train, handle_merge, handle_pull, handle_push, handle_remove,
-    handle_status, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
+    handle_status, handle_worktree_info, handle_worktree_list, handle_worktree_prune,
+    handle_worktree_remove, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
 };
 use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
@@ -418,6 +419,7 @@ fn main() -> Result<()> {
 
         Commands::LoraTrain {
             model,
+            branch,
             adapter,
             index,
             rank,
@@ -427,6 +429,7 @@ fn main() -> Result<()> {
             data,
             interactive,
             config,
+            commit,
         } => {
             let ctx = ctx.clone();
             with_runtime(
@@ -439,6 +442,7 @@ fn main() -> Result<()> {
                     handle_lora_train(
                         storage,
                         &model,
+                        branch,
                         adapter,
                         index,
                         rank,
@@ -448,6 +452,7 @@ fn main() -> Result<()> {
                         data,
                         interactive,
                         config,
+                        commit,
                     )
                     .await
                 },
@@ -513,6 +518,7 @@ fn main() -> Result<()> {
             tag,
             dirty,
             verbose,
+            worktrees,
         } => {
             let ctx = ctx.clone();
             with_runtime(
@@ -522,7 +528,7 @@ fn main() -> Result<()> {
                 },
                 || async move {
                     let storage = ctx.storage().await?;
-                    handle_list(storage, branch, tag, dirty, verbose).await
+                    handle_list(storage, branch, tag, dirty, verbose, worktrees).await
                 },
             )?;
         }
@@ -655,6 +661,35 @@ fn main() -> Result<()> {
                 || async move {
                     let storage = ctx.storage().await?;
                     handle_remove(storage, &model, force, registry_only, files_only).await
+                },
+            )?;
+        }
+
+        Commands::Worktree { command } => {
+            use hyprstream_core::cli::commands::WorktreeCommand;
+
+            let ctx = ctx.clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    let storage = ctx.storage().await?;
+                    match command {
+                        WorktreeCommand::List { model } => {
+                            handle_worktree_list(storage, &model).await
+                        }
+                        WorktreeCommand::Info { model, branch } => {
+                            handle_worktree_info(storage, &model, &branch).await
+                        }
+                        WorktreeCommand::Remove { model, branch, force } => {
+                            handle_worktree_remove(storage, &model, &branch, force).await
+                        }
+                        WorktreeCommand::Prune { model, days, dry_run } => {
+                            handle_worktree_prune(storage, &model, days, dry_run).await
+                        }
+                    }
                 },
             )?;
         }
