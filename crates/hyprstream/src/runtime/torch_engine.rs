@@ -398,7 +398,7 @@ impl TorchEngine {
             // Get model's configured vocab size
             let model_vocab_size = {
                 let model_info = self.handle_poison(self.model_info.lock())?;
-                model_info.vocab_size as usize
+                model_info.vocab_size
             };
 
             // Apply model-specific tokenizer configuration if model is loaded
@@ -1762,7 +1762,7 @@ impl<'a> TextStream<'a> {
         } else {
             let last_token = self.last_generated.expect("last_generated should be set");
 
-            if self.tokens_generated % 50 == 0 {
+            if self.tokens_generated.is_multiple_of(50) {
                 tracing::debug!(
                     "🔵 KV cache position: {}, tokens_generated: {}, last_token: {}",
                     self.kv_cache_position, self.tokens_generated, last_token
@@ -1981,12 +1981,12 @@ impl<'a> Stream for TextStream<'a> {
                     // Debug info
                     let token_str = if let Ok(guard) = self.engine.tokenizer.lock() {
                         if let Some(ref tok) = *guard {
-                            tok.decode(&[next_token], false).unwrap_or_else(|_| format!("<decode error>"))
+                            tok.decode(&[next_token], false).unwrap_or_else(|_| "<decode error>".to_string())
                         } else {
-                            format!("<no tokenizer>")
+                            "<no tokenizer>".to_string()
                         }
                     } else {
-                        format!("<lock error>")
+                        "<lock error>".to_string()
                     };
 
                     tracing::debug!("Token {} (raw: {:?}) -> buffering (incomplete UTF-8)", next_token, token_str);

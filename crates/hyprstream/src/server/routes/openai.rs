@@ -320,11 +320,11 @@ async fn chat_completions(
 
             let mut response = Json(response).into_response();
             add_no_cache_headers(&mut response);
-            return response;
+            response
         }
         Err(e) => {
             error!("Generation failed: {}", e);
-            return (
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
                     "error": {
@@ -334,7 +334,7 @@ async fn chat_completions(
                     }
                 })),
             )
-                .into_response();
+                .into_response()
         }
     }
 }
@@ -545,7 +545,7 @@ async fn stream_chat(state: ServerState, request: ChatCompletionRequest) -> impl
                 } else {
                     // Send data chunk
                     Ok(axum::response::sse::Event::default()
-                        .data(&serde_json::to_string(&json).unwrap()))
+                        .data(serde_json::to_string(&json).unwrap()))
                 }
             }
             Err(e) => {
@@ -663,10 +663,10 @@ async fn completions(
 
             let mut response = Json(response).into_response();
             add_no_cache_headers(&mut response);
-            return response;
+            response
         }
         Err(e) => {
-            return (
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
                     "error": {
@@ -676,7 +676,7 @@ async fn completions(
                     }
                 })),
             )
-                .into_response();
+                .into_response()
         }
     }
 }

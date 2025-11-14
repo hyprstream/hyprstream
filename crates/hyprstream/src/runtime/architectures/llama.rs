@@ -66,7 +66,7 @@ unsafe impl Sync for LinearProjection {}
 /// Calculate padded vocabulary size to multiple of 64 (for performance optimization)
 #[inline]
 fn calculate_padded_vocab_size(vocab_size: usize) -> usize {
-    ((vocab_size + 63) / 64) * 64
+    vocab_size.div_ceil(64) * 64
 }
 
 /// Llama model configuration
@@ -883,7 +883,7 @@ impl LlamaModel {
             .or_else(|| weights.get("embed_tokens.weight"))
             .map(|w| {
                 let vocab_size = w.size()[0] as usize;
-                let hidden_size = w.size()[1] as i64;
+                let hidden_size = w.size()[1];
 
                 // Pad vocabulary size to multiple of 64 for models that need it
                 let padded_vocab_size = calculate_padded_vocab_size(vocab_size);
@@ -896,7 +896,7 @@ impl LlamaModel {
 
                     // Create padded tensor filled with zeros (embeddings can be zero-initialized)
                     let padded = Tensor::zeros(
-                        &[padded_vocab_size as i64, hidden_size],
+                        [padded_vocab_size as i64, hidden_size],
                         (w.kind(), w.device())
                     );
 
@@ -931,7 +931,7 @@ impl LlamaModel {
             .map(|w| {
                 // LM head is stored as [vocab_size, hidden_size] in HuggingFace
                 let vocab_size = w.size()[0] as usize;
-                let hidden_size = w.size()[1] as i64;
+                let hidden_size = w.size()[1];
 
                 // Pad vocabulary size to multiple of 64 (like SGLang does for Qwen)
                 // This prevents sampling invalid token IDs
@@ -947,7 +947,7 @@ impl LlamaModel {
                     // NOTE: We can't use -1e10 here because this is the weight matrix, not logits
                     // The actual masking needs to happen after the matmul that produces logits
                     let padded = Tensor::zeros(
-                        &[padded_vocab_size as i64, hidden_size],
+                        [padded_vocab_size as i64, hidden_size],
                         (w.kind(), w.device())
                     );
 
@@ -1702,7 +1702,7 @@ impl ModelOperations for LlamaModel {
                     // Get the last dimension (vocab dimension) and mask the padded portion
                     // We need to use narrow + copy to update the values
                     let mask_values = Tensor::full(
-                        &[mask_count],
+                        [mask_count],
                         -1e10_f64,
                         (hidden_states.kind(), hidden_states.device())
                     );

@@ -126,7 +126,7 @@ impl ModelStorage {
 
         let worktrees_dir = repo_dir.join("worktrees");
         // Use canonical branch path conversion
-        let worktree_path = worktrees_dir.join(branch.to_string());
+        let worktree_path = worktrees_dir.join(branch);
 
         Ok(worktree_path)
     }

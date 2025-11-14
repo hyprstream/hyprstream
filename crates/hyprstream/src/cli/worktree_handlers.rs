@@ -27,7 +27,7 @@ pub async fn handle_worktree_list(storage: &ModelStorage, model: &str) -> Result
             let saved_str = meta.space_saved_human();
             let last_access = meta
                 .time_since_last_access()
-                .map(|d| format_duration(d))
+                .map(format_duration)
                 .unwrap_or_else(|| "never".to_string());
 
             println!("  Branch: {}", branch_name);
@@ -204,7 +204,7 @@ pub async fn handle_worktree_prune(
     for (branch_name, meta) in &to_prune {
         let last_access = meta
             .time_since_last_access()
-            .map(|d| format_duration(d))
+            .map(format_duration)
             .unwrap_or_else(|| "unknown".to_string());
         println!("  {} (last accessed {} ago)", branch_name, last_access);
     }
