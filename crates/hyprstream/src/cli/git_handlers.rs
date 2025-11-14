@@ -5,8 +5,8 @@ use crate::config::GenerationRequest;
 // Sampling config now loaded via builder pattern
 use crate::runtime::template_engine::ChatMessage;
 use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
-use crate::storage::{CheckoutOptions, ModelRef, ModelStorage};
-use anyhow::Result;
+use crate::storage::{CheckoutOptions, GitRef, ModelRef, ModelStorage};
+use anyhow::{bail, Result};
 use std::io::{self, Write};
 use tracing::{debug, info};
 
@@ -1585,31 +1585,463 @@ pub async fn handle_pull(
     Ok(())
 }
 
+/// Build git2::MergeOptions from our MergeOptions
+fn build_git2_merge_options(options: &MergeOptions) -> Result<git2::MergeOptions> {
+    let mut merge_opts = git2::MergeOptions::new();
+
+    // Apply strategy-based settings
+    if let Some(strategy) = &options.strategy {
+        match strategy.as_str() {
+            "ours" => {
+                merge_opts.file_favor(git2::FileFavor::Ours);
+            }
+            "theirs" => {
+                merge_opts.file_favor(git2::FileFavor::Theirs);
+            }
+            "recursive" => {
+                // recursive is the default, enable rename detection
+                merge_opts.find_renames(true);
+            }
+            "resolve" => {
+                // Simple two-way merge
+                merge_opts.find_renames(false);
+            }
+            "subtree" => {
+                // Subtree merge - no specific git2 option, but find renames
+                merge_opts.find_renames(true);
+            }
+            "octopus" => {
+                bail!("Octopus strategy (multi-branch merge) not supported for two-branch merges");
+            }
+            _ => {
+                bail!("Unknown merge strategy: '{}'. Supported: ours, theirs, recursive, resolve, subtree", strategy);
+            }
+        }
+    }
+
+    // Apply strategy options (-X options)
+    for opt in &options.strategy_option {
+        match opt.as_str() {
+            "ours" => {
+                merge_opts.file_favor(git2::FileFavor::Ours);
+            }
+            "theirs" => {
+                merge_opts.file_favor(git2::FileFavor::Theirs);
+            }
+            "patience" => {
+                merge_opts.patience(true);
+            }
+            "diff-algorithm=patience" => {
+                merge_opts.patience(true);
+            }
+            "diff-algorithm=minimal" => {
+                merge_opts.minimal(true);
+            }
+            "ignore-space-change" | "ignore-all-space" => {
+                merge_opts.ignore_whitespace_change(true);
+            }
+            "ignore-space-at-eol" => {
+                merge_opts.ignore_whitespace_eol(true);
+            }
+            "ignore-cr-at-eol" => {
+                // git2 doesn't have direct support, but ignore-whitespace-eol covers this
+                merge_opts.ignore_whitespace_eol(true);
+            }
+            "renormalize" => {
+                // Not directly supported in git2, but we can note it
+                if !options.quiet {
+                    eprintln!("Warning: renormalize strategy option not fully supported");
+                }
+            }
+            "no-renames" => {
+                merge_opts.find_renames(false);
+            }
+            "find-renames" => {
+                merge_opts.find_renames(true);
+            }
+            opt if opt.starts_with("find-renames=") => {
+                merge_opts.find_renames(true);
+                if let Some(threshold_str) = opt.strip_prefix("find-renames=") {
+                    if let Ok(threshold) = threshold_str.parse::<u32>() {
+                        merge_opts.rename_threshold(threshold);
+                    }
+                }
+            }
+            opt if opt.starts_with("rename-threshold=") => {
+                if let Some(threshold_str) = opt.strip_prefix("rename-threshold=") {
+                    if let Ok(threshold) = threshold_str.parse::<u32>() {
+                        merge_opts.rename_threshold(threshold);
+                    }
+                }
+            }
+            opt if opt.starts_with("subtree") => {
+                // Subtree strategy - find renames enabled
+                merge_opts.find_renames(true);
+            }
+            _ => {
+                if !options.quiet {
+                    eprintln!("Warning: unknown or unsupported strategy option: '{}'", opt);
+                }
+            }
+        }
+    }
+
+    // Default: enable rename detection for better merge results
+    if options.strategy.is_none() && options.strategy_option.is_empty() {
+        merge_opts.find_renames(true);
+    }
+
+    Ok(merge_opts)
+}
+
+/// Perform merge operation in a repository
+fn perform_merge(
+    repo: &git2::Repository,
+    source: &str,
+    options: &MergeOptions,
+) -> Result<git2::Oid> {
+    // Resolve source branch reference
+    let source_ref = repo
+        .find_reference(&format!("refs/heads/{}", source))
+        .or_else(|_| repo.find_reference(&format!("refs/remotes/origin/{}", source)))
+        .or_else(|_| repo.find_reference(source))
+        .map_err(|e| anyhow::anyhow!("Source branch '{}' not found: {}", source, e))?;
+
+    let source_commit = source_ref
+        .peel_to_commit()
+        .map_err(|e| anyhow::anyhow!("Failed to resolve source commit: {}", e))?;
+
+    let annotated_commit = repo
+        .find_annotated_commit(source_commit.id())
+        .map_err(|e| anyhow::anyhow!("Failed to create annotated commit: {}", e))?;
+
+    // Perform merge analysis
+    let (merge_analysis, _) = repo
+        .merge_analysis(&[&annotated_commit])
+        .map_err(|e| anyhow::anyhow!("Merge analysis failed: {}", e))?;
+
+    // Already up-to-date
+    if merge_analysis.is_up_to_date() {
+        return Ok(source_commit.id());
+    }
+
+    // Check fast-forward constraints
+    if options.ff_only && !merge_analysis.is_fast_forward() {
+        bail!("Cannot fast-forward - branches have diverged");
+    }
+
+    // Fast-forward merge (if possible and not --no-ff)
+    if merge_analysis.is_fast_forward() && !options.no_ff {
+        let mut head_ref = repo
+            .head()
+            .map_err(|e| anyhow::anyhow!("Failed to get HEAD: {}", e))?;
+
+        head_ref
+            .set_target(source_commit.id(), "Fast-forward merge")
+            .map_err(|e| anyhow::anyhow!("Failed to update HEAD: {}", e))?;
+
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))
+            .map_err(|e| anyhow::anyhow!("Checkout failed: {}", e))?;
+
+        return Ok(source_commit.id());
+    }
+
+    // Build merge options based on strategy and strategy options
+    let mut merge_opts = build_git2_merge_options(options)?;
+
+    // Regular merge (create merge commit)
+    repo.merge(&[&annotated_commit], Some(&mut merge_opts), None)
+        .map_err(|e| anyhow::anyhow!("Merge failed: {}", e))?;
+
+    // Check for conflicts
+    let index = repo
+        .index()
+        .map_err(|e| anyhow::anyhow!("Failed to get index: {}", e))?;
+
+    if index.has_conflicts() {
+        bail!("Merge conflicts detected");
+    }
+
+    // Create merge commit
+    let sig = git2db::GitManager::global().create_signature(None, None)?;
+
+    let mut index = repo
+        .index()
+        .map_err(|e| anyhow::anyhow!("Failed to get index: {}", e))?;
+
+    let tree_id = index
+        .write_tree()
+        .map_err(|e| anyhow::anyhow!("Failed to write tree: {}", e))?;
+
+    let tree = repo
+        .find_tree(tree_id)
+        .map_err(|e| anyhow::anyhow!("Failed to find tree: {}", e))?;
+
+    let parent = repo
+        .head()
+        .map_err(|e| anyhow::anyhow!("Failed to get HEAD: {}", e))?
+        .peel_to_commit()
+        .map_err(|e| anyhow::anyhow!("Failed to resolve HEAD commit: {}", e))?;
+
+    let message = options.message.as_deref().unwrap_or_else(|| "Merge branch");
+    let full_message = format!("{} '{}'", message, source);
+
+    let merge_oid = repo
+        .commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            &full_message,
+            &tree,
+            &[&parent, &source_commit],
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to create merge commit: {}", e))?;
+
+    repo.cleanup_state()
+        .map_err(|e| anyhow::anyhow!("Failed to cleanup merge state: {}", e))?;
+
+    Ok(merge_oid)
+}
+
+/// Options for merge command
+pub struct MergeOptions {
+    pub ff: bool,
+    pub no_ff: bool,
+    pub ff_only: bool,
+    pub no_commit: bool,
+    pub squash: bool,
+    pub message: Option<String>,
+    pub abort: bool,
+    pub continue_merge: bool,
+    pub quit: bool,
+    pub no_stat: bool,
+    pub quiet: bool,
+    pub verbose: bool,
+    pub strategy: Option<String>,
+    pub strategy_option: Vec<String>,
+    pub allow_unrelated_histories: bool,
+    pub no_verify: bool,
+}
+
 /// Handle merge command
 pub async fn handle_merge(
     storage: &ModelStorage,
-    model: &str,
-    branch: &str,
-    ff_only: bool,
-    no_ff: bool,
+    target: &str,
+    source: &str,
+    options: MergeOptions,
 ) -> Result<()> {
-    info!("Merging branch {} into model {}", branch, model);
+    // Handle conflict resolution modes first
+    if options.abort || options.continue_merge || options.quit {
+        return handle_merge_conflict_resolution(storage, target, options).await;
+    }
 
-    let model_ref = ModelRef::new(model.to_string());
+    // Parse target ModelRef (e.g., "Qwen3-4B:branch3")
+    let target_ref = ModelRef::parse(target)?;
 
-    // Use git2db's merge() API
-    let repo_id = storage.resolve_repo_id(&model_ref)?;
+    if !options.quiet {
+        info!("Merging '{}' into '{}'", source, target_ref);
+    }
+
+    // Extract target branch from ModelRef
+    let target_branch = match &target_ref.git_ref {
+        GitRef::Branch(b) => b.clone(),
+        GitRef::DefaultBranch => {
+            // Use default branch if not specified
+            storage.get_default_branch(&target_ref).await?
+        },
+        _ => {
+            bail!("Target must be a branch reference, not tag or commit: {}", target_ref.git_ref.display_name());
+        }
+    };
+
+    // Ensure worktree exists for target branch (create if needed)
+    let worktree_path = match storage.get_worktree_path(&target_ref, &target_branch).await {
+        Ok(path) if path.exists() => path,
+        _ => {
+            if !options.quiet {
+                println!("→ Creating worktree for target branch '{}'", target_branch);
+            }
+            storage.create_worktree(&target_ref, &target_branch).await?
+        }
+    };
+
+    if options.verbose {
+        println!("  Worktree: {}", worktree_path.display());
+    }
+
+    // Open the worktree repository (not the bare repo)
+    let repo = git2::Repository::open(&worktree_path)
+        .map_err(|e| anyhow::anyhow!("Failed to open worktree repository: {}", e))?;
+
+    // Verify we're on the target branch
+    let head = repo.head().map_err(|e| anyhow::anyhow!("Failed to get HEAD: {}", e))?;
+    let current_branch = head.shorthand().unwrap_or("<detached>");
+
+    if current_branch != target_branch {
+        // The worktree should already be on the correct branch
+        // This shouldn't normally happen, but if it does, we can fix it
+        if options.verbose {
+            println!("  Switching to target branch '{}' (currently on '{}')", target_branch, current_branch);
+        }
+
+        let branch_ref = repo.find_branch(&target_branch, git2::BranchType::Local)
+            .map_err(|e| anyhow::anyhow!("Target branch '{}' not found: {}", target_branch, e))?;
+
+        let commit = branch_ref.get().peel_to_commit()
+            .map_err(|e| anyhow::anyhow!("Failed to get commit for branch '{}': {}", target_branch, e))?;
+
+        repo.checkout_tree(commit.as_object(), Some(git2::build::CheckoutBuilder::new().force()))
+            .map_err(|e| anyhow::anyhow!("Failed to checkout '{}': {}", target_branch, e))?;
+
+        repo.set_head(&format!("refs/heads/{}", target_branch))
+            .map_err(|e| anyhow::anyhow!("Failed to set HEAD to '{}': {}", target_branch, e))?;
+    }
+
+    // Perform the merge directly in the worktree
+    let merge_result = perform_merge(&repo, source, &options);
+
+    match merge_result {
+        Ok(merge_oid) => {
+            if !options.quiet {
+                println!("✓ Merged '{}' into '{}'", source, target_ref);
+
+                // Show merge strategy used
+                if !options.no_stat {
+                    if options.ff_only {
+                        println!("  Strategy: fast-forward only");
+                    } else if options.no_ff {
+                        println!("  Strategy: no fast-forward (merge commit created)");
+                    } else {
+                        println!("  Strategy: auto (fast-forward if possible)");
+                    }
+
+                    // Show commit ID
+                    if options.verbose {
+                        println!("  Commit: {}", merge_oid);
+                    }
+                }
+            }
+
+            Ok(())
+        },
+        Err(e) => {
+            // Check if it's a merge conflict
+            if e.to_string().contains("conflict") {
+                eprintln!("✗ Merge conflict detected");
+                eprintln!("\nResolve conflicts in: {}", worktree_path.display());
+                eprintln!("\nThen run:");
+                eprintln!("  hyprstream merge {} --continue", target);
+                eprintln!("\nOr abort the merge:");
+                eprintln!("  hyprstream merge {} --abort", target);
+                bail!("Merge conflicts must be resolved manually");
+            } else {
+                Err(e.into())
+            }
+        }
+    }
+}
+
+/// Handle merge conflict resolution (--abort, --continue, --quit)
+async fn handle_merge_conflict_resolution(
+    storage: &ModelStorage,
+    target: &str,
+    options: MergeOptions,
+) -> Result<()> {
+    let target_ref = ModelRef::parse(target)?;
+
+    // Get target branch
+    let target_branch = match &target_ref.git_ref {
+        GitRef::Branch(b) => b.clone(),
+        GitRef::DefaultBranch => storage.get_default_branch(&target_ref).await?,
+        _ => bail!("Target must be a branch reference"),
+    };
+
+    // Get worktree path
+    let worktree_path = storage.get_worktree_path(&target_ref, &target_branch).await?;
+
+    if !worktree_path.exists() {
+        bail!("Worktree not found: {}", worktree_path.display());
+    }
+
+    // Open repository
+    let repo_id = storage.resolve_repo_id(&target_ref)?;
     let registry = storage.registry().await;
     let handle = registry.repo(&repo_id)?;
-    let _merge_oid = handle.merge(branch, ff_only, no_ff).await?;
+    let repo = handle.open_repo()?;
 
-    println!("✓ Merged branch '{}' into model {}", branch, model);
-    if ff_only {
-        println!("  Strategy: fast-forward only");
-    } else if no_ff {
-        println!("  Strategy: no fast-forward (merge commit created)");
-    } else {
-        println!("  Strategy: auto (fast-forward if possible)");
+    if options.abort {
+        // Abort merge: restore pre-merge state
+        if !options.quiet {
+            println!("→ Aborting merge...");
+        }
+
+        // Reset to ORIG_HEAD if it exists
+        if let Ok(orig_head) = repo.refname_to_id("ORIG_HEAD") {
+            let commit = repo.find_commit(orig_head)?;
+            repo.reset(commit.as_object(), git2::ResetType::Hard, None)?;
+
+            // Cleanup merge state
+            repo.cleanup_state()?;
+
+            if !options.quiet {
+                println!("✓ Merge aborted, restored pre-merge state");
+            }
+        } else {
+            bail!("No merge in progress (ORIG_HEAD not found)");
+        }
+    } else if options.continue_merge {
+        // Continue merge: check if conflicts are resolved
+        if !options.quiet {
+            println!("→ Continuing merge...");
+        }
+
+        let mut index = repo.index()?;
+        if index.has_conflicts() {
+            bail!("Conflicts still present. Resolve all conflicts before continuing.");
+        }
+
+        // Write tree and create merge commit
+        let tree_id = index.write_tree()?;
+        let tree = repo.find_tree(tree_id)?;
+
+        let sig = git2db::GitManager::global().create_signature(None, None)?;
+
+        // Get parent commits
+        let head = repo.head()?.peel_to_commit()?;
+        let merge_head = repo.find_reference("MERGE_HEAD")?
+            .peel_to_commit()?;
+
+        let message = options.message.unwrap_or_else(|| {
+            format!("Merge branch '{}'", merge_head.summary().unwrap_or("unknown"))
+        });
+
+        repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            &message,
+            &tree,
+            &[&head, &merge_head],
+        )?;
+
+        // Cleanup merge state
+        repo.cleanup_state()?;
+
+        if !options.quiet {
+            println!("✓ Merge completed successfully");
+        }
+    } else if options.quit {
+        // Quit merge: keep working tree changes but remove merge state
+        if !options.quiet {
+            println!("→ Quitting merge (keeping changes)...");
+        }
+
+        repo.cleanup_state()?;
+
+        if !options.quiet {
+            println!("✓ Merge state removed, changes retained");
+            println!("  Use 'git status' to see modified files");
+        }
     }
 
     Ok(())

@@ -1625,7 +1625,12 @@ pub struct TextStream<'a> {
     max_tokens: usize,
     stop_token_ids: Vec<u32>,
 
-      decode_stream: tokenizers::tokenizer::DecodeStream<
+    // Store tokenizer as Arc for safe sharing across streams
+    // IMPORTANT: This field is required for the unsafe transmute in TextStream::new()
+    // DO NOT REMOVE - it ensures the tokenizer lives long enough for the decode_stream lifetime 'a
+    #[allow(dead_code)]
+    tokenizer: Arc<Tokenizer>,
+    decode_stream: tokenizers::tokenizer::DecodeStream<
         'a,
         tokenizers::models::ModelWrapper,
         tokenizers::normalizers::NormalizerWrapper,
@@ -1680,18 +1685,20 @@ impl<'a> TextStream<'a> {
         };
 
         // Use Arc for safe tokenizer sharing
+        // This Arc is REQUIRED by the TextStream struct - see the comment on the tokenizer field
         let tokenizer_arc = Arc::new(tokenizer);
 
         // Create DecodeStream with proper lifetime management
-        // This avoids the unsafe transmute and manual memory management
+        // The Arc<Tokenizer> is stored in the TextStream, ensuring the tokenizer lives as long as 'a
+        // DEPENDENCY: The unsafe transmute below depends on tokenizer_arc being stored in the struct
         let decode_stream = {
             // We need to extend the tokenizer lifetime to match 'a
-            // Since we have Arc<Tokenizer>, we can safely create a reference
+            // Since we have Arc<Tokenizer> stored in the struct, we can safely create a reference
             let tokenizer_ref = unsafe {
                 // SAFETY: This is safe because:
                 // 1. The tokenizer_arc is stored in the TextStream struct, ensuring it lives as long as 'a
                 // 2. We're not moving or deallocating the tokenizer while the stream exists
-                // 3. Arc guarantees thread-safe reference counting
+                // 3. Arc guarantees thread-safe reference counting and proper lifetime management
                 std::mem::transmute::<&Tokenizer, &'a Tokenizer>(tokenizer_arc.as_ref())
             };
 
@@ -1712,6 +1719,7 @@ impl<'a> TextStream<'a> {
             repeat_penalty: request.repeat_penalty,
             max_tokens: request.max_tokens,
             stop_token_ids,
+            tokenizer: tokenizer_arc,
             decode_stream,
             prompt_len,
             // KV cache starts with prompt already in it after first forward

@@ -267,12 +267,12 @@ pub struct LlamaModel {
     norm: Option<RMSNorm>,
     lm_head: Option<Tensor>,
 
-    // KV cache for efficient generation (interior mutability for &self forward)
-    kv_cache: Option<std::cell::RefCell<crate::runtime::kv_cache::KVCacheManager>>,
+    // KV cache for efficient generation (thread-safe with Mutex)
+    kv_cache: Option<std::sync::Arc<std::sync::Mutex<crate::runtime::kv_cache::KVCacheManager>>>,
 
-    // RoPE manager for position encoding
+    // RoPE manager for position encoding (unused, RoPE handled at layer level)
     #[allow(dead_code)]
-    rope_manager: std::cell::RefCell<RoPEManager>,
+    rope_manager: std::sync::Arc<std::sync::Mutex<RoPEManager>>,
 
     // VarStore for training (if model was created with training support)
     vs: Option<nn::VarStore>,
@@ -854,7 +854,7 @@ impl LlamaModel {
             norm: None,
             lm_head: None,
             kv_cache: None, // Cache initialized on first use
-            rope_manager: std::cell::RefCell::new(RoPEManager::new()),
+            rope_manager: std::sync::Arc::new(std::sync::Mutex::new(RoPEManager::new())),
             vs: None, // No VarStore for safetensors loading
         })
     }
@@ -988,12 +988,12 @@ impl LlamaModel {
 
         // Initialize KV cache if we have layers
         let kv_cache = if !layers.is_empty() {
-            Some(std::cell::RefCell::new(
+            Some(std::sync::Arc::new(std::sync::Mutex::new(
                 crate::runtime::kv_cache::KVCacheManager::new(
                     layers.len(),
                     config.max_position_embeddings,
                 ),
-            ))
+            )))
         } else {
             None
         };
@@ -1007,7 +1007,7 @@ impl LlamaModel {
             norm,
             lm_head,
             kv_cache,
-            rope_manager: std::cell::RefCell::new(RoPEManager::new()),
+            rope_manager: std::sync::Arc::new(std::sync::Mutex::new(RoPEManager::new())),
             vs: None, // No VarStore for weight loading - weights are stored directly
         })
     }
@@ -1603,7 +1603,7 @@ impl ModelOperations for LlamaModel {
 
             // Handle KV cache per layer with proper start_pos
             let attn_output = if let Some(cache_ref) = self.kv_cache.as_ref() {
-                let mut cache_manager = cache_ref.borrow_mut();
+                let mut cache_manager = cache_ref.lock().unwrap();
                 if let Some(layer_cache) = cache_manager.get_layer_cache(idx) {
                     tracing::trace!(
                         "Layer {}: Using KV cache, cache_pos={}",
@@ -1808,7 +1808,7 @@ impl LlamaModel {
     /// Clear KV cache (e.g., for new generation)
     pub fn clear_kv_cache(&self) {
         if let Some(cache_ref) = self.kv_cache.as_ref() {
-            let mut cache_manager = cache_ref.borrow_mut();
+            let mut cache_manager = cache_ref.lock().unwrap();
             cache_manager.clear_all();
         }
     }
@@ -1817,7 +1817,7 @@ impl LlamaModel {
     pub fn kv_cache_memory_usage(&self) -> usize {
         self.kv_cache
             .as_ref()
-            .map(|cache_ref| cache_ref.borrow().memory_usage())
+            .map(|cache_ref| cache_ref.lock().unwrap().memory_usage())
             .unwrap_or(0)
     }
 }
@@ -1860,7 +1860,7 @@ mod tests {
             norm: None,
             lm_head: None,
             kv_cache: None,
-            rope_manager: std::cell::RefCell::new(RoPEManager::new()),
+            rope_manager: std::sync::Arc::new(std::sync::Mutex::new(RoPEManager::new())),
             vs: None,
         };
 
