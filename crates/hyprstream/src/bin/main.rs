@@ -346,7 +346,17 @@ fn main() -> Result<()> {
 
     // Handle commands with appropriate runtime configuration
     match cli.command {
-        Commands::Server(_cmd) => {
+        Commands::Server(cmd) => {
+            // Load base config from files
+            let mut config = load_config(cli.config.as_deref())?;
+
+            // Merge CLI server arguments into config using apply_to_builder
+            config.server = cmd.server.apply_to_builder(config.server.to_builder())
+                .build();
+
+            // Create context with merged config (CLI args override file config)
+            let ctx = AppContext::new(config);
+
             let ctx = ctx.clone();
             with_runtime(
                 RuntimeConfig {
