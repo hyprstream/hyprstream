@@ -6,7 +6,6 @@
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use tch::{Kind as DType, Tensor};
-use tracing::info;
 
 use super::torch_utils::{safe_zeros, estimate_tensor_size_mb};
 
@@ -58,14 +57,7 @@ impl LayerKVCache {
             let cache_shape = &[batch_size, self.max_seq_len as i64, num_heads, head_dim];
             let cache_size_mb = estimate_tensor_size_mb(cache_shape, dtype);
 
-            info!(
-                "Initializing KV cache: shape={:?}, size={:.2} MB per tensor ({:.2} MB total)",
-                cache_shape,
-                cache_size_mb,
-                cache_size_mb * 2.0
-            );
-
-            // Allocate cache tensors with OOM handling
+            // Initialize cache tensors with OOM handling
             let keys_cache = safe_zeros(
                 cache_shape,
                 (dtype, device),
@@ -88,8 +80,6 @@ impl LayerKVCache {
 
             self.keys = Some(keys_cache);
             self.values = Some(values_cache);
-
-            info!("✅ KV cache allocated successfully");
         }
 
         // Get mutable references to cache tensors

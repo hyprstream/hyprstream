@@ -270,16 +270,81 @@ pub enum Commands {
 
     /// Merge branches
     Merge {
-        /// Model name
-        model: String,
-        /// Branch to merge
-        branch: String,
-        /// Fast-forward only
-        #[arg(long)]
-        ff_only: bool,
-        /// No fast-forward (create merge commit)
-        #[arg(long)]
+        /// Target model and branch (e.g., "model:branch")
+        target: String,
+
+        /// Branch/ref to merge into target
+        source: String,
+
+        // Fast-forward control
+        /// Fast-forward if possible (default)
+        #[arg(long, conflicts_with = "no_ff", conflicts_with = "ff_only")]
+        ff: bool,
+
+        /// Always create merge commit
+        #[arg(long, conflicts_with = "ff", conflicts_with = "ff_only")]
         no_ff: bool,
+
+        /// Only allow fast-forward merges
+        #[arg(long, conflicts_with = "ff", conflicts_with = "no_ff")]
+        ff_only: bool,
+
+        // Commit control
+        /// Stage changes but don't commit
+        #[arg(long)]
+        no_commit: bool,
+
+        /// Squash commits into single commit
+        #[arg(long)]
+        squash: bool,
+
+        // Message control
+        /// Custom merge commit message
+        #[arg(short, long)]
+        message: Option<String>,
+
+        // Conflict handling
+        /// Abort merge and restore pre-merge state
+        #[arg(long, conflicts_with_all = ["continue_merge", "quit"])]
+        abort: bool,
+
+        /// Continue merge after resolving conflicts
+        #[arg(long = "continue", conflicts_with_all = ["abort", "quit"])]
+        continue_merge: bool,
+
+        /// Quit merge but keep changes
+        #[arg(long, conflicts_with_all = ["abort", "continue_merge"])]
+        quit: bool,
+
+        // Output control
+        /// Suppress diffstat
+        #[arg(long)]
+        no_stat: bool,
+
+        /// Suppress output except errors
+        #[arg(short = 'q', long)]
+        quiet: bool,
+
+        /// Verbose output
+        #[arg(short = 'v', long)]
+        verbose: bool,
+
+        // Advanced
+        /// Merge strategy (resolve, recursive, ours, theirs, subtree)
+        #[arg(long, short = 's')]
+        strategy: Option<String>,
+
+        /// Strategy-specific options (can be specified multiple times)
+        #[arg(long, short = 'X')]
+        strategy_option: Vec<String>,
+
+        /// Allow merging unrelated histories
+        #[arg(long)]
+        allow_unrelated_histories: bool,
+
+        /// Skip pre-merge hooks
+        #[arg(long)]
+        no_verify: bool,
     },
 
     /// Remove a model from the system
