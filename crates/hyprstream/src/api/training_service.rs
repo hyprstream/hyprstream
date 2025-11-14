@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use tracing::{info, warn};
+use tracing::{info, warn, trace};
 
 /// Training sample for LoRA fine-tuning
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,14 +90,17 @@ pub struct TrainingService {
     /// Active training sessions
     sessions: Arc<RwLock<HashMap<String, TrainingSession>>>,
 
-    /// Training sample queues per LoRA
-    sample_queues: Arc<RwLock<HashMap<String, mpsc::UnboundedSender<TrainingSample>>>>,
+    /// Training sample queues per LoRA - bounded to prevent memory pressure
+    sample_queues: Arc<RwLock<HashMap<String, mpsc::Sender<TrainingSample>>>>,
 
     /// Training statistics
     stats: Arc<RwLock<TrainingStats>>,
 
     /// Task handles for background training
     task_handles: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+
+    /// Global cancellation token registry
+    cancellation_tokens: Arc<RwLock<HashMap<String, tokio::sync::broadcast::Sender<()>>>>,
 }
 
 /// Training statistics
@@ -124,6 +127,7 @@ impl TrainingService {
             sample_queues: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(RwLock::new(TrainingStats::default())),
             task_handles: Arc::new(Mutex::new(HashMap::new())),
+            cancellation_tokens: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -148,11 +152,19 @@ impl TrainingService {
             sessions.insert(lora_id.to_string(), session);
         }
 
-        // Create sample queue
-        let (tx, mut rx) = mpsc::unbounded_channel::<TrainingSample>();
+        // Create bounded sample queue to prevent memory pressure
+        let queue_size = config.max_queue_size;
+        let (tx, mut rx) = mpsc::channel::<TrainingSample>(queue_size);
         {
             let mut queues = self.sample_queues.write().await;
             queues.insert(lora_id.to_string(), tx);
+        }
+
+        // Create cancellation broadcast channel
+        let (cancel_tx, _cancel_rx) = tokio::sync::broadcast::channel::<()>(1);
+        {
+            let mut tokens = self.cancellation_tokens.write().await;
+            tokens.insert(lora_id.to_string(), cancel_tx.clone());
         }
 
         // Start background training task
@@ -161,31 +173,109 @@ impl TrainingService {
         let sessions = self.sessions.clone();
         let stats = self.stats.clone();
 
+        // Subscribe to cancellation signals
+        let mut cancel_rx = cancel_tx.subscribe();
+
         let handle = tokio::spawn(async move {
             let mut sample_batch = Vec::new();
 
-            while let Some(sample) = rx.recv().await {
-                sample_batch.push(sample);
+            loop {
+                // Check if session is still active before processing
+                let session_active = {
+                    let sessions_guard = sessions.read().await;
+                    sessions_guard.get(&lora_id_clone)
+                        .map(|s| s.is_active)
+                        .unwrap_or(false)
+                };
 
-                // Train when we have enough samples
-                if sample_batch.len() >= config.batch_size {
-                    if let Err(e) =
-                        Self::train_batch(&lora_id_clone, &sample_batch, &config, &sessions, &stats)
-                            .await
-                    {
-                        warn!("Training error for {}: {}", lora_id_clone, e);
+                if !session_active {
+                    info!("Training session {} no longer active, exiting", lora_id_clone);
+                    break;
+                }
+
+                tokio::select! {
+                    // Handle incoming samples with timeout
+                    sample = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        rx.recv()
+                    ) => {
+                        match sample {
+                            Ok(Some(sample)) => {
+                                sample_batch.push(sample);
+
+                                // Train when we have enough samples
+                                if sample_batch.len() >= config.batch_size {
+                                    // Double-check session is still active before training
+                                    let still_active = {
+                                        let sessions_guard = sessions.read().await;
+                                        sessions_guard.get(&lora_id_clone)
+                                            .map(|s| s.is_active)
+                                            .unwrap_or(false)
+                                    };
+
+                                    if still_active {
+                                        if let Err(e) = Self::train_batch(
+                                            &lora_id_clone,
+                                            &sample_batch,
+                                            &config,
+                                            &sessions,
+                                            &stats
+                                        ).await {
+                                            warn!("Training error for {}: {}", lora_id_clone, e);
+                                        }
+                                    } else {
+                                        info!("Session {} deactivated during training", lora_id_clone);
+                                        break;
+                                    }
+
+                                    sample_batch.clear();
+                                }
+                            }
+                            Ok(None) => {
+                                // Channel closed - process remaining samples and exit
+                                info!("Training channel closed for {}", lora_id_clone);
+                                if !sample_batch.is_empty() {
+                                    // Final session check before training
+                                    let still_active = {
+                                        let sessions_guard = sessions.read().await;
+                                        sessions_guard.get(&lora_id_clone)
+                                            .map(|s| s.is_active)
+                                            .unwrap_or(false)
+                                    };
+
+                                    if still_active {
+                                        let _ = Self::train_batch(
+                                            &lora_id_clone,
+                                            &sample_batch,
+                                            &config,
+                                            &sessions,
+                                            &stats
+                                        ).await;
+                                    }
+                                }
+                                break;
+                            }
+                            Err(_) => {
+                                // Timeout - check session status and continue
+                                debug!("Training receive timeout for {}, continuing", lora_id_clone);
+                                continue;
+                            }
+                        }
                     }
-
-                    sample_batch.clear();
+                    // Handle cancellation
+                    _ = cancel_rx.recv() => {
+                        info!("Training cancelled for {}", lora_id_clone);
+                        break;
+                    }
+                    // Periodic health check
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                        debug!("Training health check for {}", lora_id_clone);
+                        // Continue loop - session already checked at start
+                    }
                 }
             }
 
-            // Process remaining samples
-            if !sample_batch.is_empty() {
-                let _ =
-                    Self::train_batch(&lora_id_clone, &sample_batch, &config, &sessions, &stats)
-                        .await;
-            }
+            info!("Training task ended for {}", lora_id_clone);
         });
 
         // Store task handle
@@ -199,7 +289,34 @@ impl TrainingService {
 
     /// Stop auto-regressive training
     pub async fn stop_auto_training(&self, lora_id: &str) -> Result<()> {
-        // Mark session as inactive
+        // Atomic cleanup: gather all resources to remove first
+        let (cancel_tx, task_handle) = {
+            // Send cancellation signal and gather resources atomically
+            let tokens = self.cancellation_tokens.read().await;
+            let cancel_tx = tokens.get(lora_id).cloned();
+
+            if let Some(ref tx) = cancel_tx {
+                let _ = tx.send(());
+                info!("Sent cancellation signal for training: {}", lora_id);
+            }
+
+            // Remove cancellation token immediately to prevent new signals
+            drop(tokens);
+            let mut tokens = self.cancellation_tokens.write().await;
+            let tx = tokens.remove(lora_id);
+
+            // Remove sample queue to stop new samples and signal training loop
+            let mut queues = self.sample_queues.write().await;
+            let _removed_sender = queues.remove(lora_id);
+
+            // Get task handle for cleanup
+            let mut handles = self.task_handles.lock().await;
+            let handle = handles.remove(lora_id);
+
+            (tx, handle)
+        };
+
+        // Mark session as inactive after cleanup actions are started
         {
             let mut sessions = self.sessions.write().await;
             if let Some(session) = sessions.get_mut(lora_id) {
@@ -207,30 +324,69 @@ impl TrainingService {
             }
         }
 
-        // Remove sample queue
-        {
-            let mut queues = self.sample_queues.write().await;
-            queues.remove(lora_id);
-        }
-
-        // Cancel background task
-        {
-            let mut handles = self.task_handles.lock().await;
-            if let Some(handle) = handles.remove(lora_id) {
-                handle.abort();
-            }
+        // Abort task if it exists (non-blocking)
+        if let Some(handle) = task_handle {
+            handle.abort();
+            info!("Aborted training task for {}", lora_id);
         }
 
         Ok(())
     }
 
-    /// Queue a training sample for auto-regressive learning
+    /// Queue a training sample for auto-regressive learning with backpressure handling
     pub async fn queue_training_sample(&self, lora_id: &str, sample: TrainingSample) -> Result<()> {
-        let queues = self.sample_queues.read().await;
-        if let Some(sender) = queues.get(lora_id) {
-            sender.send(sample)?;
+        // Check session is active before attempting to queue
+        let session_active = {
+            let sessions = self.sessions.read().await;
+            sessions.get(lora_id)
+                .map(|s| s.is_active)
+                .unwrap_or(false)
+        };
+
+        if !session_active {
+            return Err(anyhow::anyhow!("No active training session for {}", lora_id));
         }
-        Ok(())
+
+        // Get queue sender (short-lived lock)
+        let sender = {
+            let queues = self.sample_queues.read().await;
+            queues.get(lora_id).cloned()
+        };
+
+        if let Some(sender) = sender {
+            // Try to send with backpressure handling
+            match sender.try_send(sample) {
+                Ok(()) => {
+                    trace!("Sample queued for training: {}", lora_id);
+                    Ok(())
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    warn!("Training queue full for {}, dropping sample", lora_id);
+                    Err(anyhow::anyhow!("Training queue full for {}", lora_id))
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    warn!("Training queue closed for {}", lora_id);
+                    Err(anyhow::anyhow!("Training queue closed for {}", lora_id))
+                }
+            }
+        } else {
+            // Queue disappeared between session check and now
+            warn!("Training queue disappeared for {}", lora_id);
+            Err(anyhow::anyhow!("Training session for {} is shutting down", lora_id))
+        }
+    }
+
+    
+    /// Cancel training for a specific LoRA
+    pub async fn cancel_training(&self, lora_id: &str) -> Result<()> {
+        let tokens = self.cancellation_tokens.read().await;
+        if let Some(cancel_tx) = tokens.get(lora_id) {
+            let _ = cancel_tx.send(());
+            info!("Sent cancellation signal for training: {}", lora_id);
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("No active training session for {}", lora_id))
+        }
     }
 
     /// Train a batch of samples

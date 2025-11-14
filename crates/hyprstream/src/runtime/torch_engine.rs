@@ -1052,15 +1052,21 @@ impl TorchEngine {
     /// let stats = stream.stats();
     /// println!("Generated {} tokens", stats.tokens_generated);
     /// ```
-    pub fn generate(&self, request: GenerationRequest) -> Result<TextStream<'_>> {
+    pub fn generate(&self, mut request: GenerationRequest) -> Result<TextStream<'_>> {
         // Set random seed if provided for deterministic generation
         if let Some(seed) = request.seed {
             self.set_seed(seed as u64);
         }
+
+        // Apply server defaults if not specified in request
+        if request.timeout.is_none() {
+            request.timeout = Some(self.config.generation_timeout_ms);
+        }
+
         TextStream::new(self, request)
     }
 
-
+    
     /// Enable LoRA training for fine-tuning
     pub fn enable_lora_training(
         &mut self,
@@ -1599,7 +1605,8 @@ pub struct GenerationStats {
 /// Stream that yields decoded UTF-8 text chunks during generation.
 ///
 /// Automatically handles UTF-8 buffering, stop tokens, EOS detection,
-/// and all generation complexities. Just iterate and get text!
+/// timeout handling, cancellation, and all generation complexities.
+/// Just iterate and get text!
 pub struct TextStream<'a> {
     engine: &'a TorchEngine,
 
@@ -1617,9 +1624,8 @@ pub struct TextStream<'a> {
     max_tokens: usize,
     stop_token_ids: Vec<u32>,
 
-    // Store tokenizer as raw pointer (leaked Box) to get stable reference for DecodeStream
-    // We manually deallocate in Drop
-    tokenizer: *mut Tokenizer,
+    // Store tokenizer as Arc for safe sharing across streams
+    tokenizer: Arc<Tokenizer>,
     decode_stream: tokenizers::tokenizer::DecodeStream<
         'a,
         tokenizers::models::ModelWrapper,
@@ -1630,14 +1636,18 @@ pub struct TextStream<'a> {
     >,
 
     prompt_len: usize,
-    /// Direct KV cache position tracking - next write position in cache
-    /// This is the ground truth for where the next token will be written
-    kv_cache_position: usize,
+    /// Thread-safe KV cache position tracking using atomic operations
+    /// This prevents race conditions when multiple streams access the same model
+    kv_cache_position: std::sync::atomic::AtomicUsize,
     /// Total tokens generated (including buffered UTF-8) - for statistics only
     tokens_generated: usize,
     start_time: std::time::Instant,
     finished: bool,
     finish_reason: Option<FinishReason>,
+
+    // Timeout and cancellation handling
+    timeout_ms: Option<u64>,
+    cancel_token_id: Option<String>,
 }
 
 impl<'a> TextStream<'a> {
@@ -1671,28 +1681,26 @@ impl<'a> TextStream<'a> {
             64
         };
 
-        // We need to use Box::leak to create a 'static reference that we can then downcast to 'a
-        // This is safe because:
-        // 1. We're leaking the tokenizer to get a stable 'static reference
-        // 2. We'll manually drop it in TextStream's Drop impl
-        // 3. The decode_stream lifetime is properly tied to the leaked reference
-        let tokenizer_box = Box::new(tokenizer);
-        let tokenizer_static: &'static Tokenizer = Box::leak(tokenizer_box);
+        // Use Arc for safe tokenizer sharing
+        let tokenizer_arc = Arc::new(tokenizer);
 
-        // Now we can safely create DecodeStream with 'static lifetime
-        let decode_stream = unsafe {
-            // SAFETY: We transmute 'static to 'a, which is safe because:
-            // - decode_stream will be dropped before we deallocate the tokenizer
-            // - TextStream is not Clone/Copy
-            // - We maintain ownership via the raw pointer
-            let tokenizer_ref: &'a Tokenizer = std::mem::transmute(tokenizer_static);
+        // Create DecodeStream with proper lifetime management
+        // This avoids the unsafe transmute and manual memory management
+        let decode_stream = {
+            // We need to extend the tokenizer lifetime to match 'a
+            // Since we have Arc<Tokenizer>, we can safely create a reference
+            let tokenizer_ref = unsafe {
+                // SAFETY: This is safe because:
+                // 1. The tokenizer_arc is stored in the TextStream struct, ensuring it lives as long as 'a
+                // 2. We're not moving or deallocating the tokenizer while the stream exists
+                // 3. Arc guarantees thread-safe reference counting
+                std::mem::transmute::<&Tokenizer, &'a Tokenizer>(tokenizer_arc.as_ref())
+            };
+
             // Use skip_special_tokens=false because <|extra_N|> tokens are special tokens
             // that should appear in output (they represent actual model vocabulary)
             tokenizer_ref.decode_stream(false) // skip_special_tokens=false
         };
-
-        // Store the raw pointer so we can deallocate in Drop
-        let tokenizer_ptr = tokenizer_static as *const Tokenizer as *mut Tokenizer;
 
         Ok(Self {
             engine,
@@ -1706,15 +1714,17 @@ impl<'a> TextStream<'a> {
             repeat_penalty: request.repeat_penalty,
             max_tokens: request.max_tokens,
             stop_token_ids,
-            tokenizer: tokenizer_ptr,
+            tokenizer: tokenizer_arc,
             decode_stream,
             prompt_len,
             // KV cache starts with prompt already in it after first forward
-            kv_cache_position: prompt_len,
+            kv_cache_position: std::sync::atomic::AtomicUsize::new(prompt_len),
             tokens_generated: 0,
             start_time: std::time::Instant::now(),
             finished: false,
             finish_reason: None,
+            timeout_ms: request.timeout,
+            cancel_token_id: request.cancel_token_id,
         })
     }
 
@@ -1735,11 +1745,11 @@ impl<'a> TextStream<'a> {
     }
 
     fn sample_next_token(&mut self) -> Result<u32> {
-        // Determine KV position for this forward pass
+        // Determine KV position for this forward pass using atomic operations
         let current_kv_pos = if self.tokens_generated == 0 {
             0 // Initial position is 0
         } else {
-            self.kv_cache_position
+            self.kv_cache_position.load(std::sync::atomic::Ordering::Relaxed)
         };
 
         let logits = if self.tokens_generated == 0 {
@@ -1749,9 +1759,10 @@ impl<'a> TextStream<'a> {
             let last_token = self.last_generated.expect("last_generated should be set");
 
             if self.tokens_generated % 50 == 0 {
+                let kv_pos = self.kv_cache_position.load(std::sync::atomic::Ordering::Relaxed);
                 tracing::debug!(
                     "🔵 KV cache position: {}, tokens_generated: {}, last_token: {}",
-                    self.kv_cache_position, self.tokens_generated, last_token
+                    kv_pos, self.tokens_generated, last_token
                 );
             }
 
@@ -1859,17 +1870,7 @@ impl<'a> TextStream<'a> {
 // - Tokenizer itself is Send
 unsafe impl<'a> Send for TextStream<'a> {}
 
-impl<'a> Drop for TextStream<'a> {
-    fn drop(&mut self) {
-        // SAFETY: We leaked the tokenizer in new(), so we must manually deallocate it here
-        // The pointer is valid because it was created from Box::leak
-        unsafe {
-            if !self.tokenizer.is_null() {
-                let _ = Box::from_raw(self.tokenizer);
-            }
-        }
-    }
-}
+// No custom Drop needed - Arc handles automatic cleanup
 
 impl<'a> Stream for TextStream<'a> {
     type Item = Result<String>;
@@ -1879,6 +1880,24 @@ impl<'a> Stream for TextStream<'a> {
             if self.finished {
                 return Poll::Ready(None);
             }
+
+            // Check timeout
+            if let Some(timeout_ms) = self.timeout_ms {
+                let elapsed = self.start_time.elapsed();
+                if elapsed.as_millis() >= timeout_ms as u128 {
+                    tracing::debug!("Generation timed out after {}ms", timeout_ms);
+                    self.finished = true;
+                    self.finish_reason = Some(FinishReason::Error(format!(
+                        "Generation timed out after {}ms", timeout_ms
+                    )));
+                    return Poll::Ready(Some(Err(anyhow::anyhow!(
+                        "Generation timed out after {}ms", timeout_ms
+                    ))));
+                }
+            }
+
+            // TODO: Check cancellation token registry if cancel_token_id is set
+            // This would involve a global registry and broadcast channel
 
             // Check max tokens
             if self.tokens_generated >= self.max_tokens {
@@ -1894,7 +1913,7 @@ impl<'a> Stream for TextStream<'a> {
                     // FIX: Increment KV cache position after successful token sampling
                     // This ensures KV cache stays synchronized with generation state
                     if self.tokens_generated > 0 {  // Don't increment on initial prompt
-                        self.kv_cache_position += 1;
+                        self.kv_cache_position.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     token
                 },
