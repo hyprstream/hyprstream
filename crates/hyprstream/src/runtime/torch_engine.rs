@@ -1625,9 +1625,7 @@ pub struct TextStream<'a> {
     max_tokens: usize,
     stop_token_ids: Vec<u32>,
 
-    // Store tokenizer as Arc for safe sharing across streams
-    tokenizer: Arc<Tokenizer>,
-    decode_stream: tokenizers::tokenizer::DecodeStream<
+      decode_stream: tokenizers::tokenizer::DecodeStream<
         'a,
         tokenizers::models::ModelWrapper,
         tokenizers::normalizers::NormalizerWrapper,
@@ -1714,7 +1712,6 @@ impl<'a> TextStream<'a> {
             repeat_penalty: request.repeat_penalty,
             max_tokens: request.max_tokens,
             stop_token_ids,
-            tokenizer: tokenizer_arc,
             decode_stream,
             prompt_len,
             // KV cache starts with prompt already in it after first forward
