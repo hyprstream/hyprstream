@@ -832,6 +832,7 @@ impl RuntimeEngine for TorchEngine {
             repeat_last_n: 64, // Default
             stop_tokens: self.generation_config.stop_tokens.clone(),
             seed: None,
+            timeout: None,
         };
 
         let result = self.generate_with_params(request).await?;
@@ -1060,7 +1061,7 @@ impl TorchEngine {
 
         // Apply server defaults if not specified in request
         if request.timeout.is_none() {
-            request.timeout = Some(self.config.generation_timeout_ms);
+            request.timeout = Some(self.config.default_generation_timeout_ms);
         }
 
         TextStream::new(self, request)
@@ -1636,18 +1637,17 @@ pub struct TextStream<'a> {
     >,
 
     prompt_len: usize,
-    /// Thread-safe KV cache position tracking using atomic operations
-    /// This prevents race conditions when multiple streams access the same model
-    kv_cache_position: std::sync::atomic::AtomicUsize,
+    /// KV cache position tracking for this stream
+    /// Each stream has exclusive access via &mut self, so no atomic needed
+    kv_cache_position: usize,
     /// Total tokens generated (including buffered UTF-8) - for statistics only
     tokens_generated: usize,
     start_time: std::time::Instant,
     finished: bool,
     finish_reason: Option<FinishReason>,
 
-    // Timeout and cancellation handling
+    // Timeout handling
     timeout_ms: Option<u64>,
-    cancel_token_id: Option<String>,
 }
 
 impl<'a> TextStream<'a> {
@@ -1718,13 +1718,12 @@ impl<'a> TextStream<'a> {
             decode_stream,
             prompt_len,
             // KV cache starts with prompt already in it after first forward
-            kv_cache_position: std::sync::atomic::AtomicUsize::new(prompt_len),
+            kv_cache_position: prompt_len,
             tokens_generated: 0,
             start_time: std::time::Instant::now(),
             finished: false,
             finish_reason: None,
             timeout_ms: request.timeout,
-            cancel_token_id: request.cancel_token_id,
         })
     }
 
@@ -1745,11 +1744,11 @@ impl<'a> TextStream<'a> {
     }
 
     fn sample_next_token(&mut self) -> Result<u32> {
-        // Determine KV position for this forward pass using atomic operations
+        // Determine KV position for this forward pass
         let current_kv_pos = if self.tokens_generated == 0 {
             0 // Initial position is 0
         } else {
-            self.kv_cache_position.load(std::sync::atomic::Ordering::Relaxed)
+            self.kv_cache_position
         };
 
         let logits = if self.tokens_generated == 0 {
@@ -1759,10 +1758,9 @@ impl<'a> TextStream<'a> {
             let last_token = self.last_generated.expect("last_generated should be set");
 
             if self.tokens_generated % 50 == 0 {
-                let kv_pos = self.kv_cache_position.load(std::sync::atomic::Ordering::Relaxed);
                 tracing::debug!(
                     "🔵 KV cache position: {}, tokens_generated: {}, last_token: {}",
-                    kv_pos, self.tokens_generated, last_token
+                    self.kv_cache_position, self.tokens_generated, last_token
                 );
             }
 
@@ -1896,9 +1894,7 @@ impl<'a> Stream for TextStream<'a> {
                 }
             }
 
-            // TODO: Check cancellation token registry if cancel_token_id is set
-            // This would involve a global registry and broadcast channel
-
+            
             // Check max tokens
             if self.tokens_generated >= self.max_tokens {
                 tracing::debug!("Reached max tokens: {}", self.max_tokens);
@@ -1913,7 +1909,7 @@ impl<'a> Stream for TextStream<'a> {
                     // FIX: Increment KV cache position after successful token sampling
                     // This ensures KV cache stays synchronized with generation state
                     if self.tokens_generated > 0 {  // Don't increment on initial prompt
-                        self.kv_cache_position.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.kv_cache_position += 1;
                     }
                     token
                 },

@@ -148,8 +148,8 @@ impl Default for RuntimeConfig {
             precision_mode: Some("auto".to_string()),
             max_concurrent_loads: 2,
             max_concurrent_generations: 10,
-            default_generation_timeout_ms: 30000, // 30 seconds
-            default_model_load_timeout_ms: 120000, // 2 minutes
+            default_generation_timeout_ms: 120000, // 2 minutes
+            default_model_load_timeout_ms: 300000, // 5 minutes
         }
     }
 }
@@ -486,8 +486,6 @@ pub struct GenerationRequest {
     // NEW: Async configuration fields
     #[serde(default)]
     pub timeout: Option<u64>, // Duration in milliseconds
-    #[serde(default)]
-    pub cancel_token_id: Option<String>, // For cancellation tracking
 }
 
 /// Unified sampling parameters with Option fields for clean precedence merging.
@@ -520,30 +518,9 @@ pub struct SamplingParams {
     // NEW: Async parameters
     #[serde(default)]
     pub timeout_ms: Option<u64>,
-    #[serde(default)]
-    pub cancel_token_id: Option<String>,
 }
 
 impl SamplingParams {
-    /// Create system defaults (fallback when nothing else specified)
-    pub fn system_defaults() -> Self {
-        Self {
-            max_tokens: Some(2048),
-            temperature: Some(0.7),
-            top_p: Some(0.95),
-            top_k: Some(40),
-            repeat_penalty: Some(1.0),
-            repeat_last_n: Some(64),
-            stop_tokens: Some(vec![]),
-            seed: None,
-            length_penalty: None,
-            typical_p: None,
-            epsilon_cutoff: None,
-            eta_cutoff: None,
-            do_sample: Some(true),
-        }
-    }
-
     /// Load model-specific config from a model directory
     pub async fn from_model_path(model_path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
         let gen_config_path = model_path.join("generation_config.json");
@@ -591,6 +568,7 @@ impl SamplingParams {
             }),
             seed: config.get("seed").and_then(|v| v.as_u64()),
             repeat_last_n: None,
+            timeout_ms: None,
         }
     }
 
@@ -611,6 +589,7 @@ impl SamplingParams {
             epsilon_cutoff: other.epsilon_cutoff.or(self.epsilon_cutoff),
             eta_cutoff: other.eta_cutoff.or(self.eta_cutoff),
             do_sample: other.do_sample.or(self.do_sample),
+            timeout_ms: other.timeout_ms.or(self.timeout_ms),
         }
     }
 
@@ -630,8 +609,7 @@ impl SamplingParams {
             epsilon_cutoff: self.epsilon_cutoff,
             eta_cutoff: self.eta_cutoff,
             do_sample: self.do_sample.unwrap_or(true),
-            timeout_ms: self.timeout_ms.unwrap_or(30000), // Default 30 seconds
-            cancel_token_id: self.cancel_token_id,
+            timeout_ms: self.timeout_ms.unwrap_or(120000), // Use RuntimeConfig default (2 minutes)
         }
     }
 }
@@ -654,7 +632,6 @@ pub struct ResolvedSamplingParams {
     pub do_sample: bool,
     // NEW: Async parameters
     pub timeout_ms: u64,
-    pub cancel_token_id: Option<String>,
 }
 
 /// Builder for generation requests using the unified SamplingParams precedence system
@@ -728,11 +705,7 @@ impl GenerationRequestBuilder {
         self
     }
 
-    pub fn cancel_token_id(mut self, token_id: impl Into<String>) -> Self {
-        self.params.cancel_token_id = Some(token_id.into());
-        self
-    }
-
+    
     pub fn build_v2(self) -> GenerationRequestV2 {
         GenerationRequestV2 {
             prompt: self.prompt,
@@ -753,7 +726,6 @@ impl GenerationRequestBuilder {
             stop_tokens: resolved.stop_tokens,
             seed: resolved.seed.map(|s| s as u32),
             timeout: Some(resolved.timeout_ms),
-            cancel_token_id: resolved.cancel_token_id,
         }
     }
 }
@@ -770,8 +742,8 @@ impl GenerationRequest {
     }
 }
 
-impl From<&SamplingParamDefaults> for SamplingParams {
-    fn from(defaults: &SamplingParamDefaults) -> Self {
+impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
+    fn from(defaults: &crate::config::server::SamplingParamDefaults) -> Self {
         Self {
             max_tokens: Some(defaults.max_tokens),
             temperature: Some(defaults.temperature),
@@ -786,6 +758,7 @@ impl From<&SamplingParamDefaults> for SamplingParams {
             epsilon_cutoff: None,
             eta_cutoff: None,
             do_sample: None,
+            timeout_ms: None, // Don't set timeout here - let engine handle it
         }
     }
 }
@@ -803,7 +776,6 @@ impl From<&GenerationConfig> for GenerationRequest {
             stop_tokens: config.stop_tokens.clone(),
             seed: config.seed,
             timeout: None, // Not in GenerationConfig
-            cancel_token_id: None, // Not in GenerationConfig
         }
     }
 }

@@ -90,9 +90,6 @@ pub struct SamplingParamDefaults {
 
     #[serde(default = "default_repeat_penalty")]
     pub repeat_penalty: f32,
-
-    #[serde(default = "default_stream_timeout_secs")]
-    pub stream_timeout_secs: u64,
 }
 
 fn default_max_tokens() -> usize {
@@ -107,9 +104,6 @@ fn default_top_p() -> f32 {
 fn default_repeat_penalty() -> f32 {
     1.1
 }
-fn default_stream_timeout_secs() -> u64 {
-    300
-}
 
 impl Default for SamplingParamDefaults {
     fn default() -> Self {
@@ -118,7 +112,6 @@ impl Default for SamplingParamDefaults {
             temperature: default_temperature(),
             top_p: default_top_p(),
             repeat_penalty: default_repeat_penalty(),
-            stream_timeout_secs: default_stream_timeout_secs(),
         }
     }
 }
@@ -158,9 +151,6 @@ pub struct ServerConfig {
     // Concurrency settings
     #[serde(default = "default_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
-
-    #[serde(default = "default_generation_timeout_secs")]
-    pub generation_timeout_secs: u64,
 
     #[serde(default = "default_cancellation_check_interval")]
     pub cancellation_check_interval: u64,
@@ -222,9 +212,6 @@ fn default_request_timeout_secs() -> u64 {
 fn default_max_concurrent_requests() -> usize {
     100
 }
-fn default_generation_timeout_secs() -> u64 {
-    600
-}
 fn default_cancellation_check_interval() -> u64 {
     100
 }
@@ -245,7 +232,6 @@ impl Default for ServerConfig {
             max_tokens_limit: default_max_tokens_limit(),
             request_timeout_secs: default_request_timeout_secs(),
             max_concurrent_requests: default_max_concurrent_requests(),
-            generation_timeout_secs: default_generation_timeout_secs(),
             cancellation_check_interval: default_cancellation_check_interval(),
             cors: CorsConfig::default(),
             sampling_defaults: SamplingParamDefaults::default(),
@@ -338,16 +324,7 @@ impl ServerConfigBuilder {
         self
     }
 
-    pub fn generation_timeout_secs(mut self, timeout: u64) -> Self {
-        self.config.generation_timeout_secs = timeout;
-        self
-    }
-
-    pub fn generation_timeout(mut self, timeout: std::time::Duration) -> Self {
-        self.config.generation_timeout_secs = timeout.as_secs();
-        self
-    }
-
+    
     pub fn cancellation_check_interval(mut self, interval: u64) -> Self {
         self.config.cancellation_check_interval = interval;
         self
@@ -451,12 +428,7 @@ impl ServerConfigBuilder {
             }
         }
 
-        if let Ok(timeout) = std::env::var("HYPRSTREAM_GENERATION_TIMEOUT_SECS") {
-            if let Ok(t) = timeout.parse() {
-                self.config.generation_timeout_secs = t;
-            }
-        }
-
+        
         if let Ok(interval) = std::env::var("HYPRSTREAM_CANCELLATION_CHECK_INTERVAL") {
             if let Ok(i) = interval.parse() {
                 self.config.cancellation_check_interval = i;
