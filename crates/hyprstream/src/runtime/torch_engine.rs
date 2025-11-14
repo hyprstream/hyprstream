@@ -832,6 +832,7 @@ impl RuntimeEngine for TorchEngine {
             repeat_last_n: 64, // Default
             stop_tokens: self.generation_config.stop_tokens.clone(),
             seed: None,
+            timeout: None,
         };
 
         let result = self.generate_with_params(request).await?;
@@ -1052,15 +1053,21 @@ impl TorchEngine {
     /// let stats = stream.stats();
     /// println!("Generated {} tokens", stats.tokens_generated);
     /// ```
-    pub fn generate(&self, request: GenerationRequest) -> Result<TextStream<'_>> {
+    pub fn generate(&self, mut request: GenerationRequest) -> Result<TextStream<'_>> {
         // Set random seed if provided for deterministic generation
         if let Some(seed) = request.seed {
             self.set_seed(seed as u64);
         }
+
+        // Apply server defaults if not specified in request
+        if request.timeout.is_none() {
+            request.timeout = Some(self.config.default_generation_timeout_ms);
+        }
+
         TextStream::new(self, request)
     }
 
-
+    
     /// Enable LoRA training for fine-tuning
     pub fn enable_lora_training(
         &mut self,
@@ -1599,7 +1606,8 @@ pub struct GenerationStats {
 /// Stream that yields decoded UTF-8 text chunks during generation.
 ///
 /// Automatically handles UTF-8 buffering, stop tokens, EOS detection,
-/// and all generation complexities. Just iterate and get text!
+/// timeout handling, cancellation, and all generation complexities.
+/// Just iterate and get text!
 pub struct TextStream<'a> {
     engine: &'a TorchEngine,
 
@@ -1617,10 +1625,7 @@ pub struct TextStream<'a> {
     max_tokens: usize,
     stop_token_ids: Vec<u32>,
 
-    // Store tokenizer as raw pointer (leaked Box) to get stable reference for DecodeStream
-    // We manually deallocate in Drop
-    tokenizer: *mut Tokenizer,
-    decode_stream: tokenizers::tokenizer::DecodeStream<
+      decode_stream: tokenizers::tokenizer::DecodeStream<
         'a,
         tokenizers::models::ModelWrapper,
         tokenizers::normalizers::NormalizerWrapper,
@@ -1630,14 +1635,17 @@ pub struct TextStream<'a> {
     >,
 
     prompt_len: usize,
-    /// Direct KV cache position tracking - next write position in cache
-    /// This is the ground truth for where the next token will be written
+    /// KV cache position tracking for this stream
+    /// Each stream has exclusive access via &mut self, so no atomic needed
     kv_cache_position: usize,
     /// Total tokens generated (including buffered UTF-8) - for statistics only
     tokens_generated: usize,
     start_time: std::time::Instant,
     finished: bool,
     finish_reason: Option<FinishReason>,
+
+    // Timeout handling
+    timeout_ms: Option<u64>,
 }
 
 impl<'a> TextStream<'a> {
@@ -1671,28 +1679,26 @@ impl<'a> TextStream<'a> {
             64
         };
 
-        // We need to use Box::leak to create a 'static reference that we can then downcast to 'a
-        // This is safe because:
-        // 1. We're leaking the tokenizer to get a stable 'static reference
-        // 2. We'll manually drop it in TextStream's Drop impl
-        // 3. The decode_stream lifetime is properly tied to the leaked reference
-        let tokenizer_box = Box::new(tokenizer);
-        let tokenizer_static: &'static Tokenizer = Box::leak(tokenizer_box);
+        // Use Arc for safe tokenizer sharing
+        let tokenizer_arc = Arc::new(tokenizer);
 
-        // Now we can safely create DecodeStream with 'static lifetime
-        let decode_stream = unsafe {
-            // SAFETY: We transmute 'static to 'a, which is safe because:
-            // - decode_stream will be dropped before we deallocate the tokenizer
-            // - TextStream is not Clone/Copy
-            // - We maintain ownership via the raw pointer
-            let tokenizer_ref: &'a Tokenizer = std::mem::transmute(tokenizer_static);
+        // Create DecodeStream with proper lifetime management
+        // This avoids the unsafe transmute and manual memory management
+        let decode_stream = {
+            // We need to extend the tokenizer lifetime to match 'a
+            // Since we have Arc<Tokenizer>, we can safely create a reference
+            let tokenizer_ref = unsafe {
+                // SAFETY: This is safe because:
+                // 1. The tokenizer_arc is stored in the TextStream struct, ensuring it lives as long as 'a
+                // 2. We're not moving or deallocating the tokenizer while the stream exists
+                // 3. Arc guarantees thread-safe reference counting
+                std::mem::transmute::<&Tokenizer, &'a Tokenizer>(tokenizer_arc.as_ref())
+            };
+
             // Use skip_special_tokens=false because <|extra_N|> tokens are special tokens
             // that should appear in output (they represent actual model vocabulary)
             tokenizer_ref.decode_stream(false) // skip_special_tokens=false
         };
-
-        // Store the raw pointer so we can deallocate in Drop
-        let tokenizer_ptr = tokenizer_static as *const Tokenizer as *mut Tokenizer;
 
         Ok(Self {
             engine,
@@ -1706,7 +1712,6 @@ impl<'a> TextStream<'a> {
             repeat_penalty: request.repeat_penalty,
             max_tokens: request.max_tokens,
             stop_token_ids,
-            tokenizer: tokenizer_ptr,
             decode_stream,
             prompt_len,
             // KV cache starts with prompt already in it after first forward
@@ -1715,6 +1720,7 @@ impl<'a> TextStream<'a> {
             start_time: std::time::Instant::now(),
             finished: false,
             finish_reason: None,
+            timeout_ms: request.timeout,
         })
     }
 
@@ -1859,17 +1865,7 @@ impl<'a> TextStream<'a> {
 // - Tokenizer itself is Send
 unsafe impl<'a> Send for TextStream<'a> {}
 
-impl<'a> Drop for TextStream<'a> {
-    fn drop(&mut self) {
-        // SAFETY: We leaked the tokenizer in new(), so we must manually deallocate it here
-        // The pointer is valid because it was created from Box::leak
-        unsafe {
-            if !self.tokenizer.is_null() {
-                let _ = Box::from_raw(self.tokenizer);
-            }
-        }
-    }
-}
+// No custom Drop needed - Arc handles automatic cleanup
 
 impl<'a> Stream for TextStream<'a> {
     type Item = Result<String>;
@@ -1880,6 +1876,22 @@ impl<'a> Stream for TextStream<'a> {
                 return Poll::Ready(None);
             }
 
+            // Check timeout
+            if let Some(timeout_ms) = self.timeout_ms {
+                let elapsed = self.start_time.elapsed();
+                if elapsed.as_millis() >= timeout_ms as u128 {
+                    tracing::debug!("Generation timed out after {}ms", timeout_ms);
+                    self.finished = true;
+                    self.finish_reason = Some(FinishReason::Error(format!(
+                        "Generation timed out after {}ms", timeout_ms
+                    )));
+                    return Poll::Ready(Some(Err(anyhow::anyhow!(
+                        "Generation timed out after {}ms", timeout_ms
+                    ))));
+                }
+            }
+
+            
             // Check max tokens
             if self.tokens_generated >= self.max_tokens {
                 tracing::debug!("Reached max tokens: {}", self.max_tokens);

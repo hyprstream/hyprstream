@@ -128,6 +128,11 @@ pub struct RuntimeConfig {
     pub kv_cache_size_mb: usize,
     /// Precision mode (BF16/FP16/FP32/FP8)
     pub precision_mode: Option<String>,
+    // NEW: Concurrency and timeout settings
+    pub max_concurrent_loads: usize,
+    pub max_concurrent_generations: usize,
+    pub default_generation_timeout_ms: u64,
+    pub default_model_load_timeout_ms: u64,
 }
 
 impl Default for RuntimeConfig {
@@ -141,6 +146,10 @@ impl Default for RuntimeConfig {
             mmap: true,
             kv_cache_size_mb: 2048,
             precision_mode: Some("auto".to_string()),
+            max_concurrent_loads: 2,
+            max_concurrent_generations: 10,
+            default_generation_timeout_ms: 120000, // 2 minutes
+            default_model_load_timeout_ms: 300000, // 5 minutes
         }
     }
 }
@@ -474,6 +483,9 @@ pub struct GenerationRequest {
     pub repeat_last_n: usize,
     pub stop_tokens: Vec<String>,
     pub seed: Option<u32>,
+    // NEW: Async configuration fields
+    #[serde(default)]
+    pub timeout: Option<u64>, // Duration in milliseconds
 }
 
 /// Unified sampling parameters with Option fields for clean precedence merging.
@@ -502,28 +514,13 @@ pub struct SamplingParams {
     pub eta_cutoff: Option<f32>,
     #[serde(default)]
     pub do_sample: Option<bool>,
+
+    // NEW: Async parameters
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 impl SamplingParams {
-    /// Create system defaults (fallback when nothing else specified)
-    pub fn system_defaults() -> Self {
-        Self {
-            max_tokens: Some(2048),
-            temperature: Some(0.7),
-            top_p: Some(0.95),
-            top_k: Some(40),
-            repeat_penalty: Some(1.0),
-            repeat_last_n: Some(64),
-            stop_tokens: Some(vec![]),
-            seed: None,
-            length_penalty: None,
-            typical_p: None,
-            epsilon_cutoff: None,
-            eta_cutoff: None,
-            do_sample: Some(true),
-        }
-    }
-
     /// Load model-specific config from a model directory
     pub async fn from_model_path(model_path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
         let gen_config_path = model_path.join("generation_config.json");
@@ -571,6 +568,7 @@ impl SamplingParams {
             }),
             seed: config.get("seed").and_then(|v| v.as_u64()),
             repeat_last_n: None,
+            timeout_ms: None,
         }
     }
 
@@ -591,6 +589,7 @@ impl SamplingParams {
             epsilon_cutoff: other.epsilon_cutoff.or(self.epsilon_cutoff),
             eta_cutoff: other.eta_cutoff.or(self.eta_cutoff),
             do_sample: other.do_sample.or(self.do_sample),
+            timeout_ms: other.timeout_ms.or(self.timeout_ms),
         }
     }
 
@@ -610,6 +609,7 @@ impl SamplingParams {
             epsilon_cutoff: self.epsilon_cutoff,
             eta_cutoff: self.eta_cutoff,
             do_sample: self.do_sample.unwrap_or(true),
+            timeout_ms: self.timeout_ms.unwrap_or(120000), // Use RuntimeConfig default (2 minutes)
         }
     }
 }
@@ -630,6 +630,8 @@ pub struct ResolvedSamplingParams {
     pub epsilon_cutoff: Option<f32>,
     pub eta_cutoff: Option<f32>,
     pub do_sample: bool,
+    // NEW: Async parameters
+    pub timeout_ms: u64,
 }
 
 /// Builder for generation requests using the unified SamplingParams precedence system
@@ -692,6 +694,18 @@ impl GenerationRequestBuilder {
         self
     }
 
+    // NEW: Async configuration methods
+    pub fn timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.params.timeout_ms = Some(timeout.as_millis() as u64);
+        self
+    }
+
+    pub fn timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.params.timeout_ms = Some(timeout_ms);
+        self
+    }
+
+    
     pub fn build_v2(self) -> GenerationRequestV2 {
         GenerationRequestV2 {
             prompt: self.prompt,
@@ -711,6 +725,7 @@ impl GenerationRequestBuilder {
             repeat_last_n: resolved.repeat_last_n,
             stop_tokens: resolved.stop_tokens,
             seed: resolved.seed.map(|s| s as u32),
+            timeout: Some(resolved.timeout_ms),
         }
     }
 }
@@ -727,8 +742,8 @@ impl GenerationRequest {
     }
 }
 
-impl From<&SamplingParamDefaults> for SamplingParams {
-    fn from(defaults: &SamplingParamDefaults) -> Self {
+impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
+    fn from(defaults: &crate::config::server::SamplingParamDefaults) -> Self {
         Self {
             max_tokens: Some(defaults.max_tokens),
             temperature: Some(defaults.temperature),
@@ -743,6 +758,7 @@ impl From<&SamplingParamDefaults> for SamplingParams {
             epsilon_cutoff: None,
             eta_cutoff: None,
             do_sample: None,
+            timeout_ms: None, // Don't set timeout here - let engine handle it
         }
     }
 }
@@ -759,6 +775,7 @@ impl From<&GenerationConfig> for GenerationRequest {
             repeat_last_n: 64, // Default repeat_last_n
             stop_tokens: config.stop_tokens.clone(),
             seed: config.seed,
+            timeout: None, // Not in GenerationConfig
         }
     }
 }

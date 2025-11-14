@@ -90,9 +90,6 @@ pub struct SamplingParamDefaults {
 
     #[serde(default = "default_repeat_penalty")]
     pub repeat_penalty: f32,
-
-    #[serde(default = "default_stream_timeout_secs")]
-    pub stream_timeout_secs: u64,
 }
 
 fn default_max_tokens() -> usize {
@@ -107,9 +104,6 @@ fn default_top_p() -> f32 {
 fn default_repeat_penalty() -> f32 {
     1.1
 }
-fn default_stream_timeout_secs() -> u64 {
-    300
-}
 
 impl Default for SamplingParamDefaults {
     fn default() -> Self {
@@ -118,7 +112,6 @@ impl Default for SamplingParamDefaults {
             temperature: default_temperature(),
             top_p: default_top_p(),
             repeat_penalty: default_repeat_penalty(),
-            stream_timeout_secs: default_stream_timeout_secs(),
         }
     }
 }
@@ -154,6 +147,13 @@ pub struct ServerConfig {
 
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+
+    // Concurrency settings
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
+
+    #[serde(default = "default_cancellation_check_interval")]
+    pub cancellation_check_interval: u64,
 
     // CORS configuration
     #[serde(default)]
@@ -209,6 +209,12 @@ fn default_max_tokens_limit() -> usize {
 fn default_request_timeout_secs() -> u64 {
     300
 }
+fn default_max_concurrent_requests() -> usize {
+    100
+}
+fn default_cancellation_check_interval() -> u64 {
+    100
+}
 fn default_tls_min_version() -> String {
     "1.2".to_string()
 }
@@ -225,6 +231,8 @@ impl Default for ServerConfig {
             api_key: None,
             max_tokens_limit: default_max_tokens_limit(),
             request_timeout_secs: default_request_timeout_secs(),
+            max_concurrent_requests: default_max_concurrent_requests(),
+            cancellation_check_interval: default_cancellation_check_interval(),
             cors: CorsConfig::default(),
             sampling_defaults: SamplingParamDefaults::default(),
             tls_cert: None,
@@ -307,6 +315,23 @@ impl ServerConfigBuilder {
 
     pub fn request_timeout_secs(mut self, timeout: u64) -> Self {
         self.config.request_timeout_secs = timeout;
+        self
+    }
+
+    // Concurrency settings
+    pub fn max_concurrent_requests(mut self, max: usize) -> Self {
+        self.config.max_concurrent_requests = max;
+        self
+    }
+
+    
+    pub fn cancellation_check_interval(mut self, interval: u64) -> Self {
+        self.config.cancellation_check_interval = interval;
+        self
+    }
+
+    pub fn cancellation_check_interval_duration(mut self, interval: std::time::Duration) -> Self {
+        self.config.cancellation_check_interval = interval.as_millis() as u64;
         self
     }
 
@@ -393,6 +418,20 @@ impl ServerConfigBuilder {
         if let Ok(port) = std::env::var("HYPRSTREAM_SERVER_PORT") {
             if let Ok(p) = port.parse() {
                 self.config.port = p;
+            }
+        }
+
+        // Concurrency settings
+        if let Ok(max_concurrent) = std::env::var("HYPRSTREAM_MAX_CONCURRENT_REQUESTS") {
+            if let Ok(n) = max_concurrent.parse() {
+                self.config.max_concurrent_requests = n;
+            }
+        }
+
+        
+        if let Ok(interval) = std::env::var("HYPRSTREAM_CANCELLATION_CHECK_INTERVAL") {
+            if let Ok(i) = interval.parse() {
+                self.config.cancellation_check_interval = i;
             }
         }
 
