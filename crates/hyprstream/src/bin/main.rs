@@ -207,6 +207,19 @@ fn init_telemetry(provider: TelemetryProvider) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    // Set up panic handler to get better debugging information
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("🚨 PANIC occurred:");
+        if let Some(loc) = info.location() {
+            eprintln!("   Location: {}:{}", loc.file(), loc.line());
+        }
+        if let Some(msg) = info.payload().downcast_ref::<&str>() {
+            eprintln!("   Message: {}", msg);
+        }
+        eprintln!("\nThis was likely caused by a threading issue or memory corruption.");
+        eprintln!("Please check for unsafe RefCell usage or race conditions.");
+    }));
+
     // Parse CLI arguments
     let cli = Cli::parse();
 
@@ -629,10 +642,24 @@ fn main() -> Result<()> {
         }
 
         Commands::Merge {
-            model,
-            branch,
-            ff_only,
+            target,
+            source,
+            ff,
             no_ff,
+            ff_only,
+            no_commit,
+            squash,
+            message,
+            abort,
+            continue_merge,
+            quit,
+            no_stat,
+            quiet,
+            verbose,
+            strategy,
+            strategy_option,
+            allow_unrelated_histories,
+            no_verify,
         } => {
             let ctx = ctx.clone();
             with_runtime(
@@ -641,8 +668,28 @@ fn main() -> Result<()> {
                     multi_threaded: true,
                 },
                 || async move {
+                    use hyprstream_core::cli::git_handlers::MergeOptions;
+
                     let storage = ctx.storage().await?;
-                    handle_merge(storage, &model, &branch, ff_only, no_ff).await
+                    let options = MergeOptions {
+                        ff,
+                        no_ff,
+                        ff_only,
+                        no_commit,
+                        squash,
+                        message: message.clone(),
+                        abort,
+                        continue_merge,
+                        quit,
+                        no_stat,
+                        quiet,
+                        verbose,
+                        strategy: strategy.clone(),
+                        strategy_option: strategy_option.clone(),
+                        allow_unrelated_histories,
+                        no_verify,
+                    };
+                    handle_merge(storage, &target, &source, options).await
                 },
             )?;
         }
