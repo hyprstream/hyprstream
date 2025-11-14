@@ -778,7 +778,7 @@ pub async fn handle_list(
 
             // Show worktrees if --worktrees flag is set
             if worktrees {
-                match storage.list_worktrees_with_metadata(&model_ref).await {
+                match storage.list_worktrees_with_metadata(model_ref).await {
                     Ok(wt_list) if !wt_list.is_empty() => {
                         for (wt_name, meta_opt) in wt_list {
                             if let Some(meta) = meta_opt {
@@ -1783,7 +1783,7 @@ fn perform_merge(
         .peel_to_commit()
         .map_err(|e| anyhow::anyhow!("Failed to resolve HEAD commit: {}", e))?;
 
-    let message = options.message.as_deref().unwrap_or_else(|| "Merge branch");
+    let message = options.message.as_deref().unwrap_or("Merge branch");
     let full_message = format!("{} '{}'", message, source);
 
     let merge_oid = repo
@@ -1935,7 +1935,7 @@ pub async fn handle_merge(
                 eprintln!("  hyprstream merge {} --abort", target);
                 bail!("Merge conflicts must be resolved manually");
             } else {
-                Err(e.into())
+                Err(e)
             }
         }
     }
