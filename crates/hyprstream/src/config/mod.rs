@@ -128,6 +128,11 @@ pub struct RuntimeConfig {
     pub kv_cache_size_mb: usize,
     /// Precision mode (BF16/FP16/FP32/FP8)
     pub precision_mode: Option<String>,
+    // NEW: Concurrency and timeout settings
+    pub max_concurrent_loads: usize,
+    pub max_concurrent_generations: usize,
+    pub default_generation_timeout_ms: u64,
+    pub default_model_load_timeout_ms: u64,
 }
 
 impl Default for RuntimeConfig {
@@ -141,6 +146,10 @@ impl Default for RuntimeConfig {
             mmap: true,
             kv_cache_size_mb: 2048,
             precision_mode: Some("auto".to_string()),
+            max_concurrent_loads: 2,
+            max_concurrent_generations: 10,
+            default_generation_timeout_ms: 30000, // 30 seconds
+            default_model_load_timeout_ms: 120000, // 2 minutes
         }
     }
 }
@@ -474,6 +483,11 @@ pub struct GenerationRequest {
     pub repeat_last_n: usize,
     pub stop_tokens: Vec<String>,
     pub seed: Option<u32>,
+    // NEW: Async configuration fields
+    #[serde(default)]
+    pub timeout: Option<u64>, // Duration in milliseconds
+    #[serde(default)]
+    pub cancel_token_id: Option<String>, // For cancellation tracking
 }
 
 /// Unified sampling parameters with Option fields for clean precedence merging.
@@ -502,6 +516,12 @@ pub struct SamplingParams {
     pub eta_cutoff: Option<f32>,
     #[serde(default)]
     pub do_sample: Option<bool>,
+
+    // NEW: Async parameters
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub cancel_token_id: Option<String>,
 }
 
 impl SamplingParams {
@@ -610,6 +630,8 @@ impl SamplingParams {
             epsilon_cutoff: self.epsilon_cutoff,
             eta_cutoff: self.eta_cutoff,
             do_sample: self.do_sample.unwrap_or(true),
+            timeout_ms: self.timeout_ms.unwrap_or(30000), // Default 30 seconds
+            cancel_token_id: self.cancel_token_id,
         }
     }
 }
@@ -630,6 +652,9 @@ pub struct ResolvedSamplingParams {
     pub epsilon_cutoff: Option<f32>,
     pub eta_cutoff: Option<f32>,
     pub do_sample: bool,
+    // NEW: Async parameters
+    pub timeout_ms: u64,
+    pub cancel_token_id: Option<String>,
 }
 
 /// Builder for generation requests using the unified SamplingParams precedence system
@@ -692,6 +717,22 @@ impl GenerationRequestBuilder {
         self
     }
 
+    // NEW: Async configuration methods
+    pub fn timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.params.timeout_ms = Some(timeout.as_millis() as u64);
+        self
+    }
+
+    pub fn timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.params.timeout_ms = Some(timeout_ms);
+        self
+    }
+
+    pub fn cancel_token_id(mut self, token_id: impl Into<String>) -> Self {
+        self.params.cancel_token_id = Some(token_id.into());
+        self
+    }
+
     pub fn build_v2(self) -> GenerationRequestV2 {
         GenerationRequestV2 {
             prompt: self.prompt,
@@ -711,6 +752,8 @@ impl GenerationRequestBuilder {
             repeat_last_n: resolved.repeat_last_n,
             stop_tokens: resolved.stop_tokens,
             seed: resolved.seed.map(|s| s as u32),
+            timeout: Some(resolved.timeout_ms),
+            cancel_token_id: resolved.cancel_token_id,
         }
     }
 }
@@ -759,6 +802,8 @@ impl From<&GenerationConfig> for GenerationRequest {
             repeat_last_n: 64, // Default repeat_last_n
             stop_tokens: config.stop_tokens.clone(),
             seed: config.seed,
+            timeout: None, // Not in GenerationConfig
+            cancel_token_id: None, // Not in GenerationConfig
         }
     }
 }
