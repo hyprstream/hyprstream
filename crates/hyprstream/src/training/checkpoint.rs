@@ -3,9 +3,9 @@
 //! Provides non-blocking checkpoint saving during training,
 //! with commits to model branches for version control.
 
-use crate::git::{create_hyprstream_signature, get_repository};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
+use git2db::GitManager;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::fs;
@@ -257,7 +257,11 @@ impl CheckpointManager {
         }
 
         // Open repository
-        let repo = get_repository(&self.model_path)?;
+        let repo = GitManager::global()
+            .get_repository(&self.model_path)
+            .map_err(|e| anyhow::anyhow!("Failed to get repository: {}", e))?
+            .open()
+            .map_err(|e| anyhow::anyhow!("Failed to open repository: {}", e))?;
 
         // Switch branch if specified
         if let Some(branch_name) = branch {
@@ -294,7 +298,9 @@ impl CheckpointManager {
         // Create commit
         let tree_id = index.write_tree()?;
         let tree = repo.find_tree(tree_id)?;
-        let sig = create_hyprstream_signature()?;
+        let sig = GitManager::global()
+            .create_signature(None, None)
+            .map_err(|e| anyhow::anyhow!("Failed to create signature: {}", e))?;
         let parent = repo.head()?.peel_to_commit()?;
 
         let commit_message = message.unwrap_or_else(|| {
@@ -530,7 +536,11 @@ impl CheckpointManager {
         branch_name: &Option<String>,
     ) -> Result<()> {
         // Open repository
-        let repo = get_repository(model_path)?;
+        let repo = GitManager::global()
+            .get_repository(model_path)
+            .map_err(|e| anyhow::anyhow!("Failed to get repository: {}", e))?
+            .open()
+            .map_err(|e| anyhow::anyhow!("Failed to open repository: {}", e))?;
 
         // If we have a specific branch, ensure we're on it
         if let Some(branch) = branch_name {
@@ -555,7 +565,9 @@ impl CheckpointManager {
         // Create commit
         let tree_id = index.write_tree()?;
         let tree = repo.find_tree(tree_id)?;
-        let sig = create_hyprstream_signature()?;
+        let sig = GitManager::global()
+            .create_signature(None, None)
+            .map_err(|e| anyhow::anyhow!("Failed to create signature: {}", e))?;
 
         let parent_commit = repo.head()?.peel_to_commit()?;
         let message = if branch_name.is_some() {
