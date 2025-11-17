@@ -633,11 +633,6 @@ pub async fn handle_lora_train(
 /// Handle list command
 pub async fn handle_list(
     storage: &ModelStorage,
-    branch: Option<String>,
-    tag: Option<String>,
-    dirty: bool,
-    verbose: bool,
-    worktrees: bool,
 ) -> Result<()> {
     info!("Listing models");
 
@@ -662,150 +657,69 @@ pub async fn handle_list(
             .join(&model_ref.model)
             .join(format!("{}.git", model_ref.model));
 
-        let git_info = if bare_repo_path.exists() {
-            GitInfo::from_bare_repo(&bare_repo_path)
-        } else {
-            // Fall back to trying storage.status() for compatibility
-            match storage.status(&model_ref).await {
-                Ok(status) => Some(GitInfo::from_status(&status)),
-                Err(e) => {
-                    tracing::debug!("Failed to get git info for {}: {}", model_ref.model, e);
-                    None
-                }
-            }
-        };
-
-        // Apply filters
-        if dirty {
-            if let Some(ref git) = git_info {
-                if !git.is_dirty {
-                    continue;
-                }
-            } else {
-                continue;
-            }
-        }
-
-        if let Some(ref branch_filter) = branch {
-            if let Some(ref git) = git_info {
-                if !git.matches_branch(branch_filter) {
-                    continue;
-                }
-            } else {
-                continue;
-            }
-        }
-
-        if let Some(ref tag_filter) = tag {
-            if let Some(ref git) = git_info {
-                if !git.matches_tag(tag_filter) {
-                    continue;
-                }
-            } else {
-                continue;
-            }
-        }
+        let git_info = GitInfo::from_bare_repo(&bare_repo_path);
 
         models_with_git.push((model_ref, metadata, git_info));
     }
 
-    if verbose {
-        // Verbose output with detailed information
-        for (model_ref, metadata, git_info) in &models_with_git {
-            println!("Model: {}", model_ref.model);
-            if let Some(desc) = &metadata.display_name {
-                println!("  Display Name: {}", desc);
-            }
+    // Table format - the nice format you liked!
+    println!(
+        "{:<30} {:<15} {:<8} {:<6} {:<10}",
+        "MODEL NAME", "REF", "COMMIT", "STATUS", "SIZE"
+    );
+    println!("{}", "-".repeat(75));
 
-            if let Some(git) = git_info {
-                println!(
-                    "  Git Reference: {}",
-                    git.current_ref.as_deref().unwrap_or("detached")
-                );
-                println!(
-                    "  Commit: {}",
-                    git.short_commit.as_deref().unwrap_or("unknown")
-                );
-                println!("  Status: {}", if git.is_dirty { "dirty" } else { "clean" });
-                if let Some(date) = &git.last_commit_date {
-                    println!("  Last Commit: {}", date);
-                }
-            }
+    for (model_ref, metadata, git_info) in &models_with_git {
+        let size_str = if let Some(size) = metadata.size_bytes {
+            format!("{:.1}GB", size as f64 / (1024.0 * 1024.0 * 1024.0))
+        } else {
+            "n/a".to_string()
+        };
 
-            if let Some(size) = metadata.size_bytes {
-                println!("  Size: {:.2} GB", size as f64 / 1_073_741_824.0);
-            }
-            println!(
-                "  Created: {}",
-                chrono::DateTime::from_timestamp(metadata.created_at, 0)
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                    .unwrap_or_else(|| "unknown".to_string())
-            );
-            println!();
-        }
-    } else {
-        // Table format - the nice format you liked!
+        let (git_ref, commit, status) = match git_info {
+            Some(git) => (
+                git.current_ref
+                    .clone()
+                    .unwrap_or_else(|| "detached".to_string()),
+                git.short_commit
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                if git.is_dirty { "dirty" } else { "clean" },
+            ),
+            None => ("n/a".to_string(), "n/a".to_string(), "n/a"),
+        };
+
         println!(
             "{:<30} {:<15} {:<8} {:<6} {:<10}",
-            "MODEL NAME", "REF", "COMMIT", "STATUS", "SIZE"
+            model_ref.model, git_ref, commit, status, size_str
         );
-        println!("{}", "-".repeat(75));
 
-        for (model_ref, metadata, git_info) in &models_with_git {
-            let size_str = if let Some(size) = metadata.size_bytes {
-                format!("{:.1}GB", size as f64 / (1024.0 * 1024.0 * 1024.0))
-            } else {
-                "n/a".to_string()
-            };
-
-            let (git_ref, commit, status) = match git_info {
-                Some(git) => (
-                    git.current_ref
-                        .clone()
-                        .unwrap_or_else(|| "detached".to_string()),
-                    git.short_commit
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    if git.is_dirty { "dirty" } else { "clean" },
-                ),
-                None => ("n/a".to_string(), "n/a".to_string(), "n/a"),
-            };
-
-            println!(
-                "{:<30} {:<15} {:<8} {:<6} {:<10}",
-                model_ref.model, git_ref, commit, status, size_str
-            );
-
-            // Show worktrees if --worktrees flag is set
-            if worktrees {
-                match storage.list_worktrees_with_metadata(model_ref).await {
-                    Ok(wt_list) if !wt_list.is_empty() => {
-                        for (wt_name, meta_opt) in wt_list {
-                            if let Some(meta) = meta_opt {
-                                let age_str = crate::storage::format_duration(meta.age());
-                                let saved_str = meta.space_saved_human();
-                                println!(
-                                    "  ├── {} ({}, {}, {} ago)",
-                                    wt_name, meta.storage_driver, saved_str, age_str
-                                );
-                            } else {
-                                println!("  ├── {} (no metadata)", wt_name);
-                            }
-                        }
-                    }
-                    Ok(_) => {
-                        // No worktrees
-                    }
-                    Err(e) => {
-                        tracing::debug!("Failed to list worktrees for {}: {}", model_ref.model, e);
+        match storage.list_worktrees_with_metadata(model_ref).await {
+            Ok(wt_list) if !wt_list.is_empty() => {
+                for (wt_name, meta_opt) in wt_list {
+                    if let Some(meta) = meta_opt {
+                        let age_str = crate::storage::format_duration(meta.age());
+                        let saved_str = meta.space_saved_human();
+                        println!(
+                            "  ├── {} ({}, {}, {} ago)",
+                            wt_name, meta.storage_driver, saved_str, age_str
+                        );
+                    } else {
+                        println!("  ├── {} (no metadata)", wt_name);
                     }
                 }
             }
+            Ok(_) => {
+                // No worktrees
+            }
+            Err(e) => {
+                tracing::debug!("Failed to list worktrees for {}: {}", model_ref.model, e);
+            }
         }
+    }
 
-        if models_with_git.is_empty() {
-            println!("No models match the specified filters.");
-        }
+    if models_with_git.is_empty() {
+        println!("No models match the specified filters.");
     }
 
     Ok(())

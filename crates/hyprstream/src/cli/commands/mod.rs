@@ -178,23 +178,7 @@ pub enum Commands {
     },
 
     /// List available models
-    List {
-        /// Filter by git branch
-        #[arg(long)]
-        branch: Option<String>,
-        /// Filter by git tag
-        #[arg(long)]
-        tag: Option<String>,
-        /// Show only models with uncommitted changes
-        #[arg(long)]
-        dirty: bool,
-        /// Verbose output with detailed info
-        #[arg(short, long)]
-        verbose: bool,
-        /// Show worktrees for each model (default: true, use --no-worktrees to hide)
-        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
-        worktrees: bool,
-    },
+    List,
 
     /// Get detailed information about a model
     Inspect {
