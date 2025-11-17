@@ -1043,7 +1043,10 @@ impl TorchEngine {
     /// # Example
     /// ```no_run
     /// use futures::StreamExt;
+    /// use hyprstream_core::config::GenerationRequest;
     ///
+    /// # async fn example(engine: &hyprstream_core::runtime::torch_engine::TorchEngine) -> anyhow::Result<()> {
+    /// let request = GenerationRequest::default();
     /// let mut stream = engine.generate(request)?;
     ///
     /// while let Some(text_chunk) = stream.next().await {
@@ -1052,6 +1055,8 @@ impl TorchEngine {
     ///
     /// let stats = stream.stats();
     /// println!("Generated {} tokens", stats.tokens_generated);
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn generate(&self, mut request: GenerationRequest) -> Result<TextStream<'_>> {
         // Set random seed if provided for deterministic generation
