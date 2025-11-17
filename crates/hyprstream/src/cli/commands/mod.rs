@@ -380,16 +380,4 @@ pub enum WorktreeCommand {
         #[arg(short, long)]
         force: bool,
     },
-
-    /// Prune stale worktrees
-    Prune {
-        /// Model name
-        model: String,
-        /// Days of inactivity before pruning (default: 30)
-        #[arg(long, default_value = "30")]
-        days: u32,
-        /// Dry run - show what would be pruned without removing
-        #[arg(long)]
-        dry_run: bool,
-    },
 }

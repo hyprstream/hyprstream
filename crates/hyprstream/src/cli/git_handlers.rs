@@ -22,7 +22,7 @@ pub async fn handle_branch(
     let model_ref = ModelRef::new(model.to_string());
 
     // Create branch using git2db directly
-    let repo_id = storage.resolve_repo_id(&model_ref)?;
+    let repo_id = storage.resolve_repo_id(&model_ref).await?;
     let registry = storage.registry().await;
     let handle = registry.repo(&repo_id)?;
     handle.branch().create(branch_name, from_ref.as_deref()).await?;
@@ -410,7 +410,7 @@ pub async fn handle_lora_train(
         info!("Creating isolated training environment: branch {} from {}", new_branch, model_ref.git_ref.display_name());
 
         // 1. Create branch from model_ref's git_ref
-        let repo_id = storage.resolve_repo_id(&model_ref)?;
+        let repo_id = storage.resolve_repo_id(&model_ref).await?;
         let registry = storage.registry().await;
         let handle = registry.repo(&repo_id)?;
 
@@ -670,7 +670,7 @@ pub async fn handle_list(
     );
     println!("{}", "-".repeat(75));
 
-    for (model_ref, metadata, git_info) in &models_with_git {
+    for (_model_ref, metadata, git_info) in &models_with_git {
         let size_str = if let Some(size) = metadata.size_bytes {
             format!("{:.1}GB", size as f64 / (1024.0 * 1024.0 * 1024.0))
         } else {
@@ -770,7 +770,7 @@ pub async fn handle_info(
     let model_ref = ModelRef::parse(model)?;
 
     // Try to get git2db metadata
-    let repo_metadata = if let Ok(_repo_id) = storage.resolve_repo_id(&model_ref) {
+    let repo_metadata = if let Ok(_repo_id) = storage.resolve_repo_id(&model_ref).await {
         // Access registry through storage method
         match storage.get_bare_repo_path(&model_ref).await {
             Ok(_) => {
@@ -1405,7 +1405,7 @@ pub async fn handle_push(
     let model_ref = ModelRef::new(model.to_string());
 
     // Use git2db API for push
-    let repo_id = storage.resolve_repo_id(&model_ref)?;
+    let repo_id = storage.resolve_repo_id(&model_ref).await?;
     let registry = storage.registry().await;
     let handle = registry.repo(&repo_id)?;
 
@@ -1447,7 +1447,7 @@ pub async fn handle_pull(
     let model_ref = ModelRef::new(model.to_string());
 
     // Use git2db API for pull
-    let repo_id = storage.resolve_repo_id(&model_ref)?;
+    let repo_id = storage.resolve_repo_id(&model_ref).await?;
     let registry = storage.registry().await;
     let handle = registry.repo(&repo_id)?;
 
@@ -1856,7 +1856,7 @@ async fn handle_merge_conflict_resolution(
     }
 
     // Open repository
-    let repo_id = storage.resolve_repo_id(&target_ref)?;
+    let repo_id = storage.resolve_repo_id(&target_ref).await?;
     let registry = storage.registry().await;
     let handle = registry.repo(&repo_id)?;
     let repo = handle.open_repo()?;

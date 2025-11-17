@@ -361,7 +361,11 @@ impl ModelDisplayInfo {
 impl GitInfo {
     /// Create GitInfo from a git repository path
     pub fn from_repo_path(repo_path: &std::path::Path) -> Option<Self> {
-        let repo = crate::git::get_repository(repo_path).ok()?;
+        let repo = git2db::GitManager::global()
+            .get_repository(repo_path)
+            .ok()?
+            .open()
+            .ok()?;
 
         // Get current reference
         let (current_ref, ref_type) = match repo.head() {
@@ -465,7 +469,11 @@ impl GitInfo {
     /// This works with bare repos (unlike status which requires worktrees)
     pub fn from_bare_repo(repo_path: &std::path::Path) -> Option<Self> {
         // Try to open as a bare repository
-        let repo = crate::git::get_repository(repo_path).ok()?;
+        let repo = git2db::GitManager::global()
+            .get_repository(repo_path)
+            .ok()?
+            .open()
+            .ok()?;
 
         // Get HEAD reference - this works even in bare repos
         let (current_ref, ref_type, head_oid) = match repo.head() {
