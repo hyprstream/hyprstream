@@ -536,13 +536,7 @@ fn main() -> Result<()> {
             )?;
         }
 
-        Commands::List {
-            branch,
-            tag,
-            dirty,
-            verbose,
-            worktrees,
-        } => {
+        Commands::List { .. } => {
             let ctx = ctx.clone();
             with_runtime(
                 RuntimeConfig {
@@ -551,7 +545,7 @@ fn main() -> Result<()> {
                 },
                 || async move {
                     let storage = ctx.storage().await?;
-                    handle_list(storage, branch, tag, dirty, verbose, worktrees).await
+                    handle_list(storage).await
                 },
             )?;
         }
