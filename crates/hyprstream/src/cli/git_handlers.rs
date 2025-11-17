@@ -659,6 +659,7 @@ pub async fn handle_list(
 
         let git_info = GitInfo::from_bare_repo(&bare_repo_path);
 
+        println!("pushing models_with_git: {}", model_ref.model);
         models_with_git.push((model_ref, metadata, git_info));
     }
 
@@ -691,31 +692,8 @@ pub async fn handle_list(
 
         println!(
             "{:<30} {:<15} {:<8} {:<6} {:<10}",
-            model_ref.model, git_ref, commit, status, size_str
+            metadata.display_name.as_ref().unwrap(), git_ref, commit, status, size_str
         );
-
-        match storage.list_worktrees_with_metadata(model_ref).await {
-            Ok(wt_list) if !wt_list.is_empty() => {
-                for (wt_name, meta_opt) in wt_list {
-                    if let Some(meta) = meta_opt {
-                        let age_str = crate::storage::format_duration(meta.age());
-                        let saved_str = meta.space_saved_human();
-                        println!(
-                            "  ├── {} ({}, {}, {} ago)",
-                            wt_name, meta.storage_driver, saved_str, age_str
-                        );
-                    } else {
-                        println!("  ├── {} (no metadata)", wt_name);
-                    }
-                }
-            }
-            Ok(_) => {
-                // No worktrees
-            }
-            Err(e) => {
-                tracing::debug!("Failed to list worktrees for {}: {}", model_ref.model, e);
-            }
-        }
     }
 
     if models_with_git.is_empty() {
