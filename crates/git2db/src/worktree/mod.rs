@@ -1,48 +1,24 @@
 //! Worktree management with pluggable strategies
 //!
-//! This module provides worktree creation with multiple strategies:
-//! - Git worktree (always available, branch isolation via libgit2)
-//! - Overlayfs worktree (Linux-only, space-efficient CoW)
-//!
-//! Strategies are automatically selected based on platform and availability,
-//! with graceful fallback to Git worktrees.
+//! This module provides worktree creation with Git worktree strategy.
+//! Overlay2-based worktrees are now handled at the storage driver level
+//! in storage/overlay2.rs for better separation of concerns.
 
 mod git_strategy;
 mod strategy;
 
-#[cfg(feature = "overlayfs")]
-pub mod overlay;
-
 pub use git_strategy::GitWorktreeStrategy;
 pub use strategy::{StrategyCapabilities, WorktreeHandle, WorktreeMetadata, WorktreeStrategy};
-
-#[cfg(feature = "overlayfs")]
-pub use overlay::{
-    available_backends, is_available as overlayfs_available, select_best_backend,
-    BackendCapabilities, FuseBackend, KernelBackend, OverlayBackend, OverlayWorktreeStrategy,
-    UserNamespaceBackend,
-};
 
 use std::sync::Arc;
 use tracing::info;
 
 /// Select the best available worktree strategy for the current platform
 ///
-/// Priority order:
-/// 1. Overlayfs (if feature enabled and available)
-/// 2. Git worktree (always available fallback)
+/// Currently returns Git worktree strategy. Overlay2 driver is selected
+/// at the storage driver level for better architectural separation.
 pub fn select_best_strategy() -> Arc<dyn WorktreeStrategy> {
-    #[cfg(feature = "overlayfs")]
-    {
-        // Try overlayfs first on Linux
-        let overlay = OverlayWorktreeStrategy::new();
-        if overlay.is_available() {
-            info!("Selected overlayfs worktree strategy ({})", overlay.name());
-            return Arc::new(overlay);
-        }
-    }
-
-    // Fall back to Git worktree
+    // Git worktree is always available
     info!("Selected git worktree strategy");
     Arc::new(GitWorktreeStrategy)
 }
@@ -63,17 +39,5 @@ mod tests {
         let strategy = GitWorktreeStrategy;
         assert!(strategy.is_available());
         assert_eq!(strategy.name(), "git-worktree");
-    }
-
-    #[cfg(all(feature = "overlayfs", target_os = "linux"))]
-    #[test]
-    fn test_overlayfs_detection() {
-        if overlayfs_available() {
-            println!("Overlayfs is available on this system");
-            let strategy = OverlayWorktreeStrategy::new();
-            println!("Selected backend: {}", strategy.name());
-        } else {
-            println!("Overlayfs not available, will use git worktree");
-        }
     }
 }
