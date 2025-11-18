@@ -43,9 +43,10 @@ pub trait WorktreeStrategy: Send + Sync {
 
 /// Handle to a created worktree
 ///
-/// Provides access to the worktree and ensures cleanup on drop.
-/// All implementations should clean up resources (unmount, remove files, etc.)
-/// in their Drop implementation.
+/// Provides access to the worktree and requires explicit async cleanup.
+/// Caller MUST call cleanup() before dropping to ensure proper resource cleanup
+/// (unmounting, removing files, etc.).
+#[async_trait]
 pub trait WorktreeHandle: Send + Sync {
     /// Get the worktree path
     fn path(&self) -> &Path;
@@ -56,11 +57,16 @@ pub trait WorktreeHandle: Send + Sync {
     /// Get strategy-specific metadata
     fn metadata(&self) -> WorktreeMetadata;
 
-    /// Cleanup the worktree
+    /// Cleanup the worktree asynchronously
     ///
-    /// This is called automatically by Drop, but can be called explicitly
-    /// for error handling.
-    fn cleanup(&self) -> Git2DBResult<()>;
+    /// MUST be called to properly release all resources:
+    /// - Unmount overlay mounts
+    /// - Remove temporary directories
+    /// - Clean up other backend-specific resources
+    ///
+    /// Drop will attempt cleanup but provides no completion guarantees.
+    /// Always call this method explicitly.
+    async fn cleanup(&mut self) -> Git2DBResult<()>;
 }
 
 /// Strategy capabilities for auto-selection

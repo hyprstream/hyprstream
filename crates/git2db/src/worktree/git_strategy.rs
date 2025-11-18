@@ -105,6 +105,7 @@ struct GitWorktreeHandle {
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[async_trait]
 impl WorktreeHandle for GitWorktreeHandle {
     fn path(&self) -> &Path {
         &self.path
@@ -124,7 +125,7 @@ impl WorktreeHandle for GitWorktreeHandle {
         }
     }
 
-    fn cleanup(&self) -> Git2DBResult<()> {
+    async fn cleanup(&mut self) -> Git2DBResult<()> {
         // Git worktree cleanup is handled by libgit2
         // The worktree directory can be removed normally
         debug!("Git worktree cleanup at {}", self.path.display());
@@ -134,9 +135,12 @@ impl WorktreeHandle for GitWorktreeHandle {
 
 impl Drop for GitWorktreeHandle {
     fn drop(&mut self) {
-        if let Err(e) = self.cleanup() {
-            tracing::warn!("Failed to cleanup git worktree: {}", e);
-        }
+        // Warn if cleanup wasn't called
+        tracing::warn!(
+            "GitWorktreeHandle at {} dropped without calling cleanup() - \
+             cleanup may not have completed properly",
+            self.path.display()
+        );
     }
 }
 

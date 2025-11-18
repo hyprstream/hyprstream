@@ -176,30 +176,36 @@ impl Driver for Overlay2Driver {
         let work = work_dir.clone();
         let id_clone = id.clone();
 
-        let cleanup = Box::new(move || {
+        let cleanup = move || async move {
             let mount_point = mount_point.clone();
             let upper = upper.clone();
             let work = work.clone();
             let id = id_clone.clone();
 
-            tokio::spawn(async move {
-                info!("Cleaning up overlay2 worktree {}", id);
+            info!("Cleaning up overlay2 worktree {}", id);
 
-                // Unmount (try fusermount first, then umount)
-                if let Err(e) = Self::unmount_overlayfs(&mount_point).await {
-                    warn!(
-                        "Failed to unmount {} in cleanup: {}",
-                        mount_point.display(),
-                        e
-                    );
-                }
+            // Unmount (try fusermount first, then umount)
+            if let Err(e) = Self::unmount_overlayfs(&mount_point).await {
+                warn!(
+                    "Failed to unmount {} in cleanup: {}",
+                    mount_point.display(),
+                    e
+                );
+            }
 
-                // Remove overlay directories
-                let _ = tokio::fs::remove_dir_all(&upper).await;
-                let _ = tokio::fs::remove_dir_all(&work).await;
-                let _ = tokio::fs::remove_dir_all(&mount_point).await;
-            });
-        });
+            // Remove overlay directories
+            if let Err(e) = tokio::fs::remove_dir_all(&upper).await {
+                warn!("Failed to remove upper dir {}: {}", upper.display(), e);
+            }
+            if let Err(e) = tokio::fs::remove_dir_all(&work).await {
+                warn!("Failed to remove work dir {}: {}", work.display(), e);
+            }
+            if let Err(e) = tokio::fs::remove_dir_all(&mount_point).await {
+                warn!("Failed to remove mount point {}: {}", mount_point.display(), e);
+            }
+
+            Ok(())
+        };
 
         Ok(WorktreeHandle::with_cleanup(
             opts.worktree_path.clone(),

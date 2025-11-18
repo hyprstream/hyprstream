@@ -792,9 +792,7 @@ impl GitManager {
         }
 
         match result {
-            Ok(handle) => {
-                let handle = Box::new(handle) as Box<dyn WorktreeHandle>;
-
+            Ok(mut handle) => {
                 if let Err(e) = Self::fetch_lfs_files(worktree_path).await {
                     tracing::error!(
                         "Failed to fetch LFS files for worktree at {}: {}",
@@ -803,12 +801,12 @@ impl GitManager {
                     );
                     tracing::info!("Rolling back worktree creation due to LFS fetch failure");
 
-                    handle.cleanup().unwrap_or_else(|cleanup_err| {
+                    if let Err(cleanup_err) = handle.cleanup().await {
                         tracing::error!(
                             "Failed to cleanup worktree during rollback: {}",
                             cleanup_err
                         );
-                    });
+                    }
 
                     return Err(Git2DBError::internal(format!(
                         "Worktree creation failed: LFS fetch error: {}. Worktree has been rolled back.",
@@ -816,7 +814,7 @@ impl GitManager {
                     )));
                 }
 
-                Ok(handle)
+                Ok(Box::new(handle) as Box<dyn WorktreeHandle>)
             }
             Err(e) => {
                 tracing::error!(

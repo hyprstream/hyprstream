@@ -6,7 +6,9 @@
 use crate::errors::{Git2DBError, Git2DBResult};
 use async_trait::async_trait;
 use std::fmt;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 /// Storage driver selection (Docker's graphdriver pattern)
@@ -170,6 +172,9 @@ pub trait Driver: Send + Sync {
     async fn create_worktree(&self, opts: &DriverOpts) -> Git2DBResult<WorktreeHandle>;
 }
 
+/// Async cleanup function type
+pub type AsyncCleanupFn = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Git2DBResult<()>> + Send>> + Send>;
+
 /// Handle to a created worktree
 ///
 /// Provides access to the worktree and handles cleanup on drop.
@@ -181,8 +186,8 @@ pub struct WorktreeHandle {
     /// Driver that created this worktree
     pub driver_name: String,
 
-    /// Cleanup function (called on drop), wrapped in Arc<Mutex> for Sync
-    cleanup: Option<Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>>,
+    /// Async cleanup function, wrapped in Arc<Mutex> for Sync
+    cleanup: Option<Arc<Mutex<Option<AsyncCleanupFn>>>>,
 }
 
 impl WorktreeHandle {
@@ -195,15 +200,17 @@ impl WorktreeHandle {
         }
     }
 
-    /// Create with cleanup function
-    pub fn with_cleanup<F>(path: PathBuf, driver_name: String, cleanup: F) -> Self
+    /// Create with async cleanup function
+    pub fn with_cleanup<F, Fut>(path: PathBuf, driver_name: String, cleanup: F) -> Self
     where
-        F: FnOnce() + Send + 'static,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Git2DBResult<()>> + Send + 'static,
     {
+        let cleanup_fn: AsyncCleanupFn = Box::new(move || Box::pin(cleanup()));
         Self {
             path,
             driver_name,
-            cleanup: Some(Arc::new(Mutex::new(Some(Box::new(cleanup))))),
+            cleanup: Some(Arc::new(Mutex::new(Some(cleanup_fn)))),
         }
     }
 
@@ -214,6 +221,7 @@ impl WorktreeHandle {
 }
 
 // Implement the WorktreeHandle trait from worktree module
+#[async_trait]
 impl crate::worktree::WorktreeHandle for WorktreeHandle {
     fn path(&self) -> &Path {
         &self.path
@@ -233,20 +241,32 @@ impl crate::worktree::WorktreeHandle for WorktreeHandle {
         }
     }
 
-    fn cleanup(&self) -> Git2DBResult<()> {
-        // Cleanup is handled in Drop
+    async fn cleanup(&mut self) -> Git2DBResult<()> {
+        if let Some(cleanup_arc) = self.cleanup.take() {
+            let cleanup_fn = {
+                if let Ok(mut cleanup_guard) = cleanup_arc.lock() {
+                    cleanup_guard.take()
+                } else {
+                    None
+                }
+            };
+
+            if let Some(cleanup_fn) = cleanup_fn {
+                cleanup_fn().await?;
+            }
+        }
         Ok(())
     }
 }
 
 impl Drop for WorktreeHandle {
     fn drop(&mut self) {
-        if let Some(cleanup_arc) = self.cleanup.take() {
-            if let Ok(mut cleanup_guard) = cleanup_arc.lock() {
-                if let Some(cleanup_fn) = cleanup_guard.take() {
-                    cleanup_fn();
-                }
-            }
+        if self.cleanup.is_some() {
+            tracing::warn!(
+                "WorktreeHandle at {} dropped without calling cleanup() - \
+                 resources may leak (overlayfs mounts, temporary directories)",
+                self.path.display()
+            );
         }
     }
 }
