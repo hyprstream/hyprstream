@@ -28,7 +28,6 @@ pub mod repository;
 pub mod repository_handle;
 pub mod stage;
 pub mod transaction;
-pub mod worktree;
 
 // Storage drivers (Docker's graphdriver pattern)
 pub mod storage;
@@ -80,8 +79,6 @@ pub use stage::{StageManager, StagedFile};
 pub use transaction::{IsolationMode, TransactionHandle};
 pub use transport::TransportFactory;
 
-// Worktree exports
-pub use worktree::{WorktreeHandle, WorktreeMetadata};
 
 // Storage driver exports
 pub use storage::{Driver, DriverRegistry, StorageDriver};
@@ -168,12 +165,15 @@ pub mod ops {
         manager().get_repository(path)?.open()
     }
 
-    /// Create a worktree (async)
+    /// Create a worktree (async) - Note: Worktree types removed, use storage drivers directly
+    /// TODO: Re-implement worktree management using storage drivers
     pub async fn create_worktree(
         base_repo: &Path,
         worktree: &Path,
         branch: &str,
-    ) -> Git2DBResult<Box<dyn crate::worktree::WorktreeHandle>> {
+    ) -> Git2DBResult<Box<dyn std::any::Any>> {
+        // Temporarily return Any to allow compilation while worktree types are removed
+        // TODO: Implement proper worktree return type or remove this function
         manager().create_worktree(base_repo, worktree, branch).await
     }
 

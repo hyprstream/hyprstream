@@ -54,9 +54,7 @@ impl DriverRegistry {
         match selection {
             StorageDriver::Auto => self.auto_select(),
             StorageDriver::Overlay2 => self.get("overlay2"),
-            StorageDriver::Btrfs => self.get("btrfs"),
             StorageDriver::Reflink => self.get("reflink"),
-            StorageDriver::Hardlink => self.get("hardlink"),
             StorageDriver::Vfs => self.get("vfs"),
         }
     }

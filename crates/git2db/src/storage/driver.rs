@@ -7,6 +7,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use tokio::sync::OnceCell;
 
 /// Storage driver selection (Docker's graphdriver pattern)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,9 +23,7 @@ impl fmt::Display for StorageDriver {
         match self {
             Self::Auto => write!(f, "auto"),
             Self::Overlay2 => write!(f, "overlay2"),
-            Self::Btrfs => write!(f, "btrfs"),
             Self::Reflink => write!(f, "reflink"),
-            Self::Hardlink => write!(f, "hardlink"),
             Self::Vfs => write!(f, "vfs"),
         }
     }
@@ -37,9 +36,7 @@ impl std::str::FromStr for StorageDriver {
         match s.to_lowercase().as_str() {
             "auto" | "automatic" => Ok(Self::Auto),
             "overlay2" | "overlayfs" => Ok(Self::Overlay2),
-            "btrfs" => Ok(Self::Btrfs),
             "reflink" => Ok(Self::Reflink),
-            "hardlink" => Ok(Self::Hardlink),
             "vfs" | "none" => Ok(Self::Vfs),
             _ => Err(DriverError::UnknownDriver(s.to_string())),
         }
@@ -135,7 +132,7 @@ pub type AsyncCleanupFn = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Git2DB
 /// Handle to a created worktree
 ///
 /// Provides access to the worktree and handles cleanup on drop.
-/// Implements the WorktreeHandle trait from worktree module.
+/// Implements git repository operations and worktree management.
 pub struct WorktreeHandle {
     /// Path to the worktree
     pub path: PathBuf,
@@ -145,6 +142,9 @@ pub struct WorktreeHandle {
 
     /// Async cleanup function, wrapped in Arc<Mutex> for Sync
     cleanup: Option<Arc<Mutex<Option<AsyncCleanupFn>>>>,
+
+    /// Cached repository instance (to avoid reopening)
+    repo: Option<git2::Repository>,
 }
 
 impl WorktreeHandle {
@@ -154,11 +154,16 @@ impl WorktreeHandle {
             path,
             driver_name,
             cleanup: None,
+            repo: None,
         }
     }
 
     /// Create with async cleanup function
-    pub fn with_cleanup<F, Fut>(path: PathBuf, driver_name: String, cleanup: F) -> Self
+    pub fn with_cleanup<F, Fut>(
+        path: PathBuf,
+        driver_name: String,
+        cleanup: F
+    ) -> Self
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Git2DBResult<()>> + Send + 'static,
@@ -168,37 +173,81 @@ impl WorktreeHandle {
             path,
             driver_name,
             cleanup: Some(Arc::new(Mutex::new(Some(cleanup_fn)))),
+            repo: None,
         }
+    }
+
+    /// Open the worktree as a git repository
+    pub fn open_repository(&self) -> Git2DBResult<git2::Repository> {
+        git2::Repository::open(&self.path).map_err(|e| Git2DBError::internal(format!(
+            "Failed to open worktree at {}: {}", self.path.display(), e
+        )))
     }
 
     /// Get the driver name
     pub fn driver_name(&self) -> &str {
         &self.driver_name
     }
-}
 
-// Implement the WorktreeHandle trait from worktree module
-#[async_trait]
-impl crate::worktree::WorktreeHandle for WorktreeHandle {
-    fn path(&self) -> &Path {
+    /// Get the worktree path
+    pub fn path(&self) -> &Path {
         &self.path
     }
 
-    fn is_valid(&self) -> bool {
-        self.path.exists()
+    /// Get the git repository with lazy loading and caching
+    pub fn get_repository(&mut self) -> Git2DBResult<&mut git2::Repository> {
+        if self.repo.is_none() {
+            self.repo = Some(self.open_repository()?);
+        }
+        Ok(self.repo.as_mut().unwrap())
     }
 
-    fn metadata(&self) -> crate::worktree::WorktreeMetadata {
-        crate::worktree::WorktreeMetadata {
-            strategy_name: format!("driver-{}", self.driver_name),
-            created_at: chrono::Utc::now(),
-            space_saved_bytes: None, // Drivers don't track this yet
-            backend_info: Some(format!("driver: {}", self.driver_name)),
-            read_only: false,
+    /// Get the current HEAD reference
+    pub fn head(&mut self) -> Git2DBResult<git2::Reference<'_>> {
+        let repo = self.get_repository()?;
+        let head = repo.head()?;
+        Ok(head)
+    }
+
+    /// Get the current commit
+    pub fn head_commit(&mut self) -> Git2DBResult<git2::Commit<'_>> {
+        let repo = self.get_repository()?;
+        let head = repo.head()?;
+        let commit = head.peel_to_commit()?;
+        Ok(commit)
+    }
+
+    /// Check if the worktree is valid and accessible
+    pub fn is_valid(&self) -> bool {
+        self.path.exists() &&
+        self.path.join(".git").exists() &&
+        self.open_repository().is_ok()
+    }
+
+    /// Check if the worktree has uncommitted changes
+    pub fn is_dirty(&mut self) -> Git2DBResult<bool> {
+        let repo = self.get_repository()?;
+        let mut opts = git2::StatusOptions::new();
+        // Show working directory and staging area
+        opts.include_untracked(true);
+        opts.include_unmodified(true);
+        let statuses = repo.statuses(Some(&mut opts))?;
+        Ok(!statuses.is_empty())
+    }
+
+    /// Get basic worktree metadata
+    pub fn metadata(&mut self) -> WorktreeMetadata {
+        WorktreeMetadata {
+            path: self.path.clone(),
+            driver_name: self.driver_name.clone(),
+            is_valid: self.is_valid(),
+            is_dirty: self.is_dirty().unwrap_or(false),
+            created_at: chrono::Utc::now(), // This should be actual creation time
         }
     }
 
-    async fn cleanup(&mut self) -> Git2DBResult<()> {
+    /// Async cleanup method
+    pub async fn cleanup(&mut self) -> Git2DBResult<()> {
         if let Some(cleanup_arc) = self.cleanup.take() {
             let cleanup_fn = {
                 if let Ok(mut cleanup_guard) = cleanup_arc.lock() {
@@ -215,6 +264,17 @@ impl crate::worktree::WorktreeHandle for WorktreeHandle {
         Ok(())
     }
 }
+
+/// Worktree metadata for inspection and debugging
+#[derive(Debug, Clone)]
+pub struct WorktreeMetadata {
+    pub path: PathBuf,
+    pub driver_name: String,
+    pub is_valid: bool,
+    pub is_dirty: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 
 impl Drop for WorktreeHandle {
     fn drop(&mut self) {

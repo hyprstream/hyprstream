@@ -21,7 +21,6 @@ use crate::config::Git2DBConfig;
 use crate::errors::{Git2DBError, Git2DBResult};
 use crate::repository::{CacheStats, RepositoryCache};
 use crate::transport_registry::TransportRegistry;
-use crate::worktree::WorktreeHandle;
 
 // Import storage driver system
 use crate::storage::{DriverOpts, DriverRegistry, StorageDriver};
@@ -720,7 +719,7 @@ impl GitManager {
         base_repo: impl AsRef<Path>,
         worktree_path: impl AsRef<Path>,
         ref_spec: &str,
-    ) -> Git2DBResult<Box<dyn WorktreeHandle>> {
+    ) -> Git2DBResult<Box<dyn std::any::Any>> {
         let base_repo = base_repo.as_ref();
         let worktree_path = worktree_path.as_ref();
 
@@ -814,7 +813,7 @@ impl GitManager {
                     )));
                 }
 
-                Ok(Box::new(handle) as Box<dyn WorktreeHandle>)
+                Ok(Box::new(handle) as Box<dyn std::any::Any>)
             }
             Err(e) => {
                 tracing::error!(

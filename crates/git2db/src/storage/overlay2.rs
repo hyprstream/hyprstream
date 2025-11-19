@@ -196,6 +196,7 @@ impl Driver for Overlay2Driver {
         Ok(WorktreeHandle::with_cleanup(
             opts.worktree_path.clone(),
             format!("overlay2-{}", mount_method),
+            opts.ref_spec.clone(),
             cleanup,
         ))
     }

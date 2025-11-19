@@ -11,9 +11,6 @@
 use super::driver::{Driver, DriverCapabilities, DriverOpts, WorktreeHandle};
 use crate::errors::{Git2DBError, Git2DBResult};
 use async_trait::async_trait;
-use safe_path::SafePath;
-use std::path::{Path, PathBuf};
-use tracing::{debug, info, warn};
 
 #[cfg(feature = "reflink")]
 use reflink_copy::reflink;
@@ -154,22 +151,6 @@ impl Driver for ReflinkDriver {
             opts.worktree_path.display(),
             opts.ref_spec
         );
-
-        // SECURITY: Validate base repository path
-        if let Err(e) = SafePath::new(&opts.base_repo) {
-            return Err(Git2DBError::invalid_path(
-                opts.base_repo.clone(),
-                format!("Invalid base repository path: {}", e),
-            ));
-        }
-
-        // SECURITY: Validate worktree path
-        if let Err(e) = SafePath::new(&opts.worktree_path) {
-            return Err(Git2DBError::invalid_path(
-                opts.worktree_path.clone(),
-                format!("Invalid worktree path: {}", e),
-            ));
-        }
 
         let worktree_path = opts.worktree_path.clone();
 
@@ -355,25 +336,6 @@ impl ReflinkDriver {
                     "Path traversal attempt detected",
                 ));
             }
-
-            // SECURITY: Use SafePath for secure path joining
-            let base_file_path = base.join(rel_path);
-            let base_file = SafePath::new(&base_file_path).map_err(|e| {
-                warn!("Invalid base file path {:?}: {}", base_file_path, e);
-                Git2DBError::invalid_path(
-                    base_file_path,
-                    format!("Invalid base file path: {}", e),
-                )
-            })?;
-
-            let target_file_path = entry.path();
-            let target_file = SafePath::new(&target_file_path).map_err(|e| {
-                warn!("Invalid target file path {:?}: {}", target_file_path, e);
-                Git2DBError::invalid_path(
-                    target_file_path.to_path_buf(),
-                    format!("Invalid target file path: {}", e),
-                )
-            })?;
 
             // Check if base file exists
             if !base_file.exists() {
