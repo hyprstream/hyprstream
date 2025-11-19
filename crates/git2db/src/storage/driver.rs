@@ -1,7 +1,4 @@
 //! Core driver trait and types
-//!
-//! Defines the Driver trait that all storage drivers must implement,
-//! following Docker's graphdriver pattern.
 
 use crate::errors::{Git2DBError, Git2DBResult};
 use async_trait::async_trait;
@@ -12,51 +9,11 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 /// Storage driver selection (Docker's graphdriver pattern)
-///
-/// Named after the actual technologies used, with Auto for automatic selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageDriver {
-    /// Auto-select best available driver
-    ///
-    /// Priority order:
-    /// 1. overlay2 (Linux overlayfs) - ~80% space savings
-    /// 2. Future: btrfs, reflink, hardlink
-    /// 3. vfs (plain directories) - always works
     Auto,
-
-    /// Linux overlayfs (like Docker's overlay2 driver)
-    ///
-    /// - ~80% disk space savings via CoW
-    /// - Multiple backend options (FUSE, userns, kernel)
-    /// - Linux only
     Overlay2,
-
-    /// Btrfs Copy-on-Write (future)
-    ///
-    /// - Native filesystem CoW
-    /// - Requires btrfs filesystem
-    #[allow(dead_code)]
-    Btrfs,
-
-    /// Reflink-based CoW (future)
-    ///
-    /// - Uses cp --reflink on XFS/APFS/btrfs
-    /// - Cross-platform where supported
-    #[allow(dead_code)]
     Reflink,
-
-    /// Hardlink-based optimization (future)
-    ///
-    /// - Hardlink unchanged files
-    /// - Cross-platform fallback
-    #[allow(dead_code)]
-    Hardlink,
-
-    /// Plain directory (vfs) - Docker's universal fallback
-    ///
-    /// - No optimization
-    /// - Full disk usage
-    /// - Always works on all platforms
     Vfs,
 }
 

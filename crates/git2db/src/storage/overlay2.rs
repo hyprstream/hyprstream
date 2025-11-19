@@ -1,13 +1,4 @@
 //! Overlay2 driver (Linux overlayfs)
-//!
-//! Implements the overlay2 storage driver using Linux overlayfs,
-//! following Docker's overlay2 driver design.
-//!
-//! This driver provides:
-//! - ~80% disk space savings via Copy-on-Write
-//! - Smart mount strategy selection (kernel → userns → FUSE → fail)
-//! - Full git worktree functionality with optimized storage
-
 use super::driver::{Driver, DriverCapabilities, DriverOpts, WorktreeHandle};
 use crate::errors::{Git2DBError, Git2DBResult};
 use async_trait::async_trait;
@@ -30,11 +21,6 @@ pub struct Overlay2Config {
 
 
 /// Overlay2 storage driver with internalized mount strategy
-///
-/// This driver handles all overlay mounting methods internally:
-/// - Kernel overlayfs (direct mount syscall, fastest, requires CAP_SYS_ADMIN)
-/// - User namespace overlayfs (unprivileged, good perf, requires kernel support)
-/// - FUSE overlayfs (user-space, most compatible, requires fuse-overlayfs)
 #[allow(dead_code)] // config may be used for future extensions
 pub struct Overlay2Driver {
     #[allow(dead_code)]

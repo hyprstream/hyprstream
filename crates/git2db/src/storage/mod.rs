@@ -46,6 +46,7 @@
 
 mod driver;
 mod overlay2;
+mod reflink;
 mod registry;
 mod vfs;
 
@@ -54,4 +55,5 @@ pub use registry::DriverRegistry;
 
 // Re-export individual driver configurations
 pub use overlay2::Overlay2Config;
+pub use reflink::ReflinkConfig;
 pub use vfs::VfsConfig;

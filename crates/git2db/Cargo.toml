@@ -59,6 +59,10 @@ merklehash = { workspace = true, optional = true }
 nix = { workspace = true, optional = true, features = ["mount", "sched"] }
 caps = { workspace = true, optional = true }
 
+# Reflink support (cross-platform CoW)
+reflink-copy = { version = "0.1", optional = true }
+walkdir = { version = "2", optional = true }
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio-test.workspace = true
@@ -80,3 +84,5 @@ gittorrent-transport = ["gittorrent"]
 xet-storage = ["git-xet-filter/xet-storage", "data", "cas_client", "cas_object", "merklehash"]
 # Enable overlayfs worktree support (Linux-only, space-efficient CoW)
 overlayfs = ["nix/mount", "nix/sched", "dep:caps"]
+# Enable reflink worktree support (cross-platform CoW)
+reflink = ["reflink-copy", "walkdir"]
