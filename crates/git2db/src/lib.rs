@@ -83,10 +83,6 @@ pub use transport::TransportFactory;
 // Worktree exports
 pub use worktree::{WorktreeHandle, WorktreeMetadata};
 
-// Overlayfs exports (feature-gated)
-#[cfg(feature = "overlayfs")]
-pub use worktree::overlayfs_available;
-
 // Storage driver exports
 pub use storage::{Driver, DriverRegistry, StorageDriver};
 

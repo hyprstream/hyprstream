@@ -591,47 +591,6 @@ impl Default for WorktreeConfig {
     }
 }
 
-impl WorktreeConfig {
-    /// Require overlay2 driver (fail if unavailable)
-    pub fn overlay2_only() -> Self {
-        Self {
-            driver: "overlay2".to_string(),
-            fallback: false,
-            force_backend: None,
-            log_driver: true,
-        }
-    }
-
-    /// Use only vfs driver (plain git worktrees, no optimization)
-    pub fn vfs_only() -> Self {
-        Self {
-            driver: "vfs".to_string(),
-            fallback: true,
-            force_backend: None,
-            log_driver: true,
-        }
-    }
-
-    /// Force specific driver
-    pub fn with_driver(driver: impl Into<String>) -> Self {
-        Self {
-            driver: driver.into(),
-            fallback: true,
-            force_backend: None,
-            log_driver: true,
-        }
-    }
-
-    /// Force specific overlay2 backend
-    pub fn with_overlay2_backend(backend: impl Into<String>) -> Self {
-        Self {
-            driver: "overlay2".to_string(),
-            fallback: true,
-            force_backend: Some(backend.into()),
-            log_driver: true,
-        }
-    }
-}
 
 /// XET large file storage configuration
 ///

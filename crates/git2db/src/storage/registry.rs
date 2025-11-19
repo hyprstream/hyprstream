@@ -7,6 +7,8 @@ use super::driver::{Driver, DriverError, StorageDriver};
 use super::vfs::VfsDriver;
 #[cfg(all(target_os = "linux", feature = "overlayfs"))]
 use super::overlay2::Overlay2Driver;
+#[cfg(feature = "reflink")]
+use super::reflink::ReflinkDriver;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
@@ -30,6 +32,12 @@ impl DriverRegistry {
         #[cfg(all(target_os = "linux", feature = "overlayfs"))]
         {
             drivers.insert("overlay2".to_string(), Arc::new(Overlay2Driver::new()));
+        }
+
+        // Register reflink (cross-platform CoW)
+        #[cfg(feature = "reflink")]
+        {
+            drivers.insert("reflink".to_string(), Arc::new(ReflinkDriver::new()));
         }
 
         // Future: Register other drivers
@@ -64,17 +72,17 @@ impl DriverRegistry {
     /// Auto-select the best available driver (Docker pattern)
     ///
     /// Priority order:
-    /// 1. overlay2 (Linux overlayfs) - best space savings
-    /// 2. Future: btrfs, reflink, hardlink
-    /// 3. vfs (plain directories) - always works
+    /// 1. overlay2 (Linux overlayfs) - best space savings for incremental edits
+    /// 2. reflink (cross-platform CoW) - good space savings, simpler cleanup
+    /// 3. Future: btrfs, hardlink
+    /// 4. vfs (plain directories) - always works
     fn auto_select(&self) -> Result<Arc<dyn Driver>, DriverError> {
-        // Priority order (like Docker's GetDriver)
         let priorities = [
-            "overlay2", // Best: ~80% space savings on Linux
-            "btrfs",    // Future: Native btrfs CoW
-            "reflink",  // Future: XFS/APFS reflinks
-            "hardlink", // Future: Cross-platform hardlinks
-            "vfs",      // Fallback: Always works
+            "overlay2",
+            "reflink",
+            "btrfs",
+            "hardlink",
+            "vfs",
         ];
 
         for name in &priorities {
