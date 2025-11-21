@@ -8,12 +8,20 @@
 //! - macOS: APFS
 //! - Windows: ReFS, Dev Drive
 
-use super::driver::{Driver, DriverCapabilities, DriverOpts, WorktreeHandle};
+use super::driver::{Driver, DriverOpts, WorktreeHandle, DriverFactory};
 use crate::errors::{Git2DBError, Git2DBResult};
 use async_trait::async_trait;
+use std::path::Path;
+use tracing::{info, debug, warn};
 
 #[cfg(feature = "reflink")]
 use reflink_copy::reflink;
+
+#[cfg(feature = "reflink")]
+inventory::submit!(DriverFactory::new(
+    "reflink",
+    || Box::new(ReflinkDriver::new())
+));
 
 /// Configuration for reflink driver
 #[derive(Debug, Clone)]
@@ -46,7 +54,7 @@ pub struct ReflinkDriver {
 
 impl ReflinkDriver {
     /// Create with default configuration
-    pub fn new() -> Self {
+    fn new() -> Self {
         let available = Self::check_availability();
         Self {
             config: ReflinkConfig::default(),
@@ -55,7 +63,7 @@ impl ReflinkDriver {
     }
 
     /// Create with custom configuration
-    pub fn with_config(config: ReflinkConfig) -> Self {
+    fn with_config(config: ReflinkConfig) -> Self {
         let available = Self::check_availability();
         Self { config, available }
     }
@@ -124,17 +132,7 @@ impl Driver for ReflinkDriver {
         false
     }
 
-    fn capabilities(&self) -> DriverCapabilities {
-        DriverCapabilities {
-            copy_on_write: true,
-            space_savings_percent: 80, // Typical for read-heavy workloads
-            requires_privileges: false,
-            platforms: vec!["linux", "macos", "windows"],
-            required_binaries: vec![], // Pure Rust implementation
-            relative_performance: 1.0, // Native filesystem speed
-        }
-    }
-
+    
     #[cfg(feature = "reflink")]
     async fn create_worktree(&self, opts: &DriverOpts) -> Git2DBResult<WorktreeHandle> {
         // Validate inputs
@@ -188,6 +186,51 @@ impl Driver for ReflinkDriver {
         Err(Git2DBError::internal(
             "reflink driver requires 'reflink' feature to be enabled",
         ))
+    }
+
+    async fn get_worktrees(&self, base_repo: &Path) -> Git2DBResult<Vec<WorktreeHandle>> {
+        let worktrees_dir = base_repo.parent()
+            .ok_or_else(|| Git2DBError::invalid_path(base_repo.to_path_buf(), "Invalid base repository path"))?
+            .join("worktrees");
+
+        let mut worktrees = Vec::new();
+
+        if !worktrees_dir.exists() {
+            return Ok(worktrees);
+        }
+
+        // Read worktrees directory
+        for entry in std::fs::read_dir(&worktrees_dir)? {
+            let entry = entry?;
+            let worktree_path = entry.path();
+
+            // Skip non-directories and git's internal directories
+            if !worktree_path.is_dir() || worktree_path.file_name().map_or(false, |name| {
+                name.to_string_lossy().starts_with(".git")
+            }) {
+                continue;
+            }
+
+            // For Reflink driver, any directory with a .git inside is a valid worktree
+            if worktree_path.join(".git").exists() {
+                worktrees.push(WorktreeHandle::new(worktree_path, "reflink".to_string()));
+            }
+        }
+
+        Ok(worktrees)
+    }
+
+    async fn get_worktree(&self, base_repo: &Path, branch: &str) -> Git2DBResult<Option<WorktreeHandle>> {
+        let worktree_path = base_repo.parent()
+            .ok_or_else(|| Git2DBError::invalid_path(base_repo.to_path_buf(), "Invalid base repository path"))?
+            .join("worktrees")
+            .join(branch);
+
+        if worktree_path.exists() && worktree_path.join(".git").exists() {
+            Ok(Some(WorktreeHandle::new(worktree_path, "reflink".to_string())))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -337,6 +380,10 @@ impl ReflinkDriver {
                 ));
             }
 
+            // Construct base file path (same relative path but from base directory)
+            let base_file = base.join(rel_path);
+            let target_file = entry.path();
+
             // Check if base file exists
             if !base_file.exists() {
                 skipped_count += 1;
@@ -387,6 +434,51 @@ impl ReflinkDriver {
 
         Ok(())
     }
+
+    async fn get_worktrees(&self, base_repo: &Path) -> Git2DBResult<Vec<WorktreeHandle>> {
+        let worktrees_dir = base_repo.parent()
+            .ok_or_else(|| Git2DBError::invalid_path(base_repo.to_path_buf(), "Invalid base repository path"))?
+            .join("worktrees");
+
+        let mut worktrees = Vec::new();
+
+        if !worktrees_dir.exists() {
+            return Ok(worktrees);
+        }
+
+        // Read worktrees directory
+        for entry in std::fs::read_dir(&worktrees_dir)? {
+            let entry = entry?;
+            let worktree_path = entry.path();
+
+            // Skip non-directories and git's internal directories
+            if !worktree_path.is_dir() || worktree_path.file_name().map_or(false, |name| {
+                name.to_string_lossy().starts_with(".git")
+            }) {
+                continue;
+            }
+
+            // For Reflink driver, any directory with a .git inside is a valid worktree
+            if worktree_path.join(".git").exists() {
+                worktrees.push(WorktreeHandle::new(worktree_path, "reflink".to_string()));
+            }
+        }
+
+        Ok(worktrees)
+    }
+
+    async fn get_worktree(&self, base_repo: &Path, branch: &str) -> Git2DBResult<Option<WorktreeHandle>> {
+        let worktree_path = base_repo.parent()
+            .ok_or_else(|| Git2DBError::invalid_path(base_repo.to_path_buf(), "Invalid base repository path"))?
+            .join("worktrees")
+            .join(branch);
+
+        if worktree_path.exists() && worktree_path.join(".git").exists() {
+            Ok(Some(WorktreeHandle::new(worktree_path, "reflink".to_string())))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -397,20 +489,6 @@ mod tests {
     fn test_driver_name() {
         let driver = ReflinkDriver::new();
         assert_eq!(driver.name(), "reflink");
-    }
-
-    #[test]
-    fn test_capabilities() {
-        let driver = ReflinkDriver::new();
-        let caps = driver.capabilities();
-
-        assert!(caps.copy_on_write);
-        assert_eq!(caps.space_savings_percent, 80);
-        assert!(!caps.requires_privileges);
-        assert!(caps.platforms.contains(&"linux"));
-        assert!(caps.platforms.contains(&"macos"));
-        assert!(caps.platforms.contains(&"windows"));
-        assert_eq!(caps.relative_performance, 1.0);
     }
 
     #[test]

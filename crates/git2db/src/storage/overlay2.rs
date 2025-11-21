@@ -1,12 +1,16 @@
 //! Overlay2 driver (Linux overlayfs)
-use super::driver::{Driver, DriverCapabilities, DriverOpts, WorktreeHandle};
+use super::driver::{Driver, DriverOpts, WorktreeHandle, DriverFactory};
 use crate::errors::{Git2DBError, Git2DBResult};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
-use tracing::{info, warn, debug};
+use tokio::process::Command;
+use tracing::{info, debug, warn};
 
 #[cfg(all(target_os = "linux", feature = "overlayfs"))]
-use tokio::process::Command;
+inventory::submit!(DriverFactory::new(
+    "overlay2",
+    || Box::new(Overlay2Driver::new())
+));
 
 /// Configuration for overlay2 driver
 #[derive(Debug, Clone)]
@@ -21,22 +25,20 @@ pub struct Overlay2Config {
 
 
 /// Overlay2 storage driver with internalized mount strategy
-#[allow(dead_code)] // config may be used for future extensions
 pub struct Overlay2Driver {
-    #[allow(dead_code)]
     config: Overlay2Config,
 }
 
 impl Overlay2Driver {
     /// Create with default configuration
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             config: Overlay2Config::default(),
         }
     }
 
     /// Create with custom configuration
-    pub fn with_config(config: Overlay2Config) -> Self {
+    fn with_config(config: Overlay2Config) -> Self {
         Self { config }
     }
 }
@@ -68,33 +70,8 @@ impl Driver for Overlay2Driver {
         false
     }
 
-    fn capabilities(&self) -> DriverCapabilities {
-        #[cfg(all(target_os = "linux", feature = "overlayfs"))]
-        {
-            DriverCapabilities {
-                copy_on_write: true,
-                space_savings_percent: 80, // Typical overlayfs savings
-                requires_privileges: false, // Can use userns or FUSE as fallback
-                platforms: vec!["linux"],
-                required_binaries: vec!["fuse-overlayfs"], // FUSE is the final fallback
-                relative_performance: 1.0, // Kernel overlayfs performance is baseline
-            }
-        }
-
-        #[cfg(not(all(target_os = "linux", feature = "overlayfs")))]
-        {
-            DriverCapabilities {
-                copy_on_write: false,
-                space_savings_percent: 0,
-                requires_privileges: false,
-                platforms: vec![],
-                required_binaries: vec![],
-                relative_performance: 0.0,
-            }
-        }
-    }
-
-    #[cfg(feature = "overlayfs")]
+  
+  #[cfg(feature = "overlayfs")]
     async fn create_worktree(&self, opts: &DriverOpts) -> Git2DBResult<WorktreeHandle> {
         // Validate inputs
         if !opts.base_repo.exists() {
@@ -196,13 +173,73 @@ impl Driver for Overlay2Driver {
         Ok(WorktreeHandle::with_cleanup(
             opts.worktree_path.clone(),
             format!("overlay2-{}", mount_method),
-            opts.ref_spec.clone(),
             cleanup,
         ))
     }
 
     #[cfg(not(feature = "overlayfs"))]
     async fn create_worktree(&self, _opts: &DriverOpts) -> Git2DBResult<WorktreeHandle> {
+        Err(Git2DBError::internal(
+            "overlay2 driver requires 'overlayfs' feature to be enabled",
+        ))
+    }
+
+    #[cfg(feature = "overlayfs")]
+    async fn get_worktrees(&self, base_repo: &Path) -> Git2DBResult<Vec<WorktreeHandle>> {
+        let worktrees_dir = base_repo.parent()
+            .ok_or_else(|| Git2DBError::invalid_path(base_repo.to_path_buf(), "Invalid base repository path"))?
+            .join("worktrees");
+
+        let mut worktrees = Vec::new();
+
+        if !worktrees_dir.exists() {
+            return Ok(worktrees);
+        }
+
+        // Read worktrees directory
+        for entry in std::fs::read_dir(&worktrees_dir)? {
+            let entry = entry?;
+            let worktree_path = entry.path();
+
+            // Skip non-directories and git's internal directories
+            if !worktree_path.is_dir() || worktree_path.file_name().map_or(false, |name| {
+                name.to_string_lossy().starts_with(".git")
+            }) {
+                continue;
+            }
+
+            // Check if this is an overlay2 worktree by looking for overlay signatures
+            if self.is_overlay2_worktree(&worktree_path) {
+                worktrees.push(WorktreeHandle::new(worktree_path, "overlay2".to_string()));
+            }
+        }
+
+        Ok(worktrees)
+    }
+
+    #[cfg(feature = "overlayfs")]
+    async fn get_worktree(&self, base_repo: &Path, branch: &str) -> Git2DBResult<Option<WorktreeHandle>> {
+        let worktree_path = base_repo.parent()
+            .ok_or_else(|| Git2DBError::invalid_path(base_repo.to_path_buf(), "Invalid base repository path"))?
+            .join("worktrees")
+            .join(branch);
+
+        if worktree_path.exists() && self.is_overlay2_worktree(&worktree_path) {
+            Ok(Some(WorktreeHandle::new(worktree_path, "overlay2".to_string())))
+        } else {
+            Ok(None)
+        }
+    }
+
+    #[cfg(not(feature = "overlayfs"))]
+    async fn get_worktrees(&self, _base_repo: &Path) -> Git2DBResult<Vec<WorktreeHandle>> {
+        Err(Git2DBError::internal(
+            "overlay2 driver requires 'overlayfs' feature to be enabled",
+        ))
+    }
+
+    #[cfg(not(feature = "overlayfs"))]
+    async fn get_worktree(&self, _base_repo: &Path, _branch: &str) -> Git2DBResult<Option<WorktreeHandle>> {
         Err(Git2DBError::internal(
             "overlay2 driver requires 'overlayfs' feature to be enabled",
         ))
@@ -320,7 +357,7 @@ impl Overlay2Driver {
         target: &Path,
     ) -> Git2DBResult<()> {
         let mount_opts = format!(
-            "lowerdir={},upperdir={},workdir={}",
+            "lowerdir={},upperdir={},workdir={},userxattr",
             lower.display(),
             upper.display(),
             work.display()
@@ -482,6 +519,28 @@ impl Overlay2Driver {
 
         Ok(())
     }
+
+    /// Check if a worktree is managed by overlay2 driver
+    fn is_overlay2_worktree(&self, worktree_path: &Path) -> bool {
+        // Check for overlay2 signatures
+        let overlay_path = worktree_path.join(".overlay");
+        let git_overlay_path = worktree_path.join(".git").join("overlay");
+
+        // Also check for overlayfs mount signatures
+        let has_overlay_sig = overlay_path.exists() || git_overlay_path.exists();
+
+        // Additional check: look for overlay mount points in /proc/mounts
+        if has_overlay_sig {
+            if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+                let worktree_str = worktree_path.to_string_lossy();
+                if mounts.contains(&*worktree_str) {
+                    return true;
+                }
+            }
+        }
+
+        has_overlay_sig
+    }
 }
 
 #[cfg(test)]
@@ -500,23 +559,5 @@ mod tests {
         let driver = Overlay2Driver::new();
         // May or may not be available depending on system
         println!("Overlay2 available: {}", driver.is_available());
-    }
-
-    #[test]
-    fn test_capabilities() {
-        let driver = Overlay2Driver::new();
-        let caps = driver.capabilities();
-
-        #[cfg(feature = "overlayfs")]
-        {
-            assert!(caps.copy_on_write);
-            assert!(caps.space_savings_percent > 0);
-        }
-
-        #[cfg(not(feature = "overlayfs"))]
-        {
-            assert!(!caps.copy_on_write);
-            assert_eq!(caps.space_savings_percent, 0);
-        }
     }
 }

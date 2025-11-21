@@ -63,6 +63,9 @@ caps = { workspace = true, optional = true }
 reflink-copy = { version = "0.1", optional = true }
 walkdir = { version = "2", optional = true }
 
+# Plugin registry for driver discovery
+inventory = "0.3"
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio-test.workspace = true
@@ -73,7 +76,7 @@ quickcheck.workspace = true
 quickcheck_macros.workspace = true
 
 [features]
-default = []
+default = ["reflink"]
 # Enable experimental features
 experimental = []
 # Enable detailed tracing

@@ -3,12 +3,8 @@
 //! Manages driver registration and selection, similar to Docker's
 //! daemon/graphdriver/driver_linux.go
 
-use super::driver::{Driver, DriverError, StorageDriver};
-use super::vfs::VfsDriver;
-#[cfg(all(target_os = "linux", feature = "overlayfs"))]
-use super::overlay2::Overlay2Driver;
-#[cfg(feature = "reflink")]
-use super::reflink::ReflinkDriver;
+use super::driver::{Driver, DriverError, StorageDriver, DriverFactory};
+use inventory;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
@@ -25,24 +21,14 @@ impl DriverRegistry {
     pub fn new() -> Self {
         let mut drivers: HashMap<String, Arc<dyn Driver>> = HashMap::new();
 
-        // Register vfs (always available)
-        drivers.insert("vfs".to_string(), Arc::new(VfsDriver));
-
-        // Register overlay2 on Linux
-        #[cfg(all(target_os = "linux", feature = "overlayfs"))]
-        {
-            drivers.insert("overlay2".to_string(), Arc::new(Overlay2Driver::new()));
+        // Load drivers from inventory registry
+        for factory in inventory::iter::<DriverFactory> {
+            info!("Registering storage driver: {}", factory.name());
+            drivers.insert(
+                factory.name().to_string(),
+                factory.get_driver()
+            );
         }
-
-        // Register reflink (cross-platform CoW)
-        #[cfg(feature = "reflink")]
-        {
-            drivers.insert("reflink".to_string(), Arc::new(ReflinkDriver::new()));
-        }
-
-        // Future: Register other drivers
-        // #[cfg(feature = "btrfs")]
-        // drivers.insert("btrfs".to_string(), Arc::new(BtrfsDriver));
 
         Self { drivers }
     }
@@ -92,8 +78,8 @@ impl DriverRegistry {
             }
         }
 
-        // VFS should always be available as ultimate fallback
-        self.get("vfs")
+        // No drivers available - this should never happen in practice
+        Err(DriverError::NotAvailable("No storage drivers available".to_string()))
     }
 
     /// List all registered drivers

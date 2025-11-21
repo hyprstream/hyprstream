@@ -896,11 +896,7 @@ impl Git2DB {
         &self.registry_path
     }
 
-    /// Get git manager reference
-    pub(crate) fn git_manager(&self) -> &GitManager {
-        self.git_manager
-    }
-
+  
     /// Initialize and update all submodules
     ///
     /// Equivalent to:

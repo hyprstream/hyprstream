@@ -157,12 +157,14 @@ async fn test_repository_handle_operations() {
     assert_eq!(repo.url().unwrap(), url);
 
     // Test worktree access
-    let worktree = repo.worktree().unwrap();
-    assert!(worktree.exists());
-    assert!(worktree.join("README.md").exists());
+    let worktree_path = repo.worktree().unwrap();
+    assert!(worktree_path.exists());
+    assert!(worktree_path.join("README.md").exists());
 
-    // Test status
-    let status = repo.status().await.unwrap();
+    // Test status - need to get worktree handle first
+    let default_branch = repo.default_branch().unwrap();
+    let worktree_handle = repo.get_worktree(&default_branch).await.unwrap().unwrap();
+    let status = worktree_handle.status().await.unwrap();
     assert!(status.is_clean);
 }
 

@@ -165,18 +165,6 @@ pub mod ops {
         manager().get_repository(path)?.open()
     }
 
-    /// Create a worktree (async) - Note: Worktree types removed, use storage drivers directly
-    /// TODO: Re-implement worktree management using storage drivers
-    pub async fn create_worktree(
-        base_repo: &Path,
-        worktree: &Path,
-        branch: &str,
-    ) -> Git2DBResult<Box<dyn std::any::Any>> {
-        // Temporarily return Any to allow compilation while worktree types are removed
-        // TODO: Implement proper worktree return type or remove this function
-        manager().create_worktree(base_repo, worktree, branch).await
-    }
-
     /// Remove a worktree
     pub fn remove_worktree(base_repo: &Path, worktree_name: &str) -> Git2DBResult<()> {
         manager().remove_worktree(base_repo, worktree_name, None)

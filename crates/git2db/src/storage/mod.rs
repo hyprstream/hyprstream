@@ -50,7 +50,7 @@ mod reflink;
 mod registry;
 mod vfs;
 
-pub use driver::{Driver, DriverCapabilities, DriverError, DriverOpts, StorageDriver};
+pub use driver::{Driver, DriverError, DriverOpts, StorageDriver, WorktreeHandle, DriverFactory};
 pub use registry::DriverRegistry;
 
 // Re-export individual driver configurations

@@ -6,10 +6,16 @@
 //! In our case, it creates standard git worktrees using libgit2 without
 //! any storage optimization layers underneath.
 
-use super::driver::{Driver, DriverCapabilities, DriverOpts, WorktreeHandle};
+use super::driver::{Driver, DriverOpts, WorktreeHandle, DriverFactory};
 use crate::errors::{Git2DBError, Git2DBResult};
 use async_trait::async_trait;
+use std::path::Path;
 use tracing::info;
+
+inventory::submit!(DriverFactory::new(
+    "vfs",
+    || Box::new(VfsDriver::new())
+));
 
 /// Configuration for vfs driver
 #[derive(Debug, Clone, Default)]
@@ -23,6 +29,13 @@ pub struct VfsConfig {
 /// git worktrees using libgit2 without any CoW or space-saving features.
 pub struct VfsDriver;
 
+impl VfsDriver {
+    /// Create a new VFS driver (private for now)
+    fn new() -> Self {
+        Self
+    }
+}
+
 #[async_trait]
 impl Driver for VfsDriver {
     fn name(&self) -> &'static str {
@@ -32,17 +45,6 @@ impl Driver for VfsDriver {
     fn is_available(&self) -> bool {
         // VFS is always available (it's just plain directories)
         true
-    }
-
-    fn capabilities(&self) -> DriverCapabilities {
-        DriverCapabilities {
-            copy_on_write: false,
-            space_savings_percent: 0,
-            requires_privileges: false,
-            platforms: vec!["linux", "macos", "windows"], // All platforms
-            required_binaries: vec![],
-            relative_performance: 1.0, // Baseline performance
-        }
     }
 
     async fn create_worktree(&self, opts: &DriverOpts) -> Git2DBResult<WorktreeHandle> {
@@ -76,6 +78,51 @@ impl Driver for VfsDriver {
             opts.worktree_path.clone(),
             "vfs".to_string(),
         ))
+    }
+
+    async fn get_worktrees(&self, base_repo: &Path) -> Git2DBResult<Vec<WorktreeHandle>> {
+        let worktrees_dir = base_repo.parent()
+            .ok_or_else(|| Git2DBError::invalid_path(base_repo.to_path_buf(), "Invalid base repository path"))?
+            .join("worktrees");
+
+        let mut worktrees = Vec::new();
+
+        if !worktrees_dir.exists() {
+            return Ok(worktrees);
+        }
+
+        // Read worktrees directory
+        for entry in std::fs::read_dir(&worktrees_dir)? {
+            let entry = entry?;
+            let worktree_path = entry.path();
+
+            // Skip non-directories and git's internal directories
+            if !worktree_path.is_dir() || worktree_path.file_name().map_or(false, |name| {
+                name.to_string_lossy().starts_with(".git")
+            }) {
+                continue;
+            }
+
+            // For VFS driver, any directory with a .git inside is a valid worktree
+            if worktree_path.join(".git").exists() {
+                worktrees.push(WorktreeHandle::new(worktree_path, "vfs".to_string()));
+            }
+        }
+
+        Ok(worktrees)
+    }
+
+    async fn get_worktree(&self, base_repo: &Path, branch: &str) -> Git2DBResult<Option<WorktreeHandle>> {
+        let worktree_path = base_repo.parent()
+            .ok_or_else(|| Git2DBError::invalid_path(base_repo.to_path_buf(), "Invalid base repository path"))?
+            .join("worktrees")
+            .join(branch);
+
+        if worktree_path.exists() && worktree_path.join(".git").exists() {
+            Ok(Some(WorktreeHandle::new(worktree_path, "vfs".to_string())))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -174,17 +221,4 @@ mod tests {
         assert!(driver.is_available());
     }
 
-    #[test]
-    fn test_capabilities() {
-        let driver = VfsDriver;
-        let caps = driver.capabilities();
-
-        assert!(!caps.copy_on_write);
-        assert_eq!(caps.space_savings_percent, 0);
-        assert!(!caps.requires_privileges);
-        assert!(caps.platforms.contains(&"linux"));
-        assert!(caps.platforms.contains(&"macos"));
-        assert!(caps.platforms.contains(&"windows"));
-        assert_eq!(caps.relative_performance, 1.0);
-    }
-}
+  }
