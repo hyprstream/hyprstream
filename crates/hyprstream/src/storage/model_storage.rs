@@ -1,8 +1,7 @@
 //! Simplified model storage working directly with git2db
 
 use anyhow::Result;
-use dashmap::DashMap;
-use git2db::{Git2DB, RepoId};
+use git2db::{Git2DB, GitRef, RepoId};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -54,8 +53,6 @@ pub struct CacheStats {
 pub struct ModelStorage {
     base_dir: PathBuf,
     registry: Arc<RwLock<Git2DB>>,
-    /// Fast name → RepoId lookup cache
-    name_cache: Arc<DashMap<String, RepoId>>,
 }
 
 impl ModelStorage {
@@ -72,18 +69,9 @@ impl ModelStorage {
         // GitManager::global() loads config from environment automatically
         let git2db = Git2DB::open(&base_dir).await?;
 
-        // Build name cache
-        let name_cache = Arc::new(DashMap::new());
-        for tracked in git2db.list() {
-            if let Some(name) = &tracked.name {
-                name_cache.insert(name.clone(), tracked.id.clone());
-            }
-        }
-
         Ok(Self {
             base_dir,
             registry: Arc::new(RwLock::new(git2db)),
-            name_cache,
         })
     }
 
@@ -93,16 +81,22 @@ impl ModelStorage {
     }
 
     /// Resolve model name to RepoId
-    fn resolve_name(&self, name: &str) -> Result<RepoId> {
-        self.name_cache
-            .get(name)
-            .map(|id| id.clone())
-            .ok_or_else(|| anyhow::anyhow!("Model '{}' not found in registry", name))
+    async fn resolve_name(&self, name: &str) -> Result<RepoId> {
+        // Query git2db registry directly (O(n) but always accurate, no sync issues)
+        // For ~100 models, this is negligible overhead
+        let registry = self.registry.read().await;
+        let repo_id = registry
+            .list()
+            .find(|t| t.name.as_ref() == Some(&name.to_string()))
+            .map(|t| t.id.clone())
+            .ok_or_else(|| anyhow::anyhow!("Model '{}' not found in registry", name))?;
+        drop(registry);  // Explicitly drop the read guard before returning
+        Ok(repo_id)
     }
 
     /// Get bare repository path by model reference
     pub async fn get_bare_repo_path(&self, model_ref: &ModelRef) -> Result<PathBuf> {
-        let repo_id = self.resolve_name(&model_ref.model)?;
+        let repo_id = self.resolve_name(&model_ref.model).await?;
         let registry = self.registry.read().await;
         let handle = registry.repo(&repo_id)?;
 
@@ -112,7 +106,7 @@ impl ModelStorage {
 
     /// Get worktree path for a specific branch
     pub async fn get_worktree_path(&self, model_ref: &ModelRef, branch: &str) -> Result<PathBuf> {
-        let repo_id = self.resolve_name(&model_ref.model)?;
+        let repo_id = self.resolve_name(&model_ref.model).await?;
         let registry = self.registry.read().await;
         let handle = registry.repo(&repo_id)?;
 
@@ -126,57 +120,89 @@ impl ModelStorage {
 
         let worktrees_dir = repo_dir.join("worktrees");
         // Use canonical branch path conversion
-        let worktree_path = worktrees_dir.join(branch.to_string());
+        let worktree_path = worktrees_dir.join(branch);
 
         Ok(worktree_path)
     }
 
-    /// Get default worktree path (main or master)
+    /// Get worktree path for the model reference
+    /// If the model_ref specifies a branch, returns that branch's worktree path.
+    /// Otherwise, returns the default branch worktree path.
     pub async fn get_model_path(&self, model_ref: &ModelRef) -> Result<PathBuf> {
-        // For compatibility, return the default worktree path
-        let _bare_repo_path = self.get_bare_repo_path(model_ref).await?;
+        // Resolve to branch name (avoiding unnecessary clones)
+        let branch = match &model_ref.git_ref {
+            GitRef::Branch(ref name) => name.as_str(),
+            GitRef::DefaultBranch | _ => {
+                if !matches!(model_ref.git_ref, GitRef::DefaultBranch) {
+                    tracing::warn!(
+                        "Model reference specifies non-branch git ref {:?}, using default branch",
+                        model_ref.git_ref
+                    );
+                }
+                // Need to get default branch (returns owned String)
+                return self.get_worktree_path(
+                    model_ref,
+                    &self.get_default_branch(model_ref).await?
+                ).await;
+            }
+        };
 
-        // Try to detect the default branch
-        let default_branch = self.get_default_branch(model_ref).await?;
-
-        self.get_worktree_path(model_ref, &default_branch).await
+        self.get_worktree_path(model_ref, branch).await
     }
 
-    /// List all models
+    /// List all models as worktree references (model:branch format)
+    ///
+    /// This returns all available worktrees across all models, formatted as
+    /// "model:branch" references. Base models without explicit branches are not included.
     pub async fn list_models(&self) -> Result<Vec<(ModelRef, ModelMetadata)>> {
         let mut result = Vec::new();
         let registry = self.registry.read().await;
 
         for tracked in registry.list() {
             if let Some(name) = &tracked.name {
-                let model_ref = ModelRef::new(name.clone());
+                let base_ref = ModelRef::new(name.clone());
 
-                // Calculate size if model exists
-                let size_bytes = if let Ok(handle) = registry.repo(&tracked.id) {
-                    if let Ok(model_path) = handle.worktree() {
-                        if model_path.exists() {
-                            Self::calculate_dir_size(model_path).ok()
-                        } else {
-                            None
+                // Enumerate all worktrees for this model
+                match self.list_worktrees(&base_ref).await {
+                    Ok(worktrees) => {
+                        for branch_name in worktrees {
+                            // Create model:branch reference
+                            let model_ref = ModelRef::with_ref(
+                                name.clone(),
+                                git2db::GitRef::Branch(branch_name.clone())
+                            );
+
+                            // Calculate size from worktree path
+                            let worktree_path = self.get_worktree_path(&base_ref, &branch_name).await.ok();
+                            let size_bytes = if let Some(path) = &worktree_path {
+                                if path.exists() {
+                                    Self::calculate_dir_size(path).ok()
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+
+                            // Build metadata
+                            let metadata = ModelMetadata {
+                                name: name.clone(),
+                                display_name: Some(format!("{}:{}", name, branch_name)),
+                                model_type: "worktree".to_string(),
+                                created_at: chrono::Utc::now().timestamp(),
+                                updated_at: chrono::Utc::now().timestamp(),
+                                size_bytes,
+                                tags: vec![],
+                            };
+
+                            result.push((model_ref, metadata));
                         }
-                    } else {
-                        None
                     }
-                } else {
-                    None
-                };
-
-                let metadata = ModelMetadata {
-                    name: name.clone(),
-                    display_name: Some(name.clone()),
-                    model_type: "base".to_string(),
-                    created_at: chrono::Utc::now().timestamp(),
-                    updated_at: chrono::Utc::now().timestamp(),
-                    size_bytes,
-                    tags: vec![],
-                };
-
-                result.push((model_ref, metadata));
+                    Err(e) => {
+                        tracing::warn!("Failed to list worktrees for model {}: {}", name, e);
+                        // Continue with other models
+                    }
+                }
             }
         }
 
@@ -201,7 +227,12 @@ impl ModelStorage {
 
     /// Check if a model exists
     pub async fn model_exists(&self, model_name: &str) -> bool {
-        self.name_cache.contains_key(model_name)
+        let registry = self.registry.read().await;
+        let exists = registry
+            .list()
+            .any(|t| t.name.as_ref() == Some(&model_name.to_string()));
+        drop(registry);  // Explicitly drop the read guard
+        exists
     }
 
     /// Add a new model
@@ -209,22 +240,19 @@ impl ModelStorage {
         validate_model_name(name)?;
 
         let mut registry = self.registry.write().await;
-        let repo_id = registry
+        let _repo_id = registry
             .clone(source)
             .name(name)
             .depth(1)
             .exec()
             .await?;
 
-        // Update cache
-        self.name_cache.insert(name.to_string(), repo_id);
-
         Ok(())
     }
 
     /// Update a model to a different version
     pub async fn update_model(&self, name: &str, ref_spec: &str) -> Result<()> {
-        let repo_id = self.resolve_name(name)?;
+        let repo_id = self.resolve_name(name).await?;
         let registry = self.registry.read().await;
         let handle = registry.repo(&repo_id)?;
 
@@ -248,8 +276,8 @@ impl ModelStorage {
     }
 
     /// Resolve model name to RepoId for use with registry()
-    pub fn resolve_repo_id(&self, model_ref: &ModelRef) -> Result<RepoId> {
-        self.resolve_name(&model_ref.model)
+    pub async fn resolve_repo_id(&self, model_ref: &ModelRef) -> Result<RepoId> {
+        self.resolve_name(&model_ref.model).await
     }
 
     // ========== Compatibility Methods ==========
@@ -274,7 +302,7 @@ impl ModelStorage {
 
     /// Get repository status
     pub async fn status(&self, model_ref: &ModelRef) -> Result<git2db::RepositoryStatus> {
-        let repo_id = self.resolve_name(&model_ref.model)?;
+        let repo_id = self.resolve_name(&model_ref.model).await?;
         let registry = self.registry.read().await;
         let handle = registry.repo(&repo_id)?;
         Ok(handle.status().await?)
@@ -286,7 +314,7 @@ impl ModelStorage {
         model_ref: &ModelRef,
         _options: super::CheckoutOptions,
     ) -> Result<super::CheckoutResult> {
-        let repo_id = self.resolve_name(&model_ref.model)?;
+        let repo_id = self.resolve_name(&model_ref.model).await?;
         let registry = self.registry.read().await;
         let handle = registry.repo(&repo_id)?;
 
@@ -307,7 +335,7 @@ impl ModelStorage {
 
     /// Get default branch
     pub async fn get_default_branch(&self, model_ref: &ModelRef) -> Result<String> {
-        let repo_id = self.resolve_name(&model_ref.model)?;
+        let repo_id = self.resolve_name(&model_ref.model).await?;
         let registry = self.registry.read().await;
         let handle = registry.repo(&repo_id)?;
         Ok(handle.default_branch()?)
@@ -315,10 +343,9 @@ impl ModelStorage {
 
     /// Remove model
     pub async fn remove_model(&self, model_ref: &ModelRef) -> Result<()> {
-        let repo_id = self.resolve_name(&model_ref.model)?;
+        let repo_id = self.resolve_name(&model_ref.model).await?;
         let mut registry = self.registry.write().await;
         registry.remove_repository(&repo_id).await?;
-        self.name_cache.remove(&model_ref.model);
         Ok(())
     }
 
@@ -331,17 +358,23 @@ impl ModelStorage {
             return Err(anyhow::anyhow!("Worktree already exists at {:?}", worktree_path));
         }
 
-        // Create parent directories for hierarchical branches (e.g., feature/ui)
-        if let Some(parent) = worktree_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        // Use git2db's high-level worktree creation with automatic directory handling
+        tracing::info!(
+            "Creating worktree for {} at {} (branch: {})",
+            model_ref.model,
+            worktree_path.display(),
+            branch
+        );
 
-        // Create the worktree
-        git2db::GitManager::global()
+        // Create the worktree using git2db's automatic directory management
+        let _worktree_handle = git2db::GitManager::global()
             .create_worktree(&bare_repo_path, &worktree_path, branch)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create worktree: {}", e))?;
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to create worktree at {}: {}", worktree_path.display(), e)
+            })?;
 
+        tracing::info!("Successfully created worktree at {}", worktree_path.display());
         Ok(worktree_path)
     }
 
@@ -349,40 +382,23 @@ impl ModelStorage {
     pub async fn list_worktrees(&self, model_ref: &ModelRef) -> Result<Vec<String>> {
         let bare_repo_path = self.get_bare_repo_path(model_ref).await?;
 
-        // Navigate to worktrees directory
-        let repo_dir = bare_repo_path.parent()
-            .ok_or_else(|| anyhow::anyhow!("Invalid bare repo path"))?;
-        let worktrees_dir = repo_dir.join("worktrees");
-
-        if !worktrees_dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut worktrees = Vec::new();
-        for entry in std::fs::read_dir(worktrees_dir)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
-                    worktrees.push(name.to_string());
-                }
-            }
-        }
+        // Use git2db's high-level worktree listing with automatic filtering
+        let worktrees = git2db::GitManager::global()
+            .list_worktrees(&bare_repo_path)
+            .map_err(|e| anyhow::anyhow!("Failed to list worktrees: {}", e))?;
 
         Ok(worktrees)
     }
 
+
     /// Remove a worktree for a model
     pub async fn remove_worktree(&self, model_ref: &ModelRef, branch: &str) -> Result<()> {
-        let worktree_path = self.get_worktree_path(model_ref, branch).await?;
+        let bare_repo_path = self.get_bare_repo_path(model_ref).await?;
 
-        if !worktree_path.exists() {
-            return Err(anyhow::anyhow!("Worktree does not exist at {:?}", worktree_path));
-        }
-
-        // Remove the worktree directory
-        std::fs::remove_dir_all(&worktree_path)?;
-
-        // TODO: Also prune from git worktree list if needed
+        // Use git2db's high-level worktree removal with automatic cleanup
+        git2db::GitManager::global()
+            .remove_worktree(&bare_repo_path, branch, Some(&self.base_dir))
+            .map_err(|e| anyhow::anyhow!("Failed to remove worktree: {}", e))?;
 
         Ok(())
     }

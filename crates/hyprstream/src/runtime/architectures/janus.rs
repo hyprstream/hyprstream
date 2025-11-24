@@ -424,8 +424,8 @@ impl Mlp {
     fn from_weights(
         weights: &HashMap<String, Tensor>,
         prefix: &str,
-        hidden_size: usize,
-        intermediate_size: usize,
+        _hidden_size: usize,
+        _intermediate_size: usize,
         device: Device,
         dtype: DType,
     ) -> Result<Self> {
@@ -465,7 +465,7 @@ impl LayerNorm {
     fn from_weights(
         weights: &HashMap<String, Tensor>,
         prefix: &str,
-        hidden_size: usize,
+        _hidden_size: usize,
         device: Device,
         dtype: DType,
     ) -> Result<Self> {
@@ -745,7 +745,7 @@ impl JanusModel {
     /// Load the language model component
     fn load_language_model(
         weights: HashMap<String, Tensor>,
-        config: &JanusConfig,
+        _config: &JanusConfig,
         device: Device,
         dtype: DType,
     ) -> Result<Box<dyn ModelOperations>> {
@@ -918,7 +918,7 @@ impl JanusModel {
         let image_shape = image_embeds.size();
 
         let batch_size = text_shape[0];
-        let seq_len = text_shape[1];
+        let _seq_len = text_shape[1];
         let hidden_dim = text_shape[2];
 
         debug!(
@@ -937,7 +937,7 @@ impl JanusModel {
 
         // Create a view we can modify in-place
         // NOTE: shallow_clone() shares underlying data, mutations will affect the view
-        let mut result = text_embeds.shallow_clone();
+        let result = text_embeds.shallow_clone();
 
         // Process batch by batch for safety
         for b in 0..batch_size {

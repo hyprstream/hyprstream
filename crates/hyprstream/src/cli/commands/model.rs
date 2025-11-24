@@ -40,20 +40,6 @@ pub enum ModelAction {
         progress: bool,
     },
 
-    /// Clone a model using Git
-    Clone {
-        /// Git repository URL (supports all Git URL formats)
-        repo_url: String,
-
-        /// Git ref (branch, tag, commit) to clone
-        #[arg(long)]
-        git_ref: Option<String>,
-
-        /// Model ID to use (auto-generated if not provided)
-        #[arg(long)]
-        model_id: Option<String>,
-    },
-
     /// List available models
     List {
         /// Filter by registry type (hf, custom)
@@ -375,7 +361,11 @@ impl ModelDisplayInfo {
 impl GitInfo {
     /// Create GitInfo from a git repository path
     pub fn from_repo_path(repo_path: &std::path::Path) -> Option<Self> {
-        let repo = crate::git::get_repository(repo_path).ok()?;
+        let repo = git2db::GitManager::global()
+            .get_repository(repo_path)
+            .ok()?
+            .open()
+            .ok()?;
 
         // Get current reference
         let (current_ref, ref_type) = match repo.head() {
@@ -424,6 +414,110 @@ impl GitInfo {
                     .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
                     .unwrap_or_else(|| "unknown".to_string())
             });
+
+        Some(GitInfo {
+            current_ref,
+            ref_type,
+            commit,
+            short_commit,
+            is_dirty,
+            last_commit_date,
+        })
+    }
+
+    /// Create GitInfo from a git2db RepositoryStatus object
+    pub fn from_status(status: &git2db::RepositoryStatus) -> Self {
+        // Get branch information
+        let (current_ref, ref_type) = if let Some(ref branch) = &status.branch {
+            (Some(branch.clone()), RefType::Branch)
+        } else {
+            // Detached HEAD or other state
+            (None, RefType::Detached)
+        };
+
+        // Get commit information from head Oid
+        let (commit, short_commit) = if let Some(oid) = &status.head {
+            let full_id = oid.to_string();
+            // Take first 7 characters for short commit (standard git convention)
+            let short_id = if full_id.len() >= 7 {
+                full_id[..7].to_string()
+            } else {
+                full_id.clone()
+            };
+            (Some(full_id), Some(short_id))
+        } else {
+            (None, None)
+        };
+
+        // Note: RepositoryStatus doesn't provide commit timestamps
+        let last_commit_date = None;
+
+        // Check if repository is dirty (has uncommitted changes)
+        let is_dirty = !status.is_clean;
+
+        GitInfo {
+            current_ref,
+            ref_type,
+            commit,
+            short_commit,
+            is_dirty,
+            last_commit_date,
+        }
+    }
+
+    /// Create GitInfo from a bare repository path
+    /// This works with bare repos (unlike status which requires worktrees)
+    pub fn from_bare_repo(repo_path: &std::path::Path) -> Option<Self> {
+        // Try to open as a bare repository
+        let repo = git2db::GitManager::global()
+            .get_repository(repo_path)
+            .ok()?
+            .open()
+            .ok()?;
+
+        // Get HEAD reference - this works even in bare repos
+        let (current_ref, ref_type, head_oid) = match repo.head() {
+            Ok(head) => {
+                let oid = head.target();
+                if head.is_branch() {
+                    let name = head.shorthand().unwrap_or("unknown").to_string();
+                    (Some(name), RefType::Branch, oid)
+                } else if head.is_tag() {
+                    let name = head.shorthand().unwrap_or("unknown").to_string();
+                    (Some(name), RefType::Tag, oid)
+                } else {
+                    (None, RefType::Detached, oid)
+                }
+            }
+            Err(_) => (None, RefType::Detached, None),
+        };
+
+        // Get commit information
+        let (commit, short_commit, last_commit_date) = if let Some(oid) = head_oid {
+            let full_id = oid.to_string();
+            let short_id = if full_id.len() >= 7 {
+                full_id[..7].to_string()
+            } else {
+                full_id.clone()
+            };
+
+            // Try to get commit time
+            let date = repo.find_commit(oid).ok()
+                .map(|commit| {
+                    let seconds = commit.time().seconds();
+                    chrono::DateTime::from_timestamp(seconds, 0)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                });
+
+            (Some(full_id), Some(short_id), date)
+        } else {
+            (None, None, None)
+        };
+
+        // For bare repos, we can't check if it's dirty (no working tree)
+        // So we'll assume clean for display purposes
+        let is_dirty = false;
 
         Some(GitInfo {
             current_ref,

@@ -13,7 +13,8 @@ use hyprstream_core::cli::handlers::handle_server;
 use hyprstream_core::cli::{
     handle_branch, handle_checkout, handle_clone, handle_commit, handle_infer, handle_info,
     handle_list, handle_lora_train, handle_merge, handle_pull, handle_push, handle_remove,
-    handle_status, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
+    handle_status, handle_worktree_info, handle_worktree_list,
+    handle_worktree_remove, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
 };
 use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
@@ -206,6 +207,19 @@ fn init_telemetry(provider: TelemetryProvider) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    // Set up panic handler to get better debugging information
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("🚨 PANIC occurred:");
+        if let Some(loc) = info.location() {
+            eprintln!("   Location: {}:{}", loc.file(), loc.line());
+        }
+        if let Some(msg) = info.payload().downcast_ref::<&str>() {
+            eprintln!("   Message: {}", msg);
+        }
+        eprintln!("\nThis was likely caused by a threading issue or memory corruption.");
+        eprintln!("Please check for unsafe RefCell usage or race conditions.");
+    }));
+
     // Parse CLI arguments
     let cli = Cli::parse();
 
@@ -332,7 +346,17 @@ fn main() -> Result<()> {
 
     // Handle commands with appropriate runtime configuration
     match cli.command {
-        Commands::Server(_cmd) => {
+        Commands::Server(cmd) => {
+            // Load base config from files
+            let mut config = load_config(cli.config.as_deref())?;
+
+            // Merge CLI server arguments into config using apply_to_builder
+            config.server = cmd.server.apply_to_builder(config.server.to_builder())
+                .build();
+
+            // Create context with merged config (CLI args override file config)
+            let ctx = AppContext::new(config);
+
             let ctx = ctx.clone();
             with_runtime(
                 RuntimeConfig {
@@ -402,6 +426,14 @@ fn main() -> Result<()> {
             model,
             message,
             all,
+            all_untracked,
+            amend,
+            author,
+            author_name,
+            author_email,
+            allow_empty,
+            dry_run,
+            verbose,
         } => {
             let ctx = ctx.clone();
             with_runtime(
@@ -411,21 +443,34 @@ fn main() -> Result<()> {
                 },
                 || async move {
                     let storage = ctx.storage().await?;
-                    handle_commit(storage, &model, &message, all).await
+                    handle_commit(
+                        storage,
+                        &model,
+                        &message,
+                        all,
+                        all_untracked,
+                        amend,
+                        author,
+                        author_name,
+                        author_email,
+                        allow_empty,
+                        dry_run,
+                        verbose,
+                    )
+                    .await
                 },
             )?;
         }
 
         Commands::LoraTrain {
             model,
+            branch,
             adapter,
             index,
             rank,
             learning_rate,
             batch_size,
             epochs,
-            data,
-            interactive,
             config,
         } => {
             let ctx = ctx.clone();
@@ -439,35 +484,18 @@ fn main() -> Result<()> {
                     handle_lora_train(
                         storage,
                         &model,
+                        branch,
                         adapter,
                         index,
                         rank,
                         learning_rate,
                         batch_size,
                         epochs,
-                        data,
-                        interactive,
                         config,
                     )
                     .await
                 },
             )?;
-        }
-
-        Commands::FineTune { model, config } => {
-            anyhow::bail!(
-                "Fine-tuning is not yet implemented. Model: {}, Config: {:?}",
-                model,
-                config
-            );
-        }
-
-        Commands::PreTrain { model, config } => {
-            anyhow::bail!(
-                "Pre-training is not yet implemented. Model: {}, Config: {:?}",
-                model,
-                config
-            );
         }
 
         Commands::Infer {
@@ -510,12 +538,7 @@ fn main() -> Result<()> {
             )?;
         }
 
-        Commands::List {
-            branch,
-            tag,
-            dirty,
-            verbose,
-        } => {
+        Commands::List { .. } => {
             let ctx = ctx.clone();
             with_runtime(
                 RuntimeConfig {
@@ -524,7 +547,7 @@ fn main() -> Result<()> {
                 },
                 || async move {
                     let storage = ctx.storage().await?;
-                    handle_list(storage, branch, tag, dirty, verbose).await
+                    handle_list(storage).await
                 },
             )?;
         }
@@ -542,12 +565,27 @@ fn main() -> Result<()> {
                 },
                 || async move {
                     let storage = ctx.storage().await?;
-                    handle_info(storage, &model, verbose, adapters_only).await
+                    match handle_info(storage, &model, verbose, adapters_only).await {
+                        Ok(()) => Ok(()),
+                        Err(e) => {
+                            // Print error but continue to show what we can
+                            eprintln!("Warning: Some operations failed: {}", e);
+                            Ok(())
+                        }
+                    }
                 },
             )?;
         }
 
-        Commands::Clone { repo_url, name } => {
+        Commands::Clone {
+            repo_url,
+            name,
+            branch,
+            depth,
+            full,
+            quiet,
+            verbose,
+        } => {
             let ctx = ctx.clone();
             with_runtime(
                 RuntimeConfig {
@@ -556,7 +594,16 @@ fn main() -> Result<()> {
                 },
                 || async move {
                     let storage = ctx.storage().await?;
-                    handle_clone(storage, &repo_url, name).await
+                    handle_clone(
+                        storage,
+                        &repo_url,
+                        name,
+                        branch,
+                        depth,
+                        full,
+                        quiet,
+                        verbose,
+                    ).await
                 },
             )?;
         }
@@ -601,10 +648,24 @@ fn main() -> Result<()> {
         }
 
         Commands::Merge {
-            model,
-            branch,
-            ff_only,
+            target,
+            source,
+            ff,
             no_ff,
+            ff_only,
+            no_commit,
+            squash,
+            message,
+            abort,
+            continue_merge,
+            quit,
+            no_stat,
+            quiet,
+            verbose,
+            strategy,
+            strategy_option,
+            allow_unrelated_histories,
+            no_verify,
         } => {
             let ctx = ctx.clone();
             with_runtime(
@@ -613,8 +674,28 @@ fn main() -> Result<()> {
                     multi_threaded: true,
                 },
                 || async move {
+                    use hyprstream_core::cli::git_handlers::MergeOptions;
+
                     let storage = ctx.storage().await?;
-                    handle_merge(storage, &model, &branch, ff_only, no_ff).await
+                    let options = MergeOptions {
+                        ff,
+                        no_ff,
+                        ff_only,
+                        no_commit,
+                        squash,
+                        message: message.clone(),
+                        abort,
+                        continue_merge,
+                        quit,
+                        no_stat,
+                        quiet,
+                        verbose,
+                        strategy: strategy.clone(),
+                        strategy_option: strategy_option.clone(),
+                        allow_unrelated_histories,
+                        no_verify,
+                    };
+                    handle_merge(storage, &target, &source, options).await
                 },
             )?;
         }
@@ -633,6 +714,32 @@ fn main() -> Result<()> {
                 || async move {
                     let storage = ctx.storage().await?;
                     handle_remove(storage, &model, force, registry_only, files_only).await
+                },
+            )?;
+        }
+
+        Commands::Worktree { command } => {
+            use hyprstream_core::cli::commands::WorktreeCommand;
+
+            let ctx = ctx.clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    let storage = ctx.storage().await?;
+                    match command {
+                        WorktreeCommand::List { model } => {
+                            handle_worktree_list(storage, &model).await
+                        }
+                        WorktreeCommand::Info { model, branch } => {
+                            handle_worktree_info(storage, &model, &branch).await
+                        }
+                        WorktreeCommand::Remove { model, branch, force } => {
+                            handle_worktree_remove(storage, &model, &branch, force).await
+                        }
+                    }
                 },
             )?;
         }

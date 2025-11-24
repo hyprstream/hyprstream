@@ -428,10 +428,70 @@ create_tag(model_path, "checkpoint-1000")?;
 
 **Key Files**:
 - `server/state.rs` - Server state management
-- `server/routes/openai.rs` - OpenAI-compatible API
+- `server/routes/openai.rs` - OpenAI-compatible API (worktree-based listing)
 - `api/training_service.rs` - Training service (experimental)
 
 **Design**: Axum-based REST API, OpenAI compatibility
+
+**Model Listing** (Updated Nov 2025):
+- `/v1/models` endpoint lists **worktrees only**, not base models
+- Models shown as `model:branch` format (e.g., `qwen3-small:main`)
+- Multiple worktrees per model appear as separate entries
+- Metadata enrichment in `owned_by` field:
+  - Storage driver: `driver:overlay2`
+  - Space saved: `saved:2.3GB`
+  - Worktree age: `age:2h`
+  - Cache status: `cached`
+
+**Example Response**:
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "qwen3-small:main",
+      "object": "model",
+      "created": 1762974327,
+      "owned_by": "system driver:overlay2, saved:2.3GB, age:2h cached"
+    },
+    {
+      "id": "qwen3-small:experiment-1",
+      "object": "model",
+      "created": 1762975000,
+      "owned_by": "system driver:overlay2, saved:1.8GB, age:30m"
+    }
+  ]
+}
+```
+
+**Implementation**:
+```rust
+// ModelStorage::list_models() enumerates all worktrees
+pub async fn list_models(&self) -> Result<Vec<(ModelRef, ModelMetadata)>> {
+    let mut result = Vec::new();
+    let registry = self.registry.read().await;
+
+    for tracked in registry.list() {
+        if let Some(name) = &tracked.name {
+            // Get all worktrees for this model
+            let worktrees = self.list_worktrees_with_metadata(&base_ref).await?;
+
+            for (branch_name, wt_meta) in worktrees {
+                // Create model:branch reference
+                let model_ref = ModelRef::with_ref(
+                    name.clone(),
+                    GitRef::Branch(branch_name)
+                );
+
+                // Enrich with metadata
+                result.push((model_ref, metadata));
+            }
+        }
+    }
+
+    Ok(result)
+}
+```
 
 **Removed**: `api/adapter_storage.rs` (branch-based adapters - removed Oct 2025)
 

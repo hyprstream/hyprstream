@@ -791,7 +791,143 @@ impl GitManager {
             }
         }
 
-        result.map(|h| Box::new(h) as Box<dyn WorktreeHandle>)
+        match result {
+            Ok(handle) => {
+                let handle = Box::new(handle) as Box<dyn WorktreeHandle>;
+
+                if let Err(e) = Self::fetch_lfs_files(worktree_path).await {
+                    tracing::error!(
+                        "Failed to fetch LFS files for worktree at {}: {}",
+                        worktree_path.display(),
+                        e
+                    );
+                    tracing::info!("Rolling back worktree creation due to LFS fetch failure");
+
+                    handle.cleanup().unwrap_or_else(|cleanup_err| {
+                        tracing::error!(
+                            "Failed to cleanup worktree during rollback: {}",
+                            cleanup_err
+                        );
+                    });
+
+                    return Err(Git2DBError::internal(format!(
+                        "Worktree creation failed: LFS fetch error: {}. Worktree has been rolled back.",
+                        e
+                    )));
+                }
+
+                Ok(handle)
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to create worktree at {}: {}",
+                    worktree_path.display(),
+                    e
+                );
+
+                if worktree_path.exists() {
+                    tracing::info!("Cleaning up partial worktree at {}", worktree_path.display());
+                    tokio::fs::remove_dir_all(worktree_path)
+                        .await
+                        .unwrap_or_else(|cleanup_err| {
+                            tracing::warn!("Failed to cleanup partial worktree: {}", cleanup_err);
+                        });
+                }
+
+                Err(e)
+            }
+        }
+    }
+
+    /// Fetch LFS files if repository uses Git LFS
+    ///
+    /// Checks for .gitattributes with LFS configuration and runs `git lfs pull`.
+    /// Failures trigger automatic worktree rollback for atomic operation semantics.
+    async fn fetch_lfs_files(repo_path: &Path) -> Git2DBResult<()> {
+        use tokio::process::Command;
+
+        if !repo_path.exists() {
+            return Err(Git2DBError::internal(format!(
+                "Worktree path does not exist: {}",
+                repo_path.display()
+            )));
+        }
+
+        let lfs_available = Command::new("git")
+            .args(["lfs", "version"])
+            .output()
+            .await
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+
+        if !lfs_available {
+            tracing::warn!("git-lfs not installed or not in PATH");
+            return Err(Git2DBError::internal(
+                "git-lfs not available. Install with: sudo apt install git-lfs"
+            ));
+        }
+
+        let gitattributes_path = repo_path.join(".gitattributes");
+
+        let uses_lfs = if gitattributes_path.exists() {
+            tokio::fs::read_to_string(&gitattributes_path)
+                .await
+                .map(|content| content.contains("filter=lfs"))
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if !uses_lfs {
+            tracing::debug!("Repository does not use Git LFS, skipping LFS fetch");
+            return Ok(());
+        }
+
+        tracing::info!("Repository uses Git LFS, fetching LFS files (this may take a while for large files)...");
+        println!("📥 Downloading LFS files... (this may take a while for large models)");
+
+        let mut child = Command::new("git")
+            .args(["lfs", "pull"])
+            .current_dir(repo_path)
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .map_err(|e| {
+                Git2DBError::internal(format!(
+                    "Failed to spawn 'git lfs pull': {}. Is git-lfs installed?",
+                    e
+                ))
+            })?;
+
+        let status = child.wait().await.map_err(|e| {
+            Git2DBError::internal(format!("Failed to wait for 'git lfs pull': {}", e))
+        })?;
+
+        if !status.success() {
+            let exit_code = status.code().unwrap_or(-1);
+            tracing::error!("git lfs pull failed with exit code: {}", exit_code);
+
+            let error_msg = match exit_code {
+                128 => format!(
+                    "git lfs pull failed (exit code 128): Authentication failed.\n\
+                     Check your git credentials or LFS endpoint."
+                ),
+                1 => format!(
+                    "git lfs pull failed (exit code 1): Network error.\n\
+                     Check network connectivity and LFS endpoint."
+                ),
+                _ => format!(
+                    "git lfs pull failed (exit code {}): Unknown error.\n\
+                     Check logs above for details.",
+                    exit_code
+                ),
+            };
+
+            return Err(Git2DBError::internal(error_msg));
+        }
+
+        tracing::info!("Successfully fetched LFS files");
+        Ok(())
     }
 
     /// Get the driver registry

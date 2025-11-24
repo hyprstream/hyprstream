@@ -7,10 +7,11 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::Path;
 use tch::{Device, Kind as DType, Tensor};
-use tracing::{debug, info, instrument};
+use tracing::{info, instrument};
 
 use super::architectures::{gemma::GemmaModel, llama::LlamaModel, ModelOperations};
 use super::model_config::{ModelArchitecture, ModelConfig};
+use super::torch_utils::{safe_to_device, estimate_tensor_size_mb};
 #[cfg(feature = "xet")]
 use crate::storage::{LfsXetBridge, XetConfig};
 
@@ -41,14 +42,13 @@ impl ModelFactory {
         let mut f16_count = 0;
         let mut bf16_count = 0;
         let mut f32_count = 0;
-        let mut other_count = 0;
 
         for (_, tensor) in tensors.tensors().into_iter().take(10) {
             match tensor.dtype() {
                 safetensors::Dtype::F16 => f16_count += 1,
                 safetensors::Dtype::BF16 => bf16_count += 1,
                 safetensors::Dtype::F32 => f32_count += 1,
-                _ => other_count += 1,
+                _ => {}, // Other dtypes are ignored
             }
         }
 
@@ -295,9 +295,32 @@ impl ModelFactory {
         device: &Device,
         dtype: DType,
     ) -> Result<()> {
-        for (name, tensor_view) in tensors.tensors() {
+        let mut total_size_mb = 0.0;
+        let tensors_list = tensors.tensors();
+        let tensor_count = tensors_list.len();
+
+        info!(
+            "Loading {} tensors to device {:?}",
+            tensor_count,
+            device
+        );
+
+        for (idx, (name, tensor_view)) in tensors_list.into_iter().enumerate() {
             let shape: Vec<i64> = tensor_view.shape().iter().map(|&x| x as i64).collect();
             let data = tensor_view.data();
+
+            // Map safetensors dtype to tch::Kind for size estimation
+            let tensor_kind = match tensor_view.dtype() {
+                safetensors::Dtype::BF16 => tch::Kind::BFloat16,
+                safetensors::Dtype::F16 => tch::Kind::Half,
+                safetensors::Dtype::F32 => tch::Kind::Float,
+                safetensors::Dtype::F64 => tch::Kind::Double,
+                _ => tch::Kind::Float, // Default fallback
+            };
+
+            // Calculate tensor size for progress reporting
+            let tensor_size_mb = estimate_tensor_size_mb(&shape, tensor_kind);
+            total_size_mb += tensor_size_mb;
 
             // Support both F16 and BF16 models
             let tensor = match tensor_view.dtype() {
@@ -333,7 +356,7 @@ impl ModelFactory {
                         cpu_tensor
                     };
 
-                    // Transfer to target device if needed
+                    // Transfer to target device if needed (with OOM handling)
                     if *device != Device::Cpu {
                         let gpu_tensor = cpu_tensor.to_device(*device);
                         drop(cpu_tensor); // Explicitly free CPU memory
@@ -372,7 +395,7 @@ impl ModelFactory {
                         cpu_tensor
                     };
 
-                    // Transfer to target device if needed
+                    // Transfer to target device if needed (with OOM handling)
                     if *device != Device::Cpu {
                         let gpu_tensor = cpu_tensor.to_device(*device);
                         drop(cpu_tensor); // Explicitly free CPU memory
@@ -409,11 +432,30 @@ impl ModelFactory {
                         }
                     };
 
-                    // Transfer to target device if needed
+                    // Transfer to target device if needed (with OOM handling)
                     if *device != Device::Cpu {
-                        let gpu_tensor = cpu_tensor.to_device(*device);
-                        drop(cpu_tensor); // Explicitly free CPU memory
-                        gpu_tensor
+                        // Log progress for large models
+                        if idx % 100 == 0 || tensor_size_mb > 10.0 {
+                            info!(
+                                "Transferring tensor {}/{} to GPU: {} ({:.2} MB, total: {:.2} MB)",
+                                idx + 1, tensor_count, name, tensor_size_mb, total_size_mb
+                            );
+                        }
+
+                        // Use safe wrapper to catch OOM panics
+                        match safe_to_device(&cpu_tensor, *device) {
+                            Ok(gpu_tensor) => {
+                                drop(cpu_tensor); // Explicitly free CPU memory
+                                gpu_tensor
+                            }
+                            Err(e) => {
+                                drop(cpu_tensor); // CRITICAL: Free CPU memory before returning error
+                                return Err(anyhow!(
+                                    "GPU OOM loading tensor '{}': {} | Progress: {}/{} ({:.1} MB) | Try: smaller model, reduce max_position_embeddings, or free GPU memory",
+                                    name, e, idx + 1, tensor_count, total_size_mb
+                                ));
+                            }
+                        }
                     } else {
                         cpu_tensor
                     }
@@ -428,6 +470,11 @@ impl ModelFactory {
 
             weights.insert(name.to_string(), tensor);
         }
+
+        info!(
+            "✅ Successfully loaded {} tensors ({:.2} MB total) to device {:?}",
+            tensor_count, total_size_mb, device
+        );
 
         Ok(())
     }

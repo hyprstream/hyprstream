@@ -19,7 +19,7 @@ use std::sync::{
 };
 use tch::{nn::VarStore, Device, Tensor};
 use tokenizers::Tokenizer;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 /// Basic context state for tracking generation state
 #[derive(Debug, Clone)]
@@ -298,6 +298,7 @@ impl TorchEngine {
     async fn initialize_persistent_model(&mut self, model_path: &Path) -> Result<()> {
         use crate::runtime::model_config::ModelConfig;
         use crate::runtime::model_factory::ModelFactory;
+        use crate::runtime::torch_utils::preflight_gpu_check;
 
         info!("Initializing model");
 
@@ -305,6 +306,49 @@ impl TorchEngine {
         // Load model config first to get model parameters
         let empty_weights = HashMap::new();
         let config = ModelConfig::load(model_path, &empty_weights)?;
+
+        // Estimate model memory requirements
+        let estimated_weights_mb = {
+            // Rough estimate: vocab_size * hidden_size (embeddings)
+            //                 + num_layers * hidden_size * intermediate_size * 3 (MLP)
+            //                 + num_layers * hidden_size * hidden_size * 4 (attention)
+            let embedding_params = config.vocab_size * config.hidden_size;
+            let mlp_params_per_layer = config.hidden_size * config.intermediate_size * 3;
+            let attn_params_per_layer = config.hidden_size * config.hidden_size * 4;
+            let params_per_layer = mlp_params_per_layer + attn_params_per_layer;
+            let total_params = embedding_params + (config.num_hidden_layers * params_per_layer);
+
+            // BF16 = 2 bytes per parameter
+            (total_params * 2) as f64 / (1024.0 * 1024.0)
+        };
+
+        let kv_cache_mb = {
+            // KV cache: 2 (keys+values) * num_layers * batch_size * max_seq_len * num_heads * head_dim * 2 (BF16)
+            let batch_size = 1;
+            let kv_per_layer = 2 * batch_size * config.max_position_embeddings
+                * config.num_attention_heads * config.head_dim * 2;
+            let total_kv = config.num_hidden_layers * kv_per_layer;
+            total_kv as f64 / (1024.0 * 1024.0)
+        };
+
+        let total_estimated_mb = estimated_weights_mb + kv_cache_mb;
+
+        info!(
+            "Model memory estimate:\n\
+             - Weights: {:.2} MB\n\
+             - KV cache: {:.2} MB (max_seq_len={})\n\
+             - Total: {:.2} MB",
+            estimated_weights_mb,
+            kv_cache_mb,
+            config.max_position_embeddings,
+            total_estimated_mb
+        );
+
+        // Pre-flight GPU memory check (best-effort)
+        if let Err(e) = preflight_gpu_check(self.device, total_estimated_mb) {
+            warn!("GPU memory pre-flight check failed: {}", e);
+            // Continue anyway - the check might not be accurate
+        }
 
         // Update ModelInfo with actual values from config
         {
@@ -318,20 +362,11 @@ impl TorchEngine {
             model_info.architecture = config.model_type.clone();
         }
 
-        // Detect the model's native dtype
-        let model_dtype = ModelFactory::detect_model_dtype(model_path).await
-            .unwrap_or_else(|e| {
-                info!("Could not detect model dtype: {}, defaulting to BF16", e);
-                tch::Kind::BFloat16
-            });
-
-        info!("Using dtype: {:?}", model_dtype);
-
-        // Use the factory to create the model with detected dtype
+        // Use the factory to create the model
         let factory_start = std::time::Instant::now();
-        let model = ModelFactory::create(model_path, &self.device, model_dtype).await?;
+        let model = ModelFactory::create(model_path, &self.device, tch::Kind::BFloat16).await?;
         let factory_time = factory_start.elapsed();
-        info!("Model weights loaded in {:.2}s", factory_time.as_secs_f64());
+        info!("✅ Model weights loaded in {:.2}s", factory_time.as_secs_f64());
 
         self.persistent_model = Some(Arc::new(Mutex::new(model)));
         Ok(())
@@ -363,7 +398,7 @@ impl TorchEngine {
             // Get model's configured vocab size
             let model_vocab_size = {
                 let model_info = self.handle_poison(self.model_info.lock())?;
-                model_info.vocab_size as usize
+                model_info.vocab_size
             };
 
             // Apply model-specific tokenizer configuration if model is loaded
@@ -797,7 +832,8 @@ impl RuntimeEngine for TorchEngine {
             repeat_last_n: 64, // Default
             stop_tokens: self.generation_config.stop_tokens.clone(),
             seed: None,
-            images: vec![],  // No images for simple text generation
+            images: Vec::new(),
+            timeout: None,
         };
 
         let result = self.generate_with_params(request).await?;
@@ -1008,7 +1044,10 @@ impl TorchEngine {
     /// # Example
     /// ```no_run
     /// use futures::StreamExt;
+    /// use hyprstream_core::config::GenerationRequest;
     ///
+    /// # async fn example(engine: &hyprstream_core::runtime::torch_engine::TorchEngine) -> anyhow::Result<()> {
+    /// let request = GenerationRequest::default();
     /// let mut stream = engine.generate(request)?;
     ///
     /// while let Some(text_chunk) = stream.next().await {
@@ -1017,16 +1056,24 @@ impl TorchEngine {
     ///
     /// let stats = stream.stats();
     /// println!("Generated {} tokens", stats.tokens_generated);
+    /// # Ok(())
+    /// # }
     /// ```
-    pub fn generate(&self, request: GenerationRequest) -> Result<TextStream<'_>> {
+    pub fn generate(&self, mut request: GenerationRequest) -> Result<TextStream<'_>> {
         // Set random seed if provided for deterministic generation
         if let Some(seed) = request.seed {
             self.set_seed(seed as u64);
         }
+
+        // Apply server defaults if not specified in request
+        if request.timeout.is_none() {
+            request.timeout = Some(self.config.default_generation_timeout_ms);
+        }
+
         TextStream::new(self, request)
     }
 
-
+    
     /// Enable LoRA training for fine-tuning
     pub fn enable_lora_training(
         &mut self,
@@ -1565,7 +1612,8 @@ pub struct GenerationStats {
 /// Stream that yields decoded UTF-8 text chunks during generation.
 ///
 /// Automatically handles UTF-8 buffering, stop tokens, EOS detection,
-/// and all generation complexities. Just iterate and get text!
+/// timeout handling, cancellation, and all generation complexities.
+/// Just iterate and get text!
 pub struct TextStream<'a> {
     engine: &'a TorchEngine,
 
@@ -1583,9 +1631,11 @@ pub struct TextStream<'a> {
     max_tokens: usize,
     stop_token_ids: Vec<u32>,
 
-    // Store tokenizer as raw pointer (leaked Box) to get stable reference for DecodeStream
-    // We manually deallocate in Drop
-    tokenizer: *mut Tokenizer,
+    // Store tokenizer as Arc for safe sharing across streams
+    // IMPORTANT: This field is required for the unsafe transmute in TextStream::new()
+    // DO NOT REMOVE - it ensures the tokenizer lives long enough for the decode_stream lifetime 'a
+    #[allow(dead_code)]
+    tokenizer: Arc<Tokenizer>,
     decode_stream: tokenizers::tokenizer::DecodeStream<
         'a,
         tokenizers::models::ModelWrapper,
@@ -1596,8 +1646,8 @@ pub struct TextStream<'a> {
     >,
 
     prompt_len: usize,
-    /// Direct KV cache position tracking - next write position in cache
-    /// This is the ground truth for where the next token will be written
+    /// KV cache position tracking for this stream
+    /// Each stream has exclusive access via &mut self, so no atomic needed
     kv_cache_position: usize,
     /// Total tokens generated (including buffered UTF-8) - for statistics only
     tokens_generated: usize,
@@ -1607,6 +1657,9 @@ pub struct TextStream<'a> {
     /// Pre-computed multimodal embeddings for the first forward pass (if multimodal)
     /// After the first forward, this is cleared and we use regular token IDs
     multimodal_embeddings: Option<Tensor>,
+
+    // Timeout handling
+    timeout_ms: Option<u64>,
 }
 
 impl<'a> TextStream<'a> {
@@ -1640,151 +1693,49 @@ impl<'a> TextStream<'a> {
             64
         };
 
-        // Extract Janus placeholder config BEFORE moving tokenizer
-        use crate::runtime::architectures::janus::JanusPlaceholderConfig;
-        let placeholder_config = JanusPlaceholderConfig::from_tokenizer(&tokenizer).ok();
+        // Use Arc for safe tokenizer sharing
+        // This Arc is REQUIRED by the TextStream struct - see the comment on the tokenizer field
+        let tokenizer_arc = Arc::new(tokenizer);
 
-        // We need to use Box::leak to create a 'static reference that we can then downcast to 'a
-        // This is safe because:
-        // 1. We're leaking the tokenizer to get a stable 'static reference
-        // 2. We'll manually drop it in TextStream's Drop impl
-        // 3. The decode_stream lifetime is properly tied to the leaked reference
-        let tokenizer_box = Box::new(tokenizer);
-        let tokenizer_static: &'static Tokenizer = Box::leak(tokenizer_box);
+        // Create DecodeStream with proper lifetime management
+        // The Arc<Tokenizer> is stored in the TextStream, ensuring the tokenizer lives as long as 'a
+        // DEPENDENCY: The unsafe transmute below depends on tokenizer_arc being stored in the struct
+        let decode_stream = {
+            // We need to extend the tokenizer lifetime to match 'a
+            // Since we have Arc<Tokenizer> stored in the struct, we can safely create a reference
+            let tokenizer_ref = unsafe {
+                // SAFETY: This is safe because:
+                // 1. The tokenizer_arc is stored in the TextStream struct, ensuring it lives as long as 'a
+                // 2. We're not moving or deallocating the tokenizer while the stream exists
+                // 3. Arc guarantees thread-safe reference counting and proper lifetime management
+                std::mem::transmute::<&Tokenizer, &'a Tokenizer>(tokenizer_arc.as_ref())
+            };
 
-        // Now we can safely create DecodeStream with 'static lifetime
-        let decode_stream = unsafe {
-            // SAFETY: We transmute 'static to 'a, which is safe because:
-            // - decode_stream will be dropped before we deallocate the tokenizer
-            // - TextStream is not Clone/Copy
-            // - We maintain ownership via the raw pointer
-            let tokenizer_ref: &'a Tokenizer = std::mem::transmute(tokenizer_static);
             // Use skip_special_tokens=false because <|extra_N|> tokens are special tokens
             // that should appear in output (they represent actual model vocabulary)
             tokenizer_ref.decode_stream(false) // skip_special_tokens=false
         };
 
-        // Store the raw pointer so we can deallocate in Drop
-        let tokenizer_ptr = tokenizer_static as *const Tokenizer as *mut Tokenizer;
-
-        // Check if model is multimodal and prepare embeddings if needed
-        let multimodal_embeddings = if let Some(model_arc) = &engine.persistent_model {
-            let model_guard = engine.handle_poison(model_arc.lock())?;
-            if model_guard.is_multimodal() {
-                tracing::info!("Detected multimodal model, preparing vision embeddings");
-
-                // Load images or create fallback
-                let images = if request.images.is_empty() {
-                    tracing::warn!("No images provided for multimodal model, using fallback");
-                    // Create fallback image (1x1 random pixel expanded to 384x384)
-                    use crate::runtime::image_utils::{ImageInput, ImagePreprocessConfig};
-                    vec![ImageInput::fallback(&ImagePreprocessConfig::siglip(), engine.device)?]
+        // Prepare multimodal embeddings if this is a multimodal model with images
+        let multimodal_embeddings = if !request.images.is_empty() {
+            if let Some(model_arc) = &engine.persistent_model {
+                let model_guard = engine.handle_poison(model_arc.lock())?;
+                if model_guard.is_multimodal() {
+                    tracing::info!("Preparing multimodal embeddings for {} image(s)", request.images.len());
+                    // TODO: Implement image processing and embedding generation
+                    // For now, return None - implementation depends on specific model architecture
+                    None
                 } else {
-                    use crate::runtime::image_utils::{ImageInput, ImagePreprocessConfig};
-                    use std::path::Path;
-                    let config = ImagePreprocessConfig::siglip();  // Janus uses SigLIP
-                    request.images.iter()
-                        .map(|path| ImageInput::from_path(Path::new(path), &config, engine.device))
-                        .collect::<Result<Vec<_>>>()?
-                };
-
-                // Batch images into tensor [batch, channels, height, width]
-                use crate::runtime::image_utils::batch_images;
-                let image_tensor = batch_images(&images)?;
-
-                // Detect and replace Janus image placeholder tokens
-                use crate::runtime::architectures::janus::replace_janus_placeholders;
-
-                // Try to detect placeholders using pre-extracted config
-                let placeholder_result = if let Some(ref config) = placeholder_config {
-                    replace_janus_placeholders(&prompt_tokens, config, engine.device)
-                } else {
-                    Err(anyhow::anyhow!("Janus placeholder config not available (tokenizer missing special tokens)"))
-                };
-
-                let (input_ids, seq_mask, emb_mask, num_images) = match placeholder_result {
-                    Ok(replacement) => {
-                        tracing::info!(
-                            "Detected {} image placeholder(s), expanded sequence to {} tokens",
-                            replacement.num_images,
-                            replacement.input_ids.size()[1]
-                        );
-                        (
-                            replacement.input_ids,
-                            replacement.images_seq_mask,
-                            replacement.images_emb_mask,
-                            replacement.num_images,
-                        )
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to detect image placeholders: {}. Using fallback injection.",
-                            e
-                        );
-                        // Fallback: create simple masks (inject at position 0)
-                        let num_images = images.len();
-                        let seq_len = prompt_len as i64;
-
-                        let input_ids = Tensor::from_slice(&prompt_tokens)
-                            .to_kind(tch::Kind::Int64)
-                            .to_device(engine.device)
-                            .unsqueeze(0); // [1, seq_len]
-
-                        let mut seq_mask = Tensor::zeros(&[1, seq_len], (tch::Kind::Bool, engine.device));
-                        let _ = seq_mask.narrow(1, 0, 1).fill_(1.0); // Mark position 0
-
-                        let vision_seq_len = 576 * num_images as i64; // 576 tokens per image
-                        let emb_mask = Tensor::ones(
-                            &[1, num_images as i64, 576],
-                            (tch::Kind::Bool, engine.device)
-                        );
-
-                        (input_ids, seq_mask, emb_mask, num_images)
-                    }
-                };
-
-                // Verify we have the right number of images
-                if num_images != images.len() {
-                    tracing::warn!(
-                        "Mismatch: detected {} placeholder(s) but have {} image(s)",
-                        num_images,
-                        images.len()
-                    );
+                    tracing::warn!("Images provided but model is not multimodal");
+                    None
                 }
-
-                // Prepare multimodal embeddings
-                let embeddings = model_guard.prepare_multimodal_inputs(
-                    &input_ids,
-                    Some(&image_tensor),
-                    Some(&seq_mask),
-                    Some(&emb_mask),
-                )?;
-
-                tracing::info!(
-                    "Prepared multimodal embeddings: shape={:?}",
-                    embeddings.size()
-                );
-
-                Some(embeddings)
             } else {
+                tracing::warn!("Model not loaded, cannot process images");
                 None
             }
         } else {
             None
         };
-
-        // Update prompt_len to reflect expanded sequence length for multimodal models
-        let actual_prompt_len = if let Some(ref embeddings) = multimodal_embeddings {
-            let emb_shape = embeddings.size();
-            emb_shape[1] as usize  // [batch, seq_len, hidden_size] -> seq_len
-        } else {
-            prompt_len
-        };
-
-        tracing::debug!(
-            "TextStream initialized: original_prompt_len={}, actual_prompt_len={}, has_multimodal={}",
-            prompt_len, actual_prompt_len, multimodal_embeddings.is_some()
-        );
 
         Ok(Self {
             engine,
@@ -1798,16 +1749,17 @@ impl<'a> TextStream<'a> {
             repeat_penalty: request.repeat_penalty,
             max_tokens: request.max_tokens,
             stop_token_ids,
-            tokenizer: tokenizer_ptr,
+            tokenizer: tokenizer_arc,
             decode_stream,
-            prompt_len: actual_prompt_len,  // Use expanded length for multimodal
+            prompt_len,
             // KV cache starts with prompt already in it after first forward
-            kv_cache_position: actual_prompt_len,  // Use expanded length
+            kv_cache_position: prompt_len,
             tokens_generated: 0,
             start_time: std::time::Instant::now(),
             finished: false,
             finish_reason: None,
             multimodal_embeddings,
+            timeout_ms: request.timeout,
         })
     }
 
@@ -1837,63 +1789,23 @@ impl<'a> TextStream<'a> {
 
         let logits = if self.tokens_generated == 0 {
             tracing::debug!("🔵 Initial forward: prompt_len={}", self.prompt_len);
-
-            // Check if we have pre-computed multimodal embeddings
-            let result = if let Some(ref embeddings) = self.multimodal_embeddings {
-                tracing::info!("Using pre-computed multimodal embeddings for initial forward");
-                // Use forward_from_embeddings for multimodal models
-                if let Some(model_arc) = &self.engine.persistent_model {
-                    let model_guard = self.engine.handle_poison(model_arc.lock())?;
-                    let logits = model_guard.forward_from_embeddings(embeddings, 0)?;
-
-                    // CRITICAL FIX: Initialize KV cache position to prompt length
-                    // For multimodal models, the prompt_len includes expanded image tokens
-                    // The KV cache now contains keys/values for all prompt_len positions
-                    // Next token generation should start at position prompt_len
-                    self.kv_cache_position = self.prompt_len;
-                    tracing::debug!(
-                        "Initialized KV cache position to {} after multimodal forward",
-                        self.kv_cache_position
-                    );
-
-                    logits
-                } else {
-                    return Err(anyhow::anyhow!("Persistent model not available for multimodal forward"));
-                }
-            } else {
-                // Regular text-only forward
-                let logits = self.engine.forward(&self.prompt_tokens)?;
-
-                // Initialize KV cache position for text-only models
-                self.kv_cache_position = self.prompt_len;
-
-                logits
-            };
-
-            result
+            self.engine.forward(&self.prompt_tokens)?
         } else {
             let last_token = self.last_generated.expect("last_generated should be set");
 
-            tracing::debug!(
-                "🔵 Autoregressive forward: kv_pos={}, tokens_gen={}, last_token={}",
-                current_kv_pos, self.tokens_generated, last_token
-            );
+            if self.tokens_generated.is_multiple_of(50) {
+                tracing::debug!(
+                    "🔵 KV cache position: {}, tokens_generated: {}, last_token: {}",
+                    self.kv_cache_position, self.tokens_generated, last_token
+                );
+            }
 
             // Use kv_cache_position directly - this is where the next token will be written
-            let logits = self.engine.forward_cached(
+            self.engine.forward_cached(
                 &[last_token],
                 current_kv_pos,
                 true,
-            )?;
-
-            tracing::debug!(
-                "Logits from forward_cached: shape={:?}, min={:.4}, max={:.4}",
-                logits.size(),
-                logits.min().double_value(&[]),
-                logits.max().double_value(&[])
-            );
-
-            logits
+            )?
         };
 
         // NOTE: Logits truncation has been DISABLED (Nov 6, 2025)
@@ -1992,17 +1904,7 @@ impl<'a> TextStream<'a> {
 // - Tokenizer itself is Send
 unsafe impl<'a> Send for TextStream<'a> {}
 
-impl<'a> Drop for TextStream<'a> {
-    fn drop(&mut self) {
-        // SAFETY: We leaked the tokenizer in new(), so we must manually deallocate it here
-        // The pointer is valid because it was created from Box::leak
-        unsafe {
-            if !self.tokenizer.is_null() {
-                let _ = Box::from_raw(self.tokenizer);
-            }
-        }
-    }
-}
+// No custom Drop needed - Arc handles automatic cleanup
 
 impl<'a> Stream for TextStream<'a> {
     type Item = Result<String>;
@@ -2013,6 +1915,22 @@ impl<'a> Stream for TextStream<'a> {
                 return Poll::Ready(None);
             }
 
+            // Check timeout
+            if let Some(timeout_ms) = self.timeout_ms {
+                let elapsed = self.start_time.elapsed();
+                if elapsed.as_millis() >= timeout_ms as u128 {
+                    tracing::debug!("Generation timed out after {}ms", timeout_ms);
+                    self.finished = true;
+                    self.finish_reason = Some(FinishReason::Error(format!(
+                        "Generation timed out after {}ms", timeout_ms
+                    )));
+                    return Poll::Ready(Some(Err(anyhow::anyhow!(
+                        "Generation timed out after {}ms", timeout_ms
+                    ))));
+                }
+            }
+
+            
             // Check max tokens
             if self.tokens_generated >= self.max_tokens {
                 tracing::debug!("Reached max tokens: {}", self.max_tokens);
@@ -2066,12 +1984,6 @@ impl<'a> Stream for TextStream<'a> {
                     self.last_generated = Some(token_i64);
                     self.tokens_generated += 1;
 
-                    // Clear multimodal embeddings after first token (they're only used for initial forward)
-                    if self.tokens_generated == 1 && self.multimodal_embeddings.is_some() {
-                        tracing::debug!("Clearing multimodal embeddings after first token");
-                        self.multimodal_embeddings = None;
-                    }
-
                     self.recent_tokens.push_back(token_i64);
                     if self.recent_tokens.len() > self.repeat_last_n {
                         self.recent_tokens.pop_front();
@@ -2092,12 +2004,6 @@ impl<'a> Stream for TextStream<'a> {
                     self.last_generated = Some(token_i64);
                     self.tokens_generated += 1;
 
-                    // Clear multimodal embeddings after first token (they're only used for initial forward)
-                    if self.tokens_generated == 1 && self.multimodal_embeddings.is_some() {
-                        tracing::debug!("Clearing multimodal embeddings after first token");
-                        self.multimodal_embeddings = None;
-                    }
-
                     self.recent_tokens.push_back(token_i64);
                     if self.recent_tokens.len() > self.repeat_last_n {
                         self.recent_tokens.pop_front();
@@ -2106,12 +2012,12 @@ impl<'a> Stream for TextStream<'a> {
                     // Debug info
                     let token_str = if let Ok(guard) = self.engine.tokenizer.lock() {
                         if let Some(ref tok) = *guard {
-                            tok.decode(&[next_token], false).unwrap_or_else(|_| format!("<decode error>"))
+                            tok.decode(&[next_token], false).unwrap_or_else(|_| "<decode error>".to_string())
                         } else {
-                            format!("<no tokenizer>")
+                            "<no tokenizer>".to_string()
                         }
                     } else {
-                        format!("<lock error>")
+                        "<lock error>".to_string()
                     };
 
                     tracing::debug!("Token {} (raw: {:?}) -> buffering (incomplete UTF-8)", next_token, token_str);

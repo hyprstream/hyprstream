@@ -21,7 +21,7 @@ fn main() {
 
             // Try to force GPU allocation
             match std::panic::catch_unwind(|| {
-                let _tensor = tch::Tensor::zeros(&[1], (tch::Kind::Float, Device::Cuda(0)));
+                let _tensor = tch::Tensor::zeros([1], (tch::Kind::Float, Device::Cuda(0)));
                 println!("Force GPU: Success!");
             }) {
                 Ok(_) => {}

@@ -53,6 +53,7 @@ impl From<&ChatCompletionRequest> for crate::config::SamplingParams {
             epsilon_cutoff: None,
             eta_cutoff: None,
             do_sample: None,
+            timeout_ms: None,
         }
     }
 }
@@ -123,6 +124,7 @@ impl From<&CompletionRequest> for crate::config::SamplingParams {
             epsilon_cutoff: None,
             eta_cutoff: None,
             do_sample: None,
+            timeout_ms: None,
         }
     }
 }

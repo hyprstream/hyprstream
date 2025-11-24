@@ -430,13 +430,36 @@ HyprStream provides an OpenAI-compatible API endpoint for easy integration with 
 
 ```bash
 # Start API server
-hyprstream serve --port 8080
+hyprstream server --port 50051
+
+# List available models (worktree-based)
+curl http://localhost:50051/oai/v1/models
+
+# Example response shows models as model:branch format
+# {
+#   "object": "list",
+#   "data": [
+#     {
+#       "id": "qwen3-small:main",
+#       "object": "model",
+#       "created": 1762974327,
+#       "owned_by": "system driver:overlay2, saved:2.3GB, age:2h cached"
+#     },
+#     {
+#       "id": "qwen3-small:experiment-1",
+#       "object": "model",
+#       "created": 1762975000,
+#       "owned_by": "system driver:overlay2, saved:1.8GB, age:30m"
+#     }
+#   ]
+# }
 
 # Make chat completions request (OpenAI-compatible)
-curl -X POST http://localhost:8080/oai/v1/chat/completions \
+# NOTE: Models must be referenced with branch (model:branch format)
+curl -X POST http://localhost:50051/oai/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3-small",
+    "model": "qwen3-small:main",
     "messages": [
       {"role": "user", "content": "Hello, world!"}
     ],
@@ -446,9 +469,29 @@ curl -X POST http://localhost:8080/oai/v1/chat/completions \
 
 # Or use with any OpenAI-compatible client
 export OPENAI_API_KEY="dummy"
-export OPENAI_BASE_URL="http://localhost:8080/oai/v1"
+export OPENAI_BASE_URL="http://localhost:50051/oai/v1"
 # Now use any OpenAI client library
+# Note: Specify model as "qwen3-small:main" not just "qwen3-small"
 ```
+
+#### Worktree-Based Model References
+
+HyprStream uses Git worktrees for model management. The `/v1/models` endpoint lists **all worktrees** (not base models):
+
+- **Format**: Models are always shown as `model:branch` (e.g., `qwen3-small:main`)
+- **Multiple Versions**: Each worktree (branch) appears as a separate model
+- **Metadata**: The `owned_by` field includes worktree metadata:
+  - Storage driver (e.g., `driver:overlay2`)
+  - Space saved via CoW (e.g., `saved:2.3GB`)
+  - Worktree age (e.g., `age:2h`)
+  - Cache status (`cached` if loaded in memory)
+
+**Example**: If you have a model `qwen3-small` with branches `main`, `experiment-1`, and `training`, the API will list three separate entries:
+- `qwen3-small:main`
+- `qwen3-small:experiment-1`
+- `qwen3-small:training`
+
+This allows you to work with multiple versions of the same model simultaneously, each in its own worktree with isolated changes.
 
 ### Environment Configuration
 

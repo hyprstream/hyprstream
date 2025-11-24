@@ -255,7 +255,7 @@ impl TensorSampler {
 
         let cumsum_shifted = Tensor::cat(
             &[
-                Tensor::zeros(&[1], (sorted_probs.kind(), self.device)),
+                Tensor::zeros([1], (sorted_probs.kind(), self.device)),
                 cumsum.narrow(-1, 0, cumsum_size - 1),
             ],
             -1,

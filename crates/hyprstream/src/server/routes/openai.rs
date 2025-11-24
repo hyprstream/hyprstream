@@ -320,11 +320,11 @@ async fn chat_completions(
 
             let mut response = Json(response).into_response();
             add_no_cache_headers(&mut response);
-            return response;
+            response
         }
         Err(e) => {
             error!("Generation failed: {}", e);
-            return (
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
                     "error": {
@@ -334,7 +334,7 @@ async fn chat_completions(
                     }
                 })),
             )
-                .into_response();
+                .into_response()
         }
     }
 }
@@ -545,7 +545,7 @@ async fn stream_chat(state: ServerState, request: ChatCompletionRequest) -> impl
                 } else {
                     // Send data chunk
                     Ok(axum::response::sse::Event::default()
-                        .data(&serde_json::to_string(&json).unwrap()))
+                        .data(serde_json::to_string(&json).unwrap()))
                 }
             }
             Err(e) => {
@@ -663,10 +663,10 @@ async fn completions(
 
             let mut response = Json(response).into_response();
             add_no_cache_headers(&mut response);
-            return response;
+            response
         }
         Err(e) => {
-            return (
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
                     "error": {
@@ -676,7 +676,7 @@ async fn completions(
                     }
                 })),
             )
-                .into_response();
+                .into_response()
         }
     }
 }
@@ -700,23 +700,39 @@ async fn embeddings(
 }
 
 /// List available models
+///
+/// Returns all worktrees as model:branch references.
+/// Models are only accessible via their worktree branches.
 async fn list_models(State(state): State<ServerState>) -> impl IntoResponse {
-    // Get models from storage and LoRA registry
     let mut models = vec![];
 
-    // Get models from storage - the backend should provide properly formatted names
+    // Get all worktrees from storage (formatted as model:branch)
     match state.model_storage.list_models().await {
         Ok(model_list) => {
-            for (_model_ref, metadata) in model_list {
-                // The backend should provide the correct display name
-                // API layer should not be determining how to name models
-                let model_name = metadata.display_name.unwrap_or(metadata.name);
+            for (model_ref, metadata) in model_list {
+                // Use ModelRef's Display impl for consistent model:branch format
+                let model_id = model_ref.to_string();
+
+                // Build owned_by field with worktree metadata
+                let mut owned_by_parts = vec!["system".to_string()];
+
+                // Add worktree metadata tags (driver, space saved, age)
+                if !metadata.tags.is_empty() {
+                    owned_by_parts.push(metadata.tags.join(", "));
+                }
+
+                // Check if this model is cached (by model:branch name)
+                if state.model_cache.is_cached_by_name(&model_id).await {
+                    owned_by_parts.push("cached".to_string());
+                }
+
+                let owned_by = owned_by_parts.join(" ");
 
                 models.push(Model {
-                    id: model_name,
+                    id: model_id,
                     object: "model".to_string(),
                     created: metadata.created_at,
-                    owned_by: "system".to_string(),
+                    owned_by,
                 });
             }
         }
@@ -725,24 +741,7 @@ async fn list_models(State(state): State<ServerState>) -> impl IntoResponse {
         }
     }
 
-    // Add cached models with a special indicator
-    // This helps users know which models are already loaded and will be fast
-    let cache_stats = state.model_cache.stats().await;
-    if cache_stats.cached_models > 0 {
-        // Mark cached models in the list
-        for model in models.iter_mut() {
-            if state.model_cache.is_cached_by_name(&model.id).await {
-                // Append indicator that model is cached
-                model.owned_by = format!("{} (cached)", model.owned_by);
-            }
-        }
-    }
-
-    // Note: Adapter listing via branch-based AdapterStorage has been removed.
-    // Adapters are now file-based and managed via AdapterManager.
-    // To list adapters for a model, use AdapterManager::new(model_path).list_adapters()
-
-    // Add no-cache headers (using helper)
+    // Add no-cache headers
     let mut response = Json(ListModelsResponse {
         object: "list".to_string(),
         data: models,

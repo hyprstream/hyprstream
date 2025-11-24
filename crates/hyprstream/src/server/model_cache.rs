@@ -80,7 +80,7 @@ impl ModelCache {
         let model_ref = ModelRef::parse(model_ref_str)?;
 
         // Resolve to exact commit SHA
-        let repo_id = self.registry.resolve_repo_id(&model_ref)?;
+        let repo_id = self.registry.resolve_repo_id(&model_ref).await?;
         let registry = self.registry.registry().await;
         let handle = registry.repo(&repo_id)?;
         let commit_id = handle.resolve_git_ref(&model_ref.git_ref).await?;
@@ -170,34 +170,23 @@ impl ModelCache {
             }
         }
 
-        // Get the branch that contains this commit (usually main/master)
-        // For now, we'll use the default branch worktree
-        // TODO: In the future, we could check which branch contains this commit
-        let default_branch = self.registry.get_default_branch(model_ref).await?;
-        let worktree_path = self.registry.get_worktree_path(model_ref, &default_branch).await?;
+        // Get the worktree path for the requested branch
+        // get_model_path() handles branch resolution:
+        // - If branch specified: uses that branch
+        // - If default/unspecified: uses default branch
+        let worktree_path = self.registry.get_model_path(model_ref).await?;
 
         if !worktree_path.exists() {
-            // Try to get the model path (which might be the default worktree)
-            let model_path = self.registry.get_model_path(model_ref).await
-                .unwrap_or_else(|_| worktree_path.clone());
-
-            if !model_path.exists() {
-                warn!(
-                    "Worktree not found for model {} at {:?} or {:?}",
-                    model_ref.model,
-                    worktree_path,
-                    model_path
-                );
-                return Err(anyhow::anyhow!(
-                    "Model worktree not found for {}. \
-                    Please ensure the model is properly cloned with 'hyprstream clone'.",
-                    model_ref.model
-                ));
-            }
-
-            // Use the model path if it exists
-            debug!("Using model path at {:?}", model_path);
-            return Ok(model_path);
+            warn!(
+                "Worktree not found for model {} at {:?}",
+                model_ref.model,
+                worktree_path
+            );
+            return Err(anyhow::anyhow!(
+                "Model worktree not found for {}. \
+                Please ensure the model is properly cloned with 'hyprstream clone'.",
+                model_ref.model
+            ));
         }
 
         // Worktree exists, verify it's valid
@@ -233,7 +222,7 @@ impl ModelCache {
     /// Check if a model is cached by name
     pub async fn is_cached_by_name(&self, model_ref_str: &str) -> bool {
         if let Ok(model_ref) = ModelRef::parse(model_ref_str) {
-            if let Ok(repo_id) = self.registry.resolve_repo_id(&model_ref) {
+            if let Ok(repo_id) = self.registry.resolve_repo_id(&model_ref).await {
                 if let Ok(registry) = self.registry.registry().await.repo(&repo_id) {
                     if let Ok(commit_id) = registry.resolve_git_ref(&model_ref.git_ref).await {
                         let cache = self.cache.lock().await;

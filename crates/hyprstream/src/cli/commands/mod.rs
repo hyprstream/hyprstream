@@ -51,14 +51,48 @@ pub enum Commands {
 
     /// Record changes to the repository
     Commit {
-        /// Model name
+        /// Model reference (e.g., "model:branch")
         model: String,
+
         /// Commit message
         #[arg(short, long)]
         message: String,
+
         /// Stage all tracked files
         #[arg(short = 'a', long)]
         all: bool,
+
+        /// Stage all files including untracked
+        #[arg(short = 'A', long)]
+        all_untracked: bool,
+
+        /// Amend the previous commit
+        #[arg(long)]
+        amend: bool,
+
+        /// Override commit author (format: "Name <email>")
+        #[arg(long)]
+        author: Option<String>,
+
+        /// Override author name (use with --author-email)
+        #[arg(long)]
+        author_name: Option<String>,
+
+        /// Override author email (use with --author-name)
+        #[arg(long)]
+        author_email: Option<String>,
+
+        /// Allow empty commits (no changes)
+        #[arg(long)]
+        allow_empty: bool,
+
+        /// Show what would be committed without committing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Show diff of changes being committed
+        #[arg(short = 'v', long)]
+        verbose: bool,
     },
 
     /// LoRA training (shorthand for 'lora train')
@@ -66,6 +100,11 @@ pub enum Commands {
     LoraTrain {
         /// Model reference
         model: String,
+
+        /// Create new branch for isolated training
+        /// Creates a new branch from the model ref and trains in a dedicated worktree
+        #[arg(long, short = 'B')]
+        branch: Option<String>,
 
         /// Adapter name (will be auto-prefixed with index)
         #[arg(long)]
@@ -91,35 +130,7 @@ pub enum Commands {
         #[arg(long, short = 'e')]
         epochs: Option<usize>,
 
-        /// Training data file (JSONL format)
-        #[arg(long)]
-        data: Option<String>,
-
-        /// Enable interactive learning mode
-        #[arg(long)]
-        interactive: bool,
-
         /// Training configuration file (overrides CLI args)
-        #[arg(long)]
-        config: Option<String>,
-    },
-
-    /// Fine-tuning
-    #[command(name = "ft")]
-    FineTune {
-        /// Model reference
-        model: String,
-        /// Training configuration file
-        #[arg(long)]
-        config: Option<String>,
-    },
-
-    /// Pre-training
-    #[command(name = "pt")]
-    PreTrain {
-        /// Model reference
-        model: String,
-        /// Training configuration file
         #[arg(long)]
         config: Option<String>,
     },
@@ -171,20 +182,7 @@ pub enum Commands {
     },
 
     /// List available models
-    List {
-        /// Filter by git branch
-        #[arg(long)]
-        branch: Option<String>,
-        /// Filter by git tag
-        #[arg(long)]
-        tag: Option<String>,
-        /// Show only models with uncommitted changes
-        #[arg(long)]
-        dirty: bool,
-        /// Verbose output with detailed info
-        #[arg(short, long)]
-        verbose: bool,
-    },
+    List,
 
     /// Get detailed information about a model
     Inspect {
@@ -202,9 +200,31 @@ pub enum Commands {
     Clone {
         /// Git repository URL
         repo_url: String,
+
         /// Local name for the model
         #[arg(long)]
         name: Option<String>,
+
+        /// Branch, tag, or commit to clone
+        #[arg(long, short = 'b')]
+        branch: Option<String>,
+
+        /// Clone depth (number of commits). Default is 1 for shallow clone.
+        /// Use 0 or --full for complete history
+        #[arg(long, default_value = "1")]
+        depth: u32,
+
+        /// Clone with full history (overrides --depth)
+        #[arg(long)]
+        full: bool,
+
+        /// Suppress progress output
+        #[arg(long, short = 'q')]
+        quiet: bool,
+
+        /// Verbose output
+        #[arg(long, short = 'v')]
+        verbose: bool,
     },
 
     /// Push changes to remote
@@ -238,16 +258,81 @@ pub enum Commands {
 
     /// Merge branches
     Merge {
-        /// Model name
-        model: String,
-        /// Branch to merge
-        branch: String,
-        /// Fast-forward only
-        #[arg(long)]
-        ff_only: bool,
-        /// No fast-forward (create merge commit)
-        #[arg(long)]
+        /// Target model and branch (e.g., "model:branch")
+        target: String,
+
+        /// Branch/ref to merge into target
+        source: String,
+
+        // Fast-forward control
+        /// Fast-forward if possible (default)
+        #[arg(long, conflicts_with = "no_ff", conflicts_with = "ff_only")]
+        ff: bool,
+
+        /// Always create merge commit
+        #[arg(long, conflicts_with = "ff", conflicts_with = "ff_only")]
         no_ff: bool,
+
+        /// Only allow fast-forward merges
+        #[arg(long, conflicts_with = "ff", conflicts_with = "no_ff")]
+        ff_only: bool,
+
+        // Commit control
+        /// Stage changes but don't commit
+        #[arg(long)]
+        no_commit: bool,
+
+        /// Squash commits into single commit
+        #[arg(long)]
+        squash: bool,
+
+        // Message control
+        /// Custom merge commit message
+        #[arg(short, long)]
+        message: Option<String>,
+
+        // Conflict handling
+        /// Abort merge and restore pre-merge state
+        #[arg(long, conflicts_with_all = ["continue_merge", "quit"])]
+        abort: bool,
+
+        /// Continue merge after resolving conflicts
+        #[arg(long = "continue", conflicts_with_all = ["abort", "quit"])]
+        continue_merge: bool,
+
+        /// Quit merge but keep changes
+        #[arg(long, conflicts_with_all = ["abort", "continue_merge"])]
+        quit: bool,
+
+        // Output control
+        /// Suppress diffstat
+        #[arg(long)]
+        no_stat: bool,
+
+        /// Suppress output except errors
+        #[arg(short = 'q', long)]
+        quiet: bool,
+
+        /// Verbose output
+        #[arg(short = 'v', long)]
+        verbose: bool,
+
+        // Advanced
+        /// Merge strategy (resolve, recursive, ours, theirs, subtree)
+        #[arg(long, short = 's')]
+        strategy: Option<String>,
+
+        /// Strategy-specific options (can be specified multiple times)
+        #[arg(long, short = 'X')]
+        strategy_option: Vec<String>,
+
+        /// Allow merging unrelated histories
+        #[arg(long)]
+        allow_unrelated_histories: bool,
+
+        /// Skip pre-merge hooks
+        #[arg(long)]
+        no_verify: bool,
     },
 
     /// Remove a model from the system
@@ -263,5 +348,40 @@ pub enum Commands {
         /// Remove files only, keep registry entry
         #[arg(long)]
         files_only: bool,
+    },
+
+    /// Worktree management commands
+    Worktree {
+        #[command(subcommand)]
+        command: WorktreeCommand,
+    },
+}
+
+/// Worktree subcommands
+#[derive(Subcommand)]
+pub enum WorktreeCommand {
+    /// List all worktrees for a model
+    List {
+        /// Model name
+        model: String,
+    },
+
+    /// Show detailed information about a worktree
+    Info {
+        /// Model name
+        model: String,
+        /// Branch/worktree name
+        branch: String,
+    },
+
+    /// Remove a worktree
+    Remove {
+        /// Model name
+        model: String,
+        /// Branch/worktree name
+        branch: String,
+        /// Force removal without confirmation
+        #[arg(short, long)]
+        force: bool,
     },
 }
