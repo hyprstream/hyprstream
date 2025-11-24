@@ -35,7 +35,7 @@ impl TensorSampler {
     /// Sample next token directly from logits tensor
     pub fn sample_token(
         &self,
-        logits_tensor: &Tensor, // [1, vocab_size] tensor on GPU
+        logits_tensor: &Tensor, // [1, vocab_size] or [batch, seq_len, vocab_size] tensor on GPU
         temperature: f32,
         top_p: f32,
         top_k: Option<usize>,
@@ -44,12 +44,42 @@ impl TensorSampler {
     ) -> Result<usize> {
         // Ensure logits are on the correct device and squeezed to 1D
         // Preserve native precision (BF16/FP16) for GPU performance
+        // For multimodal models, logits might be [batch, seq_len, vocab_size]
+        // We need to take the last token's logits: [-1, :] -> [vocab_size]
         let logits = if logits_tensor.dim() > 1 {
-            logits_tensor.squeeze_dim(0) // [vocab_size]
+            // Get the shape
+            let shape = logits_tensor.size();
+            if shape.len() == 3 {
+                // [batch, seq_len, vocab_size] -> take last position's logits
+                logits_tensor.select(1, shape[1] - 1).squeeze_dim(0) // [vocab_size]
+            } else if shape.len() == 2 {
+                // [batch, vocab_size] or [seq_len, vocab_size] -> squeeze first dim
+                logits_tensor.squeeze_dim(0) // [vocab_size]
+            } else {
+                logits_tensor.shallow_clone()
+            }
         } else {
             logits_tensor.shallow_clone()
         }
         .to_device(self.device);
+
+        // Debug: Check logits statistics
+        if logits.dim() != 1 {
+            tracing::warn!(
+                "⚠️ Logits not 1D after squeeze: shape={:?}",
+                logits.size()
+            );
+        }
+
+        let logits_stats = (
+            logits.min().double_value(&[]),
+            logits.max().double_value(&[]),
+            logits.mean(logits.kind()).double_value(&[]),
+        );
+        tracing::debug!(
+            "Logits stats: min={:.4}, max={:.4}, mean={:.4}, shape={:?}",
+            logits_stats.0, logits_stats.1, logits_stats.2, logits.size()
+        );
 
         // Step 1: Apply repetition penalty to logits
         let penalized_logits =
@@ -214,6 +244,15 @@ impl TensorSampler {
         // This means we include tokens BEFORE cumsum exceeds top_p
         // Shift cumsum right by 1 position (first position gets 0)
         let cumsum_size = cumsum.size()[0];
+
+        // Debug shapes before concatenation
+        tracing::debug!(
+            "top_p concatenation: cumsum shape={:?}, probs shape={:?}, sorted_probs shape={:?}",
+            cumsum.size(),
+            probs.size(),
+            sorted_probs.size()
+        );
+
         let cumsum_shifted = Tensor::cat(
             &[
                 Tensor::zeros([1], (sorted_probs.kind(), self.device)),

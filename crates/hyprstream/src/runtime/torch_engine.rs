@@ -832,6 +832,7 @@ impl RuntimeEngine for TorchEngine {
             repeat_last_n: 64, // Default
             stop_tokens: self.generation_config.stop_tokens.clone(),
             seed: None,
+            images: Vec::new(),
             timeout: None,
         };
 
@@ -1653,6 +1654,9 @@ pub struct TextStream<'a> {
     start_time: std::time::Instant,
     finished: bool,
     finish_reason: Option<FinishReason>,
+    /// Pre-computed multimodal embeddings for the first forward pass (if multimodal)
+    /// After the first forward, this is cleared and we use regular token IDs
+    multimodal_embeddings: Option<Tensor>,
 
     // Timeout handling
     timeout_ms: Option<u64>,
@@ -1712,6 +1716,27 @@ impl<'a> TextStream<'a> {
             tokenizer_ref.decode_stream(false) // skip_special_tokens=false
         };
 
+        // Prepare multimodal embeddings if this is a multimodal model with images
+        let multimodal_embeddings = if !request.images.is_empty() {
+            if let Some(model_arc) = &engine.persistent_model {
+                let model_guard = engine.handle_poison(model_arc.lock())?;
+                if model_guard.is_multimodal() {
+                    tracing::info!("Preparing multimodal embeddings for {} image(s)", request.images.len());
+                    // TODO: Implement image processing and embedding generation
+                    // For now, return None - implementation depends on specific model architecture
+                    None
+                } else {
+                    tracing::warn!("Images provided but model is not multimodal");
+                    None
+                }
+            } else {
+                tracing::warn!("Model not loaded, cannot process images");
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             engine,
             prompt_tokens,
@@ -1733,6 +1758,7 @@ impl<'a> TextStream<'a> {
             start_time: std::time::Instant::now(),
             finished: false,
             finish_reason: None,
+            multimodal_embeddings,
             timeout_ms: request.timeout,
         })
     }

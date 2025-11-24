@@ -1130,6 +1130,7 @@ pub async fn handle_infer(
     storage: &ModelStorage,
     model_ref_str: &str,
     prompt: &str,
+    image_path: Option<String>,
     max_tokens: Option<usize>,
     temperature: Option<f32>,
     top_p: Option<f32>,
@@ -1347,15 +1348,22 @@ pub async fn handle_infer(
         }
     };
 
-    let request = GenerationRequest::builder(formatted_prompt)
+    let mut request_builder = GenerationRequest::builder(formatted_prompt)
         .apply_config(&crate::config::SamplingParams::from_model_path(&model_path).await.unwrap_or_default())
         .temperature(temperature.unwrap_or(0.7))
         .top_p(top_p.unwrap_or(0.95))
         .top_k(top_k)
         .repeat_penalty(repeat_penalty.unwrap_or(1.0))
         .seed(seed.map(|s| s as u64))
-        .max_tokens(max_tokens.unwrap_or(2048))
-        .build();
+        .max_tokens(max_tokens.unwrap_or(2048));
+
+    // Add image path if provided (for multimodal models)
+    if let Some(img_path) = image_path {
+        info!("Using image: {}", img_path);
+        request_builder = request_builder.image_path(std::path::PathBuf::from(img_path));
+    }
+
+    let request = request_builder.build();
 
     info!(
         "Generating response: max_tokens={}, temperature={}, top_p={}, top_k={:?}, repeat_penalty={}",

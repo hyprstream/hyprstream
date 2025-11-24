@@ -62,7 +62,42 @@ pub enum ModelArchitecture {
     Qwen,
     Gemma,
     Mistral,
+    Janus,
     Unknown(String),
+}
+
+/// Configuration source for different model architectures
+#[derive(Debug, Clone)]
+pub enum ConfigSource {
+    /// Flat config (Llama, Qwen, Gemma, etc.)
+    Flat(Box<ModelConfig>),
+
+    /// Nested config (Janus, future multimodal models)
+    Nested(Box<NestedModelConfig>),
+}
+
+/// Nested configuration for multimodal models like Janus
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NestedModelConfig {
+    /// Top-level architecture
+    pub architecture: ModelArchitecture,
+
+    /// Component configs (raw JSON for flexibility)
+    pub language_config: Option<serde_json::Value>,
+    pub vision_config: Option<serde_json::Value>,
+    pub aligner_config: Option<serde_json::Value>,
+
+    // Optional generation components
+    pub gen_aligner_config: Option<serde_json::Value>,
+    pub gen_vision_config: Option<serde_json::Value>,
+    pub gen_head_config: Option<serde_json::Value>,
+
+    /// Top-level metadata (not in sub-configs)
+    pub num_hidden_layers: Option<usize>,
+    pub image_token_id: Option<u32>,
+    pub pad_token_id: Option<u32>,
+    pub begin_image_token_id: Option<u32>,
+    pub torch_dtype: Option<String>,
 }
 
 impl ModelConfig {
@@ -80,6 +115,7 @@ impl ModelConfig {
             info!("⚠️ No config.json found, detecting from weights");
             Self::detect_from_weights(weights)?
         };
+
 
         // Step 2: Validate against weights
         config.validate_with_weights(weights)?;
@@ -107,39 +143,68 @@ impl ModelConfig {
         // Detect architecture from model_type or architectures field
         let architecture = Self::detect_architecture_from_json(&json);
 
-        // Extract all configuration values
+        // For Janus models, extract language_config and use that as the source
+        let lang_json_opt = if architecture == ModelArchitecture::Janus {
+            info!("Detected Janus multimodal model - loading from language_config");
+
+            let lang_config = json["language_config"].as_object()
+                .ok_or_else(|| anyhow::anyhow!("Janus config missing required 'language_config'"))?;
+
+            // Convert to serde_json::Value for uniform access
+            let lang_json = serde_json::Value::Object(lang_config.clone());
+
+            info!("Language config hidden_size: {}", lang_json["hidden_size"].as_u64().unwrap_or(0));
+
+            Some(lang_json)
+        } else {
+            None
+        };
+
+        // Choose config source based on architecture
+        let config_source = lang_json_opt.as_ref().unwrap_or(&json);
+
+        // Extract all configuration values from the appropriate source
         let config = Self {
             architecture: architecture.clone(),
             model_type: json["model_type"].as_str().unwrap_or("unknown").to_string(),
             version: Self::detect_version(&json, &architecture),
 
-            hidden_size: json["hidden_size"].as_u64().unwrap_or(4096) as usize,
-            num_hidden_layers: json["num_hidden_layers"].as_u64().unwrap_or(32) as usize,
-            num_attention_heads: json["num_attention_heads"].as_u64().unwrap_or(32) as usize,
-            num_key_value_heads: json["num_key_value_heads"]
-                .as_u64()
-                .or_else(|| json["num_attention_heads"].as_u64())
+            hidden_size: config_source["hidden_size"].as_u64().unwrap_or(4096) as usize,
+            num_hidden_layers: config_source["num_hidden_layers"].as_u64()
+                .or_else(|| json["num_hidden_layers"].as_u64())
                 .unwrap_or(32) as usize,
-            head_dim: json["head_dim"].as_u64().unwrap_or(128) as usize,
-            intermediate_size: json["intermediate_size"].as_u64().unwrap_or(11008) as usize,
+            num_attention_heads: config_source["num_attention_heads"].as_u64().unwrap_or(32) as usize,
+            num_key_value_heads: config_source["num_key_value_heads"]
+                .as_u64()
+                .or_else(|| config_source["num_attention_heads"].as_u64())
+                .unwrap_or(32) as usize,
+            head_dim: config_source["head_dim"].as_u64()
+                .or_else(|| {
+                    // Calculate from hidden_size / num_attention_heads
+                    let hidden = config_source["hidden_size"].as_u64()?;
+                    let heads = config_source["num_attention_heads"].as_u64()?;
+                    Some(hidden / heads)
+                })
+                .unwrap_or(128) as usize,
+            intermediate_size: config_source["intermediate_size"].as_u64().unwrap_or(11008) as usize,
 
-            vocab_size: json["vocab_size"].as_u64().unwrap_or(32000) as usize,
-            max_position_embeddings: json["max_position_embeddings"].as_u64().unwrap_or(4096)
+            vocab_size: config_source["vocab_size"].as_u64().unwrap_or(32000) as usize,
+            max_position_embeddings: config_source["max_position_embeddings"].as_u64().unwrap_or(4096)
                 as usize,
-            rope_theta: json["rope_theta"].as_f64().unwrap_or(10_000.0) as f32,
-            rope_scaling: Self::parse_rope_scaling(&json),
+            rope_theta: config_source["rope_theta"].as_f64().unwrap_or(10_000.0) as f32,
+            rope_scaling: Self::parse_rope_scaling(config_source),
 
-            rms_norm_eps: json["rms_norm_eps"].as_f64().unwrap_or(1e-5) as f32,
-            layer_norm_eps: json["layer_norm_eps"].as_f64().map(|v| v as f32),
+            rms_norm_eps: config_source["rms_norm_eps"].as_f64().unwrap_or(1e-5) as f32,
+            layer_norm_eps: config_source["layer_norm_eps"].as_f64().map(|v| v as f32),
 
-            hidden_activation: json["hidden_activation"]
+            hidden_activation: config_source["hidden_activation"]
                 .as_str()
                 .unwrap_or("silu")
                 .to_string(),
 
-            use_qk_norm: json["use_qk_norm"].as_bool().unwrap_or(false),
-            scale_embeddings: json["scale_embeddings"].as_bool().unwrap_or(false),
-            query_pre_attn_scalar: json["query_pre_attn_scalar"].as_f64().map(|v| v as f32),
+            use_qk_norm: config_source["use_qk_norm"].as_bool().unwrap_or(false),
+            scale_embeddings: config_source["scale_embeddings"].as_bool().unwrap_or(false),
+            query_pre_attn_scalar: config_source["query_pre_attn_scalar"].as_f64().map(|v| v as f32),
 
             dtype: "bfloat16".to_string(),
             use_flash_attention: true,
@@ -183,6 +248,7 @@ impl ModelConfig {
         // Check model_type field
         if let Some(model_type) = json["model_type"].as_str() {
             return match model_type.to_lowercase().as_str() {
+                "janus" => ModelArchitecture::Janus,  // Explicit Janus type
                 "llama" => ModelArchitecture::Llama,
                 "qwen" | "qwen2" | "qwen3" => ModelArchitecture::Qwen,
                 "gemma" => ModelArchitecture::Gemma,
@@ -196,6 +262,7 @@ impl ModelConfig {
             if let Some(first) = architectures.first() {
                 if let Some(arch_str) = first.as_str() {
                     return match arch_str.to_lowercase().as_str() {
+                        s if s.contains("janus") => ModelArchitecture::Janus,  // Janus in architecture name
                         s if s.contains("llama") => ModelArchitecture::Llama,
                         s if s.contains("qwen") => ModelArchitecture::Qwen,
                         s if s.contains("gemma") => ModelArchitecture::Gemma,
@@ -211,6 +278,20 @@ impl ModelConfig {
 
     fn detect_architecture_from_weights(weights: &HashMap<String, Tensor>) -> ModelArchitecture {
         // Check for architecture-specific weight patterns
+
+        // Check for Janus multimodal components first
+        let has_vision_model = weights.keys().any(|k| k.starts_with("vision_model.") || k.starts_with("vision_encoder."));
+        let has_aligner = weights.keys().any(|k| k.starts_with("aligner.") || k.starts_with("vision_aligner."));
+        let has_language_model = weights.keys().any(|k| k.starts_with("language_model."));
+
+        if has_vision_model || has_aligner || has_language_model {
+            info!("Detected Janus multimodal model from weight patterns");
+            info!("  has_vision_model: {}", has_vision_model);
+            info!("  has_aligner: {}", has_aligner);
+            info!("  has_language_model: {}", has_language_model);
+            return ModelArchitecture::Janus;
+        }
+
         for key in weights.keys() {
             if key.contains("q_norm") || key.contains("k_norm") {
                 return ModelArchitecture::Qwen;

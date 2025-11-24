@@ -158,6 +158,10 @@ extern "C" {
 
 /// Helper functions for git_buf (implemented as inline accessors)
 /// These are not actual libgit2 functions but inline macros in C
+///
+/// # Safety
+/// The `buf` pointer must be either null or point to a valid `GitBuf` structure.
+/// If non-null, the `GitBuf` must be properly initialized with a valid `ptr` field.
 #[inline]
 pub unsafe fn git_buf_ptr(buf: *const GitBuf) -> *const c_char {
     if buf.is_null() {
@@ -167,6 +171,11 @@ pub unsafe fn git_buf_ptr(buf: *const GitBuf) -> *const c_char {
     }
 }
 
+/// Get the length of a git buffer
+///
+/// # Safety
+/// The `buf` pointer must be either null or point to a valid `GitBuf` structure.
+/// If non-null, the `GitBuf` must be properly initialized with a valid `size` field.
 #[inline]
 pub unsafe fn git_buf_len(buf: *const GitBuf) -> size_t {
     if buf.is_null() {

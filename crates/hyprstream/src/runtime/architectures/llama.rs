@@ -1617,13 +1617,11 @@ impl ModelOperations for LlamaModel {
                         start_pos,
                     )?
                 } else {
-                    tracing::debug!("Layer {}: No KV cache available", idx);
                     layer
                         .self_attn
                         .forward(&hidden_states, Some(&position_ids), None, start_pos)?
                 }
             } else {
-                tracing::debug!("Layer {}: KV cache not initialized", idx);
                 layer
                     .self_attn
                     .forward(&hidden_states, Some(&position_ids), None, start_pos)?
@@ -1734,6 +1732,167 @@ impl ModelOperations for LlamaModel {
                         "Masked {} padded tokens (original vocab: {}, padded vocab: {})",
                         mask_count, original_vocab_size, padded_vocab_size
                     );
+                }
+            }
+        }
+
+        Ok(hidden_states)
+    }
+
+    fn embed_tokens(&self, input_ids: &Tensor) -> Result<Tensor> {
+        if let Some(embed) = &self.embed_tokens {
+            // Get input shape
+            let input_shape = input_ids.size();
+            let batch_size = input_shape[0];
+            let seq_len = if input_shape.len() > 1 {
+                input_shape[1]
+            } else {
+                1
+            };
+
+            // Flatten input for embedding lookup
+            let flat_input = input_ids.flatten(0, -1);
+
+            // Perform embedding lookup
+            let embeddings = embed.index_select(0, &flat_input);
+
+            // Get hidden size from embedding result
+            let emb_dims = embeddings.size();
+            let hidden_size = emb_dims[emb_dims.len() - 1];
+
+            // Reshape to [batch_size, seq_len, hidden_size]
+            let mut embeddings = embeddings.reshape([batch_size, seq_len, hidden_size]);
+
+            // Scale embeddings if needed (Gemma3)
+            if self.config.scale_embeddings {
+                let scale = (hidden_size as f32).sqrt();
+                let scale_tensor = Tensor::from_slice(&[scale])
+                    .to_kind(embeddings.kind())
+                    .to_device(embeddings.device());
+                embeddings = broadcast_mul(&embeddings, &scale_tensor)?;
+            }
+
+            Ok(embeddings)
+        } else {
+            Err(anyhow!("No embedding layer available in model"))
+        }
+    }
+
+    fn forward_from_embeddings(&self, embeddings: &Tensor, start_pos: usize) -> Result<Tensor> {
+        tracing::trace!(
+            "LlamaModel forward_from_embeddings: embeddings shape={:?}, start_pos={}",
+            embeddings.size(),
+            start_pos
+        );
+
+        // Start with pre-computed embeddings instead of embedding token IDs
+        let mut hidden_states = embeddings.shallow_clone();
+
+        // Apply transformer layers (same as forward_with_cache)
+        let seq_len = hidden_states.size()[1];
+        let position_ids = if start_pos == 0 {
+            Tensor::arange(seq_len, (tch::Kind::Int64, hidden_states.device()))
+        } else {
+            Tensor::arange_start(
+                start_pos as i64,
+                (start_pos + seq_len as usize) as i64,
+                (tch::Kind::Int64, hidden_states.device()),
+            )
+        };
+
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let residual = hidden_states.shallow_clone();
+
+            // Self-attention block with optional KV cache
+            hidden_states = layer.input_layernorm.forward(&hidden_states)?;
+
+            // Handle KV cache per layer with proper start_pos
+            let attn_output = if let Some(cache_ref) = self.kv_cache.as_ref() {
+                let mut cache_manager = cache_ref.lock().expect("Failed to lock KV cache");
+                if let Some(layer_cache) = cache_manager.get_layer_cache(idx) {
+                    layer.self_attn.forward(
+                        &hidden_states,
+                        Some(&position_ids),
+                        Some(layer_cache),
+                        start_pos,
+                    )?
+                } else {
+                    layer
+                        .self_attn
+                        .forward(&hidden_states, Some(&position_ids), None, start_pos)?
+                }
+            } else {
+                layer
+                    .self_attn
+                    .forward(&hidden_states, Some(&position_ids), None, start_pos)?
+            };
+            hidden_states = residual + attn_output;
+
+            // FFN block
+            let residual = hidden_states.shallow_clone();
+            hidden_states = layer.post_attention_layernorm.forward(&hidden_states)?;
+            let ffn_output = layer.mlp.forward(&hidden_states)?;
+            hidden_states = residual + ffn_output;
+        }
+
+        // Final layer norm
+        if let Some(norm) = &self.norm {
+            hidden_states = norm.forward(&hidden_states)?;
+        }
+
+        // LM head (same logic as forward_with_cache)
+        if let Some(lm_head) = &self.lm_head {
+            hidden_states = hidden_states.matmul(lm_head);
+        } else if let Some(embed) = &self.embed_tokens {
+            // Tied weights: lm_head = embed_tokens.T
+            let output_proj = embed.transpose(0, 1).contiguous();
+            let hs_shape = hidden_states.size();
+            if hs_shape.len() == 3 {
+                let (batch_size, seq_len, hidden_size) = (hs_shape[0], hs_shape[1], hs_shape[2]);
+                let hidden_2d = hidden_states.reshape([batch_size * seq_len, hidden_size]);
+                let logits_2d = hidden_2d.matmul(&output_proj);
+                hidden_states = logits_2d.reshape([batch_size, seq_len, -1]);
+            } else {
+                hidden_states = hidden_states.matmul(&output_proj);
+            }
+        }
+
+        // Mask padded tokens (same as forward_with_cache)
+        let padded_vocab_size = self.config.vocab_size;
+        let original_vocab_size = self.config.original_vocab_size;
+        if padded_vocab_size > original_vocab_size && original_vocab_size > 0 {
+            let logits_shape = hidden_states.size();
+            let actual_vocab_size = logits_shape[logits_shape.len() - 1] as usize;
+
+            if actual_vocab_size == padded_vocab_size {
+                let mask_start = original_vocab_size as i64;
+                let mask_count = (padded_vocab_size - original_vocab_size) as i64;
+
+                if mask_count > 0 {
+                    let mask_values = Tensor::full(
+                        &[mask_count],
+                        -1e10_f64,
+                        (hidden_states.kind(), hidden_states.device())
+                    );
+
+                    if logits_shape.len() == 3 {
+                        let batch_size = logits_shape[0];
+                        let seq_len = logits_shape[1];
+                        for b in 0..batch_size {
+                            for s in 0..seq_len {
+                                let slice = hidden_states.select(0, b).select(0, s);
+                                slice.narrow(0, mask_start, mask_count).copy_(&mask_values);
+                            }
+                        }
+                    } else if logits_shape.len() == 2 {
+                        let rows = logits_shape[0];
+                        for i in 0..rows {
+                            let slice = hidden_states.select(0, i);
+                            slice.narrow(0, mask_start, mask_count).copy_(&mask_values);
+                        }
+                    } else {
+                        hidden_states.narrow(0, mask_start, mask_count).copy_(&mask_values);
+                    }
                 }
             }
         }

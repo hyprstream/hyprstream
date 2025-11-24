@@ -4,13 +4,15 @@
 //! transformer architectures (Llama, Gemma, Qwen, etc.) with proper
 //! tensor shape handling and LoRA compatibility.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use tch::{nn, Tensor};
 
 pub mod config;
 pub mod gemma;
+pub mod janus;
 pub mod llama;
 pub mod qwen;
+pub mod siglip;
 // LoRA adapter moved to lora module
 
 pub use config::{ArchitectureConfig, AttentionConfig};
@@ -54,8 +56,43 @@ pub enum ModelArchitecture {
     },
     /// GPT-J (EleutherAI's 6B model)
     GPTJ,
+    /// Janus multimodal vision-language model
+    Janus {
+        /// Base language model architecture (usually Llama)
+        base_architecture: Box<ModelArchitecture>,
+        /// Type of vision encoder
+        vision_encoder: VisionEncoderType,
+        /// Whether model supports image generation (VQ-VAE)
+        has_generation: bool,
+    },
     /// Custom/unknown architecture
     Custom(String),
+}
+
+/// Types of vision encoders for multimodal models
+#[derive(Debug, Clone, PartialEq)]
+pub enum VisionEncoderType {
+    /// SigLIP vision encoder
+    SigLIP {
+        hidden_size: usize,
+        image_size: usize,
+        patch_size: usize,
+        num_layers: usize,
+    },
+    /// CLIP vision encoder
+    CLIP {
+        hidden_size: usize,
+        image_size: usize,
+        patch_size: usize,
+        num_layers: usize,
+    },
+    /// EVA vision encoder
+    EVA {
+        hidden_size: usize,
+        image_size: usize,
+        patch_size: usize,
+        num_layers: usize,
+    },
 }
 
 impl ModelArchitecture {
@@ -82,6 +119,18 @@ impl ModelArchitecture {
             Self::GPTNeoX => "GPT-NeoX".to_string(),
             Self::GPTOSS { total_params_b, .. } => format!("GPT-OSS-{}B", total_params_b),
             Self::GPTJ => "GPT-J".to_string(),
+            Self::Janus { vision_encoder, has_generation, .. } => {
+                let encoder_type = match vision_encoder {
+                    VisionEncoderType::SigLIP { .. } => "SigLIP",
+                    VisionEncoderType::CLIP { .. } => "CLIP",
+                    VisionEncoderType::EVA { .. } => "EVA",
+                };
+                if *has_generation {
+                    format!("Janus-{}-Gen", encoder_type)
+                } else {
+                    format!("Janus-{}", encoder_type)
+                }
+            }
             Self::Custom(name) => name.clone(),
         }
     }
@@ -137,6 +186,14 @@ pub trait ModelOperations: Send {
             ModelArchitecture::Qwen { .. } => Box::new(QwenTokenizerConfig),
             ModelArchitecture::Llama { .. } => Box::new(LlamaTokenizerConfig),
             ModelArchitecture::Gemma => Box::new(GemmaTokenizerConfig),
+            ModelArchitecture::Janus { base_architecture, .. } => {
+                // Use the base architecture's tokenizer config
+                match base_architecture.as_ref() {
+                    ModelArchitecture::Llama { .. } => Box::new(LlamaTokenizerConfig),
+                    ModelArchitecture::Qwen { .. } => Box::new(QwenTokenizerConfig),
+                    _ => Box::new(DefaultTokenizerConfig),
+                }
+            }
             _ => Box::new(DefaultTokenizerConfig),
         }
     }
@@ -172,6 +229,82 @@ pub trait ModelOperations: Send {
         // Default implementation just calls regular forward
         // Models that support KV caching should override this
         self.forward(input, None)
+    }
+
+    /// Get token embeddings for input IDs
+    fn embed_tokens(&self, _input_ids: &Tensor) -> Result<Tensor> {
+        Err(anyhow!("embed_tokens not implemented for this architecture"))
+    }
+
+    /// Forward pass from pre-computed embeddings (for multimodal models)
+    ///
+    /// This method allows models to start generation from embeddings instead of token IDs.
+    /// Useful for multimodal models where vision embeddings are merged with text embeddings.
+    ///
+    /// # Arguments
+    /// * `embeddings` - Pre-computed input embeddings [batch_size, seq_len, hidden_size]
+    /// * `start_pos` - Starting position in KV cache (0 for initial forward)
+    ///
+    /// # Returns
+    /// Logits tensor [batch_size, seq_len, vocab_size]
+    fn forward_from_embeddings(&self, _embeddings: &Tensor, _start_pos: usize) -> Result<Tensor> {
+        Err(anyhow!("forward_from_embeddings not implemented for this architecture"))
+    }
+
+    /// Check if this model is multimodal
+    fn is_multimodal(&self) -> bool {
+        matches!(self.architecture(), ModelArchitecture::Janus { .. })
+    }
+
+    /// Prepare inputs with vision embeddings (for multimodal models)
+    ///
+    /// This method combines text token IDs with vision embeddings for multimodal inference.
+    /// Only implemented for multimodal architectures.
+    ///
+    /// # Arguments
+    /// * `input_ids` - Text token IDs [batch_size, seq_len]
+    /// * `pixel_values` - Preprocessed images [batch_size, channels, height, width]
+    /// * `images_seq_mask` - Where to inject vision embeddings [batch_size, seq_len]
+    /// * `images_emb_mask` - Which vision embeddings to use [batch_size, num_patches]
+    ///
+    /// # Returns
+    /// Combined embeddings [batch_size, seq_len, hidden_size]
+    fn prepare_multimodal_inputs(
+        &self,
+        _input_ids: &Tensor,
+        _pixel_values: Option<&Tensor>,
+        _images_seq_mask: Option<&Tensor>,
+        _images_emb_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        Err(anyhow!("prepare_multimodal_inputs not implemented - model is not multimodal"))
+    }
+
+    /// Decode a single layer (for layer-wise processing)
+    fn decode_layer(
+        &self,
+        _layer_idx: usize,
+        _hidden_states: &Tensor,
+        _attention_mask: Option<&Tensor>,
+        _position_ids: Option<&Tensor>,
+        _past_kv: Option<&crate::runtime::kv_cache::LayerKVCache>,
+    ) -> Result<(Tensor, Option<(Tensor, Tensor)>)> {
+        Err(anyhow!("decode_layer not implemented for this architecture"))
+    }
+
+    /// Apply final layer normalization
+    fn apply_final_norm(&self, _hidden_states: &Tensor) -> Result<Tensor> {
+        Err(anyhow!("apply_final_norm not implemented for this architecture"))
+    }
+
+    /// Apply language model head to get logits
+    fn lm_head(&self, _hidden_states: &Tensor) -> Result<Tensor> {
+        Err(anyhow!("lm_head not implemented for this architecture"))
+    }
+
+    /// Get the number of transformer layers
+    fn num_layers(&self) -> usize {
+        // Default implementation - architectures should override
+        32  // Common default
     }
 
     /// Reshape tensor for attention computation

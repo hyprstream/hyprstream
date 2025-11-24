@@ -501,6 +501,7 @@ fn main() -> Result<()> {
         Commands::Infer {
             model,
             prompt,
+            image,
             max_tokens,
             temperature,
             top_p,
@@ -522,6 +523,7 @@ fn main() -> Result<()> {
                         storage,
                         &model,
                         &prompt,
+                        image,
                         max_tokens,
                         temperature,
                         top_p,
