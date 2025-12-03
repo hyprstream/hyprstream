@@ -2,6 +2,11 @@
 //!
 //! This module implements KV caching to avoid recomputing past key and value
 //! states during inference, providing 10-50x speedup for long sequences.
+//!
+//! ## Memory Optimization
+//!
+//! The cache uses a chunked growth strategy instead of pre-allocating the full
+//! max_seq_len. This saves ~4GB+ VRAM for models with large context windows.
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -9,17 +14,22 @@ use tch::{Kind as DType, Tensor};
 
 use super::torch_utils::{safe_zeros, estimate_tensor_size_mb};
 
+/// Default chunk size for KV cache growth (in tokens)
+const DEFAULT_CHUNK_SIZE: usize = 1024;
+
 /// KV cache for a single attention layer
 #[derive(Debug)]
 pub struct LayerKVCache {
-    /// Cached keys with shape [batch, max_seq_len, num_heads, head_dim]
+    /// Cached keys with shape [batch, seq_len, num_heads, head_dim]
     pub keys: Option<Tensor>,
-    /// Cached values with shape [batch, max_seq_len, num_heads, head_dim]  
+    /// Cached values with shape [batch, seq_len, num_heads, head_dim]
     pub values: Option<Tensor>,
     /// Current sequence position (number of cached tokens)
     pub seq_pos: usize,
     /// Maximum sequence length
     pub max_seq_len: usize,
+    /// Currently allocated capacity (grows in chunks up to max_seq_len)
+    allocated_capacity: usize,
 }
 
 impl LayerKVCache {
@@ -30,7 +40,57 @@ impl LayerKVCache {
             values: None,
             seq_pos: 0,
             max_seq_len,
+            allocated_capacity: 0,
         }
+    }
+
+    /// Ensure cache has capacity for required_len tokens
+    fn ensure_capacity(&mut self, required_len: usize, template: &Tensor) -> Result<()> {
+        if required_len <= self.allocated_capacity {
+            return Ok(());
+        }
+
+        // Round up to chunk boundary
+        let new_capacity = ((required_len + DEFAULT_CHUNK_SIZE - 1) / DEFAULT_CHUNK_SIZE)
+            * DEFAULT_CHUNK_SIZE;
+        let new_capacity = new_capacity.min(self.max_seq_len);
+
+        let shape = template.size();
+        if shape.len() != 4 {
+            return Err(anyhow!("Expected 4D tensor, got {:?}", shape));
+        }
+        let (batch_size, num_heads, head_dim) = (shape[0], shape[2], shape[3]);
+
+        let device = template.device();
+        let dtype = template.kind();
+        let new_shape = [batch_size, new_capacity as i64, num_heads, head_dim];
+
+        let cache_size_mb = estimate_tensor_size_mb(&new_shape, dtype);
+        tracing::debug!(
+            "Growing KV cache: {} -> {} tokens ({:.1} MB per tensor)",
+            self.allocated_capacity, new_capacity, cache_size_mb
+        );
+
+        let new_keys = safe_zeros(&new_shape, (dtype, device))?;
+        let new_values = safe_zeros(&new_shape, (dtype, device))?;
+
+        // Copy existing data if any
+        if let (Some(old_keys), Some(old_values)) = (&self.keys, &self.values) {
+            if self.seq_pos > 0 {
+                new_keys
+                    .narrow(1, 0, self.seq_pos as i64)
+                    .copy_(&old_keys.narrow(1, 0, self.seq_pos as i64));
+                new_values
+                    .narrow(1, 0, self.seq_pos as i64)
+                    .copy_(&old_values.narrow(1, 0, self.seq_pos as i64));
+            }
+        }
+
+        self.keys = Some(new_keys);
+        self.values = Some(new_values);
+        self.allocated_capacity = new_capacity;
+
+        Ok(())
     }
 
     /// Update cache with new keys and values
@@ -40,68 +100,29 @@ impl LayerKVCache {
         new_values: &Tensor,
         start_pos: usize,
     ) -> Result<()> {
-        let (batch_size, seq_len, num_heads, head_dim) = {
-            let k_size = new_keys.size();
-            if k_size.len() != 4 {
-                return Err(anyhow!("Expected 4D tensor for keys, got {:?}", k_size));
-            }
-            (k_size[0], k_size[1] as usize, k_size[2], k_size[3])
-        };
-
-        // Initialize cache if needed
-        if self.keys.is_none() || self.values.is_none() {
-            let device = new_keys.device();
-            let dtype = new_keys.kind();
-
-            // Calculate cache sizes for logging
-            let cache_shape = &[batch_size, self.max_seq_len as i64, num_heads, head_dim];
-            let cache_size_mb = estimate_tensor_size_mb(cache_shape, dtype);
-
-            // Initialize cache tensors with OOM handling
-            let keys_cache = safe_zeros(
-                cache_shape,
-                (dtype, device),
-            ).map_err(|e| {
-                anyhow!(
-                    "GPU OOM allocating KV cache keys: {} | Size: {:.1} MB | max_seq_len: {} | Try: reduce max_position_embeddings in config.json",
-                    e, cache_size_mb * 2.0, self.max_seq_len
-                )
-            })?;
-
-            let values_cache = safe_zeros(
-                cache_shape,
-                (dtype, device),
-            ).map_err(|e| {
-                anyhow!(
-                    "GPU OOM allocating KV cache values (keys succeeded, critically low memory): {} | Size: {:.1} MB | Try: reduce max_position_embeddings",
-                    e, cache_size_mb * 2.0
-                )
-            })?;
-
-            self.keys = Some(keys_cache);
-            self.values = Some(values_cache);
+        let k_size = new_keys.size();
+        if k_size.len() != 4 {
+            return Err(anyhow!("Expected 4D tensor for keys, got {:?}", k_size));
         }
+        let seq_len = k_size[1] as usize;
 
-        // Get mutable references to cache tensors
-        let cached_keys = self
-            .keys
-            .as_mut()
-            .ok_or_else(|| anyhow!("Keys cache not initialized"))?;
-        let cached_values = self
-            .values
-            .as_mut()
-            .ok_or_else(|| anyhow!("Values cache not initialized"))?;
-
-        // Check bounds
-        if start_pos + seq_len > self.max_seq_len {
+        // Check bounds against hard limit
+        let end_pos = start_pos + seq_len;
+        if end_pos > self.max_seq_len {
             return Err(anyhow!(
                 "Cache overflow: trying to cache {} tokens starting at position {}, but max_seq_len is {}",
                 seq_len, start_pos, self.max_seq_len
             ));
         }
 
-        // Update cache using narrow and copy
-        let end_pos = start_pos + seq_len;
+        // Grow cache if needed (chunked allocation)
+        self.ensure_capacity(end_pos, new_keys)?;
+
+        // Get references to cache tensors
+        let cached_keys = self.keys.as_ref()
+            .ok_or_else(|| anyhow!("Keys cache not initialized after ensure_capacity"))?;
+        let cached_values = self.values.as_ref()
+            .ok_or_else(|| anyhow!("Values cache not initialized after ensure_capacity"))?;
 
         // Update keys: cached_keys[:, start_pos:end_pos] = new_keys
         cached_keys
@@ -146,6 +167,7 @@ impl LayerKVCache {
         self.keys = None;
         self.values = None;
         self.seq_pos = 0;
+        self.allocated_capacity = 0;
     }
 
     /// Check if cache is initialized
