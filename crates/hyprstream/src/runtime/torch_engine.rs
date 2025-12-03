@@ -126,15 +126,31 @@ impl TorchEngine {
     fn new_sync(config: RuntimeConfig) -> Result<Self> {
         // Determine device based on configuration
         let device = if config.use_gpu {
-            let gpu_device = Device::cuda_if_available();
+            // Use specified GPU device ID, or auto-detect
+            let gpu_device = if let Some(device_id) = config.gpu_device_id {
+                // Check if CUDA/ROCm is available at all
+                if Device::cuda_if_available() != Device::Cpu {
+                    Device::Cuda(device_id)
+                } else {
+                    info!("⚠️  GPU {} requested but CUDA/ROCm not available, falling back to CPU", device_id);
+                    Device::Cpu
+                }
+            } else {
+                Device::cuda_if_available()
+            };
+
             if gpu_device != Device::Cpu {
                 // Check if this is actually ROCm/HIP
+                let device_id = match gpu_device {
+                    Device::Cuda(id) => id,
+                    _ => 0,
+                };
                 if std::env::var("HIP_VISIBLE_DEVICES").is_ok()
                     || std::path::Path::new("../libtorch/lib/libtorch_hip.so").exists()
                 {
-                    info!("🚀 Using ROCm/HIP GPU acceleration");
+                    info!("🚀 Using ROCm/HIP GPU {} acceleration", device_id);
                 } else {
-                    info!("🚀 Using CUDA GPU acceleration");
+                    info!("🚀 Using CUDA GPU {} acceleration", device_id);
                 }
                 gpu_device
             } else {

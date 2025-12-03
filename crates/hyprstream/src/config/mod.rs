@@ -120,6 +120,8 @@ pub struct RuntimeConfig {
     pub cpu_threads: Option<usize>,
     /// Use GPU acceleration
     pub use_gpu: bool,
+    /// GPU device ID (None = auto-detect, typically device 0)
+    pub gpu_device_id: Option<usize>,
     /// GPU layers to offload (None = auto)
     pub gpu_layers: Option<usize>,
     /// Use memory mapping for model files
@@ -137,11 +139,17 @@ pub struct RuntimeConfig {
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
+        // Check environment variable for GPU device
+        let gpu_device_id = std::env::var("HYPRSTREAM_GPU_DEVICE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok());
+
         Self {
             context_length: 4096,
             batch_size: 512,
             cpu_threads: None,
             use_gpu: true,
+            gpu_device_id, // From env or None (auto-detect device 0)
             gpu_layers: None,
             mmap: true,
             kv_cache_size_mb: 2048,

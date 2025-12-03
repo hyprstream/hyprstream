@@ -47,6 +47,10 @@ struct Cli {
     #[arg(long, global = true, env = "HYPRSTREAM_CONFIG")]
     config: Option<std::path::PathBuf>,
 
+    /// GPU device ID to use (e.g., 0, 1). Defaults to auto-detect (device 0).
+    #[arg(long, global = true, env = "HYPRSTREAM_GPU_DEVICE")]
+    gpu_device: Option<usize>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -353,6 +357,12 @@ fn main() -> Result<()> {
             // Merge CLI server arguments into config using apply_to_builder
             config.server = cmd.server.apply_to_builder(config.server.to_builder())
                 .build();
+
+            // Apply GPU device setting from CLI if specified
+            if let Some(gpu_device) = cli.gpu_device {
+                config.runtime.gpu_device_id = Some(gpu_device);
+                info!("Using GPU device {} from CLI", gpu_device);
+            }
 
             // Create context with merged config (CLI args override file config)
             let ctx = AppContext::new(config);
