@@ -7,7 +7,41 @@ pub mod server;
 pub use git::{GitAction, GitCommand};
 pub use server::{ServerCliArgs, ServerCommand};
 
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
+
+use crate::runtime::kv_quant::KVQuantType;
+
+/// KV cache quantization type for inference
+///
+/// Quantization reduces GPU memory usage at a slight quality cost:
+/// - `none`: Full precision (default)
+/// - `int8`: 50% memory savings, minimal quality loss
+/// - `nf4`: 75% memory savings, best quality for 4-bit
+/// - `fp4`: 75% memory savings, standard 4-bit quantization
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KVQuantArg {
+    /// No quantization (full precision FP16/BF16)
+    #[default]
+    None,
+    /// 8-bit integer quantization (~50% memory savings)
+    Int8,
+    /// 4-bit NormalFloat quantization (~75% memory savings)
+    Nf4,
+    /// 4-bit FloatingPoint quantization (~75% memory savings)
+    Fp4,
+}
+
+impl From<KVQuantArg> for KVQuantType {
+    fn from(arg: KVQuantArg) -> Self {
+        match arg {
+            KVQuantArg::None => KVQuantType::None,
+            KVQuantArg::Int8 => KVQuantType::Int8,
+            KVQuantArg::Nf4 => KVQuantType::Nf4,
+            KVQuantArg::Fp4 => KVQuantType::Fp4,
+        }
+    }
+}
 
 #[derive(Subcommand)]
 pub enum Commands {
@@ -179,6 +213,16 @@ pub enum Commands {
         /// Force re-download even if cached
         #[arg(long)]
         force_download: bool,
+
+        /// Maximum context length for KV cache allocation.
+        /// Overrides model's max_position_embeddings to reduce GPU memory.
+        #[arg(long)]
+        max_context: Option<usize>,
+
+        /// KV cache quantization type for reduced GPU memory usage.
+        /// Reduces GPU memory by 50-75% at slight quality cost.
+        #[arg(long, value_enum, default_value = "none")]
+        kv_quant: KVQuantArg,
     },
 
     /// List available models

@@ -190,6 +190,11 @@ pub struct KVCacheManager {
 impl KVCacheManager {
     /// Create a new KV cache manager
     pub fn new(num_layers: usize, max_seq_len: usize) -> Self {
+        tracing::info!(
+            "[KVCacheManager::new] Creating cache for {} layers with max_seq_len = {}",
+            num_layers, max_seq_len
+        );
+
         let mut layer_caches = HashMap::new();
         for layer_idx in 0..num_layers {
             layer_caches.insert(layer_idx, LayerKVCache::new(max_seq_len));

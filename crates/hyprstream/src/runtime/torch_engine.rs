@@ -323,6 +323,12 @@ impl TorchEngine {
         let empty_weights = HashMap::new();
         let config = ModelConfig::load(model_path, &empty_weights)?;
 
+        // Effective context length (CLI override or model default)
+        let effective_max_context = self.config.max_context.unwrap_or(config.max_position_embeddings);
+        if self.config.max_context.is_some() {
+            info!("Using max_context override: {} tokens (model default: {})", effective_max_context, config.max_position_embeddings);
+        }
+
         // Estimate model memory requirements
         let estimated_weights_mb = {
             // Rough estimate: vocab_size * hidden_size (embeddings)
@@ -341,7 +347,7 @@ impl TorchEngine {
         let kv_cache_mb = {
             // KV cache: 2 (keys+values) * num_layers * batch_size * max_seq_len * num_heads * head_dim * 2 (BF16)
             let batch_size = 1;
-            let kv_per_layer = 2 * batch_size * config.max_position_embeddings
+            let kv_per_layer = 2 * batch_size * effective_max_context
                 * config.num_attention_heads * config.head_dim * 2;
             let total_kv = config.num_hidden_layers * kv_per_layer;
             total_kv as f64 / (1024.0 * 1024.0)
@@ -356,7 +362,7 @@ impl TorchEngine {
              - Total: {:.2} MB",
             estimated_weights_mb,
             kv_cache_mb,
-            config.max_position_embeddings,
+            effective_max_context,
             total_estimated_mb
         );
 
@@ -374,13 +380,19 @@ impl TorchEngine {
             model_info.num_attention_heads = Some(config.num_attention_heads);
             model_info.num_hidden_layers = Some(config.num_hidden_layers);
             model_info.vocab_size = config.vocab_size;
-            model_info.context_length = config.max_position_embeddings;
+            model_info.context_length = effective_max_context;
             model_info.architecture = config.model_type.clone();
         }
 
         // Use the factory to create the model
         let factory_start = std::time::Instant::now();
-        let model = ModelFactory::create(model_path, &self.device, tch::Kind::BFloat16).await?;
+        let model = ModelFactory::create(
+            model_path,
+            &self.device,
+            tch::Kind::BFloat16,
+            self.config.max_context,
+            self.config.kv_quant_type,
+        ).await?;
         let factory_time = factory_start.elapsed();
         info!("✅ Model weights loaded in {:.2}s", factory_time.as_secs_f64());
 
@@ -641,7 +653,8 @@ impl TorchEngine {
 
         // Lock the model and run forward pass (efficient!) with poison recovery
         let model = self.handle_poison(model_arc.lock())?;
-        let logits = model.forward(&input_tensor, None)?;
+        // CRITICAL: Wrap in no_grad to prevent gradient tracking during inference
+        let logits = tch::no_grad(|| model.forward(&input_tensor, None))?;
 
         // Extract logits for the last token
         let logits_shape = logits.size();
@@ -690,7 +703,8 @@ impl TorchEngine {
         let model = self.handle_poison(model_arc.lock())?;
 
         // Use the new forward_with_cache method that properly tracks position
-        let logits = model.forward_with_cache(&input_tensor, start_pos)?;
+        // CRITICAL: Wrap in no_grad to prevent gradient tracking during inference
+        let logits = tch::no_grad(|| model.forward_with_cache(&input_tensor, start_pos))?;
 
         // Extract logits for the last token
         let logits_shape = logits.size();

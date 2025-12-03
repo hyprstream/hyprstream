@@ -520,6 +520,8 @@ fn main() -> Result<()> {
             seed,
             stream,
             force_download,
+            max_context,
+            kv_quant,
         } => {
             let ctx = ctx.clone();
             with_runtime(
@@ -542,6 +544,8 @@ fn main() -> Result<()> {
                         seed,
                         stream,
                         force_download,
+                        max_context,
+                        kv_quant,
                     )
                     .await
                 },

@@ -11,6 +11,8 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, instrument, warn};
 
+use crate::cli::commands::KVQuantArg;
+use crate::runtime::kv_quant::KVQuantType;
 use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
 use crate::storage::{ModelRef, ModelStorage};
 
@@ -39,6 +41,10 @@ pub struct ModelCache {
     max_size: usize,
     /// Git service for repository operations
     git_manager: Arc<GitManager>,
+    /// Maximum context length for KV cache allocation (overrides model's max_position_embeddings)
+    max_context: Option<usize>,
+    /// KV cache quantization type
+    kv_quant: KVQuantType,
 }
 
 impl ModelCache {
@@ -46,8 +52,10 @@ impl ModelCache {
     pub fn new(
         max_size: usize,
         registry: Arc<ModelStorage>,
+        max_context: Option<usize>,
+        kv_quant: KVQuantArg,
     ) -> Result<Self> {
-        Self::new_with_config(max_size, registry, GitConfig::default())
+        Self::new_with_config(max_size, registry, GitConfig::default(), max_context, kv_quant)
     }
 
     /// Create a new model cache with custom Git configuration
@@ -55,11 +63,22 @@ impl ModelCache {
         max_size: usize,
         registry: Arc<ModelStorage>,
         git_config: GitConfig,
+        max_context: Option<usize>,
+        kv_quant: KVQuantArg,
     ) -> Result<Self> {
         let cache_size =
             NonZeroUsize::new(max_size).unwrap_or_else(|| NonZeroUsize::new(5).unwrap());
 
         let git_manager = Arc::new(GitManager::new(git_config));
+
+        if let Some(mc) = max_context {
+            info!("ModelCache using max_context override: {} tokens", mc);
+        }
+
+        let kv_quant_type: KVQuantType = kv_quant.into();
+        if kv_quant_type != KVQuantType::None {
+            info!("ModelCache using KV cache quantization: {:?}", kv_quant_type);
+        }
 
         Ok(Self {
             cache: Arc::new(Mutex::new(LruCache::new(cache_size))),
@@ -67,6 +86,8 @@ impl ModelCache {
             checkouts: Arc::new(RwLock::new(HashMap::new())),
             max_size,
             git_manager,
+            max_context,
+            kv_quant: kv_quant_type,
         })
     }
 
@@ -109,8 +130,10 @@ impl ModelCache {
         tracing::Span::current().record("cache_hit", false);
         let checkout_path = self.get_or_create_checkout(&model_ref, commit_id).await?;
 
-        // Create engine and load model
-        let config = RuntimeConfig::default();
+        // Create engine and load model with max_context and kv_quant overrides if configured
+        let mut config = RuntimeConfig::default();
+        config.max_context = self.max_context;
+        config.kv_quant_type = self.kv_quant;
         let mut engine = TorchEngine::new(config)?;
 
         info!("Model path: {:?}", checkout_path);

@@ -1139,6 +1139,8 @@ pub async fn handle_infer(
     seed: Option<u32>,
     stream: bool,
     _force_download: bool,
+    max_context: Option<usize>,
+    kv_quant: crate::cli::commands::KVQuantArg,
 ) -> Result<()> {
     info!(
         "Running base model inference: model={}, prompt_len={}",
@@ -1168,8 +1170,10 @@ pub async fn handle_infer(
 
     info!("Using model at: {}", model_path.display());
 
-    // Initialize inference engine
-    let runtime_config = RuntimeConfig::default();
+    // Initialize inference engine with max_context and kv_quant overrides
+    let mut runtime_config = RuntimeConfig::default();
+    runtime_config.max_context = max_context;
+    runtime_config.kv_quant_type = kv_quant.into();
     let mut engine = TorchEngine::new(runtime_config)?;
 
     // Load the model

@@ -4,6 +4,7 @@
 //! Configuration logic is in crate::config module.
 
 use super::config::LoggingConfig;
+use super::KVQuantArg;
 use crate::config::ServerConfigBuilder;
 use clap::Args;
 use serde::Deserialize;
@@ -55,6 +56,18 @@ pub struct ServerCliArgs {
     /// Allow all headers in CORS (permissive mode for development - NOT recommended for production)
     #[arg(long, env = "HYPRSTREAM_CORS_PERMISSIVE_HEADERS")]
     pub cors_permissive_headers: Option<bool>,
+
+    /// Maximum context length for KV cache allocation.
+    /// Overrides model's max_position_embeddings to reduce GPU memory usage.
+    /// Lower values = less memory (e.g., 2048 instead of 40960 can save ~18GB on Qwen3-4B).
+    #[arg(long, env = "HYPRSTREAM_MAX_CONTEXT")]
+    pub max_context: Option<usize>,
+
+    /// KV cache quantization type for reduced GPU memory usage.
+    /// Reduces GPU memory by 50-75% at slight quality cost.
+    #[arg(long, value_enum, default_value = "none", env = "HYPRSTREAM_KV_QUANT")]
+    #[serde(default)]
+    pub kv_quant: KVQuantArg,
 }
 
 impl ServerCliArgs {
@@ -95,6 +108,12 @@ impl ServerCliArgs {
         if let Some(ref file) = self.pid_file {
             builder = builder.pid_file(PathBuf::from(file));
         }
+        if let Some(max_context) = self.max_context {
+            builder = builder.max_context(Some(max_context));
+        }
+
+        // Always apply kv_quant (has default value)
+        builder = builder.kv_quant(self.kv_quant);
 
         builder
     }

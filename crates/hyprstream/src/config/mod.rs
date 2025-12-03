@@ -114,6 +114,14 @@ impl Default for ModelConfig {
 pub struct RuntimeConfig {
     /// Context window size
     pub context_length: usize,
+    /// Maximum context length override for KV cache allocation.
+    /// None = use model's max_position_embeddings (can be very large, e.g., 40K tokens)
+    /// Some(n) = cap KV cache at n tokens (significantly reduces GPU memory)
+    pub max_context: Option<usize>,
+    /// KV cache quantization type (None, INT8, NF4, FP4).
+    /// Reduces GPU memory by 50-75% at slight quality cost.
+    #[serde(default)]
+    pub kv_quant_type: crate::runtime::kv_quant::KVQuantType,
     /// Batch processing size
     pub batch_size: usize,
     /// CPU threads (None = auto-detect)
@@ -146,6 +154,8 @@ impl Default for RuntimeConfig {
 
         Self {
             context_length: 4096,
+            max_context: None, // Use model's max_position_embeddings by default
+            kv_quant_type: crate::runtime::kv_quant::KVQuantType::None,
             batch_size: 512,
             cpu_threads: None,
             use_gpu: true,
