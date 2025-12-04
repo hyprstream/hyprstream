@@ -34,14 +34,19 @@ impl DriverRegistry {
     }
 
     /// Get a driver by selection
-    ///
-    /// Resolves Auto to the best available driver.
     pub fn get_driver(&self, selection: StorageDriver) -> Result<Arc<dyn Driver>, DriverError> {
-        match selection {
-            StorageDriver::Auto => self.auto_select(),
-            StorageDriver::Overlay2 => self.get("overlay2"),
-            StorageDriver::Reflink => self.get("reflink"),
-            StorageDriver::Vfs => self.get("vfs"),
+        let (name, driver_result) = match selection {
+            StorageDriver::Overlay2 => ("overlay2", self.get("overlay2")),
+            StorageDriver::Reflink => ("reflink", self.get("reflink")),
+            StorageDriver::Vfs => ("vfs", self.get("vfs")),
+        };
+
+        match driver_result {
+            Ok(driver) => {
+                info!("Selected storage driver: {}", name);
+                Ok(driver)
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -51,35 +56,6 @@ impl DriverRegistry {
             .get(name)
             .cloned()
             .ok_or_else(|| DriverError::NotAvailable(format!("Driver '{}' not registered", name)))
-    }
-
-    /// Auto-select the best available driver (Docker pattern)
-    ///
-    /// Priority order:
-    /// 1. overlay2 (Linux overlayfs) - best space savings for incremental edits
-    /// 2. reflink (cross-platform CoW) - good space savings, simpler cleanup
-    /// 3. Future: btrfs, hardlink
-    /// 4. vfs (plain directories) - always works
-    fn auto_select(&self) -> Result<Arc<dyn Driver>, DriverError> {
-        let priorities = [
-            "overlay2",
-            "reflink",
-            "btrfs",
-            "hardlink",
-            "vfs",
-        ];
-
-        for name in &priorities {
-            if let Some(driver) = self.drivers.get(*name) {
-                if driver.is_available() {
-                    info!("Auto-selected storage driver: {}", driver.name());
-                    return Ok(driver.clone());
-                }
-            }
-        }
-
-        // No drivers available - this should never happen in practice
-        Err(DriverError::NotAvailable("No storage drivers available".to_string()))
     }
 
     /// List all registered drivers
@@ -118,18 +94,6 @@ mod tests {
         // Overlay2 only on Linux with feature
         #[cfg(all(target_os = "linux", feature = "overlayfs"))]
         assert!(drivers.contains(&"overlay2".to_string()));
-    }
-
-    #[test]
-    fn test_auto_select() {
-        let registry = DriverRegistry::new();
-        let driver = registry
-            .auto_select()
-            .expect("Should always select a driver");
-
-        // Should select best available
-        println!("Auto-selected driver: {}", driver.name());
-        assert!(driver.is_available());
     }
 
     #[test]

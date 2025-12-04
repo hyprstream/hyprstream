@@ -3,7 +3,7 @@
 use anyhow::Result;
 use git2db::{Git2DB, GitRef, RepoId};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -195,22 +195,6 @@ impl ModelStorage {
         }
 
         Ok(result)
-    }
-
-    /// Calculate directory size
-    fn calculate_dir_size(path: &Path) -> Result<u64> {
-        let mut total_size = 0u64;
-        for entry in walkdir::WalkDir::new(path)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            if entry.file_type().is_file() {
-                if let Ok(metadata) = entry.metadata() {
-                    total_size += metadata.len();
-                }
-            }
-        }
-        Ok(total_size)
     }
 
     /// Check if a model exists

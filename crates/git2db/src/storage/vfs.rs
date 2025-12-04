@@ -14,27 +14,14 @@ use tracing::info;
 
 inventory::submit!(DriverFactory::new(
     "vfs",
-    || Box::new(VfsDriver::new())
+    || Box::new(VfsDriver)
 ));
-
-/// Configuration for vfs driver
-#[derive(Debug, Clone, Default)]
-pub struct VfsConfig {
-    // VFS has no special configuration - it's just plain git worktrees
-}
 
 /// VFS storage driver (plain git worktree, no optimization)
 ///
 /// This is the universal fallback that always works. It creates standard
 /// git worktrees using libgit2 without any CoW or space-saving features.
 pub struct VfsDriver;
-
-impl VfsDriver {
-    /// Create a new VFS driver (private for now)
-    fn new() -> Self {
-        Self
-    }
-}
 
 #[async_trait]
 impl Driver for VfsDriver {

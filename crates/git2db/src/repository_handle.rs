@@ -4,15 +4,14 @@
 
 use crate::branch::BranchManager;
 use crate::errors::{Git2DBError, Git2DBResult};
-use crate::GitManager;
 use crate::references::GitRef;
 use crate::registry::{Git2DB, RepoId, TrackedRepository};
 use crate::remote::RemoteManager;
-use crate::storage::{DriverOpts, StorageDriver, WorktreeHandle};
+use crate::storage::{DriverOpts, WorktreeHandle};
 use crate::stage::StageManager;
 use git2::{Oid, Repository};
 use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use tracing::info;
 
 /// Handle to a tracked repository
 ///
@@ -420,27 +419,8 @@ impl<'a> RepositoryHandle<'a> {
     pub async fn get_worktrees(&self) -> Git2DBResult<Vec<WorktreeHandle>> {
         let tracked_repo = self.metadata()?;
 
-        // Determine the storage driver used for this repository's worktrees
-        let driver_selection = GitManager::global()
-            .config()
-            .worktree
-            .driver
-            .parse::<StorageDriver>()
-            .map_err(|e| Git2DBError::internal(format!("Invalid driver selection: {}", e)))?;
-
-        // Get driver from registry
-        let driver = match GitManager::global().driver_registry().get_driver(driver_selection) {
-            Ok(driver) => driver,
-            Err(e) if GitManager::global().config().worktree.fallback => {
-                // Fallback to vfs
-                tracing::warn!("Driver not available, falling back to vfs: {}", e);
-                GitManager::global()
-                    .driver_registry()
-                    .get_driver(StorageDriver::Vfs)
-                    .map_err(|e| Git2DBError::internal(format!("VFS fallback failed: {}", e)))?
-            }
-            Err(e) => return Err(Git2DBError::internal(format!("Driver error: {}", e))),
-        };
+        // Use pre-loaded storage driver from registry
+        let driver = self.registry.storage_driver().clone();
 
         // Query storage driver directly for worktrees
         driver.get_worktrees(&tracked_repo.worktree_path).await
@@ -465,27 +445,8 @@ impl<'a> RepositoryHandle<'a> {
     pub async fn get_worktree(&self, branch: &str) -> Git2DBResult<Option<WorktreeHandle>> {
         let tracked_repo = self.metadata()?;
 
-        // Determine the storage driver used for this repository's worktrees
-        let driver_selection = GitManager::global()
-            .config()
-            .worktree
-            .driver
-            .parse::<StorageDriver>()
-            .map_err(|e| Git2DBError::internal(format!("Invalid driver selection: {}", e)))?;
-
-        // Get driver from registry
-        let driver = match GitManager::global().driver_registry().get_driver(driver_selection) {
-            Ok(driver) => driver,
-            Err(e) if GitManager::global().config().worktree.fallback => {
-                // Fallback to vfs
-                tracing::warn!("Driver not available, falling back to vfs: {}", e);
-                GitManager::global()
-                    .driver_registry()
-                    .get_driver(StorageDriver::Vfs)
-                    .map_err(|e| Git2DBError::internal(format!("VFS fallback failed: {}", e)))?
-            }
-            Err(e) => return Err(Git2DBError::internal(format!("Driver error: {}", e))),
-        };
+        // Use pre-loaded storage driver from registry
+        let driver = self.registry.storage_driver().clone();
 
         // Query storage driver directly for specific worktree
         driver.get_worktree(&tracked_repo.worktree_path, branch).await
@@ -604,44 +565,22 @@ impl<'a> RepositoryHandle<'a> {
     pub async fn create_worktree(&self, worktree_path: &Path, branch: &str) -> Git2DBResult<WorktreeHandle> {
         let tracked_repo = self.metadata()?;
 
-        // Parse driver selection from config
-        let driver_selection = GitManager::global()
-            .config()
-            .worktree
-            .driver
-            .parse::<StorageDriver>()
-            .map_err(|e| Git2DBError::internal(format!("Invalid driver selection: {}", e)))?;
+        // Use pre-loaded storage driver from registry
+        let driver = self.registry.storage_driver().clone();
 
-        // Get driver from registry
-        let driver = match GitManager::global().driver_registry().get_driver(driver_selection) {
-            Ok(driver) => driver,
-            Err(e) if GitManager::global().config().worktree.fallback => {
-                // Fallback to vfs
-                warn!("Driver not available, falling back to vfs: {}", e);
-                GitManager::global()
-                    .driver_registry()
-                    .get_driver(StorageDriver::Vfs)
-                    .map_err(|e| Git2DBError::internal(format!("VFS fallback failed: {}", e)))?
-            }
-            Err(e) => return Err(Git2DBError::internal(format!("Driver error: {}", e))),
-        };
-
-        if GitManager::global().config().worktree.log_driver {
-            info!(
-                "Creating worktree with {} driver: base={}, path={}, ref={}",
-                driver.name(),
-                tracked_repo.worktree_path.display(),
-                worktree_path.display(),
-                branch
-            );
-        }
+        info!(
+            "Creating worktree with {} driver: base={}, path={}, ref={}",
+            driver.name(),
+            tracked_repo.worktree_path.display(),
+            worktree_path.display(),
+            branch
+        );
 
         // Create driver options
         let opts = DriverOpts {
             base_repo: tracked_repo.worktree_path.clone(),
             worktree_path: worktree_path.to_path_buf(),
             ref_spec: branch.to_string(),
-            force_backend: GitManager::global().config().worktree.force_backend.clone(),
         };
 
         // Create worktree using driver
@@ -663,9 +602,9 @@ impl<'a> RepositoryHandle<'a> {
                 {
                     if driver.name() == "overlay2" {
                         tracing::error!(
-                            "Hint: Install fuse-overlayfs or enable fallback:\n  \
+                            "Hint: Install fuse-overlayfs:\n  \
                              sudo apt install fuse-overlayfs\n  \
-                             OR set worktree.fallback = true in config"
+                             OR try a different driver like 'vfs'"
                         );
                     }
                 }

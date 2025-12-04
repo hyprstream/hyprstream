@@ -11,7 +11,6 @@
 //! 2. Drivers are named after the **actual technology** they use
 //! 3. Simple string-based selection in configuration
 //! 4. `vfs` is the universal fallback (plain directories)
-//! 5. Auto-selection with priority ordering
 //!
 //! # Architecture
 //!
@@ -34,12 +33,13 @@
 //! use git2db::storage::{StorageDriver, DriverRegistry};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! // Auto-select best available driver
 //! let registry = DriverRegistry::new();
-//! let driver = registry.get_driver(StorageDriver::Auto)?;
 //!
-//! // Or explicitly select a driver
+//! // Select a driver explicitly
 //! let driver = registry.get_driver(StorageDriver::Overlay2)?;
+//!
+//! // Or use vfs as a safe fallback
+//! let driver = registry.get_driver(StorageDriver::Vfs)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -52,8 +52,3 @@ mod vfs;
 
 pub use driver::{Driver, DriverError, DriverOpts, StorageDriver, WorktreeHandle, DriverFactory};
 pub use registry::DriverRegistry;
-
-// Re-export individual driver configurations
-pub use overlay2::Overlay2Config;
-pub use reflink::ReflinkConfig;
-pub use vfs::VfsConfig;

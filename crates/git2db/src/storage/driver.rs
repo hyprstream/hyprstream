@@ -14,10 +14,9 @@ use std::sync::{Arc, Mutex};
 use inventory;
 
 
-/// Storage driver selection (Docker's graphdriver pattern)
+/// Storage driver selection
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageDriver {
-    Auto,
     Overlay2,
     Reflink,
     Vfs,
@@ -26,7 +25,6 @@ pub enum StorageDriver {
 impl fmt::Display for StorageDriver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Auto => write!(f, "auto"),
             Self::Overlay2 => write!(f, "overlay2"),
             Self::Reflink => write!(f, "reflink"),
             Self::Vfs => write!(f, "vfs"),
@@ -39,7 +37,6 @@ impl std::str::FromStr for StorageDriver {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "auto" | "automatic" => Ok(Self::Auto),
             "overlay2" | "overlayfs" => Ok(Self::Overlay2),
             "reflink" => Ok(Self::Reflink),
             "vfs" | "none" => Ok(Self::Vfs),
@@ -60,9 +57,6 @@ pub struct DriverOpts {
     /// Git ref specification (branch, commit SHA, tag, HEAD~3, etc.)
     /// Examples: "main", "a1b2c3d4", "v1.0.0", "HEAD~3", "origin/main"
     pub ref_spec: String,
-
-    /// Optional: Force specific backend (for drivers with multiple backends)
-    pub force_backend: Option<String>,
 }
 
 

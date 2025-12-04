@@ -1,53 +1,25 @@
 //! Overlay2 driver (Linux overlayfs)
-use super::driver::{Driver, DriverOpts, WorktreeHandle, DriverFactory};
+use super::driver::{Driver, DriverOpts, WorktreeHandle};
+#[cfg(all(target_os = "linux", feature = "overlayfs"))]
+use super::driver::DriverFactory;
 use crate::errors::{Git2DBError, Git2DBResult};
 use async_trait::async_trait;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(all(target_os = "linux", feature = "overlayfs"))]
 use tokio::process::Command;
+#[cfg(all(target_os = "linux", feature = "overlayfs"))]
 use tracing::{info, debug, warn};
 
 #[cfg(all(target_os = "linux", feature = "overlayfs"))]
 inventory::submit!(DriverFactory::new(
     "overlay2",
-    || Box::new(Overlay2Driver::new())
+    || Box::new(Overlay2Driver)
 ));
 
-/// Configuration for overlay2 driver
-#[derive(Debug, Clone)]
-#[derive(Default)]
-pub struct Overlay2Config {
-    /// Force a specific backend (kernel, userns, fuse)
-    pub force_backend: Option<String>,
-
-    /// Custom overlay directory (default: temp directory)
-    pub overlay_dir: Option<PathBuf>,
-}
-
-
-/// Overlay2 storage driver with internalized mount strategy
-pub struct Overlay2Driver {
-    config: Overlay2Config,
-}
-
-impl Overlay2Driver {
-    /// Create with default configuration
-    fn new() -> Self {
-        Self {
-            config: Overlay2Config::default(),
-        }
-    }
-
-    /// Create with custom configuration
-    fn with_config(config: Overlay2Config) -> Self {
-        Self { config }
-    }
-}
-
-impl Default for Overlay2Driver {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// Overlay2 storage driver (Linux overlayfs)
+///
+/// Automatically tries mount methods in order: kernel → userns → fuse
+pub struct Overlay2Driver;
 
 #[async_trait]
 impl Driver for Overlay2Driver {
@@ -549,15 +521,13 @@ mod tests {
 
     #[test]
     fn test_driver_name() {
-        let driver = Overlay2Driver::new();
-        assert_eq!(driver.name(), "overlay2");
+        assert_eq!(Overlay2Driver.name(), "overlay2");
     }
 
     #[test]
     #[cfg(all(feature = "overlayfs", target_os = "linux"))]
     fn test_availability() {
-        let driver = Overlay2Driver::new();
         // May or may not be available depending on system
-        println!("Overlay2 available: {}", driver.is_available());
+        println!("Overlay2 available: {}", Overlay2Driver.is_available());
     }
 }

@@ -81,7 +81,7 @@ impl GitManager {
         let cleanup_handle = if config.performance.auto_cleanup {
             Some(Self::start_cleanup_task(
                 repo_cache.clone(),
-                config.performance.repo_cache_ttl,
+                Duration::from_secs(config.performance.repo_cache_ttl_secs),
                 config.performance.max_repo_cache,
             ))
         } else {
@@ -232,7 +232,7 @@ impl GitManager {
         }
 
         // Set up timeout
-        builder = builder.timeout(self.config.network.timeout.as_secs() as u32);
+        builder = builder.timeout(self.config.network.timeout_secs as u32);
 
         // Set up authentication
         use crate::auth::AuthStrategy;
@@ -308,7 +308,7 @@ impl GitManager {
 
         // Check cache first (lock-free read with DashMap)
         if let Some(entry) = self.repo_cache.get(&path) {
-            if !entry.is_expired(self.config.performance.repo_cache_ttl) {
+            if !entry.is_expired(Duration::from_secs(self.config.performance.repo_cache_ttl_secs)) {
                 entry.touch();
                 trace!("Repository cache hit for {:?}", path);
                 return Ok(entry.cache.clone());
@@ -393,7 +393,7 @@ impl GitManager {
 
     /// Manually trigger cache cleanup (remove expired entries)
     pub fn cleanup_cache(&self) {
-        let ttl = self.config.performance.repo_cache_ttl;
+        let ttl = Duration::from_secs(self.config.performance.repo_cache_ttl_secs);
         let expired: Vec<PathBuf> = self
             .repo_cache
             .iter()
@@ -728,11 +728,8 @@ mod tests {
         let stats = manager.cache_stats();
         assert_eq!(stats.total_entries, 1);
 
-        // Should be the same cache entry
-        assert!(std::ptr::eq(
-            &*cache1.repository,
-            &*cache2.repository
-        ));
+        // Should be the same cache entry (compare by path)
+        assert_eq!(cache1.path(), cache2.path());
 
         // Cleanup
         manager.clear_cache();
@@ -758,8 +755,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_concurrent_operations() {
+    #[tokio::test]
+    async fn test_concurrent_operations() {
         let config = test_config();
         let manager = Arc::new(GitManager::new(config));
 

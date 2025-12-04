@@ -649,7 +649,7 @@ pub async fn handle_list(
     let models_dir = storage_paths.models_dir()?;
 
     // Collect models with git info
-    let mut models_with_git = Vec::new();
+    let mut git_repos = Vec::new();
     for (model_ref, metadata) in models {
         // Get git info from the bare repository
         // The bare repo is at: models/{name}/{name}.git/
@@ -659,8 +659,7 @@ pub async fn handle_list(
 
         let git_info = GitInfo::from_bare_repo(&bare_repo_path);
 
-        println!("pushing models_with_git: {}", model_ref.model);
-        models_with_git.push((model_ref, metadata, git_info));
+        git_repos.push((model_ref, metadata, git_info));
     }
 
     // Table format - the nice format you liked!
@@ -670,7 +669,7 @@ pub async fn handle_list(
     );
     println!("{}", "-".repeat(75));
 
-    for (_model_ref, metadata, git_info) in &models_with_git {
+    for (_model_ref, metadata, git_info) in &git_repos {
         let size_str = if let Some(size) = metadata.size_bytes {
             format!("{:.1}GB", size as f64 / (1024.0 * 1024.0 * 1024.0))
         } else {
@@ -696,7 +695,7 @@ pub async fn handle_list(
         );
     }
 
-    if models_with_git.is_empty() {
+    if git_repos.is_empty() {
         println!("No models match the specified filters.");
     }
 
