@@ -1138,6 +1138,8 @@ pub async fn handle_infer(
     seed: Option<u32>,
     stream: bool,
     _force_download: bool,
+    max_context: Option<usize>,
+    kv_quant: crate::cli::commands::KVQuantArg,
 ) -> Result<()> {
     info!(
         "Running base model inference: model={}, prompt_len={}",
@@ -1167,8 +1169,11 @@ pub async fn handle_infer(
 
     info!("Using model at: {}", model_path.display());
 
-    // Initialize inference engine
-    let runtime_config = RuntimeConfig::default();
+    // Initialize inference engine with max_context and kv_quant from CLI/env
+    // Clap handles precedence: CLI args > env vars > defaults
+    let mut runtime_config = RuntimeConfig::default();
+    runtime_config.max_context = max_context;  // From clap (already merged CLI > env)
+    runtime_config.kv_quant_type = kv_quant.into();  // From clap (already merged CLI > env)
     let mut engine = TorchEngine::new(runtime_config)?;
 
     // Load the model
@@ -1390,7 +1395,8 @@ pub async fn handle_infer(
         }
         println!("\n{}", full_text);
         let stats = text_stream.stats();
-        info!("Generated {} tokens", stats.tokens_generated);
+        info!("Generated {} tokens in {}ms ({:.2} tokens/sec)",
+              stats.tokens_generated, stats.generation_time_ms, stats.tokens_per_second);
     }
 
     Ok(())

@@ -91,9 +91,13 @@ impl ServerState {
         let training_service = Arc::new(TrainingService::new());
 
         // Initialize model cache using git2db's worktree management
+        // Pass max_context to limit KV cache allocation and reduce GPU memory
+        // Pass kv_quant for KV cache quantization (reduces memory by 50-75%)
         let model_cache = Arc::new(ModelCache::new(
             config.max_cached_models,
             model_storage.clone(),
+            config.max_context,
+            config.kv_quant,
         )?);
 
         // Preload models for faster first request

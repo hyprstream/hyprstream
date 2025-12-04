@@ -17,6 +17,7 @@ pub use crate::config::{
 
 pub mod architectures; // Architecture-specific model implementations (includes Janus placeholder utils)
 pub mod conversation_router; // Seamless model evolution and routing
+pub mod kv_quant; // KV cache quantization types
 pub mod tensor_sampling; // Device-agnostic tensor-based sampling
 pub mod image_utils; // Image loading and preprocessing for multimodal models
 pub mod kv_cache; // Key-Value caching for efficient autoregressive generation

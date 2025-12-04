@@ -22,8 +22,9 @@ pub struct QwenAdapter;
 
 impl QwenAdapter {
     /// Create a Qwen model from weights and config.json, using Llama as the base implementation
+    /// Takes mutable reference to weights to enable incremental tensor freeing during construction
     pub fn from_weights(
-        weights: &HashMap<String, Tensor>,
+        weights: &mut HashMap<String, Tensor>,
         config_json: &str,
         version: u8,
         is_moe: bool,
@@ -83,8 +84,8 @@ impl QwenAdapter {
             config.rope_theta
         );
 
-        // Create the model using Llama implementation with Qwen config
-        let model = LlamaModel::from_weights_with_config(weights, config, device, dtype)?;
+        // Create the model using Llama implementation with Qwen config (no KV quantization for adapter)
+        let model = LlamaModel::from_weights_with_config(weights, config, device, dtype, crate::runtime::kv_quant::KVQuantType::None)?;
         Ok(Box::new(model))
     }
 

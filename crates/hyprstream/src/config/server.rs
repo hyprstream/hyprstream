@@ -7,6 +7,7 @@
 //! - TLS settings
 //! - Process management (working directory, PID file)
 
+use crate::cli::commands::KVQuantArg;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -155,6 +156,17 @@ pub struct ServerConfig {
     #[serde(default = "default_cancellation_check_interval")]
     pub cancellation_check_interval: u64,
 
+    /// Maximum context length for KV cache allocation.
+    /// Overrides model's max_position_embeddings to reduce GPU memory.
+    /// None = use model's default, Some(n) = cap at n tokens
+    #[serde(default)]
+    pub max_context: Option<usize>,
+
+    /// KV cache quantization type for reduced GPU memory usage.
+    /// Reduces GPU memory by 50-75% at slight quality cost.
+    #[serde(default)]
+    pub kv_quant: KVQuantArg,
+
     // CORS configuration
     #[serde(default)]
     pub cors: CorsConfig,
@@ -233,6 +245,8 @@ impl Default for ServerConfig {
             request_timeout_secs: default_request_timeout_secs(),
             max_concurrent_requests: default_max_concurrent_requests(),
             cancellation_check_interval: default_cancellation_check_interval(),
+            max_context: None, // Use model's default max_position_embeddings
+            kv_quant: KVQuantArg::None,
             cors: CorsConfig::default(),
             sampling_defaults: SamplingParamDefaults::default(),
             tls_cert: None,
@@ -332,6 +346,18 @@ impl ServerConfigBuilder {
 
     pub fn cancellation_check_interval_duration(mut self, interval: std::time::Duration) -> Self {
         self.config.cancellation_check_interval = interval.as_millis() as u64;
+        self
+    }
+
+    /// Set maximum context length for KV cache allocation
+    pub fn max_context(mut self, max_context: Option<usize>) -> Self {
+        self.config.max_context = max_context;
+        self
+    }
+
+    /// Set KV cache quantization type
+    pub fn kv_quant(mut self, kv_quant: KVQuantArg) -> Self {
+        self.config.kv_quant = kv_quant;
         self
     }
 
