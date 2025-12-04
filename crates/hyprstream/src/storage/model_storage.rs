@@ -3,7 +3,7 @@
 use anyhow::Result;
 use git2db::{Git2DB, GitRef, RepoId};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -172,26 +172,14 @@ impl ModelStorage {
                                 git2db::GitRef::Branch(branch_name.clone())
                             );
 
-                            // Calculate size from worktree path
-                            let worktree_path = self.get_worktree_path(&base_ref, &branch_name).await.ok();
-                            let size_bytes = if let Some(path) = &worktree_path {
-                                if path.exists() {
-                                    Self::calculate_dir_size(path).ok()
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            };
-
-                            // Build metadata
+                            // Build metadata (size calculation removed for performance)
                             let metadata = ModelMetadata {
                                 name: name.clone(),
                                 display_name: Some(format!("{}:{}", name, branch_name)),
                                 model_type: "worktree".to_string(),
                                 created_at: chrono::Utc::now().timestamp(),
                                 updated_at: chrono::Utc::now().timestamp(),
-                                size_bytes,
+                                size_bytes: None,  // Removed expensive directory size calculation
                                 tags: vec![],
                             };
 
@@ -207,22 +195,6 @@ impl ModelStorage {
         }
 
         Ok(result)
-    }
-
-    /// Calculate directory size
-    fn calculate_dir_size(path: &Path) -> Result<u64> {
-        let mut total_size = 0u64;
-        for entry in walkdir::WalkDir::new(path)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            if entry.file_type().is_file() {
-                if let Ok(metadata) = entry.metadata() {
-                    total_size += metadata.len();
-                }
-            }
-        }
-        Ok(total_size)
     }
 
     /// Check if a model exists
@@ -256,9 +228,17 @@ impl ModelStorage {
         let registry = self.registry.read().await;
         let handle = registry.repo(&repo_id)?;
 
-        handle.fetch(None).await?;
-        handle.checkout(ref_spec).await?;
+        // Create a temporary worktree for the git operations
+        let temp_dir = tempfile::tempdir()?;
+        let worktree_path = temp_dir.path();
+        let mut worktree = handle.create_worktree(worktree_path, "temp-update").await?;
 
+        // Perform git operations on the worktree
+        worktree.fetch(None).await?;
+        worktree.checkout(ref_spec).await?;
+
+        // Cleanup the temporary worktree
+        worktree.cleanup().await?;
         Ok(())
     }
 
@@ -305,7 +285,14 @@ impl ModelStorage {
         let repo_id = self.resolve_name(&model_ref.model).await?;
         let registry = self.registry.read().await;
         let handle = registry.repo(&repo_id)?;
-        Ok(handle.status().await?)
+
+        // Create a temporary worktree to get status
+        let temp_dir = tempfile::tempdir()?;
+        let worktree_path = temp_dir.path();
+        let mut worktree = handle.create_worktree(worktree_path, "temp-status").await?;
+        let status = worktree.status().await?;
+        worktree.cleanup().await?;
+        Ok(status)
     }
 
     /// Checkout a git reference
@@ -319,7 +306,14 @@ impl ModelStorage {
         let handle = registry.repo(&repo_id)?;
 
         let previous_oid = handle.current_oid()?.unwrap_or(git2db::Oid::zero());
-        handle.checkout(model_ref.git_ref.clone()).await?;
+
+        // Create a temporary worktree to perform checkout
+        let temp_dir = tempfile::tempdir()?;
+        let worktree_path = temp_dir.path();
+        let mut worktree = handle.create_worktree(worktree_path, "temp-checkout").await?;
+        worktree.checkout(model_ref.git_ref.clone()).await?;
+        worktree.cleanup().await?;
+
         let new_oid = handle.current_oid()?.unwrap_or(git2db::Oid::zero());
 
         Ok(super::CheckoutResult {
@@ -351,14 +345,17 @@ impl ModelStorage {
 
     /// Create a new worktree for a model
     pub async fn create_worktree(&self, model_ref: &ModelRef, branch: &str) -> Result<PathBuf> {
-        let bare_repo_path = self.get_bare_repo_path(model_ref).await?;
         let worktree_path = self.get_worktree_path(model_ref, branch).await?;
 
         if worktree_path.exists() {
             return Err(anyhow::anyhow!("Worktree already exists at {:?}", worktree_path));
         }
 
-        // Use git2db's high-level worktree creation with automatic directory handling
+        // Use RepositoryHandle for worktree creation with storage driver support
+        let repo_id = self.resolve_name(&model_ref.model).await?;
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&repo_id)?;
+
         tracing::info!(
             "Creating worktree for {} at {} (branch: {})",
             model_ref.model,
@@ -366,10 +363,8 @@ impl ModelStorage {
             branch
         );
 
-        // Create the worktree using git2db's automatic directory management
-        let _worktree_handle = git2db::GitManager::global()
-            .create_worktree(&bare_repo_path, &worktree_path, branch)
-            .await
+        // Create the worktree using RepositoryHandle (automatic storage driver selection)
+        let _worktree_handle = handle.create_worktree(&worktree_path, branch).await
             .map_err(|e| {
                 anyhow::anyhow!("Failed to create worktree at {}: {}", worktree_path.display(), e)
             })?;
@@ -380,14 +375,25 @@ impl ModelStorage {
 
     /// List all worktrees for a model
     pub async fn list_worktrees(&self, model_ref: &ModelRef) -> Result<Vec<String>> {
-        let bare_repo_path = self.get_bare_repo_path(model_ref).await?;
+        let repo_id = self.resolve_name(&model_ref.model).await?;
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&repo_id)?;
 
-        // Use git2db's high-level worktree listing with automatic filtering
-        let worktrees = git2db::GitManager::global()
-            .list_worktrees(&bare_repo_path)
+        // Use RepositoryHandle for worktree listing with storage driver support
+        let worktrees = handle.get_worktrees().await
             .map_err(|e| anyhow::anyhow!("Failed to list worktrees: {}", e))?;
 
-        Ok(worktrees)
+        // Extract branch names from worktree paths
+        Ok(worktrees.into_iter()
+            .map(|wt| {
+                // Extract branch name from worktree path: models/{name}/worktrees/{branch}
+                wt.path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("unknown")
+                    .to_string()
+            })
+            .collect())
     }
 
 
@@ -395,7 +401,8 @@ impl ModelStorage {
     pub async fn remove_worktree(&self, model_ref: &ModelRef, branch: &str) -> Result<()> {
         let bare_repo_path = self.get_bare_repo_path(model_ref).await?;
 
-        // Use git2db's high-level worktree removal with automatic cleanup
+        // Use GitManager's high-level worktree removal with automatic cleanup
+        // This method is already optimized and handles storage driver cleanup properly
         git2db::GitManager::global()
             .remove_worktree(&bare_repo_path, branch, Some(&self.base_dir))
             .map_err(|e| anyhow::anyhow!("Failed to remove worktree: {}", e))?;

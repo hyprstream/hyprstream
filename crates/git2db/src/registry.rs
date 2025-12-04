@@ -11,10 +11,12 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use uuid::Uuid;
 
+use crate::config::Git2DBConfig;
 use crate::errors::{Git2DBError, Git2DBResult};
 use crate::manager::GitManager;
 use crate::references::GitRef;
 use crate::repository_handle::RepositoryHandle;
+use crate::storage::{Driver, StorageDriver};
 use tracing::{debug, info, trace, warn};
 
 /// Repository identifier using UUID
@@ -132,6 +134,15 @@ pub struct Git2DB {
     metadata: RegistryMetadata,
     /// Git manager for operations
     git_manager: &'static GitManager,
+    /// Pre-loaded storage driver for this registry (loaded once)
+    storage_driver: std::sync::Arc<dyn Driver>,
+}
+
+impl Git2DB {
+    /// Get the pre-loaded storage driver for this registry
+    pub fn storage_driver(&self) -> &std::sync::Arc<dyn Driver> {
+        &self.storage_driver
+    }
 }
 
 impl Git2DB {
@@ -261,11 +272,37 @@ impl Git2DB {
             RegistryMetadata::default()
         };
 
+        // Load storage driver once based on fresh configuration
+        let config = Git2DBConfig::load()
+            .map_err(|e| Git2DBError::internal(format!("Failed to load configuration: {}", e)))?;
+        // Debug logging for configuration
+        info!("Worktree driver configuration loaded: '{}'", config.worktree.driver);
+
+        let driver_config = config.worktree.driver
+            .parse::<StorageDriver>()
+            .map_err(|e| Git2DBError::internal(format!("Invalid storage driver config '{}': {}", config.worktree.driver, e)))?;
+
+        info!("Parsed driver configuration: {:?}", driver_config);
+
+        let storage_driver = git_manager
+            .driver_registry()
+            .get_driver(driver_config)
+            .map_err(|e| Git2DBError::internal(format!("Failed to load storage driver: {}", e)))?;
+
+        // Validate that the selected driver is available
+        if !storage_driver.is_available() {
+            return Err(Git2DBError::internal(format!(
+                "Selected storage driver '{}' is not available on this system",
+                storage_driver.name()
+            )));
+        }
+
         let mut registry = Self {
             registry_path,
             base_dir,
             metadata,
             git_manager,
+            storage_driver,
         };
 
         // Check for and recover from uncommitted changes (e.g., from interrupted operations)
@@ -896,11 +933,7 @@ impl Git2DB {
         &self.registry_path
     }
 
-    /// Get git manager reference
-    pub(crate) fn git_manager(&self) -> &GitManager {
-        self.git_manager
-    }
-
+  
     /// Initialize and update all submodules
     ///
     /// Equivalent to:

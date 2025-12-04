@@ -309,8 +309,8 @@ impl HyprConfig {
             .add_source(File::from(config_dir.join("config.toml")).required(false))
             .add_source(File::from(config_dir.join("config.json")).required(false))
             .add_source(File::from(config_dir.join("config.yaml")).required(false))
-            // Load from environment variables with HYPRSTREAM_ prefix
-            .add_source(Environment::with_prefix("HYPRSTREAM").separator("__"));
+            // Load from environment variables with HYPRSTREAM__ prefix (double underscore for nesting)
+            .add_source(Environment::with_prefix("HYPRSTREAM").separator("__").try_parsing(true));
 
         // Build and deserialize configuration
         let mut hypr_config: HyprConfig = settings.build()?.try_deserialize()?;
@@ -327,6 +327,7 @@ impl HyprConfig {
             }
             Err(e) => {
                 tracing::warn!("Failed to load git2db config: {}, using default", e);
+                hypr_config.git2db = git2db::config::Git2DBConfig::default();
             }
         }
 

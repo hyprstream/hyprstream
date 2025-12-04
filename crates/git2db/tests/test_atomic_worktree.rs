@@ -1,6 +1,6 @@
 //! Tests for atomic worktree creation with rollback
 
-use git2db::{Git2DB, Git2DBConfig, GitManager, WorktreeConfig};
+use git2db::{Git2DB, Git2DBConfig, GitManager, RepoId, WorktreeConfig};
 use std::path::PathBuf;
 use tempfile::TempDir;
 
@@ -49,16 +49,13 @@ async fn test_lfs_fetch_failure_rolls_back_worktree() {
     .unwrap();
 
     // Configure git2db (LFS fetch is always enabled with atomic rollback)
-    let config = Git2DBConfig::default();
-
-    // Create GitManager with config (not global - for testing)
-    let manager = GitManager::new(config);
+    let registry = Git2DB::open(temp.path()).await.unwrap();
+    let repo_id = registry.register_repository(&RepoId::new(), None, format!("test-repo-{}", repo_dir.display())).unwrap();
+    let handle = registry.repo(&repo_id).unwrap();
 
     // Attempt to create worktree - should fail and rollback
     let worktree_path = temp.path().join("worktree");
-    let result = manager
-        .create_worktree(&repo_dir, &worktree_path, "main")
-        .await;
+    let result = handle.create_worktree(&worktree_path, "main").await;
 
     // Verify that:
     // 1. Worktree creation failed
@@ -128,13 +125,12 @@ async fn test_metadata_save_failure_rolls_back_worktree() {
 
     // This test verifies hyprstream's model_storage layer
     // For now, just verify the basic worktree creation works
-    let config = Git2DBConfig::default();
-    let manager = GitManager::new(config);
+    let registry = Git2DB::open(temp.path()).await.unwrap();
+    let repo_id = registry.register_repository(&RepoId::new(), None, format!("test-repo-{}", repo_dir.display())).unwrap();
+    let handle = registry.repo(&repo_id).unwrap();
 
     let worktree_path = temp.path().join("worktree");
-    let result = manager
-        .create_worktree(&repo_dir, &worktree_path, "main")
-        .await;
+    let result = handle.create_worktree(&worktree_path, "main").await;
 
     assert!(result.is_ok(), "Basic worktree creation should succeed");
     assert!(worktree_path.exists(), "Worktree should exist");
@@ -164,12 +160,12 @@ async fn test_driver_failure_cleans_up_partial_worktree() {
     repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[]).unwrap();
 
     // Try to create worktree with invalid ref - should fail
-    let manager = GitManager::global();
+    let registry = Git2DB::open(temp.path()).await.unwrap();
+    let repo_id = registry.register_repository(&RepoId::new(), None, format!("test-repo-{}", repo_dir.display())).unwrap();
+    let handle = registry.repo(&repo_id).unwrap();
     let worktree_path = temp.path().join("worktree");
 
-    let result = manager
-        .create_worktree(&repo_dir, &worktree_path, "nonexistent-branch")
-        .await;
+    let result = handle.create_worktree(&worktree_path, "nonexistent-branch").await;
 
     // Should fail
     assert!(result.is_err(), "Should fail to create worktree with invalid branch");

@@ -1,70 +1,25 @@
 //! Overlay2 driver (Linux overlayfs)
-//!
-//! Implements the overlay2 storage driver using Linux overlayfs,
-//! following Docker's overlay2 driver design.
-//!
-//! This driver provides:
-//! - ~80% disk space savings via Copy-on-Write
-//! - Multiple backend options (FUSE, user namespace, kernel)
-//! - Full git worktree functionality with optimized storage
-
-use super::driver::{Driver, DriverCapabilities, DriverOpts, WorktreeHandle};
+use super::driver::{Driver, DriverOpts, WorktreeHandle};
+#[cfg(all(target_os = "linux", feature = "overlayfs"))]
+use super::driver::DriverFactory;
 use crate::errors::{Git2DBError, Git2DBResult};
 use async_trait::async_trait;
-use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use std::path::Path;
+#[cfg(all(target_os = "linux", feature = "overlayfs"))]
+use tokio::process::Command;
+#[cfg(all(target_os = "linux", feature = "overlayfs"))]
+use tracing::{info, debug, warn};
 
-// Re-export overlay backends from worktree module
-#[cfg(feature = "overlayfs")]
-use crate::worktree::overlay::{select_best_backend, OverlayBackend};
+#[cfg(all(target_os = "linux", feature = "overlayfs"))]
+inventory::submit!(DriverFactory::new(
+    "overlay2",
+    || Box::new(Overlay2Driver)
+));
 
-/// Configuration for overlay2 driver
-#[derive(Debug, Clone)]
-#[derive(Default)]
-pub struct Overlay2Config {
-    /// Force a specific backend (fuse, userns, kernel)
-    pub force_backend: Option<String>,
-
-    /// Custom overlay directory (default: temp directory)
-    pub overlay_dir: Option<PathBuf>,
-}
-
-
-/// Overlay2 storage driver
+/// Overlay2 storage driver (Linux overlayfs)
 ///
-/// Uses Linux overlayfs to create space-efficient git worktrees.
-pub struct Overlay2Driver {
-    #[cfg(feature = "overlayfs")]
-    backend: std::sync::Arc<dyn OverlayBackend>,
-    #[allow(dead_code)]
-    config: Overlay2Config,
-}
-
-impl Overlay2Driver {
-    /// Create with default configuration
-    #[cfg(feature = "overlayfs")]
-    pub fn new() -> Self {
-        Self {
-            backend: select_best_backend(),
-            config: Overlay2Config::default(),
-        }
-    }
-
-    /// Create without overlayfs feature (stub)
-    #[cfg(not(feature = "overlayfs"))]
-    pub fn new() -> Self {
-        Self {
-            config: Overlay2Config::default(),
-        }
-    }
-}
-
-#[cfg(feature = "overlayfs")]
-impl Default for Overlay2Driver {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// Automatically tries mount methods in order: kernel → userns → fuse
+pub struct Overlay2Driver;
 
 #[async_trait]
 impl Driver for Overlay2Driver {
@@ -72,54 +27,23 @@ impl Driver for Overlay2Driver {
         "overlay2"
     }
 
-    #[cfg(feature = "overlayfs")]
     fn is_available(&self) -> bool {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "overlayfs"))]
         {
-            self.backend.is_available()
+            // Check if overlay filesystem is supported by kernel
+            if let Ok(filesystems) = std::fs::read_to_string("/proc/filesystems") {
+                filesystems.contains("overlay")
+            } else {
+                false
+            }
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            false
-        }
-    }
 
-    #[cfg(not(feature = "overlayfs"))]
-    fn is_available(&self) -> bool {
+        #[cfg(not(all(target_os = "linux", feature = "overlayfs")))]
         false
     }
 
-    fn capabilities(&self) -> DriverCapabilities {
-        #[cfg(feature = "overlayfs")]
-        {
-            let backend_caps = self.backend.capabilities();
-            DriverCapabilities {
-                copy_on_write: true,
-                space_savings_percent: backend_caps.space_savings_percent,
-                requires_privileges: backend_caps.requires_privileges,
-                platforms: vec!["linux"],
-                required_binaries: backend_caps
-                    .requires_binary
-                    .map(|b| vec![b])
-                    .unwrap_or_default(),
-                relative_performance: backend_caps.relative_performance,
-            }
-        }
-
-        #[cfg(not(feature = "overlayfs"))]
-        {
-            DriverCapabilities {
-                copy_on_write: false,
-                space_savings_percent: 0,
-                requires_privileges: false,
-                platforms: vec![],
-                required_binaries: vec![],
-                relative_performance: 0.0,
-            }
-        }
-    }
-
-    #[cfg(feature = "overlayfs")]
+  
+  #[cfg(feature = "overlayfs")]
     async fn create_worktree(&self, opts: &DriverOpts) -> Git2DBResult<WorktreeHandle> {
         // Validate inputs
         if !opts.base_repo.exists() {
@@ -147,7 +71,6 @@ impl Driver for Overlay2Driver {
 
         let upper_dir = overlay_base.join("upper");
         let work_dir = overlay_base.join("work");
-        // Use a separate mount point for overlayfs, not the worktree path
         let mount_dir = overlay_base.join("mount");
 
         tokio::fs::create_dir_all(&upper_dir).await.map_err(|e| {
@@ -161,62 +84,67 @@ impl Driver for Overlay2Driver {
             .map_err(|e| Git2DBError::internal(format!("Failed to create mount point: {}", e)))?;
 
         info!(
-            "Creating overlay2 worktree: id={}, backend={}, lower={}, mount={}",
+            "Creating overlay2 worktree: id={}, lower={}, mount={}",
             id,
-            self.backend.name(),
             opts.base_repo.display(),
             mount_dir.display()
         );
 
-        // Mount overlayfs to our dedicated mount directory
-        self.backend
-            .mount(&opts.base_repo, &upper_dir, &work_dir, &mount_dir)
-            .await?;
+        // Try mounting with fallback strategy
+        let mount_method = self.try_mount_overlayfs(
+            &opts.base_repo,
+            &upper_dir,
+            &work_dir,
+            &mount_dir,
+        )
+        .await?;
 
-        // Create git worktree at the desired path (which can now be created by git without conflicts)
+        info!("Successfully mounted using {}", mount_method);
+
+        // Create git worktree at the desired path
         self.create_git_worktree(&opts.base_repo, &opts.worktree_path, &opts.ref_spec)
             .await?;
 
-        // Now we need to bind mount or symlink the overlay mount to the worktree path
-        // Since the worktree is created at the desired path, we'll copy the overlay content there
-        // This is handled by git worktree creation itself
-
-        // Create handle with cleanup (using the actual mount directory)
+        // Create handle with cleanup
         let mount_point = mount_dir.clone();
-        let backend = self.backend.clone();
         let upper = upper_dir.clone();
         let work = work_dir.clone();
         let id_clone = id.clone();
 
-        let cleanup = Box::new(move || {
+        let cleanup = move || async move {
             let mount_point = mount_point.clone();
-            let backend = backend.clone();
             let upper = upper.clone();
             let work = work.clone();
             let id = id_clone.clone();
 
-            tokio::spawn(async move {
-                info!("Cleaning up overlay2 worktree {}", id);
+            info!("Cleaning up overlay2 worktree {}", id);
 
-                // Unmount
-                if let Err(e) = backend.unmount(&mount_point).await {
-                    warn!(
-                        "Failed to unmount {} in cleanup: {}",
-                        mount_point.display(),
-                        e
-                    );
-                }
+            // Unmount (try fusermount first, then umount)
+            if let Err(e) = Self::unmount_overlayfs(&mount_point).await {
+                warn!(
+                    "Failed to unmount {} in cleanup: {}",
+                    mount_point.display(),
+                    e
+                );
+            }
 
-                // Remove overlay directories
-                let _ = tokio::fs::remove_dir_all(&upper).await;
-                let _ = tokio::fs::remove_dir_all(&work).await;
-                let _ = tokio::fs::remove_dir_all(&mount_point).await;
-            });
-        });
+            // Remove overlay directories
+            if let Err(e) = tokio::fs::remove_dir_all(&upper).await {
+                warn!("Failed to remove upper dir {}: {}", upper.display(), e);
+            }
+            if let Err(e) = tokio::fs::remove_dir_all(&work).await {
+                warn!("Failed to remove work dir {}: {}", work.display(), e);
+            }
+            if let Err(e) = tokio::fs::remove_dir_all(&mount_point).await {
+                warn!("Failed to remove mount point {}: {}", mount_point.display(), e);
+            }
+
+            Ok(())
+        };
 
         Ok(WorktreeHandle::with_cleanup(
             opts.worktree_path.clone(),
-            format!("overlay2-{}", self.backend.name()),
+            format!("overlay2-{}", mount_method),
             cleanup,
         ))
     }
@@ -227,13 +155,273 @@ impl Driver for Overlay2Driver {
             "overlay2 driver requires 'overlayfs' feature to be enabled",
         ))
     }
+
+    #[cfg(feature = "overlayfs")]
+    async fn get_worktrees(&self, base_repo: &Path) -> Git2DBResult<Vec<WorktreeHandle>> {
+        let worktrees_dir = base_repo.parent()
+            .ok_or_else(|| Git2DBError::invalid_path(base_repo.to_path_buf(), "Invalid base repository path"))?
+            .join("worktrees");
+
+        let mut worktrees = Vec::new();
+
+        if !worktrees_dir.exists() {
+            return Ok(worktrees);
+        }
+
+        // Read worktrees directory
+        for entry in std::fs::read_dir(&worktrees_dir)? {
+            let entry = entry?;
+            let worktree_path = entry.path();
+
+            // Skip non-directories and git's internal directories
+            if !worktree_path.is_dir() || worktree_path.file_name().map_or(false, |name| {
+                name.to_string_lossy().starts_with(".git")
+            }) {
+                continue;
+            }
+
+            // Check if this is an overlay2 worktree by looking for overlay signatures
+            if self.is_overlay2_worktree(&worktree_path) {
+                worktrees.push(WorktreeHandle::new(worktree_path, "overlay2".to_string()));
+            }
+        }
+
+        Ok(worktrees)
+    }
+
+    #[cfg(feature = "overlayfs")]
+    async fn get_worktree(&self, base_repo: &Path, branch: &str) -> Git2DBResult<Option<WorktreeHandle>> {
+        let worktree_path = base_repo.parent()
+            .ok_or_else(|| Git2DBError::invalid_path(base_repo.to_path_buf(), "Invalid base repository path"))?
+            .join("worktrees")
+            .join(branch);
+
+        if worktree_path.exists() && self.is_overlay2_worktree(&worktree_path) {
+            Ok(Some(WorktreeHandle::new(worktree_path, "overlay2".to_string())))
+        } else {
+            Ok(None)
+        }
+    }
+
+    #[cfg(not(feature = "overlayfs"))]
+    async fn get_worktrees(&self, _base_repo: &Path) -> Git2DBResult<Vec<WorktreeHandle>> {
+        Err(Git2DBError::internal(
+            "overlay2 driver requires 'overlayfs' feature to be enabled",
+        ))
+    }
+
+    #[cfg(not(feature = "overlayfs"))]
+    async fn get_worktree(&self, _base_repo: &Path, _branch: &str) -> Git2DBResult<Option<WorktreeHandle>> {
+        Err(Git2DBError::internal(
+            "overlay2 driver requires 'overlayfs' feature to be enabled",
+        ))
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "overlayfs"))]
+impl Overlay2Driver {
+    /// Try mounting overlayfs with automatic fallback strategy
+    ///
+    /// Attempts methods in order of preference:
+    /// 1. Kernel overlayfs (fastest, requires CAP_SYS_ADMIN or user namespace)
+    /// 2. User namespace overlayfs (good perf, unprivileged, requires kernel support)
+    /// 3. FUSE overlayfs (slow but compatible, requires fuse-overlayfs binary)
+    async fn try_mount_overlayfs(
+        &self,
+        lower: &Path,
+        upper: &Path,
+        work: &Path,
+        target: &Path,
+    ) -> Git2DBResult<String> {
+        // Build common mount options
+        let mount_opts = format!(
+            "lowerdir={},upperdir={},workdir={}",
+            lower.display(),
+            upper.display(),
+            work.display()
+        );
+
+        // Try 1: Kernel overlayfs (fastest)
+        if let Ok(filesystems) = std::fs::read_to_string("/proc/filesystems") {
+            if filesystems.contains("overlay") {
+                debug!("Attempting kernel overlayfs mount");
+                match Self::mount_kernel(target, &mount_opts).await {
+                    Ok(()) => {
+                        return Ok("kernel".to_string());
+                    }
+                    Err(e) => {
+                        debug!("Kernel overlayfs failed, trying next method: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Try 2: User namespace overlayfs (unprivileged)
+        if Self::can_use_userns().await {
+            debug!("Attempting user namespace overlayfs mount");
+            match Self::mount_userns(lower, upper, work, target).await {
+                Ok(()) => {
+                    return Ok("userns".to_string());
+                }
+                Err(e) => {
+                    debug!("User namespace mount failed, trying next method: {}", e);
+                }
+            }
+        }
+
+        // Try 3: FUSE overlayfs (most compatible)
+        debug!("Attempting FUSE overlayfs mount");
+        match Self::mount_fuse(target, &mount_opts).await {
+            Ok(()) => {
+                return Ok("fuse".to_string());
+            }
+            Err(e) => {
+                debug!("FUSE overlayfs failed: {}", e);
+            }
+        }
+
+        // All methods failed
+        Err(Git2DBError::internal(
+            "All overlayfs mount methods failed. Ensure one of: \
+             1) Kernel overlayfs + CAP_SYS_ADMIN capability, \
+             2) User namespace support (unprivileged_userns_clone=1), \
+             3) fuse-overlayfs binary installed and available".to_string()
+        ))
+    }
+
+    /// Mount using kernel overlayfs syscall
+    #[cfg(all(target_os = "linux", feature = "overlayfs"))]
+    async fn mount_kernel(target: &Path, mount_opts: &str) -> Git2DBResult<()> {
+        use nix::mount::{mount, MsFlags};
+
+        mount(
+            Some("overlay"),
+            target,
+            Some("overlay"),
+            MsFlags::empty(),
+            Some(mount_opts),
+        )
+        .map_err(|e| {
+            Git2DBError::internal(format!("Failed to mount kernel overlayfs: {}", e))
+        })
+    }
+
+    /// Check if user namespaces are available
+    async fn can_use_userns() -> bool {
+        // Check sysctl setting
+        if let Ok(content) = std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone") {
+            return content.trim() == "1";
+        }
+
+        // Try to create a test namespace
+        use nix::sched::{unshare, CloneFlags};
+        match unshare(CloneFlags::CLONE_NEWUSER) {
+            Ok(_) => true,
+            Err(_) => false,
+        }
+    }
+
+    /// Mount using user namespace
+    async fn mount_userns(
+        lower: &Path,
+        upper: &Path,
+        work: &Path,
+        target: &Path,
+    ) -> Git2DBResult<()> {
+        let mount_opts = format!(
+            "lowerdir={},upperdir={},workdir={},userxattr",
+            lower.display(),
+            upper.display(),
+            work.display()
+        );
+
+        let output = Command::new("unshare")
+            .arg("--user")
+            .arg("--map-root-user")
+            .arg("--mount")
+            .arg("mount")
+            .arg("-t")
+            .arg("overlay")
+            .arg("overlay")
+            .arg("-o")
+            .arg(&mount_opts)
+            .arg(target)
+            .output()
+            .await
+            .map_err(|e| Git2DBError::internal(format!("Failed to execute unshare: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Git2DBError::internal(format!(
+                "User namespace mount failed: {}",
+                stderr
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Mount using FUSE overlayfs
+    async fn mount_fuse(target: &Path, mount_opts: &str) -> Git2DBResult<()> {
+        let output = Command::new("fuse-overlayfs")
+            .arg("-o")
+            .arg(mount_opts)
+            .arg(target)
+            .output()
+            .await
+            .map_err(|e| {
+                Git2DBError::internal(format!("Failed to execute fuse-overlayfs: {}", e))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Git2DBError::internal(format!(
+                "FUSE overlayfs failed: {}",
+                stderr
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Unmount overlayfs (try fusermount first, then umount)
+    async fn unmount_overlayfs(target: &Path) -> Git2DBResult<()> {
+        // Try fusermount first (for FUSE mounts)
+        let fusermount_output = Command::new("fusermount")
+            .arg("-u")
+            .arg(target)
+            .output()
+            .await;
+
+        if fusermount_output.is_ok() && fusermount_output.unwrap().status.success() {
+            return Ok(());
+        }
+
+        // Fallback to umount
+        let output = Command::new("umount")
+            .arg(target)
+            .output()
+            .await
+            .map_err(|e| Git2DBError::internal(format!("Failed to execute umount: {}", e)))?;
+
+        if !output.status.success() {
+            // Try lazy unmount as last resort
+            let _ = Command::new("umount")
+                .arg("-l")
+                .arg(target)
+                .output()
+                .await;
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "overlayfs")]
 impl Overlay2Driver {
     /// Create git worktree using libgit2 with unified ref support
     ///
-    /// Note: The overlay is already mounted at worktree_path by the driver.
+    /// Note: The overlay is already mounted by the driver.
     /// We just need to create the git worktree structure on top of it.
     async fn create_git_worktree(
         &self,
@@ -303,6 +491,28 @@ impl Overlay2Driver {
 
         Ok(())
     }
+
+    /// Check if a worktree is managed by overlay2 driver
+    fn is_overlay2_worktree(&self, worktree_path: &Path) -> bool {
+        // Check for overlay2 signatures
+        let overlay_path = worktree_path.join(".overlay");
+        let git_overlay_path = worktree_path.join(".git").join("overlay");
+
+        // Also check for overlayfs mount signatures
+        let has_overlay_sig = overlay_path.exists() || git_overlay_path.exists();
+
+        // Additional check: look for overlay mount points in /proc/mounts
+        if has_overlay_sig {
+            if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+                let worktree_str = worktree_path.to_string_lossy();
+                if mounts.contains(&*worktree_str) {
+                    return true;
+                }
+            }
+        }
+
+        has_overlay_sig
+    }
 }
 
 #[cfg(test)]
@@ -311,33 +521,13 @@ mod tests {
 
     #[test]
     fn test_driver_name() {
-        let driver = Overlay2Driver::new();
-        assert_eq!(driver.name(), "overlay2");
+        assert_eq!(Overlay2Driver.name(), "overlay2");
     }
 
     #[test]
     #[cfg(all(feature = "overlayfs", target_os = "linux"))]
     fn test_availability() {
-        let driver = Overlay2Driver::new();
         // May or may not be available depending on system
-        println!("Overlay2 available: {}", driver.is_available());
-    }
-
-    #[test]
-    fn test_capabilities() {
-        let driver = Overlay2Driver::new();
-        let caps = driver.capabilities();
-
-        #[cfg(feature = "overlayfs")]
-        {
-            assert!(caps.copy_on_write);
-            assert!(caps.space_savings_percent > 0);
-        }
-
-        #[cfg(not(feature = "overlayfs"))]
-        {
-            assert!(!caps.copy_on_write);
-            assert_eq!(caps.space_savings_percent, 0);
-        }
+        println!("Overlay2 available: {}", Overlay2Driver.is_available());
     }
 }

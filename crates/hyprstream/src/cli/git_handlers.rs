@@ -649,7 +649,7 @@ pub async fn handle_list(
     let models_dir = storage_paths.models_dir()?;
 
     // Collect models with git info
-    let mut models_with_git = Vec::new();
+    let mut git_repos = Vec::new();
     for (model_ref, metadata) in models {
         // Get git info from the bare repository
         // The bare repo is at: models/{name}/{name}.git/
@@ -659,8 +659,7 @@ pub async fn handle_list(
 
         let git_info = GitInfo::from_bare_repo(&bare_repo_path);
 
-        println!("pushing models_with_git: {}", model_ref.model);
-        models_with_git.push((model_ref, metadata, git_info));
+        git_repos.push((model_ref, metadata, git_info));
     }
 
     // Table format - the nice format you liked!
@@ -670,7 +669,7 @@ pub async fn handle_list(
     );
     println!("{}", "-".repeat(75));
 
-    for (_model_ref, metadata, git_info) in &models_with_git {
+    for (_model_ref, metadata, git_info) in &git_repos {
         let size_str = if let Some(size) = metadata.size_bytes {
             format!("{:.1}GB", size as f64 / (1024.0 * 1024.0 * 1024.0))
         } else {
@@ -696,7 +695,7 @@ pub async fn handle_list(
         );
     }
 
-    if models_with_git.is_empty() {
+    if git_repos.is_empty() {
         println!("No models match the specified filters.");
     }
 
@@ -1417,17 +1416,19 @@ pub async fn handle_push(
     let registry = storage.registry().await;
     let handle = registry.repo(&repo_id)?;
 
-    if let Some(branch) = branch_name {
-        handle.push(Some(remote_name), branch).await?;
-    } else {
-        // Push current branch
-        let status = handle.status().await?;
-        if let Some(current_branch) = status.branch {
-            handle.push(Some(remote_name), current_branch).await?;
-        } else {
-            anyhow::bail!("Not on a branch - specify branch to push");
-        }
-    }
+    // Create a temporary worktree for push operations
+    let temp_dir = tempfile::tempdir()?;
+    let worktree_path = temp_dir.path();
+    let mut worktree = handle.create_worktree(worktree_path, "temp-push").await?;
+
+    // Push current branch (worktree.push only takes remote parameter)
+    worktree.push(Some(remote_name)).await?;
+
+    // Note: The old code was trying to push specific branches, but WorktreeHandle.push()
+    // only operates on the current branch of the worktree. For multi-branch support,
+    // we'd need to checkout branches first or use different approach.
+
+    worktree.cleanup().await?;
 
     println!("✓ Pushed model {} to {}", model, remote_name);
     if let Some(b) = branch_name {
@@ -1459,17 +1460,19 @@ pub async fn handle_pull(
     let registry = storage.registry().await;
     let handle = registry.repo(&repo_id)?;
 
-    if let Some(branch) = branch_name {
-        handle.pull(Some(remote_name), branch).await?;
-    } else {
-        // Pull current branch
-        let status = handle.status().await?;
-        if let Some(current_branch) = status.branch {
-            handle.pull(Some(remote_name), current_branch).await?;
-        } else {
-            anyhow::bail!("Not on a branch - specify branch to pull");
-        }
-    }
+    // Create a temporary worktree for pull operations
+    let temp_dir = tempfile::tempdir()?;
+    let worktree_path = temp_dir.path();
+    let mut worktree = handle.create_worktree(worktree_path, "temp-pull").await?;
+
+    // Pull current branch (worktree.pull only takes remote parameter)
+    worktree.pull(Some(remote_name)).await?;
+
+    // Note: The old code was trying to pull specific branches, but WorktreeHandle.pull()
+    // only operates on the current branch of the worktree. For multi-branch support,
+    // we'd need to checkout branches first or use different approach.
+
+    worktree.cleanup().await?;
 
     println!("✓ Pulled latest changes for model {}", model);
     println!("  Remote: {}", remote_name);

@@ -28,7 +28,6 @@ pub mod repository;
 pub mod repository_handle;
 pub mod stage;
 pub mod transaction;
-pub mod worktree;
 
 // Storage drivers (Docker's graphdriver pattern)
 pub mod storage;
@@ -80,12 +79,6 @@ pub use stage::{StageManager, StagedFile};
 pub use transaction::{IsolationMode, TransactionHandle};
 pub use transport::TransportFactory;
 
-// Worktree exports
-pub use worktree::{WorktreeHandle, WorktreeMetadata};
-
-// Overlayfs exports (feature-gated)
-#[cfg(feature = "overlayfs")]
-pub use worktree::overlayfs_available;
 
 // Storage driver exports
 pub use storage::{Driver, DriverRegistry, StorageDriver};
@@ -170,15 +163,6 @@ pub mod ops {
     /// Open a repository
     pub fn open<P: AsRef<Path>>(path: P) -> Git2DBResult<git2::Repository> {
         manager().get_repository(path)?.open()
-    }
-
-    /// Create a worktree (async)
-    pub async fn create_worktree(
-        base_repo: &Path,
-        worktree: &Path,
-        branch: &str,
-    ) -> Git2DBResult<Box<dyn crate::worktree::WorktreeHandle>> {
-        manager().create_worktree(base_repo, worktree, branch).await
     }
 
     /// Remove a worktree
