@@ -1597,7 +1597,6 @@ impl ModelOperations for LlamaModel {
                     .to_kind(embeddings.kind()) // Match embeddings dtype (likely BF16)
                     .to_device(embeddings.device());
                 embeddings = broadcast_mul(&embeddings, &scale_tensor)?;
-                tracing::debug!("Scaled embeddings by sqrt(hidden_size) = {}", scale);
             }
 
             embeddings
@@ -1738,11 +1737,6 @@ impl ModelOperations for LlamaModel {
                         // 1D tensor [vocab]
                         hidden_states.narrow(0, mask_start, mask_count).copy_(&mask_values);
                     }
-
-                    tracing::debug!(
-                        "Masked {} padded tokens (original vocab: {}, padded vocab: {})",
-                        mask_count, original_vocab_size, padded_vocab_size
-                    );
                 }
             }
         }

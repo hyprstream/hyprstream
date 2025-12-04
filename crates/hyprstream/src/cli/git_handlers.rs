@@ -1395,7 +1395,8 @@ pub async fn handle_infer(
         }
         println!("\n{}", full_text);
         let stats = text_stream.stats();
-        info!("Generated {} tokens", stats.tokens_generated);
+        info!("Generated {} tokens in {}ms ({:.2} tokens/sec)",
+              stats.tokens_generated, stats.generation_time_ms, stats.tokens_per_second);
     }
 
     Ok(())

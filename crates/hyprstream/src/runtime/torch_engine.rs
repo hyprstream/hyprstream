@@ -1900,14 +1900,6 @@ impl<'a> TextStream<'a> {
         };
 
         // Validate sampled token is within model vocabulary
-        // With truncation disabled, tokens can be in range [0, model_vocab_size)
-        // Some tokens may be beyond tokenizer vocab [vocab_size, model_vocab_size)
-        // which is OK - the DecodeStream will handle decoding gracefully
-        tracing::debug!(
-            "Sampled token: {}, tokenizer_vocab_size: {}, model_vocab_size: {}, logits_shape: {:?}",
-            next_token, vocab_size, model_vocab_size, logits_shape
-        );
-
         if model_vocab_size > 0 && next_token >= model_vocab_size {
             return Err(anyhow::anyhow!(
                 "Generated out-of-bounds token {}: exceeds model vocab size {}",
