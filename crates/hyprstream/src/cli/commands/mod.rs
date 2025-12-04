@@ -216,12 +216,12 @@ pub enum Commands {
 
         /// Maximum context length for KV cache allocation.
         /// Overrides model's max_position_embeddings to reduce GPU memory.
-        #[arg(long)]
+        #[arg(long, env = "HYPRSTREAM_MAX_CONTEXT")]
         max_context: Option<usize>,
 
         /// KV cache quantization type for reduced GPU memory usage.
         /// Reduces GPU memory by 50-75% at slight quality cost.
-        #[arg(long, value_enum, default_value = "none")]
+        #[arg(long, value_enum, default_value = "none", env = "HYPRSTREAM_KV_QUANT")]
         kv_quant: KVQuantArg,
     },
 

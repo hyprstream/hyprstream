@@ -147,15 +147,31 @@ pub struct RuntimeConfig {
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
-        // Check environment variable for GPU device
+        // Check environment variables for runtime configuration
+        // These serve as fallback defaults; CLI args (via clap) take precedence
         let gpu_device_id = std::env::var("HYPRSTREAM_GPU_DEVICE")
             .ok()
             .and_then(|s| s.parse::<usize>().ok());
 
+        let max_context = std::env::var("HYPRSTREAM_MAX_CONTEXT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok());
+
+        let kv_quant_type = std::env::var("HYPRSTREAM_KV_QUANT")
+            .ok()
+            .and_then(|s| match s.to_lowercase().as_str() {
+                "int8" => Some(crate::runtime::kv_quant::KVQuantType::Int8),
+                "nf4" => Some(crate::runtime::kv_quant::KVQuantType::Nf4),
+                "fp4" => Some(crate::runtime::kv_quant::KVQuantType::Fp4),
+                "none" | "" => Some(crate::runtime::kv_quant::KVQuantType::None),
+                _ => None,
+            })
+            .unwrap_or(crate::runtime::kv_quant::KVQuantType::None);
+
         Self {
             context_length: 4096,
-            max_context: None, // Use model's max_position_embeddings by default
-            kv_quant_type: crate::runtime::kv_quant::KVQuantType::None,
+            max_context,
+            kv_quant_type,
             batch_size: 512,
             cpu_threads: None,
             use_gpu: true,
