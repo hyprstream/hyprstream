@@ -89,6 +89,7 @@ rayon.workspace = true  # Parallel processing for tensor operations
 memmap2.workspace = true
 rand.workspace = true
 tch = { git = "https://github.com/hyprstream/tch-rs", branch = "hip" }
+bitsandbytes-sys = { path = "../bitsandbytes-sys", optional = true }  # KV cache quantization
 
 # Candle ML Framework - REMOVED: Fully migrated to Tch (PyTorch Rust bindings)
 # candle-core = "0.9.1"
@@ -140,6 +141,7 @@ shellexpand.workspace = true
 [features]
 default = ["gittorrent"]
 cuda = []
+bnb = ["dep:bitsandbytes-sys"]  # Enable bitsandbytes KV cache quantization (requires compatible ROCm/CUDA)
 xet = ["git2db/xet-storage"]  # Enable XET large file storage (EXPERIMENTAL - has known bugs, disabled by default)
 otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:opentelemetry-semantic-conventions", "dep:opentelemetry-stdout"]
 gittorrent = ["dep:gittorrent", "git2db/gittorrent-transport"]  # Enable P2P model sharing via gittorrent transport

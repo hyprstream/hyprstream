@@ -30,6 +30,7 @@
 #![allow(non_snake_case)]
 #![allow(dead_code)]
 
+#[cfg(not(bnb_stub))]
 use std::ffi::c_int;
 #[allow(unused_imports)]
 use std::ptr;
@@ -223,6 +224,10 @@ pub fn quantize_blockwise_fp32(input: &[f32], blocksize: usize) -> Result<(Vec<u
     let mut state = QuantState::new_8bit(n, blocksize);
     let mut output = vec![0u8; n];
 
+    // SAFETY: The bitsandbytes C API uses mutable pointers for historical reasons,
+    // but cquantize_blockwise_fp32 only reads from `input`. The `code` array is
+    // read-only (lookup table), and `absmax` is written to (output parameter).
+    // We pass mutable pointers to satisfy the C ABI.
     unsafe {
         cquantize_blockwise_fp32(
             state.code.as_mut_ptr(),
@@ -249,6 +254,9 @@ pub fn dequantize_blockwise_fp32(input: &[u8], state: &QuantState) -> Result<Vec
     let n = state.n_elements;
     let mut output = vec![0.0f32; n];
 
+    // SAFETY: The bitsandbytes C API uses mutable pointers for historical reasons,
+    // but cdequantize_blockwise_fp32 only reads from `code`, `input`, and `absmax`.
+    // Only `output` is written to. We cast const pointers to mutable to satisfy the C ABI.
     unsafe {
         cdequantize_blockwise_fp32(
             state.code.as_ptr() as *mut f32,
@@ -287,6 +295,9 @@ pub fn quantize_4bit_nf4_fp32(input: &[f32], blocksize: usize) -> Result<(Vec<u8
     let output_size = (n + 1) / 2;
     let mut output = vec![0u8; output_size];
 
+    // SAFETY: The bitsandbytes C API uses mutable pointers for historical reasons,
+    // but cquantize_blockwise_fp32_nf4 only reads from `input`. The `code` array is
+    // read-only (NF4 lookup table), and `absmax` is written to (output parameter).
     unsafe {
         cquantize_blockwise_fp32_nf4(
             state.code.as_mut_ptr(),
@@ -313,6 +324,9 @@ pub fn dequantize_4bit_nf4_fp32(input: &[u8], state: &QuantState) -> Result<Vec<
     let n = state.n_elements;
     let mut output = vec![0.0f32; n];
 
+    // SAFETY: The bitsandbytes C API uses mutable pointers for historical reasons,
+    // but cdequantize_blockwise_fp32_nf4 only reads from `code`, `input`, and `absmax`.
+    // Only `output` is written to. We cast const pointers to mutable to satisfy the C ABI.
     unsafe {
         cdequantize_blockwise_fp32_nf4(
             state.code.as_ptr() as *mut f32,
@@ -351,6 +365,9 @@ pub fn quantize_4bit_fp4_fp32(input: &[f32], blocksize: usize) -> Result<(Vec<u8
     let output_size = (n + 1) / 2;
     let mut output = vec![0u8; output_size];
 
+    // SAFETY: The bitsandbytes C API uses mutable pointers for historical reasons,
+    // but cquantize_blockwise_fp32_fp4 only reads from `input`. The `code` array is
+    // read-only (FP4 lookup table), and `absmax` is written to (output parameter).
     unsafe {
         cquantize_blockwise_fp32_fp4(
             state.code.as_mut_ptr(),
@@ -377,6 +394,9 @@ pub fn dequantize_4bit_fp4_fp32(input: &[u8], state: &QuantState) -> Result<Vec<
     let n = state.n_elements;
     let mut output = vec![0.0f32; n];
 
+    // SAFETY: The bitsandbytes C API uses mutable pointers for historical reasons,
+    // but cdequantize_blockwise_fp32_fp4 only reads from `code`, `input`, and `absmax`.
+    // Only `output` is written to. We cast const pointers to mutable to satisfy the C ABI.
     unsafe {
         cdequantize_blockwise_fp32_fp4(
             state.code.as_ptr() as *mut f32,
@@ -432,6 +452,9 @@ pub fn quantize_blockwise_cpu_fp32(input: &[f32], blocksize: usize) -> Result<(V
     let mut state = QuantState::new_8bit(n, blocksize);
     let mut output = vec![0u8; n];
 
+    // SAFETY: The bitsandbytes C API uses mutable pointers for historical reasons,
+    // but cquantize_blockwise_cpu_fp32 only reads from `input`. The `code` array is
+    // read-only (lookup table), and `absmax` is written to (output parameter).
     unsafe {
         cquantize_blockwise_cpu_fp32(
             state.code.as_mut_ptr(),
@@ -458,6 +481,9 @@ pub fn dequantize_blockwise_cpu_fp32(input: &[u8], state: &QuantState) -> Result
     let n = state.n_elements;
     let mut output = vec![0.0f32; n];
 
+    // SAFETY: The bitsandbytes C API uses mutable pointers for historical reasons,
+    // but cdequantize_blockwise_cpu_fp32 only reads from `code`, `input`, and `absmax`.
+    // Only `output` is written to. We cast const pointers to mutable to satisfy the C ABI.
     unsafe {
         cdequantize_blockwise_cpu_fp32(
             state.code.as_ptr() as *mut f32,

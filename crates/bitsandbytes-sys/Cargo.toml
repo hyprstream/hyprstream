@@ -18,10 +18,14 @@ cpu = []
 # Generate bindings at build time (requires libclang)
 bindgen = ["dep:bindgen"]
 
+# Build bitsandbytes from source (auto-clones from GitHub if needed)
+build-from-source = ["dep:git2"]
+
 [dependencies]
 
 [build-dependencies]
 bindgen = { workspace = true, optional = true }
 pkg-config.workspace = true
+git2 = { version = "0.19", optional = true }
 
 [dev-dependencies]

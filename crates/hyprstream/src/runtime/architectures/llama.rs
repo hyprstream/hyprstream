@@ -883,11 +883,12 @@ impl LlamaModel {
         mut config: LlamaConfig,
         device: &Device,
         dtype: DType,
-        _kv_quant_type: crate::runtime::kv_quant::KVQuantType,
+        kv_quant_type: crate::runtime::kv_quant::KVQuantType,
     ) -> Result<Self> {
         tracing::info!(
-            "[from_weights_with_config] Received config.max_position_embeddings = {}",
-            config.max_position_embeddings
+            "[from_weights_with_config] Received config.max_position_embeddings = {}, kv_quant = {:?}",
+            config.max_position_embeddings,
+            kv_quant_type
         );
 
         // Extract key tensors (with padding for models that need it)
@@ -1009,14 +1010,16 @@ impl LlamaModel {
         // Initialize KV cache if we have layers
         let kv_cache = if !layers.is_empty() {
             tracing::info!(
-                "[LlamaModel] Creating KV cache: num_layers={}, max_seq_len={} (from config.max_position_embeddings)",
+                "[LlamaModel] Creating KV cache: num_layers={}, max_seq_len={}, quant={:?}",
                 layers.len(),
-                config.max_position_embeddings
+                config.max_position_embeddings,
+                kv_quant_type
             );
             Some(std::sync::Arc::new(std::sync::Mutex::new(
                 crate::runtime::kv_cache::KVCacheManager::new(
                     layers.len(),
                     config.max_position_embeddings,
+                    kv_quant_type,
                 ),
             )))
         } else {

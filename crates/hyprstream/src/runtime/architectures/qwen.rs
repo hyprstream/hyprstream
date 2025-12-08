@@ -31,6 +31,7 @@ impl QwenAdapter {
         _context_length: usize,
         device: &Device,
         dtype: DType,
+        kv_quant_type: crate::runtime::kv_quant::KVQuantType,
     ) -> Result<Box<dyn ModelOperations>> {
         // Parse the config.json to get proper rope_theta and other settings
         let config = LlamaModel::parse_config(config_json)?;
@@ -75,17 +76,18 @@ impl QwenAdapter {
 
         // Log the configuration being used
         tracing::info!(
-            "[from_weights] Creating Qwen{} model with config: hidden_size={}, num_heads={}, num_kv_heads={}, context_length={}, rope_theta={}",
+            "[from_weights] Creating Qwen{} model with config: hidden_size={}, num_heads={}, num_kv_heads={}, context_length={}, rope_theta={}, kv_quant={:?}",
             version,
             config.hidden_size,
             config.num_attention_heads,
             config.num_key_value_heads,
             config.max_position_embeddings,
-            config.rope_theta
+            config.rope_theta,
+            kv_quant_type
         );
 
-        // Create the model using Llama implementation with Qwen config (no KV quantization for adapter)
-        let model = LlamaModel::from_weights_with_config(weights, config, device, dtype, crate::runtime::kv_quant::KVQuantType::None)?;
+        // Create the model using Llama implementation with Qwen config
+        let model = LlamaModel::from_weights_with_config(weights, config, device, dtype, kv_quant_type)?;
         Ok(Box::new(model))
     }
 

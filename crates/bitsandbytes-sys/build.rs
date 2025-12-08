@@ -164,7 +164,8 @@ fn generate_bindings(out_path: &PathBuf) {
         .header("wrapper.h")
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         // Only generate bindings for our wrapper functions
-        .allowlist_function("bnb_.*")
+        // Functions use 'c' prefix (cquantize, cdequantize, cgemm, etc.)
+        .allowlist_function("c.*")
         .allowlist_type("bnb_.*")
         .allowlist_var("BNB_.*")
         // Use core types
