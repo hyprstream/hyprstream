@@ -653,7 +653,7 @@ impl TorchEngine {
 
         // Lock the model and run forward pass (efficient!) with poison recovery
         let model = self.handle_poison(model_arc.lock())?;
-        // CRITICAL: Wrap in no_grad to prevent gradient tracking during inference
+        // Wrap in no_grad to prevent gradient tracking during inference
         let logits = tch::no_grad(|| model.forward(&input_tensor, None))?;
 
         // Extract logits for the last token

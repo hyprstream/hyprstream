@@ -148,7 +148,8 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         // Check environment variables for runtime configuration
-        // These serve as fallback defaults; CLI args (via clap) take precedence
+        // Precedence: CLI args > env vars (read here) > hardcoded defaults.
+        // Environment variables set initial defaults; CLI args may override them later.
         let gpu_device_id = std::env::var("HYPRSTREAM_GPU_DEVICE")
             .ok()
             .and_then(|s| s.parse::<usize>().ok());
