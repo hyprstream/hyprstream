@@ -30,9 +30,7 @@
 #![allow(non_snake_case)]
 #![allow(dead_code)]
 
-#[cfg(not(bnb_stub))]
 use std::ffi::c_int;
-#[allow(unused_imports)]
 use std::ptr;
 
 // ============================================================================
@@ -50,8 +48,6 @@ pub use bindings::*;
 /// Error type for bitsandbytes operations
 #[derive(Debug, Clone)]
 pub enum BnbError {
-    /// Library not found or not loaded
-    LibraryNotFound,
     /// Invalid input parameters
     InvalidInput(String),
     /// Quantization failed
@@ -65,7 +61,6 @@ pub enum BnbError {
 impl std::fmt::Display for BnbError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BnbError::LibraryNotFound => write!(f, "bitsandbytes library not found"),
             BnbError::InvalidInput(msg) => write!(f, "invalid input: {}", msg),
             BnbError::QuantizationFailed(msg) => write!(f, "quantization failed: {}", msg),
             BnbError::AllocationFailed => write!(f, "memory allocation failed"),
@@ -214,7 +209,6 @@ impl QuantState {
 ///
 /// # Returns
 /// Tuple of (quantized data, quantization state)
-#[cfg(not(bnb_stub))]
 pub fn quantize_blockwise_fp32(input: &[f32], blocksize: usize) -> Result<(Vec<u8>, QuantState)> {
     if input.is_empty() {
         return Err(BnbError::InvalidInput("input is empty".to_string()));
@@ -243,7 +237,6 @@ pub fn quantize_blockwise_fp32(input: &[f32], blocksize: usize) -> Result<(Vec<u
 }
 
 /// Dequantize 8-bit blockwise quantized data back to f32
-#[cfg(not(bnb_stub))]
 pub fn dequantize_blockwise_fp32(input: &[u8], state: &QuantState) -> Result<Vec<f32>> {
     if state.is_4bit {
         return Err(BnbError::InvalidInput(
@@ -282,7 +275,6 @@ pub fn dequantize_blockwise_fp32(input: &[u8], state: &QuantState) -> Result<Vec
 ///
 /// # Returns
 /// Tuple of (quantized data, quantization state)
-#[cfg(not(bnb_stub))]
 pub fn quantize_4bit_nf4_fp32(input: &[f32], blocksize: usize) -> Result<(Vec<u8>, QuantState)> {
     if input.is_empty() {
         return Err(BnbError::InvalidInput("input is empty".to_string()));
@@ -313,7 +305,6 @@ pub fn quantize_4bit_nf4_fp32(input: &[f32], blocksize: usize) -> Result<(Vec<u8
 }
 
 /// Dequantize 4-bit NF4 quantized data back to f32
-#[cfg(not(bnb_stub))]
 pub fn dequantize_4bit_nf4_fp32(input: &[u8], state: &QuantState) -> Result<Vec<f32>> {
     if !state.is_4bit || state.quant_type != Some(QuantType::Nf4) {
         return Err(BnbError::InvalidInput(
@@ -352,7 +343,6 @@ pub fn dequantize_4bit_nf4_fp32(input: &[u8], state: &QuantState) -> Result<Vec<
 ///
 /// # Returns
 /// Tuple of (quantized data, quantization state)
-#[cfg(not(bnb_stub))]
 pub fn quantize_4bit_fp4_fp32(input: &[f32], blocksize: usize) -> Result<(Vec<u8>, QuantState)> {
     if input.is_empty() {
         return Err(BnbError::InvalidInput("input is empty".to_string()));
@@ -383,7 +373,6 @@ pub fn quantize_4bit_fp4_fp32(input: &[f32], blocksize: usize) -> Result<(Vec<u8
 }
 
 /// Dequantize 4-bit FP4 quantized data back to f32
-#[cfg(not(bnb_stub))]
 pub fn dequantize_4bit_fp4_fp32(input: &[u8], state: &QuantState) -> Result<Vec<f32>> {
     if !state.is_4bit || state.quant_type != Some(QuantType::Fp4) {
         return Err(BnbError::InvalidInput(
@@ -413,7 +402,6 @@ pub fn dequantize_4bit_fp4_fp32(input: &[u8], state: &QuantState) -> Result<Vec<
 }
 
 /// Generic 4-bit quantization function that dispatches to NF4 or FP4
-#[cfg(not(bnb_stub))]
 pub fn quantize_4bit_fp32(
     input: &[f32],
     blocksize: usize,
@@ -426,7 +414,6 @@ pub fn quantize_4bit_fp32(
 }
 
 /// Generic 4-bit dequantization function that dispatches based on state
-#[cfg(not(bnb_stub))]
 pub fn dequantize_4bit_fp32(input: &[u8], state: &QuantState) -> Result<Vec<f32>> {
     match state.quant_type {
         Some(QuantType::Nf4) => dequantize_4bit_nf4_fp32(input, state),
@@ -442,7 +429,6 @@ pub fn dequantize_4bit_fp32(input: &[u8], state: &QuantState) -> Result<Vec<f32>
 // ============================================================================
 
 /// Quantize f32 data using 8-bit blockwise quantization (CPU implementation)
-#[cfg(not(bnb_stub))]
 pub fn quantize_blockwise_cpu_fp32(input: &[f32], blocksize: usize) -> Result<(Vec<u8>, QuantState)> {
     if input.is_empty() {
         return Err(BnbError::InvalidInput("input is empty".to_string()));
@@ -470,7 +456,6 @@ pub fn quantize_blockwise_cpu_fp32(input: &[f32], blocksize: usize) -> Result<(V
 }
 
 /// Dequantize 8-bit blockwise quantized data back to f32 (CPU implementation)
-#[cfg(not(bnb_stub))]
 pub fn dequantize_blockwise_cpu_fp32(input: &[u8], state: &QuantState) -> Result<Vec<f32>> {
     if state.is_4bit {
         return Err(BnbError::InvalidInput(
@@ -499,78 +484,8 @@ pub fn dequantize_blockwise_cpu_fp32(input: &[u8], state: &QuantState) -> Result
 }
 
 // ============================================================================
-// Stub implementations (when library not found)
-// ============================================================================
-
-#[cfg(bnb_stub)]
-pub fn quantize_blockwise_fp32(_input: &[f32], _blocksize: usize) -> Result<(Vec<u8>, QuantState)> {
-    Err(BnbError::LibraryNotFound)
-}
-
-#[cfg(bnb_stub)]
-pub fn dequantize_blockwise_fp32(_input: &[u8], _state: &QuantState) -> Result<Vec<f32>> {
-    Err(BnbError::LibraryNotFound)
-}
-
-#[cfg(bnb_stub)]
-pub fn quantize_4bit_nf4_fp32(_input: &[f32], _blocksize: usize) -> Result<(Vec<u8>, QuantState)> {
-    Err(BnbError::LibraryNotFound)
-}
-
-#[cfg(bnb_stub)]
-pub fn dequantize_4bit_nf4_fp32(_input: &[u8], _state: &QuantState) -> Result<Vec<f32>> {
-    Err(BnbError::LibraryNotFound)
-}
-
-#[cfg(bnb_stub)]
-pub fn quantize_4bit_fp4_fp32(_input: &[f32], _blocksize: usize) -> Result<(Vec<u8>, QuantState)> {
-    Err(BnbError::LibraryNotFound)
-}
-
-#[cfg(bnb_stub)]
-pub fn dequantize_4bit_fp4_fp32(_input: &[u8], _state: &QuantState) -> Result<Vec<f32>> {
-    Err(BnbError::LibraryNotFound)
-}
-
-#[cfg(bnb_stub)]
-pub fn quantize_4bit_fp32(
-    _input: &[f32],
-    _blocksize: usize,
-    _quant_type: QuantType,
-) -> Result<(Vec<u8>, QuantState)> {
-    Err(BnbError::LibraryNotFound)
-}
-
-#[cfg(bnb_stub)]
-pub fn dequantize_4bit_fp32(_input: &[u8], _state: &QuantState) -> Result<Vec<f32>> {
-    Err(BnbError::LibraryNotFound)
-}
-
-#[cfg(bnb_stub)]
-pub fn quantize_blockwise_cpu_fp32(_input: &[f32], _blocksize: usize) -> Result<(Vec<u8>, QuantState)> {
-    Err(BnbError::LibraryNotFound)
-}
-
-#[cfg(bnb_stub)]
-pub fn dequantize_blockwise_cpu_fp32(_input: &[u8], _state: &QuantState) -> Result<Vec<f32>> {
-    Err(BnbError::LibraryNotFound)
-}
-
-// ============================================================================
 // Utility Functions
 // ============================================================================
-
-/// Check if bitsandbytes library is available
-pub fn is_available() -> bool {
-    #[cfg(bnb_stub)]
-    {
-        false
-    }
-    #[cfg(not(bnb_stub))]
-    {
-        true
-    }
-}
 
 /// Get the current backend type
 #[allow(unreachable_code)]
@@ -581,9 +496,7 @@ pub fn get_backend() -> &'static str {
     return "hip";
     #[cfg(bnb_cpu)]
     return "cpu";
-    #[cfg(bnb_stub)]
-    return "stub";
-    #[cfg(not(any(bnb_cuda, bnb_hip, bnb_cpu, bnb_stub)))]
+    #[cfg(not(any(bnb_cuda, bnb_hip, bnb_cpu)))]
     return "unknown";
 }
 
@@ -621,13 +534,6 @@ mod tests {
         let backend = get_backend();
         println!("Detected backend: {}", backend);
         // Should be one of the valid backends
-        assert!(["cuda", "hip", "cpu", "stub", "unknown"].contains(&backend));
-    }
-
-    #[test]
-    fn test_is_available() {
-        let available = is_available();
-        println!("bitsandbytes available: {}", available);
-        // Just check it doesn't panic
+        assert!(["cuda", "hip", "cpu", "unknown"].contains(&backend));
     }
 }
