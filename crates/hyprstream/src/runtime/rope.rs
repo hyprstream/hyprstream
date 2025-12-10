@@ -165,14 +165,13 @@ impl RoPE {
         }
 
         // Get sin/cos embeddings
-        // CRITICAL FIX: When using position_ids, we need to ensure the cache is large enough
-        // to contain the MAX position, not just seq_len tokens
-        let required_len = if let Some(pos_ids) = position_ids {
-            // Find the maximum position ID to ensure cache is large enough
-            let max_pos = pos_ids.max().int64_value(&[]) + 1; // +1 because positions are 0-indexed
-            let final_len = max_pos.max(seq_len);
-            tracing::debug!("🔵 RoPE cache sizing: seq_len={}, max_pos={}, required_len={}", seq_len, max_pos, final_len);
-            final_len
+        // Cache is pre-sized to max_seq_len during init, so we use that as the upper bound.
+        // This avoids GPU sync to extract max position from position_ids tensor.
+        // ASSUMPTION: position_ids never exceed max_seq_len (enforced by KV cache bounds).
+        // If this assumption is violated, index_select will fail at runtime.
+        let required_len = if position_ids.is_some() {
+            // Use pre-configured max_seq_len - positions are bounded by KV cache
+            self.max_seq_len.max(seq_len)
         } else {
             seq_len
         };

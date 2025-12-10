@@ -2,35 +2,395 @@
 //!
 //! This module implements KV caching to avoid recomputing past key and value
 //! states during inference, providing 10-50x speedup for long sequences.
+//!
+//! ## Memory Optimization
+//!
+//! The cache uses a chunked growth strategy instead of pre-allocating the full
+//! max_seq_len. This saves ~4GB+ VRAM for models with large context windows.
+//!
+//! ## Quantization Support
+//!
+//! Supports optional quantization via bitsandbytes:
+//! - `None`: Full precision (FP16/BF16) - default
+//! - `Int8`: 8-bit quantization
+//! - `Nf4`: 4-bit NormalFloat (best quality for 4-bit)
+//! - `Fp4`: 4-bit FloatingPoint
+//!
+//! Quantization uses a hybrid approach:
+//! - Historical tokens are stored quantized (memory savings)
+//! - Recent tokens stay in a full-precision buffer (fast updates)
+//! - Dequantized view is cached across layers (avoids repeated dequantization)
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
-use tch::{Kind as DType, Tensor};
+use tch::{Device, Kind as DType, Tensor};
 
-use super::torch_utils::{safe_zeros, estimate_tensor_size_mb};
+use super::kv_quant::KVQuantType;
+use super::torch_utils::{estimate_tensor_size_mb, safe_zeros};
+
+/// Default chunk size for KV cache growth (in tokens)
+const DEFAULT_CHUNK_SIZE: usize = 1024;
+
+/// Default blocksize for bitsandbytes quantization
+#[cfg(feature = "bnb")]
+const QUANT_BLOCKSIZE: usize = 64;
+
+/// Number of tokens to accumulate before flushing to quantized storage
+#[cfg(feature = "bnb")]
+const BUFFER_FLUSH_THRESHOLD: usize = 64;
+
+/// Get byte size per element for a dtype
+fn dtype_element_size(dtype: DType) -> usize {
+    match dtype {
+        DType::Half | DType::BFloat16 => 2,
+        _ => 4, // Float, Double, Int, etc.
+    }
+}
+
+/// Quantized tensor storage - stores a contiguous quantized tensor
+#[cfg(feature = "bnb")]
+#[derive(Debug)]
+struct QuantizedTensor {
+    /// Quantized data bytes
+    data: Vec<u8>,
+    /// Quantization state (codebook, absmax, etc.)
+    state: bitsandbytes_sys::QuantState,
+    /// Original tensor shape for reconstruction
+    shape: Vec<i64>,
+    /// Original dtype for reconstruction
+    dtype: DType,
+    /// Target device for reconstruction
+    device: Device,
+}
+
+#[cfg(feature = "bnb")]
+impl QuantizedTensor {
+    /// Quantize a tensor using the specified quantization type
+    fn from_tensor(tensor: &Tensor, quant_type: KVQuantType) -> Result<Self> {
+        let shape = tensor.size();
+        let dtype = tensor.kind();
+        let device = tensor.device();
+
+        // Move to CPU and convert to f32 for quantization
+        let cpu_tensor = tensor
+            .to_device(Device::Cpu)
+            .to_kind(DType::Float)
+            .contiguous();
+        let numel = cpu_tensor.numel();
+
+        // Extract f32 data from tensor
+        let mut f32_data = vec![0.0f32; numel];
+        cpu_tensor
+            .f_copy_data(&mut f32_data, numel)
+            .map_err(|e| anyhow!("Failed to copy tensor data: {:?}", e))?;
+
+        // Quantize based on type
+        let (data, state) = match quant_type {
+            KVQuantType::Int8 => bitsandbytes_sys::quantize_blockwise_fp32(&f32_data, QUANT_BLOCKSIZE)
+                .map_err(|e| anyhow!("Int8 quantization failed: {:?}", e))?,
+            KVQuantType::Nf4 => bitsandbytes_sys::quantize_4bit_nf4_fp32(&f32_data, QUANT_BLOCKSIZE)
+                .map_err(|e| anyhow!("NF4 quantization failed: {:?}", e))?,
+            KVQuantType::Fp4 => bitsandbytes_sys::quantize_4bit_fp4_fp32(&f32_data, QUANT_BLOCKSIZE)
+                .map_err(|e| anyhow!("FP4 quantization failed: {:?}", e))?,
+            KVQuantType::None => {
+                return Err(anyhow!(
+                    "Cannot create QuantizedTensor with KVQuantType::None"
+                ));
+            }
+        };
+
+        tracing::trace!(
+            "Quantized tensor: {} elements, shape {:?} -> {} bytes ({:.1}% of f32)",
+            numel,
+            shape,
+            data.len(),
+            (data.len() as f64 / (numel * 4) as f64) * 100.0
+        );
+
+        Ok(Self {
+            data,
+            state,
+            shape,
+            dtype,
+            device,
+        })
+    }
+
+    /// Dequantize back to a tensor
+    fn to_tensor(&self) -> Result<Tensor> {
+        // Dequantize based on quantization type
+        let f32_data = if self.state.is_4bit {
+            match self.state.quant_type {
+                Some(bitsandbytes_sys::QuantType::Nf4) => {
+                    bitsandbytes_sys::dequantize_4bit_nf4_fp32(&self.data, &self.state)
+                        .map_err(|e| anyhow!("NF4 dequantization failed: {:?}", e))?
+                }
+                Some(bitsandbytes_sys::QuantType::Fp4) => {
+                    bitsandbytes_sys::dequantize_4bit_fp4_fp32(&self.data, &self.state)
+                        .map_err(|e| anyhow!("FP4 dequantization failed: {:?}", e))?
+                }
+                _ => {
+                    return Err(anyhow!("Unknown 4-bit quantization type"));
+                }
+            }
+        } else {
+            bitsandbytes_sys::dequantize_blockwise_fp32(&self.data, &self.state)
+                .map_err(|e| anyhow!("Int8 dequantization failed: {:?}", e))?
+        };
+
+        // Create tensor from f32 data
+        let cpu_tensor = Tensor::from_slice(&f32_data).reshape(&self.shape);
+
+        // Convert to original dtype and move to original device
+        let tensor = cpu_tensor.to_kind(self.dtype).to_device(self.device);
+
+        Ok(tensor)
+    }
+
+    /// Get memory usage in bytes
+    fn memory_usage(&self) -> usize {
+        self.data.len() + self.state.code.len() * 4 + self.state.absmax.len() * 4
+    }
+}
+
+/// Storage for KV cache - either full precision tensors or quantized
+#[derive(Debug)]
+enum KVStorage {
+    /// Full precision tensor storage
+    FullPrecision {
+        keys: Option<Tensor>,
+        values: Option<Tensor>,
+    },
+    /// Quantized storage with buffer for recent tokens (requires `bnb` feature)
+    #[cfg(feature = "bnb")]
+    Quantized {
+        /// Quantized historical keys (contiguous)
+        keys_quantized: Option<QuantizedTensor>,
+        /// Quantized historical values (contiguous)
+        values_quantized: Option<QuantizedTensor>,
+        /// Number of tokens in quantized storage
+        quantized_len: usize,
+
+        /// Buffer for recent tokens (full precision) - not yet quantized
+        keys_buffer: Option<Tensor>,
+        /// Buffer for recent values (full precision)
+        values_buffer: Option<Tensor>,
+        /// Number of tokens in buffer
+        buffer_len: usize,
+
+        /// Cached dequantized view (valid for current forward pass)
+        /// This avoids re-dequantizing for each layer
+        dequant_keys: Option<Tensor>,
+        dequant_values: Option<Tensor>,
+        /// Position up to which dequant cache is valid
+        dequant_valid_len: usize,
+
+        /// Quantization type
+        quant_type: KVQuantType,
+        /// Template info for tensor creation
+        dtype: Option<DType>,
+        device: Option<Device>,
+    },
+}
 
 /// KV cache for a single attention layer
 #[derive(Debug)]
 pub struct LayerKVCache {
-    /// Cached keys with shape [batch, max_seq_len, num_heads, head_dim]
-    pub keys: Option<Tensor>,
-    /// Cached values with shape [batch, max_seq_len, num_heads, head_dim]  
-    pub values: Option<Tensor>,
+    /// Storage for keys and values
+    storage: KVStorage,
     /// Current sequence position (number of cached tokens)
     pub seq_pos: usize,
     /// Maximum sequence length
     pub max_seq_len: usize,
+    /// Currently allocated capacity (grows in chunks up to max_seq_len)
+    allocated_capacity: usize,
+    /// Quantization type
+    quant_type: KVQuantType,
 }
 
 impl LayerKVCache {
     /// Create a new layer KV cache
-    pub fn new(max_seq_len: usize) -> Self {
+    #[cfg(feature = "bnb")]
+    pub fn new(max_seq_len: usize, quant_type: KVQuantType) -> Self {
+        let storage = match quant_type {
+            KVQuantType::None => KVStorage::FullPrecision {
+                keys: None,
+                values: None,
+            },
+            _ => KVStorage::Quantized {
+                keys_quantized: None,
+                values_quantized: None,
+                quantized_len: 0,
+                keys_buffer: None,
+                values_buffer: None,
+                buffer_len: 0,
+                dequant_keys: None,
+                dequant_values: None,
+                dequant_valid_len: 0,
+                quant_type,
+                dtype: None,
+                device: None,
+            },
+        };
+
         Self {
-            keys: None,
-            values: None,
+            storage,
             seq_pos: 0,
             max_seq_len,
+            allocated_capacity: 0,
+            quant_type,
         }
+    }
+
+    /// Create a new layer KV cache (without bnb feature - quantization disabled)
+    #[cfg(not(feature = "bnb"))]
+    pub fn new(max_seq_len: usize, quant_type: KVQuantType) -> Self {
+        if quant_type != KVQuantType::None {
+            tracing::warn!(
+                "KV cache quantization requested ({:?}) but 'bnb' feature not enabled. Falling back to full precision.",
+                quant_type
+            );
+        }
+
+        Self {
+            storage: KVStorage::FullPrecision {
+                keys: None,
+                values: None,
+            },
+            seq_pos: 0,
+            max_seq_len,
+            allocated_capacity: 0,
+            quant_type: KVQuantType::None,
+        }
+    }
+
+    /// Ensure cache has capacity for required_len tokens (full precision only)
+    fn ensure_capacity_fp(&mut self, required_len: usize, template: &Tensor) -> Result<()> {
+        if required_len <= self.allocated_capacity {
+            return Ok(());
+        }
+
+        // Round up to chunk boundary
+        let new_capacity =
+            ((required_len + DEFAULT_CHUNK_SIZE - 1) / DEFAULT_CHUNK_SIZE) * DEFAULT_CHUNK_SIZE;
+        let new_capacity = new_capacity.min(self.max_seq_len);
+
+        let shape = template.size();
+        if shape.len() != 4 {
+            return Err(anyhow!("Expected 4D tensor, got {:?}", shape));
+        }
+        let (batch_size, num_heads, head_dim) = (shape[0], shape[2], shape[3]);
+
+        let device = template.device();
+        let dtype = template.kind();
+        let new_shape = [batch_size, new_capacity as i64, num_heads, head_dim];
+
+        let cache_size_mb = estimate_tensor_size_mb(&new_shape, dtype);
+        tracing::debug!(
+            "Growing KV cache: {} -> {} tokens ({:.1} MB per tensor)",
+            self.allocated_capacity,
+            new_capacity,
+            cache_size_mb
+        );
+
+        let new_keys = safe_zeros(&new_shape, (dtype, device))?;
+        let new_values = safe_zeros(&new_shape, (dtype, device))?;
+
+        // Copy existing data if any
+        if let KVStorage::FullPrecision {
+            keys: Some(old_keys),
+            values: Some(old_values),
+        } = &self.storage
+        {
+            if self.seq_pos > 0 {
+                new_keys
+                    .narrow(1, 0, self.seq_pos as i64)
+                    .copy_(&old_keys.narrow(1, 0, self.seq_pos as i64));
+                new_values
+                    .narrow(1, 0, self.seq_pos as i64)
+                    .copy_(&old_values.narrow(1, 0, self.seq_pos as i64));
+            }
+        }
+
+        self.storage = KVStorage::FullPrecision {
+            keys: Some(new_keys),
+            values: Some(new_values),
+        };
+        self.allocated_capacity = new_capacity;
+
+        Ok(())
+    }
+
+    /// Flush buffer to quantized storage
+    #[cfg(feature = "bnb")]
+    fn flush_buffer(&mut self) -> Result<()> {
+        if let KVStorage::Quantized {
+            keys_quantized,
+            values_quantized,
+            quantized_len,
+            keys_buffer,
+            values_buffer,
+            buffer_len,
+            dequant_keys,
+            dequant_values,
+            dequant_valid_len,
+            quant_type,
+            ..
+        } = &mut self.storage
+        {
+            if *buffer_len == 0 {
+                return Ok(());
+            }
+
+            let kb = keys_buffer
+                .as_ref()
+                .ok_or_else(|| anyhow!("Buffer keys missing"))?;
+            let vb = values_buffer
+                .as_ref()
+                .ok_or_else(|| anyhow!("Buffer values missing"))?;
+
+            // Get just the valid portion of the buffer
+            let keys_to_quantize = kb.narrow(1, 0, *buffer_len as i64);
+            let values_to_quantize = vb.narrow(1, 0, *buffer_len as i64);
+
+            if keys_quantized.is_some() {
+                // Merge: dequantize existing + concat buffer + requantize
+                let existing_keys = keys_quantized.as_ref().unwrap().to_tensor()?;
+                let existing_values = values_quantized.as_ref().unwrap().to_tensor()?;
+
+                let merged_keys = Tensor::cat(&[existing_keys, keys_to_quantize], 1);
+                let merged_values = Tensor::cat(&[existing_values, values_to_quantize], 1);
+
+                *keys_quantized = Some(QuantizedTensor::from_tensor(&merged_keys, *quant_type)?);
+                *values_quantized =
+                    Some(QuantizedTensor::from_tensor(&merged_values, *quant_type)?);
+
+                tracing::debug!(
+                    "Flushed buffer: merged {} + {} = {} tokens",
+                    *quantized_len,
+                    *buffer_len,
+                    *quantized_len + *buffer_len
+                );
+            } else {
+                // First flush - just quantize the buffer
+                *keys_quantized =
+                    Some(QuantizedTensor::from_tensor(&keys_to_quantize, *quant_type)?);
+                *values_quantized =
+                    Some(QuantizedTensor::from_tensor(&values_to_quantize, *quant_type)?);
+
+                tracing::debug!("Initial quantization: {} tokens", *buffer_len);
+            }
+
+            *quantized_len += *buffer_len;
+            *buffer_len = 0;
+
+            // Invalidate dequant cache since quantized data changed
+            *dequant_keys = None;
+            *dequant_values = None;
+            *dequant_valid_len = 0;
+        }
+
+        Ok(())
     }
 
     /// Update cache with new keys and values
@@ -40,78 +400,157 @@ impl LayerKVCache {
         new_values: &Tensor,
         start_pos: usize,
     ) -> Result<()> {
-        let (batch_size, seq_len, num_heads, head_dim) = {
-            let k_size = new_keys.size();
-            if k_size.len() != 4 {
-                return Err(anyhow!("Expected 4D tensor for keys, got {:?}", k_size));
-            }
-            (k_size[0], k_size[1] as usize, k_size[2], k_size[3])
-        };
-
-        // Initialize cache if needed
-        if self.keys.is_none() || self.values.is_none() {
-            let device = new_keys.device();
-            let dtype = new_keys.kind();
-
-            // Calculate cache sizes for logging
-            let cache_shape = &[batch_size, self.max_seq_len as i64, num_heads, head_dim];
-            let cache_size_mb = estimate_tensor_size_mb(cache_shape, dtype);
-
-            // Initialize cache tensors with OOM handling
-            let keys_cache = safe_zeros(
-                cache_shape,
-                (dtype, device),
-            ).map_err(|e| {
-                anyhow!(
-                    "GPU OOM allocating KV cache keys: {} | Size: {:.1} MB | max_seq_len: {} | Try: reduce max_position_embeddings in config.json",
-                    e, cache_size_mb * 2.0, self.max_seq_len
-                )
-            })?;
-
-            let values_cache = safe_zeros(
-                cache_shape,
-                (dtype, device),
-            ).map_err(|e| {
-                anyhow!(
-                    "GPU OOM allocating KV cache values (keys succeeded, critically low memory): {} | Size: {:.1} MB | Try: reduce max_position_embeddings",
-                    e, cache_size_mb * 2.0
-                )
-            })?;
-
-            self.keys = Some(keys_cache);
-            self.values = Some(values_cache);
+        let k_size = new_keys.size();
+        if k_size.len() != 4 {
+            return Err(anyhow!("Expected 4D tensor for keys, got {:?}", k_size));
         }
+        let seq_len = k_size[1] as usize;
 
-        // Get mutable references to cache tensors
-        let cached_keys = self
-            .keys
-            .as_mut()
-            .ok_or_else(|| anyhow!("Keys cache not initialized"))?;
-        let cached_values = self
-            .values
-            .as_mut()
-            .ok_or_else(|| anyhow!("Values cache not initialized"))?;
-
-        // Check bounds
-        if start_pos + seq_len > self.max_seq_len {
+        // Check bounds against hard limit
+        let end_pos = start_pos + seq_len;
+        if end_pos > self.max_seq_len {
             return Err(anyhow!(
                 "Cache overflow: trying to cache {} tokens starting at position {}, but max_seq_len is {}",
                 seq_len, start_pos, self.max_seq_len
             ));
         }
 
-        // Update cache using narrow and copy
-        let end_pos = start_pos + seq_len;
+        match &mut self.storage {
+            KVStorage::FullPrecision { .. } => {
+                // Grow cache if needed (chunked allocation)
+                self.ensure_capacity_fp(end_pos, new_keys)?;
 
-        // Update keys: cached_keys[:, start_pos:end_pos] = new_keys
-        cached_keys
-            .narrow(1, start_pos as i64, seq_len as i64)
-            .copy_(new_keys);
+                // Re-borrow after potential reallocation
+                if let KVStorage::FullPrecision {
+                    keys: Some(cached_keys),
+                    values: Some(cached_values),
+                } = &self.storage
+                {
+                    cached_keys
+                        .narrow(1, start_pos as i64, seq_len as i64)
+                        .copy_(new_keys);
+                    cached_values
+                        .narrow(1, start_pos as i64, seq_len as i64)
+                        .copy_(new_values);
+                }
+            }
+            #[cfg(feature = "bnb")]
+            KVStorage::Quantized {
+                keys_quantized,
+                values_quantized,
+                quantized_len,
+                keys_buffer,
+                values_buffer,
+                buffer_len,
+                dequant_keys,
+                dequant_values,
+                dequant_valid_len,
+                dtype,
+                device,
+                ..
+            } => {
+                // Store template info on first update
+                if dtype.is_none() {
+                    *dtype = Some(new_keys.kind());
+                    *device = Some(new_keys.device());
+                }
 
-        // Update values: cached_values[:, start_pos:end_pos] = new_values
-        cached_values
-            .narrow(1, start_pos as i64, seq_len as i64)
-            .copy_(new_values);
+                // Invalidate dequant cache
+                *dequant_keys = None;
+                *dequant_values = None;
+                *dequant_valid_len = 0;
+
+                if start_pos == 0 {
+                    // Fresh prompt - put everything in buffer, will be quantized on flush
+                    *keys_quantized = None;
+                    *values_quantized = None;
+                    *quantized_len = 0;
+
+                    *keys_buffer = Some(new_keys.shallow_clone());
+                    *values_buffer = Some(new_values.shallow_clone());
+                    *buffer_len = seq_len;
+
+                    // Flush immediately if large prompt
+                    if seq_len >= BUFFER_FLUSH_THRESHOLD {
+                        self.flush_buffer()?;
+                    }
+                } else {
+                    // Incremental update - append to buffer
+                    let dt = dtype.ok_or_else(|| anyhow!("dtype not set"))?;
+                    let dev = device.ok_or_else(|| anyhow!("device not set"))?;
+
+                    // Ensure buffer exists and has capacity
+                    let shape = new_keys.size();
+                    let (batch_size, num_heads, head_dim) = (shape[0], shape[2], shape[3]);
+
+                    if keys_buffer.is_none() {
+                        // Create buffer with capacity for threshold + some extra
+                        let buf_capacity = (BUFFER_FLUSH_THRESHOLD + 64) as i64;
+                        *keys_buffer = Some(Tensor::zeros(
+                            [batch_size, buf_capacity, num_heads, head_dim],
+                            (dt, dev),
+                        ));
+                        *values_buffer = Some(Tensor::zeros(
+                            [batch_size, buf_capacity, num_heads, head_dim],
+                            (dt, dev),
+                        ));
+                    }
+
+                    let kb = keys_buffer.as_ref().unwrap();
+
+                    // Check if buffer needs to grow
+                    let buf_capacity = kb.size()[1] as usize;
+                    if *buffer_len + seq_len > buf_capacity {
+                        // Flush current buffer first
+                        self.flush_buffer()?;
+
+                        // Re-borrow after flush
+                        if let KVStorage::Quantized {
+                            keys_buffer,
+                            values_buffer,
+                            buffer_len,
+                            ..
+                        } = &mut self.storage
+                        {
+                            // Create fresh buffer
+                            let buf_capacity = (BUFFER_FLUSH_THRESHOLD + 64) as i64;
+                            *keys_buffer = Some(Tensor::zeros(
+                                [batch_size, buf_capacity, num_heads, head_dim],
+                                (dt, dev),
+                            ));
+                            *values_buffer = Some(Tensor::zeros(
+                                [batch_size, buf_capacity, num_heads, head_dim],
+                                (dt, dev),
+                            ));
+                            *buffer_len = 0;
+                        }
+                    }
+
+                    // Re-borrow for the actual copy
+                    if let KVStorage::Quantized {
+                        keys_buffer: Some(kb),
+                        values_buffer: Some(vb),
+                        buffer_len,
+                        ..
+                    } = &mut self.storage
+                    {
+                        // Copy new data into buffer
+                        kb.narrow(1, *buffer_len as i64, seq_len as i64)
+                            .copy_(new_keys);
+                        vb.narrow(1, *buffer_len as i64, seq_len as i64)
+                            .copy_(new_values);
+                        *buffer_len += seq_len;
+                    }
+
+                    // Check if we should flush
+                    if let KVStorage::Quantized { buffer_len, .. } = &self.storage {
+                        if *buffer_len >= BUFFER_FLUSH_THRESHOLD {
+                            self.flush_buffer()?;
+                        }
+                    }
+                }
+            }
+        }
 
         // Update position
         self.seq_pos = end_pos;
@@ -120,37 +559,222 @@ impl LayerKVCache {
     }
 
     /// Get cached keys and values up to current position
-    pub fn get(&self) -> Result<(Tensor, Tensor)> {
-        let cached_keys = self
-            .keys
-            .as_ref()
-            .ok_or_else(|| anyhow!("Keys cache not initialized"))?;
-        let cached_values = self
-            .values
-            .as_ref()
-            .ok_or_else(|| anyhow!("Values cache not initialized"))?;
-
+    pub fn get(&mut self) -> Result<(Tensor, Tensor)> {
         if self.seq_pos == 0 {
             return Err(anyhow!("Cache is empty"));
         }
 
-        // Return sliced tensors up to current position
-        let keys_slice = cached_keys.narrow(1, 0, self.seq_pos as i64);
-        let values_slice = cached_values.narrow(1, 0, self.seq_pos as i64);
+        match &mut self.storage {
+            KVStorage::FullPrecision {
+                keys: Some(cached_keys),
+                values: Some(cached_values),
+            } => {
+                let keys_slice = cached_keys.narrow(1, 0, self.seq_pos as i64);
+                let values_slice = cached_values.narrow(1, 0, self.seq_pos as i64);
+                Ok((keys_slice, values_slice))
+            }
+            KVStorage::FullPrecision { .. } => Err(anyhow!("Keys/values cache not initialized")),
+            #[cfg(feature = "bnb")]
+            KVStorage::Quantized {
+                keys_quantized,
+                values_quantized,
+                quantized_len,
+                keys_buffer,
+                values_buffer,
+                buffer_len,
+                dequant_keys,
+                dequant_values,
+                dequant_valid_len,
+                ..
+            } => {
+                let total_len = *quantized_len + *buffer_len;
 
-        Ok((keys_slice, values_slice))
+                // Check if we have a valid cached dequantized view
+                if *dequant_valid_len == total_len
+                    && dequant_keys.is_some()
+                    && dequant_values.is_some()
+                {
+                    let dk = dequant_keys.as_ref().unwrap();
+                    let dv = dequant_values.as_ref().unwrap();
+                    return Ok((dk.shallow_clone(), dv.shallow_clone()));
+                }
+
+                // Need to build the full view
+                let mut key_parts: Vec<Tensor> = Vec::new();
+                let mut value_parts: Vec<Tensor> = Vec::new();
+
+                // Part 1: Dequantized historical data
+                if let Some(kq) = keys_quantized {
+                    key_parts.push(kq.to_tensor()?);
+                    value_parts.push(values_quantized.as_ref().unwrap().to_tensor()?);
+                }
+
+                // Part 2: Buffer data
+                if *buffer_len > 0 {
+                    if let Some(kb) = keys_buffer.as_ref() {
+                        key_parts.push(kb.narrow(1, 0, *buffer_len as i64));
+                    }
+                    if let Some(vb) = values_buffer.as_ref() {
+                        value_parts.push(vb.narrow(1, 0, *buffer_len as i64));
+                    }
+                }
+
+                let (keys, values) = if key_parts.is_empty() {
+                    return Err(anyhow!("No data in cache"));
+                } else if key_parts.len() == 1 {
+                    (key_parts.remove(0), value_parts.remove(0))
+                } else {
+                    (
+                        Tensor::cat(&key_parts, 1),
+                        Tensor::cat(&value_parts, 1),
+                    )
+                };
+
+                // Cache the dequantized view
+                let keys_clone = keys.shallow_clone();
+                let values_clone = values.shallow_clone();
+
+                *dequant_keys = Some(keys_clone);
+                *dequant_values = Some(values_clone);
+                *dequant_valid_len = total_len;
+
+                Ok((keys, values))
+            }
+        }
     }
 
     /// Clear the cache
     pub fn clear(&mut self) {
-        self.keys = None;
-        self.values = None;
+        match &mut self.storage {
+            KVStorage::FullPrecision { keys, values } => {
+                *keys = None;
+                *values = None;
+            }
+            #[cfg(feature = "bnb")]
+            KVStorage::Quantized {
+                keys_quantized,
+                values_quantized,
+                quantized_len,
+                keys_buffer,
+                values_buffer,
+                buffer_len,
+                dequant_keys,
+                dequant_values,
+                dequant_valid_len,
+                dtype,
+                device,
+                ..
+            } => {
+                *keys_quantized = None;
+                *values_quantized = None;
+                *quantized_len = 0;
+                *keys_buffer = None;
+                *values_buffer = None;
+                *buffer_len = 0;
+                *dequant_keys = None;
+                *dequant_values = None;
+                *dequant_valid_len = 0;
+                *dtype = None;
+                *device = None;
+            }
+        }
         self.seq_pos = 0;
+        self.allocated_capacity = 0;
     }
 
     /// Check if cache is initialized
     pub fn is_initialized(&self) -> bool {
-        self.keys.is_some() && self.values.is_some()
+        match &self.storage {
+            KVStorage::FullPrecision { keys, values } => keys.is_some() && values.is_some(),
+            #[cfg(feature = "bnb")]
+            KVStorage::Quantized {
+                quantized_len,
+                buffer_len,
+                ..
+            } => *quantized_len > 0 || *buffer_len > 0,
+        }
+    }
+
+    /// Get memory usage in bytes (approximate)
+    pub fn memory_usage(&self) -> usize {
+        match &self.storage {
+            KVStorage::FullPrecision { keys, values } => {
+                let mut total = 0;
+                if let Some(k) = keys {
+                    total += k.numel() * dtype_element_size(k.kind());
+                }
+                if let Some(v) = values {
+                    total += v.numel() * dtype_element_size(v.kind());
+                }
+                total
+            }
+            #[cfg(feature = "bnb")]
+            KVStorage::Quantized {
+                keys_quantized,
+                values_quantized,
+                keys_buffer,
+                values_buffer,
+                buffer_len,
+                ..
+            } => {
+                let mut total = 0;
+
+                // Quantized storage
+                if let Some(kq) = keys_quantized {
+                    total += kq.memory_usage();
+                }
+                if let Some(vq) = values_quantized {
+                    total += vq.memory_usage();
+                }
+
+                // Buffer (only count used portion)
+                if let Some(kb) = keys_buffer {
+                    if *buffer_len > 0 {
+                        let shape = kb.size();
+                        let per_token = shape[0] * shape[2] * shape[3];
+                        total += (*buffer_len as i64 * per_token) as usize
+                            * dtype_element_size(kb.kind());
+                    }
+                }
+                if let Some(vb) = values_buffer {
+                    if *buffer_len > 0 {
+                        let shape = vb.size();
+                        let per_token = shape[0] * shape[2] * shape[3];
+                        total += (*buffer_len as i64 * per_token) as usize
+                            * dtype_element_size(vb.kind());
+                    }
+                }
+
+                // Note: dequant cache is temporary and not counted
+                total
+            }
+        }
+    }
+
+    /// Get the quantization type
+    pub fn quant_type(&self) -> KVQuantType {
+        self.quant_type
+    }
+}
+
+// Backwards compatibility: expose keys/values for code that accesses them directly
+impl LayerKVCache {
+    /// Get keys tensor (only for full precision mode)
+    pub fn keys(&self) -> Option<&Tensor> {
+        match &self.storage {
+            KVStorage::FullPrecision { keys, .. } => keys.as_ref(),
+            #[cfg(feature = "bnb")]
+            KVStorage::Quantized { .. } => None,
+        }
+    }
+
+    /// Get values tensor (only for full precision mode)
+    pub fn values(&self) -> Option<&Tensor> {
+        match &self.storage {
+            KVStorage::FullPrecision { values, .. } => values.as_ref(),
+            #[cfg(feature = "bnb")]
+            KVStorage::Quantized { .. } => None,
+        }
     }
 }
 
@@ -163,20 +787,30 @@ pub struct KVCacheManager {
     max_seq_len: usize,
     /// Whether caching is enabled
     enabled: bool,
+    /// Quantization type
+    quant_type: KVQuantType,
 }
 
 impl KVCacheManager {
     /// Create a new KV cache manager
-    pub fn new(num_layers: usize, max_seq_len: usize) -> Self {
+    pub fn new(num_layers: usize, max_seq_len: usize, quant_type: KVQuantType) -> Self {
+        tracing::info!(
+            "[KVCacheManager::new] Creating cache for {} layers, max_seq_len={}, quant={:?}",
+            num_layers,
+            max_seq_len,
+            quant_type
+        );
+
         let mut layer_caches = HashMap::new();
         for layer_idx in 0..num_layers {
-            layer_caches.insert(layer_idx, LayerKVCache::new(max_seq_len));
+            layer_caches.insert(layer_idx, LayerKVCache::new(max_seq_len, quant_type));
         }
 
         Self {
             layer_caches,
             max_seq_len,
             enabled: true,
+            quant_type,
         }
     }
 
@@ -209,24 +843,12 @@ impl KVCacheManager {
             return 0;
         }
 
-        let mut total = 0;
-        for cache in self.layer_caches.values() {
-            if let (Some(keys), Some(values)) = (&cache.keys, &cache.values) {
-                let element_size = match keys.kind() {
-                    DType::Float => 4,
-                    DType::Half => 2,
-                    DType::BFloat16 => 2,
-                    _ => 4,
-                };
+        self.layer_caches.values().map(|c| c.memory_usage()).sum()
+    }
 
-                let key_elements = keys.size().iter().product::<i64>() as usize;
-                let value_elements = values.size().iter().product::<i64>() as usize;
-
-                total += (key_elements + value_elements) * element_size;
-            }
-        }
-
-        total
+    /// Get the quantization type
+    pub fn quant_type(&self) -> KVQuantType {
+        self.quant_type
     }
 }
 
@@ -235,34 +857,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_layer_kv_cache() -> Result<()> {
-        use tch::Device;
+    fn test_layer_kv_cache_unquantized() -> Result<()> {
         let device = Device::Cpu;
         let dtype = DType::Float;
 
-        // Create cache
-        let mut cache = LayerKVCache::new(100);
+        let mut cache = LayerKVCache::new(100, KVQuantType::None);
 
-        // Create test tensors
         let batch_size = 2;
         let seq_len = 10;
         let num_heads = 8;
         let head_dim = 64;
 
         let keys = Tensor::randn(
-            &[batch_size, seq_len as i64, num_heads, head_dim],
+            [batch_size, seq_len as i64, num_heads, head_dim],
             (dtype, device),
         );
         let values = Tensor::randn(
-            &[batch_size, seq_len as i64, num_heads, head_dim],
+            [batch_size, seq_len as i64, num_heads, head_dim],
             (dtype, device),
         );
 
-        // Update cache
         cache.update(&keys, &values, 0)?;
         assert_eq!(cache.seq_pos, 10);
 
-        // Get cached values
         let (cached_keys, cached_values) = cache.get()?;
         assert_eq!(
             cached_keys.size(),
@@ -277,22 +894,85 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "bnb")]
+    fn test_layer_kv_cache_quantized_int8() -> Result<()> {
+        // Skip if bitsandbytes library is not available (stub mode)
+        if !bitsandbytes_sys::is_available() {
+            eprintln!("Skipping quantized test: bitsandbytes library not available");
+            return Ok(());
+        }
+
+        let device = Device::Cpu;
+        let dtype = DType::Float;
+
+        let mut cache = LayerKVCache::new(1000, KVQuantType::Int8);
+
+        let batch_size: i64 = 1;
+        let seq_len: i64 = 100; // Large enough to trigger flush
+        let num_heads: i64 = 2;
+        let head_dim: i64 = 64;
+
+        let keys = Tensor::randn([batch_size, seq_len, num_heads, head_dim], (dtype, device));
+        let values = Tensor::randn([batch_size, seq_len, num_heads, head_dim], (dtype, device));
+
+        // Initial prompt
+        cache.update(&keys, &values, 0)?;
+        assert_eq!(cache.seq_pos, seq_len as usize);
+
+        // Get should work
+        let (cached_keys, cached_values) = cache.get()?;
+        assert_eq!(
+            cached_keys.size(),
+            vec![batch_size, seq_len, num_heads, head_dim]
+        );
+        assert_eq!(
+            cached_values.size(),
+            vec![batch_size, seq_len, num_heads, head_dim]
+        );
+
+        // Second get should use cache
+        let (cached_keys2, _) = cache.get()?;
+        assert_eq!(cached_keys2.size(), cached_keys.size());
+
+        // Add more tokens
+        let new_keys = Tensor::randn([batch_size, 1, num_heads, head_dim], (dtype, device));
+        let new_values = Tensor::randn([batch_size, 1, num_heads, head_dim], (dtype, device));
+        cache.update(&new_keys, &new_values, seq_len as usize)?;
+
+        let (final_keys, _) = cache.get()?;
+        assert_eq!(
+            final_keys.size(),
+            vec![batch_size, seq_len + 1, num_heads, head_dim]
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_kv_cache_manager() {
         let num_layers = 32;
         let max_seq_len = 2048;
 
-        let mut manager = KVCacheManager::new(num_layers, max_seq_len);
+        let mut manager = KVCacheManager::new(num_layers, max_seq_len, KVQuantType::None);
 
-        // Check all layers are initialized
         for layer_idx in 0..num_layers {
             assert!(manager.get_layer_cache(layer_idx).is_some());
         }
 
-        // Test enable/disable
         manager.set_enabled(false);
         assert!(manager.get_layer_cache(0).is_none());
 
         manager.set_enabled(true);
         assert!(manager.get_layer_cache(0).is_some());
+    }
+
+    #[test]
+    fn test_kv_cache_manager_quantized() {
+        let num_layers = 4;
+        let max_seq_len = 512;
+
+        let manager = KVCacheManager::new(num_layers, max_seq_len, KVQuantType::Nf4);
+
+        assert_eq!(manager.quant_type(), KVQuantType::Nf4);
     }
 }

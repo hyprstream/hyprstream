@@ -63,7 +63,7 @@ impl TensorSampler {
         }
         .to_device(self.device);
 
-        // Debug: Check logits statistics
+        // Validate logits shape (no GPU sync - just checks dimensions)
         if logits.dim() != 1 {
             tracing::warn!(
                 "⚠️ Logits not 1D after squeeze: shape={:?}",
@@ -71,15 +71,8 @@ impl TensorSampler {
             );
         }
 
-        let logits_stats = (
-            logits.min().double_value(&[]),
-            logits.max().double_value(&[]),
-            logits.mean(logits.kind()).double_value(&[]),
-        );
-        tracing::debug!(
-            "Logits stats: min={:.4}, max={:.4}, mean={:.4}, shape={:?}",
-            logits_stats.0, logits_stats.1, logits_stats.2, logits.size()
-        );
+        // NOTE: Debug stats removed to eliminate GPU-CPU sync overhead
+        // Previous code extracted min/max/mean which forced 3 sync points per token
 
         // Step 1: Apply repetition penalty to logits
         let penalized_logits =
@@ -245,14 +238,6 @@ impl TensorSampler {
         // Shift cumsum right by 1 position (first position gets 0)
         let cumsum_size = cumsum.size()[0];
 
-        // Debug shapes before concatenation
-        tracing::debug!(
-            "top_p concatenation: cumsum shape={:?}, probs shape={:?}, sorted_probs shape={:?}",
-            cumsum.size(),
-            probs.size(),
-            sorted_probs.size()
-        );
-
         let cumsum_shifted = Tensor::cat(
             &[
                 Tensor::zeros([1], (sorted_probs.kind(), self.device)),
@@ -285,58 +270,24 @@ impl TensorSampler {
     }
 
     /// Sample from multinomial distribution on GPU
+    /// Optimized to minimize GPU-CPU synchronization
     fn multinomial_sample(&self, probs: &Tensor) -> Result<usize> {
         let vocab_size = probs.size()[0] as usize;
 
-        // Check if probabilities are valid
-        let sum = probs.sum(probs.kind());
-        let sum_scalar = sum.double_value(&[]);
-
-        tracing::debug!(
-            "💰 multinomial_sample: vocab_size={}, prob_sum={}, is_valid={}",
-            vocab_size,
-            sum_scalar,
-            !(sum_scalar <= 0.0 || sum_scalar.is_nan() || sum_scalar.is_infinite())
-        );
-
-        if sum_scalar <= 0.0 || sum_scalar.is_nan() || sum_scalar.is_infinite() {
-            // Fallback: return the most likely token (argmax)
-            let (_, max_idx) = probs.max_dim(0, false);
-            let token_id = max_idx.int64_value(&[]) as usize;
-
-            tracing::warn!(
-                "⚠️ Invalid probability distribution! Using argmax. token_id={}, vocab_size={}",
-                token_id,
-                vocab_size
-            );
-
-            // Ensure it's within bounds
-            if token_id >= vocab_size {
-                return Ok(0); // Return first token as ultimate fallback
-            }
-            return Ok(token_id);
-        }
-
         // Use PyTorch's multinomial sampling (GPU accelerated)
+        // This is the primary path - avoid validation overhead in hot path
         let sample = probs.multinomial(1, false); // Sample 1 token
-        let token_id = sample.int64_value(&[0]) as usize;
-
-        tracing::debug!(
-            "✅ multinomial_sample DONE: token_id={}, vocab_size={}, in_bounds={}",
-            token_id,
-            vocab_size,
-            token_id < vocab_size
-        );
+        let token_id = sample.int64_value(&[0]) as usize; // Single GPU sync point
 
         // Validate the sampled token is within vocabulary bounds
         if token_id >= vocab_size {
+            // Rare error path - only log and do extra work here
             tracing::error!(
-                "🔴 OUT OF BOUNDS! token_id={} >= vocab_size={}. This corrupts generation!",
+                "OUT OF BOUNDS! token_id={} >= vocab_size={}",
                 token_id,
                 vocab_size
             );
-            // This shouldn't happen with valid probabilities, but if it does,
-            // fall back to argmax
+            // Fall back to argmax
             let (_, max_idx) = probs.max_dim(0, false);
             let safe_token_id = max_idx.int64_value(&[]) as usize;
             if safe_token_id < vocab_size {
