@@ -10,7 +10,6 @@ use tch::{Device, Kind as DType, Tensor};
 use tracing::{info, instrument};
 
 use super::architectures::{gemma::GemmaModel, llama::LlamaModel, ModelOperations};
-use super::kv_quant::KVQuantType;
 use super::model_config::{ModelArchitecture, ModelConfig};
 use super::torch_utils::{safe_to_device, estimate_tensor_size_mb};
 #[cfg(feature = "xet")]
@@ -76,16 +75,8 @@ impl ModelFactory {
         model_path: &Path,
         device: &Device,
         dtype: DType,
-        max_context: Option<usize>,
-        kv_quant_type: KVQuantType,
     ) -> Result<Box<dyn ModelOperations>> {
         info!("Loading model: {}", model_path.display());
-        if let Some(mc) = max_context {
-            info!("Using max_context override: {} tokens", mc);
-        }
-        if kv_quant_type != KVQuantType::None {
-            info!("Using KV cache quantization: {:?}", kv_quant_type);
-        }
 
         // Check if we have sharded files that need incremental loading
         let shard_files = Self::find_shard_files(model_path)?;
@@ -96,12 +87,12 @@ impl ModelFactory {
                 "📦 Using incremental loading for {} shards",
                 shard_files.len()
             );
-            Self::create_incremental(model_path, device, dtype, shard_files, max_context, kv_quant_type).await
+            Self::create_incremental(model_path, device, dtype, shard_files).await
         } else {
             // Standard loading for single files or small models
             let weights = Self::load_weights(model_path, device, dtype).await?;
             let config = ModelConfig::load(model_path, &weights)?;
-            let model = Self::create_model_from_config(config, weights, device, dtype, max_context, kv_quant_type)?;
+            let model = Self::create_model_from_config(config, weights, device, dtype)?;
             info!("✅ ModelFactory: Model created successfully");
             Ok(model)
         }
@@ -139,8 +130,6 @@ impl ModelFactory {
         device: &Device,
         dtype: DType,
         shard_files: Vec<std::path::PathBuf>,
-        max_context: Option<usize>,
-        kv_quant_type: KVQuantType,
     ) -> Result<Box<dyn ModelOperations>> {
         // For now, we still need to load all weights, but we do it more efficiently
         // by processing shards sequentially and immediately transferring to GPU
@@ -163,7 +152,7 @@ impl ModelFactory {
 
         // Load config and create model
         let config = ModelConfig::load(model_path, &all_weights)?;
-        let model = Self::create_model_from_config(config, all_weights, device, dtype, max_context, kv_quant_type)?;
+        let model = Self::create_model_from_config(config, all_weights, device, dtype)?;
 
         info!("Model loaded");
         Ok(model)
@@ -496,30 +485,28 @@ impl ModelFactory {
         weights: HashMap<String, Tensor>,
         device: &Device,
         dtype: DType,
-        max_context: Option<usize>,
-        kv_quant_type: KVQuantType,
     ) -> Result<Box<dyn ModelOperations>> {
         match config.architecture {
             ModelArchitecture::Llama => {
                 info!("Creating Llama model");
-                Self::create_llama_model(config, weights, device, dtype, max_context, kv_quant_type)
+                Self::create_llama_model(config, weights, device, dtype)
             }
             ModelArchitecture::Qwen => {
                 info!("Creating Qwen model");
-                Self::create_qwen_model(config, weights, device, dtype, max_context, kv_quant_type)
+                Self::create_qwen_model(config, weights, device, dtype)
             }
             ModelArchitecture::Gemma => {
                 info!("Creating Gemma model");
-                Self::create_gemma_model(config, weights, device, dtype, max_context, kv_quant_type)
+                Self::create_gemma_model(config, weights, device, dtype)
             }
             ModelArchitecture::Mistral => {
                 info!("Creating Mistral model");
                 // For now, Mistral uses Llama architecture
-                Self::create_llama_model(config, weights, device, dtype, max_context, kv_quant_type)
+                Self::create_llama_model(config, weights, device, dtype)
             }
             ModelArchitecture::Janus => {
                 info!("Creating Janus multimodal model");
-                Self::create_janus_model(config, weights, device, dtype, max_context, kv_quant_type)
+                Self::create_janus_model(config, weights, device, dtype)
             }
             ModelArchitecture::Unknown(arch) => Err(anyhow!("Unknown architecture: {}", arch)),
         }
@@ -527,19 +514,11 @@ impl ModelFactory {
 
     fn create_llama_model(
         config: ModelConfig,
-        mut weights: HashMap<String, Tensor>,
+        weights: HashMap<String, Tensor>,
         device: &Device,
         dtype: DType,
-        max_context: Option<usize>,
-        kv_quant_type: KVQuantType,
     ) -> Result<Box<dyn ModelOperations>> {
         use super::architectures::llama::LlamaConfig;
-
-        // Apply max_context override if specified
-        let effective_max_pos = max_context.unwrap_or(config.max_position_embeddings);
-        if max_context.is_some() {
-            info!("Overriding max_position_embeddings: {} -> {}", config.max_position_embeddings, effective_max_pos);
-        }
 
         // Convert unified config to LlamaConfig
         let llama_config = LlamaConfig {
@@ -549,7 +528,7 @@ impl ModelFactory {
             hidden_size: config.hidden_size,
             head_dim: config.head_dim,
             intermediate_size: config.intermediate_size,
-            max_position_embeddings: effective_max_pos,
+            max_position_embeddings: config.max_position_embeddings,
             rms_norm_eps: config.rms_norm_eps,
             vocab_size: config.vocab_size,
             original_vocab_size: config.vocab_size,  // Will be updated if padding is applied
@@ -564,18 +543,11 @@ impl ModelFactory {
             rope_local_base_freq: None,
         };
 
-        info!(
-            "[create_llama_model] Passing llama_config.max_position_embeddings = {} to from_weights_with_config",
-            llama_config.max_position_embeddings
-        );
-
-        // Pass mutable reference to allow incremental tensor freeing during construction
         let model = LlamaModel::from_weights_with_config(
-            &mut weights,
+            &weights,
             llama_config,
             device,
             dtype,
-            kv_quant_type,
         )?;
 
         Ok(Box::new(model))
@@ -586,14 +558,12 @@ impl ModelFactory {
         weights: HashMap<String, Tensor>,
         device: &Device,
         dtype: DType,
-        max_context: Option<usize>,
-        kv_quant_type: KVQuantType,
     ) -> Result<Box<dyn ModelOperations>> {
         // Qwen uses Llama architecture with specific configuration
         // The key difference is in the config values, not the architecture
         info!("   Using Llama architecture with Qwen configuration");
         info!("   rope_theta: {} (from config)", config.rope_theta);
-        Self::create_llama_model(config, weights, device, dtype, max_context, kv_quant_type)
+        Self::create_llama_model(config, weights, device, dtype)
     }
 
     fn create_gemma_model(
@@ -601,11 +571,8 @@ impl ModelFactory {
         weights: HashMap<String, Tensor>,
         device: &Device,
         dtype: DType,
-        _max_context: Option<usize>,
-        _kv_quant_type: KVQuantType,
     ) -> Result<Box<dyn ModelOperations>> {
         // Gemma has its own implementation
-        // TODO: Pass max_context and kv_quant_type to GemmaModel when it supports them
         Ok(Box::new(GemmaModel::from_weights(&weights, device, dtype)?))
     }
 
@@ -614,16 +581,11 @@ impl ModelFactory {
         weights: HashMap<String, Tensor>,
         device: &Device,
         dtype: DType,
-        max_context: Option<usize>,
-        _kv_quant_type: KVQuantType,
     ) -> Result<Box<dyn ModelOperations>> {
         use super::architectures::janus::{
             JanusModel, JanusConfig, VisionEncoderConfig, ProjectorConfig,
         };
         use super::architectures::VisionEncoderType;
-
-        // Apply max_context override if specified
-        let effective_max_pos = max_context.unwrap_or(config.max_position_embeddings);
 
         // For now, create a simplified Janus config
         // In practice, this would be derived from the model's config.json
@@ -636,7 +598,7 @@ impl ModelFactory {
                 hidden_size: config.hidden_size,
                 head_dim: config.head_dim,
                 intermediate_size: config.intermediate_size,
-                max_position_embeddings: effective_max_pos,
+                max_position_embeddings: config.max_position_embeddings,
                 rms_norm_eps: config.rms_norm_eps,
                 vocab_size: config.vocab_size,
                 original_vocab_size: config.vocab_size,

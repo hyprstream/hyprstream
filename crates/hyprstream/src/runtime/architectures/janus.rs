@@ -744,7 +744,7 @@ impl JanusModel {
 
     /// Load the language model component
     fn load_language_model(
-        mut weights: HashMap<String, Tensor>,
+        weights: HashMap<String, Tensor>,
         _config: &JanusConfig,
         device: Device,
         dtype: DType,
@@ -754,7 +754,7 @@ impl JanusModel {
 
         // Create Llama config from Janus language config
         // This would need proper conversion logic
-        let llama_model = LlamaModel::from_weights(&mut weights, &device, dtype)?;
+        let llama_model = LlamaModel::from_weights(&weights, &device, dtype)?;
 
         Ok(Box::new(llama_model))
     }

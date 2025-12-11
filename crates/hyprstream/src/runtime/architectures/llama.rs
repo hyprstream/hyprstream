@@ -866,31 +866,22 @@ impl LlamaModel {
 
     /// Create Llama model from pre-loaded weight tensors
     pub fn from_weights(
-        weights: &mut HashMap<String, Tensor>,
+        weights: &HashMap<String, Tensor>,
         device: &Device,
         dtype: DType,
     ) -> Result<Self> {
         // Parse config from weights if possible, otherwise use defaults
         let config = Self::detect_config_from_weights(weights)?;
-        Self::from_weights_with_config(weights, config, device, dtype, crate::runtime::kv_quant::KVQuantType::None)
+        Self::from_weights_with_config(weights, config, device, dtype)
     }
 
     /// Create Llama model with explicit config (allows Qwen models to override)
-    /// Build model from weights, taking mutable reference to free tensors as they're processed.
-    /// This reduces peak memory by ~50% by removing original weight tensors after transposing.
     pub fn from_weights_with_config(
-        weights: &mut HashMap<String, Tensor>,
+        weights: &HashMap<String, Tensor>,
         mut config: LlamaConfig,
         device: &Device,
         dtype: DType,
-        kv_quant_type: crate::runtime::kv_quant::KVQuantType,
     ) -> Result<Self> {
-        tracing::info!(
-            "[from_weights_with_config] Received config.max_position_embeddings = {}, kv_quant = {:?}",
-            config.max_position_embeddings,
-            kv_quant_type
-        );
-
         // Extract key tensors (with padding for models that need it)
         let embed_tokens = weights
             .get("model.embed_tokens.weight")
@@ -998,8 +989,7 @@ impl LlamaModel {
                 eps: config.rms_norm_eps,
             });
 
-        // Build transformer layers incrementally, freeing weight tensors as we go
-        // This reduces peak memory by ~50% (7.7GB savings for Qwen3-4B)
+        // Build transformer layers
         let mut layers = Vec::new();
         for layer_idx in 0..config.num_hidden_layers {
             if let Some(layer) = Self::build_layer(layer_idx, weights, &config, device)? {
@@ -1009,17 +999,10 @@ impl LlamaModel {
 
         // Initialize KV cache if we have layers
         let kv_cache = if !layers.is_empty() {
-            tracing::info!(
-                "[LlamaModel] Creating KV cache: num_layers={}, max_seq_len={}, quant={:?}",
-                layers.len(),
-                config.max_position_embeddings,
-                kv_quant_type
-            );
             Some(std::sync::Arc::new(std::sync::Mutex::new(
                 crate::runtime::kv_cache::KVCacheManager::new(
                     layers.len(),
                     config.max_position_embeddings,
-                    kv_quant_type,
                 ),
             )))
         } else {
@@ -1166,10 +1149,9 @@ impl LlamaModel {
     }
 
     /// Build a single transformer layer from weights
-    /// Takes mutable reference to remove processed weights, reducing peak memory
     fn build_layer(
         layer_idx: usize,
-        weights: &mut HashMap<String, Tensor>,
+        weights: &HashMap<String, Tensor>,
         config: &LlamaConfig,
         _device: &Device,
     ) -> Result<Option<LlamaLayer>> {
@@ -1187,9 +1169,9 @@ impl LlamaModel {
         let (q_proj, k_proj, v_proj) = if has_separate_qkv {
             // Standard separate Q, K, V projections (Llama/Qwen style)
 
-            // Load Q projection - remove from HashMap to free original tensor after transpose
+            // Load Q projection
             let q_weight = weights
-                .remove(&format!("{}.self_attn.q_proj.weight", prefix))
+                .get(&format!("{}.self_attn.q_proj.weight", prefix))
                 .ok_or_else(|| anyhow!("Missing q_proj weight"))?
                 .transpose(0, 1)
                 .contiguous();
@@ -1201,9 +1183,9 @@ impl LlamaModel {
                 LinearProjection::new(q_weight)
             };
 
-            // Load K projection - remove from HashMap to free original tensor after transpose
+            // Load K projection
             let k_weight = weights
-                .remove(&format!("{}.self_attn.k_proj.weight", prefix))
+                .get(&format!("{}.self_attn.k_proj.weight", prefix))
                 .ok_or_else(|| anyhow!("Missing k_proj weight"))?
                 .transpose(0, 1)
                 .contiguous();
@@ -1215,9 +1197,9 @@ impl LlamaModel {
                 LinearProjection::new(k_weight)
             };
 
-            // Load V projection - remove from HashMap to free original tensor after transpose
+            // Load V projection
             let v_weight = weights
-                .remove(&format!("{}.self_attn.v_proj.weight", prefix))
+                .get(&format!("{}.self_attn.v_proj.weight", prefix))
                 .ok_or_else(|| anyhow!("Missing v_proj weight"))?
                 .transpose(0, 1)
                 .contiguous();
@@ -1232,9 +1214,8 @@ impl LlamaModel {
             (q_proj, k_proj, v_proj)
         } else {
             // Combined QKV projection (some Qwen models use c_attn)
-            // Remove from HashMap to free original tensor after transpose
             let c_attn_weight = weights
-                .remove(&format!("{}.self_attn.c_attn.weight", prefix))
+                .get(&format!("{}.self_attn.c_attn.weight", prefix))
                 .ok_or_else(|| anyhow!("Missing c_attn weight"))?
                 .transpose(0, 1) // Transpose from [out, in] to [in, out]
                 .contiguous();
@@ -1317,10 +1298,9 @@ impl LlamaModel {
         };
 
         // Load output projection (typically no bias, but check anyway)
-        // Remove from HashMap to free original tensor after transpose
         let o_weight = weights
-            .remove(&format!("{}.self_attn.o_proj.weight", prefix))
-            .or_else(|| weights.remove(&format!("{}.self_attn.c_proj.weight", prefix))) // Some models use c_proj for output
+            .get(&format!("{}.self_attn.o_proj.weight", prefix))
+            .or_else(|| weights.get(&format!("{}.self_attn.c_proj.weight", prefix))) // Some models use c_proj for output
             .ok_or_else(|| anyhow!("Missing o_proj/c_proj weight"))?
             .transpose(0, 1) // Transpose from [out, in] to [in, out]
             .contiguous();
@@ -1352,10 +1332,10 @@ impl LlamaModel {
             layer_idx,
         };
 
+        // Build MLP
         // Build MLP with optional biases
-        // Remove from HashMap to free original tensors after transpose
         let gate_weight = weights
-            .remove(&format!("{}.mlp.gate_proj.weight", prefix))
+            .get(&format!("{}.mlp.gate_proj.weight", prefix))
             .ok_or_else(|| anyhow!("Missing gate_proj weight"))?
             .transpose(0, 1) // Transpose from [out, in] to [in, out]
             .contiguous();
@@ -1368,7 +1348,7 @@ impl LlamaModel {
         };
 
         let up_weight = weights
-            .remove(&format!("{}.mlp.up_proj.weight", prefix))
+            .get(&format!("{}.mlp.up_proj.weight", prefix))
             .ok_or_else(|| anyhow!("Missing up_proj weight"))?
             .transpose(0, 1) // Transpose from [out, in] to [in, out]
             .contiguous();
@@ -1381,7 +1361,7 @@ impl LlamaModel {
         };
 
         let down_weight = weights
-            .remove(&format!("{}.mlp.down_proj.weight", prefix))
+            .get(&format!("{}.mlp.down_proj.weight", prefix))
             .ok_or_else(|| anyhow!("Missing down_proj weight"))?
             .transpose(0, 1) // Transpose from [out, in] to [in, out]
             .contiguous();
@@ -1600,6 +1580,7 @@ impl ModelOperations for LlamaModel {
                     .to_kind(embeddings.kind()) // Match embeddings dtype (likely BF16)
                     .to_device(embeddings.device());
                 embeddings = broadcast_mul(&embeddings, &scale_tensor)?;
+                tracing::debug!("Scaled embeddings by sqrt(hidden_size) = {}", scale);
             }
 
             embeddings
@@ -1634,8 +1615,8 @@ impl ModelOperations for LlamaModel {
 
             // Handle KV cache per layer with proper start_pos
             let attn_output = if let Some(cache_ref) = self.kv_cache.as_ref() {
-                let cache_manager = cache_ref.lock().unwrap();  // Lock is immutable since with_layer_cache takes &self
-                if let Some(result) = cache_manager.with_layer_cache(idx, |layer_cache| {
+                let mut cache_manager = cache_ref.lock().unwrap();
+                if let Some(layer_cache) = cache_manager.get_layer_cache(idx) {
                     tracing::trace!(
                         "Layer {}: Using KV cache, cache_pos={}",
                         idx,
@@ -1646,9 +1627,7 @@ impl ModelOperations for LlamaModel {
                         Some(&position_ids),
                         Some(layer_cache),
                         start_pos,
-                    )
-                }) {
-                    result?
+                    )?
                 } else {
                     layer
                         .self_attn
@@ -1742,6 +1721,11 @@ impl ModelOperations for LlamaModel {
                         // 1D tensor [vocab]
                         hidden_states.narrow(0, mask_start, mask_count).copy_(&mask_values);
                     }
+
+                    tracing::debug!(
+                        "Masked {} padded tokens (original vocab: {}, padded vocab: {})",
+                        mask_count, original_vocab_size, padded_vocab_size
+                    );
                 }
             }
         }
@@ -1818,16 +1802,14 @@ impl ModelOperations for LlamaModel {
 
             // Handle KV cache per layer with proper start_pos
             let attn_output = if let Some(cache_ref) = self.kv_cache.as_ref() {
-                let cache_manager = cache_ref.lock().expect("Failed to lock KV cache");
-                if let Some(result) = cache_manager.with_layer_cache(idx, |layer_cache| {
+                let mut cache_manager = cache_ref.lock().expect("Failed to lock KV cache");
+                if let Some(layer_cache) = cache_manager.get_layer_cache(idx) {
                     layer.self_attn.forward(
                         &hidden_states,
                         Some(&position_ids),
                         Some(layer_cache),
                         start_pos,
-                    )
-                }) {
-                    result?
+                    )?
                 } else {
                     layer
                         .self_attn
@@ -1978,7 +1960,7 @@ impl LlamaModel {
     /// Clear KV cache (e.g., for new generation)
     pub fn clear_kv_cache(&self) {
         if let Some(cache_ref) = self.kv_cache.as_ref() {
-            let cache_manager = cache_ref.lock().unwrap();
+            let mut cache_manager = cache_ref.lock().unwrap();
             cache_manager.clear_all();
         }
     }
@@ -1989,5 +1971,95 @@ impl LlamaModel {
             .as_ref()
             .map(|cache_ref| cache_ref.lock().unwrap().memory_usage())
             .unwrap_or(0)
+    }
+}
+
+// Temporarily disabled - needs updating for new Tensor API
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_llama_configs() {
+        let llama2 = LlamaConfig::default();
+        assert_eq!(llama2.version, 2);
+        assert_eq!(llama2.num_attention_heads, 32);
+        assert_eq!(llama2.num_key_value_heads, 32);
+
+        let llama3_8b = LlamaConfig::llama3_8b();
+        assert_eq!(llama3_8b.version, 3);
+        assert_eq!(llama3_8b.num_attention_heads, 32);
+        assert_eq!(llama3_8b.num_key_value_heads, 8); // GQA
+        assert!(llama3_8b.rope_scaling.is_some());
+
+        let llama3_70b = LlamaConfig::llama3_70b();
+        assert_eq!(llama3_70b.version, 3);
+        assert_eq!(llama3_70b.num_attention_heads, 64);
+        assert_eq!(llama3_70b.num_key_value_heads, 8); // GQA
+    }
+
+    #[test]
+    fn test_llama_reshape_for_gqa() {
+        let device = Device::Cpu;
+        let dtype = DType::BFloat16;
+        let config = LlamaConfig::llama3_8b();
+        let model = LlamaModel {
+            config: config.clone(),
+            device: device,
+            dtype, // Use the provided dtype (should be BF16)
+            embed_tokens: None,
+            layers: vec![],
+            norm: None,
+            lm_head: None,
+            kv_cache: None,
+            rope_manager: std::sync::Arc::new(std::sync::Mutex::new(RoPEManager::new())),
+            vs: None,
+        };
+
+        // Test tensor for key/value with shape [2, 10, 1024] (8 * 128)
+        let kv_tensor = Tensor::randn(&[2, 10, 1024], (DType::Float, device));
+
+        // Reshape for key/value (GQA)
+        let reshaped = model.reshape_for_attention(&kv_tensor, true).unwrap();
+        assert_eq!(reshaped.size(), &[2, 10, 8, 128]); // 8 KV heads for Llama 3
+
+        // Test tensor for query with shape [2, 10, 4096] (32 * 128)
+        let q_tensor = Tensor::randn(&[2, 10, 4096], (DType::Float, device));
+
+        // Reshape for query
+        let reshaped = model.reshape_for_attention(&q_tensor, false).unwrap();
+        assert_eq!(reshaped.size(), &[2, 10, 32, 128]); // 32 Q heads
+    }
+
+    #[test]
+    fn test_kv_expansion_for_gqa() {
+        let device = Device::Cpu;
+        let attn = LlamaAttention {
+            q_proj: LinearProjection::new(Tensor::zeros(&[4096, 4096], (DType::Float, device))),
+            k_proj: LinearProjection::new(Tensor::zeros(&[4096, 1024], (DType::Float, device))),
+            v_proj: LinearProjection::new(Tensor::zeros(&[4096, 1024], (DType::Float, device))),
+            o_proj: LinearProjection::new(Tensor::zeros(&[4096, 4096], (DType::Float, device))),
+            num_heads: 32,
+            num_kv_heads: 8,
+            head_dim: 128,
+            rope_theta: 500000.0,
+            rope_scaling: Some(RopeScaling {
+                scaling_type: "linear".to_string(),
+                factor: 8.0,
+            }),
+            q_norm: None,
+            k_norm: None,
+            query_pre_attn_scalar: None,
+            sliding_window: None,
+            layer_type: "global".to_string(),
+            layer_idx: 0,
+        };
+
+        // Create KV tensor with 8 heads
+        let kv = Tensor::randn(&[2, 10, 8, 128], (DType::Float, device));
+
+        // Expand to match 32 query heads (using correct method name with actual_kv_heads parameter)
+        let expanded = attn.expand_kv_for_gqa_with_heads(&kv, 8).unwrap();
+        assert_eq!(expanded.size(), &[2, 10, 32, 128]);
     }
 }

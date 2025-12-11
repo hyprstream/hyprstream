@@ -5,9 +5,10 @@
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::config::GenerationRequest;
@@ -15,8 +16,8 @@ use crate::runtime::RuntimeEngine;
 
 /// Conversation routing for seamless model transitions
 pub struct ConversationRouter {
-    /// Active conversation sessions (lock-free concurrent access)
-    active_conversations: Arc<DashMap<String, ConversationSession>>,
+    /// Active conversation sessions
+    active_conversations: Arc<RwLock<HashMap<String, ConversationSession>>>,
     /// Model pool for hot-swapping
     model_pool: Arc<ModelPool>,
     /// Routing configuration
@@ -97,10 +98,10 @@ pub enum AdaptationTrigger {
 
 /// Model pool for hot-swapping between variants
 pub struct ModelPool {
-    /// Available model instances (lock-free concurrent access)
-    model_instances: Arc<DashMap<String, Arc<dyn RuntimeEngine>>>,
+    /// Available model instances
+    model_instances: Arc<RwLock<HashMap<String, Arc<dyn RuntimeEngine>>>>,
     /// Pre-warming queue for model variants
-    warmup_queue: Arc<parking_lot::Mutex<Vec<ModelVariantSpec>>>,
+    warmup_queue: Arc<RwLock<Vec<ModelVariantSpec>>>,
     /// Pool configuration
     config: PoolConfig,
 }
@@ -161,7 +162,7 @@ impl ConversationRouter {
     /// Create new conversation router
     pub async fn new(model_pool: Arc<ModelPool>, config: RoutingConfig) -> Result<Self> {
         Ok(Self {
-            active_conversations: Arc::new(DashMap::new()),
+            active_conversations: Arc::new(RwLock::new(HashMap::new())),
             model_pool,
             config,
         })
@@ -192,7 +193,8 @@ impl ConversationRouter {
             last_activity: Utc::now(),
         };
 
-        self.active_conversations.insert(session_id.clone(), session);
+        let mut conversations = self.active_conversations.write().await;
+        conversations.insert(session_id.clone(), session);
 
         tracing::info!("Started conversation: {}", session_id);
         Ok(session_id)
@@ -209,7 +211,8 @@ impl ConversationRouter {
         // Get conversation session
         let session_id_copy = session_id.to_string();
         let mut conversation = {
-            self.active_conversations
+            let conversations = self.active_conversations.read().await;
+            conversations
                 .get(&session_id_copy)
                 .ok_or_else(|| anyhow!("Conversation session not found: {}", session_id_copy))?
                 .clone()
@@ -258,7 +261,10 @@ impl ConversationRouter {
         conversation.last_activity = Utc::now();
 
         // Store updated conversation
-        self.active_conversations.insert(session_id.to_string(), conversation.clone());
+        {
+            let mut conversations = self.active_conversations.write().await;
+            conversations.insert(session_id.to_string(), conversation.clone());
+        }
 
         // Accumulate temporal gradients for future adaptation
         self.accumulate_conversation_gradients(&conversation, &turn)
@@ -282,12 +288,13 @@ impl ConversationRouter {
         turn_id: &str,
         quality_score: f32,
     ) -> Result<()> {
-        let mut conversation_ref = self.active_conversations
+        let mut conversations = self.active_conversations.write().await;
+        let conversation = conversations
             .get_mut(session_id)
             .ok_or_else(|| anyhow!("Conversation session not found: {}", session_id))?;
 
         // Find and update the turn with feedback
-        if let Some(turn) = conversation_ref
+        if let Some(turn) = conversation
             .conversation_history
             .iter_mut()
             .find(|t| t.turn_id == turn_id)
@@ -296,7 +303,7 @@ impl ConversationRouter {
         }
 
         // Check if feedback triggers adaptation
-        let recent_feedback: Vec<f32> = conversation_ref
+        let recent_feedback: Vec<f32> = conversation
             .conversation_history
             .iter()
             .rev()
@@ -322,7 +329,7 @@ impl ConversationRouter {
                     timestamp: Utc::now(),
                 };
 
-                conversation_ref.adaptation_history.push(event);
+                conversation.adaptation_history.push(event);
                 tracing::info!(
                     "📊 Feedback-triggered adaptation queued for session: {}",
                     session_id
@@ -344,21 +351,22 @@ impl ConversationRouter {
             return Err(anyhow!("Seamless transitions not enabled"));
         }
 
-        let mut conversation_ref = self.active_conversations
+        let mut conversations = self.active_conversations.write().await;
+        let conversation = conversations
             .get_mut(session_id)
             .ok_or_else(|| anyhow!("Conversation session not found: {}", session_id))?;
 
-        let old_model_id = conversation_ref.current_model_id.clone();
+        let old_model_id = conversation.current_model_id.clone();
 
         // Ensure new model is warmed up in pool
         self.model_pool.ensure_warmed_up(&new_model_id).await?;
 
         // Transfer conversation context
-        self.transfer_conversation_context(&old_model_id, &new_model_id, &conversation_ref)
+        self.transfer_conversation_context(&old_model_id, &new_model_id, conversation)
             .await?;
 
         // Update conversation state
-        conversation_ref.current_model_id = new_model_id.clone();
+        conversation.current_model_id = new_model_id.clone();
 
         // Record transition event
         let event = AdaptationEvent {
@@ -373,7 +381,7 @@ impl ConversationRouter {
             timestamp: Utc::now(),
         };
 
-        conversation_ref.adaptation_history.push(event);
+        conversation.adaptation_history.push(event);
 
         tracing::info!(
             "🔄 Seamless transition: {} -> {} for session: {}",
@@ -681,29 +689,32 @@ impl ModelPool {
         };
 
         Ok(Self {
-            model_instances: Arc::new(DashMap::new()),
-            warmup_queue: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            model_instances: Arc::new(RwLock::new(HashMap::new())),
+            warmup_queue: Arc::new(RwLock::new(Vec::new())),
             config,
         })
     }
 
     /// Get model instance from pool
     pub async fn get_model(&self, model_id: &str) -> Result<Arc<dyn RuntimeEngine>> {
-        self.model_instances
+        let instances = self.model_instances.read().await;
+        instances
             .get(model_id)
-            .map(|entry| entry.clone())
+            .cloned()
             .ok_or_else(|| anyhow!("Model not found in pool: {}", model_id))
     }
 
     /// Ensure model variant is warmed up
     pub async fn ensure_warmed_up(&self, model_id: &str) -> Result<()> {
-        if self.model_instances.contains_key(model_id) {
+        let instances = self.model_instances.read().await;
+        if instances.contains_key(model_id) {
             return Ok(()); // Already warmed up
         }
+        drop(instances);
 
         // Add to warmup queue if not already there
         {
-            let mut queue = self.warmup_queue.lock();
+            let mut queue = self.warmup_queue.write().await;
             if !queue.iter().any(|spec| spec.variant_id == model_id) {
                 let variant_spec = ModelVariantSpec {
                     variant_id: model_id.to_string(),
@@ -742,11 +753,14 @@ impl ModelPool {
         )?);
 
         // Add to pool
-        self.model_instances.insert(variant_id.clone(), engine);
+        {
+            let mut instances = self.model_instances.write().await;
+            instances.insert(variant_id.clone(), engine);
+        }
 
         // Update warmup queue status
         {
-            let mut queue = self.warmup_queue.lock();
+            let mut queue = self.warmup_queue.write().await;
             if let Some(spec) = queue.iter_mut().find(|s| s.variant_id == variant_id) {
                 spec.warmup_status = WarmupStatus::Ready;
             }
@@ -763,9 +777,11 @@ impl ModelPool {
         self.ensure_warmed_up(new_model_id).await?;
 
         // Atomic swap - this is the key for seamless transitions
-        if let Some(entry) = self.model_instances.get(new_model_id) {
-            let new_engine = entry.clone();
-            self.model_instances.insert(old_model_id.to_string(), new_engine);
+        {
+            let mut instances = self.model_instances.write().await;
+            if let Some(new_engine) = instances.get(new_model_id).cloned() {
+                instances.insert(old_model_id.to_string(), new_engine);
+            }
         }
 
         let swap_time = swap_start.elapsed();
@@ -793,17 +809,21 @@ impl ModelPool {
         let _warmup_result = engine.generate(warmup_prompt, 10).await?;
 
         // Add to active pool
-        self.model_instances.insert(model_id.to_string(), engine);
+        {
+            let mut instances = self.model_instances.write().await;
+            instances.insert(model_id.to_string(), engine);
+        }
 
         Ok(())
     }
 
     /// Get pool statistics
     pub async fn get_pool_stats(&self) -> PoolStats {
-        let queue = self.warmup_queue.lock();
+        let instances = self.model_instances.read().await;
+        let queue = self.warmup_queue.read().await;
 
         PoolStats {
-            active_instances: self.model_instances.len(),
+            active_instances: instances.len(),
             queued_variants: queue.len(),
             max_capacity: self.config.max_instances,
         }

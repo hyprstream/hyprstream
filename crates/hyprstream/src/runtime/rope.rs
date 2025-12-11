@@ -165,12 +165,11 @@ impl RoPE {
         }
 
         // Get sin/cos embeddings
-        // Cache is pre-sized to max_seq_len during init, so we use that as the upper bound.
-        // This avoids GPU sync to extract max position from position_ids tensor.
-        // ASSUMPTION: position_ids never exceed max_seq_len (enforced by KV cache bounds).
-        // If this assumption is violated, index_select will fail at runtime.
+        // Cache is pre-sized to max_seq_len during init, so we use that as the upper bound
+        // This avoids GPU sync to extract max position from position_ids tensor
+        // If positions exceed cache, get_embeddings will extend it automatically
         let required_len = if position_ids.is_some() {
-            // Use pre-configured max_seq_len - positions are bounded by KV cache
+            // Use pre-configured max_seq_len - cache handles extension if needed
             self.max_seq_len.max(seq_len)
         } else {
             seq_len
