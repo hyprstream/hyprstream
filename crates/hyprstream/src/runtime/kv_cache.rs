@@ -22,7 +22,7 @@
 //! - Dequantized view is cached across layers (avoids repeated dequantization)
 
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
+use dashmap::DashMap;
 use tch::{Device, Kind as DType, Tensor};
 
 use super::kv_quant::KVQuantType;
@@ -780,8 +780,8 @@ impl LayerKVCache {
 
 /// KV cache manager for all layers in a model
 pub struct KVCacheManager {
-    /// Cache for each layer
-    layer_caches: HashMap<usize, LayerKVCache>,
+    /// Cache for each layer (lock-free concurrent access)
+    layer_caches: DashMap<usize, LayerKVCache>,
     /// Maximum sequence length
     #[allow(dead_code)]
     max_seq_len: usize,
@@ -801,7 +801,7 @@ impl KVCacheManager {
             quant_type
         );
 
-        let mut layer_caches = HashMap::new();
+        let layer_caches = DashMap::new();
         for layer_idx in 0..num_layers {
             layer_caches.insert(layer_idx, LayerKVCache::new(max_seq_len, quant_type));
         }
@@ -814,18 +814,30 @@ impl KVCacheManager {
         }
     }
 
-    /// Get cache for a specific layer
-    pub fn get_layer_cache(&mut self, layer_idx: usize) -> Option<&mut LayerKVCache> {
+    /// Get cache for a specific layer with a closure
+    pub fn with_layer_cache<F, R>(&self, layer_idx: usize, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut LayerKVCache) -> R,
+    {
         if !self.enabled {
             return None;
         }
-        self.layer_caches.get_mut(&layer_idx)
+        self.layer_caches.get_mut(&layer_idx).map(|mut cache_ref| f(&mut cache_ref))
+    }
+
+    /// Check if a layer cache exists (for testing)
+    #[cfg(test)]
+    fn get_layer_cache(&self, layer_idx: usize) -> Option<()> {
+        if !self.enabled {
+            return None;
+        }
+        self.layer_caches.contains_key(&layer_idx).then_some(())
     }
 
     /// Clear all caches
-    pub fn clear_all(&mut self) {
-        for cache in self.layer_caches.values_mut() {
-            cache.clear();
+    pub fn clear_all(&self) {
+        for mut cache_ref in self.layer_caches.iter_mut() {
+            cache_ref.clear();
         }
     }
 
@@ -843,7 +855,7 @@ impl KVCacheManager {
             return 0;
         }
 
-        self.layer_caches.values().map(|c| c.memory_usage()).sum()
+        self.layer_caches.iter().map(|c| c.memory_usage()).sum()
     }
 
     /// Get the quantization type

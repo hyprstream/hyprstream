@@ -55,7 +55,6 @@ pub struct TorchEngine {
     /// Device for computation (CPU/CUDA/ROCm) - immutable after construction
     device: Device,
     /// Runtime configuration - immutable after construction
-    #[allow(dead_code)]
     config: RuntimeConfig,
     /// Generation configuration with defaults
     generation_config: GenerationConfig,
@@ -67,9 +66,6 @@ pub struct TorchEngine {
     lora_model: Arc<Mutex<Option<crate::lora::torch_adapter::LoRAModel>>>,
     /// LoRA trainer for fine-tuning
     lora_trainer: Arc<Mutex<Option<crate::lora::trainer::LoRATrainer>>>,
-    /// Sampling configuration - immutable after construction
-    #[allow(dead_code)]
-    sampling_config: RuntimeConfig,
     /// GPU sampler for efficient token sampling - thread safe after initialization
     sampler: TensorSampler,  // Renamed from gpu_sampler - works on both CPU and GPU
     /// Cached tokenizer vocabulary size for lock-free access
@@ -196,7 +192,6 @@ impl TorchEngine {
             active_lora: Arc::new(Mutex::new(None)),
             lora_model: Arc::new(Mutex::new(None)),
             lora_trainer: Arc::new(Mutex::new(None)),
-            sampling_config: config,
             sampler: TensorSampler::new(device),
             tokenizer_vocab_size: Arc::new(AtomicUsize::new(0)),
         })
