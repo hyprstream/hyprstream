@@ -148,59 +148,77 @@ impl<'a> CloneBuilder<'a> {
         let repo_dir = safe_path::scoped_join(models_dir, &repo_name)
             .map_err(|e| Git2DBError::configuration(format!("Invalid repository name: {}", e)))?;
 
-        // Validate target doesn't exist
-        if repo_dir.exists() {
-            return Err(Git2DBError::configuration(format!(
-                "Target directory already exists: {}",
-                repo_dir.display()
-            )));
+        // Check if already fully registered (idempotent return)
+        if let Some(tracked) = self.registry.get_by_name(&repo_name) {
+            tracing::info!("Repository '{}' already registered with ID {}", repo_name, tracked.id);
+            return Ok(tracked.id.clone());
         }
 
-        // Create directory structure first
-        std::fs::create_dir_all(&repo_dir).map_err(|e| {
-            Git2DBError::repository(&repo_dir, format!("Failed to create repo directory: {}", e))
-        })?;
-
-        // Now we can safely join paths since repo_dir exists
-        // models/{name}/{name}.git/ (bare repo)
+        // Build paths (repo_name is already validated, so simple join is safe)
         let bare_repo_name = format!("{}.git", &repo_name);
-        let bare_repo_path = safe_path::scoped_join(&repo_dir, &bare_repo_name)
-            .map_err(|e| Git2DBError::configuration(format!("Invalid bare repo path: {}", e)))?;
+        let bare_repo_path = repo_dir.join(&bare_repo_name);
+        let worktrees_dir = repo_dir.join("worktrees");
 
-        // models/{name}/worktrees/
-        let worktrees_dir = safe_path::scoped_join(&repo_dir, "worktrees")
-            .map_err(|e| Git2DBError::configuration(format!("Invalid worktrees path: {}", e)))?;
+        // Check for existing bare repo (resume case)
+        let existing_bare_repo = if repo_dir.exists() {
+            match git2::Repository::open_bare(&bare_repo_path) {
+                Ok(repo) => {
+                    tracing::info!("Resuming clone: valid bare repo found at {:?}", bare_repo_path);
+                    Some(repo)
+                }
+                Err(_) => {
+                    // Corrupted/incomplete - cleanup and restart
+                    tracing::warn!("Removing incomplete/corrupted clone at {:?}", repo_dir);
+                    std::fs::remove_dir_all(&repo_dir).map_err(|e| {
+                        Git2DBError::repository(&repo_dir, format!("Failed to cleanup incomplete clone: {}", e))
+                    })?;
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
-        std::fs::create_dir_all(&worktrees_dir).map_err(|e| {
-            Git2DBError::repository(&worktrees_dir, format!("Failed to create worktrees directory: {}", e))
-        })?;
+        // Create directory structure only if fresh clone
+        if existing_bare_repo.is_none() {
+            std::fs::create_dir_all(&repo_dir).map_err(|e| {
+                Git2DBError::repository(&repo_dir, format!("Failed to create repo directory: {}", e))
+            })?;
+            std::fs::create_dir_all(&worktrees_dir).map_err(|e| {
+                Git2DBError::repository(&worktrees_dir, format!("Failed to create worktrees directory: {}", e))
+            })?;
+        }
 
-        // Perform the clone using git2 directly for bare repos
-        tracing::info!("Cloning repository '{}' as bare to {:?}", repo_name, bare_repo_path);
+        // Clone or reuse existing bare repo
+        let bare_repo = if let Some(repo) = existing_bare_repo {
+            repo
+        } else {
+            // Perform the clone using git2 directly for bare repos
+            tracing::info!("Cloning repository '{}' as bare to {:?}", repo_name, bare_repo_path);
 
-        // Clone as bare repository using git2 directly
-        let url_clone = self.url.clone();
-        let bare_path_clone = bare_repo_path.clone();
+            let url_clone = self.url.clone();
+            let bare_path_clone = bare_repo_path.clone();
 
-        let bare_repo = tokio::task::spawn_blocking(move || -> Git2DBResult<git2::Repository> {
-            let mut builder = git2::build::RepoBuilder::new();
+            tokio::task::spawn_blocking(move || -> Git2DBResult<git2::Repository> {
+                let mut builder = git2::build::RepoBuilder::new();
 
-            // Set up bare clone
-            builder.bare(true);
+                // Set up bare clone
+                builder.bare(true);
 
-            // TODO: Add authentication callbacks from GitManager if needed
+                // TODO: Add authentication callbacks from GitManager if needed
 
-            // Perform the clone
-            let repo = builder.clone(&url_clone, &bare_path_clone)
-                .map_err(|e| Git2DBError::repository(
-                    &bare_path_clone,
-                    format!("Failed to clone bare repository: {}", e)
-                ))?;
+                // Perform the clone
+                let repo = builder.clone(&url_clone, &bare_path_clone)
+                    .map_err(|e| Git2DBError::repository(
+                        &bare_path_clone,
+                        format!("Failed to clone bare repository: {}", e)
+                    ))?;
 
-            Ok(repo)
-        })
-        .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))??;
+                Ok(repo)
+            })
+            .await
+            .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))??
+        };
 
         // Add additional remotes to bare repo
         for (remote_name, remote_url) in &self.remotes {
@@ -214,8 +232,7 @@ impl<'a> CloneBuilder<'a> {
         tracing::debug!("Default branch detected: {}", default_branch);
 
         // Create initial worktree for the default branch
-        let initial_worktree = safe_path::scoped_join(&worktrees_dir, &default_branch.to_string())
-            .map_err(|e| Git2DBError::configuration(format!("Invalid worktree path: {}", e)))?;
+        let initial_worktree = worktrees_dir.join(&default_branch);
 
         // Create parent directories if default branch has hierarchy
         if let Some(parent) = initial_worktree.parent() {
@@ -228,8 +245,11 @@ impl<'a> CloneBuilder<'a> {
 
         tracing::info!("Creating default worktree '{}' at {:?}", default_branch, initial_worktree);
 
+        // Get storage driver from registry for worktree creation
+        let driver = self.registry.storage_driver().clone();
+
         // Create worktree from bare repo
-        create_worktree(&bare_repo_path, &initial_worktree, &default_branch).await?;
+        create_worktree(&driver, &bare_repo_path, &initial_worktree, &default_branch).await?;
 
         // If a specific reference was requested and it's different from default, create another worktree
         let checkout_ref = match &self.reference {
@@ -242,8 +262,7 @@ impl<'a> CloneBuilder<'a> {
 
         if checkout_ref != default_branch && !matches!(self.reference, GitRef::DefaultBranch) {
             // Create additional worktree for the requested reference
-            let ref_worktree_path = safe_path::scoped_join(&worktrees_dir, &checkout_ref.to_string())
-                .map_err(|e| Git2DBError::configuration(format!("Invalid worktree path: {}", e)))?;
+            let ref_worktree_path = worktrees_dir.join(&checkout_ref);
 
             // Create parent directories for hierarchical branches
             if let Some(parent) = ref_worktree_path.parent() {
@@ -253,7 +272,7 @@ impl<'a> CloneBuilder<'a> {
             }
 
             tracing::info!("Creating worktree for ref '{}'", checkout_ref);
-            create_worktree(&bare_repo_path, &ref_worktree_path, &checkout_ref).await?;
+            create_worktree(&driver, &bare_repo_path, &ref_worktree_path, &checkout_ref).await?;
         }
 
         // Note: LFS files are automatically fetched by GitManager::create_worktree()
@@ -337,27 +356,84 @@ fn get_default_branch(repo: &git2::Repository) -> Git2DBResult<String> {
     Ok("main".to_string())
 }
 
-/// Create a worktree from a bare repository
-async fn create_worktree(bare_repo_path: &std::path::PathBuf, worktree_path: &std::path::PathBuf, branch: &str) -> Git2DBResult<()> {
-    // We need to register the repository first to use RepositoryHandle
-    let mut registry = crate::Git2DB::open(bare_repo_path.parent().unwrap_or(bare_repo_path)).await?;
-    let repo_id = crate::RepoId::new();
-    registry.register(repo_id.clone())
-        .name(format!("bare-repo-{}", bare_repo_path.display()))
-        .url(format!("file://{}", bare_repo_path.display()))
-        .exec().await?;
-    let handle = registry.repo(&repo_id)?;
+/// Check existing worktree state (sync, to avoid Send issues with git2::Statuses)
+fn check_existing_worktree(worktree_path: &std::path::Path) -> Git2DBResult<Option<bool>> {
+    // Returns: None = no worktree exists, Some(true) = clean worktree, Some(false) = dirty worktree
+    if !worktree_path.join(".git").exists() {
+        return Ok(None);
+    }
 
-    // Use RepositoryHandle for worktree creation
-    handle
-        .create_worktree(worktree_path, branch)
-        .await
-        .map_err(|e| {
-            Git2DBError::repository(
-                worktree_path,
-                format!("Failed to create worktree for branch '{}': {}", branch, e)
-            )
+    match git2::Repository::open(worktree_path) {
+        Ok(repo) => {
+            let statuses = repo.statuses(None).map_err(|e| {
+                Git2DBError::repository(worktree_path, format!("Failed to get worktree status: {}", e))
+            })?;
+            Ok(Some(statuses.is_empty()))
+        }
+        Err(_) => {
+            // Invalid/corrupted worktree - clean it up
+            tracing::warn!("Removing corrupted worktree at {:?}", worktree_path);
+            std::fs::remove_dir_all(worktree_path).map_err(|e| {
+                Git2DBError::repository(worktree_path, format!("Failed to remove corrupted worktree: {}", e))
+            })?;
+            Ok(None)
+        }
+    }
+}
+
+/// Create a worktree from a bare repository using the storage driver
+async fn create_worktree(
+    driver: &std::sync::Arc<dyn crate::storage::Driver>,
+    bare_repo_path: &std::path::Path,
+    worktree_path: &std::path::Path,
+    branch: &str,
+) -> Git2DBResult<()> {
+    // Check if worktree already exists (sync check to avoid Send issues)
+    match check_existing_worktree(worktree_path)? {
+        Some(true) => {
+            // Clean worktree - safe to reuse
+            tracing::info!("Worktree already exists and is clean at {:?}", worktree_path);
+            // Still run LFS fetch (idempotent)
+            crate::repository_handle::RepositoryHandle::fetch_lfs_files(worktree_path).await?;
+            return Ok(());
+        }
+        Some(false) => {
+            // Dirty worktree - don't destroy user's work!
+            tracing::warn!("Worktree at {:?} has uncommitted changes", worktree_path);
+            return Err(Git2DBError::configuration(format!(
+                "Worktree at {} has uncommitted changes. \
+                 Commit or discard changes before retrying clone.",
+                worktree_path.display()
+            )));
+        }
+        None => {
+            // No worktree or was cleaned up - continue to create
+        }
+    }
+
+    // Ensure parent exists
+    if let Some(parent) = worktree_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            Git2DBError::configuration(format!("Failed to create worktree parent directories: {}", e))
         })?;
+    }
+
+    // Use storage driver (proper registry integration)
+    let opts = crate::storage::DriverOpts {
+        base_repo: bare_repo_path.to_path_buf(),
+        worktree_path: worktree_path.to_path_buf(),
+        ref_spec: branch.to_string(),
+    };
+
+    driver.create_worktree(&opts).await.map_err(|e| {
+        Git2DBError::repository(
+            worktree_path,
+            format!("Failed to create worktree for branch '{}': {}", branch, e)
+        )
+    })?;
+
+    // LFS fetch (idempotent)
+    crate::repository_handle::RepositoryHandle::fetch_lfs_files(worktree_path).await?;
 
     tracing::info!("Created worktree at {:?} for branch '{}'", worktree_path, branch);
     Ok(())
