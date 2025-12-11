@@ -114,12 +114,22 @@ impl Default for ModelConfig {
 pub struct RuntimeConfig {
     /// Context window size
     pub context_length: usize,
+    /// Maximum context length override for KV cache allocation.
+    /// None = use model's max_position_embeddings (can be very large, e.g., 40K tokens)
+    /// Some(n) = cap KV cache at n tokens (significantly reduces GPU memory)
+    pub max_context: Option<usize>,
+    /// KV cache quantization type (None, INT8, NF4, FP4).
+    /// Reduces GPU memory by 50-75% at slight quality cost.
+    #[serde(default)]
+    pub kv_quant_type: crate::runtime::kv_quant::KVQuantType,
     /// Batch processing size
     pub batch_size: usize,
     /// CPU threads (None = auto-detect)
     pub cpu_threads: Option<usize>,
     /// Use GPU acceleration
     pub use_gpu: bool,
+    /// GPU device ID (None = auto-detect, typically device 0)
+    pub gpu_device_id: Option<usize>,
     /// GPU layers to offload (None = auto)
     pub gpu_layers: Option<usize>,
     /// Use memory mapping for model files
@@ -137,11 +147,36 @@ pub struct RuntimeConfig {
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
+        // Check environment variables for runtime configuration
+        // Precedence: CLI args > env vars (read here) > hardcoded defaults.
+        // Environment variables set initial defaults; CLI args may override them later.
+        let gpu_device_id = std::env::var("HYPRSTREAM_GPU_DEVICE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok());
+
+        let max_context = std::env::var("HYPRSTREAM_MAX_CONTEXT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok());
+
+        let kv_quant_type = std::env::var("HYPRSTREAM_KV_QUANT")
+            .ok()
+            .and_then(|s| match s.to_lowercase().as_str() {
+                "int8" => Some(crate::runtime::kv_quant::KVQuantType::Int8),
+                "nf4" => Some(crate::runtime::kv_quant::KVQuantType::Nf4),
+                "fp4" => Some(crate::runtime::kv_quant::KVQuantType::Fp4),
+                "none" | "" => Some(crate::runtime::kv_quant::KVQuantType::None),
+                _ => None,
+            })
+            .unwrap_or(crate::runtime::kv_quant::KVQuantType::None);
+
         Self {
             context_length: 4096,
+            max_context,
+            kv_quant_type,
             batch_size: 512,
             cpu_threads: None,
             use_gpu: true,
+            gpu_device_id, // From env or None (auto-detect device 0)
             gpu_layers: None,
             mmap: true,
             kv_cache_size_mb: 2048,

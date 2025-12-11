@@ -1,0 +1,31 @@
+[package]
+name = "bitsandbytes-sys"
+version = "0.1.0"
+edition.workspace = true
+description = "Rust FFI bindings for bitsandbytes quantization library"
+license = "MIT"
+repository.workspace = true
+keywords = ["quantization", "llm", "cuda", "rocm", "ffi"]
+categories = ["external-ffi-bindings", "science"]
+
+[features]
+default = []
+# Backend selection - only one should be enabled
+cuda = []
+hip = []
+cpu = []
+
+# Generate bindings at build time (requires libclang)
+bindgen = ["dep:bindgen"]
+
+# Build bitsandbytes from source (auto-clones from GitHub if needed)
+build-from-source = ["dep:git2"]
+
+[dependencies]
+
+[build-dependencies]
+bindgen = { workspace = true, optional = true }
+pkg-config.workspace = true
+git2 = { version = "0.19", optional = true }
+
+[dev-dependencies]
