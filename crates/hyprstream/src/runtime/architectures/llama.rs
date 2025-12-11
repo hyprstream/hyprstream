@@ -1603,8 +1603,8 @@ impl ModelOperations for LlamaModel {
 
             // Handle KV cache per layer with proper start_pos
             let attn_output = if let Some(cache_ref) = self.kv_cache.as_ref() {
-                let mut cache_manager = cache_ref.lock().unwrap();
-                if let Some(layer_cache) = cache_manager.get_layer_cache(idx) {
+                let cache_manager = cache_ref.lock().unwrap();  // Lock is immutable since with_layer_cache takes &self
+                if let Some(result) = cache_manager.with_layer_cache(idx, |layer_cache| {
                     tracing::trace!(
                         "Layer {}: Using KV cache, cache_pos={}",
                         idx,
@@ -1615,7 +1615,9 @@ impl ModelOperations for LlamaModel {
                         Some(&position_ids),
                         Some(layer_cache),
                         start_pos,
-                    )?
+                    )
+                }) {
+                    result?
                 } else {
                     tracing::debug!("Layer {}: No KV cache available", idx);
                     layer
@@ -1808,7 +1810,7 @@ impl LlamaModel {
     /// Clear KV cache (e.g., for new generation)
     pub fn clear_kv_cache(&self) {
         if let Some(cache_ref) = self.kv_cache.as_ref() {
-            let mut cache_manager = cache_ref.lock().unwrap();
+            let cache_manager = cache_ref.lock().unwrap();
             cache_manager.clear_all();
         }
     }

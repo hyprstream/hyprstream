@@ -4,7 +4,7 @@
 //! states during inference, providing 10-50x speedup for long sequences.
 
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
+use dashmap::DashMap;
 use tch::{Kind as DType, Tensor};
 
 use super::torch_utils::{safe_zeros, estimate_tensor_size_mb};
@@ -156,8 +156,8 @@ impl LayerKVCache {
 
 /// KV cache manager for all layers in a model
 pub struct KVCacheManager {
-    /// Cache for each layer
-    layer_caches: HashMap<usize, LayerKVCache>,
+    /// Cache for each layer (lock-free concurrent access)
+    layer_caches: DashMap<usize, LayerKVCache>,
     /// Maximum sequence length
     #[allow(dead_code)]
     max_seq_len: usize,
@@ -168,7 +168,7 @@ pub struct KVCacheManager {
 impl KVCacheManager {
     /// Create a new KV cache manager
     pub fn new(num_layers: usize, max_seq_len: usize) -> Self {
-        let mut layer_caches = HashMap::new();
+        let layer_caches = DashMap::new();
         for layer_idx in 0..num_layers {
             layer_caches.insert(layer_idx, LayerKVCache::new(max_seq_len));
         }
@@ -180,18 +180,30 @@ impl KVCacheManager {
         }
     }
 
-    /// Get cache for a specific layer
-    pub fn get_layer_cache(&mut self, layer_idx: usize) -> Option<&mut LayerKVCache> {
+    /// Get cache for a specific layer with a closure
+    pub fn with_layer_cache<F, R>(&self, layer_idx: usize, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut LayerKVCache) -> R,
+    {
         if !self.enabled {
             return None;
         }
-        self.layer_caches.get_mut(&layer_idx)
+        self.layer_caches.get_mut(&layer_idx).map(|mut cache_ref| f(&mut cache_ref))
+    }
+
+    /// Check if a layer cache exists (for testing)
+    #[cfg(test)]
+    fn get_layer_cache(&self, layer_idx: usize) -> Option<()> {
+        if !self.enabled {
+            return None;
+        }
+        self.layer_caches.contains_key(&layer_idx).then_some(())
     }
 
     /// Clear all caches
-    pub fn clear_all(&mut self) {
-        for cache in self.layer_caches.values_mut() {
-            cache.clear();
+    pub fn clear_all(&self) {
+        for mut cache_ref in self.layer_caches.iter_mut() {
+            cache_ref.clear();
         }
     }
 
@@ -210,7 +222,8 @@ impl KVCacheManager {
         }
 
         let mut total = 0;
-        for cache in self.layer_caches.values() {
+        for cache_ref in self.layer_caches.iter() {
+            let cache = cache_ref.value();
             if let (Some(keys), Some(values)) = (&cache.keys, &cache.values) {
                 let element_size = match keys.kind() {
                     DType::Float => 4,
