@@ -1810,14 +1810,16 @@ impl ModelOperations for LlamaModel {
 
             // Handle KV cache per layer with proper start_pos
             let attn_output = if let Some(cache_ref) = self.kv_cache.as_ref() {
-                let mut cache_manager = cache_ref.lock().expect("Failed to lock KV cache");
-                if let Some(layer_cache) = cache_manager.get_layer_cache(idx) {
+                let cache_manager = cache_ref.lock().expect("Failed to lock KV cache");
+                if let Some(result) = cache_manager.with_layer_cache(idx, |layer_cache| {
                     layer.self_attn.forward(
                         &hidden_states,
                         Some(&position_ids),
                         Some(layer_cache),
                         start_pos,
-                    )?
+                    )
+                }) {
+                    result?
                 } else {
                     layer
                         .self_attn
