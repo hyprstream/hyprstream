@@ -4,12 +4,14 @@
 
 use crate::branch::BranchManager;
 use crate::errors::{Git2DBError, Git2DBResult};
-use crate::references::{GitRef, IntoGitRef};
+use crate::references::GitRef;
 use crate::registry::{Git2DB, RepoId, TrackedRepository};
 use crate::remote::RemoteManager;
+use crate::storage::{DriverOpts, WorktreeHandle};
 use crate::stage::StageManager;
-use git2::{Oid, Repository, Signature};
+use git2::{Oid, Repository};
 use std::path::{Path, PathBuf};
+use tracing::info;
 
 /// Handle to a tracked repository
 ///
@@ -78,37 +80,6 @@ impl<'a> RepositoryHandle<'a> {
             .map_err(|e| Git2DBError::repository(path, format!("Failed to open repository: {}", e)))
     }
 
-    /// Get repository status
-    pub async fn status(&self) -> Git2DBResult<RepositoryStatus> {
-        let repo = self.open_repo()?;
-
-        let head = repo.head().ok();
-        let branch = head
-            .as_ref()
-            .and_then(|h| h.shorthand())
-            .map(|s| s.to_string());
-        let head_oid = head.as_ref().and_then(|h| h.target());
-
-        let statuses = repo.statuses(None).map_err(|e| {
-            Git2DBError::internal(format!("Failed to get repository status: {}", e))
-        })?;
-
-        let is_clean = statuses.is_empty();
-        let modified_files: Vec<PathBuf> = statuses
-            .iter()
-            .filter_map(|entry| entry.path().map(PathBuf::from))
-            .collect();
-
-        Ok(RepositoryStatus {
-            branch,
-            head: head_oid,
-            ahead: 0, // TODO: Calculate ahead/behind
-            behind: 0,
-            is_clean,
-            modified_files,
-        })
-    }
-
     /// Checkout a specific reference (branch, tag, or commit)
     ///
     /// Accepts strings, GitRef enums, or direct Oids for type safety.
@@ -129,202 +100,6 @@ impl<'a> RepositoryHandle<'a> {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn checkout(&self, reference: impl IntoGitRef) -> Git2DBResult<()> {
-        let repo = self.open_repo()?;
-        let git_ref = reference.into_git_ref();
-
-        // Resolve the reference to an OID
-        let oid = match git_ref {
-            GitRef::DefaultBranch => {
-                let head = repo.head().map_err(|e| {
-                    Git2DBError::reference("HEAD", format!("Failed to get HEAD: {}", e))
-                })?;
-                head.target().ok_or_else(|| {
-                    Git2DBError::reference("HEAD", "HEAD is not a direct reference")
-                })?
-            }
-            GitRef::Branch(ref branch_name) => {
-                let branch = repo
-                    .find_branch(branch_name, git2::BranchType::Local)
-                    .or_else(|_| repo.find_branch(branch_name, git2::BranchType::Remote))
-                    .map_err(|e| {
-                        Git2DBError::reference(branch_name, format!("Branch not found: {}", e))
-                    })?;
-                branch
-                    .get()
-                    .target()
-                    .ok_or_else(|| Git2DBError::reference(branch_name, "Branch has no target"))?
-            }
-            GitRef::Tag(ref tag_name) => {
-                let reference = repo
-                    .find_reference(&format!("refs/tags/{}", tag_name))
-                    .map_err(|e| {
-                        Git2DBError::reference(tag_name, format!("Tag not found: {}", e))
-                    })?;
-                reference
-                    .target()
-                    .ok_or_else(|| Git2DBError::reference(tag_name, "Tag has no target"))?
-            }
-            GitRef::Commit(oid) => oid,
-            GitRef::Revspec(ref spec) => {
-                let obj = repo.revparse_single(spec).map_err(|e| {
-                    Git2DBError::reference(spec, format!("Failed to resolve revspec: {}", e))
-                })?;
-                obj.id()
-            }
-        };
-
-        // Checkout the commit
-        let commit = repo
-            .find_commit(oid)
-            .map_err(|e| Git2DBError::internal(format!("Failed to find commit: {}", e)))?;
-
-        repo.checkout_tree(commit.as_object(), None)
-            .map_err(|e| Git2DBError::internal(format!("Failed to checkout tree: {}", e)))?;
-
-        // Update HEAD
-        repo.set_head_detached(oid)
-            .map_err(|e| Git2DBError::internal(format!("Failed to update HEAD: {}", e)))?;
-
-        Ok(())
-    }
-
-    /// Fetch from a remote
-    pub async fn fetch(&self, remote: Option<&str>) -> Git2DBResult<()> {
-        let repo = self.open_repo()?;
-        let remote_name = remote.unwrap_or("origin");
-
-        let mut remote_obj = repo
-            .find_remote(remote_name)
-            .map_err(|e| Git2DBError::reference(remote_name, format!("Remote not found: {}", e)))?;
-
-        remote_obj.fetch(&[] as &[&str], None, None).map_err(|e| {
-            Git2DBError::network(format!("Failed to fetch from {}: {}", remote_name, e))
-        })?;
-
-        Ok(())
-    }
-
-    /// Update to latest from tracking remote
-    pub async fn update(&self) -> Git2DBResult<()> {
-        self.fetch(None).await?;
-        // TODO: Merge or rebase based on tracking branch
-        Ok(())
-    }
-
-    /// Push to a remote
-    ///
-    /// Similar to `git push <remote> <refspec>`
-    ///
-    /// Accepts strings, GitRef enums, or direct Oids for the refspec.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// # async fn example(repo: git2db::RepositoryHandle<'_>) -> Result<(), Box<dyn std::error::Error>> {
-    /// // Push current branch to origin
-    /// repo.push(Some("origin"), "main").await?;
-    ///
-    /// // Push using GitRef
-    /// repo.push(Some("origin"), git2db::GitRef::Branch("develop".into())).await?;
-    ///
-    /// // Push specific commit (type-safe)
-    /// let oid = git2::Oid::from_str("abc123...")?;
-    /// repo.push(Some("origin"), oid).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn push(&self, remote: Option<&str>, refspec: impl IntoGitRef) -> Git2DBResult<()> {
-        let repo = self.open_repo()?;
-        let remote_name = remote.unwrap_or("origin");
-        let git_ref = refspec.into_git_ref();
-
-        let mut remote_obj = repo
-            .find_remote(remote_name)
-            .map_err(|e| Git2DBError::reference(remote_name, format!("Remote not found: {}", e)))?;
-
-        // Build refspec for push
-        let refspec_str = match &git_ref {
-            GitRef::DefaultBranch => {
-                // Push current HEAD branch
-                let head = repo.head().map_err(|e| {
-                    Git2DBError::reference("HEAD", format!("Failed to get HEAD: {}", e))
-                })?;
-                head.name().unwrap_or("HEAD").to_string()
-            }
-            GitRef::Branch(name) => format!("refs/heads/{}:refs/heads/{}", name, name),
-            GitRef::Tag(name) => format!("refs/tags/{}:refs/tags/{}", name, name),
-            GitRef::Commit(oid) => format!("{}:refs/heads/main", oid), // Push commit to main by default
-            GitRef::Revspec(spec) => format!("{}:refs/heads/{}", spec, spec),
-        };
-
-        remote_obj
-            .push(&[refspec_str.as_str()], None)
-            .map_err(|e| {
-                Git2DBError::network(format!("Failed to push to {}: {}", remote_name, e))
-            })?;
-
-        Ok(())
-    }
-
-    /// Pull from a remote
-    ///
-    /// Similar to `git pull <remote> <refspec>`
-    ///
-    /// Accepts strings, GitRef enums, or direct Oids for the refspec.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// # async fn example(repo: git2db::RepositoryHandle<'_>) -> Result<(), Box<dyn std::error::Error>> {
-    /// // Pull main branch from origin
-    /// repo.pull(Some("origin"), "main").await?;
-    ///
-    /// // Pull using GitRef
-    /// repo.pull(Some("origin"), git2db::GitRef::Branch("develop".into())).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn pull(&self, remote: Option<&str>, refspec: impl IntoGitRef) -> Git2DBResult<()> {
-        let repo = self.open_repo()?;
-        let remote_name = remote.unwrap_or("origin");
-        let git_ref = refspec.into_git_ref();
-
-        // First fetch
-        let mut remote_obj = repo
-            .find_remote(remote_name)
-            .map_err(|e| Git2DBError::reference(remote_name, format!("Remote not found: {}", e)))?;
-
-        remote_obj.fetch(&[] as &[&str], None, None).map_err(|e| {
-            Git2DBError::network(format!("Failed to fetch from {}: {}", remote_name, e))
-        })?;
-
-        // Then merge/rebase
-        let fetch_head = repo.find_reference("FETCH_HEAD").map_err(|e| {
-            Git2DBError::reference("FETCH_HEAD", format!("Failed to find FETCH_HEAD: {}", e))
-        })?;
-
-        let commit = fetch_head.peel_to_commit().map_err(|e| {
-            Git2DBError::reference("FETCH_HEAD", format!("Failed to get commit: {}", e))
-        })?;
-
-        // Checkout the commit
-        repo.checkout_tree(commit.as_object(), None)
-            .map_err(|e| Git2DBError::internal(format!("Failed to checkout tree: {}", e)))?;
-
-        // Update HEAD
-        if let GitRef::Branch(branch_name) = git_ref {
-            let ref_name = format!("refs/heads/{}", branch_name);
-            repo.set_head(&ref_name)
-                .map_err(|e| Git2DBError::internal(format!("Failed to update HEAD: {}", e)))?;
-        } else {
-            repo.set_head_detached(commit.id())
-                .map_err(|e| Git2DBError::internal(format!("Failed to update HEAD: {}", e)))?;
-        }
-
-        Ok(())
-    }
-
     /// Get remote manager for this repository
     ///
     /// Provides git-native remote operations like `git remote`.
@@ -397,292 +172,6 @@ impl<'a> RepositoryHandle<'a> {
     /// ```
     pub fn staging(&self) -> StageManager<'a> {
         StageManager::new(self.registry, self.repo_id.clone())
-    }
-
-    /// Commit staged changes
-    ///
-    /// Similar to `git commit -m "<message>"`
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// # async fn example(repo: git2db::RepositoryHandle<'_>) -> Result<(), Box<dyn std::error::Error>> {
-    /// // Stage changes
-    /// repo.staging().add("src/main.rs")?;
-    ///
-    /// // Commit
-    /// let oid = repo.commit("Add new feature").await?;
-    /// println!("Created commit: {}", oid);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn commit(&self, message: &str) -> Git2DBResult<Oid> {
-        // Get default signature from GitManager
-        let sig = self.registry.git_manager().create_signature(None, None)?;
-
-        self.commit_as(&sig, message).await
-    }
-
-    /// Commit staged changes with a specific author/committer
-    ///
-    /// Similar to `git commit -m "<message>" --author="<name> <email>"`
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// # async fn example(repo: git2db::RepositoryHandle<'_>) -> Result<(), Box<dyn std::error::Error>> {
-    /// use git2::Signature;
-    ///
-    /// // Stage changes
-    /// repo.staging().add("README.md")?;
-    ///
-    /// // Create custom signature
-    /// let sig = Signature::now("Alice", "alice@example.com")?;
-    ///
-    /// // Commit as specific user
-    /// let oid = repo.commit_as(&sig, "Update docs").await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn commit_as(&self, signature: &Signature<'_>, message: &str) -> Git2DBResult<Oid> {
-        let repo = self.open_repo()?;
-
-        // Get the current index
-        let mut index = repo
-            .index()
-            .map_err(|e| Git2DBError::internal(format!("Failed to get index: {}", e)))?;
-
-        // Write index to tree
-        let tree_oid = index
-            .write_tree()
-            .map_err(|e| Git2DBError::internal(format!("Failed to write tree: {}", e)))?;
-
-        let tree = repo
-            .find_tree(tree_oid)
-            .map_err(|e| Git2DBError::internal(format!("Failed to find tree: {}", e)))?;
-
-        // Get parent commit (if any)
-        let parent_commits = if let Ok(head) = repo.head() {
-            vec![head.peel_to_commit().map_err(|e| {
-                Git2DBError::reference("HEAD", format!("Failed to get HEAD commit: {}", e))
-            })?]
-        } else {
-            vec![]
-        };
-
-        let parent_refs: Vec<&git2::Commit> = parent_commits.iter().collect();
-
-        // Create the commit
-        let commit_oid = repo
-            .commit(
-                Some("HEAD"),
-                signature,
-                signature,
-                message,
-                &tree,
-                &parent_refs,
-            )
-            .map_err(|e| Git2DBError::internal(format!("Failed to create commit: {}", e)))?;
-
-        Ok(commit_oid)
-    }
-
-    /// Amend the last commit
-    ///
-    /// Similar to `git commit --amend`
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// # async fn example(repo: git2db::RepositoryHandle<'_>) -> Result<(), Box<dyn std::error::Error>> {
-    /// // Stage additional changes
-    /// repo.staging().add("forgotten_file.rs")?;
-    ///
-    /// // Amend previous commit
-    /// let oid = repo.amend(Some("Updated commit message")).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn amend(&self, message: Option<&str>) -> Git2DBResult<Oid> {
-        let repo = self.open_repo()?;
-
-        // Get HEAD commit
-        let head = repo
-            .head()
-            .map_err(|e| Git2DBError::reference("HEAD", format!("Failed to get HEAD: {}", e)))?;
-
-        let head_commit = head.peel_to_commit().map_err(|e| {
-            Git2DBError::reference("HEAD", format!("Failed to get HEAD commit: {}", e))
-        })?;
-
-        // Get current index
-        let mut index = repo
-            .index()
-            .map_err(|e| Git2DBError::internal(format!("Failed to get index: {}", e)))?;
-
-        // Write index to tree
-        let tree_oid = index
-            .write_tree()
-            .map_err(|e| Git2DBError::internal(format!("Failed to write tree: {}", e)))?;
-
-        let tree = repo
-            .find_tree(tree_oid)
-            .map_err(|e| Git2DBError::internal(format!("Failed to find tree: {}", e)))?;
-
-        // Use provided message or keep original
-        let commit_message =
-            message.unwrap_or_else(|| head_commit.message().unwrap_or("Amended commit"));
-
-        // Amend the commit
-        let amended_oid = head_commit
-            .amend(
-                Some("HEAD"),
-                None, // Keep original author
-                None, // Keep original committer
-                None, // Keep original encoding
-                Some(commit_message),
-                Some(&tree),
-            )
-            .map_err(|e| Git2DBError::internal(format!("Failed to amend commit: {}", e)))?;
-
-        Ok(amended_oid)
-    }
-
-    /// Merge a branch into the current HEAD
-    ///
-    /// Similar to `git merge <branch>`
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// # async fn example(repo: git2db::RepositoryHandle<'_>) -> Result<(), Box<dyn std::error::Error>> {
-    /// // Fast-forward merge (default)
-    /// repo.merge("feature-branch", false, false).await?;
-    ///
-    /// // Force merge commit (--no-ff)
-    /// repo.merge("feature-branch", false, true).await?;
-    ///
-    /// // Fast-forward only (--ff-only)
-    /// repo.merge("feature-branch", true, false).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn merge(
-        &self,
-        branch: &str,
-        ff_only: bool,
-        no_ff: bool,
-    ) -> Git2DBResult<Oid> {
-        let repo = self.open_repo()?;
-
-        // Resolve branch reference
-        let branch_ref = repo
-            .find_reference(&format!("refs/heads/{}", branch))
-            .or_else(|_| repo.find_reference(&format!("refs/remotes/origin/{}", branch)))
-            .or_else(|_| repo.find_reference(branch))
-            .map_err(|e| {
-                Git2DBError::reference(branch, format!("Branch not found: {}", e))
-            })?;
-
-        let branch_commit = branch_ref.peel_to_commit().map_err(|e| {
-            Git2DBError::reference(branch, format!("Failed to resolve commit: {}", e))
-        })?;
-
-        let annotated_commit = repo.find_annotated_commit(branch_commit.id()).map_err(|e| {
-            Git2DBError::internal(format!("Failed to create annotated commit: {}", e))
-        })?;
-
-        // Perform merge analysis
-        let (merge_analysis, _) = repo.merge_analysis(&[&annotated_commit]).map_err(|e| {
-            Git2DBError::internal(format!("Merge analysis failed: {}", e))
-        })?;
-
-        // Already up-to-date
-        if merge_analysis.is_up_to_date() {
-            return Ok(branch_commit.id());
-        }
-
-        // Check fast-forward constraints
-        if ff_only && !merge_analysis.is_fast_forward() {
-            return Err(Git2DBError::merge_conflict(
-                "Cannot fast-forward - branches have diverged",
-            ));
-        }
-
-        // Fast-forward merge (if possible and not --no-ff)
-        if merge_analysis.is_fast_forward() && !no_ff {
-            let mut head_ref = repo.head().map_err(|e| {
-                Git2DBError::reference("HEAD", format!("Failed to get HEAD: {}", e))
-            })?;
-
-            head_ref
-                .set_target(branch_commit.id(), "Fast-forward merge")
-                .map_err(|e| {
-                    Git2DBError::internal(format!("Failed to update HEAD: {}", e))
-                })?;
-
-            repo.checkout_head(Some(
-                git2::build::CheckoutBuilder::default()
-                    .force()
-            ))
-            .map_err(|e| {
-                Git2DBError::internal(format!("Checkout failed: {}", e))
-            })?;
-
-            return Ok(branch_commit.id());
-        }
-
-        // Regular merge (create merge commit)
-        repo.merge(&[&annotated_commit], None, None)
-            .map_err(|e| Git2DBError::internal(format!("Merge failed: {}", e)))?;
-
-        // Check for conflicts
-        if repo
-            .index()
-            .map_err(|e| Git2DBError::internal(format!("Failed to get index: {}", e)))?
-            .has_conflicts()
-        {
-            return Err(Git2DBError::merge_conflict(
-                "Merge conflicts detected - please resolve manually",
-            ));
-        }
-
-        // Create merge commit
-        let sig = self.registry.git_manager().create_signature(None, None)?;
-
-        let tree_id = repo
-            .index()
-            .map_err(|e| Git2DBError::internal(format!("Failed to get index: {}", e)))?
-            .write_tree()
-            .map_err(|e| Git2DBError::internal(format!("Failed to write tree: {}", e)))?;
-
-        let tree = repo
-            .find_tree(tree_id)
-            .map_err(|e| Git2DBError::internal(format!("Failed to find tree: {}", e)))?;
-
-        let parent = repo
-            .head()
-            .map_err(|e| Git2DBError::reference("HEAD", format!("Failed to get HEAD: {}", e)))?
-            .peel_to_commit()
-            .map_err(|e| {
-                Git2DBError::internal(format!("Failed to resolve HEAD commit: {}", e))
-            })?;
-
-        let merge_oid = repo
-            .commit(
-                Some("HEAD"),
-                &sig,
-                &sig,
-                &format!("Merge branch '{}'", branch),
-                &tree,
-                &[&parent, &branch_commit],
-            )
-            .map_err(|e| Git2DBError::internal(format!("Failed to create merge commit: {}", e)))?;
-
-        repo.cleanup_state()
-            .map_err(|e| Git2DBError::internal(format!("Failed to cleanup merge state: {}", e)))?;
-
-        Ok(merge_oid)
     }
 
     /// List all references (branches and tags) with their OIDs
@@ -909,6 +398,263 @@ impl<'a> RepositoryHandle<'a> {
             Git2DBError::reference(spec, format!("Failed to resolve revspec: {}", e))
         })?;
         Ok(obj.id())
+    }
+
+    /// Get all worktrees managed by the storage driver for this repository
+    ///
+    /// Returns all worktrees that were created using storage drivers for this repository.
+    /// This is useful for discovering existing worktrees managed by overlay2, vfs, etc.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # async fn example(repo: &git2db::RepositoryHandle<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    /// // List all worktrees for this repository
+    /// for worktree in repo.get_worktrees().await? {
+    ///     println!("Worktree: {} (driver: {})", worktree.path().display(), worktree.driver_name());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_worktrees(&self) -> Git2DBResult<Vec<WorktreeHandle>> {
+        let tracked_repo = self.metadata()?;
+
+        // Use pre-loaded storage driver from registry
+        let driver = self.registry.storage_driver().clone();
+
+        // Query storage driver directly for worktrees
+        driver.get_worktrees(&tracked_repo.worktree_path).await
+    }
+
+    /// Get a specific worktree by branch name
+    ///
+    /// Returns the worktree if it exists and is managed by the storage driver.
+    /// This is useful for checking if a specific branch worktree exists.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # async fn example(repo: &git2db::RepositoryHandle<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    /// // Check if a worktree for a specific branch exists
+    /// if let Some(worktree) = repo.get_worktree("feature-branch").await? {
+    ///     println!("Found worktree at: {}", worktree.path().display());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_worktree(&self, branch: &str) -> Git2DBResult<Option<WorktreeHandle>> {
+        let tracked_repo = self.metadata()?;
+
+        // Use pre-loaded storage driver from registry
+        let driver = self.registry.storage_driver().clone();
+
+        // Query storage driver directly for specific worktree
+        driver.get_worktree(&tracked_repo.worktree_path, branch).await
+    }
+
+    /// Create a new worktree using the configured storage driver
+    ///
+    /// This creates a new worktree using the storage driver selected in the configuration.
+    /// On Linux, this will typically use overlay2 for ~80% space savings, while on other
+    /// platforms it will use vfs (plain git worktrees).
+    ///
+    /// The worktree will be created at the specified path and checked out to the given branch/ref.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # async fn example(repo: git2db::RepositoryHandle<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    /// // Create a worktree for a feature branch with overlay2 optimization
+    /// let worktree = repo.create_worktree("/tmp/feature-branch", "feature-branch").await?;
+    /// println!("Created worktree at: {}", worktree.path().display());
+    ///
+    /// // Create worktree at custom path
+    /// let worktree = repo.create_worktree("/tmp/custom-path", "main").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Fetch LFS files for the worktree
+    async fn fetch_lfs_files(repo_path: &Path) -> Git2DBResult<()> {
+        use tokio::process::Command;
+
+        if !repo_path.exists() {
+            return Err(Git2DBError::internal(format!(
+                "Worktree path does not exist: {}",
+                repo_path.display()
+            )));
+        }
+
+        let lfs_available = Command::new("git")
+            .args(["lfs", "version"])
+            .output()
+            .await
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+
+        if !lfs_available {
+            tracing::warn!("git-lfs not installed or not in PATH");
+            return Err(Git2DBError::internal(
+                "git-lfs not available. Install with: sudo apt install git-lfs"
+            ));
+        }
+
+        let gitattributes_path = repo_path.join(".gitattributes");
+
+        let uses_lfs = if gitattributes_path.exists() {
+            tokio::fs::read_to_string(&gitattributes_path)
+                .await
+                .map(|content| content.contains("filter=lfs"))
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if !uses_lfs {
+            tracing::debug!("Repository does not use Git LFS, skipping LFS fetch");
+            return Ok(());
+        }
+
+        tracing::info!("Repository uses Git LFS, fetching LFS files (this may take a while for large files)...");
+        println!("📥 Downloading LFS files... (this may take a while for large models)");
+
+        let mut child = Command::new("git")
+            .args(["lfs", "pull"])
+            .current_dir(repo_path)
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .map_err(|e| {
+                Git2DBError::internal(format!(
+                    "Failed to spawn 'git lfs pull': {}. Is git-lfs installed?",
+                    e
+                ))
+            })?;
+
+        let status = child.wait().await.map_err(|e| {
+            Git2DBError::internal(format!("Failed to wait for 'git lfs pull': {}", e))
+        })?;
+
+        if !status.success() {
+            let exit_code = status.code().unwrap_or(-1);
+            tracing::error!("git lfs pull failed with exit code: {}", exit_code);
+
+            let error_msg = match exit_code {
+                128 => format!(
+                    "git lfs pull failed (exit code 128): Authentication failed.\n\
+                     Check your git credentials or LFS endpoint."
+                ),
+                1 => format!(
+                    "git lfs pull failed (exit code 1): Network error.\n\
+                     Check network connectivity and LFS endpoint."
+                ),
+                _ => format!(
+                    "git lfs pull failed (exit code {}): Unknown error.\n\
+                     Check logs above for details.",
+                    exit_code
+                ),
+            };
+
+            return Err(Git2DBError::internal(error_msg));
+        }
+
+        tracing::info!("Successfully fetched LFS files");
+        Ok(())
+    }
+
+    pub async fn create_worktree(&self, worktree_path: &Path, branch: &str) -> Git2DBResult<WorktreeHandle> {
+        let tracked_repo = self.metadata()?;
+
+        // Use pre-loaded storage driver from registry
+        let driver = self.registry.storage_driver().clone();
+
+        info!(
+            "Creating worktree with {} driver: base={}, path={}, ref={}",
+            driver.name(),
+            tracked_repo.worktree_path.display(),
+            worktree_path.display(),
+            branch
+        );
+
+        // Create driver options
+        let opts = DriverOpts {
+            base_repo: tracked_repo.worktree_path.clone(),
+            worktree_path: worktree_path.to_path_buf(),
+            ref_spec: branch.to_string(),
+        };
+
+        // Create worktree using driver
+        let result = driver.create_worktree(&opts).await;
+
+        match &result {
+            Ok(_handle) => {
+                // Already logged above
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to create worktree at {}: {}",
+                    worktree_path.display(),
+                    e
+                );
+
+                // Provide helpful hints
+                #[cfg(feature = "overlayfs")]
+                {
+                    if driver.name() == "overlay2" {
+                        tracing::error!(
+                            "Hint: Install fuse-overlayfs:\n  \
+                             sudo apt install fuse-overlayfs\n  \
+                             OR try a different driver like 'vfs'"
+                        );
+                    }
+                }
+            }
+        }
+
+        match result {
+            Ok(mut handle) => {
+                if let Err(e) = Self::fetch_lfs_files(worktree_path).await {
+                    tracing::error!(
+                        "Failed to fetch LFS files for worktree at {}: {}",
+                        worktree_path.display(),
+                        e
+                    );
+                    tracing::info!("Rolling back worktree creation due to LFS fetch failure");
+
+                    if let Err(cleanup_err) = handle.cleanup().await {
+                        tracing::error!(
+                            "Failed to cleanup worktree during rollback: {}",
+                            cleanup_err
+                        );
+                    }
+
+                    return Err(Git2DBError::internal(format!(
+                        "Worktree creation failed: LFS fetch error: {}. Worktree has been rolled back.",
+                        e
+                    )));
+                }
+
+                Ok(handle)
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to create worktree at {}: {}",
+                    worktree_path.display(),
+                    e
+                );
+
+                if worktree_path.exists() {
+                    tracing::info!("Cleaning up partial worktree at {}", worktree_path.display());
+                    tokio::fs::remove_dir_all(worktree_path)
+                        .await
+                        .unwrap_or_else(|cleanup_err| {
+                            tracing::warn!("Failed to cleanup partial worktree: {}", cleanup_err);
+                        });
+                }
+
+                Err(e)
+            }
+        }
     }
 }
 

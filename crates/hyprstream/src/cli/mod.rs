@@ -20,7 +20,7 @@ pub use git_handlers::{
 };
 pub use handlers::{handle_config, handle_server};
 pub use worktree_handlers::{
-    handle_worktree_info, handle_worktree_list, handle_worktree_prune, handle_worktree_remove,
+    handle_worktree_info, handle_worktree_list, handle_worktree_remove,
 };
 
 /// Device preference strategy

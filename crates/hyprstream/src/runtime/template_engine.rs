@@ -199,6 +199,15 @@ impl TemplateEngine {
 {% endif %}"#
                     .to_string()
             }
+            "janus" | "janus-1.3b" | "janus-pro" => {
+                // DeepSeek/Janus format - simple User:/Assistant: format
+                r#"{% for message in messages %}
+{% if message['role'] == 'user' %}User: {{ message['content'] }}
+{% elif message['role'] == 'assistant' %}Assistant: {{ message['content'] }}
+{% endif %}{% endfor %}
+{% if add_generation_prompt %}Assistant: {% endif %}"#
+                    .to_string()
+            }
             _ => {
                 // Default simple template
                 r#"{% for message in messages %}

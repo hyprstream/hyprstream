@@ -35,9 +35,9 @@ pub(crate) static PAYLOAD_REGISTRY: Lazy<DashMap<usize, Arc<XetFilterPayload>>> 
 
 /// Register payload for a filter instance
 #[cfg(feature = "xet-storage")]
-pub(crate) fn register_payload(filter_ptr: *const OpaqueGitFilter, payload: Box<XetFilterPayload>) {
+pub(crate) fn register_payload(filter_ptr: *const OpaqueGitFilter, payload: XetFilterPayload) {
     let key = filter_ptr as usize;
-    PAYLOAD_REGISTRY.insert(key, Arc::new(*payload));
+    PAYLOAD_REGISTRY.insert(key, Arc::new(payload));
     tracing::debug!("Registered payload for filter instance {:x}", key);
 }
 
@@ -83,6 +83,12 @@ pub extern "C" fn xet_filter_shutdown(_filter: *mut OpaqueGitFilter) {
 }
 
 /// Check callback (determines if filter should apply)
+///
+/// # Safety
+/// This function is called by libgit2 with valid pointers. The `source` pointer
+/// must be valid for the duration of this call. This is guaranteed by libgit2's
+/// callback contract. The raw pointer dereferences are safe within this context.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[cfg(feature = "xet-storage")]
 pub extern "C" fn xet_filter_check(
     _filter: *mut OpaqueGitFilter,
@@ -90,7 +96,7 @@ pub extern "C" fn xet_filter_check(
     source: *const OpaqueGitFilterSource,
     _attr_values: *const *const libc::c_char,
 ) -> c_int {
-    // Get the filter mode to determine the operation
+    // SAFETY: libgit2 guarantees source is valid for this callback
     let mode = unsafe { git_filter_source_mode(source) };
 
     // CRITICAL: During clone/checkout, libgit2 should ONLY call SMUDGE (ODB → workdir)
@@ -100,6 +106,7 @@ pub extern "C" fn xet_filter_check(
     // Refuse to CLEAN during checkout to prevent uploading files during clone.
     if mode == GIT_FILTER_CLEAN {
         // Check if this is a checkout operation (TO_WORKDIR flag)
+        // SAFETY: libgit2 guarantees source is valid for this callback
         let flags = unsafe { git_filter_source_flags(source) };
         const GIT_FILTER_TO_WORKTREE: u32 = 1 << 0;
 
@@ -117,6 +124,12 @@ pub extern "C" fn xet_filter_check(
 }
 
 /// Stream callback (performs actual filtering)
+///
+/// # Safety
+/// This function is called by libgit2 with valid pointers. All pointer parameters
+/// must be valid for the duration of this call. This is guaranteed by libgit2's
+/// callback contract. The raw pointer dereferences are safe within this context.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[cfg(feature = "xet-storage")]
 pub extern "C" fn xet_filter_stream(
     _out: *mut *mut OpaqueGitWriteStream,
@@ -125,10 +138,11 @@ pub extern "C" fn xet_filter_stream(
     source: *const OpaqueGitFilterSource,
     next: *mut OpaqueGitWriteStream,
 ) -> c_int {
-    // Get filter mode
+    // SAFETY: libgit2 guarantees source is valid for this callback
     let mode = unsafe { git_filter_source_mode(source) };
 
     // Get file path for logging
+    // SAFETY: libgit2 guarantees source is valid for this callback
     let path = unsafe {
         let path_ptr = git_filter_source_path(source);
         if path_ptr.is_null() {

@@ -19,6 +19,55 @@ use crate::storage::{LfsXetBridge, XetConfig};
 pub struct ModelFactory;
 
 impl ModelFactory {
+    /// Detect the dtype of a model by examining its tensors
+    pub async fn detect_model_dtype(model_path: &Path) -> Result<DType> {
+        // Check for single file first
+        let single_file = model_path.join("model.safetensors");
+        let file_to_check = if single_file.exists() {
+            single_file
+        } else {
+            // Look for first shard file
+            let shard_files = Self::find_shard_files(model_path)?;
+            if shard_files.is_empty() {
+                return Err(anyhow!("No model weights found in {}", model_path.display()));
+            }
+            shard_files[0].clone()
+        };
+
+        // Load just the metadata to check dtype
+        let file_content = std::fs::read(&file_to_check)?;
+        let tensors = safetensors::SafeTensors::deserialize(&file_content)?;
+
+        // Check the first few tensors to determine predominant dtype
+        let mut f16_count = 0;
+        let mut bf16_count = 0;
+        let mut f32_count = 0;
+
+        for (_, tensor) in tensors.tensors().into_iter().take(10) {
+            match tensor.dtype() {
+                safetensors::Dtype::F16 => f16_count += 1,
+                safetensors::Dtype::BF16 => bf16_count += 1,
+                safetensors::Dtype::F32 => f32_count += 1,
+                _ => {}, // Other dtypes are ignored
+            }
+        }
+
+        // Return the most common dtype
+        if f16_count > bf16_count && f16_count > f32_count {
+            info!("Detected F16 model");
+            Ok(tch::Kind::Half)
+        } else if bf16_count >= f16_count && bf16_count >= f32_count {
+            info!("Detected BF16 model");
+            Ok(tch::Kind::BFloat16)
+        } else if f32_count > 0 {
+            info!("Detected F32 model");
+            Ok(tch::Kind::Float)
+        } else {
+            info!("Could not detect model dtype, defaulting to BF16");
+            Ok(tch::Kind::BFloat16)
+        }
+    }
+
     /// Create a model from a directory containing weights and optionally config.json
     /// This is the ONLY way models should be created to ensure consistency
     #[instrument(name = "model_factory.create", skip(device, dtype), fields(model_path = %model_path.display()))]
@@ -260,17 +309,26 @@ impl ModelFactory {
             let shape: Vec<i64> = tensor_view.shape().iter().map(|&x| x as i64).collect();
             let data = tensor_view.data();
 
+            // Map safetensors dtype to tch::Kind for size estimation
+            let tensor_kind = match tensor_view.dtype() {
+                safetensors::Dtype::BF16 => tch::Kind::BFloat16,
+                safetensors::Dtype::F16 => tch::Kind::Half,
+                safetensors::Dtype::F32 => tch::Kind::Float,
+                safetensors::Dtype::F64 => tch::Kind::Double,
+                _ => tch::Kind::Float, // Default fallback
+            };
+
             // Calculate tensor size for progress reporting
-            let tensor_size_mb = estimate_tensor_size_mb(&shape, tch::Kind::BFloat16);
+            let tensor_size_mb = estimate_tensor_size_mb(&shape, tensor_kind);
             total_size_mb += tensor_size_mb;
 
-            // Only BF16 is supported
+            // Support both F16 and BF16 models
             let tensor = match tensor_view.dtype() {
                 safetensors::Dtype::BF16 => {
                     // Verify target dtype matches
-                    if dtype != tch::Kind::BFloat16 {
+                    if dtype != tch::Kind::BFloat16 && dtype != tch::Kind::Half {
                         return Err(anyhow!(
-                            "Only BF16 models are supported (target dtype: {:?})",
+                            "Model dtype BF16 but target dtype is {:?}",
                             dtype
                         ));
                     }
@@ -290,6 +348,89 @@ impl ModelFactory {
 
                     // Make an owned copy to prevent use-after-free
                     let cpu_tensor = borrowed_tensor.copy();
+
+                    // Convert dtype if needed
+                    let cpu_tensor = if dtype == tch::Kind::Half {
+                        cpu_tensor.to_kind(tch::Kind::Half)
+                    } else {
+                        cpu_tensor
+                    };
+
+                    // Transfer to target device if needed (with OOM handling)
+                    if *device != Device::Cpu {
+                        let gpu_tensor = cpu_tensor.to_device(*device);
+                        drop(cpu_tensor); // Explicitly free CPU memory
+                        gpu_tensor
+                    } else {
+                        cpu_tensor
+                    }
+                }
+                safetensors::Dtype::F16 => {
+                    // Verify target dtype matches
+                    if dtype != tch::Kind::Half && dtype != tch::Kind::BFloat16 {
+                        return Err(anyhow!(
+                            "Model dtype F16 but target dtype is {:?}",
+                            dtype
+                        ));
+                    }
+
+                    // Create tensor from borrowed data
+                    let borrowed_tensor = unsafe {
+                        Tensor::from_blob(
+                            data.as_ptr(),
+                            &shape,
+                            &[],
+                            tch::Kind::Half,
+                            Device::Cpu,
+                        )
+                    };
+
+                    // Make an owned copy to prevent use-after-free
+                    let cpu_tensor = borrowed_tensor.copy();
+
+                    // Convert dtype if needed
+                    let cpu_tensor = if dtype == tch::Kind::BFloat16 {
+                        cpu_tensor.to_kind(tch::Kind::BFloat16)
+                    } else {
+                        cpu_tensor
+                    };
+
+                    // Transfer to target device if needed (with OOM handling)
+                    if *device != Device::Cpu {
+                        let gpu_tensor = cpu_tensor.to_device(*device);
+                        drop(cpu_tensor); // Explicitly free CPU memory
+                        gpu_tensor
+                    } else {
+                        cpu_tensor
+                    }
+                }
+                safetensors::Dtype::F32 => {
+                    // Support F32 as well for completeness
+                    let borrowed_tensor = unsafe {
+                        Tensor::from_blob(
+                            data.as_ptr(),
+                            &shape,
+                            &[],
+                            tch::Kind::Float,
+                            Device::Cpu,
+                        )
+                    };
+
+                    // Make an owned copy
+                    let cpu_tensor = borrowed_tensor.copy();
+
+                    // Convert to target dtype
+                    let cpu_tensor = match dtype {
+                        tch::Kind::Half => cpu_tensor.to_kind(tch::Kind::Half),
+                        tch::Kind::BFloat16 => cpu_tensor.to_kind(tch::Kind::BFloat16),
+                        tch::Kind::Float => cpu_tensor,
+                        _ => {
+                            return Err(anyhow!(
+                                "Cannot convert F32 to target dtype {:?}",
+                                dtype
+                            ))
+                        }
+                    };
 
                     // Transfer to target device if needed (with OOM handling)
                     if *device != Device::Cpu {
@@ -321,7 +462,7 @@ impl ModelFactory {
                 }
                 dtype => {
                     return Err(anyhow!(
-                        "Tensor '{}' has unsupported dtype {:?}. Only BF16 models are supported.",
+                        "Tensor '{}' has unsupported dtype {:?}. Supported: F16, BF16, F32",
                         name, dtype
                     ));
                 }
@@ -362,6 +503,10 @@ impl ModelFactory {
                 info!("Creating Mistral model");
                 // For now, Mistral uses Llama architecture
                 Self::create_llama_model(config, weights, device, dtype)
+            }
+            ModelArchitecture::Janus => {
+                info!("Creating Janus multimodal model");
+                Self::create_janus_model(config, weights, device, dtype)
             }
             ModelArchitecture::Unknown(arch) => Err(anyhow!("Unknown architecture: {}", arch)),
         }
@@ -429,5 +574,74 @@ impl ModelFactory {
     ) -> Result<Box<dyn ModelOperations>> {
         // Gemma has its own implementation
         Ok(Box::new(GemmaModel::from_weights(&weights, device, dtype)?))
+    }
+
+    fn create_janus_model(
+        config: ModelConfig,
+        weights: HashMap<String, Tensor>,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Box<dyn ModelOperations>> {
+        use super::architectures::janus::{
+            JanusModel, JanusConfig, VisionEncoderConfig, ProjectorConfig,
+        };
+        use super::architectures::VisionEncoderType;
+
+        // For now, create a simplified Janus config
+        // In practice, this would be derived from the model's config.json
+        let janus_config = JanusConfig {
+            // Use Llama config for the language model
+            language_config: Box::new(super::architectures::llama::LlamaConfig {
+                version: 3,
+                num_attention_heads: config.num_attention_heads,
+                num_key_value_heads: config.num_key_value_heads,
+                hidden_size: config.hidden_size,
+                head_dim: config.head_dim,
+                intermediate_size: config.intermediate_size,
+                max_position_embeddings: config.max_position_embeddings,
+                rms_norm_eps: config.rms_norm_eps,
+                vocab_size: config.vocab_size,
+                original_vocab_size: config.vocab_size,
+                num_hidden_layers: config.num_hidden_layers,
+                rope_theta: config.rope_theta,
+                rope_scaling: None,  // TODO: Convert from config.rope_scaling
+                hidden_activation: config.hidden_activation.clone(),
+                query_pre_attn_scalar: config.query_pre_attn_scalar,
+                use_qk_norm: config.use_qk_norm,
+                scale_embeddings: config.scale_embeddings,
+                layer_types: vec!["global".to_string(); config.num_hidden_layers],
+                rope_local_base_freq: None,
+            }),
+            vision_config: VisionEncoderConfig {
+                encoder_type: VisionEncoderType::SigLIP {
+                    hidden_size: 1024,  // From config: vision_config.hidden_size
+                    image_size: 384,
+                    patch_size: 16,
+                    num_layers: 24,
+                },
+                hidden_size: 1024,
+                image_size: 384,
+                patch_size: 16,
+                num_layers: 24,
+                num_patches: (384 / 16) * (384 / 16),  // 576 patches
+                num_attention_heads: Some(16),  // From config: vision_config.num_attention_heads
+                intermediate_size: Some(4096),  // From config: vision_config.intermediate_size
+            },
+            aligner_config: ProjectorConfig {
+                input_dim: 1024,  // Vision hidden size (matches vision_config.hidden_size)
+                output_dim: config.hidden_size,  // Language model hidden size
+                hidden_dim: Some(config.hidden_size),  // 2-layer MLP
+            },
+            generation_config: None,  // No image generation for now
+            device: *device,
+            dtype,
+        };
+
+        Ok(Box::new(JanusModel::from_weights(
+            weights,
+            janus_config,
+            *device,
+            dtype,
+        )?))
     }
 }

@@ -339,11 +339,18 @@ fn get_default_branch(repo: &git2::Repository) -> Git2DBResult<String> {
 
 /// Create a worktree from a bare repository
 async fn create_worktree(bare_repo_path: &std::path::PathBuf, worktree_path: &std::path::PathBuf, branch: &str) -> Git2DBResult<()> {
-    // Use git2db's GitManager for worktree creation
-    let manager = crate::manager::GitManager::global();
+    // We need to register the repository first to use RepositoryHandle
+    let mut registry = crate::Git2DB::open(bare_repo_path.parent().unwrap_or(bare_repo_path)).await?;
+    let repo_id = crate::RepoId::new();
+    registry.register(repo_id.clone())
+        .name(format!("bare-repo-{}", bare_repo_path.display()))
+        .url(format!("file://{}", bare_repo_path.display()))
+        .exec().await?;
+    let handle = registry.repo(&repo_id)?;
 
-    manager
-        .create_worktree(bare_repo_path, worktree_path, branch)
+    // Use RepositoryHandle for worktree creation
+    handle
+        .create_worktree(worktree_path, branch)
         .await
         .map_err(|e| {
             Git2DBError::repository(

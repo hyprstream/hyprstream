@@ -35,6 +35,7 @@ use tracing::{error, warn};
 /// # Example
 /// ```no_run
 /// use tch::{Device, Tensor};
+/// use hyprstream_core::runtime::torch_utils::safe_tensor_op;
 /// let result = safe_tensor_op(|| {
 ///     Tensor::zeros([1024, 1024], (tch::Kind::BFloat16, Device::Cuda(0)))
 /// });

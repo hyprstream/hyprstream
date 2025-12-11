@@ -309,8 +309,8 @@ impl HyprConfig {
             .add_source(File::from(config_dir.join("config.toml")).required(false))
             .add_source(File::from(config_dir.join("config.json")).required(false))
             .add_source(File::from(config_dir.join("config.yaml")).required(false))
-            // Load from environment variables with HYPRSTREAM_ prefix
-            .add_source(Environment::with_prefix("HYPRSTREAM").separator("__"));
+            // Load from environment variables with HYPRSTREAM__ prefix (double underscore for nesting)
+            .add_source(Environment::with_prefix("HYPRSTREAM").separator("__").try_parsing(true));
 
         // Build and deserialize configuration
         let mut hypr_config: HyprConfig = settings.build()?.try_deserialize()?;
@@ -327,6 +327,7 @@ impl HyprConfig {
             }
             Err(e) => {
                 tracing::warn!("Failed to load git2db config: {}, using default", e);
+                hypr_config.git2db = git2db::config::Git2DBConfig::default();
             }
         }
 
@@ -483,7 +484,10 @@ pub struct GenerationRequest {
     pub repeat_last_n: usize,
     pub stop_tokens: Vec<String>,
     pub seed: Option<u32>,
-    // NEW: Async configuration fields
+    /// Optional image paths for multimodal models
+    #[serde(default)]
+    pub images: Vec<String>,
+    // Async configuration fields
     #[serde(default)]
     pub timeout: Option<u64>, // Duration in milliseconds
 }
@@ -638,6 +642,7 @@ pub struct ResolvedSamplingParams {
 pub struct GenerationRequestBuilder {
     prompt: String,
     params: SamplingParams,
+    images: Vec<String>,
 }
 
 impl GenerationRequestBuilder {
@@ -645,6 +650,7 @@ impl GenerationRequestBuilder {
         Self {
             prompt: prompt.into(),
             params: SamplingParams::default(),
+            images: vec![],
         }
     }
 
@@ -694,7 +700,17 @@ impl GenerationRequestBuilder {
         self
     }
 
-    // NEW: Async configuration methods
+    pub fn image_path(mut self, value: std::path::PathBuf) -> Self {
+        self.images.push(value.to_string_lossy().to_string());
+        self
+    }
+
+    pub fn images(mut self, value: Vec<String>) -> Self {
+        self.images = value;
+        self
+    }
+
+    // Async configuration methods
     pub fn timeout(mut self, timeout: std::time::Duration) -> Self {
         self.params.timeout_ms = Some(timeout.as_millis() as u64);
         self
@@ -705,7 +721,6 @@ impl GenerationRequestBuilder {
         self
     }
 
-    
     pub fn build_v2(self) -> GenerationRequestV2 {
         GenerationRequestV2 {
             prompt: self.prompt,
@@ -725,6 +740,7 @@ impl GenerationRequestBuilder {
             repeat_last_n: resolved.repeat_last_n,
             stop_tokens: resolved.stop_tokens,
             seed: resolved.seed.map(|s| s as u32),
+            images: self.images,
             timeout: Some(resolved.timeout_ms),
         }
     }
@@ -774,6 +790,7 @@ impl From<&GenerationConfig> for GenerationRequest {
             repeat_penalty: config.repeat_penalty,
             repeat_last_n: 64, // Default repeat_last_n
             stop_tokens: config.stop_tokens.clone(),
+            images: vec![],  // No images in conversion
             seed: config.seed,
             timeout: None, // Not in GenerationConfig
         }

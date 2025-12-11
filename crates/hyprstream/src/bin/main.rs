@@ -13,7 +13,7 @@ use hyprstream_core::cli::handlers::handle_server;
 use hyprstream_core::cli::{
     handle_branch, handle_checkout, handle_clone, handle_commit, handle_infer, handle_info,
     handle_list, handle_lora_train, handle_merge, handle_pull, handle_push, handle_remove,
-    handle_status, handle_worktree_info, handle_worktree_list, handle_worktree_prune,
+    handle_status, handle_worktree_info, handle_worktree_list,
     handle_worktree_remove, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
 };
 use hyprstream_core::config::HyprConfig;
@@ -501,6 +501,7 @@ fn main() -> Result<()> {
         Commands::Infer {
             model,
             prompt,
+            image,
             max_tokens,
             temperature,
             top_p,
@@ -522,6 +523,7 @@ fn main() -> Result<()> {
                         storage,
                         &model,
                         &prompt,
+                        image,
                         max_tokens,
                         temperature,
                         top_p,
@@ -536,13 +538,7 @@ fn main() -> Result<()> {
             )?;
         }
 
-        Commands::List {
-            branch,
-            tag,
-            dirty,
-            verbose,
-            worktrees,
-        } => {
+        Commands::List { .. } => {
             let ctx = ctx.clone();
             with_runtime(
                 RuntimeConfig {
@@ -551,7 +547,7 @@ fn main() -> Result<()> {
                 },
                 || async move {
                     let storage = ctx.storage().await?;
-                    handle_list(storage, branch, tag, dirty, verbose, worktrees).await
+                    handle_list(storage).await
                 },
             )?;
         }
@@ -742,9 +738,6 @@ fn main() -> Result<()> {
                         }
                         WorktreeCommand::Remove { model, branch, force } => {
                             handle_worktree_remove(storage, &model, &branch, force).await
-                        }
-                        WorktreeCommand::Prune { model, days, dry_run } => {
-                            handle_worktree_prune(storage, &model, days, dry_run).await
                         }
                     }
                 },

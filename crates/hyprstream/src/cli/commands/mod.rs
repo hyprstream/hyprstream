@@ -144,6 +144,10 @@ pub enum Commands {
         #[arg(short, long)]
         prompt: String,
 
+        /// Image file path for multimodal models (e.g., --image /path/to/image.jpg)
+        #[arg(short = 'i', long)]
+        image: Option<String>,
+
         /// Maximum tokens to generate
         #[arg(short = 'm', long)]
         max_tokens: Option<usize>,
@@ -178,23 +182,7 @@ pub enum Commands {
     },
 
     /// List available models
-    List {
-        /// Filter by git branch
-        #[arg(long)]
-        branch: Option<String>,
-        /// Filter by git tag
-        #[arg(long)]
-        tag: Option<String>,
-        /// Show only models with uncommitted changes
-        #[arg(long)]
-        dirty: bool,
-        /// Verbose output with detailed info
-        #[arg(short, long)]
-        verbose: bool,
-        /// Show worktrees for each model (default: true, use --no-worktrees to hide)
-        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
-        worktrees: bool,
-    },
+    List,
 
     /// Get detailed information about a model
     Inspect {
@@ -395,17 +383,5 @@ pub enum WorktreeCommand {
         /// Force removal without confirmation
         #[arg(short, long)]
         force: bool,
-    },
-
-    /// Prune stale worktrees
-    Prune {
-        /// Model name
-        model: String,
-        /// Days of inactivity before pruning (default: 30)
-        #[arg(long, default_value = "30")]
-        days: u32,
-        /// Dry run - show what would be pruned without removing
-        #[arg(long)]
-        dry_run: bool,
     },
 }
