@@ -218,16 +218,15 @@ async fn chat_completions(
     Json(request): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {
     // Extract session/request ID for KV cache routing
-    // TODO: Wire into TorchEngine.set_session() once registry is initialized on model load
-    // This will enable context preservation across requests in the same session
-    let _cache_owner = extract_cache_owner(&headers);
+    let cache_owner = extract_cache_owner(&headers);
 
     // Debug log the incoming request
     info!(
-        "Chat completion request - model: {}, stream: {:?}, messages: {} msgs",
+        "Chat completion request - model: {}, stream: {:?}, messages: {} msgs, cache: {:?}",
         request.model,
         request.stream,
         request.messages.len(),
+        cache_owner
     );
 
     // Log if streaming is defaulting
@@ -303,10 +302,28 @@ async fn chat_completions(
         "Starting generation with prompt length: {}",
         gen_request.prompt.len()
     );
+
+    // Determine if this is a stateless request (for cleanup after generation)
+    let is_stateless = matches!(cache_owner, CacheOwner::Stateless(_));
+
     let result = {
         let engine_guard = engine.lock().await;
+
+        // Set session for KV cache routing (if registry is initialized)
+        if let Err(e) = engine_guard.set_session(cache_owner.clone()) {
+            debug!("Could not set session (registry may not be initialized): {}", e);
+        }
+
         engine_guard.generate_with_params(gen_request).await
     };
+
+    // Release stateless caches to free memory (session caches are preserved)
+    if is_stateless {
+        let engine_guard = engine.lock().await;
+        if let Err(e) = engine_guard.release_session(&cache_owner) {
+            debug!("Could not release session cache: {}", e);
+        }
+    }
 
     info!("Generation completed - success: {}", result.is_ok());
 
@@ -375,9 +392,8 @@ async fn chat_completions(
 /// Handle streaming chat completions using TextStream
 async fn stream_chat(state: ServerState, headers: HeaderMap, request: ChatCompletionRequest) -> impl IntoResponse {
     // Extract session/request ID for KV cache routing
-    // TODO: Wire into TorchEngine.set_session() once registry is initialized on model load
-    // This will enable context preservation across requests in the same session
-    let _cache_owner = extract_cache_owner(&headers);
+    let cache_owner = extract_cache_owner(&headers);
+    let is_stateless = matches!(cache_owner, CacheOwner::Stateless(_));
 
     // Create channel for SSE events
     let (tx, rx) = mpsc::channel::<Result<serde_json::Value, anyhow::Error>>(100);
@@ -455,6 +471,11 @@ async fn stream_chat(state: ServerState, headers: HeaderMap, request: ChatComple
 
         // NOW lock the engine for generation
         let engine = engine_arc.lock().await;
+
+        // Set session for KV cache routing (if registry is initialized)
+        if let Err(e) = engine.set_session(cache_owner.clone()) {
+            debug!("Could not set session (registry may not be initialized): {}", e);
+        }
 
         let gen_request = GenerationRequest::builder(prompt)
             .apply_config(&(&defaults).into())
@@ -569,6 +590,16 @@ async fn stream_chat(state: ServerState, headers: HeaderMap, request: ChatComple
 
         // Send [DONE] message
         let _ = tx.send(Ok(serde_json::json!({"done": true}))).await;
+
+        // Release stateless caches to free memory (session caches are preserved)
+        // Need to drop engine lock first, then reacquire for release
+        drop(engine);
+        if is_stateless {
+            let engine_guard = engine_arc.lock().await;
+            if let Err(e) = engine_guard.release_session(&cache_owner) {
+                debug!("Could not release session cache: {}", e);
+            }
+        }
 
         // Metrics are automatically decremented by MetricsGuard drop
     });

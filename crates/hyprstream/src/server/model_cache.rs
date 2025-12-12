@@ -146,6 +146,22 @@ impl ModelCache {
             load_time.as_secs_f64()
         );
 
+        // Initialize KV cache registry for session-based cache isolation
+        // This enables concurrent inference with isolated context per session
+        let model_info = engine.model_info();
+        let num_layers = model_info.num_hidden_layers.unwrap_or(32);
+        let max_seq_len = self.max_context.unwrap_or(model_info.context_length);
+        engine.initialize_kv_registry(
+            num_layers,
+            max_seq_len,
+            self.kv_quant,
+            None, // No memory budget limit for now
+        );
+        info!(
+            "KV cache registry initialized: {} layers, max_seq_len={}",
+            num_layers, max_seq_len
+        );
+
         let engine = Arc::new(Mutex::new(engine));
 
         // Create cached entry
