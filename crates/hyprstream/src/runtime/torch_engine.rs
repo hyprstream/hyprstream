@@ -71,6 +71,12 @@ pub struct TorchEngine {
     /// Cached tokenizer vocabulary size for lock-free access
     /// 0 means not yet initialized
     tokenizer_vocab_size: Arc<AtomicUsize>,
+    /// KV cache registry for session-based cache isolation
+    /// Enables concurrent inference across multiple sessions
+    kv_cache_registry: Option<Arc<crate::runtime::kv_cache::KVCacheRegistry>>,
+    /// Current active session owner for KV cache selection
+    /// If set, generation uses the corresponding cache from the registry
+    active_cache_owner: Arc<Mutex<Option<crate::runtime::kv_cache::CacheOwner>>>,
     // Note: XET/LFS handled by git-xet-filter + ModelFactory::load_file_with_pointer_detection()
     // Note: Pre-training not supported (persistent_model doesn't expose VarStore), LoRA only
 }
@@ -105,6 +111,111 @@ impl TorchEngine {
                 .ok()
                 .and_then(|guard| guard.as_ref().map(|t| t.get_vocab_size(true)))
                 .unwrap_or(0)  // Return 0 if tokenizer not loaded (caller should error)
+        }
+    }
+
+    // ============================================================================
+    // Session-Based KV Cache Management
+    // ============================================================================
+
+    /// Initialize the KV cache registry for session-based cache isolation.
+    ///
+    /// This should be called after loading a model when the configuration is known.
+    /// The registry will manage separate KV caches for different sessions/requests.
+    pub fn initialize_kv_registry(
+        &mut self,
+        num_layers: usize,
+        max_seq_len: usize,
+        quant_type: crate::runtime::kv_quant::KVQuantType,
+        memory_budget: Option<usize>,
+    ) {
+        let config = crate::runtime::kv_cache::CacheConfig::new(num_layers, max_seq_len)
+            .with_quant_type(quant_type);
+
+        let registry = crate::runtime::kv_cache::KVCacheRegistry::new(config, memory_budget);
+        self.kv_cache_registry = Some(Arc::new(registry));
+
+        tracing::info!(
+            "[TorchEngine] Initialized KV cache registry: {} layers, max_seq_len={}, budget={:?}",
+            num_layers, max_seq_len, memory_budget
+        );
+    }
+
+    /// Get the KV cache registry (for external access)
+    pub fn kv_registry(&self) -> Option<Arc<crate::runtime::kv_cache::KVCacheRegistry>> {
+        self.kv_cache_registry.clone()
+    }
+
+    /// Set the active session for generation.
+    ///
+    /// This sets which KV cache will be used for the next generation call.
+    /// Use `CacheOwner::Session(session_id)` for conversational sessions that
+    /// should preserve context across multiple requests.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // For a conversational session (preserves context)
+    /// engine.set_session(CacheOwner::Session("conversation-123".into()));
+    ///
+    /// // For a stateless request (cache discarded after)
+    /// engine.set_session(CacheOwner::new_stateless());
+    /// ```
+    pub fn set_session(&self, owner: crate::runtime::kv_cache::CacheOwner) -> Result<()> {
+        if self.kv_cache_registry.is_none() {
+            return Err(anyhow!("KV cache registry not initialized. Call initialize_kv_registry first."));
+        }
+
+        let mut active_owner = self.handle_poison(self.active_cache_owner.lock())?;
+
+        tracing::debug!("Setting active session to: {:?}", owner);
+        *active_owner = Some(owner);
+
+        Ok(())
+    }
+
+    /// Get the current active session owner
+    pub fn get_session(&self) -> Option<crate::runtime::kv_cache::CacheOwner> {
+        self.handle_poison(self.active_cache_owner.lock())
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    /// Clear the active session (subsequent generations will use the model's internal cache)
+    pub fn clear_session(&self) -> Result<()> {
+        let mut active_owner = self.handle_poison(self.active_cache_owner.lock())?;
+        *active_owner = None;
+        Ok(())
+    }
+
+    /// Release a session's KV cache (for cleanup after conversation ends)
+    pub fn release_session(&self, owner: &crate::runtime::kv_cache::CacheOwner) -> Result<()> {
+        if let Some(registry) = &self.kv_cache_registry {
+            registry.release(owner);
+            tracing::debug!("Released session cache: {:?}", owner);
+        }
+        Ok(())
+    }
+
+    /// Get total memory usage across all session caches
+    pub fn session_cache_memory_usage(&self) -> usize {
+        self.kv_cache_registry
+            .as_ref()
+            .map(|r| r.total_memory_usage())
+            .unwrap_or(0)
+    }
+
+    /// Get number of active session caches
+    pub fn active_session_count(&self) -> usize {
+        self.kv_cache_registry
+            .as_ref()
+            .map(|r| r.cache_count())
+            .unwrap_or(0)
+    }
+
+    /// Evict LRU session caches to stay within memory budget
+    pub fn evict_session_caches(&self) {
+        if let Some(registry) = &self.kv_cache_registry {
+            registry.evict_to_budget();
         }
     }
 
@@ -194,6 +305,8 @@ impl TorchEngine {
             lora_trainer: Arc::new(Mutex::new(None)),
             sampler: TensorSampler::new(device),
             tokenizer_vocab_size: Arc::new(AtomicUsize::new(0)),
+            kv_cache_registry: None, // Initialized after model load when config is known
+            active_cache_owner: Arc::new(Mutex::new(None)),
         })
     }
 

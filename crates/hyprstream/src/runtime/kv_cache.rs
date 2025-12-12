@@ -23,12 +23,266 @@
 
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(any(feature = "bnb", test))]
 use tch::Device;
 use tch::{Kind as DType, Tensor};
 
 use super::kv_quant::KVQuantType;
 use super::torch_utils::{estimate_tensor_size_mb, safe_zeros};
+
+// ============================================================================
+// Cache Owner and Registry Types (for multi-session support)
+// ============================================================================
+
+/// Identifies the owner of a KV cache instance for session isolation.
+///
+/// Each owner gets their own isolated cache, enabling concurrent inference
+/// without interference between different conversations/sessions.
+#[derive(Clone, Hash, Eq, PartialEq, Debug)]
+pub enum CacheOwner {
+    /// Session-based inference - multiple requests share cache for context continuity.
+    /// Use this for conversational AI where context should persist across requests.
+    Session(String),
+
+    /// Stateless inference - one-off completions where cache is discarded after use.
+    /// Use this for standard OpenAI-compatible API requests without session tracking.
+    Stateless(u64),
+
+    /// Training validation inference - for evaluating model during training.
+    Training { adapter: String, run_id: u64 },
+}
+
+impl CacheOwner {
+    /// Create a new stateless owner with a random ID
+    pub fn new_stateless() -> Self {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        CacheOwner::Stateless(id)
+    }
+
+    /// Create a session owner
+    pub fn session(session_id: impl Into<String>) -> Self {
+        CacheOwner::Session(session_id.into())
+    }
+
+    /// Create a training owner
+    pub fn training(adapter: impl Into<String>, run_id: u64) -> Self {
+        CacheOwner::Training {
+            adapter: adapter.into(),
+            run_id,
+        }
+    }
+}
+
+/// Configuration for KV cache instances
+#[derive(Clone, Debug)]
+pub struct CacheConfig {
+    /// Number of transformer layers
+    pub num_layers: usize,
+    /// Maximum sequence length (context window)
+    pub max_seq_len: usize,
+    /// Quantization type for memory efficiency
+    pub quant_type: KVQuantType,
+    /// Whether this cache is exempt from eviction (e.g., for training)
+    pub eviction_exempt: bool,
+}
+
+impl CacheConfig {
+    /// Create a new cache configuration
+    pub fn new(num_layers: usize, max_seq_len: usize) -> Self {
+        Self {
+            num_layers,
+            max_seq_len,
+            quant_type: KVQuantType::None,
+            eviction_exempt: false,
+        }
+    }
+
+    /// Set quantization type
+    pub fn with_quant_type(mut self, quant_type: KVQuantType) -> Self {
+        self.quant_type = quant_type;
+        self
+    }
+
+    /// Mark as eviction exempt
+    pub fn with_eviction_exempt(mut self, exempt: bool) -> Self {
+        self.eviction_exempt = exempt;
+        self
+    }
+}
+
+/// Registry managing multiple KV cache instances for concurrent sessions.
+///
+/// Each `CacheOwner` gets their own isolated `KVCacheManager` wrapped in a Mutex.
+/// The registry uses DashMap for lock-free access to different sessions, while
+/// each individual cache uses Mutex for thread-safe layer access (required because
+/// tch-rs Tensor contains raw pointers that aren't `Sync`).
+///
+/// # Concurrency Model
+///
+/// ```text
+/// Request A ──► Registry.get_or_create(Session("abc")) ──► Cache A (Mutex)
+/// Request B ──► Registry.get_or_create(Session("xyz")) ──► Cache B (Mutex)
+///                                                          ↑
+///                                                No contention between A and B!
+/// ```
+pub struct KVCacheRegistry {
+    /// Active caches indexed by owner (lock-free access to different owners)
+    caches: DashMap<CacheOwner, Arc<Mutex<KVCacheManager>>>,
+    /// Default configuration for new caches
+    default_config: CacheConfig,
+    /// Memory budget in bytes (None = unlimited)
+    memory_budget_bytes: Option<usize>,
+}
+
+impl KVCacheRegistry {
+    /// Create a new KV cache registry
+    pub fn new(default_config: CacheConfig, memory_budget: Option<usize>) -> Self {
+        tracing::info!(
+            "[KVCacheRegistry::new] Creating registry with {} layers, max_seq_len={}, quant={:?}, budget={:?}",
+            default_config.num_layers,
+            default_config.max_seq_len,
+            default_config.quant_type,
+            memory_budget
+        );
+
+        Self {
+            caches: DashMap::new(),
+            default_config,
+            memory_budget_bytes: memory_budget,
+        }
+    }
+
+    /// Get or create a cache for the given owner.
+    ///
+    /// If the cache doesn't exist, creates a new one with the default config.
+    /// Returns `Arc<Mutex<KVCacheManager>>` - caller must lock() to use.
+    pub fn get_or_create(&self, owner: CacheOwner) -> Arc<Mutex<KVCacheManager>> {
+        // Try to get existing cache first (fast path)
+        if let Some(cache) = self.caches.get(&owner) {
+            // Update access time
+            if let Ok(guard) = cache.lock() {
+                guard.touch();
+            }
+            return cache.clone();
+        }
+
+        // Slow path: create new cache
+        let cache = Arc::new(Mutex::new(KVCacheManager::new(
+            self.default_config.num_layers,
+            self.default_config.max_seq_len,
+            self.default_config.quant_type,
+        )));
+
+        // Insert and return (handles race condition - returns existing if another thread inserted)
+        self.caches
+            .entry(owner)
+            .or_insert(cache.clone())
+            .clone()
+    }
+
+    /// Release a cache when the session is done.
+    ///
+    /// For `Stateless` owners, this removes the cache immediately.
+    /// For `Session` owners, the cache is kept for potential reuse.
+    pub fn release(&self, owner: &CacheOwner) {
+        match owner {
+            CacheOwner::Stateless(_) => {
+                // Stateless caches are removed immediately
+                self.caches.remove(owner);
+                tracing::debug!("Released stateless cache: {:?}", owner);
+            }
+            CacheOwner::Session(_) | CacheOwner::Training { .. } => {
+                // Session and training caches are kept for reuse
+                // They will be evicted by LRU if memory pressure occurs
+                tracing::debug!("Marked session cache for potential reuse: {:?}", owner);
+            }
+        }
+    }
+
+    /// Evict least-recently-used caches to stay within memory budget.
+    pub fn evict_to_budget(&self) {
+        let budget = match self.memory_budget_bytes {
+            Some(b) => b,
+            None => return, // No budget = no eviction
+        };
+
+        let current_usage = self.total_memory_usage();
+        if current_usage <= budget {
+            return;
+        }
+
+        // Collect eviction candidates (skip eviction-exempt and training caches)
+        let mut candidates: Vec<(CacheOwner, u64, usize)> = self
+            .caches
+            .iter()
+            .filter_map(|entry| {
+                let owner = entry.key().clone();
+
+                // Skip training caches
+                if matches!(owner, CacheOwner::Training { .. }) {
+                    return None;
+                }
+
+                if let Ok(guard) = entry.value().lock() {
+                    let last_access = guard.last_access();
+                    let memory = guard.memory_usage();
+                    Some((owner, last_access, memory))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Sort by last access (oldest first)
+        candidates.sort_by_key(|(_, last_access, _)| *last_access);
+
+        // Evict until under budget
+        let mut freed = 0;
+        for (owner, _, size) in candidates {
+            if current_usage - freed <= budget {
+                break;
+            }
+            self.caches.remove(&owner);
+            freed += size;
+            tracing::info!("Evicted cache {:?}, freed {} bytes", owner, size);
+        }
+    }
+
+    /// Get total memory usage across all caches in bytes
+    pub fn total_memory_usage(&self) -> usize {
+        self.caches
+            .iter()
+            .map(|entry| {
+                entry
+                    .value()
+                    .lock()
+                    .map(|g| g.memory_usage())
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
+
+    /// Get number of active caches
+    pub fn cache_count(&self) -> usize {
+        self.caches.len()
+    }
+
+    /// Clear all caches (useful for cleanup)
+    pub fn clear_all(&self) {
+        self.caches.clear();
+        tracing::info!("Cleared all KV caches from registry");
+    }
+}
+
+// ============================================================================
+// Original KV Cache Implementation
+// ============================================================================
 
 /// Default chunk size for KV cache growth (in tokens)
 const DEFAULT_CHUNK_SIZE: usize = 1024;
@@ -780,6 +1034,14 @@ impl LayerKVCache {
     }
 }
 
+/// Get current timestamp in milliseconds since UNIX_EPOCH
+fn current_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// KV cache manager for all layers in a model
 pub struct KVCacheManager {
     /// Cache for each layer (lock-free concurrent access)
@@ -791,6 +1053,10 @@ pub struct KVCacheManager {
     enabled: bool,
     /// Quantization type
     quant_type: KVQuantType,
+    /// Last access timestamp in milliseconds (for LRU eviction)
+    last_access_ms: AtomicU64,
+    /// Access count (for metrics)
+    access_count: AtomicU64,
 }
 
 impl KVCacheManager {
@@ -813,6 +1079,8 @@ impl KVCacheManager {
             max_seq_len,
             enabled: true,
             quant_type,
+            last_access_ms: AtomicU64::new(current_timestamp_ms()),
+            access_count: AtomicU64::new(0),
         }
     }
 
@@ -863,6 +1131,22 @@ impl KVCacheManager {
     /// Get the quantization type
     pub fn quant_type(&self) -> KVQuantType {
         self.quant_type
+    }
+
+    /// Update last access timestamp (for LRU eviction)
+    pub fn touch(&self) {
+        self.last_access_ms.store(current_timestamp_ms(), Ordering::Relaxed);
+        self.access_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Get last access timestamp in milliseconds
+    pub fn last_access(&self) -> u64 {
+        self.last_access_ms.load(Ordering::Relaxed)
+    }
+
+    /// Get access count
+    pub fn access_count(&self) -> u64 {
+        self.access_count.load(Ordering::Relaxed)
     }
 }
 

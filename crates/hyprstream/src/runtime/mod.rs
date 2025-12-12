@@ -35,6 +35,9 @@ pub mod weight_provider; // Weight provider for streaming large models
 // Primary exports - use TorchEngine as default
 pub use torch_engine::{TorchEngine, TextStream, GenerationStats};
 
+// KV cache exports for multi-session support
+pub use kv_cache::{CacheConfig, CacheOwner, KVCacheManager, KVCacheRegistry};
+
 #[derive(Debug, Clone)]
 pub struct MistralEngine;
 

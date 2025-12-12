@@ -1972,22 +1972,43 @@ impl ModelOperations for LlamaModel {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-}
 
-impl LlamaModel {
-    /// Clear KV cache (e.g., for new generation)
-    pub fn clear_kv_cache(&self) {
+    // ============================================================================
+    // KV Cache Management (trait implementation)
+    // ============================================================================
+
+    fn clear_kv_cache(&self) {
         if let Some(cache_ref) = self.kv_cache.as_ref() {
             let cache_manager = cache_ref.lock().unwrap();
             cache_manager.clear_all();
         }
     }
 
-    /// Get KV cache memory usage in bytes
-    pub fn kv_cache_memory_usage(&self) -> usize {
+    fn kv_cache_memory_usage(&self) -> usize {
         self.kv_cache
             .as_ref()
             .map(|cache_ref| cache_ref.lock().unwrap().memory_usage())
             .unwrap_or(0)
     }
+
+    fn set_kv_cache(
+        &mut self,
+        cache: std::sync::Arc<std::sync::Mutex<crate::runtime::kv_cache::KVCacheManager>>,
+    ) {
+        self.kv_cache = Some(cache);
+    }
+
+    fn get_kv_cache(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::runtime::kv_cache::KVCacheManager>>> {
+        self.kv_cache.clone()
+    }
+
+    fn take_kv_cache(
+        &mut self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::runtime::kv_cache::KVCacheManager>>> {
+        self.kv_cache.take()
+    }
 }
+
+// KV cache methods are now defined in the ModelOperations trait implementation above

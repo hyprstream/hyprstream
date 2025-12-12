@@ -324,6 +324,45 @@ pub trait ModelOperations: Send {
 
     /// Downcast to Any for accessing architecture-specific methods
     fn as_any(&self) -> &dyn std::any::Any;
+
+    // ============================================================================
+    // KV Cache Management (for session-based cache isolation)
+    // ============================================================================
+
+    /// Clear the KV cache (for new generation)
+    fn clear_kv_cache(&self) {
+        // Default: no-op for models without KV caching
+    }
+
+    /// Get KV cache memory usage in bytes
+    fn kv_cache_memory_usage(&self) -> usize {
+        0 // Default: no cache
+    }
+
+    /// Set an external KV cache (for session-based cache management)
+    ///
+    /// This allows a KVCacheRegistry to manage caches externally while
+    /// the model uses them for inference.
+    fn set_kv_cache(
+        &mut self,
+        _cache: std::sync::Arc<std::sync::Mutex<crate::runtime::kv_cache::KVCacheManager>>,
+    ) {
+        // Default: no-op for models without configurable cache
+    }
+
+    /// Get the current KV cache (for external management)
+    fn get_kv_cache(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::runtime::kv_cache::KVCacheManager>>> {
+        None // Default: no cache
+    }
+
+    /// Take ownership of the KV cache (removes it from the model)
+    fn take_kv_cache(
+        &mut self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::runtime::kv_cache::KVCacheManager>>> {
+        None // Default: no cache
+    }
 }
 
 /// Attention mechanism types

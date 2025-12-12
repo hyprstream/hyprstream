@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Json, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Sse},
     routing::{get, post},
     Router,
@@ -13,14 +13,14 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::{
     api::openai_compat::{
         ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, CompletionChoice,
         CompletionRequest, CompletionResponse, EmbeddingRequest, ListModelsResponse, Model, Usage,
     },
-    runtime::{FinishReason, GenerationRequest, RuntimeEngine, TorchEngine},
+    runtime::{CacheOwner, FinishReason, GenerationRequest, RuntimeEngine, TorchEngine},
     server::state::ServerState,
 };
 
@@ -90,6 +90,33 @@ impl ErrorResponse {
 // - Invalid temperature/top_p → clamped or falls back to greedy (safe)
 // - max_tokens → enforced by generation loop (safe)
 // Rate limiting should be handled at middleware layer, not per-endpoint
+
+/// Extract cache owner from request headers.
+///
+/// Session management:
+/// - `x-session-id` header: Uses session-based caching (context preserved)
+/// - No header: Generates a stateless request ID (context not preserved)
+///
+/// The session ID is used to route the request to the appropriate KV cache,
+/// allowing multiple concurrent sessions to have isolated context.
+fn extract_cache_owner(headers: &HeaderMap) -> CacheOwner {
+    if let Some(session_id) = headers
+        .get("x-session-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+    {
+        debug!("Using session-based caching for session: {}", session_id);
+        CacheOwner::Session(session_id.to_string())
+    } else {
+        // Stateless request - generate unique ID
+        let request_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        debug!("Using stateless caching for request: {}", request_id);
+        CacheOwner::Stateless(request_id)
+    }
+}
 
 /// Helper: Load model from cache with proper error handling
 async fn load_model_or_error(
@@ -187,14 +214,20 @@ pub fn create_router() -> Router<ServerState> {
 /// Handle chat completion requests
 async fn chat_completions(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {
+    // Extract session/request ID for KV cache routing
+    // TODO: Wire into TorchEngine.set_session() once registry is initialized on model load
+    // This will enable context preservation across requests in the same session
+    let _cache_owner = extract_cache_owner(&headers);
+
     // Debug log the incoming request
     info!(
         "Chat completion request - model: {}, stream: {:?}, messages: {} msgs",
         request.model,
         request.stream,
-        request.messages.len()
+        request.messages.len(),
     );
 
     // Log if streaming is defaulting
@@ -206,7 +239,7 @@ async fn chat_completions(
 
     if request.stream.unwrap_or(false) {
         info!("Handling streaming request");
-        return stream_chat(state, request).await.into_response();
+        return stream_chat(state, headers, request).await.into_response();
     }
     info!("Handling non-streaming request");
 
@@ -340,7 +373,12 @@ async fn chat_completions(
 }
 
 /// Handle streaming chat completions using TextStream
-async fn stream_chat(state: ServerState, request: ChatCompletionRequest) -> impl IntoResponse {
+async fn stream_chat(state: ServerState, headers: HeaderMap, request: ChatCompletionRequest) -> impl IntoResponse {
+    // Extract session/request ID for KV cache routing
+    // TODO: Wire into TorchEngine.set_session() once registry is initialized on model load
+    // This will enable context preservation across requests in the same session
+    let _cache_owner = extract_cache_owner(&headers);
+
     // Create channel for SSE events
     let (tx, rx) = mpsc::channel::<Result<serde_json::Value, anyhow::Error>>(100);
 
