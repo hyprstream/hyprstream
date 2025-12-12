@@ -475,7 +475,7 @@ impl<'a> RepositoryHandle<'a> {
     /// ```
     ///
     /// Fetch LFS files for the worktree
-    async fn fetch_lfs_files(repo_path: &Path) -> Git2DBResult<()> {
+    pub async fn fetch_lfs_files(repo_path: &Path) -> Git2DBResult<()> {
         use tokio::process::Command;
 
         if !repo_path.exists() {
