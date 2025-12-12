@@ -1863,11 +1863,27 @@ impl TorchEngine {
         let lora_model = LoRAModel::new(config.clone(), module_configs, self.device)?;
         let total_params = lora_model.num_parameters();
 
-        // Install the LoRA model into the engine's shared state.
-        // This replaces any previously loaded LoRA model.
+        // Create trainer for gradient updates during training.
+        // The trainer uses the model's VarStore for parameter optimization.
+        let training_config = crate::lora::TrainingConfig {
+            learning_rate: config.learning_rate as f64,
+            ..Default::default()
+        };
+        let trainer = crate::lora::trainer::LoRATrainer::new(
+            &lora_model.vs,
+            self.device,
+            training_config,
+        )?;
+
+        // Install the LoRA model and trainer into the engine's shared state.
+        // This replaces any previously loaded LoRA model/trainer.
         {
             let mut lora_guard = self.handle_poison(self.lora_model.lock())?;
             *lora_guard = Some(lora_model);
+        }
+        {
+            let mut trainer_guard = self.handle_poison(self.lora_trainer.lock())?;
+            *trainer_guard = Some(trainer);
         }
 
         tracing::info!(

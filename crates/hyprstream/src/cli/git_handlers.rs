@@ -673,7 +673,12 @@ fn save_training_mode_config(
         target_adapter: Some(target_adapter.to_string()),
         learning_rate: learning_rate.unwrap_or(1e-4) as f64,
         batch_size: batch_size.unwrap_or(4),
-        ..Default::default()
+        // Use sensible defaults for training (not Rust's Default which is 0)
+        min_buffer_size: 1,   // Train after first quality example
+        steps_per_cycle: 10,  // 10 training steps per cycle
+        min_quality_threshold: 0.3,
+        train_after_examples: 1,  // Start training immediately
+        train_base_model: false,
     };
 
     ModelConfig::save_training_config(model_path, &training_config)?;

@@ -973,7 +973,7 @@ pub enum FinishReason {
 ///
 /// This allows inference to automatically collect training examples when enabled.
 /// The training mode is set via `hyprstream lt --training-mode self_supervised`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HyprstreamTrainingConfig {
     /// Training mode: disabled, self_supervised, supervised
     #[serde(default)]
@@ -1015,6 +1015,22 @@ impl HyprstreamTrainingConfig {
     /// Check if training is enabled (mode != Disabled)
     pub fn is_enabled(&self) -> bool {
         self.mode != TrainingMode::Disabled
+    }
+}
+
+impl Default for HyprstreamTrainingConfig {
+    fn default() -> Self {
+        Self {
+            mode: TrainingMode::default(),
+            target_adapter: None,
+            learning_rate: default_training_learning_rate(),
+            batch_size: default_training_batch_size(),
+            min_buffer_size: default_training_min_buffer_size(),
+            steps_per_cycle: default_training_steps_per_cycle(),
+            min_quality_threshold: default_training_min_quality(),
+            train_base_model: false,
+            train_after_examples: default_training_train_after(),
+        }
     }
 }
 
