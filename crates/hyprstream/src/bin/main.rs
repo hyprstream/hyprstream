@@ -525,6 +525,17 @@ fn main() -> Result<()> {
             max_context,
             kv_quant,
         } => {
+            // Read prompt from stdin if not provided via --prompt
+            let prompt = match prompt {
+                Some(p) => p,
+                None => {
+                    use std::io::Read;
+                    let mut buffer = String::new();
+                    std::io::stdin().read_to_string(&mut buffer)?;
+                    buffer.trim().to_string()
+                }
+            };
+
             let ctx = ctx.clone();
             with_runtime(
                 RuntimeConfig {

@@ -180,9 +180,9 @@ pub enum Commands {
         /// Model reference (e.g., "Qwen3-4B", "qwen/qwen-2b", "model:branch")
         model: String,
 
-        /// Prompt text
+        /// Prompt text (reads from stdin if not provided)
         #[arg(short, long)]
-        prompt: String,
+        prompt: Option<String>,
 
         /// Image file path for multimodal models (e.g., --image /path/to/image.jpg)
         #[arg(short = 'i', long)]
