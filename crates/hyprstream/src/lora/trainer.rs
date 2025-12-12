@@ -307,34 +307,30 @@ impl LoRATrainer {
         labels: &Tensor,
         forward_fn: impl Fn(&Tensor, Option<&Tensor>, bool) -> Result<Tensor>,
     ) -> Result<f64> {
-        // Disable gradients for evaluation
-        tch::no_grad(|| {});
+        // Disable gradients for entire evaluation block
+        tch::no_grad(|| {
+            // Forward pass without dropout
+            let logits = forward_fn(input_ids, None, false)?;
 
-        // Forward pass without dropout
-        let logits = forward_fn(input_ids, None, false)?;
+            // Compute loss
+            let batch_size = logits.size()[0];
+            let seq_len = logits.size()[1];
+            let vocab_size = logits.size()[2];
 
-        // Compute loss
-        let batch_size = logits.size()[0];
-        let seq_len = logits.size()[1];
-        let vocab_size = logits.size()[2];
+            let logits_flat = logits.view([batch_size * seq_len, vocab_size]);
+            let labels_flat = labels.view([batch_size * seq_len]);
 
-        let logits_flat = logits.view([batch_size * seq_len, vocab_size]);
-        let labels_flat = labels.view([batch_size * seq_len]);
+            let loss = logits_flat.cross_entropy_loss::<Tensor>(
+                &labels_flat,
+                None,
+                Reduction::Mean,
+                -100,
+                0.0,
+            );
 
-        let loss = logits_flat.cross_entropy_loss::<Tensor>(
-            &labels_flat,
-            None,
-            Reduction::Mean,
-            -100,
-            0.0,
-        );
-
-        let loss_value = loss.double_value(&[]);
-
-        // Re-enable gradients
-        // Gradient tracking enabled by default in training
-
-        Ok(loss_value)
+            let loss_value = loss.double_value(&[]);
+            Ok(loss_value)
+        })
     }
 
     /// Get current learning rate

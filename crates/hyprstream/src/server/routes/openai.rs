@@ -20,8 +20,10 @@ use crate::{
         ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, CompletionChoice,
         CompletionRequest, CompletionResponse, EmbeddingRequest, ListModelsResponse, Model, Usage,
     },
-    runtime::{CacheOwner, FinishReason, GenerationRequest, RuntimeEngine, TorchEngine},
+    config::TrainingMode,
+    runtime::{model_config::ModelConfig, CacheOwner, FinishReason, GenerationRequest, RuntimeEngine, TorchEngine},
     server::state::ServerState,
+    training::{ReplayBufferConfig, SelfSupervisedConfig, SelfSupervisedTrainer},
 };
 
 /// RAII guard for metrics cleanup
@@ -477,6 +479,9 @@ async fn stream_chat(state: ServerState, headers: HeaderMap, request: ChatComple
             debug!("Could not set session (registry may not be initialized): {}", e);
         }
 
+        // Keep a copy for training (prompt is moved into request builder)
+        let prompt_for_training = prompt.clone();
+
         let gen_request = GenerationRequest::builder(prompt)
             .apply_config(&(&defaults).into())
             .apply_config(&crate::config::SamplingParams::from_model_path(&model_path).await.unwrap_or_default())
@@ -517,11 +522,15 @@ async fn stream_chat(state: ServerState, headers: HeaderMap, request: ChatComple
         });
         let _ = tx.send(Ok(initial_msg)).await;
 
-        // Consume text chunks from stream
+        // Consume text chunks from stream (collect for training)
         info!("Starting streaming generation...");
+        let mut full_response = String::new();
         while let Some(text_result) = text_stream.next().await {
             match text_result {
                 Ok(text) => {
+                    // Collect for training
+                    full_response.push_str(&text);
+
                     // Send text chunk
                     let chunk = serde_json::json!({
                         "id": stream_id,
@@ -564,6 +573,88 @@ async fn stream_chat(state: ServerState, headers: HeaderMap, request: ChatComple
             stats.tokens_generated as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
+
+        // Collect training example if self-supervised training is enabled
+        if let Some(ref qm) = stats.quality_metrics {
+            // Check if training is enabled for this model
+            if let Some(tc) = ModelConfig::load_training_config(&model_path) {
+                if tc.is_enabled() && tc.mode == TrainingMode::SelfSupervised {
+                    // Get or create trainer for this model
+                    let trainer = state.trainers
+                        .entry(model_name.clone())
+                        .or_insert_with(|| {
+                            let ss_config = SelfSupervisedConfig {
+                                learning_rate: tc.learning_rate,
+                                batch_size: tc.batch_size,
+                                min_buffer_size: tc.min_buffer_size,
+                                steps_per_cycle: tc.steps_per_cycle,
+                                ..Default::default()
+                            };
+                            let buffer_config = ReplayBufferConfig {
+                                min_quality_threshold: tc.min_quality_threshold,
+                                ..Default::default()
+                            };
+                            Arc::new(SelfSupervisedTrainer::new(ss_config, buffer_config))
+                        })
+                        .clone();
+
+                    // Tokenize for training using the engine
+                    let tokenize = |text: &str| -> Result<Vec<i64>, anyhow::Error> {
+                        let engine_guard = engine_arc.blocking_lock();
+                        let tokenizer = engine_guard.get_tokenizer()?;
+                        let encoding = tokenizer
+                            .encode(text, false)
+                            .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
+                        Ok(encoding.get_ids().iter().map(|&id| id as i64).collect())
+                    };
+
+                    match (tokenize(&prompt_for_training), tokenize(&full_response)) {
+                        (Ok(prompt_tokens), Ok(response_tokens)) => {
+                            // Extract session ID if present for session-based filtering
+                            let session_id = match &cache_owner {
+                                CacheOwner::Session(id) => Some(id.clone()),
+                                _ => None,
+                            };
+
+                            trainer
+                                .add_example(prompt_tokens, response_tokens, qm.clone(), session_id)
+                                .await;
+
+                            debug!(
+                                "Training example collected for model {}: quality={:.3}, buffer_size={}",
+                                model_name,
+                                qm.quality_score(),
+                                trainer.replay_buffer.len().await
+                            );
+
+                            // Note: Training cycles are triggered asynchronously
+                            // We don't block the response - training happens in background
+                            if trainer.ready_to_train().await {
+                                let trainer_clone = trainer.clone();
+                                let engine_clone = engine_arc.clone();
+                                tokio::spawn(async move {
+                                    let mut engine = engine_clone.lock().await;
+                                    match trainer_clone.train_cycle(&mut engine).await {
+                                        Ok(result) => {
+                                            info!(
+                                                "Training cycle complete: {} steps, loss={:.4}",
+                                                result.steps, result.total_loss
+                                            );
+                                        }
+                                        Err(e) => {
+                                            error!("Training cycle failed: {}", e);
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                        (Err(e), _) | (_, Err(e)) => {
+                            debug!("Failed to tokenize for training: {}", e);
+                        }
+                    }
+                }
+            }
+        }
 
         // Send completion message with finish reason
         let finish_reason = match stats.finish_reason {

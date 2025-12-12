@@ -4,7 +4,9 @@ use super::model_cache::ModelCache;
 use crate::{
     api::training_service::TrainingService,
     storage::ModelStorage,
+    training::SelfSupervisedTrainer,
 };
+use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -22,6 +24,10 @@ pub struct ServerState {
 
     /// Training service for auto-regressive learning
     pub training_service: Arc<TrainingService>,
+
+    /// Self-supervised trainers per model (model_ref -> trainer)
+    /// Each model with training enabled gets its own trainer instance
+    pub trainers: Arc<DashMap<String, Arc<SelfSupervisedTrainer>>>,
 
     /// Server configuration (from unified config system)
     pub config: Arc<ServerConfig>,
@@ -115,10 +121,14 @@ impl ServerState {
         // Initialize metrics
         let metrics = Arc::new(Metrics::default());
 
+        // Initialize self-supervised trainers map (trainers are created lazily per model)
+        let trainers = Arc::new(DashMap::new());
+
         Ok(Self {
             model_cache,
             model_storage,
             training_service,
+            trainers,
             config: Arc::new(config),
             metrics,
         })

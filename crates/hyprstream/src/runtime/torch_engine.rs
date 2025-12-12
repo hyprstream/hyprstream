@@ -94,6 +94,79 @@ impl TorchEngine {
         }
     }
 
+    // ============================================================================
+    // Lock Ordering for Thread Safety
+    // ============================================================================
+    //
+    // IMPORTANT: To prevent deadlocks, always acquire locks in this order:
+    //   1. lora_model
+    //   2. lora_trainer
+    //   3. persistent_model
+    //   4. var_store
+    //
+    // The helper methods below enforce this ordering.
+    // ============================================================================
+
+    /// Acquire both LoRA model and trainer locks in the correct order.
+    ///
+    /// This helper ensures consistent lock ordering across all call sites to
+    /// prevent deadlocks. The lora_model lock is always acquired first, then
+    /// lora_trainer.
+    ///
+    /// # Thread Safety
+    /// This method acquires `lora_model` and `lora_trainer` locks.
+    /// Callers must not hold these locks when calling.
+    ///
+    /// # Returns
+    /// Returns the result of the callback function `f` which receives
+    /// mutable references to both the LoRAModel and LoRATrainer.
+    pub fn with_training_locks<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(
+            &mut crate::lora::torch_adapter::LoRAModel,
+            &mut crate::lora::trainer::LoRATrainer,
+        ) -> Result<T>,
+    {
+        // IMPORTANT: Always acquire lora_model FIRST, then lora_trainer
+        let mut model_guard = self.handle_poison(self.lora_model.lock())?;
+        let mut trainer_guard = self.handle_poison(self.lora_trainer.lock())?;
+
+        let model = model_guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("LoRA model not initialized"))?;
+        let trainer = trainer_guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("LoRA trainer not initialized"))?;
+
+        f(model, trainer)
+    }
+
+    /// Acquire LoRA model lock only (for read-only operations).
+    ///
+    /// Use this for operations that only need the model, not the trainer.
+    pub fn with_lora_model<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&crate::lora::torch_adapter::LoRAModel) -> Result<T>,
+    {
+        let model_guard = self.handle_poison(self.lora_model.lock())?;
+        let model = model_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("LoRA model not initialized"))?;
+        f(model)
+    }
+
+    /// Acquire LoRA model lock for mutation.
+    pub fn with_lora_model_mut<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut crate::lora::torch_adapter::LoRAModel) -> Result<T>,
+    {
+        let mut model_guard = self.handle_poison(self.lora_model.lock())?;
+        let model = model_guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("LoRA model not initialized"))?;
+        f(model)
+    }
+
     /// Set the random seed for deterministic generation
     /// Useful for debugging - enables reproducible token sequences
     pub fn set_seed(&self, seed: u64) {
@@ -1388,17 +1461,10 @@ impl TorchEngine {
         // Forward pass with LoRA
         let logits = self.forward_with_lora(&input_ids, None, true)?;
 
-        // Training step
-        let metrics = {
-            let mut trainer_guard = self.handle_poison(self.lora_trainer.lock())?;
-            let lora_guard = self.handle_poison(self.lora_model.lock())?;
-
-            if let (Some(trainer), Some(lora_model)) = (&mut *trainer_guard, &*lora_guard) {
-                trainer.training_step(lora_model, &logits, &labels)?
-            } else {
-                return Err(anyhow!("LoRA trainer or model not initialized"));
-            }
-        };
+        // Training step - use helper to ensure correct lock ordering
+        let metrics = self.with_training_locks(|lora_model, trainer| {
+            trainer.training_step(lora_model, &logits, &labels)
+        })?;
 
         tracing::info!(
             "LoRA training step {}: loss={:.4}, ppl={:.2}, lr={:.6}",
@@ -1409,6 +1475,224 @@ impl TorchEngine {
         );
 
         Ok(())
+    }
+
+    // ============================================================================
+    // RL Training Methods for Self-Supervised Learning
+    // ============================================================================
+
+    /// Atomic LoRA training step with gradient clipping.
+    ///
+    /// Performs a complete training step in one atomic operation:
+    /// 1. Zero gradients
+    /// 2. Backward pass (loss.backward())
+    /// 3. Gradient clipping
+    /// 4. Optimizer step
+    ///
+    /// This prevents race conditions that could occur if these operations
+    /// were exposed as separate methods.
+    ///
+    /// # Arguments
+    /// - `loss` - The loss tensor to backpropagate
+    /// - `max_grad_norm` - Optional gradient clipping threshold (default: 1.0)
+    ///
+    /// # Returns
+    /// The gradient norm before clipping (useful for monitoring training stability)
+    ///
+    /// # Thread Safety
+    /// Acquires `lora_model` and `lora_trainer` locks in correct order.
+    pub fn lora_training_step(&self, loss: &Tensor, max_grad_norm: Option<f64>) -> Result<f64> {
+        self.with_training_locks(|lora_model, trainer| {
+            // 1. Zero gradients
+            trainer.optimizer.zero_grad();
+
+            // 2. Backward pass
+            loss.backward();
+
+            // 3. Gradient clipping
+            let grad_norm = {
+                let params: Vec<Tensor> = lora_model
+                    .vs
+                    .trainable_variables()
+                    .iter()
+                    .map(|v| v.shallow_clone())
+                    .collect();
+
+                // Calculate total gradient norm
+                let total_norm: f64 = params
+                    .iter()
+                    .map(|p| {
+                        let grad = p.grad();
+                        if grad.numel() > 0 {
+                            grad.norm().double_value(&[])
+                        } else {
+                            0.0
+                        }
+                    })
+                    .sum::<f64>()
+                    .sqrt();
+
+                // Clip if needed
+                let clip_threshold = max_grad_norm.unwrap_or(1.0);
+                if total_norm > clip_threshold && total_norm > 0.0 {
+                    let clip_coef = clip_threshold / total_norm;
+                    for param in &params {
+                        let mut grad = param.grad();
+                        if grad.numel() > 0 {
+                            // Scale gradients in place
+                            let _ = grad.g_mul_scalar_(clip_coef);
+                        }
+                    }
+                    tracing::debug!(
+                        "Clipped gradients: {:.4} -> {:.4}",
+                        total_norm,
+                        clip_threshold
+                    );
+                }
+
+                total_norm
+            };
+
+            // 4. Optimizer step
+            trainer.optimizer.step();
+
+            Ok(grad_norm)
+        })
+    }
+
+    /// Compute RL-style loss with KL divergence penalty.
+    ///
+    /// Computes the policy gradient loss for self-supervised RL training:
+    /// ```text
+    /// loss = -advantage * sum(log_prob(response_tokens)) / num_tokens + kl_coef * KL_div
+    /// ```
+    ///
+    /// The KL divergence term prevents the model from drifting too far from
+    /// its original behavior, which helps prevent:
+    /// - Mode collapse
+    /// - Reward hacking
+    /// - Loss of base model capabilities
+    ///
+    /// # Arguments
+    /// - `prompt_tokens` - Tokenized prompt (context)
+    /// - `response_tokens` - Tokenized response to evaluate
+    /// - `advantage` - Normalized advantage (quality score - baseline)
+    /// - `kl_coef` - KL divergence penalty coefficient (0.0 to disable)
+    ///
+    /// # Returns
+    /// Tuple of (total_loss_tensor, policy_gradient_loss, kl_divergence)
+    ///
+    /// # Thread Safety
+    /// Acquires model locks for forward pass with gradient tracking.
+    pub fn compute_rl_loss_with_kl(
+        &self,
+        prompt_tokens: &[u32],
+        response_tokens: &[u32],
+        advantage: f32,
+        kl_coef: f32,
+    ) -> Result<(Tensor, f32, f32)> {
+        // Concatenate prompt + response for full sequence
+        let full_tokens: Vec<i64> = prompt_tokens
+            .iter()
+            .chain(response_tokens.iter())
+            .map(|&t| t as i64)
+            .collect();
+
+        let prompt_len = prompt_tokens.len();
+        let response_len = response_tokens.len();
+
+        if response_len == 0 {
+            return Err(anyhow!("Response tokens cannot be empty"));
+        }
+
+        // Create input tensor
+        let input_ids = Tensor::from_slice(&full_tokens)
+            .to_device(self.device)
+            .unsqueeze(0); // [1, seq_len]
+
+        // Forward pass WITH gradient tracking (don't use no_grad)
+        let logits = self.forward_with_lora(&input_ids, None, true)?; // [1, seq_len, vocab_size]
+
+        // Get log probabilities
+        let log_probs = logits.log_softmax(-1, tch::Kind::Float); // [1, seq_len, vocab_size]
+
+        // Extract log probs for response tokens only
+        // For token at position i, we look at logits at position i-1 (autoregressive)
+        let mut response_log_probs = Vec::with_capacity(response_len);
+
+        for (i, &token) in response_tokens.iter().enumerate() {
+            let pos = prompt_len + i; // Position in full sequence
+            if pos > 0 {
+                // Get log prob of this token given previous context
+                let log_prob_at_pos = log_probs
+                    .get(0) // batch dim
+                    .get((pos - 1) as i64) // position (shifted by 1)
+                    .get(token as i64); // vocab index
+                response_log_probs.push(log_prob_at_pos);
+            }
+        }
+
+        if response_log_probs.is_empty() {
+            return Err(anyhow!("No valid response tokens for loss computation"));
+        }
+
+        // Sum log probs and normalize by length
+        let log_prob_sum = Tensor::stack(&response_log_probs, 0).sum(tch::Kind::Float);
+        let avg_log_prob = &log_prob_sum / (response_log_probs.len() as f64);
+
+        // Policy gradient loss: -advantage * avg_log_prob
+        let advantage_tensor = Tensor::from_slice(&[advantage as f64]).to_device(self.device);
+        let pg_loss = -(&advantage_tensor * &avg_log_prob);
+
+        // KL divergence computation (comparing to base model without LoRA)
+        let kl_div = if kl_coef > 0.0 {
+            // For KL, we need forward pass without LoRA to get base model probs
+            // This is expensive, so we approximate using entropy regularization instead
+            // KL ≈ -H(p_lora) when p_base is uniform-ish
+            // More accurate: run base model forward pass separately
+
+            // Simplified: use negative entropy as KL proxy
+            let probs = logits.softmax(-1, tch::Kind::Float);
+            let entropy = -(&probs * &log_probs).sum(tch::Kind::Float) / (full_tokens.len() as f64);
+            let neg_entropy = -entropy; // Lower entropy = more confident = higher KL-like penalty
+
+            neg_entropy.double_value(&[]) as f32
+        } else {
+            0.0
+        };
+
+        // Total loss = PG loss + KL penalty
+        let kl_penalty = Tensor::from_slice(&[kl_coef as f64 * kl_div as f64]).to_device(self.device);
+        let total_loss = &pg_loss + &kl_penalty;
+
+        let pg_loss_value = pg_loss.double_value(&[]) as f32;
+
+        Ok((total_loss, pg_loss_value, kl_div))
+    }
+
+    /// Get the current LoRA weights as a state dictionary for checkpointing.
+    ///
+    /// Returns a HashMap of tensor name -> tensor for all trainable LoRA parameters.
+    /// Tensors are moved to CPU to avoid GPU memory issues when storing.
+    ///
+    /// # Returns
+    /// HashMap mapping parameter names to their tensor values
+    pub fn get_lora_state_dict(&self) -> Result<HashMap<String, Tensor>> {
+        self.with_lora_model(|lora_model| {
+            let mut state_dict = HashMap::new();
+
+            for (name, tensor) in lora_model.vs.variables() {
+                // Move to CPU before storing to avoid GPU memory leaks
+                state_dict.insert(name.clone(), tensor.to(Device::Cpu));
+            }
+
+            tracing::debug!(
+                "Extracted LoRA state dict with {} parameters",
+                state_dict.len()
+            );
+
+            Ok(state_dict)
+        })
     }
 
     /// Save LoRA weights

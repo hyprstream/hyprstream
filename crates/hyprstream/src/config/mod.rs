@@ -964,3 +964,89 @@ pub enum FinishReason {
     Error(String),
     Stop,
 }
+
+// =============================================================================
+// Training Mode Configuration (Phase D)
+// =============================================================================
+
+/// Model-level training mode configuration (embedded in config.json under "hyprstream_training")
+///
+/// This allows inference to automatically collect training examples when enabled.
+/// The training mode is set via `hyprstream lt --training-mode self_supervised`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HyprstreamTrainingConfig {
+    /// Training mode: disabled, self_supervised, supervised
+    #[serde(default)]
+    pub mode: TrainingMode,
+
+    /// Target adapter to train (e.g., "01_coding")
+    pub target_adapter: Option<String>,
+
+    /// Learning rate for training
+    #[serde(default = "default_training_learning_rate")]
+    pub learning_rate: f64,
+
+    /// Batch size for training
+    #[serde(default = "default_training_batch_size")]
+    pub batch_size: usize,
+
+    /// Minimum examples in buffer before training triggers
+    #[serde(default = "default_training_min_buffer_size")]
+    pub min_buffer_size: usize,
+
+    /// Training steps per training cycle
+    #[serde(default = "default_training_steps_per_cycle")]
+    pub steps_per_cycle: usize,
+
+    /// Minimum quality score to keep examples (0.0-1.0)
+    #[serde(default = "default_training_min_quality")]
+    pub min_quality_threshold: f32,
+
+    /// Enable training on base model weights (vs LoRA only)
+    #[serde(default)]
+    pub train_base_model: bool,
+
+    /// Trigger training after N examples collected
+    #[serde(default = "default_training_train_after")]
+    pub train_after_examples: usize,
+}
+
+impl HyprstreamTrainingConfig {
+    /// Check if training is enabled (mode != Disabled)
+    pub fn is_enabled(&self) -> bool {
+        self.mode != TrainingMode::Disabled
+    }
+}
+
+/// Training mode for self-supervised learning
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingMode {
+    /// Training disabled (default)
+    #[default]
+    Disabled,
+    /// Self-supervised training using generation quality metrics
+    SelfSupervised,
+    /// Supervised training with explicit training data
+    Supervised,
+}
+
+// Default functions for HyprstreamTrainingConfig
+fn default_training_learning_rate() -> f64 {
+    1e-5
+}
+fn default_training_batch_size() -> usize {
+    4
+}
+fn default_training_min_buffer_size() -> usize {
+    100
+}
+fn default_training_steps_per_cycle() -> usize {
+    10
+}
+fn default_training_min_quality() -> f32 {
+    0.3
+}
+fn default_training_train_after() -> usize {
+    100
+}

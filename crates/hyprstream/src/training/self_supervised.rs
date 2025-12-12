@@ -25,6 +25,7 @@
 //! ```
 
 use crate::runtime::generation_metrics::GenerationQualityMetrics;
+use crate::training::checkpoint::{CheckpointManager, TrainingMetrics, WeightFormat, WeightSnapshot};
 use anyhow::Result;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -306,9 +307,9 @@ pub struct ReplayBufferStats {
 /// Configuration for the self-supervised trainer
 #[derive(Debug, Clone)]
 pub struct SelfSupervisedConfig {
-    /// Learning rate
+    /// Learning rate (recommended: 3e-6 for RL, lower than supervised)
     pub learning_rate: f64,
-    /// Batch size for training
+    /// Batch size for training (recommended: 8-16 for reduced variance)
     pub batch_size: usize,
     /// Minimum examples in buffer before training
     pub min_buffer_size: usize,
@@ -316,7 +317,7 @@ pub struct SelfSupervisedConfig {
     pub steps_per_cycle: usize,
     /// Gradient accumulation steps
     pub gradient_accumulation_steps: usize,
-    /// Maximum gradient norm for clipping
+    /// Maximum gradient norm for clipping (recommended: 0.5 for RL)
     pub max_grad_norm: f64,
     /// Weight decay (L2 regularization)
     pub weight_decay: f64,
@@ -326,21 +327,31 @@ pub struct SelfSupervisedConfig {
     pub quality_exponent: f32,
     /// Baseline for advantage computation (moving average of rewards)
     pub use_baseline: bool,
+    /// Baseline EMA alpha (recommended: 0.1 for faster adaptation)
+    pub baseline_alpha: f32,
+    /// KL divergence penalty coefficient (recommended: 0.05-0.2)
+    /// Prevents model drift from base behavior. Set to 0.0 to disable.
+    pub kl_coef: f32,
+    /// Optional KL target for adaptive KL (if set, kl_coef adjusts automatically)
+    pub kl_target: Option<f32>,
 }
 
 impl Default for SelfSupervisedConfig {
     fn default() -> Self {
         Self {
-            learning_rate: 1e-5,
-            batch_size: 4,
+            learning_rate: 3e-6,      // Lower than supervised for RL stability
+            batch_size: 8,            // Larger for reduced variance
             min_buffer_size: 100,
             steps_per_cycle: 10,
             gradient_accumulation_steps: 4,
-            max_grad_norm: 1.0,
+            max_grad_norm: 0.5,       // More aggressive clipping for RL
             weight_decay: 0.01,
-            train_base_model: false, // Default to LoRA only
-            quality_exponent: 2.0,
+            train_base_model: false,  // Default to LoRA only
+            quality_exponent: 1.5,    // Less extreme reward shaping
             use_baseline: true,
+            baseline_alpha: 0.1,      // Faster baseline adaptation
+            kl_coef: 0.1,             // KL penalty to prevent drift
+            kl_target: None,
         }
     }
 }
@@ -355,6 +366,8 @@ pub struct SelfSupervisedTrainer {
     reward_baseline: Arc<Mutex<f32>>,
     /// Total training steps completed
     steps_completed: Arc<Mutex<usize>>,
+    /// Optional checkpoint manager for weight persistence
+    checkpoint_manager: Option<CheckpointManager>,
 }
 
 impl SelfSupervisedTrainer {
@@ -365,12 +378,43 @@ impl SelfSupervisedTrainer {
             config,
             reward_baseline: Arc::new(Mutex::new(0.5)), // Start at neutral
             steps_completed: Arc::new(Mutex::new(0)),
+            checkpoint_manager: None,
         }
     }
 
     /// Create with default configuration
     pub fn with_defaults() -> Self {
         Self::new(SelfSupervisedConfig::default(), ReplayBufferConfig::default())
+    }
+
+    /// Set checkpoint manager for weight persistence
+    ///
+    /// When set, the trainer will save checkpoints after each training cycle.
+    /// The checkpoint manager can also update a target adapter file for live inference.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let checkpoint_mgr = CheckpointManager::new(model_path)?
+    ///     .with_target_adapter("01_coding".to_string());
+    /// let trainer = SelfSupervisedTrainer::with_defaults()
+    ///     .with_checkpoint_manager(checkpoint_mgr);
+    /// ```
+    pub fn with_checkpoint_manager(mut self, manager: CheckpointManager) -> Self {
+        self.checkpoint_manager = Some(manager);
+        self
+    }
+
+    /// Get the checkpoint manager if set
+    pub fn checkpoint_manager(&self) -> Option<&CheckpointManager> {
+        self.checkpoint_manager.as_ref()
+    }
+
+    /// Take ownership of the checkpoint manager (for shutdown)
+    ///
+    /// This removes the checkpoint manager from the trainer and returns it,
+    /// allowing the caller to properly shutdown the manager.
+    pub fn take_checkpoint_manager(&mut self) -> Option<CheckpointManager> {
+        self.checkpoint_manager.take()
     }
 
     /// Add a training example from a completed generation
@@ -391,7 +435,7 @@ impl SelfSupervisedTrainer {
         // Update reward baseline with exponential moving average
         if self.config.use_baseline {
             let mut baseline = self.reward_baseline.lock().await;
-            let alpha = 0.01; // Smoothing factor
+            let alpha = self.config.baseline_alpha;
             *baseline = *baseline * (1.0 - alpha) + example.reward() * alpha;
         }
 
@@ -441,10 +485,16 @@ impl SelfSupervisedTrainer {
 
     /// Run a single training step
     ///
-    /// Returns the average loss for this step
+    /// Returns the average loss for this step.
+    ///
+    /// This method:
+    /// 1. Samples a batch from the replay buffer
+    /// 2. Normalizes advantages across the batch (critical for RL stability)
+    /// 3. For each example, computes RL loss with KL penalty
+    /// 4. Performs atomic training step (zero_grad -> backward -> clip -> step)
     pub async fn training_step(
         &self,
-        _engine: &mut crate::runtime::TorchEngine,
+        engine: &crate::runtime::TorchEngine,
     ) -> Result<TrainingStepResult> {
         // Sample batch from replay buffer
         let batch = self.replay_buffer.sample(self.config.batch_size).await;
@@ -458,98 +508,137 @@ impl SelfSupervisedTrainer {
             });
         }
 
-        let baseline = *self.reward_baseline.lock().await;
-
-        // Compute rewards and advantages
+        // Compute rewards
         let rewards: Vec<f32> = batch.iter().map(|ex| ex.reward()).collect();
+        let mean_reward = rewards.iter().sum::<f32>() / rewards.len() as f32;
+
+        // Normalize advantages across batch (critical for RL stability!)
+        // advantage_i = (reward_i - mean) / (std + epsilon)
+        let std_reward = {
+            let variance: f32 = rewards
+                .iter()
+                .map(|&r| (r - mean_reward).powi(2))
+                .sum::<f32>()
+                / rewards.len() as f32;
+            variance.sqrt()
+        };
+
         let advantages: Vec<f32> = rewards
             .iter()
             .map(|&r| {
+                // Apply quality exponent for reward shaping
                 let shaped = r.powf(self.config.quality_exponent);
-                if self.config.use_baseline {
-                    shaped - baseline.powf(self.config.quality_exponent)
-                } else {
-                    shaped
-                }
+                let shaped_mean = mean_reward.powf(self.config.quality_exponent);
+                let shaped_std = std_reward.powf(self.config.quality_exponent).max(1e-8);
+
+                // Normalized advantage
+                (shaped - shaped_mean) / shaped_std
             })
             .collect();
 
-        let mean_reward = rewards.iter().sum::<f32>() / rewards.len() as f32;
         let mean_advantage = advantages.iter().sum::<f32>() / advantages.len() as f32;
 
-        // Perform forward pass with gradients for each example
-        // In a full implementation, this would:
-        // 1. Concatenate prompt + response tokens
-        // 2. Forward pass through model
-        // 3. Extract log_probs for response tokens
-        // 4. Compute loss = -advantage * sum(log_probs)
-        // 5. Backward pass and optimizer step
-
+        // Training loop - process each example
         let mut total_loss = 0.0;
+        let mut total_kl = 0.0;
+        let mut successful_steps = 0;
 
-        for (example, advantage) in batch.iter().zip(advantages.iter()) {
-            // Simulate loss computation
-            // Real implementation would compute:
-            //   log_probs = model.forward(prompt + response).log_softmax(-1)
-            //   response_log_probs = log_probs[prompt_len:].gather(response_tokens)
-            //   loss = -advantage * response_log_probs.mean()
-
-            let _sequence_tokens: Vec<i64> = example
+        for (example, &advantage) in batch.iter().zip(advantages.iter()) {
+            // Convert tokens from i64 to u32 for the engine API
+            let prompt_tokens: Vec<u32> = example
                 .prompt_tokens
                 .iter()
-                .chain(example.response_tokens.iter())
-                .copied()
+                .map(|&t| t as u32)
+                .collect();
+            let response_tokens: Vec<u32> = example
+                .response_tokens
+                .iter()
+                .map(|&t| t as u32)
                 .collect();
 
-            // Placeholder: In real implementation, compute actual loss
-            // For now, we use the advantage as a proxy
-            let example_loss = -advantage;
-            total_loss += example_loss;
+            // Skip if response is empty
+            if response_tokens.is_empty() {
+                tracing::debug!("Skipping example with empty response");
+                continue;
+            }
 
-            // Log for debugging
+            // Compute RL loss with KL penalty
+            let (loss, pg_loss, kl_div) = match engine.compute_rl_loss_with_kl(
+                &prompt_tokens,
+                &response_tokens,
+                advantage,
+                self.config.kl_coef,
+            ) {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::warn!("Failed to compute loss for example: {}", e);
+                    continue;
+                }
+            };
+
+            // Atomic training step (zero_grad -> backward -> clip -> step)
+            let grad_norm = match engine.lora_training_step(&loss, Some(self.config.max_grad_norm)) {
+                Ok(norm) => norm,
+                Err(e) => {
+                    tracing::warn!("Failed training step: {}", e);
+                    continue;
+                }
+            };
+
+            total_loss += pg_loss;
+            total_kl += kl_div;
+            successful_steps += 1;
+
+            // Detect training instability
+            if pg_loss.is_nan() || grad_norm > 100.0 {
+                tracing::error!(
+                    "Training instability detected: loss={}, grad_norm={}",
+                    pg_loss,
+                    grad_norm
+                );
+            }
+
             tracing::trace!(
-                "Example: prompt_len={}, response_len={}, reward={:.3}, advantage={:.3}",
+                "Example: prompt_len={}, response_len={}, reward={:.3}, advantage={:.3}, loss={:.4}, kl={:.4}, grad_norm={:.4}",
                 example.prompt_tokens.len(),
                 example.response_tokens.len(),
                 example.reward(),
-                advantage
+                advantage,
+                pg_loss,
+                kl_div,
+                grad_norm
             );
         }
 
-        let loss = total_loss / batch.len() as f32;
-
-        // TODO: Actually apply gradients via engine
-        // This would require exposing gradient computation in TorchEngine
-        // For LoRA training: engine.apply_lora_gradients(loss)?;
-        // For full training: engine.apply_gradients(loss)?;
-
-        // Increment step counter
+        // Update step counter
         {
             let mut steps = self.steps_completed.lock().await;
             *steps += 1;
         }
 
-        // Trigger actual gradient computation if engine supports it
-        if self.config.train_base_model {
-            // Full model training (not yet supported)
-            tracing::debug!("Full model training step (placeholder)");
+        let avg_loss = if successful_steps > 0 {
+            total_loss / successful_steps as f32
         } else {
-            // LoRA training
-            tracing::debug!(
-                "LoRA training step: loss={:.4}, mean_advantage={:.4}",
-                loss,
-                mean_advantage
-            );
-            // engine.train_lora_step(loss)?; // Would need to implement
-        }
+            0.0
+        };
 
-        // Log the loss from quality metrics for self-supervised signal
-        // In practice, we'd compute actual language model loss here
-        let _quality_loss = self.compute_loss(&batch).await;
+        let avg_kl = if successful_steps > 0 {
+            total_kl / successful_steps as f32
+        } else {
+            0.0
+        };
+
+        tracing::debug!(
+            "Training step complete: {} examples, avg_loss={:.4}, avg_kl={:.4}, mean_reward={:.3}",
+            successful_steps,
+            avg_loss,
+            avg_kl,
+            mean_reward
+        );
 
         Ok(TrainingStepResult {
-            loss,
-            batch_size: batch.len(),
+            loss: avg_loss,
+            batch_size: successful_steps,
             mean_reward,
             mean_advantage,
         })
@@ -558,7 +647,7 @@ impl SelfSupervisedTrainer {
     /// Run a full training cycle
     pub async fn train_cycle(
         &self,
-        engine: &mut crate::runtime::TorchEngine,
+        engine: &crate::runtime::TorchEngine,
     ) -> Result<TrainingCycleResult> {
         if !self.ready_to_train().await {
             let buffer_size = self.replay_buffer.len().await;
@@ -603,6 +692,57 @@ impl SelfSupervisedTrainer {
         let mean_loss = total_loss / self.config.steps_per_cycle as f32;
         let mean_reward = total_reward / self.config.steps_per_cycle as f32;
 
+        // Save checkpoint if manager is configured
+        let current_step = *self.steps_completed.lock().await;
+        if let Some(ref checkpoint_mgr) = self.checkpoint_manager {
+            // Get LoRA state dict from engine
+            match engine.get_lora_state_dict() {
+                Ok(state_dict) => {
+                    // Serialize weights to bytes
+                    let weights_bytes = match serialize_state_dict(&state_dict) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            tracing::warn!("Failed to serialize weights for checkpoint: {}", e);
+                            return Ok(TrainingCycleResult {
+                                steps: self.config.steps_per_cycle,
+                                total_loss: mean_loss,
+                                mean_reward,
+                            });
+                        }
+                    };
+
+                    let metrics = TrainingMetrics {
+                        loss: mean_loss,
+                        learning_rate: self.config.learning_rate as f32,
+                        gradient_norm: None,
+                        validation_loss: None,
+                        validation_accuracy: None,
+                        duration_seconds: 0.0,
+                    };
+
+                    // Save checkpoint asynchronously
+                    if let Err(e) = checkpoint_mgr
+                        .write_checkpoint(
+                            WeightSnapshot::Memory {
+                                data: weights_bytes,
+                                format: WeightFormat::SafeTensors,
+                            },
+                            current_step,
+                            Some(metrics),
+                        )
+                        .await
+                    {
+                        tracing::warn!("Failed to save checkpoint at step {}: {}", current_step, e);
+                    } else {
+                        tracing::info!("Checkpoint saved at step {}", current_step);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to get LoRA state dict for checkpoint: {}", e);
+                }
+            }
+        }
+
         tracing::info!(
             "Training cycle complete: mean_loss={:.4}, mean_reward={:.3}",
             mean_loss,
@@ -614,6 +754,17 @@ impl SelfSupervisedTrainer {
             total_loss: mean_loss,
             mean_reward,
         })
+    }
+
+    /// Gracefully shutdown the trainer, including checkpoint manager
+    ///
+    /// This should be called before dropping the trainer to ensure
+    /// all pending checkpoints are saved.
+    pub async fn shutdown(mut self) -> Result<()> {
+        if let Some(checkpoint_mgr) = self.checkpoint_manager.take() {
+            checkpoint_mgr.shutdown().await?;
+        }
+        Ok(())
     }
 
     /// Get training statistics
@@ -633,6 +784,74 @@ impl SelfSupervisedTrainer {
     pub fn config(&self) -> &SelfSupervisedConfig {
         &self.config
     }
+}
+
+/// Serialize a state dict (HashMap<String, Tensor>) to bytes
+///
+/// Uses safetensors format for efficient, safe serialization.
+fn serialize_state_dict(
+    state_dict: &std::collections::HashMap<String, tch::Tensor>,
+) -> Result<Vec<u8>> {
+    use safetensors::tensor::TensorView;
+
+    // We need to collect tensor data into stable storage
+    let tensor_data: Vec<(String, Vec<u8>, Vec<usize>, safetensors::Dtype)> = state_dict
+        .iter()
+        .map(|(name, tensor)| {
+            // Get tensor shape
+            let shape: Vec<usize> = tensor.size().iter().map(|&d| d as usize).collect();
+
+            // Get dtype
+            let dtype = match tensor.kind() {
+                tch::Kind::Float => safetensors::Dtype::F32,
+                tch::Kind::Half => safetensors::Dtype::F16,
+                tch::Kind::BFloat16 => safetensors::Dtype::BF16,
+                tch::Kind::Double => safetensors::Dtype::F64,
+                tch::Kind::Int => safetensors::Dtype::I32,
+                tch::Kind::Int64 => safetensors::Dtype::I64,
+                _ => safetensors::Dtype::F32, // Fallback
+            };
+
+            // Copy tensor data to CPU and convert to bytes
+            let cpu_tensor = tensor.to(tch::Device::Cpu).contiguous();
+            let numel = cpu_tensor.numel();
+            let elem_size = match dtype {
+                safetensors::Dtype::F32 | safetensors::Dtype::I32 => 4,
+                safetensors::Dtype::F16 | safetensors::Dtype::BF16 => 2,
+                safetensors::Dtype::F64 | safetensors::Dtype::I64 => 8,
+                _ => 4,
+            };
+            let data_size = numel * elem_size;
+
+            // Get raw bytes from tensor
+            let mut data = vec![0u8; data_size];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    cpu_tensor.data_ptr() as *const u8,
+                    data.as_mut_ptr(),
+                    data_size,
+                );
+            }
+
+            (name.clone(), data, shape, dtype)
+        })
+        .collect();
+
+    // Build tensor views as owned tuples
+    let tensors: Result<Vec<(String, TensorView)>> = tensor_data
+        .iter()
+        .map(|(name, data, shape, dtype)| {
+            let view = TensorView::new(dtype.clone(), shape.clone(), data.as_slice())
+                .map_err(|e| anyhow::anyhow!("Failed to create tensor view: {}", e))?;
+            Ok((name.clone(), view))
+        })
+        .collect();
+
+    let tensors = tensors?;
+
+    // Serialize to bytes - convert to the format serialize expects
+    safetensors::serialize(tensors, &None)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize tensors: {}", e))
 }
 
 /// Result of a single training step

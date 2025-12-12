@@ -481,3 +481,58 @@ impl Default for ModelConfig {
         }
     }
 }
+
+// =============================================================================
+// Training Configuration Load/Save (Phase D)
+// =============================================================================
+
+impl ModelConfig {
+    /// Load hyprstream training config from the model's config.json
+    ///
+    /// Extracts the `hyprstream_training` section if present, otherwise returns None.
+    pub fn load_training_config(
+        model_path: &Path,
+    ) -> Option<crate::config::HyprstreamTrainingConfig> {
+        let config_path = model_path.join("config.json");
+        if !config_path.exists() {
+            return None;
+        }
+
+        let content = std::fs::read_to_string(&config_path).ok()?;
+        let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+        // Extract hyprstream_training section if present
+        json.get("hyprstream_training")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+
+    /// Save hyprstream training config to the model's config.json
+    ///
+    /// Preserves all other fields in config.json, only updates/inserts `hyprstream_training`.
+    pub fn save_training_config(
+        model_path: &Path,
+        training_config: &crate::config::HyprstreamTrainingConfig,
+    ) -> Result<()> {
+        let config_path = model_path.join("config.json");
+
+        // Read existing config
+        let content = std::fs::read_to_string(&config_path)?;
+        let mut json: serde_json::Value = serde_json::from_str(&content)?;
+
+        // Update or insert hyprstream_training section
+        json["hyprstream_training"] = serde_json::to_value(training_config)?;
+
+        // Write back with pretty formatting
+        let output = serde_json::to_string_pretty(&json)?;
+        std::fs::write(&config_path, output)?;
+
+        info!(
+            "✅ Training config saved to {}: mode={:?}, target_adapter={:?}",
+            config_path.display(),
+            training_config.mode,
+            training_config.target_adapter
+        );
+
+        Ok(())
+    }
+}

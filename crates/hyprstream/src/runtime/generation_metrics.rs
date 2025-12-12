@@ -237,28 +237,51 @@ pub struct GenerationQualityMetrics {
     pub token_count: u32,
 }
 
+/// Weights for quality score components (sum to 1.0)
+const W_CONFIDENCE: f32 = 0.5;
+const W_CONSISTENCY: f32 = 0.2;
+const W_NON_REPETITION: f32 = 0.3;
+
 impl GenerationQualityMetrics {
-    /// Compute a simple quality score from metrics
+    /// Compute a quality score from metrics using weighted additive formula
     ///
-    /// Higher score = better quality generation
+    /// Higher score = better quality generation (range: 0.0 to 1.0)
     ///
     /// # Formula
+    /// Uses weighted additive combination (avoids multiplicative dead zones):
     /// ```text
-    /// score = 1.0 / (1.0 + perplexity/10.0)  // Confidence component
-    ///       * (1.0 - entropy_variance.min(1.0))  // Consistency component
-    ///       * (1.0 - repetition_ratio)  // Non-repetition component
+    /// confidence = 1.0 / (1.0 + max(0, ln(perplexity/10)))  // Log-space normalization
+    /// consistency = exp(-min(entropy_variance, 2.0))        // Exponential decay
+    /// non_repetition = 1.0 - sqrt(repetition_ratio)         // Sqrt for less aggressive penalty
+    ///
+    /// score = 0.5 * confidence + 0.2 * consistency + 0.3 * non_repetition
     /// ```
+    ///
+    /// The additive formula ensures:
+    /// - No single bad metric can zero the entire score
+    /// - More interpretable component contributions
+    /// - Better gradient signals for RL training
     pub fn quality_score(&self) -> f32 {
-        // Normalize perplexity to 0-1 range (lower perplexity = higher score)
-        let confidence = 1.0 / (1.0 + self.perplexity / 10.0);
+        // Log-space normalization for perplexity (more stable for large values)
+        // perplexity of 10 -> ln(1) = 0 -> confidence = 1.0
+        // perplexity of 100 -> ln(10) ≈ 2.3 -> confidence ≈ 0.30
+        // perplexity of 1000 -> ln(100) ≈ 4.6 -> confidence ≈ 0.18
+        let confidence = 1.0 / (1.0 + (self.perplexity / 10.0).ln().max(0.0));
 
-        // Consistency: penalize high entropy variance
-        let consistency = 1.0 - self.entropy_variance.min(1.0);
+        // Exponential decay for entropy variance (smoother penalty)
+        // variance of 0 -> exp(0) = 1.0
+        // variance of 1 -> exp(-1) ≈ 0.37
+        // variance of 2 -> exp(-2) ≈ 0.14
+        let consistency = (-self.entropy_variance.min(2.0)).exp();
 
-        // Non-repetition: penalize repeated n-grams
-        let non_repetition = 1.0 - self.repetition_ratio;
+        // Sqrt for repetition (less aggressive penalty for small amounts)
+        // ratio of 0.0 -> 1.0
+        // ratio of 0.1 -> 1 - 0.316 ≈ 0.68
+        // ratio of 0.5 -> 1 - 0.707 ≈ 0.29
+        let non_repetition = 1.0 - self.repetition_ratio.sqrt();
 
-        confidence * consistency * non_repetition
+        // Weighted additive combination
+        W_CONFIDENCE * confidence + W_CONSISTENCY * consistency + W_NON_REPETITION * non_repetition
     }
 
     /// Check if metrics indicate potentially problematic generation
@@ -413,7 +436,20 @@ mod tests {
             repetition_ratio: 0.0,
             token_count: 100,
         };
-        assert!(good.quality_score() > 0.7);
+        // With additive formula: 0.5*1.0 + 0.2*0.90 + 0.3*1.0 ≈ 0.98
+        assert!(good.quality_score() > 0.9);
+
+        // Medium generation: moderate metrics
+        let medium = GenerationQualityMetrics {
+            perplexity: 20.0, // ln(2) ≈ 0.69 → confidence ≈ 0.59
+            avg_entropy: 3.0,
+            entropy_variance: 1.0, // exp(-1) ≈ 0.37
+            repetition_ratio: 0.1, // sqrt(0.1) ≈ 0.32 → non_rep ≈ 0.68
+            token_count: 100,
+        };
+        // score ≈ 0.5*0.59 + 0.2*0.37 + 0.3*0.68 ≈ 0.30 + 0.07 + 0.20 ≈ 0.57
+        let med_score = medium.quality_score();
+        assert!(med_score > 0.4 && med_score < 0.7, "medium score: {}", med_score);
 
         // Bad generation: high perplexity, high variance, lots of repetition
         let bad = GenerationQualityMetrics {
@@ -423,7 +459,9 @@ mod tests {
             repetition_ratio: 0.5,
             token_count: 100,
         };
-        assert!(bad.quality_score() < 0.1);
+        // With additive formula: 0.5*0.30 + 0.2*0.14 + 0.3*0.29 ≈ 0.27
+        // (still gets some credit from each component - no dead zones!)
+        assert!(bad.quality_score() < 0.35);
     }
 
     #[test]

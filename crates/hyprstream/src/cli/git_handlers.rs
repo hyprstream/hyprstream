@@ -1,14 +1,20 @@
 //! Handlers for git-style CLI commands
 
 use crate::cli::commands::model::GitInfo;
-use crate::config::GenerationRequest;
+use crate::config::{GenerationRequest, TrainingMode};
 // Sampling config now loaded via builder pattern
+use crate::runtime::model_config::ModelConfig;
 use crate::runtime::template_engine::ChatMessage;
 use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
 use crate::storage::{CheckoutOptions, GitRef, ModelRef, ModelStorage};
+use crate::training::{
+    checkpoint::{CheckpointConfig, CheckpointManager},
+    ReplayBufferConfig, SelfSupervisedConfig, SelfSupervisedTrainer,
+};
 use anyhow::{bail, Result};
 use std::io::{self, Write};
-use tracing::{debug, info};
+use std::sync::Arc;
+use tracing::{debug, info, warn};
 
 /// Handle branch command
 pub async fn handle_branch(
@@ -402,6 +408,7 @@ pub async fn handle_lora_train(
     batch_size: Option<usize>,
     epochs: Option<usize>,
     config: Option<String>,
+    training_mode: Option<String>,
 ) -> Result<()> {
     let model_ref = ModelRef::parse(model_ref_str)?;
 
@@ -481,6 +488,11 @@ pub async fn handle_lora_train(
 
         println!("\n✓ Initialized adapter: adapters/{}.safetensors", indexed_adapter_name);
         println!("✓ Created config: adapters/{}.config.json", indexed_adapter_name);
+
+        // Save training mode to config.json if specified
+        if let Some(ref mode_str) = training_mode {
+            save_training_mode_config(&worktree_path, mode_str, &indexed_adapter_name, learning_rate, batch_size)?;
+        }
 
         println!("\n✓ Isolated training complete!");
         println!("\n→ Next steps:");
@@ -618,6 +630,11 @@ pub async fn handle_lora_train(
         indexed_adapter_name
     );
 
+    // Save training mode to config.json if specified
+    if let Some(ref mode_str) = training_mode {
+        save_training_mode_config(&model_path, mode_str, &indexed_adapter_name, learning_rate, batch_size)?;
+    }
+
     println!("\n✓ Adapter initialization complete!");
     println!("\n→ Next steps:");
     println!("  1. Check status: hyprstream status {}", model_ref.model);
@@ -626,6 +643,50 @@ pub async fn handle_lora_train(
         "  3. Commit changes: hyprstream commit {} -m \"Added {} adapter\"",
         model_ref.model, indexed_adapter_name
     );
+
+    Ok(())
+}
+
+/// Helper function to save training mode configuration to config.json
+fn save_training_mode_config(
+    model_path: &std::path::Path,
+    mode_str: &str,
+    target_adapter: &str,
+    learning_rate: Option<f32>,
+    batch_size: Option<usize>,
+) -> Result<()> {
+    use crate::config::{HyprstreamTrainingConfig, TrainingMode};
+    use crate::runtime::model_config::ModelConfig;
+
+    let mode = match mode_str.to_lowercase().as_str() {
+        "self_supervised" | "self-supervised" => TrainingMode::SelfSupervised,
+        "supervised" => TrainingMode::Supervised,
+        "disabled" | "off" | "none" => TrainingMode::Disabled,
+        _ => {
+            warn!("Unknown training mode '{}', defaulting to disabled", mode_str);
+            TrainingMode::Disabled
+        }
+    };
+
+    let training_config = HyprstreamTrainingConfig {
+        mode: mode.clone(),
+        target_adapter: Some(target_adapter.to_string()),
+        learning_rate: learning_rate.unwrap_or(1e-4) as f64,
+        batch_size: batch_size.unwrap_or(4),
+        ..Default::default()
+    };
+
+    ModelConfig::save_training_config(model_path, &training_config)?;
+
+    match mode {
+        TrainingMode::Disabled => println!("✓ Training mode set to: disabled"),
+        TrainingMode::SelfSupervised => {
+            println!("✓ Training mode set to: self_supervised");
+            println!("  → Inference will automatically collect training examples");
+            println!("  → Training cycles will trigger after {} high-quality examples", training_config.min_buffer_size);
+        }
+        TrainingMode::Supervised => println!("✓ Training mode set to: supervised"),
+    }
 
     Ok(())
 }
@@ -1330,11 +1391,67 @@ pub async fn handle_infer(
         tracing::info!("No LoRA adapters found in model directory - using base model only");
     }
 
-    // Clear any previously loaded LoRA (in case of manual loads)
-    {
-        let mut lora_guard = engine.active_lora.lock().unwrap();
-        *lora_guard = None;
-    }
+    // Note: Do NOT clear active_lora here - adapter loading above correctly sets it.
+    // The loaded adapter weights should persist for inference + training.
+
+    // Check for training mode in config.json
+    let training_config = ModelConfig::load_training_config(&model_path);
+    let trainer: Option<Arc<SelfSupervisedTrainer>> = if let Some(ref tc) = training_config {
+        if tc.is_enabled() && tc.mode == TrainingMode::SelfSupervised {
+            info!(
+                "Self-supervised training enabled, target_adapter: {:?}",
+                tc.target_adapter
+            );
+            let ss_config = SelfSupervisedConfig {
+                learning_rate: tc.learning_rate,
+                batch_size: tc.batch_size,
+                min_buffer_size: tc.min_buffer_size,
+                steps_per_cycle: tc.steps_per_cycle,
+                ..Default::default()
+            };
+            let buffer_config = ReplayBufferConfig {
+                min_quality_threshold: tc.min_quality_threshold,
+                ..Default::default()
+            };
+
+            // Create trainer with checkpoint manager if target_adapter is set
+            let mut trainer = SelfSupervisedTrainer::new(ss_config, buffer_config);
+
+            if let Some(ref target_adapter) = tc.target_adapter {
+                // Create checkpoint manager for weight persistence
+                let checkpoint_config = CheckpointConfig {
+                    max_checkpoints: 5,
+                    git_commit_interval: tc.steps_per_cycle * 10, // Commit every 10 cycles
+                    queue_size: 10,
+                };
+
+                match CheckpointManager::with_config(
+                    model_path.clone(),
+                    checkpoint_config,
+                    None,
+                ) {
+                    Ok(checkpoint_mgr) => {
+                        let checkpoint_mgr =
+                            checkpoint_mgr.with_target_adapter(target_adapter.clone());
+                        trainer = trainer.with_checkpoint_manager(checkpoint_mgr);
+                        info!(
+                            "Checkpoint manager initialized, target_adapter: {}",
+                            target_adapter
+                        );
+                    }
+                    Err(e) => {
+                        warn!("Failed to create checkpoint manager: {}", e);
+                    }
+                }
+            }
+
+            Some(Arc::new(trainer))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Apply chat template to the prompt
     let formatted_prompt = {
@@ -1351,6 +1468,9 @@ pub async fn handle_infer(
             }
         }
     };
+
+    // Keep a copy for training (prompt is moved into request builder)
+    let formatted_prompt_for_training = formatted_prompt.clone();
 
     let mut request_builder = GenerationRequest::builder(formatted_prompt)
         .apply_config(&crate::config::SamplingParams::from_model_path(&model_path).await.unwrap_or_default())
@@ -1378,32 +1498,87 @@ pub async fn handle_infer(
 
     let mut text_stream = engine.generate(request)?;
 
+    // Collect full response text (needed for training)
+    let mut full_response = String::new();
+
     if stream {
         println!();
         while let Some(text_chunk) = text_stream.next().await {
-            print!("{}", text_chunk?);
+            let chunk = text_chunk?;
+            full_response.push_str(&chunk);
+            print!("{}", chunk);
             let _ = io::stdout().flush();
         }
         println!();
-        let stats = text_stream.stats();
-        info!("Generated {} tokens in {}ms ({:.2} tokens/sec)",
-              stats.tokens_generated, stats.generation_time_ms, stats.tokens_per_second);
-        if let Some(ref qm) = stats.quality_metrics {
-            info!("Quality metrics: perplexity={:.2}, entropy={:.2}, entropy_var={:.4}, repetition={:.3}, quality_score={:.3}",
-                  qm.perplexity, qm.avg_entropy, qm.entropy_variance, qm.repetition_ratio, qm.quality_score());
-        }
     } else {
-        let mut full_text = String::new();
         while let Some(text_chunk) = text_stream.next().await {
-            full_text.push_str(&text_chunk?);
+            full_response.push_str(&text_chunk?);
         }
-        println!("\n{}", full_text);
-        let stats = text_stream.stats();
-        info!("Generated {} tokens in {}ms ({:.2} tokens/sec)",
-              stats.tokens_generated, stats.generation_time_ms, stats.tokens_per_second);
+        println!("\n{}", full_response);
+    }
+
+    let stats = text_stream.stats();
+    info!(
+        "Generated {} tokens in {}ms ({:.2} tokens/sec)",
+        stats.tokens_generated, stats.generation_time_ms, stats.tokens_per_second
+    );
+    if let Some(ref qm) = stats.quality_metrics {
+        info!(
+            "Quality metrics: perplexity={:.2}, entropy={:.2}, entropy_var={:.4}, repetition={:.3}, quality_score={:.3}",
+            qm.perplexity, qm.avg_entropy, qm.entropy_variance, qm.repetition_ratio, qm.quality_score()
+        );
+    }
+
+    // Collect training example if self-supervised training is enabled
+    if let Some(ref trainer) = trainer {
         if let Some(ref qm) = stats.quality_metrics {
-            info!("Quality metrics: perplexity={:.2}, entropy={:.2}, entropy_var={:.4}, repetition={:.3}, quality_score={:.3}",
-                  qm.perplexity, qm.avg_entropy, qm.entropy_variance, qm.repetition_ratio, qm.quality_score());
+            // Tokenize prompt and response for training using public tokenizer
+            match engine.get_tokenizer() {
+                Ok(tokenizer) => {
+                    let tokenize = |text: &str| -> Result<Vec<i64>> {
+                        let encoding = tokenizer
+                            .encode(text, false)
+                            .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
+                        Ok(encoding.get_ids().iter().map(|&id| id as i64).collect())
+                    };
+
+                    match (tokenize(&formatted_prompt_for_training), tokenize(&full_response)) {
+                        (Ok(prompt_tokens), Ok(response_tokens)) => {
+                            trainer
+                                .add_example(prompt_tokens, response_tokens, qm.clone(), None)
+                                .await;
+
+                            info!(
+                                "Training example collected (quality={:.3}, buffer_size={})",
+                                qm.quality_score(),
+                                trainer.replay_buffer.len().await
+                            );
+
+                            // Check if ready to train and trigger training cycle
+                            if trainer.ready_to_train().await {
+                                info!("Training cycle triggered...");
+                                match trainer.train_cycle(&engine).await {
+                                    Ok(result) => {
+                                        info!(
+                                            "Training cycle complete: {} steps, mean_loss={:.4}, mean_reward={:.3}",
+                                            result.steps, result.total_loss, result.mean_reward
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!("Training cycle failed: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                        (Err(e), _) | (_, Err(e)) => {
+                            warn!("Failed to tokenize for training: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to get tokenizer for training: {}", e);
+                }
+            }
         }
     }
 

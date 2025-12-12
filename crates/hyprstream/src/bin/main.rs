@@ -482,6 +482,7 @@ fn main() -> Result<()> {
             batch_size,
             epochs,
             config,
+            training_mode,
         } => {
             let ctx = ctx.clone();
             with_runtime(
@@ -502,6 +503,7 @@ fn main() -> Result<()> {
                         batch_size,
                         epochs,
                         config,
+                        training_mode,
                     )
                     .await
                 },

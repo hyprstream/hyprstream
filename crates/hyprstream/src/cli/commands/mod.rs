@@ -167,6 +167,12 @@ pub enum Commands {
         /// Training configuration file (overrides CLI args)
         #[arg(long)]
         config: Option<String>,
+
+        /// Set training mode for self-supervised learning: self_supervised, supervised, disabled
+        /// When set to self_supervised, inference will automatically collect training examples
+        /// and trigger training cycles based on quality metrics.
+        #[arg(long, short = 'T')]
+        training_mode: Option<String>,
     },
 
     /// Run inference with a model
