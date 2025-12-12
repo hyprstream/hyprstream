@@ -1745,6 +1745,8 @@ pub struct GenerationStats {
     pub generation_time_ms: u64,
     pub tokens_per_second: f32,
     pub finish_reason: Option<FinishReason>,
+    /// Quality metrics captured during generation (for self-supervised training)
+    pub quality_metrics: Option<crate::runtime::generation_metrics::GenerationQualityMetrics>,
 }
 
 /// Stream that yields decoded UTF-8 text chunks during generation.
@@ -1798,6 +1800,9 @@ pub struct TextStream<'a> {
 
     // Timeout handling
     timeout_ms: Option<u64>,
+
+    /// Metrics accumulator for self-supervised training quality signals
+    metrics_accumulator: crate::runtime::generation_metrics::GenerationMetricsAccumulator,
 }
 
 impl<'a> TextStream<'a> {
@@ -1898,12 +1903,20 @@ impl<'a> TextStream<'a> {
             finish_reason: None,
             multimodal_embeddings,
             timeout_ms: request.timeout,
+            metrics_accumulator: crate::runtime::generation_metrics::GenerationMetricsAccumulator::new(),
         })
     }
 
     /// Get generation statistics (call after stream exhausted)
     pub fn stats(&self) -> GenerationStats {
         let generation_time = self.start_time.elapsed();
+
+        // Finalize quality metrics from accumulator
+        let quality_metrics = if !self.metrics_accumulator.is_empty() {
+            Some(self.metrics_accumulator.finalize())
+        } else {
+            None
+        };
 
         GenerationStats {
             tokens_generated: self.tokens_generated,
@@ -1914,6 +1927,7 @@ impl<'a> TextStream<'a> {
                 0.0
             },
             finish_reason: self.finish_reason.clone(),
+            quality_metrics,
         }
     }
 
@@ -2022,6 +2036,50 @@ impl<'a> TextStream<'a> {
                 "⚠️ Sampled token {} is beyond tokenizer vocab ({}) but within model vocab ({}). This may indicate a vocab mismatch.",
                 next_token, vocab_size, model_vocab_size
             );
+        }
+
+        // Capture metrics for self-supervised training (minimal overhead)
+        // Compute log_prob and entropy from logits tensor
+        {
+            // Get last token's logits (already squeezed to 1D in sampler, but handle 2D case)
+            let last_logits = if logits.dim() > 1 {
+                let shape = logits.size();
+                if shape.len() == 3 {
+                    // [batch, seq_len, vocab] -> take [-1, -1, :] -> [vocab]
+                    logits.select(1, shape[1] - 1).squeeze_dim(0)
+                } else if shape.len() == 2 {
+                    // [seq_len, vocab] or [batch, vocab] -> squeeze
+                    logits.squeeze_dim(0)
+                } else {
+                    logits.shallow_clone()
+                }
+            } else {
+                logits.shallow_clone()
+            };
+
+            // Compute stable softmax: exp(x - max(x)) / sum(exp(x - max(x)))
+            let max_logit = last_logits.max();
+            let shifted = &last_logits - &max_logit;
+            let exp_logits = shifted.exp();
+            let sum_exp = exp_logits.sum(tch::Kind::Float);
+            let probs = &exp_logits / &sum_exp;
+
+            // Compute log_prob of sampled token (in nats)
+            // log_prob = log(probs[next_token])
+            let log_prob = probs
+                .select(0, next_token as i64)
+                .log()
+                .double_value(&[]) as f32;
+
+            // Compute entropy: -sum(p * log(p)) where p > 0
+            // Use a small epsilon to avoid log(0)
+            let eps = 1e-10f64;
+            let safe_probs = probs.clamp(eps, 1.0 - eps);
+            let log_probs = safe_probs.log();
+            let entropy = (-(&probs * &log_probs)).sum(tch::Kind::Float).double_value(&[]) as f32;
+
+            // Add to accumulator (O(1) per token)
+            self.metrics_accumulator.add_token(log_prob, entropy, next_token as u32);
         }
 
         Ok(next_token as u32)

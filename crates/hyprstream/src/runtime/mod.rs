@@ -17,6 +17,7 @@ pub use crate::config::{
 
 pub mod architectures; // Architecture-specific model implementations (includes Janus placeholder utils)
 pub mod conversation_router; // Seamless model evolution and routing
+pub mod generation_metrics; // Quality metrics for self-supervised training
 pub mod kv_quant; // KV cache quantization types
 pub mod tensor_sampling; // Device-agnostic tensor-based sampling
 pub mod image_utils; // Image loading and preprocessing for multimodal models
@@ -37,6 +38,9 @@ pub use torch_engine::{TorchEngine, TextStream, GenerationStats};
 
 // KV cache exports for multi-session support
 pub use kv_cache::{CacheConfig, CacheOwner, KVCacheManager, KVCacheRegistry};
+
+// Generation metrics exports for self-supervised training
+pub use generation_metrics::{GenerationMetricsAccumulator, GenerationQualityMetrics, SessionMetrics};
 
 #[derive(Debug, Clone)]
 pub struct MistralEngine;

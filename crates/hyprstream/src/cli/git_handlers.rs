@@ -1388,6 +1388,10 @@ pub async fn handle_infer(
         let stats = text_stream.stats();
         info!("Generated {} tokens in {}ms ({:.2} tokens/sec)",
               stats.tokens_generated, stats.generation_time_ms, stats.tokens_per_second);
+        if let Some(ref qm) = stats.quality_metrics {
+            info!("Quality metrics: perplexity={:.2}, entropy={:.2}, entropy_var={:.4}, repetition={:.3}, quality_score={:.3}",
+                  qm.perplexity, qm.avg_entropy, qm.entropy_variance, qm.repetition_ratio, qm.quality_score());
+        }
     } else {
         let mut full_text = String::new();
         while let Some(text_chunk) = text_stream.next().await {
@@ -1397,6 +1401,10 @@ pub async fn handle_infer(
         let stats = text_stream.stats();
         info!("Generated {} tokens in {}ms ({:.2} tokens/sec)",
               stats.tokens_generated, stats.generation_time_ms, stats.tokens_per_second);
+        if let Some(ref qm) = stats.quality_metrics {
+            info!("Quality metrics: perplexity={:.2}, entropy={:.2}, entropy_var={:.4}, repetition={:.3}, quality_score={:.3}",
+                  qm.perplexity, qm.avg_entropy, qm.entropy_variance, qm.repetition_ratio, qm.quality_score());
+        }
     }
 
     Ok(())
