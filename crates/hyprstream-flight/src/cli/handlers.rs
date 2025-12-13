@@ -5,7 +5,6 @@ use std::{
     collections::HashMap,
     error::Error as StdError,
     fmt,
-    net::SocketAddr,
     path::PathBuf,
 };
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
@@ -52,7 +51,7 @@ pub async fn handle_server(
         _ => return Err("Unsupported storage type (only duckdb supported currently)".into()),
     };
 
-    let service = FlightSqlServer::new(backend).into_service();
+    let service = FlightSqlServer::new(backend).await?.into_service();
     let mut server = Server::builder();
 
     // Configure TLS if enabled

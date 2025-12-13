@@ -470,7 +470,7 @@ impl StorageBackend for AdbcBackend {
         let mut fields = Vec::new();
         while let Some(batch) = reader.next() {
             let batch = batch.map_err(|e| Status::internal(format!("Failed to read batch: {}", e)))?;
-            
+
             let names = batch
                 .column_by_name("column_name")
                 .and_then(|col| col.as_any().downcast_ref::<StringArray>())
@@ -502,5 +502,25 @@ impl StorageBackend for AdbcBackend {
         }
 
         Ok(Arc::new(Schema::new(fields)))
+    }
+
+    async fn export_to_parquet(
+        &self,
+        _table_name: &str,
+        _path: &std::path::Path,
+    ) -> Result<(), Status> {
+        Err(Status::unimplemented(
+            "Parquet export not supported for ADBC backend. Use DuckDB for checkpointing.",
+        ))
+    }
+
+    async fn import_from_parquet(
+        &self,
+        _table_name: &str,
+        _path: &std::path::Path,
+    ) -> Result<(), Status> {
+        Err(Status::unimplemented(
+            "Parquet import not supported for ADBC backend. Use DuckDB for checkpointing.",
+        ))
     }
 }

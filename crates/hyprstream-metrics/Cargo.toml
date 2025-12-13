@@ -56,6 +56,11 @@ anyhow = "1.0.95"
 bytes = "1.9.0"
 thiserror = "1.0"
 num_cpus = "1.16"
+uuid = { version = "1.0", features = ["v4"] }
+
+# Git-based checkpoint storage
+git2db = { path = "../git2db" }
+git2.workspace = true
 
 # Polars for data processing
 polars = "0.45.1"

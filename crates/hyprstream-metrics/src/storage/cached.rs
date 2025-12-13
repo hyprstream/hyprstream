@@ -218,4 +218,24 @@ impl StorageBackend for CachedStorageBackend {
         // Get schema from store (source of truth)
         self.store.get_table_schema(table_name).await
     }
+
+    async fn export_to_parquet(
+        &self,
+        table_name: &str,
+        path: &std::path::Path,
+    ) -> Result<(), Status> {
+        // Export from store (source of truth)
+        self.store.export_to_parquet(table_name, path).await
+    }
+
+    async fn import_from_parquet(
+        &self,
+        table_name: &str,
+        path: &std::path::Path,
+    ) -> Result<(), Status> {
+        // Import into both cache and store
+        self.cache.import_from_parquet(table_name, path).await?;
+        self.store.import_from_parquet(table_name, path).await?;
+        Ok(())
+    }
 }

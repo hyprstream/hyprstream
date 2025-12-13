@@ -2,6 +2,7 @@ use hyprstream_metrics::storage::{
     view::ViewDefinition,
     StorageBackend, StorageBackendType,
 };
+use hyprstream_metrics::query::QueryOrchestrator;
 use arrow_flight::{
     flight_service_server::{FlightService, FlightServiceServer},
     sql::{
@@ -14,7 +15,6 @@ use arrow_flight::{
     Action, FlightDescriptor, FlightInfo, Ticket, HandshakeRequest, HandshakeResponse, FlightEndpoint,
     encode::FlightDataEncoderBuilder, error::FlightError,
 };
-use arrow_ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
 use futures::{Stream, StreamExt, TryStreamExt};
 use prost::Message;
 use std::pin::Pin;
@@ -142,6 +142,7 @@ impl TableCommand {
 #[derive(Clone)]
 pub struct FlightSqlServer {
     backend: Arc<StorageBackendType>,
+    orchestrator: Arc<QueryOrchestrator>,
     #[allow(dead_code)]
     statement_counter: Arc<AtomicU64>,
     prepared_statements: Arc<Mutex<Vec<(u64, String)>>>,
@@ -175,27 +176,14 @@ impl FlightSqlService for FlightSqlServer {
         query: CommandStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        // Prepare the SQL to get schema information
-        let statement_handle = self.backend.prepare_sql(&query.query).await?;
+        // Use QueryOrchestrator to prepare and get schema
+        let cached_stmt = self.orchestrator.prepare(&query.query).await
+            .map_err(|e| Status::internal(format!("Query preparation failed: {}", e)))?;
 
-        // Execute query to get schema (we need at least one result to know the schema)
-        let batch = self.backend.query_sql(&statement_handle).await?;
-        let schema = batch.schema();
+        let schema = cached_stmt.schema.clone();
+        let handle = cached_stmt.handle;
 
-        // Generate schema bytes
-        let generator = IpcDataGenerator::default();
-        let options = IpcWriteOptions::default();
-        let mut dictionary_tracker = DictionaryTracker::new(false);
-        let _schema_data = generator.schema_to_bytes_with_dictionary_tracker(
-            schema.as_ref(),
-            &mut dictionary_tracker,
-            &options,
-        );
-
-        // Generate ticket for do_get
-        let handle = self.statement_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-        // Store SQL with handle
+        // Store SQL with handle for do_get (for compatibility with Flight SQL protocol)
         {
             let mut statements = self.prepared_statements.lock()
                 .map_err(|e| Status::internal(format!("Lock error: {}", e)))?;
@@ -230,37 +218,28 @@ impl FlightSqlService for FlightSqlServer {
         ticket: TicketStatementQuery,
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        // Get SQL from prepared statement handle
+        // Get statement handle from ticket
         let handle = u64::from_le_bytes(
             ticket.statement_handle.to_vec()
                 .try_into()
                 .map_err(|_| Status::invalid_argument("Invalid statement handle"))?
         );
 
-        // Get SQL query from prepared statements
-        let sql = {
-            let guard = self.prepared_statements.lock()
-                .map_err(|e| Status::internal(format!("Lock error: {}", e)))?;
+        // Get cached statement from orchestrator
+        let cached_stmt = self.orchestrator.get_statement(handle).await
+            .ok_or_else(|| Status::invalid_argument("Statement handle not found"))?;
 
-            let sql = guard.iter()
-                .find(|(h, _)| *h == handle)
-                .map(|(_, sql)| sql.to_string())
-                .ok_or_else(|| Status::invalid_argument("Statement handle not found"))?;
+        let schema = cached_stmt.schema.clone();
 
-            sql
-        };
+        // Execute using the orchestrator's cached physical plan
+        let result_stream = self.orchestrator.execute(&cached_stmt).await
+            .map_err(|e| Status::internal(format!("Query execution failed: {}", e)))?;
 
-        // Execute query using storage backend
-        let statement_handle = self.backend.prepare_sql(&sql).await?;
-        let batch = self.backend.query_sql(&statement_handle).await?;
-        let schema = batch.schema();
-
-        // Convert single batch to stream
-        let batches = vec![Ok(batch)];
-        let stream = futures::stream::iter(batches)
-            .map_err(|e: Status| FlightError::ExternalError(Box::new(std::io::Error::new(
+        // Convert DataFusion stream to Flight stream
+        let stream = result_stream
+            .map_err(|e| FlightError::ExternalError(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                e.message(),
+                e.to_string(),
             ))));
 
         let stream = FlightDataEncoderBuilder::new()
@@ -305,12 +284,20 @@ impl FlightSqlService for FlightSqlServer {
 }
 
 impl FlightSqlServer {
-    pub fn new(backend: StorageBackendType) -> Self {
-        Self {
-            backend: Arc::new(backend),
+    pub async fn new(backend: StorageBackendType) -> Result<Self, Status> {
+        let backend = Arc::new(backend);
+
+        // Create query orchestrator with the storage backend
+        let orchestrator = QueryOrchestrator::new(backend.clone() as Arc<dyn StorageBackend>)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to create query orchestrator: {}", e)))?;
+
+        Ok(Self {
+            backend,
+            orchestrator: Arc::new(orchestrator),
             statement_counter: Arc::new(AtomicU64::new(0)),
             prepared_statements: Arc::new(Mutex::new(Vec::new())),
-        }
+        })
     }
 
     pub fn into_service(self) -> FlightServiceServer<Self> {
@@ -342,19 +329,28 @@ impl FlightSqlServer {
     async fn handle_action(&self, request: Request<Action>) -> Result<Vec<u8>, Status> {
         let action = request.into_inner();
         match Command::from_json(&action.body)? {
-            Command::Table(cmd) => self.handle_table_command(cmd).await,
+            Command::Table(cmd) => {
+                let result = self.handle_table_command(cmd).await;
+                // Refresh orchestrator's table registrations after schema changes
+                if result.is_ok() {
+                    let _ = self.orchestrator.refresh_tables().await;
+                }
+                result
+            }
             Command::Sql(SqlCommand::Execute(sql)) => {
-                // Prepare and execute statement
-                let statement_handle = self.backend.prepare_sql(&sql).await?;
-                self.backend.query_sql(&statement_handle).await?;
+                // Execute statement via orchestrator
+                self.orchestrator.query_collect(&sql).await
+                    .map_err(|e| Status::internal(format!("Query execution failed: {}", e)))?;
                 Ok(vec![])
             }
             Command::Sql(SqlCommand::Query(sql)) => {
-                // Prepare statement and store handle
-                let _statement_handle = self.backend.prepare_sql(&sql).await?;
-                let handle = self.statement_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Prepare statement via orchestrator
+                let cached_stmt = self.orchestrator.prepare(&sql).await
+                    .map_err(|e| Status::internal(format!("Query preparation failed: {}", e)))?;
 
-                // Store SQL with handle (in a separate scope to ensure MutexGuard is dropped)
+                let handle = cached_stmt.handle;
+
+                // Store SQL with handle for do_get compatibility
                 {
                     let mut statements = self.prepared_statements.lock()
                         .map_err(|e| Status::internal(format!("Lock error: {}", e)))?;
@@ -365,5 +361,10 @@ impl FlightSqlServer {
                 Ok(handle.to_le_bytes().to_vec())
             }
         }
+    }
+
+    /// Get reference to the query orchestrator
+    pub fn orchestrator(&self) -> &Arc<QueryOrchestrator> {
+        &self.orchestrator
     }
 }

@@ -340,7 +340,7 @@ impl StorageBackend for DuckDbBackend {
             let name: String = row.get(1)?;
             let type_str: String = row.get(2)?;
             let nullable: bool = row.get(3)?;
-            
+
             let data_type = match type_str.to_uppercase().as_str() {
                 "INTEGER" | "BIGINT" => DataType::Int64,
                 "DOUBLE" | "REAL" => DataType::Float64,
@@ -357,6 +357,46 @@ impl StorageBackend for DuckDbBackend {
         }
 
         Ok(Arc::new(Schema::new(fields)))
+    }
+
+    async fn export_to_parquet(
+        &self,
+        table_name: &str,
+        path: &std::path::Path,
+    ) -> Result<(), Status> {
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                Status::internal(format!("Failed to create export directory: {}", e))
+            })?;
+        }
+
+        let sql = format!(
+            "COPY {} TO '{}' (FORMAT PARQUET)",
+            table_name,
+            path.display()
+        );
+        self.execute_statement(&sql).await
+    }
+
+    async fn import_from_parquet(
+        &self,
+        table_name: &str,
+        path: &std::path::Path,
+    ) -> Result<(), Status> {
+        if !path.exists() {
+            return Err(Status::not_found(format!(
+                "Parquet file not found: {}",
+                path.display()
+            )));
+        }
+
+        let sql = format!(
+            "COPY {} FROM '{}' (FORMAT PARQUET)",
+            table_name,
+            path.display()
+        );
+        self.execute_statement(&sql).await
     }
 }
 

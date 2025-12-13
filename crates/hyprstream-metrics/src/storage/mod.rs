@@ -4,13 +4,15 @@
 //! - `duckdb`: High-performance embedded SQL database
 //! - `adbc`: Arrow Database Connectivity for external database integration (optional)
 //! - `cached`: Two-tier storage with configurable caching layer
+//! - `datafusion_provider`: DataFusion TableProvider bridge for DuckDB
 //!
 //! Each backend implements the `StorageBackend` trait, providing a consistent
 //! interface for SQL operations like table management, querying, and data insertion.
 
 pub mod cache;
-pub mod duckdb;
 pub mod cached;
+pub mod datafusion_provider;
+pub mod duckdb;
 pub mod table_manager;
 pub mod view;
 
@@ -24,6 +26,8 @@ use self::{
 };
 #[cfg(feature = "adbc")]
 use self::adbc::AdbcBackend;
+
+pub use datafusion_provider::{DuckDBExec, DuckDBTableProvider};
 
 use ::duckdb::arrow::array::RecordBatch;
 use ::duckdb::arrow::datatypes::{DataType, Field, Schema};
@@ -148,6 +152,20 @@ pub trait StorageBackend: Send + Sync + 'static {
 
     /// Drop a table
     async fn drop_table(&self, table_name: &str) -> Result<(), Status>;
+
+    /// Export a table to Parquet format
+    async fn export_to_parquet(
+        &self,
+        table_name: &str,
+        path: &std::path::Path,
+    ) -> Result<(), Status>;
+
+    /// Import a table from Parquet format
+    async fn import_from_parquet(
+        &self,
+        table_name: &str,
+        path: &std::path::Path,
+    ) -> Result<(), Status>;
 }
 
 impl AsRef<dyn StorageBackend> for StorageBackendType {
@@ -256,5 +274,21 @@ impl StorageBackend for StorageBackendType {
 
     async fn get_table_schema(&self, table_name: &str) -> Result<Arc<Schema>, Status> {
         self.as_ref().get_table_schema(table_name).await
+    }
+
+    async fn export_to_parquet(
+        &self,
+        table_name: &str,
+        path: &std::path::Path,
+    ) -> Result<(), Status> {
+        self.as_ref().export_to_parquet(table_name, path).await
+    }
+
+    async fn import_from_parquet(
+        &self,
+        table_name: &str,
+        path: &std::path::Path,
+    ) -> Result<(), Status> {
+        self.as_ref().import_from_parquet(table_name, path).await
     }
 }

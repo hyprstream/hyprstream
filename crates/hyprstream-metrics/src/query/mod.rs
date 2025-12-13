@@ -4,14 +4,16 @@
 //! - Query planning and optimization
 //! - Physical plan execution
 //! - Query optimization rules
-//! - Query execution context
+//! - Query orchestration with statement caching
 
 pub mod executor;
+pub mod orchestrator;
 pub mod physical;
 pub mod planner;
 pub mod rules;
 
 pub use executor::{DataFusionExecutor, ExecutorConfig, QueryExecutor};
+pub use orchestrator::{CachedStatement, QueryOrchestrator};
 pub use physical::{PhysicalOperator, VectorizedOperator};
 pub use planner::{
     DataFusionPlanner, OptimizationHint, OptimizerContext, Query, QueryPlanner, Statistics,

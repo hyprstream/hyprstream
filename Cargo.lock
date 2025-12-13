@@ -4196,6 +4196,8 @@ dependencies = [
  "datafusion-common",
  "duckdb",
  "futures",
+ "git2",
+ "git2db",
  "hex",
  "lazy_static",
  "num_cpus",
@@ -4212,6 +4214,7 @@ dependencies = [
  "tokio-test",
  "tonic 0.13.1",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

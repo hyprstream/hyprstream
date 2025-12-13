@@ -4,8 +4,10 @@
 //! - Efficient metric storage and retrieval
 //! - Real-time aggregation and analysis
 //! - Model management and versioning
+//! - Git-based checkpoint and recovery
 
 pub mod aggregation;
+pub mod checkpoint;
 pub mod config;
 pub mod error;
 pub mod metrics;
@@ -15,7 +17,14 @@ pub mod storage;
 pub mod utils;
 
 pub use aggregation::{AggregateFunction, AggregateResult, GroupBy, TimeWindow};
-pub use query::{DataFusionExecutor, DataFusionPlanner, ExecutorConfig, Query};
+pub use checkpoint::{
+    Checkpoint, CheckpointConfig, CheckpointManager, CheckpointMetadata, RecoveryManager,
+    RecoveryStatus,
+};
+pub use query::{
+    CachedStatement, DataFusionExecutor, DataFusionPlanner, ExecutorConfig, Query,
+    QueryOrchestrator,
+};
 pub use storage::StorageBackend;
 
 // Re-export Arrow types from DuckDB for consistency
