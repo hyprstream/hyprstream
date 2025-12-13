@@ -1,0 +1,69 @@
+[package]
+name = "hyprstream-metrics"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+repository = "https://github.com/hyprstream/hyprstream"
+description = "Metrics storage, aggregation, and query engine with DuckDB and DataFusion"
+
+[lib]
+name = "hyprstream_metrics"
+path = "src/lib.rs"
+
+[dependencies]
+# Data processing - use DuckDB's arrow version for consistency
+duckdb = { version = "1.4.3", features = ["bundled"] }
+
+# Re-export arrow from duckdb to avoid version conflicts
+# arrow = { version = "54", package = "arrow" }  # via duckdb
+
+# DataFusion for query planning - try 50 for Arrow 56
+datafusion = "50.0.0"
+datafusion-common = "50.0.0"
+
+# ADBC for external database connectivity
+adbc_core = { version = "0.15.0", features = ["driver_manager"], optional = true }
+
+# Async runtime
+tokio = { version = "1.43.0", features = ["rt-multi-thread", "signal", "fs"] }
+async-trait = "0.1"
+futures = { version = "0.3.31", features = ["alloc"] }
+async-stream = "0.3"
+tokio-stream = "0.1.17"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_derive = "1.0"
+serde_json = "1.0"
+bincode = "1.3.3"
+
+# SQL parsing
+sqlparser = "0.39.0"
+
+# Configuration
+config = { version = "0.13", features = ["toml"] }
+
+# Server/RPC
+tonic = { version = "0.13", features = ["transport"] }
+
+# Utilities
+chrono = "0.4"
+hex = "0.4"
+lazy_static = "1.4"
+parking_lot = "0.12"
+tracing = "0.1"
+anyhow = "1.0.95"
+bytes = "1.9.0"
+thiserror = "1.0"
+num_cpus = "1.16"
+
+# Polars for data processing
+polars = "0.45.1"
+
+[features]
+default = []
+adbc = ["adbc_core"]
+
+[dev-dependencies]
+tempfile = "3.9.0"
+tokio-test = "0.4"

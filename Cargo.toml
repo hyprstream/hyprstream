@@ -5,6 +5,8 @@ members = [
     "crates/git-xet-filter",
     "crates/gittorrent",
     "crates/bitsandbytes-sys",
+    "crates/hyprstream-metrics",
+    "crates/hyprstream-flight",
 ]
 default-members = ["crates/hyprstream"]
 resolver = "2"
