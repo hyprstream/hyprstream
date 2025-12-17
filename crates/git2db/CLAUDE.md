@@ -111,12 +111,12 @@ handle.remote().push("origin", "main").await?;
 - ✅ `branch()` - Branch management (complete)
 - ✅ `staging()` - Stage operations (complete)
 - ✅ `remote()` - Remote operations (complete)
-- ❌ `commit()` - Commit creation (not yet implemented)
+- ✅ `commit()` - Commit creation (complete)
 - ❌ `merge()` - Merge operations (not yet implemented)
 
 **Escape Hatch** (when high-level API missing):
 ```rust
-let repo = handle.open()?;  // Get raw git2::Repository
+let repo = handle.open_repo()?;  // Get raw git2::Repository
 // Use git2 directly for operations not yet in RepositoryHandle
 ```
 
@@ -225,12 +225,10 @@ let repo_id = registry.clone("https://huggingface.co/Qwen/Qwen3-0.6B")
 // All operations via git2db
 let handle = registry.repo(&repo_id)?;
 handle.branch().create("experiment", None).await?;
-handle.staging().add_all()?;
+handle.staging().add_all().await?;
 
-// Commit via escape hatch (until commit() API implemented)
-let repo = handle.open()?;
-let sig = GitManager::global().create_signature(None, None)?;
-// ... manual commit creation ...
+// Commit using the commit API
+let oid = handle.commit("Experimental changes").await?;
 ```
 
 ### **Worktree Creation**
@@ -355,14 +353,10 @@ handle.branch().create("feature", None).await?;
 handle.branch().checkout("feature").await?;
 
 // Make changes, stage, commit
-handle.staging().add_all()?;
+handle.staging().add_all().await?;
 
-// Commit via escape hatch (temporary)
-let repo = handle.open()?;
-let sig = GitManager::global().create_signature(None, None)?;
-let tree = repo.find_tree(repo.index()?.write_tree()?)?;
-let parent = repo.head()?.peel_to_commit()?;
-repo.commit(Some("HEAD"), &sig, &sig, "Message", &tree, &[&parent])?;
+// Commit using the commit API
+let oid = handle.commit("Message").await?;
 ```
 
 ### **Worktree Creation**
@@ -385,17 +379,17 @@ let wt_path = GitManager::global()
 - `branch()` API - Full branch management
 - `staging()` API - Stage operations
 - `remote()` API - Remote operations
+- `commit()` API - Commit creation
 - Storage driver system
 - overlay2 driver (3 backends: kernel, userns, fuse)
 - Configuration system
 
 **Not Yet Implemented** ❌:
-- `commit()` API - Still uses escape hatch
 - `merge()` API - Complex git operation
 - `rebase()` API - Complex git operation
 - Tag management API - Use git2 directly
 
-**Workaround**: Use `handle.open()` escape hatch for missing APIs
+**Workaround**: Use `handle.open_repo()` escape hatch for missing APIs
 
 ---
 
