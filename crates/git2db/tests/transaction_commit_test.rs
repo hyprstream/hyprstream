@@ -201,3 +201,34 @@ async fn test_transaction_worktree_mode() {
 
     println!("✓ Worktree mode works correctly");
 }
+
+#[tokio::test]
+async fn test_registry_version_accessor() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = Git2DB::open(temp_dir.path()).await.unwrap();
+
+    // Verify registry exposes a non-empty version from metadata
+    let version = registry.version();
+    assert!(!version.is_empty(), "Registry should have a version");
+
+    // Version should be a valid semver-like string
+    assert!(
+        version.chars().next().unwrap().is_ascii_digit(),
+        "Version should start with a digit"
+    );
+
+    // Verify version remains consistent across calls
+    assert_eq!(registry.version(), version);
+
+    // Start a transaction to ensure version() works in transaction contexts
+    // (transaction snapshots use registry.version() internally)
+    let _tx = registry
+        .start_transaction_with_mode(IsolationMode::Optimistic)
+        .await
+        .unwrap();
+
+    // Version should still be accessible and unchanged
+    assert_eq!(registry.version(), version);
+
+    println!("✓ Registry version accessor works correctly");
+}
