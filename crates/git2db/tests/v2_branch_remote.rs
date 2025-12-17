@@ -445,3 +445,83 @@ async fn test_multi_remote_setup() {
     assert!(names.contains(&"backup"));
     assert!(names.contains(&"mirror"));
 }
+
+#[tokio::test]
+async fn test_remote_sync_to_metadata() {
+    setup_logging();
+    init_git_manager_no_shallow();
+
+    let temp_dir = TempDir::new().unwrap();
+    let registry_path = temp_dir.path();
+    let mut registry = Git2DB::open(registry_path).await.unwrap();
+
+    // Create test repository
+    let test_repo = temp_dir.path().join("repo");
+    fs::create_dir(&test_repo).unwrap();
+    create_test_repo_with_branches(&test_repo).await.unwrap();
+    let url = format!("file://{}", test_repo.display());
+
+    // Add repository to registry
+    let repo_id = registry.add_repository("test-repo", &url).await.unwrap();
+
+    // Initially, metadata should have the origin remote from registration
+    let initial_metadata = registry.get_by_id(&repo_id).unwrap();
+    assert!(!initial_metadata.remotes.is_empty(), "Should have at least origin remote");
+    let initial_remote_count = initial_metadata.remotes.len();
+
+    // Add a new remote via RemoteManager
+    {
+        let repo = registry.repo(&repo_id).unwrap();
+        let remote_mgr = repo.remote();
+        remote_mgr.add("backup", "https://backup.com/repo.git").await.unwrap();
+    }
+
+    // Metadata should not be updated yet (RemoteManager can't update it)
+    let before_sync = registry.get_by_id(&repo_id).unwrap();
+    assert_eq!(
+        before_sync.remotes.len(),
+        initial_remote_count,
+        "Metadata should not be updated until sync is called"
+    );
+
+    // Sync remotes to metadata
+    registry.sync_repository_remotes(&repo_id).await.unwrap();
+
+    // Now metadata should include the new remote
+    let after_sync = registry.get_by_id(&repo_id).unwrap();
+    assert_eq!(
+        after_sync.remotes.len(),
+        initial_remote_count + 1,
+        "Metadata should include the new remote after sync"
+    );
+
+    // Verify the backup remote is in metadata
+    let backup_remote = after_sync
+        .remotes
+        .iter()
+        .find(|r| r.name == "backup")
+        .expect("backup remote should be in metadata");
+    assert_eq!(backup_remote.url, "https://backup.com/repo.git");
+
+    // Remove a remote and sync again
+    {
+        let repo = registry.repo(&repo_id).unwrap();
+        let remote_mgr = repo.remote();
+        remote_mgr.remove("backup").await.unwrap();
+    }
+    registry.sync_repository_remotes(&repo_id).await.unwrap();
+
+    // Metadata should reflect the removal
+    let after_remove = registry.get_by_id(&repo_id).unwrap();
+    assert_eq!(
+        after_remove.remotes.len(),
+        initial_remote_count,
+        "Metadata should reflect remote removal after sync"
+    );
+    assert!(
+        !after_remove.remotes.iter().any(|r| r.name == "backup"),
+        "backup remote should be removed from metadata"
+    );
+
+    println!("✓ Remote sync to metadata works correctly");
+}

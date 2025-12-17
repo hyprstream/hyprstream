@@ -404,6 +404,9 @@ impl Git2DB {
             .exec()
             .await?;
 
+        // Sync remotes from the cloned repository to metadata
+        self.sync_repository_remotes(&repo_id).await?;
+
         Ok(())
     }
 
@@ -818,6 +821,86 @@ impl Git2DB {
         // Save and commit changes
         self.save_metadata().await?;
         self.commit_changes(&format!("Update repository: {}", id.0))?;
+
+        Ok(())
+    }
+
+    /// Sync remotes from git config to registry metadata for a repository
+    ///
+    /// This method reads the current remotes from the repository's `.git/config`
+    /// and updates the registry metadata to match. This should be called after
+    /// remote operations (add, remove, set_url) to keep metadata in sync.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # async fn example(registry: &mut git2db::Git2DB, repo_id: &git2db::RepoId) -> Result<(), Box<dyn std::error::Error>> {
+    /// // After adding/removing remotes via RemoteManager
+    /// registry.sync_repository_remotes(repo_id).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn sync_repository_remotes(&mut self, repo_id: &RepoId) -> Git2DBResult<()> {
+        // Get repository metadata
+        let repo = self.metadata.repositories.get_mut(&repo_id.0).ok_or_else(|| {
+            Git2DBError::invalid_repository(repo_id.to_string(), "Repository not found")
+        })?;
+
+        // Get the repository path
+        let repo_path = &repo.worktree_path;
+
+        // Read remotes from git config
+        let remotes = tokio::task::spawn_blocking({
+            let repo_path = repo_path.clone();
+            move || -> Git2DBResult<Vec<RemoteConfig>> {
+                use git2::Repository;
+                let git_repo = Repository::open(&repo_path).map_err(|e| {
+                    Git2DBError::repository(&repo_path, format!("Failed to open repository: {}", e))
+                })?;
+
+                let remote_names = git_repo
+                    .remotes()
+                    .map_err(|e| Git2DBError::internal(format!("Failed to list remotes: {}", e)))?;
+
+                let mut configs = Vec::new();
+                for name in remote_names.iter().flatten() {
+                    if let Ok(remote) = git_repo.find_remote(name) {
+                        let url = remote.url().unwrap_or("").to_string();
+                        let fetch_refspec = remote
+                            .fetch_refspecs()
+                            .map_err(|_| Git2DBError::internal("Failed to get fetch refspecs"))?;
+
+                        let fetch_refs: Vec<String> = fetch_refspec
+                            .iter()
+                            .flatten()
+                            .map(|s| s.to_string())
+                            .collect();
+
+                        configs.push(RemoteConfig {
+                            name: name.to_string(),
+                            url,
+                            fetch_refs,
+                        });
+                    }
+                }
+
+                Ok(configs)
+            }
+        })
+        .await
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))??;
+
+        // Update remotes in metadata
+        info!(
+            "Syncing {} remotes to metadata for repository {}",
+            remotes.len(),
+            repo_id
+        );
+        repo.remotes = remotes;
+
+        // Save and commit changes
+        self.save_metadata().await?;
+        self.commit_changes(&format!("Sync remotes for repository: {}", repo_id.0))?;
 
         Ok(())
     }
