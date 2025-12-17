@@ -163,7 +163,7 @@ async fn test_repository_handle_operations() {
 
     // Test status - need to get worktree handle first
     let default_branch = repo.default_branch().unwrap();
-    let worktree_handle = repo.get_worktree(&default_branch).await.unwrap().unwrap();
+    let mut worktree_handle = repo.get_worktree(&default_branch).await.unwrap().unwrap();
     let status = worktree_handle.status().await.unwrap();
     assert!(status.is_clean);
 }
@@ -343,4 +343,48 @@ async fn test_list_repositories() {
     assert!(names.contains(&"repo1".to_string()));
     assert!(names.contains(&"repo2".to_string()));
     assert!(names.contains(&"repo3".to_string()));
+}
+
+#[tokio::test]
+async fn test_registry_clone_with_auth_callbacks() {
+    setup_logging();
+    init_git_manager_no_shallow();
+
+    let temp_dir = TempDir::new().unwrap();
+    let registry_path = temp_dir.path();
+    let mut registry = Git2DB::open(registry_path).await.unwrap();
+
+    // Create a test repository to clone
+    let test_repo = temp_dir.path().join("source-repo");
+    fs::create_dir(&test_repo).unwrap();
+    create_test_repo(&test_repo).await.unwrap();
+    let url = format!("file://{}", test_repo.display());
+
+    // Test that registry.clone() works (this uses bare clone with auth callbacks)
+    // Even though file:// URLs don't require auth, this verifies the code path
+    // that sets up authentication callbacks is being exercised
+    let repo_id = registry.clone(&url)
+        .name("cloned-repo")
+        .exec()
+        .await
+        .unwrap();
+
+    // Verify the repository was cloned successfully
+    let handle = registry.repo(&repo_id).unwrap();
+    assert_eq!(handle.name().unwrap(), Some("cloned-repo"));
+    
+    // Verify the worktree exists and has the expected files
+    let worktree_path = handle.worktree().unwrap();
+    assert!(worktree_path.exists());
+    assert!(worktree_path.join("README.md").exists());
+
+    // Verify the bare repository exists (registry.clone creates bare repos)
+    let repo_dir = registry_path.join("repos").join("cloned-repo");
+    let bare_repo_path = repo_dir.join("cloned-repo.git");
+    assert!(bare_repo_path.exists(), "Bare repository should exist");
+    
+    // Verify it's actually a bare repository
+    use git2::Repository;
+    let bare_repo = Repository::open_bare(&bare_repo_path).unwrap();
+    assert!(bare_repo.is_bare(), "Repository should be bare");
 }
