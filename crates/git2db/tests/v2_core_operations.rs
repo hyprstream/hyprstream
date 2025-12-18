@@ -222,6 +222,63 @@ async fn test_remove_repository_cleanup() {
     }
 }
 
+#[tokio::test]
+async fn test_repository_handle_commit() {
+    setup_logging();
+    init_git_manager_no_shallow();
+
+    let temp_dir = TempDir::new().unwrap();
+    let registry_path = temp_dir.path();
+    let mut registry = Git2DB::open(registry_path).await.unwrap();
+
+    // Create test repository
+    let test_repo = temp_dir.path().join("repo");
+    fs::create_dir(&test_repo).unwrap();
+    create_test_repo(&test_repo).await.unwrap();
+    let url = format!("file://{}", test_repo.display());
+
+    // Add repository to registry
+    let repo_id = registry.add_repository("test-repo", &url).await.unwrap();
+    let handle = registry.repo(&repo_id).unwrap();
+
+    // Make a change to the repository
+    let worktree_path = handle.worktree().unwrap();
+    let test_file = worktree_path.join("test.txt");
+    fs::write(&test_file, "Hello, world!").unwrap();
+
+    // Stage the change
+    handle.staging().add("test.txt").await.unwrap();
+
+    // Commit using the new commit API
+    let commit_oid = handle.commit("Add test file").await.unwrap();
+
+    // Verify the commit was created
+    assert!(!commit_oid.is_zero(), "Commit OID should not be zero");
+
+    // Verify the file is in the commit
+    let repo = handle.open_repo().unwrap();
+    let commit = repo.find_commit(commit_oid).unwrap();
+    let tree = commit.tree().unwrap();
+    assert!(tree.get_path(std::path::Path::new("test.txt")).is_ok(), "test.txt should be in the commit");
+
+    // Verify commit message
+    assert_eq!(commit.message(), Some("Add test file\n"));
+
+    // Test commit_as with custom signature
+    let test_file2 = worktree_path.join("test2.txt");
+    fs::write(&test_file2, "Another file").unwrap();
+    handle.staging().add("test2.txt").await.unwrap();
+
+    use git2::Signature;
+    let custom_sig = Signature::now("Test User", "test@example.com").unwrap();
+    let commit_oid2 = handle.commit_as(&custom_sig, "Add second test file").await.unwrap();
+
+    // Verify custom signature was used
+    let commit2 = repo.find_commit(commit_oid2).unwrap();
+    assert_eq!(commit2.author().name(), Some("Test User"));
+    assert_eq!(commit2.author().email(), Some("test@example.com"));
+}
+
 // NOTE: Transaction tests temporarily disabled due to complex lifetime constraints
 // The transaction API works but requires more complex test setup
 // TODO: Implement transaction tests with proper async lifetime handling
