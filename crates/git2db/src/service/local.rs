@@ -5,14 +5,14 @@
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, instrument};
 
 use crate::{Git2DB, RepoId, TrackedRepository};
 
-use super::client::{RegistryClient, ServiceError};
+use super::client::{RegistryClient, RepositoryClient, ServiceError, WorktreeInfo};
 use super::request::RegistryRequest;
 
 /// In-process registry service that runs as a tokio task.
@@ -163,6 +163,61 @@ impl LocalService {
                 // Service is healthy if we can process requests
                 let _ = reply.send(Ok(()));
             }
+
+            // === Repository Operations ===
+
+            RegistryRequest::CreateWorktree {
+                repo_id,
+                worktree_path,
+                branch,
+                reply,
+            } => {
+                let result = self.do_create_worktree(&repo_id, &worktree_path, &branch).await;
+                let _ = reply.send(result);
+            }
+
+            RegistryRequest::ListWorktrees { repo_id, reply } => {
+                let result = self.do_list_worktrees(&repo_id).await;
+                let _ = reply.send(result);
+            }
+
+            RegistryRequest::WorktreePath {
+                repo_id,
+                branch,
+                reply,
+            } => {
+                let result = self.do_worktree_path(&repo_id, &branch).await;
+                let _ = reply.send(result);
+            }
+
+            RegistryRequest::CreateBranch {
+                repo_id,
+                name,
+                from,
+                reply,
+            } => {
+                let result = self.do_create_branch(&repo_id, &name, from.as_deref()).await;
+                let _ = reply.send(result);
+            }
+
+            RegistryRequest::Checkout {
+                repo_id,
+                ref_spec,
+                reply,
+            } => {
+                let result = self.do_checkout(&repo_id, &ref_spec).await;
+                let _ = reply.send(result);
+            }
+
+            RegistryRequest::DefaultBranch { repo_id, reply } => {
+                let result = self.do_default_branch(&repo_id).await;
+                let _ = reply.send(result);
+            }
+
+            RegistryRequest::ListBranches { repo_id, reply } => {
+                let result = self.do_list_branches(&repo_id).await;
+                let _ = reply.send(result);
+            }
         }
     }
 
@@ -194,6 +249,92 @@ impl LocalService {
         let repos: Vec<TrackedRepository> = self.registry.list().cloned().collect();
         debug!(repo_count = repos.len(), "Cache refreshed");
         self.cache.store(Arc::new(repos));
+    }
+
+    // === Repository Operation Implementations ===
+
+    /// Create a worktree - uses RepositoryHandle which handles LFS properly.
+    async fn do_create_worktree(
+        &self,
+        repo_id: &RepoId,
+        worktree_path: &Path,
+        branch: &str,
+    ) -> Result<PathBuf, ServiceError> {
+        let handle = self.registry.repo(repo_id)?;
+        let worktree_handle = handle.create_worktree(worktree_path, branch).await?;
+        Ok(worktree_handle.path().to_path_buf())
+    }
+
+    /// List worktrees.
+    async fn do_list_worktrees(&self, repo_id: &RepoId) -> Result<Vec<WorktreeInfo>, ServiceError> {
+        let handle = self.registry.repo(repo_id)?;
+        let worktree_handles = handle.get_worktrees().await?;
+
+        // Convert WorktreeHandle to WorktreeInfo
+        let mut result = Vec::new();
+        for wt in worktree_handles {
+            // Extract branch name from path (last component: worktrees/{branch})
+            let branch = wt.path()
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned());
+
+            result.push(WorktreeInfo {
+                path: wt.path().to_path_buf(),
+                branch,
+                driver: wt.driver_name.clone(),
+            });
+        }
+        Ok(result)
+    }
+
+    /// Get worktree path for a branch.
+    async fn do_worktree_path(
+        &self,
+        repo_id: &RepoId,
+        branch: &str,
+    ) -> Result<Option<PathBuf>, ServiceError> {
+        let handle = self.registry.repo(repo_id)?;
+
+        // Use get_worktree which looks up by branch name
+        if let Some(wt) = handle.get_worktree(branch).await? {
+            return Ok(Some(wt.path().to_path_buf()));
+        }
+        Ok(None)
+    }
+
+    /// Create a branch.
+    async fn do_create_branch(
+        &self,
+        repo_id: &RepoId,
+        name: &str,
+        from: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        let handle = self.registry.repo(repo_id)?;
+        handle.branch().create(name, from).await?;
+        Ok(())
+    }
+
+    /// Checkout a branch or ref.
+    async fn do_checkout(&self, repo_id: &RepoId, ref_spec: &str) -> Result<(), ServiceError> {
+        let handle = self.registry.repo(repo_id)?;
+        handle.branch().checkout(ref_spec).await?;
+        Ok(())
+    }
+
+    /// Get the default branch.
+    async fn do_default_branch(&self, repo_id: &RepoId) -> Result<String, ServiceError> {
+        let handle = self.registry.repo(repo_id)?;
+        // default_branch is synchronous
+        let default = handle.default_branch()?;
+        Ok(default)
+    }
+
+    /// List all branches.
+    async fn do_list_branches(&self, repo_id: &RepoId) -> Result<Vec<String>, ServiceError> {
+        let handle = self.registry.repo(repo_id)?;
+        let branches = handle.branch().list().await?;
+        // Convert Branch structs to their names
+        Ok(branches.into_iter().map(|b| b.name).collect())
     }
 }
 
@@ -310,6 +451,143 @@ impl RegistryClient for LocalClient {
         let (tx, rx) = oneshot::channel();
         self.sender
             .send(RegistryRequest::HealthCheck { reply: tx })
+            .map_err(|_| ServiceError::Unavailable)?;
+        rx.await.map_err(|_| ServiceError::channel("No response"))?
+    }
+
+    /// Get a scoped repository client by name.
+    async fn repo(&self, name: &str) -> Result<Arc<dyn RepositoryClient>, ServiceError> {
+        // Find repository by name
+        let tracked = self.get_by_name(name).await?;
+        let tracked = tracked.ok_or_else(|| {
+            ServiceError::channel(format!("Repository '{}' not found", name))
+        })?;
+
+        let repo_name = tracked.name.unwrap_or_else(|| name.to_string());
+        Ok(Arc::new(LocalRepositoryClient {
+            sender: self.sender.clone(),
+            repo_id: tracked.id,
+            name: repo_name,
+        }))
+    }
+
+    /// Get a scoped repository client by ID.
+    async fn repo_by_id(&self, id: &RepoId) -> Result<Arc<dyn RepositoryClient>, ServiceError> {
+        // Find repository by ID
+        let tracked = self.get(id).await?;
+        let tracked = tracked.ok_or_else(|| {
+            ServiceError::channel(format!("Repository with ID {:?} not found", id))
+        })?;
+
+        let name = tracked.name.unwrap_or_else(|| id.to_string());
+        Ok(Arc::new(LocalRepositoryClient {
+            sender: self.sender.clone(),
+            repo_id: id.clone(),
+            name,
+        }))
+    }
+}
+
+/// Scoped repository client for a specific repository.
+///
+/// This client sends requests to the LocalService for a specific repository.
+/// All operations use RepositoryHandle internally, ensuring proper LFS handling.
+#[derive(Clone)]
+pub struct LocalRepositoryClient {
+    sender: mpsc::UnboundedSender<RegistryRequest>,
+    repo_id: RepoId,
+    name: String,
+}
+
+#[async_trait]
+impl RepositoryClient for LocalRepositoryClient {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn id(&self) -> &RepoId {
+        &self.repo_id
+    }
+
+    async fn create_worktree(&self, path: &Path, branch: &str) -> Result<PathBuf, ServiceError> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(RegistryRequest::CreateWorktree {
+                repo_id: self.repo_id.clone(),
+                worktree_path: path.to_path_buf(),
+                branch: branch.to_string(),
+                reply: tx,
+            })
+            .map_err(|_| ServiceError::Unavailable)?;
+        rx.await.map_err(|_| ServiceError::channel("No response"))?
+    }
+
+    async fn list_worktrees(&self) -> Result<Vec<WorktreeInfo>, ServiceError> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(RegistryRequest::ListWorktrees {
+                repo_id: self.repo_id.clone(),
+                reply: tx,
+            })
+            .map_err(|_| ServiceError::Unavailable)?;
+        rx.await.map_err(|_| ServiceError::channel("No response"))?
+    }
+
+    async fn worktree_path(&self, branch: &str) -> Result<Option<PathBuf>, ServiceError> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(RegistryRequest::WorktreePath {
+                repo_id: self.repo_id.clone(),
+                branch: branch.to_string(),
+                reply: tx,
+            })
+            .map_err(|_| ServiceError::Unavailable)?;
+        rx.await.map_err(|_| ServiceError::channel("No response"))?
+    }
+
+    async fn create_branch(&self, name: &str, from: Option<&str>) -> Result<(), ServiceError> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(RegistryRequest::CreateBranch {
+                repo_id: self.repo_id.clone(),
+                name: name.to_string(),
+                from: from.map(String::from),
+                reply: tx,
+            })
+            .map_err(|_| ServiceError::Unavailable)?;
+        rx.await.map_err(|_| ServiceError::channel("No response"))?
+    }
+
+    async fn checkout(&self, ref_spec: &str) -> Result<(), ServiceError> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(RegistryRequest::Checkout {
+                repo_id: self.repo_id.clone(),
+                ref_spec: ref_spec.to_string(),
+                reply: tx,
+            })
+            .map_err(|_| ServiceError::Unavailable)?;
+        rx.await.map_err(|_| ServiceError::channel("No response"))?
+    }
+
+    async fn default_branch(&self) -> Result<String, ServiceError> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(RegistryRequest::DefaultBranch {
+                repo_id: self.repo_id.clone(),
+                reply: tx,
+            })
+            .map_err(|_| ServiceError::Unavailable)?;
+        rx.await.map_err(|_| ServiceError::channel("No response"))?
+    }
+
+    async fn list_branches(&self) -> Result<Vec<String>, ServiceError> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(RegistryRequest::ListBranches {
+                repo_id: self.repo_id.clone(),
+                reply: tx,
+            })
             .map_err(|_| ServiceError::Unavailable)?;
         rx.await.map_err(|_| ServiceError::channel("No response"))?
     }

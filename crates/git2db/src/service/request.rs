@@ -7,6 +7,7 @@ use crate::{RepoId, TrackedRepository};
 use std::path::PathBuf;
 use tokio::sync::oneshot;
 
+use super::client::WorktreeInfo;
 use super::ServiceError;
 
 /// Request types for the registry service.
@@ -63,6 +64,56 @@ pub enum RegistryRequest {
     HealthCheck {
         reply: oneshot::Sender<Result<(), ServiceError>>,
     },
+
+    // === Repository Operations ===
+
+    /// Create a worktree for a repository.
+    CreateWorktree {
+        repo_id: RepoId,
+        worktree_path: PathBuf,
+        branch: String,
+        reply: oneshot::Sender<Result<PathBuf, ServiceError>>,
+    },
+
+    /// List worktrees for a repository.
+    ListWorktrees {
+        repo_id: RepoId,
+        reply: oneshot::Sender<Result<Vec<WorktreeInfo>, ServiceError>>,
+    },
+
+    /// Get worktree path for a branch.
+    WorktreePath {
+        repo_id: RepoId,
+        branch: String,
+        reply: oneshot::Sender<Result<Option<PathBuf>, ServiceError>>,
+    },
+
+    /// Create a branch.
+    CreateBranch {
+        repo_id: RepoId,
+        name: String,
+        from: Option<String>,
+        reply: oneshot::Sender<Result<(), ServiceError>>,
+    },
+
+    /// Checkout a branch or ref.
+    Checkout {
+        repo_id: RepoId,
+        ref_spec: String,
+        reply: oneshot::Sender<Result<(), ServiceError>>,
+    },
+
+    /// Get the default branch.
+    DefaultBranch {
+        repo_id: RepoId,
+        reply: oneshot::Sender<Result<String, ServiceError>>,
+    },
+
+    /// List all branches.
+    ListBranches {
+        repo_id: RepoId,
+        reply: oneshot::Sender<Result<Vec<String>, ServiceError>>,
+    },
 }
 
 impl std::fmt::Debug for RegistryRequest {
@@ -88,6 +139,53 @@ impl std::fmt::Debug for RegistryRequest {
             }
             Self::Remove { id, .. } => write!(f, "RegistryRequest::Remove {{ id: {:?} }}", id),
             Self::HealthCheck { .. } => write!(f, "RegistryRequest::HealthCheck"),
+            Self::CreateWorktree {
+                repo_id,
+                worktree_path,
+                branch,
+                ..
+            } => {
+                write!(
+                    f,
+                    "RegistryRequest::CreateWorktree {{ repo_id: {:?}, path: {:?}, branch: {:?} }}",
+                    repo_id, worktree_path, branch
+                )
+            }
+            Self::ListWorktrees { repo_id, .. } => {
+                write!(f, "RegistryRequest::ListWorktrees {{ repo_id: {:?} }}", repo_id)
+            }
+            Self::WorktreePath { repo_id, branch, .. } => {
+                write!(
+                    f,
+                    "RegistryRequest::WorktreePath {{ repo_id: {:?}, branch: {:?} }}",
+                    repo_id, branch
+                )
+            }
+            Self::CreateBranch {
+                repo_id,
+                name,
+                from,
+                ..
+            } => {
+                write!(
+                    f,
+                    "RegistryRequest::CreateBranch {{ repo_id: {:?}, name: {:?}, from: {:?} }}",
+                    repo_id, name, from
+                )
+            }
+            Self::Checkout { repo_id, ref_spec, .. } => {
+                write!(
+                    f,
+                    "RegistryRequest::Checkout {{ repo_id: {:?}, ref_spec: {:?} }}",
+                    repo_id, ref_spec
+                )
+            }
+            Self::DefaultBranch { repo_id, .. } => {
+                write!(f, "RegistryRequest::DefaultBranch {{ repo_id: {:?} }}", repo_id)
+            }
+            Self::ListBranches { repo_id, .. } => {
+                write!(f, "RegistryRequest::ListBranches {{ repo_id: {:?} }}", repo_id)
+            }
         }
     }
 }

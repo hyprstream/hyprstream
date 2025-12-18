@@ -2,8 +2,20 @@
 
 use crate::{Git2DBError, RepoId, TrackedRepository};
 use async_trait::async_trait;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
+
+/// Worktree information returned by list_worktrees.
+#[derive(Debug, Clone)]
+pub struct WorktreeInfo {
+    /// Path to the worktree
+    pub path: PathBuf,
+    /// Branch name (if associated with a branch)
+    pub branch: Option<String>,
+    /// Storage driver name
+    pub driver: String,
+}
 
 /// Transport-agnostic registry client trait.
 ///
@@ -69,6 +81,56 @@ pub trait RegistryClient: Send + Sync {
     ///
     /// Returns `Ok(())` if the service is healthy, error otherwise.
     async fn health_check(&self) -> Result<(), ServiceError>;
+
+    // === Repository Client Access ===
+
+    /// Get a scoped repository client by name.
+    ///
+    /// Returns a client that provides repository-level operations (worktrees, branches, etc.).
+    async fn repo(&self, name: &str) -> Result<Arc<dyn RepositoryClient>, ServiceError>;
+
+    /// Get a scoped repository client by ID.
+    async fn repo_by_id(&self, id: &RepoId) -> Result<Arc<dyn RepositoryClient>, ServiceError>;
+}
+
+/// Scoped repository operations (mirrors RepositoryHandle).
+///
+/// This trait provides repository-level operations that work over the service layer.
+/// Implementations send requests to the service, which uses RepositoryHandle internally.
+#[async_trait]
+pub trait RepositoryClient: Send + Sync {
+    /// Repository name
+    fn name(&self) -> &str;
+
+    /// Repository ID
+    fn id(&self) -> &RepoId;
+
+    // === Worktree Operations ===
+
+    /// Create a new worktree for a branch.
+    ///
+    /// This properly handles LFS/XET file smudging via the service.
+    async fn create_worktree(&self, path: &Path, branch: &str) -> Result<PathBuf, ServiceError>;
+
+    /// List all worktrees.
+    async fn list_worktrees(&self) -> Result<Vec<WorktreeInfo>, ServiceError>;
+
+    /// Get the path for a worktree.
+    async fn worktree_path(&self, branch: &str) -> Result<Option<PathBuf>, ServiceError>;
+
+    // === Branch Operations ===
+
+    /// Create a new branch.
+    async fn create_branch(&self, name: &str, from: Option<&str>) -> Result<(), ServiceError>;
+
+    /// Checkout a branch or ref.
+    async fn checkout(&self, ref_spec: &str) -> Result<(), ServiceError>;
+
+    /// Get the default branch name.
+    async fn default_branch(&self) -> Result<String, ServiceError>;
+
+    /// List all branches.
+    async fn list_branches(&self) -> Result<Vec<String>, ServiceError>;
 }
 
 /// Service error type wrapping Git2DBError with service-layer concerns.

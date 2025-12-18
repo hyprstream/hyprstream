@@ -373,12 +373,24 @@ impl ModelStorage {
 
 
     /// Get repository status
+    ///
+    /// Status is obtained from the worktree for the specified branch, not the bare repo.
     pub async fn status(&self, model_ref: &ModelRef) -> Result<git2db::RepositoryStatus> {
-        let tracked = self.resolve_repo(&model_ref.model).await?;
-        let repo_path = PathBuf::from(&tracked.worktree_path);
+        // Get the worktree path for this model:branch reference
+        let worktree_path = self.get_model_path(model_ref).await?;
 
-        // Use GitManager for local git operations
-        let repo_cache = GitManager::global().get_repository(&repo_path)?;
+        // Check if worktree exists
+        if !worktree_path.exists() {
+            return Err(anyhow::anyhow!(
+                "Worktree does not exist at {}. Create it with: hyprstream branch {} {}",
+                worktree_path.display(),
+                model_ref.model,
+                model_ref.git_ref.display_name()
+            ));
+        }
+
+        // Use GitManager to open the worktree repository
+        let repo_cache = GitManager::global().get_repository(&worktree_path)?;
         let repo = repo_cache.open()?;
 
         // Get status from repository
@@ -454,31 +466,12 @@ impl ModelStorage {
 
     /// Get default branch
     pub async fn get_default_branch(&self, model_ref: &ModelRef) -> Result<String> {
-        let tracked = self.resolve_repo(&model_ref.model).await?;
-        let repo_path = PathBuf::from(&tracked.worktree_path);
+        // Use RepositoryClient to get default branch via service layer
+        let repo_client = self.client.repo(&model_ref.model).await
+            .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
 
-        // Use GitManager for local git operations
-        let repo_cache = GitManager::global().get_repository(&repo_path)?;
-        let repo = repo_cache.open()?;
-
-        // Try to get default branch from HEAD or config
-        if let Ok(head) = repo.head() {
-            if head.is_branch() {
-                if let Some(name) = head.shorthand() {
-                    return Ok(name.to_string());
-                }
-            }
-        }
-
-        // Fallback: try to find main or master
-        if repo.find_branch("main", git2::BranchType::Local).is_ok() {
-            return Ok("main".to_string());
-        }
-        if repo.find_branch("master", git2::BranchType::Local).is_ok() {
-            return Ok("master".to_string());
-        }
-
-        Err(anyhow::anyhow!("Could not determine default branch"))
+        repo_client.default_branch().await
+            .map_err(|e| anyhow::anyhow!("Failed to get default branch: {}", e))
     }
 
     /// Remove model
@@ -495,15 +488,15 @@ impl ModelStorage {
     }
 
     /// Create a new worktree for a model
+    ///
+    /// Uses RepositoryClient to route through the service layer, which properly
+    /// handles LFS file smudging via RepositoryHandle.
     pub async fn create_worktree(&self, model_ref: &ModelRef, branch: &str) -> Result<PathBuf> {
         let worktree_path = self.get_worktree_path(model_ref, branch).await?;
 
         if worktree_path.exists() {
             return Err(anyhow::anyhow!("Worktree already exists at {:?}", worktree_path));
         }
-
-        let tracked = self.resolve_repo(&model_ref.model).await?;
-        let repo_path = PathBuf::from(&tracked.worktree_path);
 
         tracing::info!(
             "Creating worktree for {} at {} (branch: {})",
@@ -512,54 +505,35 @@ impl ModelStorage {
             branch
         );
 
-        // Create parent directories
-        if let Some(parent) = worktree_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        // Use RepositoryClient to create worktree - routes through service layer
+        // which uses RepositoryHandle.create_worktree() with proper LFS handling
+        let repo_client = self.client.repo(&model_ref.model).await
+            .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
 
-        // Open repo and create worktree using git2
-        let repo_cache = GitManager::global().get_repository(&repo_path)?;
-        let repo = repo_cache.open()?;
-
-        // Find or create the branch
-        let branch_ref = if let Ok(branch_ref) = repo.find_branch(branch, git2::BranchType::Local) {
-            branch_ref
-        } else {
-            // Branch doesn't exist, create it from HEAD
-            let head_commit = repo.head()?.peel_to_commit()?;
-            repo.branch(branch, &head_commit, false)?
-        };
-
-        // Create worktree - use the branch reference
-        let reference = branch_ref.into_reference();
-        repo.worktree(branch, &worktree_path, Some(&mut git2::WorktreeAddOptions::new().reference(Some(&reference))))
+        let result_path = repo_client.create_worktree(&worktree_path, branch).await
             .map_err(|e| anyhow::anyhow!("Failed to create worktree: {}", e))?;
 
-        tracing::info!("Successfully created worktree at {}", worktree_path.display());
-        Ok(worktree_path)
+        tracing::info!("Successfully created worktree at {}", result_path.display());
+        Ok(result_path)
     }
 
     /// List all worktrees for a model
+    ///
+    /// Returns the list of actual worktrees that exist on disk. If no worktrees
+    /// exist, returns an empty list (does not include phantom default branch).
     pub async fn list_worktrees(&self, model_ref: &ModelRef) -> Result<Vec<String>> {
-        let tracked = self.resolve_repo(&model_ref.model).await?;
-        let repo_path = PathBuf::from(&tracked.worktree_path);
+        // Use RepositoryClient to get worktrees via service layer
+        let repo_client = self.client.repo(&model_ref.model).await
+            .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
 
-        // Collect worktrees synchronously (git2 types are not Send)
-        let result: Vec<String> = {
-            let repo_cache = GitManager::global().get_repository(&repo_path)?;
-            let repo = repo_cache.open()?;
+        let worktree_infos = repo_client.list_worktrees().await
+            .map_err(|e| anyhow::anyhow!("Failed to list worktrees: {}", e))?;
 
-            // List worktrees using git2 and collect immediately
-            let worktrees = repo.worktrees()?;
-            worktrees.iter().flatten().map(|s| s.to_string()).collect()
-        };
-
-        // If no worktrees listed, include the main branch
-        if result.is_empty() {
-            if let Ok(default_branch) = self.get_default_branch(model_ref).await {
-                return Ok(vec![default_branch]);
-            }
-        }
+        // Extract branch names from WorktreeInfo
+        let result: Vec<String> = worktree_infos
+            .into_iter()
+            .filter_map(|wt| wt.branch)
+            .collect();
 
         Ok(result)
     }
