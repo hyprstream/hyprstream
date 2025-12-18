@@ -571,7 +571,14 @@ impl GitManager {
             Git2DBError::repository(&base_repo_path, format!("Failed to find worktree: {}", e))
         })?;
 
-        wt.prune(Some(&mut git2::WorktreePruneOptions::new()))
+        // Configure prune options:
+        // - valid(true): Allow pruning even if worktree is valid (not orphaned)
+        // - working_tree(true): Also remove the working directory contents
+        let mut opts = git2::WorktreePruneOptions::new();
+        opts.valid(true);
+        opts.working_tree(true);
+
+        wt.prune(Some(&mut opts))
             .map_err(|e| {
                 Git2DBError::repository(&base_repo_path, format!("Failed to prune worktree: {}", e))
             })?;

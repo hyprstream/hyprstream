@@ -2214,22 +2214,71 @@ pub async fn handle_remove(
         ));
     }
 
-    let model_ref = ModelRef::new(model.to_string());
+    // Parse model reference to handle model:branch format
+    let model_ref = ModelRef::parse(model)?;
 
+    // Check if a specific branch/worktree was specified
+    let is_worktree_removal = !matches!(model_ref.git_ref, crate::storage::GitRef::DefaultBranch);
+
+    if is_worktree_removal {
+        // Removing a specific worktree, not the entire model
+        let branch = model_ref.git_ref.display_name();
+        info!("Removing worktree {} for model {}", branch, model_ref.model);
+
+        // Check if the worktree exists
+        let worktree_path = match storage.get_model_path(&model_ref).await {
+            Ok(path) => path,
+            Err(_) => {
+                println!("❌ Worktree '{}' not found for model '{}'", branch, model_ref.model);
+                return Ok(());
+            }
+        };
+
+        if !worktree_path.exists() {
+            println!("❌ Worktree '{}' not found for model '{}'", branch, model_ref.model);
+            return Ok(());
+        }
+
+        // Show what will be removed
+        println!("Worktree '{}:{}' removal plan:", model_ref.model, branch);
+        println!("  📁 Remove worktree at: {}", worktree_path.display());
+
+        // Confirmation prompt unless forced
+        if !force {
+            print!("Are you sure you want to remove worktree '{}:{}'? [y/N]: ", model_ref.model, branch);
+            io::stdout().flush()?;
+
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            let input = input.trim().to_lowercase();
+
+            if input != "y" && input != "yes" {
+                println!("Removal cancelled");
+                return Ok(());
+            }
+        }
+
+        // Remove the worktree
+        storage.remove_worktree(&ModelRef::new(model_ref.model.clone()), &branch).await?;
+        println!("✓ Worktree '{}:{}' removed successfully", model_ref.model, branch);
+        return Ok(());
+    }
+
+    // Removing the entire model (no branch specified)
     // Check if model exists in registry
     let registry_exists = storage.get_model_path(&model_ref).await.is_ok();
 
-    // Check if model exists in filesystem
-    let model_path = storage.get_models_dir().join(model);
+    // Check if model exists in filesystem (model directory)
+    let model_path = storage.get_models_dir().join(&model_ref.model);
     let files_exist = model_path.exists();
 
     if !registry_exists && !files_exist {
-        println!("❌ Model '{}' not found in registry or filesystem", model);
+        println!("❌ Model '{}' not found in registry or filesystem", model_ref.model);
         return Ok(());
     }
 
     // Show what will be removed
-    println!("Model '{}' removal plan:", model);
+    println!("Model '{}' removal plan:", model_ref.model);
     if registry_exists && !files_only {
         println!("  🗂️  Remove from git registry (submodule)");
     }
@@ -2270,7 +2319,7 @@ pub async fn handle_remove(
 
     // Confirmation prompt unless forced
     if !force {
-        print!("Are you sure you want to remove model '{}'? [y/N]: ", model);
+        print!("Are you sure you want to remove model '{}'? [y/N]: ", model_ref.model);
         io::stdout().flush()?;
 
         let mut input = String::new();
@@ -2287,10 +2336,10 @@ pub async fn handle_remove(
     if registry_exists && !files_only {
         match storage.remove_model(&model_ref).await {
             Ok(_) => {
-                println!("✓ Removed '{}' from git registry", model);
+                println!("✓ Removed '{}' from git registry", model_ref.model);
             }
             Err(e) => {
-                eprintln!("❌ Failed to remove '{}' from git registry: {}", model, e);
+                eprintln!("❌ Failed to remove '{}' from git registry: {}", model_ref.model, e);
                 if !files_only {
                     return Err(e);
                 }
@@ -2344,6 +2393,6 @@ pub async fn handle_remove(
         }
     }
 
-    println!("✓ Model '{}' removed successfully", model);
+    println!("✓ Model '{}' removed successfully", model_ref.model);
     Ok(())
 }
