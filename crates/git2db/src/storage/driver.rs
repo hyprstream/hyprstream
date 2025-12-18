@@ -567,7 +567,11 @@ impl WorktreeHandle {
 
     /// Get the current status of the worktree
     ///
-    /// Returns branch information, modified files, and repository state
+    /// Returns branch information, modified files, repository state, and ahead/behind counts
+    /// compared to the upstream tracking branch (if configured).
+    ///
+    /// The `ahead` and `behind` fields indicate how many commits the local branch is ahead
+    /// or behind its upstream tracking branch. If no upstream is configured, both will be 0.
     ///
     /// # Examples
     ///
@@ -577,6 +581,8 @@ impl WorktreeHandle {
     /// println!("Current branch: {:?}", status.branch);
     /// println!("Modified files: {:?}", status.modified_files);
     /// println!("Is clean: {}", status.is_clean);
+    /// println!("Ahead: {} commits", status.ahead);
+    /// println!("Behind: {} commits", status.behind);
     /// # Ok(())
     /// # }
     /// ```
@@ -600,11 +606,42 @@ impl WorktreeHandle {
             .filter_map(|entry| entry.path().map(PathBuf::from))
             .collect();
 
+        // Calculate ahead/behind counts if we have a branch with upstream
+        let (ahead, behind) = if let (Some(branch_name), Some(local_oid)) = (&branch, head_oid) {
+            // Try to find the local branch to get its upstream
+            if let Ok(local_branch) = repo.find_branch(branch_name, git2::BranchType::Local) {
+                // Get the upstream tracking branch
+                if let Ok(upstream_branch) = local_branch.upstream() {
+                    if let Some(upstream_oid) = upstream_branch.get().target() {
+                        // Calculate ahead/behind using git2's graph_ahead_behind
+                        match repo.graph_ahead_behind(local_oid, upstream_oid) {
+                            Ok((a, b)) => (a, b),
+                            Err(_) => {
+                                // If calculation fails (e.g., no common ancestor), return zeros
+                                (0, 0)
+                            }
+                        }
+                    } else {
+                        (0, 0)
+                    }
+                } else {
+                    // No upstream tracking branch configured
+                    (0, 0)
+                }
+            } else {
+                // Couldn't find the branch (shouldn't happen, but handle gracefully)
+                (0, 0)
+            }
+        } else {
+            // No branch or no HEAD OID (detached HEAD or empty repo)
+            (0, 0)
+        };
+
         Ok(RepositoryStatus {
             branch,
             head: head_oid,
-            ahead: 0, // TODO: Calculate ahead/behind
-            behind: 0,
+            ahead,
+            behind,
             is_clean,
             modified_files,
         })

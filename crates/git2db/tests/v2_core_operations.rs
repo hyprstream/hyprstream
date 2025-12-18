@@ -222,6 +222,63 @@ async fn test_remove_repository_cleanup() {
     }
 }
 
+#[tokio::test]
+async fn test_repository_handle_commit() {
+    setup_logging();
+    init_git_manager_no_shallow();
+
+    let temp_dir = TempDir::new().unwrap();
+    let registry_path = temp_dir.path();
+    let mut registry = Git2DB::open(registry_path).await.unwrap();
+
+    // Create test repository
+    let test_repo = temp_dir.path().join("repo");
+    fs::create_dir(&test_repo).unwrap();
+    create_test_repo(&test_repo).await.unwrap();
+    let url = format!("file://{}", test_repo.display());
+
+    // Add repository to registry
+    let repo_id = registry.add_repository("test-repo", &url).await.unwrap();
+    let handle = registry.repo(&repo_id).unwrap();
+
+    // Make a change to the repository
+    let worktree_path = handle.worktree().unwrap();
+    let test_file = worktree_path.join("test.txt");
+    fs::write(&test_file, "Hello, world!").unwrap();
+
+    // Stage the change
+    handle.staging().add("test.txt").await.unwrap();
+
+    // Commit using the new commit API
+    let commit_oid = handle.commit("Add test file").await.unwrap();
+
+    // Verify the commit was created
+    assert!(!commit_oid.is_zero(), "Commit OID should not be zero");
+
+    // Verify the file is in the commit
+    let repo = handle.open_repo().unwrap();
+    let commit = repo.find_commit(commit_oid).unwrap();
+    let tree = commit.tree().unwrap();
+    assert!(tree.get_path(std::path::Path::new("test.txt")).is_ok(), "test.txt should be in the commit");
+
+    // Verify commit message
+    assert_eq!(commit.message(), Some("Add test file\n"));
+
+    // Test commit_as with custom signature
+    let test_file2 = worktree_path.join("test2.txt");
+    fs::write(&test_file2, "Another file").unwrap();
+    handle.staging().add("test2.txt").await.unwrap();
+
+    use git2::Signature;
+    let custom_sig = Signature::now("Test User", "test@example.com").unwrap();
+    let commit_oid2 = handle.commit_as(&custom_sig, "Add second test file").await.unwrap();
+
+    // Verify custom signature was used
+    let commit2 = repo.find_commit(commit_oid2).unwrap();
+    assert_eq!(commit2.author().name(), Some("Test User"));
+    assert_eq!(commit2.author().email(), Some("test@example.com"));
+}
+
 // NOTE: Transaction tests temporarily disabled due to complex lifetime constraints
 // The transaction API works but requires more complex test setup
 // TODO: Implement transaction tests with proper async lifetime handling
@@ -372,19 +429,160 @@ async fn test_registry_clone_with_auth_callbacks() {
     // Verify the repository was cloned successfully
     let handle = registry.repo(&repo_id).unwrap();
     assert_eq!(handle.name().unwrap(), Some("cloned-repo"));
-    
-    // Verify the worktree exists and has the expected files
-    let worktree_path = handle.worktree().unwrap();
-    assert!(worktree_path.exists());
-    assert!(worktree_path.join("README.md").exists());
 
-    // Verify the bare repository exists (registry.clone creates bare repos)
-    let repo_dir = registry_path.join("repos").join("cloned-repo");
-    let bare_repo_path = repo_dir.join("cloned-repo.git");
-    assert!(bare_repo_path.exists(), "Bare repository should exist");
-    
+    // Verify the bare repository exists
+    // Note: handle.worktree() returns the bare repo path for cloned repos
+    let bare_repo_path = handle.worktree().unwrap();
+    assert!(bare_repo_path.exists(), "Bare repository path should exist");
+
     // Verify it's actually a bare repository
     use git2::Repository;
-    let bare_repo = Repository::open_bare(&bare_repo_path).unwrap();
+    let bare_repo = Repository::open_bare(bare_repo_path).unwrap();
     assert!(bare_repo.is_bare(), "Repository should be bare");
+
+    // Verify the default worktree exists and has the expected files
+    // registry.clone() creates worktrees at {repo_dir}/worktrees/{branch}
+    let repo_dir = registry_path.join("cloned-repo");
+    let default_worktree = repo_dir.join("worktrees").join("main");
+    assert!(default_worktree.exists(), "Default worktree should exist");
+    assert!(
+        default_worktree.join("README.md").exists(),
+        "README.md should exist in the worktree"
+    );
+}
+
+#[tokio::test]
+async fn test_worktree_status_ahead_behind() {
+    setup_logging();
+    init_git_manager_no_shallow();
+
+    let temp_dir = TempDir::new().unwrap();
+    let registry_path = temp_dir.path();
+    let mut registry = Git2DB::open(registry_path).await.unwrap();
+
+    // Create a test repository with multiple commits
+    let test_repo_dir = temp_dir.path().join("test-repo");
+    fs::create_dir(&test_repo_dir).unwrap();
+
+    use git2::Repository;
+    let repo = Repository::init(&test_repo_dir).unwrap();
+    let sig = repo.signature().unwrap();
+
+    // Create initial commit
+    let mut index = repo.index().unwrap();
+    let readme_path = test_repo_dir.join("README.md");
+    fs::write(&readme_path, "# Test Repository\n").unwrap();
+    index.add_path(std::path::Path::new("README.md")).unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[]).unwrap();
+
+    // Create a second commit (local is ahead)
+    let file2_path = test_repo_dir.join("file2.txt");
+    fs::write(&file2_path, "Content\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("file2.txt")).unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "Second commit", &tree, &[&head]).unwrap();
+
+    // Add repository to registry
+    let url = format!("file://{}", test_repo_dir.display());
+    let repo_id = registry.add_repository("test-repo", &url).await.unwrap();
+    let handle = registry.repo(&repo_id).unwrap();
+
+    // Create a new branch "test-branch" for the worktree (can't use main since it's already checked out)
+    let base_repo_path = handle.worktree().unwrap();
+    {
+        let base_repo = Repository::open(&base_repo_path).unwrap();
+        let head_commit = base_repo.head().unwrap().peel_to_commit().unwrap();
+        base_repo.branch("test-branch", &head_commit, false).unwrap();
+    }
+
+    // Create a worktree for "test-branch"
+    let worktree_path = temp_dir.path().join("worktrees").join("test-branch");
+    let mut worktree_handle = handle.create_worktree(&worktree_path, "test-branch").await.unwrap();
+
+    // Get status - should show ahead: 0, behind: 0 since there's no upstream tracking
+    let status = worktree_handle.status().await.unwrap();
+    assert_eq!(status.ahead, 0, "Should be 0 ahead when no upstream is configured");
+    assert_eq!(status.behind, 0, "Should be 0 behind when no upstream is configured");
+
+    // Now set up upstream tracking by creating a "remote" branch in the same repo
+    // and setting it as upstream
+    let repo_path = &worktree_path;
+    let repo = Repository::open(repo_path).unwrap();
+
+    // Create a remote branch reference (simulating origin/test-branch)
+    let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
+    let test_branch = "test-branch";
+    let remote_ref_name = format!("refs/remotes/origin/{}", test_branch);
+    repo.reference(&remote_ref_name, head_commit.id(), false, "Create remote ref").unwrap();
+
+    // Set upstream for the current branch (test-branch)
+    let mut branch = repo.find_branch(test_branch, git2::BranchType::Local).unwrap();
+    branch.set_upstream(Some(&format!("origin/{}", test_branch))).unwrap();
+
+    // Now make another local commit (we'll be ahead of the remote)
+    let file3_path = repo_path.join("file3.txt");
+    fs::write(&file3_path, "More content\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("file3.txt")).unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "Third commit", &tree, &[&head]).unwrap();
+
+    // Get status again - should show ahead: 1, behind: 0
+    let status = worktree_handle.status().await.unwrap();
+    assert_eq!(status.ahead, 1, "Should be 1 commit ahead of upstream");
+    assert_eq!(status.behind, 0, "Should be 0 commits behind upstream");
+
+    // Now simulate a divergence scenario:
+    // We need the remote to have a commit that local doesn't have.
+    // To do this, we'll:
+    // 1. Create a new commit on top of the original HEAD (before our local commit)
+    // 2. Update the remote ref to point to that new commit
+    //
+    // Current state:
+    //   remote: A -> B (original head_commit)
+    //   local:  A -> B -> C (our "Third commit")
+    //
+    // We want:
+    //   remote: A -> B -> D (new commit branching from B)
+    //   local:  A -> B -> C (our "Third commit")
+    //
+    // This will make local 1 ahead (has C) and 1 behind (doesn't have D)
+
+    // Get the parent of the current HEAD (this is commit B, before we added "Third commit")
+    let current_head = repo.head().unwrap().peel_to_commit().unwrap();
+    let parent_commit = current_head.parent(0).unwrap();
+
+    // Create a "remote" commit D on top of B (the parent)
+    let remote_file = repo_path.join("remote_file.txt");
+    fs::write(&remote_file, "Remote-only content\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("remote_file.txt")).unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    // Create commit D with parent B (not C)
+    let remote_commit = repo.commit(None, &sig, &sig, "Remote commit D", &tree, &[&parent_commit]).unwrap();
+
+    // Update the remote ref to point to this new commit D
+    repo.reference(&remote_ref_name, remote_commit, true, "Update remote to diverged commit").unwrap();
+
+    // Clean up the working directory (remove the remote_file we added to index)
+    fs::remove_file(&remote_file).unwrap();
+    // Reset the index to match HEAD
+    repo.reset(current_head.as_object(), git2::ResetType::Mixed, None).unwrap();
+
+    // Get status - should show ahead: 1, behind: 1 (diverged branches)
+    let status = worktree_handle.status().await.unwrap();
+    assert_eq!(status.ahead, 1, "Should be 1 commit ahead of upstream");
+    assert_eq!(status.behind, 1, "Should be 1 commit behind upstream");
 }

@@ -143,6 +143,13 @@ impl Git2DB {
     pub fn storage_driver(&self) -> &std::sync::Arc<dyn Driver> {
         &self.storage_driver
     }
+
+    /// Get the registry version
+    ///
+    /// Returns the version string from the registry metadata.
+    pub fn version(&self) -> &str {
+        &self.metadata.version
+    }
 }
 
 impl Git2DB {
