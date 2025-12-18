@@ -427,17 +427,25 @@ async fn test_registry_clone_with_auth_callbacks() {
         .unwrap();
 
     // Verify the repository was cloned successfully
-    let handle = registry.repo(&repo_id).unwrap();
-    assert_eq!(handle.name().unwrap(), Some("cloned-repo"));
+    let handle = registry
+        .repo(&repo_id)
+        .expect("repo handle should exist after clone");
+    assert_eq!(
+        handle.name().expect("name should be accessible"),
+        Some("cloned-repo")
+    );
 
     // Verify the bare repository exists
     // Note: handle.worktree() returns the bare repo path for cloned repos
-    let bare_repo_path = handle.worktree().unwrap();
+    let bare_repo_path = handle
+        .worktree()
+        .expect("worktree path should be accessible");
     assert!(bare_repo_path.exists(), "Bare repository path should exist");
 
     // Verify it's actually a bare repository
     use git2::Repository;
-    let bare_repo = Repository::open_bare(bare_repo_path).unwrap();
+    let bare_repo =
+        Repository::open_bare(bare_repo_path).expect("should open as bare repository");
     assert!(bare_repo.is_bare(), "Repository should be bare");
 
     // Verify the default worktree exists and has the expected files
