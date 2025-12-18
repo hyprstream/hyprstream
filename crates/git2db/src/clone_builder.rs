@@ -196,16 +196,24 @@ impl<'a> CloneBuilder<'a> {
             // Perform the clone using git2 directly for bare repos
             tracing::info!("Cloning repository '{}' as bare to {:?}", repo_name, bare_repo_path);
 
+            // Get default clone options from GitManager for authentication
+            let clone_options = crate::manager::GitManager::global().default_clone_options();
+
             let url_clone = self.url.clone();
             let bare_path_clone = bare_repo_path.clone();
 
             tokio::task::spawn_blocking(move || -> Git2DBResult<git2::Repository> {
+                // Convert to git2 options inside spawn_blocking (where non-Send is acceptable)
+                let mut git2_options = clone_options.to_git2_options();
+
                 let mut builder = git2::build::RepoBuilder::new();
 
                 // Set up bare clone
                 builder.bare(true);
 
-                // TODO: Add authentication callbacks from GitManager if needed
+                // Apply fetch options with authentication callbacks from GitManager
+                builder.fetch_options(git2_options.create_fetch_options()
+                    .map_err(|e| Git2DBError::internal(format!("Failed to create fetch options: {}", e)))?);
 
                 // Perform the clone
                 let repo = builder.clone(&url_clone, &bare_path_clone)

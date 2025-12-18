@@ -403,6 +403,63 @@ async fn test_list_repositories() {
 }
 
 #[tokio::test]
+async fn test_registry_clone_with_auth_callbacks() {
+    setup_logging();
+    init_git_manager_no_shallow();
+
+    let temp_dir = TempDir::new().unwrap();
+    let registry_path = temp_dir.path();
+    let mut registry = Git2DB::open(registry_path).await.unwrap();
+
+    // Create a test repository to clone
+    let test_repo = temp_dir.path().join("source-repo");
+    fs::create_dir(&test_repo).unwrap();
+    create_test_repo(&test_repo).await.unwrap();
+    let url = format!("file://{}", test_repo.display());
+
+    // Test that registry.clone() works (this uses bare clone with auth callbacks)
+    // Even though file:// URLs don't require auth, this verifies the code path
+    // that sets up authentication callbacks is being exercised
+    let repo_id = registry.clone(&url)
+        .name("cloned-repo")
+        .exec()
+        .await
+        .unwrap();
+
+    // Verify the repository was cloned successfully
+    let handle = registry
+        .repo(&repo_id)
+        .expect("repo handle should exist after clone");
+    assert_eq!(
+        handle.name().expect("name should be accessible"),
+        Some("cloned-repo")
+    );
+
+    // Verify the bare repository exists
+    // Note: handle.worktree() returns the bare repo path for cloned repos
+    let bare_repo_path = handle
+        .worktree()
+        .expect("worktree path should be accessible");
+    assert!(bare_repo_path.exists(), "Bare repository path should exist");
+
+    // Verify it's actually a bare repository
+    use git2::Repository;
+    let bare_repo =
+        Repository::open_bare(bare_repo_path).expect("should open as bare repository");
+    assert!(bare_repo.is_bare(), "Repository should be bare");
+
+    // Verify the default worktree exists and has the expected files
+    // registry.clone() creates worktrees at {repo_dir}/worktrees/{branch}
+    let repo_dir = registry_path.join("cloned-repo");
+    let default_worktree = repo_dir.join("worktrees").join("main");
+    assert!(default_worktree.exists(), "Default worktree should exist");
+    assert!(
+        default_worktree.join("README.md").exists(),
+        "README.md should exist in the worktree"
+    );
+}
+
+#[tokio::test]
 async fn test_worktree_status_ahead_behind() {
     setup_logging();
     init_git_manager_no_shallow();
@@ -414,7 +471,7 @@ async fn test_worktree_status_ahead_behind() {
     // Create a test repository with multiple commits
     let test_repo_dir = temp_dir.path().join("test-repo");
     fs::create_dir(&test_repo_dir).unwrap();
-    
+
     use git2::Repository;
     let repo = Repository::init(&test_repo_dir).unwrap();
     let sig = repo.signature().unwrap();
@@ -466,7 +523,7 @@ async fn test_worktree_status_ahead_behind() {
     // and setting it as upstream
     let repo_path = &worktree_path;
     let repo = Repository::open(repo_path).unwrap();
-    
+
     // Create a remote branch reference (simulating origin/test-branch)
     let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
     let test_branch = "test-branch";
