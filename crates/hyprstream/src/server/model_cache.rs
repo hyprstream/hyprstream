@@ -12,8 +12,9 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, instrument, warn};
 
 use crate::cli::commands::KVQuantArg;
+use crate::inference::{InferenceClient, LocalInferenceClient, LocalInferenceService};
 use crate::runtime::kv_quant::KVQuantType;
-use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
+use crate::runtime::RuntimeConfig;
 use crate::storage::{ModelRef, ModelStorage};
 
 /// Cached model entry
@@ -23,8 +24,8 @@ pub struct CachedModel {
     pub commit_id: git2db::Oid,
     /// Model reference string
     pub model_ref: String,
-    /// Loaded engine
-    pub engine: Arc<Mutex<TorchEngine>>,
+    /// Inference client handle (cloneable, communicates with service on dedicated thread)
+    pub client: LocalInferenceClient,
     /// Last access time
     pub last_accessed: std::time::Instant,
 }
@@ -96,15 +97,12 @@ impl ModelCache {
         model_ref = %model_ref_str,
         cache_hit = tracing::field::Empty
     ))]
-    pub async fn get_or_load(&self, model_ref_str: &str) -> Result<Arc<Mutex<TorchEngine>>> {
+    pub async fn get_or_load(&self, model_ref_str: &str) -> Result<LocalInferenceClient> {
         // Parse model reference
         let model_ref = ModelRef::parse(model_ref_str)?;
 
         // Resolve to exact commit SHA
-        let repo_id = self.registry.resolve_repo_id(&model_ref).await?;
-        let registry = self.registry.registry().await;
-        let handle = registry.repo(&repo_id)?;
-        let commit_id = handle.resolve_git_ref(&model_ref.git_ref).await?;
+        let commit_id = self.registry.resolve_git_ref(&model_ref).await?;
 
         // Check cache by commit SHA
         {
@@ -117,7 +115,7 @@ impl ModelCache {
                 );
                 tracing::Span::current().record("cache_hit", true);
                 cached.last_accessed = std::time::Instant::now();
-                return Ok(Arc::clone(&cached.engine));
+                return Ok(cached.client.clone());
             }
         }
 
@@ -130,15 +128,19 @@ impl ModelCache {
         tracing::Span::current().record("cache_hit", false);
         let checkout_path = self.get_or_create_checkout(&model_ref, commit_id).await?;
 
-        // Create engine and load model with max_context and kv_quant overrides if configured
+        // Create runtime config with max_context and kv_quant overrides
         let mut config = RuntimeConfig::default();
         config.max_context = self.max_context;
         config.kv_quant_type = self.kv_quant;
-        let mut engine = TorchEngine::new(config)?;
 
         info!("Model path: {:?}", checkout_path);
         let load_start = std::time::Instant::now();
-        engine.load_model(&checkout_path).await?;
+
+        // Start inference service (runs on dedicated thread, loads model, initializes KV cache)
+        let client = LocalInferenceService::start(&checkout_path, config)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to start inference service: {}", e))?;
+
         let load_time = load_start.elapsed();
         info!(
             "Model ready: {} (loaded in {:.2}s)",
@@ -146,29 +148,11 @@ impl ModelCache {
             load_time.as_secs_f64()
         );
 
-        // Initialize KV cache registry for session-based cache isolation
-        // This enables concurrent inference with isolated context per session
-        let model_info = engine.model_info();
-        let num_layers = model_info.num_hidden_layers.unwrap_or(32);
-        let max_seq_len = self.max_context.unwrap_or(model_info.context_length);
-        engine.initialize_kv_registry(
-            num_layers,
-            max_seq_len,
-            self.kv_quant,
-            None, // No memory budget limit for now
-        );
-        info!(
-            "KV cache registry initialized: {} layers, max_seq_len={}",
-            num_layers, max_seq_len
-        );
-
-        let engine = Arc::new(Mutex::new(engine));
-
         // Create cached entry
         let cached_model = CachedModel {
             commit_id,
             model_ref: model_ref_str.to_string(),
-            engine: Arc::clone(&engine),
+            client: client.clone(),
             last_accessed: std::time::Instant::now(),
         };
 
@@ -181,14 +165,20 @@ impl ModelCache {
                     evicted.model_ref,
                     format_oid(&evicted_id)
                 );
+                // Send shutdown signal to evicted service (fire-and-forget)
+                tokio::spawn(async move {
+                    if let Err(e) = evicted.client.shutdown().await {
+                        warn!("Failed to shutdown evicted model service: {}", e);
+                    }
+                });
             }
         }
 
-        Ok(engine)
+        Ok(client)
     }
 
     /// Get or load a model by name (for backwards compatibility)
-    pub async fn get_or_load_by_name(&self, model_name: &str) -> Result<Arc<Mutex<TorchEngine>>> {
+    pub async fn get_or_load_by_name(&self, model_name: &str) -> Result<LocalInferenceClient> {
         self.get_or_load(model_name).await
     }
 
@@ -261,13 +251,9 @@ impl ModelCache {
     /// Check if a model is cached by name
     pub async fn is_cached_by_name(&self, model_ref_str: &str) -> bool {
         if let Ok(model_ref) = ModelRef::parse(model_ref_str) {
-            if let Ok(repo_id) = self.registry.resolve_repo_id(&model_ref).await {
-                if let Ok(registry) = self.registry.registry().await.repo(&repo_id) {
-                    if let Ok(commit_id) = registry.resolve_git_ref(&model_ref.git_ref).await {
-                        let cache = self.cache.lock().await;
-                        return cache.peek(&commit_id).is_some();
-                    }
-                }
+            if let Ok(commit_id) = self.registry.resolve_git_ref(&model_ref).await {
+                let cache = self.cache.lock().await;
+                return cache.peek(&commit_id).is_some();
             }
         }
         false

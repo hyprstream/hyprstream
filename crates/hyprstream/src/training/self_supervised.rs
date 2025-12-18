@@ -65,9 +65,12 @@ impl TrainingExample {
 
     /// Get the reward signal based on quality metrics
     ///
-    /// Returns a value in [0, 1] where higher = better quality
+    /// Returns a value in [0, 1] where higher = better quality.
+    /// Uses inverse perplexity: lower perplexity (more confident) = higher reward.
     pub fn reward(&self) -> f32 {
-        self.quality_metrics.quality_score()
+        // Convert perplexity to reward: perplexity of 1 -> reward ~0.5, perplexity of 10 -> reward ~0.09
+        // This keeps rewards in a reasonable range for RL training
+        1.0 / (1.0 + self.quality_metrics.perplexity)
     }
 
     /// Check if this example is high quality (worth reinforcing)

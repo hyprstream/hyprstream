@@ -26,6 +26,7 @@ pub use query::{
     QueryOrchestrator,
 };
 pub use storage::StorageBackend;
+pub use storage::context::{ContextRecord, ContextStore, SearchResult, context_schema, DEFAULT_EMBEDDING_DIM};
 
 // Re-export Arrow types from DuckDB for consistency
 pub use duckdb::arrow;

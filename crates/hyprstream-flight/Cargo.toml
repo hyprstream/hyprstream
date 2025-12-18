@@ -10,13 +10,15 @@ description = "Arrow Flight SQL server for hyprstream-metrics"
 name = "hyprstream_flight"
 path = "src/lib.rs"
 
-[[bin]]
-name = "hyprstream-flight"
-path = "src/bin/main.rs"
+# Binary removed - hyprstream-flight is now a library
+# Use `hyprstream flight` command instead (via hyprstream CLI)
 
 [dependencies]
 # Core metrics library
 hyprstream-metrics = { path = "../hyprstream-metrics" }
+
+# Git registry service
+git2db = { path = "../git2db" }
 
 # Arrow Flight - use v56 to match DuckDB 1.4.3 + DataFusion 50
 arrow = "56.2.0"
@@ -48,6 +50,9 @@ tokio-stream = "0.1.17"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 bytes = "1.9.0"
+
+# Error handling
+thiserror = "2.0"
 
 # Utilities
 tracing = "0.1"

@@ -12,12 +12,19 @@ use hyprstream_core::cli::commands::Commands;
 use hyprstream_core::cli::handlers::handle_server;
 use hyprstream_core::cli::{
     handle_branch, handle_checkout, handle_clone, handle_commit, handle_infer, handle_info,
-    handle_list, handle_lora_train, handle_merge, handle_pull, handle_push, handle_remove,
-    handle_status, handle_worktree_info, handle_worktree_list,
-    handle_worktree_remove, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
+    handle_list, handle_lora_train, handle_merge, handle_policy_apply, handle_policy_check,
+    handle_policy_diff, handle_policy_edit, handle_policy_history, handle_policy_rollback,
+    handle_policy_show, handle_pull, handle_push, handle_remove, handle_status,
+    handle_token_create, handle_token_list, handle_token_revoke, handle_worktree_info,
+    handle_worktree_list, handle_worktree_remove, AppContext, DeviceConfig, DevicePreference,
+    RuntimeConfig,
 };
 use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
+
+// Registry service
+use git2db::service::{LocalService, RegistryClient};
+use std::sync::Arc;
 // Tracing imports (feature-gated)
 #[cfg(feature = "otel")]
 use opentelemetry::trace::TracerProvider;
@@ -122,8 +129,11 @@ where
 }
 
 /// Server command handler - requires multi-threaded runtime for GPU
-async fn handle_server_cmd(ctx: AppContext) -> Result<()> {
-    handle_server(ctx)
+async fn handle_server_cmd(
+    ctx: AppContext,
+    flight_config: Option<hyprstream_core::cli::FlightServerConfig>,
+) -> Result<()> {
+    handle_server(ctx, flight_config)
         .await
         .map_err(|e| anyhow::anyhow!("{}", e))
 }
@@ -235,8 +245,23 @@ fn main() -> Result<()> {
         .validate()
         .context("Configuration validation failed")?;
 
-    // Create application context
-    let ctx = AppContext::new(config);
+    // Start registry service ONCE at CLI level
+    // This runtime must stay alive to keep LocalService running
+    let _registry_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("Failed to create registry runtime")?;
+
+    let registry_client: Arc<dyn RegistryClient> = _registry_runtime
+        .block_on(async {
+            let models_dir = config.models_dir();
+            LocalService::start(models_dir).await
+        })
+        .map(|client| Arc::new(client) as Arc<dyn RegistryClient>)
+        .context("Failed to start registry service")?;
+
+    // Create application context with shared registry client
+    let ctx = AppContext::with_client(config, registry_client.clone());
 
     // Keep the guard alive for the entire program lifetime
     // Dropping the guard stops the background logging thread
@@ -364,8 +389,17 @@ fn main() -> Result<()> {
                 info!("Using GPU device {} from CLI", gpu_device);
             }
 
-            // Create context with merged config (CLI args override file config)
-            let ctx = AppContext::new(config);
+            // Create Flight SQL server config if dataset is specified
+            let flight_config = cmd.dataset.as_ref().map(|dataset| {
+                hyprstream_core::cli::FlightServerConfig {
+                    dataset: Some(dataset.clone()),
+                    port: cmd.flight_port,
+                    host: cmd.flight_host.clone(),
+                }
+            });
+
+            // Create context with merged config and shared registry client
+            let ctx = AppContext::with_client(config, registry_client.clone());
 
             let ctx = ctx.clone();
             with_runtime(
@@ -373,7 +407,7 @@ fn main() -> Result<()> {
                     device: DeviceConfig::request_gpu(),
                     multi_threaded: true,
                 },
-                || handle_server_cmd(ctx),
+                || handle_server_cmd(ctx, flight_config),
             )?
         }
         // Phase 1: Git-style commands
@@ -574,7 +608,9 @@ fn main() -> Result<()> {
                 },
                 || async move {
                     let storage = ctx.storage().await?;
-                    handle_list(storage).await
+                    // Pass None for policy_manager - CLI shows full access by default
+                    // TODO: Load PolicyManager from .registry/policies/ for permission-aware list
+                    handle_list(storage, None).await
                 },
             )?;
         }
@@ -770,6 +806,113 @@ fn main() -> Result<()> {
                 },
             )?;
         }
+
+        Commands::Flight(args) => {
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    use hyprstream_flight::client::{
+                        format_batches_as_csv, format_batches_as_json, format_batches_as_table,
+                        FlightClient,
+                    };
+
+                    let mut client = FlightClient::connect(&args.addr)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Failed to connect: {}", e))?;
+
+                    if let Some(sql) = args.query {
+                        let batches = client
+                            .query(&sql)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Query failed: {}", e))?;
+
+                        let output = match args.format.as_str() {
+                            "csv" => format_batches_as_csv(&batches),
+                            "json" => format_batches_as_json(&batches)
+                                .map_err(|e| anyhow::anyhow!("JSON format error: {}", e))?,
+                            _ => format_batches_as_table(&batches),
+                        };
+                        print!("{}", output);
+                    } else {
+                        // Interactive REPL mode - TODO: implement readline-based REPL
+                        println!("Connected to Flight SQL server at {}", args.addr);
+                        println!("Interactive mode not yet implemented. Use --query to execute SQL.");
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+
+        Commands::Policy { command } => {
+            use hyprstream_core::auth::{PolicyManager, TokenManager};
+            use hyprstream_core::cli::commands::{PolicyCommand, TokenCommand};
+
+            let ctx = ctx.clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    // Get the policies directory from the registry
+                    let storage = ctx.storage().await?;
+                    let registry_path = storage.get_models_dir().join(".registry");
+                    let policies_dir = registry_path.join("policies");
+
+                    // Initialize policy manager
+                    let policy_manager = PolicyManager::new(&policies_dir)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Failed to initialize policy manager: {}", e))?;
+
+                    match command {
+                        PolicyCommand::Show { raw } => {
+                            handle_policy_show(&policy_manager, raw).await
+                        }
+                        PolicyCommand::History { count, oneline } => {
+                            handle_policy_history(&policy_manager, count, oneline).await
+                        }
+                        PolicyCommand::Edit => {
+                            handle_policy_edit(&policy_manager).await
+                        }
+                        PolicyCommand::Diff { against } => {
+                            handle_policy_diff(&policy_manager, against).await
+                        }
+                        PolicyCommand::Apply { dry_run, message } => {
+                            handle_policy_apply(&policy_manager, dry_run, message).await
+                        }
+                        PolicyCommand::Rollback { git_ref, dry_run } => {
+                            handle_policy_rollback(&policy_manager, &git_ref, dry_run).await
+                        }
+                        PolicyCommand::Check { user, resource, action } => {
+                            handle_policy_check(&policy_manager, &user, &resource, &action).await
+                        }
+                        PolicyCommand::Token { command: token_cmd } => {
+                            // Initialize token manager
+                            let tokens_path = policies_dir.join("tokens.csv");
+                            let mut token_manager = TokenManager::new(&tokens_path)
+                                .await
+                                .map_err(|e| anyhow::anyhow!("Failed to initialize token manager: {}", e))?;
+
+                            match token_cmd {
+                                TokenCommand::Create { user, name, expires, scope, admin } => {
+                                    handle_token_create(&mut token_manager, &user, name, &expires, scope, admin).await
+                                }
+                                TokenCommand::List { user } => {
+                                    handle_token_list(&token_manager, user).await
+                                }
+                                TokenCommand::Revoke { token, name, revoke_user, force } => {
+                                    handle_token_revoke(&mut token_manager, token, name, revoke_user, force).await
+                                }
+                            }
+                        }
+                    }
+                },
+            )?;
+        }
+
     };
 
     Ok(())

@@ -1,5 +1,6 @@
 //! CLI handlers for adaptive ML inference server
 
+use crate::archetypes::capabilities::Query;
 use crate::storage::ModelStorage;
 use crate::training::{CheckpointManager, WeightFormat, WeightSnapshot};
 use ::config::{Config, File};
@@ -83,7 +84,21 @@ pub async fn execute_sparse_query(
     Ok(())
 }
 
-pub async fn handle_server(ctx: crate::cli::AppContext) -> Result<(), Box<dyn std::error::Error>> {
+/// Flight SQL configuration for the server
+#[derive(Debug, Clone, Default)]
+pub struct FlightServerConfig {
+    /// Dataset name to serve via Flight SQL
+    pub dataset: Option<String>,
+    /// Flight SQL server port
+    pub port: u16,
+    /// Flight SQL server host (defaults to HTTP server host if not specified)
+    pub host: Option<String>,
+}
+
+pub async fn handle_server(
+    ctx: crate::cli::AppContext,
+    flight_config: Option<FlightServerConfig>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let config = ctx.config();
 
     // Clone git2db config and set DHT mode to Server for full P2P participation
@@ -100,19 +115,83 @@ pub async fn handle_server(ctx: crate::cli::AppContext) -> Result<(), Box<dyn st
     // Use server config from HyprConfig
     let server_config = config.server.clone();
 
-    // Get host and port for addr binding
-    let host = &server_config.host;
+    // Get host and port for addr binding (clone host before moving server_config)
+    let host = server_config.host.clone();
     let port = server_config.port;
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
 
-    // Create server state with git2db config (DHT mode set to Server)
-    let server_state =
-        crate::server::state::ServerState::new_with_git2db(server_config, git2db_config).await?;
+    // Create server state - use shared client if available, otherwise start internal service
+    let server_state = if let Some(client) = ctx.registry_client() {
+        crate::server::state::ServerState::new_with_client(server_config, client.clone()).await?
+    } else {
+        crate::server::state::ServerState::new_with_git2db(server_config, git2db_config).await?
+    };
 
     info!("Starting Hyprstream HTTP server on {}", addr);
     info!("OpenAI-compatible API available at http://{}/oai/v1", addr);
 
-    // Start server (TLS configuration would come from config.server.tls if needed)
+    // Start Flight SQL server if dataset is specified
+    if let Some(ref flight_cfg) = flight_config {
+        if let Some(ref dataset_name) = flight_cfg.dataset {
+            if let Some(registry_client) = ctx.registry_client() {
+                // Check if dataset has FLIGHT_SQL capability
+                let dataset_ref = crate::storage::ModelRef::parse(dataset_name)
+                    .unwrap_or_else(|_| crate::storage::ModelRef::new(dataset_name.clone()));
+
+                // Get the dataset path from the storage
+                let storage_paths = crate::storage::StoragePaths::new()?;
+                let models_dir = storage_paths.models_dir()?;
+
+                // Try to find the dataset worktree path
+                let dataset_path = models_dir
+                    .join(&dataset_ref.model)
+                    .join("worktrees")
+                    .join(dataset_ref.git_ref_str().unwrap_or_else(|| "main".to_string()));
+
+                // Check for QUERY capability using type-safe API
+                let archetype_registry = crate::archetypes::global_registry();
+                let detected = archetype_registry.detect(&dataset_path);
+                let domains = detected.to_detected_domains();
+
+                if !domains.has::<Query>() {
+                    error!(
+                        "Cannot start Flight SQL server: dataset '{}' does not have FLIGHT_SQL capability. Detected archetypes: {:?}",
+                        dataset_name, detected.archetypes
+                    );
+                } else {
+                    let flight_host = flight_cfg.host.as_ref().unwrap_or(&host);
+                    let flight_addr = format!("{}:{}", flight_host, flight_cfg.port);
+
+                    info!(
+                        "Starting Flight SQL server on {} for dataset '{}'",
+                        flight_addr, dataset_name
+                    );
+
+                    let client = registry_client.clone();
+                    let dataset = dataset_name.clone();
+                    let flight_port = flight_cfg.port;
+                    let flight_host_owned = flight_host.clone();
+
+                    // Start Flight SQL server in background
+                    tokio::spawn(async move {
+                        let config = hyprstream_flight::FlightConfig::default()
+                            .with_host(flight_host_owned)
+                            .with_port(flight_port);
+
+                        if let Err(e) =
+                            hyprstream_flight::start_flight_server(Some(client), &dataset, config).await
+                        {
+                            error!("Flight SQL server error: {}", e);
+                        }
+                    });
+                }
+            } else {
+                error!("Cannot start Flight SQL server: no registry client available");
+            }
+        }
+    }
+
+    // Start HTTP server (blocks until shutdown)
     crate::server::start_server(addr, server_state).await?;
 
     Ok(())
@@ -391,12 +470,17 @@ pub async fn handle_write_checkpoint(
     model_id: String,
     _name: Option<String>,
     step: Option<usize>,
+    client: Option<std::sync::Arc<dyn git2db::service::RegistryClient>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Writing checkpoint for model: {}", model_id);
 
-    // Load model storage
+    // Load model storage - use shared client if provided, otherwise start internal service
     let config = crate::config::HyprConfig::load().unwrap_or_default();
-    let storage = ModelStorage::create(config.models_dir().to_path_buf()).await?;
+    let storage = if let Some(client) = client {
+        ModelStorage::new(client, config.models_dir().to_path_buf())
+    } else {
+        ModelStorage::create(config.models_dir().to_path_buf()).await?
+    };
 
     // Resolve model path
     let model_ref = crate::storage::ModelRef::parse(&model_id)?;

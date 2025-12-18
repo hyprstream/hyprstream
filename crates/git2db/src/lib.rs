@@ -32,6 +32,9 @@ pub mod transaction;
 // Storage drivers (Docker's graphdriver pattern)
 pub mod storage;
 
+// Registry service abstraction
+pub mod service;
+
 // Optional gittorrent integration
 #[cfg(feature = "gittorrent-transport")]
 pub mod gittorrent_integration;

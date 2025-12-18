@@ -1,11 +1,15 @@
-//! Simplified model storage working directly with git2db
+//! Model storage using git2db registry service
+//!
+//! This module provides model storage using a shared registry service.
+//! Registry operations (list, clone, register) go through the service,
+//! while repository operations (worktrees, branches) use local git access.
 
 use anyhow::Result;
-use git2db::{Git2DB, GitRef, RepoId};
+use git2db::service::RegistryClient;
+use git2db::{GitManager, GitRef, RepoId, TrackedRepository};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use super::model_ref::{validate_model_name, ModelRef};
@@ -49,29 +53,52 @@ pub struct CacheStats {
     pub total_size_bytes: u64,
 }
 
-/// Simplified model storage working directly with git2db
+/// Model storage using a shared registry service.
+///
+/// Registry operations (list, clone, register) go through the service client.
+/// Repository operations (worktrees, branches) use local git access via GitManager.
 pub struct ModelStorage {
     base_dir: PathBuf,
-    registry: Arc<RwLock<Git2DB>>,
+    client: Arc<dyn RegistryClient>,
 }
 
 impl ModelStorage {
-    /// Create with a new registry
-    pub async fn create(base_dir: PathBuf) -> Result<Self> {
-        Self::create_with_config(base_dir, git2db::config::Git2DBConfig::default()).await
+    /// Create with a registry client.
+    ///
+    /// The client is typically obtained from `LocalService::start()` or passed
+    /// from a parent component that manages the shared registry.
+    pub fn new(client: Arc<dyn RegistryClient>, base_dir: PathBuf) -> Self {
+        Self { client, base_dir }
     }
 
-    /// Create with a new registry and custom git2db configuration
+    /// Create ModelStorage with default configuration.
+    ///
+    /// This is a convenience method for CLI and standalone usage where there's
+    /// no shared registry service. For server usage, prefer passing a shared
+    /// RegistryClient via `new()`.
+    pub async fn create(base_dir: PathBuf) -> Result<Self> {
+        Self::create_with_config(base_dir, git2db::Git2DBConfig::default()).await
+    }
+
+    /// Create ModelStorage with configuration, starting a local registry service.
+    ///
+    /// This is a convenience method for CLI and standalone usage where there's
+    /// no shared registry service. For server usage, prefer passing a shared
+    /// RegistryClient via `new()`.
     pub async fn create_with_config(
         base_dir: PathBuf,
-        _git2db_config: git2db::config::Git2DBConfig,
+        _config: git2db::Git2DBConfig,
     ) -> Result<Self> {
-        // GitManager::global() loads config from environment automatically
-        let git2db = Git2DB::open(&base_dir).await?;
+        use git2db::service::LocalService;
+
+        // Start local registry service
+        let client = LocalService::start(&base_dir)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to start registry service: {}", e))?;
 
         Ok(Self {
+            client: Arc::new(client),
             base_dir,
-            registry: Arc::new(RwLock::new(git2db)),
         })
     }
 
@@ -80,42 +107,43 @@ impl ModelStorage {
         self.base_dir.clone()
     }
 
+    /// Resolve model name to TrackedRepository
+    async fn resolve_repo(&self, name: &str) -> Result<TrackedRepository> {
+        // Use cached_list for fast reads, fall back to list() if cache unavailable
+        let repos = self
+            .client
+            .cached_list()
+            .unwrap_or(self.client.list().await.map_err(|e| anyhow::anyhow!("{}", e))?);
+
+        repos
+            .into_iter()
+            .find(|t| t.name.as_ref() == Some(&name.to_string()))
+            .ok_or_else(|| anyhow::anyhow!("Model '{}' not found in registry", name))
+    }
+
     /// Resolve model name to RepoId
     async fn resolve_name(&self, name: &str) -> Result<RepoId> {
-        // Query git2db registry directly (O(n) but always accurate, no sync issues)
-        // For ~100 models, this is negligible overhead
-        let registry = self.registry.read().await;
-        let repo_id = registry
-            .list()
-            .find(|t| t.name.as_ref() == Some(&name.to_string()))
-            .map(|t| t.id.clone())
-            .ok_or_else(|| anyhow::anyhow!("Model '{}' not found in registry", name))?;
-        drop(registry);  // Explicitly drop the read guard before returning
-        Ok(repo_id)
+        Ok(self.resolve_repo(name).await?.id)
     }
 
     /// Get bare repository path by model reference
     pub async fn get_bare_repo_path(&self, model_ref: &ModelRef) -> Result<PathBuf> {
-        let repo_id = self.resolve_name(&model_ref.model).await?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&repo_id)?;
-
-        // The registry tracks the bare repo path (models/{name}/{name}.git/)
-        Ok(handle.worktree()?.to_path_buf())
+        let repo = self.resolve_repo(&model_ref.model).await?;
+        // TrackedRepository stores the worktree path
+        Ok(PathBuf::from(&repo.worktree_path))
     }
 
     /// Get worktree path for a specific branch
     pub async fn get_worktree_path(&self, model_ref: &ModelRef, branch: &str) -> Result<PathBuf> {
-        let repo_id = self.resolve_name(&model_ref.model).await?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&repo_id)?;
+        let repo = self.resolve_repo(&model_ref.model).await?;
 
-        // Get bare repo path from registry
-        let bare_repo_path = handle.worktree()?;
+        // Get bare repo path from tracked repository
+        let bare_repo_path = PathBuf::from(&repo.worktree_path);
 
         // Navigate from bare repo to worktrees directory
         // From models/{name}/{name}.git/ to models/{name}/worktrees/{branch}
-        let repo_dir = bare_repo_path.parent()
+        let repo_dir = bare_repo_path
+            .parent()
             .ok_or_else(|| anyhow::anyhow!("Invalid bare repo path"))?;
 
         let worktrees_dir = repo_dir.join("worktrees");
@@ -156,9 +184,14 @@ impl ModelStorage {
     /// "model:branch" references. Base models without explicit branches are not included.
     pub async fn list_models(&self) -> Result<Vec<(ModelRef, ModelMetadata)>> {
         let mut result = Vec::new();
-        let registry = self.registry.read().await;
 
-        for tracked in registry.list() {
+        // Use cached_list for fast reads, fall back to list() if cache unavailable
+        let repos = self
+            .client
+            .cached_list()
+            .unwrap_or(self.client.list().await.map_err(|e| anyhow::anyhow!("{}", e))?);
+
+        for tracked in repos {
             if let Some(name) = &tracked.name {
                 let base_ref = ModelRef::new(name.clone());
 
@@ -199,65 +232,124 @@ impl ModelStorage {
 
     /// Check if a model exists
     pub async fn model_exists(&self, model_name: &str) -> bool {
-        let registry = self.registry.read().await;
-        let exists = registry
-            .list()
-            .any(|t| t.name.as_ref() == Some(&model_name.to_string()));
-        drop(registry);  // Explicitly drop the read guard
-        exists
+        // Use cached_list for fast reads
+        let repos = self
+            .client
+            .cached_list()
+            .unwrap_or_else(|| {
+                // Fallback to blocking call - this shouldn't happen often
+                vec![]
+            });
+
+        repos
+            .iter()
+            .any(|t| t.name.as_ref() == Some(&model_name.to_string()))
     }
 
     /// Add a new model
     pub async fn add_model(&self, name: &str, source: &str) -> Result<()> {
         validate_model_name(name)?;
 
-        let mut registry = self.registry.write().await;
-        let _repo_id = registry
-            .clone(source)
-            .name(name)
-            .depth(1)
-            .exec()
-            .await?;
+        // Clone via registry service
+        let _repo_id = self
+            .client
+            .clone_repo(source, Some(name))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to clone model: {}", e))?;
 
         Ok(())
     }
 
     /// Update a model to a different version
     pub async fn update_model(&self, name: &str, ref_spec: &str) -> Result<()> {
-        let repo_id = self.resolve_name(name).await?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&repo_id)?;
+        let tracked = self.resolve_repo(name).await?;
+        let repo_path = PathBuf::from(&tracked.worktree_path);
 
-        // Create a temporary worktree for the git operations
-        let temp_dir = tempfile::tempdir()?;
-        let worktree_path = temp_dir.path();
-        let mut worktree = handle.create_worktree(worktree_path, "temp-update").await?;
+        // Use GitManager for local git operations
+        let repo_cache = GitManager::global().get_repository(&repo_path)?;
+        let repo = repo_cache.open()?;
 
-        // Perform git operations on the worktree
-        worktree.fetch(None).await?;
-        worktree.checkout(ref_spec).await?;
+        // Fetch from remote
+        let mut remote = repo.find_remote("origin")?;
+        remote.fetch(&["refs/heads/*:refs/remotes/origin/*"], None, None)?;
 
-        // Cleanup the temporary worktree
-        worktree.cleanup().await?;
+        // Checkout the ref spec
+        let (object, reference) = repo.revparse_ext(ref_spec)?;
+        repo.checkout_tree(&object, None)?;
+
+        if let Some(ref_name) = reference {
+            repo.set_head(ref_name.name().unwrap_or(ref_spec))?;
+        } else {
+            repo.set_head_detached(object.id())?;
+        }
+
         Ok(())
     }
 
-    /// Get read access to the git2db registry
-    ///
-    /// Use this with `resolve_repo_id()` to perform git operations:
-    /// ```ignore
-    /// let repo_id = storage.resolve_repo_id(&model_ref)?;
-    /// let registry = storage.registry().await;
-    /// let handle = registry.repo(&repo_id)?;
-    /// handle.branch().create("new", None).await?;
-    /// ```
-    pub async fn registry(&self) -> tokio::sync::RwLockReadGuard<'_, Git2DB> {
-        self.registry.read().await
+    /// Get the registry client for advanced operations
+    pub fn registry(&self) -> &Arc<dyn RegistryClient> {
+        &self.client
     }
 
-    /// Resolve model name to RepoId for use with registry()
+    /// Open repository for direct git operations
+    ///
+    /// This provides access to the underlying git2::Repository for advanced
+    /// operations not covered by the high-level ModelStorage API.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let repo = storage.open_repo(&model_ref).await?;
+    /// let branches = repo.branches(None)?;
+    /// ```
+    pub async fn open_repo(&self, model_ref: &ModelRef) -> Result<git2::Repository> {
+        let tracked = self.resolve_repo(&model_ref.model).await?;
+        let repo_path = PathBuf::from(&tracked.worktree_path);
+
+        let repo_cache = GitManager::global().get_repository(&repo_path)?;
+        Ok(repo_cache.open()?)
+    }
+
+    /// Create a branch for a model
+    pub async fn create_branch(
+        &self,
+        model_ref: &ModelRef,
+        branch_name: &str,
+        from_ref: Option<&str>,
+    ) -> Result<()> {
+        let repo = self.open_repo(model_ref).await?;
+
+        // Find the commit to branch from
+        let commit = if let Some(ref_name) = from_ref {
+            let (obj, _) = repo.revparse_ext(ref_name)?;
+            repo.find_commit(obj.id())?
+        } else {
+            repo.head()?.peel_to_commit()?
+        };
+
+        // Create the branch
+        repo.branch(branch_name, &commit, false)?;
+        Ok(())
+    }
+
+    /// Resolve model name to RepoId for use with client operations
     pub async fn resolve_repo_id(&self, model_ref: &ModelRef) -> Result<RepoId> {
         self.resolve_name(&model_ref.model).await
+    }
+
+    /// Resolve a git reference to a commit OID
+    pub async fn resolve_git_ref(&self, model_ref: &ModelRef) -> Result<git2db::Oid> {
+        let repo = self.open_repo(model_ref).await?;
+
+        let ref_spec = match &model_ref.git_ref {
+            GitRef::Branch(name) => name.clone(),
+            GitRef::Tag(name) => format!("refs/tags/{}", name),
+            GitRef::Commit(oid) => return Ok(*oid),
+            GitRef::DefaultBranch => "HEAD".to_string(),
+            GitRef::Revspec(spec) => spec.clone(),
+        };
+
+        let (obj, _) = repo.revparse_ext(&ref_spec)?;
+        Ok(obj.id())
     }
 
     // ========== Compatibility Methods ==========
@@ -282,17 +374,35 @@ impl ModelStorage {
 
     /// Get repository status
     pub async fn status(&self, model_ref: &ModelRef) -> Result<git2db::RepositoryStatus> {
-        let repo_id = self.resolve_name(&model_ref.model).await?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&repo_id)?;
+        let tracked = self.resolve_repo(&model_ref.model).await?;
+        let repo_path = PathBuf::from(&tracked.worktree_path);
 
-        // Create a temporary worktree to get status
-        let temp_dir = tempfile::tempdir()?;
-        let worktree_path = temp_dir.path();
-        let mut worktree = handle.create_worktree(worktree_path, "temp-status").await?;
-        let status = worktree.status().await?;
-        worktree.cleanup().await?;
-        Ok(status)
+        // Use GitManager for local git operations
+        let repo_cache = GitManager::global().get_repository(&repo_path)?;
+        let repo = repo_cache.open()?;
+
+        // Get status from repository
+        let statuses = repo.statuses(None)?;
+
+        // Build RepositoryStatus
+        let is_clean = statuses.is_empty();
+        let branch = repo.head().ok().and_then(|h| h.shorthand().map(String::from));
+        let head = repo.head().ok().and_then(|h| h.target());
+
+        // Collect modified file paths
+        let modified_files: Vec<PathBuf> = statuses
+            .iter()
+            .filter_map(|entry| entry.path().map(|p| PathBuf::from(p)))
+            .collect();
+
+        Ok(git2db::RepositoryStatus {
+            is_clean,
+            branch,
+            head,
+            ahead: 0,
+            behind: 0,
+            modified_files,
+        })
     }
 
     /// Checkout a git reference
@@ -301,20 +411,35 @@ impl ModelStorage {
         model_ref: &ModelRef,
         _options: super::CheckoutOptions,
     ) -> Result<super::CheckoutResult> {
-        let repo_id = self.resolve_name(&model_ref.model).await?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&repo_id)?;
+        let tracked = self.resolve_repo(&model_ref.model).await?;
+        let repo_path = PathBuf::from(&tracked.worktree_path);
 
-        let previous_oid = handle.current_oid()?.unwrap_or(git2db::Oid::zero());
+        // Use GitManager for local git operations
+        let repo_cache = GitManager::global().get_repository(&repo_path)?;
+        let repo = repo_cache.open()?;
 
-        // Create a temporary worktree to perform checkout
-        let temp_dir = tempfile::tempdir()?;
-        let worktree_path = temp_dir.path();
-        let mut worktree = handle.create_worktree(worktree_path, "temp-checkout").await?;
-        worktree.checkout(model_ref.git_ref.clone()).await?;
-        worktree.cleanup().await?;
+        let previous_oid = repo.head().ok().and_then(|h| h.target()).unwrap_or(git2db::Oid::zero());
 
-        let new_oid = handle.current_oid()?.unwrap_or(git2db::Oid::zero());
+        // Convert GitRef to string for revparse
+        let ref_spec = match &model_ref.git_ref {
+            GitRef::Branch(name) => name.clone(),
+            GitRef::Tag(name) => format!("refs/tags/{}", name),
+            GitRef::Commit(oid) => oid.to_string(),
+            GitRef::DefaultBranch => "HEAD".to_string(),
+            GitRef::Revspec(spec) => spec.clone(),
+        };
+
+        // Checkout the ref spec
+        let (object, reference) = repo.revparse_ext(&ref_spec)?;
+        repo.checkout_tree(&object, None)?;
+
+        if let Some(ref_name) = reference {
+            repo.set_head(ref_name.name().unwrap_or(&ref_spec))?;
+        } else {
+            repo.set_head_detached(object.id())?;
+        }
+
+        let new_oid = repo.head().ok().and_then(|h| h.target()).unwrap_or(git2db::Oid::zero());
 
         Ok(super::CheckoutResult {
             previous_oid,
@@ -329,17 +454,43 @@ impl ModelStorage {
 
     /// Get default branch
     pub async fn get_default_branch(&self, model_ref: &ModelRef) -> Result<String> {
-        let repo_id = self.resolve_name(&model_ref.model).await?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&repo_id)?;
-        Ok(handle.default_branch()?)
+        let tracked = self.resolve_repo(&model_ref.model).await?;
+        let repo_path = PathBuf::from(&tracked.worktree_path);
+
+        // Use GitManager for local git operations
+        let repo_cache = GitManager::global().get_repository(&repo_path)?;
+        let repo = repo_cache.open()?;
+
+        // Try to get default branch from HEAD or config
+        if let Ok(head) = repo.head() {
+            if head.is_branch() {
+                if let Some(name) = head.shorthand() {
+                    return Ok(name.to_string());
+                }
+            }
+        }
+
+        // Fallback: try to find main or master
+        if repo.find_branch("main", git2::BranchType::Local).is_ok() {
+            return Ok("main".to_string());
+        }
+        if repo.find_branch("master", git2::BranchType::Local).is_ok() {
+            return Ok("master".to_string());
+        }
+
+        Err(anyhow::anyhow!("Could not determine default branch"))
     }
 
     /// Remove model
     pub async fn remove_model(&self, model_ref: &ModelRef) -> Result<()> {
         let repo_id = self.resolve_name(&model_ref.model).await?;
-        let mut registry = self.registry.write().await;
-        registry.remove_repository(&repo_id).await?;
+
+        // Remove via registry service
+        self.client
+            .remove(&repo_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to remove model: {}", e))?;
+
         Ok(())
     }
 
@@ -351,10 +502,8 @@ impl ModelStorage {
             return Err(anyhow::anyhow!("Worktree already exists at {:?}", worktree_path));
         }
 
-        // Use RepositoryHandle for worktree creation with storage driver support
-        let repo_id = self.resolve_name(&model_ref.model).await?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&repo_id)?;
+        let tracked = self.resolve_repo(&model_ref.model).await?;
+        let repo_path = PathBuf::from(&tracked.worktree_path);
 
         tracing::info!(
             "Creating worktree for {} at {} (branch: {})",
@@ -363,11 +512,28 @@ impl ModelStorage {
             branch
         );
 
-        // Create the worktree using RepositoryHandle (automatic storage driver selection)
-        let _worktree_handle = handle.create_worktree(&worktree_path, branch).await
-            .map_err(|e| {
-                anyhow::anyhow!("Failed to create worktree at {}: {}", worktree_path.display(), e)
-            })?;
+        // Create parent directories
+        if let Some(parent) = worktree_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // Open repo and create worktree using git2
+        let repo_cache = GitManager::global().get_repository(&repo_path)?;
+        let repo = repo_cache.open()?;
+
+        // Find or create the branch
+        let branch_ref = if let Ok(branch_ref) = repo.find_branch(branch, git2::BranchType::Local) {
+            branch_ref
+        } else {
+            // Branch doesn't exist, create it from HEAD
+            let head_commit = repo.head()?.peel_to_commit()?;
+            repo.branch(branch, &head_commit, false)?
+        };
+
+        // Create worktree - use the branch reference
+        let reference = branch_ref.into_reference();
+        repo.worktree(branch, &worktree_path, Some(&mut git2::WorktreeAddOptions::new().reference(Some(&reference))))
+            .map_err(|e| anyhow::anyhow!("Failed to create worktree: {}", e))?;
 
         tracing::info!("Successfully created worktree at {}", worktree_path.display());
         Ok(worktree_path)
@@ -375,25 +541,27 @@ impl ModelStorage {
 
     /// List all worktrees for a model
     pub async fn list_worktrees(&self, model_ref: &ModelRef) -> Result<Vec<String>> {
-        let repo_id = self.resolve_name(&model_ref.model).await?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&repo_id)?;
+        let tracked = self.resolve_repo(&model_ref.model).await?;
+        let repo_path = PathBuf::from(&tracked.worktree_path);
 
-        // Use RepositoryHandle for worktree listing with storage driver support
-        let worktrees = handle.get_worktrees().await
-            .map_err(|e| anyhow::anyhow!("Failed to list worktrees: {}", e))?;
+        // Collect worktrees synchronously (git2 types are not Send)
+        let result: Vec<String> = {
+            let repo_cache = GitManager::global().get_repository(&repo_path)?;
+            let repo = repo_cache.open()?;
 
-        // Extract branch names from worktree paths
-        Ok(worktrees.into_iter()
-            .map(|wt| {
-                // Extract branch name from worktree path: models/{name}/worktrees/{branch}
-                wt.path()
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("unknown")
-                    .to_string()
-            })
-            .collect())
+            // List worktrees using git2 and collect immediately
+            let worktrees = repo.worktrees()?;
+            worktrees.iter().flatten().map(|s| s.to_string()).collect()
+        };
+
+        // If no worktrees listed, include the main branch
+        if result.is_empty() {
+            if let Ok(default_branch) = self.get_default_branch(model_ref).await {
+                return Ok(vec![default_branch]);
+            }
+        }
+
+        Ok(result)
     }
 
 

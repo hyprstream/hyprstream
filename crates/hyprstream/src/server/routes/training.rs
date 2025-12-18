@@ -173,26 +173,13 @@ async fn submit_samples(
 
 /// Write checkpoint to filesystem (no Git)
 async fn write_checkpoint(
-    State(_state): State<ServerState>,
+    State(state): State<ServerState>,
     Json(req): Json<CheckpointRequest>,
 ) -> impl IntoResponse {
-    use crate::config::HyprConfig;
-    use crate::storage::{ModelRef, ModelStorage};
+    use crate::storage::ModelRef;
 
-    // Load model storage
-    let config = HyprConfig::load().unwrap_or_default();
-    let storage = match ModelStorage::create(config.models_dir().to_path_buf()).await {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("Failed to create storage: {}", e)
-                })),
-            )
-                .into_response();
-        }
-    };
+    // Use the shared model storage from server state
+    let storage = &state.model_storage;
 
     // Resolve model path
     let model_ref = match ModelRef::parse(&req.model_id) {

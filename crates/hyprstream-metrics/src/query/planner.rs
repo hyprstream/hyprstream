@@ -185,7 +185,7 @@ use std::collections::HashMap;
 mod tests {
     use super::*;
     use crate::storage::duckdb::DuckDbBackend;
-    use arrow::datatypes::{DataType, Field, Schema};
+    use duckdb::arrow::datatypes::{DataType, Field, Schema};
 
     #[tokio::test]
     async fn test_query_planning_with_views() -> Result<()> {

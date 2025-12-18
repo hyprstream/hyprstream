@@ -3,6 +3,8 @@
 use super::model_cache::ModelCache;
 use crate::{
     api::training_service::TrainingService,
+    auth::{PolicyManager, TokenManager},
+    events::{EventBus, SinkRegistry, SinksConfig},
     storage::ModelStorage,
     training::SelfSupervisedTrainer,
 };
@@ -12,6 +14,10 @@ use tokio::sync::RwLock;
 
 // Re-export config types so other server modules can access them via server::state
 pub use crate::config::{CorsConfig, SamplingParamDefaults, ServerConfig};
+
+// Re-export context storage types when metrics feature is enabled
+#[cfg(feature = "metrics")]
+pub use hyprstream_metrics::storage::context::{ContextRecord, ContextStore, SearchResult};
 
 /// Shared server state
 #[derive(Clone)]
@@ -34,6 +40,22 @@ pub struct ServerState {
 
     /// Metrics collector
     pub metrics: Arc<Metrics>,
+
+    /// Policy manager for RBAC/ABAC access control
+    pub policy_manager: Arc<PolicyManager>,
+
+    /// Token manager for API key authentication
+    pub token_manager: Arc<RwLock<TokenManager>>,
+
+    /// Event bus for pub/sub messaging
+    pub event_bus: Arc<EventBus>,
+
+    /// Sink registry for managing event consumers
+    pub sink_registry: Arc<SinkRegistry>,
+
+    /// Context store for RAG/CAG (optional, requires metrics feature)
+    #[cfg(feature = "metrics")]
+    pub context_store: Option<Arc<ContextStore<hyprstream_metrics::storage::duckdb::DuckDbBackend>>>,
 }
 
 /// Metrics collector
@@ -68,6 +90,30 @@ impl ServerState {
         Self::new_with_git2db(config, git2db::config::Git2DBConfig::default()).await
     }
 
+    /// Create a new server state with a shared registry client
+    ///
+    /// This is the preferred method when a shared registry client is available.
+    /// The client should be obtained from `LocalService::start()` in main.rs.
+    pub async fn new_with_client(
+        config: ServerConfig,
+        client: Arc<dyn git2db::service::RegistryClient>,
+    ) -> Result<Self, anyhow::Error> {
+        // Use proper storage paths via StoragePaths (XDG Base Directory spec)
+        let storage_paths = crate::storage::paths::StoragePaths::new()?;
+
+        // Allow environment override but use proper XDG paths by default
+        let models_dir = if let Ok(dir) = std::env::var("HYPRSTREAM_MODELS_DIR") {
+            std::path::PathBuf::from(dir)
+        } else {
+            storage_paths.models_dir()?
+        };
+
+        tracing::info!("Initializing model storage at: {:?}", models_dir);
+        let model_storage = Arc::new(ModelStorage::new(client, models_dir));
+
+        Self::create_with_storage(config, model_storage).await
+    }
+
     /// Create a new server state with custom git2db configuration
     pub async fn new_with_git2db(
         config: ServerConfig,
@@ -92,6 +138,53 @@ impl ServerState {
         tracing::info!("Initializing model storage at: {:?}", models_dir);
         let model_storage =
             Arc::new(ModelStorage::create_with_config(models_dir.clone(), git2db_config).await?);
+
+        Self::create_with_storage(config, model_storage).await
+    }
+
+    /// Internal helper to create server state with pre-initialized storage
+    async fn create_with_storage(
+        config: ServerConfig,
+        model_storage: Arc<ModelStorage>,
+    ) -> Result<Self, anyhow::Error> {
+        // Initialize policy manager from .registry/policies/
+        let registry_path = model_storage.get_models_dir().join(".registry");
+        let policies_dir = registry_path.join("policies");
+        tracing::info!("Initializing policy manager from: {:?}", policies_dir);
+        let policy_manager = Arc::new(
+            PolicyManager::new(&policies_dir)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "Failed to load policies from {:?}: {}. Using permissive defaults.",
+                        policies_dir,
+                        e
+                    );
+                    // Fall back to permissive policy manager synchronously
+                    // This is safe since we're already in an async context
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current()
+                            .block_on(PolicyManager::permissive())
+                            .expect("Failed to create permissive policy manager")
+                    })
+                }),
+        );
+
+        // Initialize token manager from .registry/policies/tokens.csv
+        let tokens_path = policies_dir.join("tokens.csv");
+        tracing::info!("Initializing token manager from: {:?}", tokens_path);
+        let token_manager = Arc::new(RwLock::new(
+            TokenManager::new(&tokens_path)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "Failed to load tokens from {:?}: {}. Starting with empty token store.",
+                        tokens_path,
+                        e
+                    );
+                    TokenManager::in_memory()
+                }),
+        ));
 
         // Initialize training service
         let training_service = Arc::new(TrainingService::new());
@@ -124,6 +217,41 @@ impl ServerState {
         // Initialize self-supervised trainers map (trainers are created lazily per model)
         let trainers = Arc::new(DashMap::new());
 
+        // Initialize event bus for pub/sub messaging
+        let event_bus = Arc::new(EventBus::new().await.map_err(|e| {
+            anyhow::anyhow!("failed to initialize event bus: {}", e)
+        })?);
+        tracing::info!("Event bus initialized with endpoints: {:?}", event_bus.endpoints());
+
+        // Initialize sink registry
+        let sink_registry = Arc::new(SinkRegistry::new(event_bus.clone()));
+
+        // Load sink configuration from .registry/event_sinks.yaml
+        let sinks_config_path = registry_path.join("event_sinks.yaml");
+        if sinks_config_path.exists() {
+            match SinksConfig::load(&sinks_config_path) {
+                Ok(sinks_config) => {
+                    tracing::info!(
+                        "Loading {} event sinks from {:?}",
+                        sinks_config.sinks.len(),
+                        sinks_config_path
+                    );
+                    for sink_config in sinks_config.sinks {
+                        if let Err(e) = sink_registry.register(sink_config.clone()).await {
+                            tracing::warn!(
+                                "Failed to register sink '{}': {}",
+                                sink_config.name,
+                                e
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load sinks config: {}. Continuing without event sinks.", e);
+                }
+            }
+        }
+
         Ok(Self {
             model_cache,
             model_storage,
@@ -131,6 +259,12 @@ impl ServerState {
             trainers,
             config: Arc::new(config),
             metrics,
+            policy_manager,
+            token_manager,
+            event_bus,
+            sink_registry,
+            #[cfg(feature = "metrics")]
+            context_store: None, // Initialize via enable_context_store() if needed
         })
     }
 
@@ -142,6 +276,50 @@ impl ServerState {
             "avg_latency_ms": *self.metrics.avg_latency_ms.read().await,
             "active_requests": self.metrics.active_requests.load(std::sync::atomic::Ordering::Relaxed),
         })
+    }
+
+    /// Enable context storage for RAG/CAG functionality.
+    ///
+    /// This initializes a context store using DuckDB for embedding storage.
+    /// Call this during server initialization if RAG/CAG is needed.
+    ///
+    /// # Arguments
+    /// - `db_path` - Path to DuckDB database (use ":memory:" for in-memory)
+    /// - `embedding_dim` - Dimension of embeddings (e.g., 768 for many models)
+    ///
+    /// # Returns
+    /// A mutable reference to the initialized ContextStore
+    #[cfg(feature = "metrics")]
+    pub async fn enable_context_store(
+        &mut self,
+        db_path: &str,
+        embedding_dim: i32,
+    ) -> Result<(), anyhow::Error> {
+        use hyprstream_metrics::storage::context::{context_schema, ContextStore};
+        use hyprstream_metrics::storage::duckdb::DuckDbBackend;
+        use hyprstream_metrics::StorageBackend;
+
+        let backend = Arc::new(DuckDbBackend::new(db_path)?);
+        backend.init().await.map_err(|e| anyhow::anyhow!("Failed to init DuckDB: {}", e))?;
+        backend.create_table("context", &context_schema(embedding_dim)).await
+            .map_err(|e| anyhow::anyhow!("Failed to create context table: {}", e))?;
+
+        let store = ContextStore::new(backend, "context", embedding_dim);
+        self.context_store = Some(Arc::new(store));
+
+        tracing::info!(
+            "Context store enabled with embedding_dim={} at {}",
+            embedding_dim,
+            db_path
+        );
+
+        Ok(())
+    }
+
+    /// Get the context store if initialized
+    #[cfg(feature = "metrics")]
+    pub fn get_context_store(&self) -> Option<&Arc<ContextStore<hyprstream_metrics::storage::duckdb::DuckDbBackend>>> {
+        self.context_store.as_ref()
     }
 }
 

@@ -4,7 +4,9 @@
 
 use super::{paths::StoragePaths, ModelId, ModelStorage};
 use anyhow::Result;
+use git2db::service::RegistryClient;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Result of cloning a model
 pub struct ClonedModel {
@@ -28,11 +30,23 @@ pub struct CloneOptions {
 
 /// Clone a model from a git repository using proper git submodule workflow
 ///
-/// This is the shared implementation used by both CLI and server
+/// This is the shared implementation used by both CLI and server.
+/// If a registry client is provided, it will be used for shared registry access.
+/// Otherwise, a new local service is started.
 pub async fn clone_model(
     repo_url: &str,
     name: Option<&str>,
     git_ref: Option<&str>,
+) -> Result<ClonedModel> {
+    clone_model_with_client(repo_url, name, git_ref, None).await
+}
+
+/// Clone a model with an optional shared registry client
+pub async fn clone_model_with_client(
+    repo_url: &str,
+    name: Option<&str>,
+    git_ref: Option<&str>,
+    client: Option<Arc<dyn RegistryClient>>,
 ) -> Result<ClonedModel> {
     // Get storage paths
     let storage_paths = StoragePaths::new()?;
@@ -60,12 +74,13 @@ pub async fn clone_model(
         extracted.to_string()
     };
 
-    // Load config to get git2db settings (includes auth tokens from env)
-    let hypr_config = crate::config::HyprConfig::load().unwrap_or_default();
-
-    // Create model storage with registry and config
-    let model_storage =
-        ModelStorage::create_with_config(models_dir.clone(), hypr_config.git2db.clone()).await?;
+    // Create model storage - use shared client if provided, otherwise start local service
+    let model_storage = if let Some(client) = client {
+        ModelStorage::new(client, models_dir.clone())
+    } else {
+        let hypr_config = crate::config::HyprConfig::load().unwrap_or_default();
+        ModelStorage::create_with_config(models_dir.clone(), hypr_config.git2db.clone()).await?
+    };
 
     // Use proper git submodule workflow
     tracing::info!(
@@ -139,10 +154,20 @@ pub async fn clone_model_with_options(
 
 /// List all available models
 pub async fn list_models() -> Result<Vec<(super::ModelRef, super::ModelMetadata)>> {
+    list_models_with_client(None).await
+}
+
+/// List all available models with an optional shared registry client
+pub async fn list_models_with_client(
+    client: Option<Arc<dyn RegistryClient>>,
+) -> Result<Vec<(super::ModelRef, super::ModelMetadata)>> {
     let storage_paths = StoragePaths::new()?;
-    let hypr_config = crate::config::HyprConfig::load().unwrap_or_default();
-    let model_storage =
+    let model_storage = if let Some(client) = client {
+        ModelStorage::new(client, storage_paths.models_dir()?)
+    } else {
+        let hypr_config = crate::config::HyprConfig::load().unwrap_or_default();
         ModelStorage::create_with_config(storage_paths.models_dir()?, hypr_config.git2db.clone())
-            .await?;
+            .await?
+    };
     model_storage.list_models().await
 }

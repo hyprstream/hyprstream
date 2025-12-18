@@ -55,6 +55,7 @@ toml.workspace = true
 serde_yaml.workspace = true
 git2.workspace = true  # Still needed by git2db internally
 git2db = { path = "../git2db", features = ["overlayfs"] }  # High-level git library with overlayfs
+hyprstream-flight = { path = "../hyprstream-flight" }  # Flight SQL server and client
 gittorrent = { workspace = true, optional = true }  # P2P transport
 clap.workspace = true
 tracing.workspace = true
@@ -118,12 +119,15 @@ chunk_cache.workspace = true
 merklehash.workspace = true
 
 uuid.workspace = true
+zeromq.workspace = true  # Event bus for pub/sub messaging
 glob.workspace = true
 walkdir.workspace = true
 reqwest.workspace = true
 libc = "0.2"  # For system calls in overlay2 driver
 lru.workspace = true  # LRU cache for model caching and Git repository handles
 dashmap.workspace = true  # Concurrent HashMap for thread-safe repository caching
+bitflags = "2.4"  # Capability flags for archetype detection
+casbin = "2"  # Access control library for RBAC/ABAC
 indicatif.workspace = true              # Progress bars
 fastrand.workspace = true                # Fast random number generation for sampling
 xdg.workspace = true                     # XDG Base Directory specification

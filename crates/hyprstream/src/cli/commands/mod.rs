@@ -1,10 +1,14 @@
 pub mod chat;
 pub mod config;
+pub mod flight;
 pub mod git;
 pub mod model;
+pub mod policy;
 pub mod server;
 
+pub use flight::FlightArgs;
 pub use git::{GitAction, GitCommand};
+pub use policy::{PolicyCommand, TokenCommand};
 pub use server::{ServerCliArgs, ServerCommand};
 
 use clap::{Subcommand, ValueEnum};
@@ -47,6 +51,9 @@ impl From<KVQuantArg> for KVQuantType {
 pub enum Commands {
     /// Start the Hyprstream server
     Server(ServerCommand),
+
+    /// Flight SQL client to query datasets
+    Flight(FlightArgs),
 
     // Phase 1: Git-style commands at top level
     /// Create a new branch
@@ -404,6 +411,12 @@ pub enum Commands {
     Worktree {
         #[command(subcommand)]
         command: WorktreeCommand,
+    },
+
+    /// Policy management commands for RBAC/ABAC access control
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
     },
 }
 

@@ -27,11 +27,8 @@ pub async fn handle_branch(
 
     let model_ref = ModelRef::new(model.to_string());
 
-    // Create branch using git2db directly
-    let repo_id = storage.resolve_repo_id(&model_ref).await?;
-    let registry = storage.registry().await;
-    let handle = registry.repo(&repo_id)?;
-    handle.branch().create(branch_name, from_ref.as_deref()).await?;
+    // Create branch using ModelStorage helper
+    storage.create_branch(&model_ref, branch_name, from_ref.as_deref()).await?;
 
     println!("✓ Created branch {}", branch_name);
 
@@ -417,12 +414,8 @@ pub async fn handle_lora_train(
         info!("Creating isolated training environment: branch {} from {}", new_branch, model_ref.git_ref.display_name());
 
         // 1. Create branch from model_ref's git_ref
-        let repo_id = storage.resolve_repo_id(&model_ref).await?;
-        let registry = storage.registry().await;
-        let handle = registry.repo(&repo_id)?;
-
         let from_ref = model_ref.git_ref.to_ref_string();
-        handle.branch().create(&new_branch, from_ref.as_deref()).await?;
+        storage.create_branch(&model_ref, &new_branch, from_ref.as_deref()).await?;
 
         println!("✓ Created branch {} from {}", new_branch, model_ref.git_ref.display_name());
 
@@ -699,6 +692,7 @@ fn save_training_mode_config(
 /// Handle list command
 pub async fn handle_list(
     storage: &ModelStorage,
+    policy_manager: Option<&crate::auth::PolicyManager>,
 ) -> Result<()> {
     info!("Listing models");
 
@@ -710,11 +704,19 @@ pub async fn handle_list(
         return Ok(());
     }
 
+    // Get current user for permission checks (OS user for CLI)
+    let current_user = users::get_current_username()
+        .map(|u| u.to_string_lossy().to_string())
+        .unwrap_or_else(|| "anonymous".to_string());
+
     // Get storage paths for model directories
     let storage_paths = crate::storage::StoragePaths::new()?;
     let models_dir = storage_paths.models_dir()?;
 
-    // Collect models with git info
+    // Get archetype registry for capability detection
+    let archetype_registry = crate::archetypes::global_registry();
+
+    // Collect models with git info and capabilities
     let mut git_repos = Vec::new();
     for (model_ref, metadata) in models {
         // Get git info from the bare repository
@@ -725,22 +727,41 @@ pub async fn handle_list(
 
         let git_info = GitInfo::from_bare_repo(&bare_repo_path);
 
-        git_repos.push((model_ref, metadata, git_info));
+        // Detect capabilities from worktree path
+        let worktree_path = models_dir
+            .join(&model_ref.model)
+            .join("worktrees")
+            .join(model_ref.git_ref_str().unwrap_or_else(|| "main".to_string()));
+        let detected = archetype_registry.detect(&worktree_path);
+        let domains = detected.to_detected_domains();
+
+        // Compute access string based on user permissions
+        let resource = format!("model:{}", model_ref.model);
+        let access_str = if let Some(pm) = policy_manager {
+            crate::auth::capabilities_to_access_string(pm, &current_user, &resource, &domains.capabilities)
+        } else {
+            // No policy manager = full access (show all capabilities)
+            domains.capabilities.to_ids().join(",")
+        };
+
+        git_repos.push((model_ref, metadata, git_info, domains, access_str));
     }
 
-    // Table format - the nice format you liked!
+    // Table format with DOMAINS and ACCESS columns
     println!(
-        "{:<30} {:<15} {:<8} {:<6} {:<10}",
-        "MODEL NAME", "REF", "COMMIT", "STATUS", "SIZE"
+        "{:<30} {:<16} {:<16} {:<15} {:<8} {:<6} {:<10}",
+        "MODEL NAME", "DOMAINS", "ACCESS", "REF", "COMMIT", "STATUS", "SIZE"
     );
-    println!("{}", "-".repeat(75));
+    println!("{}", "-".repeat(111));
 
-    for (_model_ref, metadata, git_info) in &git_repos {
+    for (_model_ref, metadata, git_info, domains, access_str) in &git_repos {
         let size_str = if let Some(size) = metadata.size_bytes {
             format!("{:.1}GB", size as f64 / (1024.0 * 1024.0 * 1024.0))
         } else {
             "n/a".to_string()
         };
+
+        let domains_str = domains.domains_display();
 
         let (git_ref, commit, status) = match git_info {
             Some(git) => (
@@ -756,8 +777,8 @@ pub async fn handle_list(
         };
 
         println!(
-            "{:<30} {:<15} {:<8} {:<6} {:<10}",
-            metadata.display_name.as_ref().unwrap(), git_ref, commit, status, size_str
+            "{:<30} {:<16} {:<16} {:<15} {:<8} {:<6} {:<10}",
+            metadata.display_name.as_ref().unwrap(), domains_str, access_str, git_ref, commit, status, size_str
         );
     }
 
@@ -938,6 +959,20 @@ pub async fn handle_info(
 
         println!("Reference: {}", display_ref);
         println!("Path: {}", model_path.display());
+
+        // Detect and display archetypes
+        let archetype_registry = crate::archetypes::global_registry();
+        let detected = archetype_registry.detect(&model_path);
+
+        if !detected.is_empty() {
+            println!("\nArchetypes:");
+            for archetype in &detected.archetypes {
+                println!("  - {}", archetype);
+            }
+            println!("Capabilities: {}", detected.capabilities);
+        } else {
+            println!("\nArchetypes: None detected");
+        }
     }
 
     // Get bare repository information
@@ -1529,8 +1564,8 @@ pub async fn handle_infer(
     );
     if let Some(ref qm) = stats.quality_metrics {
         info!(
-            "Quality metrics: perplexity={:.2}, entropy={:.2}, entropy_var={:.4}, repetition={:.3}, quality_score={:.3}",
-            qm.perplexity, qm.avg_entropy, qm.entropy_variance, qm.repetition_ratio, qm.quality_score()
+            "Quality metrics: perplexity={:.2}, entropy={:.2}, entropy_var={:.4}, repetition={:.3}",
+            qm.perplexity, qm.avg_entropy, qm.entropy_variance, qm.repetition_ratio
         );
     }
 
@@ -1554,8 +1589,8 @@ pub async fn handle_infer(
                                 .await;
 
                             info!(
-                                "Training example collected (quality={:.3}, buffer_size={})",
-                                qm.quality_score(),
+                                "Training example collected (perplexity={:.2}, buffer_size={})",
+                                qm.perplexity,
                                 trainer.replay_buffer.len().await
                             );
 
@@ -1605,24 +1640,23 @@ pub async fn handle_push(
     let branch_name = branch.as_deref();
     let model_ref = ModelRef::new(model.to_string());
 
-    // Use git2db API for push
-    let repo_id = storage.resolve_repo_id(&model_ref).await?;
-    let registry = storage.registry().await;
-    let handle = registry.repo(&repo_id)?;
+    // Open repository for push operations
+    let repo = storage.open_repo(&model_ref).await?;
 
-    // Create a temporary worktree for push operations
-    let temp_dir = tempfile::tempdir()?;
-    let worktree_path = temp_dir.path();
-    let mut worktree = handle.create_worktree(worktree_path, "temp-push").await?;
+    // Get current branch or specified branch
+    let push_branch = if let Some(b) = branch_name {
+        b.to_string()
+    } else {
+        repo.head()?
+            .shorthand()
+            .ok_or_else(|| anyhow::anyhow!("Could not determine current branch"))?
+            .to_string()
+    };
 
-    // Push current branch (worktree.push only takes remote parameter)
-    worktree.push(Some(remote_name)).await?;
-
-    // Note: The old code was trying to push specific branches, but WorktreeHandle.push()
-    // only operates on the current branch of the worktree. For multi-branch support,
-    // we'd need to checkout branches first or use different approach.
-
-    worktree.cleanup().await?;
+    // Find remote and push
+    let mut remote = repo.find_remote(remote_name)?;
+    let refspec = format!("refs/heads/{}:refs/heads/{}", push_branch, push_branch);
+    remote.push(&[&refspec], None)?;
 
     println!("✓ Pushed model {} to {}", model, remote_name);
     if let Some(b) = branch_name {
@@ -1649,24 +1683,46 @@ pub async fn handle_pull(
     let branch_name = branch.as_deref();
     let model_ref = ModelRef::new(model.to_string());
 
-    // Use git2db API for pull
-    let repo_id = storage.resolve_repo_id(&model_ref).await?;
-    let registry = storage.registry().await;
-    let handle = registry.repo(&repo_id)?;
+    // Open repository for pull operations
+    let repo = storage.open_repo(&model_ref).await?;
 
-    // Create a temporary worktree for pull operations
-    let temp_dir = tempfile::tempdir()?;
-    let worktree_path = temp_dir.path();
-    let mut worktree = handle.create_worktree(worktree_path, "temp-pull").await?;
+    // Fetch from remote
+    let mut remote = repo.find_remote(remote_name)?;
+    remote.fetch(&["refs/heads/*:refs/remotes/origin/*"], None, None)?;
 
-    // Pull current branch (worktree.pull only takes remote parameter)
-    worktree.pull(Some(remote_name)).await?;
+    // Get current branch or specified branch
+    let pull_branch = if let Some(b) = branch_name {
+        b.to_string()
+    } else {
+        repo.head()?
+            .shorthand()
+            .ok_or_else(|| anyhow::anyhow!("Could not determine current branch"))?
+            .to_string()
+    };
 
-    // Note: The old code was trying to pull specific branches, but WorktreeHandle.pull()
-    // only operates on the current branch of the worktree. For multi-branch support,
-    // we'd need to checkout branches first or use different approach.
+    // Get the remote tracking branch
+    let remote_ref = format!("refs/remotes/{}/{}", remote_name, pull_branch);
+    let fetch_head = repo.find_reference(&remote_ref)?;
+    let fetch_commit = repo.reference_to_annotated_commit(&fetch_head)?;
 
-    worktree.cleanup().await?;
+    // Merge the fetched changes
+    let (analysis, _) = repo.merge_analysis(&[&fetch_commit])?;
+
+    if analysis.is_up_to_date() {
+        println!("✓ Already up to date");
+    } else if analysis.is_fast_forward() {
+        // Fast-forward merge
+        let refname = format!("refs/heads/{}", pull_branch);
+        let mut reference = repo.find_reference(&refname)?;
+        reference.set_target(fetch_commit.id(), "Fast-forward")?;
+        repo.set_head(&refname)?;
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
+        println!("✓ Fast-forwarded to latest");
+    } else if analysis.is_normal() {
+        // Normal merge
+        repo.merge(&[&fetch_commit], None, None)?;
+        println!("✓ Merged remote changes");
+    }
 
     println!("✓ Pulled latest changes for model {}", model);
     println!("  Remote: {}", remote_name);
@@ -2061,10 +2117,7 @@ async fn handle_merge_conflict_resolution(
     }
 
     // Open repository
-    let repo_id = storage.resolve_repo_id(&target_ref).await?;
-    let registry = storage.registry().await;
-    let handle = registry.repo(&repo_id)?;
-    let repo = handle.open_repo()?;
+    let repo = storage.open_repo(&target_ref).await?;
 
     if options.abort {
         // Abort merge: restore pre-merge state

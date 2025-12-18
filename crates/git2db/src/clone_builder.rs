@@ -345,6 +345,7 @@ async fn create_worktree(bare_repo_path: &std::path::PathBuf, worktree_path: &st
     registry.register(repo_id.clone())
         .name(format!("bare-repo-{}", bare_repo_path.display()))
         .url(format!("file://{}", bare_repo_path.display()))
+        .worktree_path(bare_repo_path)
         .exec().await?;
     let handle = registry.repo(&repo_id)?;
 

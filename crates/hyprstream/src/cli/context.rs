@@ -7,6 +7,7 @@
 use crate::config::HyprConfig;
 use crate::storage::ModelStorage;
 use anyhow::{Context as _, Result};
+use git2db::service::RegistryClient;
 use std::sync::{Arc, Mutex};
 
 /// Application context passed to all command handlers
@@ -18,16 +19,22 @@ use std::sync::{Arc, Mutex};
 /// # Example
 ///
 /// ```rust,ignore
-/// let config = HyprConfig::load()?;
-/// let context = AppContext::new(config);
+/// use git2db::service::LocalService;
 ///
-/// // Pass to handlers
+/// // Start registry service ONCE at CLI level
+/// let client = LocalService::start(&models_dir).await?;
+/// let context = AppContext::with_client(config, Arc::new(client));
+///
+/// // Pass to handlers - all share the same registry
 /// handle_server(context.clone()).await?;
 /// ```
 #[derive(Clone)]
 pub struct AppContext {
     /// Shared configuration (immutable after creation)
     config: Arc<HyprConfig>,
+
+    /// Shared registry client (if provided)
+    client: Option<Arc<dyn RegistryClient>>,
 
     /// Lazy-initialized storage (created on demand with thread safety)
     storage: Arc<tokio::sync::OnceCell<ModelStorage>>,
@@ -37,10 +44,27 @@ pub struct AppContext {
 }
 
 impl AppContext {
-    /// Create new context from config
+    /// Create new context from config (legacy - starts internal service)
+    ///
+    /// **Deprecated**: Use `with_client()` instead to share a single
+    /// registry service across all components.
     pub fn new(config: HyprConfig) -> Self {
         Self {
             config: Arc::new(config),
+            client: None,
+            storage: Arc::new(tokio::sync::OnceCell::new()),
+            init_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// Create new context with a shared registry client
+    ///
+    /// This is the preferred method - the registry client should be started
+    /// once in main() and shared across all components.
+    pub fn with_client(config: HyprConfig, client: Arc<dyn RegistryClient>) -> Self {
+        Self {
+            config: Arc::new(config),
+            client: Some(client),
             storage: Arc::new(tokio::sync::OnceCell::new()),
             init_lock: Arc::new(Mutex::new(())),
         }
@@ -49,6 +73,11 @@ impl AppContext {
     /// Get configuration reference
     pub fn config(&self) -> &HyprConfig {
         &self.config
+    }
+
+    /// Get the registry client if available
+    pub fn registry_client(&self) -> Option<&Arc<dyn RegistryClient>> {
+        self.client.as_ref()
     }
 
     /// Get or create storage instance (lazy initialization)
@@ -73,10 +102,15 @@ impl AppContext {
             return Ok(storage);
         }
 
-        // Initialize storage
-        let storage = ModelStorage::create(self.config.models_dir().clone())
-            .await
-            .context("Failed to create model storage")?;
+        // Initialize storage - use shared client if available
+        let storage = if let Some(client) = &self.client {
+            ModelStorage::new(client.clone(), self.config.models_dir().clone())
+        } else {
+            // Fallback: start internal service (legacy behavior)
+            ModelStorage::create(self.config.models_dir().clone())
+                .await
+                .context("Failed to create model storage")?
+        };
 
         // Store in OnceCell (this will only succeed once)
         self.storage

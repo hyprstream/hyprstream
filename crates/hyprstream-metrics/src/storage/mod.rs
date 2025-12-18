@@ -5,12 +5,14 @@
 //! - `adbc`: Arrow Database Connectivity for external database integration (optional)
 //! - `cached`: Two-tier storage with configurable caching layer
 //! - `datafusion_provider`: DataFusion TableProvider bridge for DuckDB
+//! - `context`: Embedding storage for RAG/CAG functionality
 //!
 //! Each backend implements the `StorageBackend` trait, providing a consistent
 //! interface for SQL operations like table management, querying, and data insertion.
 
 pub mod cache;
 pub mod cached;
+pub mod context;
 pub mod datafusion_provider;
 pub mod duckdb;
 pub mod table_manager;

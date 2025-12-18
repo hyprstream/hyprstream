@@ -17,10 +17,16 @@ const NGRAM_BUFFER_SIZE: usize = 32;
 /// N-gram size for repetition detection (trigrams)
 const NGRAM_SIZE: usize = 3;
 
+/// Number of hash functions for bloom filter (k=3 gives ~2% FP rate at 50% fill)
+const BLOOM_K: usize = 3;
+
+/// Bloom filter size in bits (2048 bits = 256 bytes)
+const BLOOM_BITS: usize = 2048;
+
 /// O(1) online metrics accumulator using Welford's algorithm
 ///
 /// This accumulator maintains running statistics without storing per-token data,
-/// using approximately 100 bytes of memory regardless of sequence length.
+/// using approximately 360 bytes of memory regardless of sequence length.
 ///
 /// # Example
 /// ```ignore
@@ -50,10 +56,12 @@ pub struct GenerationMetricsAccumulator {
     // N-gram repetition counter
     ngram_repeats: u32,
 
-    // Track unique n-grams seen (using simple hash set approximation)
-    // We use a fixed-size bloom filter approximation for memory efficiency
-    ngram_hashes: [u64; 64],
-    ngram_hash_count: u32,
+    // Bloom filter for n-gram tracking (256 bytes = 2048 bits)
+    // Uses k=3 hash functions for ~2% false positive rate at 50% fill
+    bloom_filter: [u64; 32],
+
+    // Count of unique n-grams inserted (approximate, counts insertions not unique)
+    ngram_insert_count: u32,
 }
 
 impl Default for GenerationMetricsAccumulator {
@@ -73,8 +81,8 @@ impl GenerationMetricsAccumulator {
             count: 0,
             recent_tokens: VecDeque::with_capacity(NGRAM_BUFFER_SIZE),
             ngram_repeats: 0,
-            ngram_hashes: [0u64; 64],
-            ngram_hash_count: 0,
+            bloom_filter: [0u64; 32],
+            ngram_insert_count: 0,
         }
     }
 
@@ -115,21 +123,57 @@ impl GenerationMetricsAccumulator {
         if self.recent_tokens.len() >= NGRAM_SIZE {
             let ngram_hash = self.compute_current_ngram_hash();
 
-            // Check if we've seen this n-gram before (bloom filter style)
-            let slot = (ngram_hash % 64) as usize;
-            let bit = ngram_hash / 64;
-
-            if self.ngram_hashes[slot] == bit {
-                // Likely repeat (possible false positive, but rare)
+            // Check if this n-gram might already be in the bloom filter
+            if self.bloom_contains(ngram_hash) {
+                // Likely repeat (with ~2% false positive rate at 50% fill)
                 self.ngram_repeats += 1;
-            } else if self.ngram_hashes[slot] == 0 {
-                // New n-gram
-                self.ngram_hashes[slot] = bit;
-                self.ngram_hash_count += 1;
+            } else {
+                // New n-gram, add to bloom filter
+                self.bloom_insert(ngram_hash);
+                self.ngram_insert_count += 1;
             }
-            // If slot is occupied with different hash, we have a collision
-            // This is acceptable for approximate repetition counting
         }
+    }
+
+    /// Insert a hash into the bloom filter
+    ///
+    /// Uses k=3 hash functions derived from the base hash via mixing.
+    fn bloom_insert(&mut self, hash: u64) {
+        for i in 0..BLOOM_K {
+            let bit_index = self.bloom_hash(hash, i);
+            let word_index = bit_index / 64;
+            let bit_offset = bit_index % 64;
+            self.bloom_filter[word_index] |= 1 << bit_offset;
+        }
+    }
+
+    /// Check if a hash might be in the bloom filter
+    ///
+    /// Returns true if the element might be present (with some false positive rate),
+    /// false if the element is definitely not present.
+    fn bloom_contains(&self, hash: u64) -> bool {
+        for i in 0..BLOOM_K {
+            let bit_index = self.bloom_hash(hash, i);
+            let word_index = bit_index / 64;
+            let bit_offset = bit_index % 64;
+            if (self.bloom_filter[word_index] & (1 << bit_offset)) == 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Compute the i-th hash function for the bloom filter
+    ///
+    /// Uses the double hashing technique: h_i(x) = h1(x) + i * h2(x)
+    /// where h1 and h2 are derived from the input hash.
+    fn bloom_hash(&self, hash: u64, i: usize) -> usize {
+        // Split hash into two 32-bit values for double hashing
+        let h1 = (hash & 0xFFFFFFFF) as usize;
+        let h2 = ((hash >> 32) | 1) as usize; // Ensure h2 is odd for better distribution
+
+        // Double hashing: h_i(x) = (h1 + i * h2) mod m
+        (h1.wrapping_add(i.wrapping_mul(h2))) % BLOOM_BITS
     }
 
     /// Compute hash of the current n-gram (last NGRAM_SIZE tokens)
@@ -237,53 +281,7 @@ pub struct GenerationQualityMetrics {
     pub token_count: u32,
 }
 
-/// Weights for quality score components (sum to 1.0)
-const W_CONFIDENCE: f32 = 0.5;
-const W_CONSISTENCY: f32 = 0.2;
-const W_NON_REPETITION: f32 = 0.3;
-
 impl GenerationQualityMetrics {
-    /// Compute a quality score from metrics using weighted additive formula
-    ///
-    /// Higher score = better quality generation (range: 0.0 to 1.0)
-    ///
-    /// # Formula
-    /// Uses weighted additive combination (avoids multiplicative dead zones):
-    /// ```text
-    /// confidence = 1.0 / (1.0 + max(0, ln(perplexity/10)))  // Log-space normalization
-    /// consistency = exp(-min(entropy_variance, 2.0))        // Exponential decay
-    /// non_repetition = 1.0 - sqrt(repetition_ratio)         // Sqrt for less aggressive penalty
-    ///
-    /// score = 0.5 * confidence + 0.2 * consistency + 0.3 * non_repetition
-    /// ```
-    ///
-    /// The additive formula ensures:
-    /// - No single bad metric can zero the entire score
-    /// - More interpretable component contributions
-    /// - Better gradient signals for RL training
-    pub fn quality_score(&self) -> f32 {
-        // Log-space normalization for perplexity (more stable for large values)
-        // perplexity of 10 -> ln(1) = 0 -> confidence = 1.0
-        // perplexity of 100 -> ln(10) ≈ 2.3 -> confidence ≈ 0.30
-        // perplexity of 1000 -> ln(100) ≈ 4.6 -> confidence ≈ 0.18
-        let confidence = 1.0 / (1.0 + (self.perplexity / 10.0).ln().max(0.0));
-
-        // Exponential decay for entropy variance (smoother penalty)
-        // variance of 0 -> exp(0) = 1.0
-        // variance of 1 -> exp(-1) ≈ 0.37
-        // variance of 2 -> exp(-2) ≈ 0.14
-        let consistency = (-self.entropy_variance.min(2.0)).exp();
-
-        // Sqrt for repetition (less aggressive penalty for small amounts)
-        // ratio of 0.0 -> 1.0
-        // ratio of 0.1 -> 1 - 0.316 ≈ 0.68
-        // ratio of 0.5 -> 1 - 0.707 ≈ 0.29
-        let non_repetition = 1.0 - self.repetition_ratio.sqrt();
-
-        // Weighted additive combination
-        W_CONFIDENCE * confidence + W_CONSISTENCY * consistency + W_NON_REPETITION * non_repetition
-    }
-
     /// Check if metrics indicate potentially problematic generation
     pub fn is_concerning(&self) -> bool {
         self.perplexity > 50.0 || self.repetition_ratio > 0.3 || self.entropy_variance > 2.0
@@ -339,31 +337,9 @@ impl SessionMetrics {
         (self.session_perplexity_sum / self.session_token_sum as f64) as f32
     }
 
-    /// Compute session-level average quality score
-    pub fn avg_quality_score(&self) -> f32 {
-        if self.turn_metrics.is_empty() {
-            return 0.0;
-        }
-        let sum: f32 = self.turn_metrics.iter().map(|m| m.quality_score()).sum();
-        sum / self.turn_metrics.len() as f32
-    }
-
     /// Get total tokens generated in this session
     pub fn total_tokens(&self) -> u64 {
         self.session_token_sum
-    }
-
-    /// Check if session quality is declining
-    pub fn is_quality_declining(&self) -> bool {
-        if self.turn_metrics.len() < 3 {
-            return false;
-        }
-
-        // Compare last 3 turns to first 3 turns
-        let recent: f32 = self.turn_metrics.iter().rev().take(3).map(|m| m.quality_score()).sum();
-        let early: f32 = self.turn_metrics.iter().take(3).map(|m| m.quality_score()).sum();
-
-        recent < early * 0.7 // 30% decline threshold
     }
 }
 
@@ -424,44 +400,6 @@ mod tests {
         let metrics = acc.finalize();
         // Should detect repetition
         assert!(metrics.repetition_ratio > 0.0);
-    }
-
-    #[test]
-    fn test_quality_score() {
-        // Good generation: low perplexity, low variance, no repetition
-        let good = GenerationQualityMetrics {
-            perplexity: 2.0,
-            avg_entropy: 1.0,
-            entropy_variance: 0.1,
-            repetition_ratio: 0.0,
-            token_count: 100,
-        };
-        // With additive formula: 0.5*1.0 + 0.2*0.90 + 0.3*1.0 ≈ 0.98
-        assert!(good.quality_score() > 0.9);
-
-        // Medium generation: moderate metrics
-        let medium = GenerationQualityMetrics {
-            perplexity: 20.0, // ln(2) ≈ 0.69 → confidence ≈ 0.59
-            avg_entropy: 3.0,
-            entropy_variance: 1.0, // exp(-1) ≈ 0.37
-            repetition_ratio: 0.1, // sqrt(0.1) ≈ 0.32 → non_rep ≈ 0.68
-            token_count: 100,
-        };
-        // score ≈ 0.5*0.59 + 0.2*0.37 + 0.3*0.68 ≈ 0.30 + 0.07 + 0.20 ≈ 0.57
-        let med_score = medium.quality_score();
-        assert!(med_score > 0.4 && med_score < 0.7, "medium score: {}", med_score);
-
-        // Bad generation: high perplexity, high variance, lots of repetition
-        let bad = GenerationQualityMetrics {
-            perplexity: 100.0,
-            avg_entropy: 5.0,
-            entropy_variance: 3.0,
-            repetition_ratio: 0.5,
-            token_count: 100,
-        };
-        // With additive formula: 0.5*0.30 + 0.2*0.14 + 0.3*0.29 ≈ 0.27
-        // (still gets some credit from each component - no dead zones!)
-        assert!(bad.quality_score() < 0.35);
     }
 
     #[test]

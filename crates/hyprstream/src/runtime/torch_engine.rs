@@ -1971,6 +1971,133 @@ impl TorchEngine {
         tracing::info!("Unloaded LoRA adapter");
         Ok(())
     }
+
+    // ============================================================================
+    // Embedding Extraction for RAG/CAG
+    // ============================================================================
+
+    /// Extract embedding from text using the model's hidden states.
+    ///
+    /// This method tokenizes the input text, runs a forward pass through the model,
+    /// and extracts the final hidden states. The embedding is computed by mean-pooling
+    /// the hidden states over the sequence dimension.
+    ///
+    /// # Arguments
+    /// - `text` - Input text to embed
+    ///
+    /// # Returns
+    /// - Vec<f32> - The embedding vector (dimension = model's hidden_size)
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use hyprstream::runtime::torch_engine::TorchEngine;
+    /// # fn example(engine: &TorchEngine) -> anyhow::Result<()> {
+    /// let embedding = engine.extract_embedding("What is machine learning?")?;
+    /// println!("Embedding dimension: {}", embedding.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn extract_embedding(&self, text: &str) -> Result<Vec<f32>> {
+        // Tokenize input
+        let tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
+        let tokenizer = tokenizer_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("No tokenizer loaded"))?;
+
+        let encoding = tokenizer
+            .encode(text, false)
+            .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
+
+        let token_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
+        drop(tokenizer_guard);
+
+        self.extract_embedding_from_tokens(&token_ids)
+    }
+
+    /// Extract embedding from pre-tokenized input.
+    ///
+    /// This is a lower-level method for when tokens are already available
+    /// (e.g., from a previous generation). Uses mean pooling over the hidden states.
+    ///
+    /// # Arguments
+    /// - `token_ids` - Pre-tokenized input IDs
+    ///
+    /// # Returns
+    /// - Vec<f32> - The embedding vector (dimension = model's hidden_size)
+    pub fn extract_embedding_from_tokens(&self, token_ids: &[i64]) -> Result<Vec<f32>> {
+        if token_ids.is_empty() {
+            return Err(anyhow!("Empty token list"));
+        }
+
+        let input_tensor = Tensor::from_slice(token_ids)
+            .to_device(self.device)
+            .unsqueeze(0); // [1, seq_len]
+
+        let model_guard = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("No model loaded"))?
+            .lock()
+            .map_err(|_| anyhow!("Model lock poisoned"))?;
+
+        tch::no_grad(|| {
+            // Get token embeddings
+            let embeddings = model_guard.embed_tokens(&input_tensor)?;
+
+            // Process through layers to get hidden states
+            let hidden_states = self.process_through_layers_for_embedding(&**model_guard, &embeddings)
+                .unwrap_or_else(|_| embeddings.shallow_clone());
+
+            // Apply final normalization
+            let normalized = model_guard.apply_final_norm(&hidden_states)
+                .unwrap_or_else(|_| hidden_states);
+
+            // Mean pool over sequence dimension: [1, seq_len, hidden_size] -> [1, hidden_size]
+            let pooled = normalized.mean_dim(1, false, tch::Kind::Float);
+
+            // Squeeze batch dimension
+            let pooled_1d = pooled.squeeze_dim(0); // [hidden_size]
+
+            // L2 normalize for cosine similarity
+            let norm = pooled_1d.norm();
+            let normalized_embedding = if norm.double_value(&[]) > 1e-12 {
+                &pooled_1d / norm
+            } else {
+                pooled_1d
+            };
+
+            // Convert to CPU and extract values
+            let cpu_tensor = normalized_embedding.to_device(tch::Device::Cpu);
+            let numel = cpu_tensor.numel() as usize;
+            let mut embedding_vec = vec![0.0f32; numel];
+            cpu_tensor.copy_data(&mut embedding_vec, numel);
+
+            Ok(embedding_vec)
+        })
+    }
+
+    /// Process embeddings through all model layers for embedding extraction
+    fn process_through_layers_for_embedding(
+        &self,
+        model: &dyn crate::runtime::architectures::ModelOperations,
+        embeddings: &Tensor,
+    ) -> Result<Tensor> {
+        let num_layers = model.num_layers();
+        let mut hidden_states = embeddings.shallow_clone();
+
+        for layer_idx in 0..num_layers {
+            let (new_hidden, _kv) = model.decode_layer(
+                layer_idx,
+                &hidden_states,
+                None, // attention_mask
+                None, // position_ids
+                None, // past_kv
+            )?;
+            hidden_states = new_hidden;
+        }
+
+        Ok(hidden_states)
+    }
 }
 
 impl Drop for TorchEngine {

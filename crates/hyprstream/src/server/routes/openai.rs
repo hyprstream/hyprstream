@@ -9,9 +9,7 @@ use axum::{
 };
 use futures::stream::StreamExt;
 use std::convert::Infallible;
-use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info};
 
@@ -20,10 +18,10 @@ use crate::{
         ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, CompletionChoice,
         CompletionRequest, CompletionResponse, EmbeddingRequest, ListModelsResponse, Model, Usage,
     },
-    config::TrainingMode,
-    runtime::{model_config::ModelConfig, CacheOwner, FinishReason, GenerationRequest, RuntimeEngine, TorchEngine},
+    archetypes::capabilities::Infer,
+    inference::{InferenceClient, LocalInferenceClient},
+    runtime::{CacheOwner, FinishReason, GenerationRequest},
     server::state::ServerState,
-    training::{ReplayBufferConfig, SelfSupervisedConfig, SelfSupervisedTrainer},
 };
 
 /// RAII guard for metrics cleanup
@@ -120,11 +118,101 @@ fn extract_cache_owner(headers: &HeaderMap) -> CacheOwner {
     }
 }
 
+/// Result of user extraction from request headers
+pub enum ExtractUserResult {
+    /// Successfully extracted user identity
+    Ok(String),
+    /// Invalid or expired token
+    InvalidToken,
+}
+
+/// Extract user identity from request headers.
+///
+/// Authentication priority (OpenAI-compatible):
+/// 1. `Authorization: Bearer hypr_...` header (API token)
+/// 2. `X-User` header (internal/trusted requests)
+/// 3. Default to "anonymous"
+///
+/// Returns `InvalidToken` if a Bearer token is provided but invalid.
+async fn extract_user(headers: &HeaderMap, state: &ServerState) -> ExtractUserResult {
+    // 1. Check for Bearer token authentication
+    if let Some(auth_header) = headers.get(header::AUTHORIZATION) {
+        if let Ok(auth_str) = auth_header.to_str() {
+            if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                // Validate the token
+                let token_manager = state.token_manager.read().await;
+                match token_manager.validate(token) {
+                    Some(record) => {
+                        debug!("Authenticated via Bearer token as user: {}", record.user);
+                        return ExtractUserResult::Ok(record.user.clone());
+                    }
+                    None => {
+                        debug!("Invalid or expired Bearer token");
+                        return ExtractUserResult::InvalidToken;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Fallback to X-User header (trusted internal requests)
+    if let Some(user_header) = headers.get("x-user") {
+        if let Ok(user) = user_header.to_str() {
+            if !user.is_empty() {
+                debug!("Using X-User header identity: {}", user);
+                return ExtractUserResult::Ok(user.to_string());
+            }
+        }
+    }
+
+    // 3. Default to anonymous
+    debug!("No authentication provided, using anonymous identity");
+    ExtractUserResult::Ok("anonymous".to_string())
+}
+
 /// Helper: Load model from cache with proper error handling
 async fn load_model_or_error(
     state: &ServerState,
     model_name: &str,
-) -> Result<Arc<Mutex<TorchEngine>>, impl IntoResponse> {
+) -> Result<LocalInferenceClient, impl IntoResponse> {
+    // First check if model has INFERENCE capability before loading
+    let model_ref = match crate::storage::ModelRef::parse(model_name) {
+        Ok(r) => r,
+        Err(e) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    format!("Invalid model reference: {}", e),
+                    "invalid_model_ref",
+                    "parse_error",
+                )),
+            )
+                .into_response());
+        }
+    };
+
+    // Get model path for capability check
+    if let Ok(path) = state.model_storage.get_model_path(&model_ref).await {
+        let archetype_registry = crate::archetypes::global_registry();
+        let detected = archetype_registry.detect(&path);
+
+        let domains = detected.to_detected_domains();
+        if !domains.has::<Infer>() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    format!(
+                        "Model '{}' does not support inference. Detected domains: {:?}",
+                        model_name, domains.domains
+                    ),
+                    "capability_error",
+                    "inference_not_supported",
+                )),
+            )
+                .into_response());
+        }
+    }
+
     match state.model_cache.get_or_load(model_name).await {
         Ok(engine) => Ok(engine),
         Err(e) => {
@@ -181,7 +269,29 @@ async fn resolve_model_path(
     };
 
     match state.model_storage.get_model_path(&model_ref).await {
-        Ok(path) => Ok(path),
+        Ok(path) => {
+            // Check if model has INFERENCE capability
+            let archetype_registry = crate::archetypes::global_registry();
+            let detected = archetype_registry.detect(&path);
+
+            let domains = detected.to_detected_domains();
+            if !domains.has::<Infer>() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new(
+                        format!(
+                            "Model '{}' does not support inference. Detected domains: {:?}",
+                            model_name, domains.domains
+                        ),
+                        "capability_error",
+                        "inference_not_supported",
+                    )),
+                )
+                    .into_response());
+            }
+
+            Ok(path)
+        }
         Err(e) => Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse::new(
@@ -219,6 +329,40 @@ async fn chat_completions(
     headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {
+    // Extract user identity from headers (Bearer token or X-User)
+    let user = match extract_user(&headers, &state).await {
+        ExtractUserResult::Ok(user) => user,
+        ExtractUserResult::InvalidToken => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse::new(
+                    "Invalid API key provided",
+                    "invalid_request_error",
+                    "invalid_api_key",
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    // Check permission for inference on this model
+    let resource = format!("model:{}", request.model);
+    if !state
+        .policy_manager
+        .check(&user, &resource, crate::auth::Operation::Infer)
+        .await
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(
+                format!("Permission denied: user '{}' cannot infer on '{}'", user, request.model),
+                "permission_denied",
+                "insufficient_permissions",
+            )),
+        )
+            .into_response();
+    }
+
     // Extract session/request ID for KV cache routing
     let cache_owner = extract_cache_owner(&headers);
 
@@ -306,23 +450,22 @@ async fn chat_completions(
     );
 
     // Determine if this is a stateless request (for cleanup after generation)
-    let is_stateless = matches!(cache_owner, CacheOwner::Stateless(_));
-
-    let result = {
-        let engine_guard = engine.lock().await;
-
-        // Set session for KV cache routing (if registry is initialized)
-        if let Err(e) = engine_guard.set_session(cache_owner.clone()) {
-            debug!("Could not set session (registry may not be initialized): {}", e);
-        }
-
-        engine_guard.generate_with_params(gen_request).await
+    let (is_stateless, session_id) = match &cache_owner {
+        CacheOwner::Session(id) => (false, id.clone()),
+        CacheOwner::Stateless(id) => (true, format!("stateless-{}", id)),
+        CacheOwner::Training { adapter, run_id } => (false, format!("training-{}-{}", adapter, run_id)),
     };
+
+    // Set session for KV cache routing (if registry is initialized)
+    if let Err(e) = engine.set_session(session_id.clone()).await {
+        debug!("Could not set session (registry may not be initialized): {}", e);
+    }
+
+    let result = engine.generate(gen_request).await;
 
     // Release stateless caches to free memory (session caches are preserved)
     if is_stateless {
-        let engine_guard = engine.lock().await;
-        if let Err(e) = engine_guard.release_session(&cache_owner) {
+        if let Err(e) = engine.release_session(&session_id).await {
             debug!("Could not release session cache: {}", e);
         }
     }
@@ -395,7 +538,7 @@ async fn chat_completions(
 async fn stream_chat(state: ServerState, headers: HeaderMap, request: ChatCompletionRequest) -> impl IntoResponse {
     // Extract session/request ID for KV cache routing
     let cache_owner = extract_cache_owner(&headers);
-    let is_stateless = matches!(cache_owner, CacheOwner::Stateless(_));
+    let _is_stateless = matches!(cache_owner, CacheOwner::Stateless(_));
 
     // Create channel for SSE events
     let (tx, rx) = mpsc::channel::<Result<serde_json::Value, anyhow::Error>>(100);
@@ -416,8 +559,6 @@ async fn stream_chat(state: ServerState, headers: HeaderMap, request: ChatComple
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     tokio::spawn(async move {
-        use futures::StreamExt;
-
         // Ensure metrics are decremented on all exit paths
         let _metrics_guard = MetricsGuard::new(&state.metrics);
 
@@ -452,7 +593,7 @@ async fn stream_chat(state: ServerState, headers: HeaderMap, request: ChatComple
             }
         };
 
-        // Format messages BEFORE locking the engine to avoid deadlock
+        // Format messages using inference service
         info!("Formatting messages for streaming...");
         let prompt = match format_messages_with_template(&messages, &engine_arc).await {
             Ok(p) => {
@@ -471,11 +612,13 @@ async fn stream_chat(state: ServerState, headers: HeaderMap, request: ChatComple
             }
         };
 
-        // NOW lock the engine for generation
-        let engine = engine_arc.lock().await;
-
-        // Set session for KV cache routing (if registry is initialized)
-        if let Err(e) = engine.set_session(cache_owner.clone()) {
+        // Set session for KV cache routing
+        let (is_stateless, session_id) = match &cache_owner {
+            CacheOwner::Session(id) => (false, id.clone()),
+            CacheOwner::Stateless(id) => (true, format!("stateless-{}", id)),
+            CacheOwner::Training { adapter, run_id } => (false, format!("training-{}-{}", adapter, run_id)),
+        };
+        if let Err(e) = engine_arc.set_session(session_id.clone()).await {
             debug!("Could not set session (registry may not be initialized): {}", e);
         }
 
@@ -494,12 +637,12 @@ async fn stream_chat(state: ServerState, headers: HeaderMap, request: ChatComple
             gen_request.max_tokens, gen_request.temperature, gen_request.top_p, gen_request.top_k, gen_request.repeat_penalty
         );
 
-        // Create text stream - handles all decoding internally
-        let mut text_stream = match engine.generate(gen_request) {
-            Ok(stream) => stream,
+        // Create stream handle via inference service
+        let mut stream_handle = match engine_arc.generate_stream(gen_request).await {
+            Ok(handle) => handle,
             Err(e) => {
-                error!("Failed to create text stream: {}", e);
-                let _ = tx.send(Err(e)).await;
+                error!("Failed to create stream handle: {}", e);
+                let _ = tx.send(Err(anyhow::anyhow!("Generation failed: {}", e))).await;
                 return;
             }
         };
@@ -525,7 +668,7 @@ async fn stream_chat(state: ServerState, headers: HeaderMap, request: ChatComple
         // Consume text chunks from stream (collect for training)
         info!("Starting streaming generation...");
         let mut full_response = String::new();
-        while let Some(text_result) = text_stream.next().await {
+        while let Some(text_result) = stream_handle.next().await {
             match text_result {
                 Ok(text) => {
                     // Collect for training
@@ -555,14 +698,20 @@ async fn stream_chat(state: ServerState, headers: HeaderMap, request: ChatComple
                 Err(e) => {
                     // Generation error
                     error!("Generation error: {}", e);
-                    let _ = tx.send(Err(e)).await;
+                    let _ = tx.send(Err(anyhow::anyhow!("Generation error: {}", e))).await;
                     return;
                 }
             }
         }
 
-        // Get final statistics
-        let stats = text_stream.stats();
+        // Get final statistics (consumes stream handle)
+        let stats = match stream_handle.stats().await {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("Could not get stream stats: {}", e);
+                crate::inference::StreamStats::default()
+            }
+        };
         info!(
             "Streaming generation completed with {} tokens in {}ms ({:.2} tokens/sec)",
             stats.tokens_generated, stats.generation_time_ms, stats.tokens_per_second
@@ -574,87 +723,10 @@ async fn stream_chat(state: ServerState, headers: HeaderMap, request: ChatComple
             std::sync::atomic::Ordering::Relaxed,
         );
 
-        // Collect training example if self-supervised training is enabled
-        if let Some(ref qm) = stats.quality_metrics {
-            // Check if training is enabled for this model
-            if let Some(tc) = ModelConfig::load_training_config(&model_path) {
-                if tc.is_enabled() && tc.mode == TrainingMode::SelfSupervised {
-                    // Get or create trainer for this model
-                    let trainer = state.trainers
-                        .entry(model_name.clone())
-                        .or_insert_with(|| {
-                            let ss_config = SelfSupervisedConfig {
-                                learning_rate: tc.learning_rate,
-                                batch_size: tc.batch_size,
-                                min_buffer_size: tc.min_buffer_size,
-                                steps_per_cycle: tc.steps_per_cycle,
-                                ..Default::default()
-                            };
-                            let buffer_config = ReplayBufferConfig {
-                                min_quality_threshold: tc.min_quality_threshold,
-                                ..Default::default()
-                            };
-                            Arc::new(SelfSupervisedTrainer::new(ss_config, buffer_config))
-                        })
-                        .clone();
-
-                    // Tokenize for training using the engine
-                    let tokenize = |text: &str| -> Result<Vec<i64>, anyhow::Error> {
-                        let engine_guard = engine_arc.blocking_lock();
-                        let tokenizer = engine_guard.get_tokenizer()?;
-                        let encoding = tokenizer
-                            .encode(text, false)
-                            .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
-                        Ok(encoding.get_ids().iter().map(|&id| id as i64).collect())
-                    };
-
-                    match (tokenize(&prompt_for_training), tokenize(&full_response)) {
-                        (Ok(prompt_tokens), Ok(response_tokens)) => {
-                            // Extract session ID if present for session-based filtering
-                            let session_id = match &cache_owner {
-                                CacheOwner::Session(id) => Some(id.clone()),
-                                _ => None,
-                            };
-
-                            trainer
-                                .add_example(prompt_tokens, response_tokens, qm.clone(), session_id)
-                                .await;
-
-                            debug!(
-                                "Training example collected for model {}: quality={:.3}, buffer_size={}",
-                                model_name,
-                                qm.quality_score(),
-                                trainer.replay_buffer.len().await
-                            );
-
-                            // Note: Training cycles are triggered asynchronously
-                            // We don't block the response - training happens in background
-                            if trainer.ready_to_train().await {
-                                let trainer_clone = trainer.clone();
-                                let engine_clone = engine_arc.clone();
-                                tokio::spawn(async move {
-                                    let mut engine = engine_clone.lock().await;
-                                    match trainer_clone.train_cycle(&mut engine).await {
-                                        Ok(result) => {
-                                            info!(
-                                                "Training cycle complete: {} steps, loss={:.4}",
-                                                result.steps, result.total_loss
-                                            );
-                                        }
-                                        Err(e) => {
-                                            error!("Training cycle failed: {}", e);
-                                        }
-                                    }
-                                });
-                            }
-                        }
-                        (Err(e), _) | (_, Err(e)) => {
-                            debug!("Failed to tokenize for training: {}", e);
-                        }
-                    }
-                }
-            }
-        }
+        // TODO: Self-supervised training collection requires InferenceClient training integration (Phase 4)
+        // Training example collection disabled pending InferenceClient training methods
+        let _ = (&stats.quality_metrics, &prompt_for_training, &full_response, &cache_owner);
+        let _ = &model_path;
 
         // Send completion message with finish reason
         let finish_reason = match stats.finish_reason {
@@ -683,11 +755,8 @@ async fn stream_chat(state: ServerState, headers: HeaderMap, request: ChatComple
         let _ = tx.send(Ok(serde_json::json!({"done": true}))).await;
 
         // Release stateless caches to free memory (session caches are preserved)
-        // Need to drop engine lock first, then reacquire for release
-        drop(engine);
         if is_stateless {
-            let engine_guard = engine_arc.lock().await;
-            if let Err(e) = engine_guard.release_session(&cache_owner) {
+            if let Err(e) = engine_arc.release_session(&session_id).await {
                 debug!("Could not release session cache: {}", e);
             }
         }
@@ -732,8 +801,47 @@ async fn stream_chat(state: ServerState, headers: HeaderMap, request: ChatComple
 /// Handle text completion requests
 async fn completions(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Json(request): Json<CompletionRequest>,
 ) -> impl IntoResponse {
+    // Extract user identity from headers (Bearer token or X-User)
+    let user = match extract_user(&headers, &state).await {
+        ExtractUserResult::Ok(user) => user,
+        ExtractUserResult::InvalidToken => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": "Invalid API key provided",
+                        "type": "invalid_request_error",
+                        "code": "invalid_api_key"
+                    }
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Check permission for inference on this model
+    let resource = format!("model:{}", request.model);
+    if !state
+        .policy_manager
+        .check(&user, &resource, crate::auth::Operation::Infer)
+        .await
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": {
+                    "message": format!("Permission denied: user '{}' cannot infer on '{}'", user, request.model),
+                    "type": "permission_denied",
+                    "code": "insufficient_permissions"
+                }
+            })),
+        )
+            .into_response();
+    }
+
     // Update metrics (use RAII guard for automatic cleanup)
     state
         .metrics
@@ -794,10 +902,7 @@ async fn completions(
         gen_request.max_tokens, gen_request.temperature, gen_request.top_p, gen_request.top_k, gen_request.repeat_penalty
     );
 
-    let result = {
-        let engine = engine.lock().await;
-        engine.generate_with_params(gen_request).await
-    };
+    let result = engine.generate(gen_request).await;
 
     // Metrics automatically decremented by MetricsGuard on drop
 
@@ -914,7 +1019,7 @@ async fn list_models(State(state): State<ServerState>) -> impl IntoResponse {
 /// Format chat messages into a prompt using template engine
 async fn format_messages_with_template(
     messages: &[ChatMessage],
-    engine: &Arc<Mutex<TorchEngine>>,
+    client: &LocalInferenceClient,
 ) -> Result<String, String> {
     // Log messages for debugging
     for (i, msg) in messages.iter().enumerate() {
@@ -945,12 +1050,10 @@ async fn format_messages_with_template(
         })
         .collect();
 
-    info!("Acquiring engine lock for template formatting...");
-    // Apply the engine's template formatting
-    let engine_guard = engine.lock().await;
-    info!("Engine lock acquired, applying template...");
-    let result = engine_guard
+    info!("Applying chat template via inference service...");
+    let result = client
         .apply_chat_template(&template_messages, true)
+        .await
         .map_err(|e| format!("Failed to apply chat template: {}", e));
     info!("Template application complete: {:?}", result.is_ok());
     result

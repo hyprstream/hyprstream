@@ -13,11 +13,13 @@ use {
     datafusion::physical_plan::{empty::EmptyExec, ExecutionPlan},
     datafusion::catalog::Session,
     async_trait::async_trait,
+    duckdb::arrow::datatypes::SchemaRef,
 };
 
 #[cfg(test)]
+#[derive(Debug)]
 struct EmptyTableProvider {
-    schema: arrow_schema::SchemaRef,
+    schema: SchemaRef,
 }
 
 #[cfg(test)]
@@ -26,7 +28,7 @@ impl TableSource for EmptyTableProvider {
         self
     }
 
-    fn schema(&self) -> arrow_schema::SchemaRef {
+    fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 }
@@ -38,7 +40,7 @@ impl TableProvider for EmptyTableProvider {
         self
     }
 
-    fn schema(&self) -> arrow_schema::SchemaRef {
+    fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
@@ -200,7 +202,7 @@ mod tests {
     use super::*;
     use crate::storage::view::ViewDefinition;
     use crate::storage::duckdb::DuckDbBackend;
-    use arrow_schema::{DataType, Field, Schema};
+    use duckdb::arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
 
     #[tokio::test]

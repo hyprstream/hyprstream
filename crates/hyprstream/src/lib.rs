@@ -9,11 +9,15 @@
 
 pub mod adapters;
 pub mod api;
+pub mod archetypes;
+pub mod auth;
 pub mod cli;
 pub mod config;
 pub mod constants;
 pub mod error;
+pub mod events;
 pub mod git;
+pub mod inference;
 pub mod lora;
 pub mod runtime;
 pub mod server;
@@ -53,3 +57,6 @@ pub use runtime::TorchEngine as HyprStreamEngine;
 
 // Export init function from runtime
 pub use runtime::create_engine as init;
+
+// Event bus exports
+pub use events::{EventBus, EventEnvelope, EventPayload, EventSource, SinkRegistry};

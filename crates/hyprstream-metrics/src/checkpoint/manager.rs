@@ -4,14 +4,15 @@ use crate::checkpoint::state::{Checkpoint, CheckpointMetadata, TableCheckpoint};
 use crate::storage::duckdb::DuckDbBackend;
 use crate::storage::StorageBackend;
 use chrono::Utc;
-use git2db::{Git2DB, GitManager, RepoId};
-use std::path::{Path, PathBuf};
+use git2db::service::RegistryClient;
+use git2db::{GitManager, RepoId};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tonic::Status;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, error, info, instrument};
 
 /// Configuration for checkpoint behavior
 #[derive(Debug, Clone)]
@@ -59,22 +60,91 @@ impl CheckpointConfig {
 
 /// Manages checkpoints for metrics storage
 pub struct CheckpointManager {
-    /// git2db registry for versioned storage
-    registry: Git2DB,
-    /// Repository ID for checkpoint storage
-    repo_id: RepoId,
     /// Configuration
     config: CheckpointConfig,
-    /// Path to the worktree
-    worktree_path: PathBuf,
+    /// Shared registry client (if using shared registry)
+    client: Option<Arc<dyn RegistryClient>>,
+    /// Repository name in registry (if using shared registry)
+    repo_name: Option<String>,
+    /// Path to the checkpoint repository
+    repo_path: PathBuf,
     /// List of recent checkpoints (cached)
     checkpoints: RwLock<Vec<Checkpoint>>,
 }
 
 impl CheckpointManager {
-    /// Create a new checkpoint manager
+    /// Create a new checkpoint manager (standalone mode)
+    ///
+    /// This creates a local git repository that is not tracked in any registry.
+    /// For shared registry integration, use `new_with_client()` instead.
     #[instrument(skip(config), fields(base_dir = ?config.base_dir))]
     pub async fn new(config: CheckpointConfig) -> Result<Self, Status> {
+        Self::create_internal(config, None, None).await
+    }
+
+    /// Create a new checkpoint manager with shared registry client
+    ///
+    /// The checkpoint repository will be registered in the shared registry,
+    /// allowing it to be discovered and managed alongside other repositories.
+    ///
+    /// # Arguments
+    /// - `client` - Shared registry client
+    /// - `repo_name` - Name for the checkpoint repository (e.g., "metrics-checkpoints")
+    /// - `config` - Checkpoint configuration
+    #[instrument(skip(client, config), fields(repo_name = %repo_name, base_dir = ?config.base_dir))]
+    pub async fn new_with_client(
+        client: Arc<dyn RegistryClient>,
+        repo_name: &str,
+        config: CheckpointConfig,
+    ) -> Result<Self, Status> {
+        info!("Initializing CheckpointManager with shared registry");
+
+        // Check if repo already exists in registry
+        let existing = client
+            .get_by_name(repo_name)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to query registry: {}", e)))?;
+
+        if let Some(tracked) = existing {
+            // Repository already registered - use its path
+            let repo_path = PathBuf::from(&tracked.worktree_path);
+            info!("Using existing registered checkpoint repository at {:?}", repo_path);
+
+            return Ok(Self {
+                config,
+                client: Some(client),
+                repo_name: Some(repo_name.to_string()),
+                repo_path,
+                checkpoints: RwLock::new(Vec::new()),
+            });
+        }
+
+        // Create the repository and register it
+        let manager = Self::create_internal(
+            config,
+            Some(client.clone()),
+            Some(repo_name.to_string()),
+        )
+        .await?;
+
+        // Register with the registry
+        let repo_id = RepoId::new();
+        client
+            .register(&repo_id, Some(repo_name), &manager.repo_path)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to register checkpoint repo: {}", e)))?;
+
+        info!("Registered checkpoint repository '{}' in registry", repo_name);
+
+        Ok(manager)
+    }
+
+    /// Internal helper to create the checkpoint manager
+    async fn create_internal(
+        config: CheckpointConfig,
+        client: Option<Arc<dyn RegistryClient>>,
+        repo_name: Option<String>,
+    ) -> Result<Self, Status> {
         info!("Initializing CheckpointManager");
 
         // Ensure base directory exists
@@ -85,14 +155,8 @@ impl CheckpointManager {
             ))
         })?;
 
-        // Initialize git2db registry
-        let mut registry = Git2DB::open(&config.base_dir).await.map_err(|e| {
-            Status::internal(format!("Failed to open git2db registry: {}", e))
-        })?;
-
         // Create or get the checkpoint repository
         let repo_path = config.base_dir.join("repo");
-        let repo_id = RepoId::new();
 
         // Initialize git repository if it doesn't exist
         if !repo_path.join(".git").exists() {
@@ -104,31 +168,16 @@ impl CheckpointManager {
                 Status::internal(format!("Failed to initialize git repository: {}", e))
             })?;
 
-            info!("Created new checkpoint repository");
+            info!("Created new checkpoint repository at {:?}", repo_path);
         } else {
-            info!("Using existing checkpoint repository");
+            info!("Using existing checkpoint repository at {:?}", repo_path);
         }
 
-        // Register with git2db
-        registry
-            .register_repository(
-                &repo_id,
-                Some("checkpoints".to_string()),
-                repo_path.to_string_lossy().to_string(),
-            )
-            .await
-            .map_err(|e| {
-                Status::internal(format!("Failed to register checkpoint repository: {}", e))
-            })?;
-
-        // Get the worktree path (use repo path directly for simplicity)
-        let worktree_path = repo_path;
-
         Ok(Self {
-            registry,
-            repo_id,
             config,
-            worktree_path,
+            client,
+            repo_name,
+            repo_path,
             checkpoints: RwLock::new(Vec::new()),
         })
     }
@@ -147,7 +196,7 @@ impl CheckpointManager {
         debug!(table_count = tables.len(), "Found tables to checkpoint");
 
         // Ensure tables directory exists
-        let tables_dir = self.worktree_path.join("tables");
+        let tables_dir = self.repo_path.join("tables");
         std::fs::create_dir_all(&tables_dir).map_err(|e| {
             Status::internal(format!("Failed to create tables directory: {}", e))
         })?;
@@ -192,7 +241,7 @@ impl CheckpointManager {
         metadata = metadata.with_metadata("created_by", "checkpoint_manager");
 
         // Save metadata file
-        let metadata_path = self.worktree_path.join("checkpoint.json");
+        let metadata_path = self.repo_path.join("checkpoint.json");
         let metadata_json = serde_json::to_string_pretty(&metadata).map_err(|e| {
             Status::internal(format!("Failed to serialize checkpoint metadata: {}", e))
         })?;
@@ -230,14 +279,14 @@ impl CheckpointManager {
         metadata: &CheckpointMetadata,
         name: Option<&str>,
     ) -> Result<String, Status> {
-        let handle = self.registry.repo(&self.repo_id).map_err(|e| {
-            Status::internal(format!("Failed to get repository handle: {}", e))
-        })?;
+        // Use GitManager for repository access
+        let repo_cache = GitManager::global()
+            .get_repository(&self.repo_path)
+            .map_err(|e| Status::internal(format!("Failed to get repository: {}", e)))?;
 
-        // Create commit
-        let repo = handle.open_repo().map_err(|e| {
-            Status::internal(format!("Failed to open repository: {}", e))
-        })?;
+        let repo = repo_cache
+            .open()
+            .map_err(|e| Status::internal(format!("Failed to open repository: {}", e)))?;
 
         // Stage all files using git2 directly
         let mut index = repo.index().map_err(|e| {
@@ -302,14 +351,14 @@ impl CheckpointManager {
     ) -> Result<(), Status> {
         info!("Restoring from checkpoint");
 
-        // Checkout the checkpoint commit
-        let handle = self.registry.repo(&self.repo_id).map_err(|e| {
-            Status::internal(format!("Failed to get repository handle: {}", e))
-        })?;
+        // Use GitManager for repository access
+        let repo_cache = GitManager::global()
+            .get_repository(&self.repo_path)
+            .map_err(|e| Status::internal(format!("Failed to get repository: {}", e)))?;
 
-        let repo = handle.open_repo().map_err(|e| {
-            Status::internal(format!("Failed to open repository: {}", e))
-        })?;
+        let repo = repo_cache
+            .open()
+            .map_err(|e| Status::internal(format!("Failed to open repository: {}", e)))?;
 
         let oid = git2::Oid::from_str(checkpoint_id).map_err(|e| {
             Status::invalid_argument(format!("Invalid checkpoint ID: {}", e))
@@ -324,7 +373,7 @@ impl CheckpointManager {
             .map_err(|e| Status::internal(format!("Failed to reset to checkpoint: {}", e)))?;
 
         // Read checkpoint metadata
-        let metadata_path = self.worktree_path.join("checkpoint.json");
+        let metadata_path = self.repo_path.join("checkpoint.json");
         let metadata_json = std::fs::read_to_string(&metadata_path).map_err(|e| {
             Status::internal(format!("Failed to read checkpoint metadata: {}", e))
         })?;
@@ -334,7 +383,7 @@ impl CheckpointManager {
 
         // Import each table from Parquet
         for table in &metadata.tables {
-            let parquet_path = self.worktree_path.join(&table.file_path);
+            let parquet_path = self.repo_path.join(&table.file_path);
             debug!(table = %table.name, path = ?parquet_path, "Importing table");
 
             // Drop existing table if it exists
@@ -393,14 +442,28 @@ impl CheckpointManager {
     pub fn config(&self) -> &CheckpointConfig {
         &self.config
     }
+
+    /// Get the registry client if using shared registry
+    pub fn registry_client(&self) -> Option<&Arc<dyn RegistryClient>> {
+        self.client.as_ref()
+    }
+
+    /// Get the repository name in registry if using shared registry
+    pub fn repo_name(&self) -> Option<&str> {
+        self.repo_name.as_deref()
+    }
+
+    /// Get the repository path
+    pub fn repo_path(&self) -> &PathBuf {
+        &self.repo_path
+    }
 }
 
 impl std::fmt::Debug for CheckpointManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CheckpointManager")
             .field("config", &self.config)
-            .field("repo_id", &self.repo_id)
-            .field("worktree_path", &self.worktree_path)
+            .field("repo_path", &self.repo_path)
             .finish()
     }
 }

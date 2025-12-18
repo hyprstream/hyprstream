@@ -42,6 +42,7 @@ uuid.workspace = true
 chrono.workspace = true
 tempfile.workspace = true
 async-trait.workspace = true
+arc-swap = "1.7"
 
 # Optional gittorrent support
 gittorrent = { workspace = true, optional = true }
