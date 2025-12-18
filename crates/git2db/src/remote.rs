@@ -1,9 +1,34 @@
 //! Remote management for tracked repositories
 //!
-//! Provides git-native remote operations similar to `git remote`
+//! Provides git-native remote operations similar to `git remote`.
+//!
+//! # Metadata Sync Pattern
+//!
+//! Remote operations (`add`, `remove`, `set_url`, `rename`) persist changes to
+//! `.git/config` immediately, but do NOT automatically update registry metadata.
+//! To sync remotes to registry metadata, call `registry.sync_repository_remotes()`
+//! after making changes:
+//!
+//! ```rust,no_run
+//! # async fn example(registry: &mut git2db::Git2DB, repo_id: &git2db::RepoId) -> Result<(), Box<dyn std::error::Error>> {
+//! let repo = registry.repo(repo_id)?;
+//! let remote_mgr = repo.remote();
+//!
+//! // Make changes (persisted to .git/config immediately)
+//! remote_mgr.add("backup", "https://backup.com/repo.git").await?;
+//! remote_mgr.set_url("origin", "https://new-url.com/repo.git").await?;
+//!
+//! // Sync all changes to registry metadata in one call
+//! registry.sync_repository_remotes(repo_id).await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! This "pull" model allows batching multiple remote changes with a single metadata
+//! commit, rather than committing after each operation.
 
 use crate::errors::{Git2DBError, Git2DBResult};
-use crate::registry::{Git2DB, RemoteConfig, RepoId};
+use crate::registry::{Git2DB, RepoId};
 use crate::repo_accessor::RepositoryAccessor;
 use git2::Repository;
 
@@ -60,6 +85,22 @@ impl<'a> RemoteManager<'a> {
     /// Add a new remote
     ///
     /// Similar to `git remote add <name> <url>`
+    ///
+    /// Note: After adding a remote, call `registry.sync_repository_remotes(repo_id).await?`
+    /// to sync the change to registry metadata.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # async fn example(registry: &mut git2db::Git2DB, repo_id: &git2db::RepoId) -> Result<(), Box<dyn std::error::Error>> {
+    /// let repo = registry.repo(repo_id)?;
+    /// let remote_mgr = repo.remote();
+    /// remote_mgr.add("backup", "https://backup.com/repo.git").await?;
+    /// // Sync to metadata
+    /// registry.sync_repository_remotes(repo_id).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn add(&self, name: &str, url: &str) -> Git2DBResult<()> {
         let path = self.repo_path()?;
         let name = name.to_string();
@@ -88,15 +129,15 @@ impl<'a> RemoteManager<'a> {
         .await
         .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))??;
 
-        // Update registry metadata
-        self.update_metadata_remotes().await?;
-
         Ok(())
     }
 
     /// Remove a remote
     ///
     /// Similar to `git remote remove <name>`
+    ///
+    /// Note: After removing a remote, call `registry.sync_repository_remotes(repo_id).await?`
+    /// to sync the change to registry metadata.
     pub async fn remove(&self, name: &str) -> Git2DBResult<()> {
         let path = self.repo_path()?;
         let name = name.to_string();
@@ -120,15 +161,15 @@ impl<'a> RemoteManager<'a> {
         .await
         .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))??;
 
-        // Update registry metadata
-        self.update_metadata_remotes().await?;
-
         Ok(())
     }
 
     /// Change a remote's URL
     ///
     /// Similar to `git remote set-url <name> <url>`
+    ///
+    /// Note: After changing a remote URL, call `registry.sync_repository_remotes(repo_id).await?`
+    /// to sync the change to registry metadata.
     pub async fn set_url(&self, name: &str, url: &str) -> Git2DBResult<()> {
         let path = self.repo_path()?;
         let name = name.to_string();
@@ -156,15 +197,15 @@ impl<'a> RemoteManager<'a> {
         .await
         .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))??;
 
-        // Update registry metadata
-        self.update_metadata_remotes().await?;
-
         Ok(())
     }
 
     /// Rename a remote
     ///
     /// Similar to `git remote rename <old> <new>`
+    ///
+    /// Note: After renaming a remote, call `registry.sync_repository_remotes(repo_id).await?`
+    /// to sync the change to registry metadata.
     pub async fn rename(&self, old_name: &str, new_name: &str) -> Git2DBResult<()> {
         let path = self.repo_path()?;
         let old_name = old_name.to_string();
@@ -200,9 +241,6 @@ impl<'a> RemoteManager<'a> {
         })
         .await
         .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))??;
-
-        // Update registry metadata
-        self.update_metadata_remotes().await?;
 
         Ok(())
     }
@@ -263,30 +301,6 @@ impl<'a> RemoteManager<'a> {
 
         // Return first remote if any
         Ok(remotes.into_iter().next())
-    }
-
-    /// Update registry metadata with current remotes
-    async fn update_metadata_remotes(&self) -> Git2DBResult<()> {
-        // Get current remotes from git
-        let remotes = self.list().await?;
-
-        // Convert to RemoteConfig
-        let _configs: Vec<RemoteConfig> = remotes
-            .into_iter()
-            .map(|r| RemoteConfig {
-                name: r.name,
-                url: r.url,
-                fetch_refs: r.fetch_refs,
-            })
-            .collect();
-
-        // Update in registry metadata
-        // Note: This requires &mut self, which we don't have
-        // For now, remotes are persisted in .git/config
-        // Metadata sync will happen on next registry save
-        // TODO: Implement proper metadata update mechanism (use _configs)
-
-        Ok(())
     }
 }
 
