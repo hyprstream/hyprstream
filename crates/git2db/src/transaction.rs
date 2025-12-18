@@ -182,7 +182,7 @@ impl Git2DB {
 
         // Create snapshot of current registry state
         let snapshot = RegistrySnapshot {
-            version: "2.0.0".to_string(), // TODO: Get from registry
+            version: self.version().to_string(),
             repositories: self.list().map(|r| (r.id.0, r.clone())).collect(),
         };
 
