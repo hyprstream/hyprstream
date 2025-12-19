@@ -149,6 +149,54 @@ const DEFAULT_POLICY_CSV: &str = r#"# Default deny-all policy (secure default)
 # IMPORTANT: Without policies, all access is denied.
 "#;
 
+/// Validate policy.csv format before loading
+///
+/// Ensures all policy lines have the correct number of fields:
+/// - Policy lines (p, ...): 6 fields (p, subject, domain, resource, action, effect)
+/// - Role lines (g, ...): 3 fields (g, user, role)
+fn validate_policy_csv(policy_path: &Path) -> Result<(), PolicyError> {
+    let content = std::fs::read_to_string(policy_path)
+        .map_err(PolicyError::IoError)?;
+
+    for (line_num, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        // Check policy lines (p, ...)
+        if line.starts_with("p,") || line.starts_with("p ") {
+            let fields: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+            if fields.len() != 6 {  // "p" + 5 fields
+                return Err(PolicyError::ValidationError(format!(
+                    "Invalid policy format at line {}:\n\
+                    Found:    {}\n\
+                    Expected: p, subject, domain, resource, action, effect\n\
+                    Example:  p, admin, *, *, *, allow\n\n\
+                    Your policy has {} fields but 6 are required.\n\
+                    Edit {} to fix the format.",
+                    line_num + 1, line, fields.len(), policy_path.display()
+                )));
+            }
+        }
+
+        // Check role lines (g, ...)
+        if line.starts_with("g,") || line.starts_with("g ") {
+            let fields: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+            if fields.len() != 3 {  // "g" + 2 fields
+                return Err(PolicyError::ValidationError(format!(
+                    "Invalid role format at line {}:\n\
+                    Found:    {}\n\
+                    Expected: g, user, role\n\
+                    Example:  g, alice, admin",
+                    line_num + 1, line
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Policy manager wrapping Casbin enforcer
 pub struct PolicyManager {
     /// Casbin enforcer
@@ -184,6 +232,10 @@ impl PolicyManager {
             info!("Creating default policy.csv (deny-all - add policies to grant access)");
             tokio::fs::write(&policy_path, DEFAULT_POLICY_CSV).await?;
         }
+
+        // Validate policy.csv format before loading
+        // This catches common errors like missing domain or effect columns
+        validate_policy_csv(&policy_path)?;
 
         // Load the model
         let model = DefaultModel::from_file(&model_path)

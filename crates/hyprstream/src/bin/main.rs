@@ -14,10 +14,11 @@ use hyprstream_core::cli::{
     handle_branch, handle_checkout, handle_clone, handle_commit, handle_infer, handle_info,
     handle_list, handle_lora_train, handle_merge, handle_policy_apply, handle_policy_check,
     handle_policy_diff, handle_policy_edit, handle_policy_history, handle_policy_rollback,
-    handle_policy_show, handle_pull, handle_push, handle_remove, handle_status,
-    handle_token_create, handle_token_list, handle_token_revoke, handle_worktree_info,
-    handle_worktree_list, handle_worktree_remove, AppContext, DeviceConfig, DevicePreference,
-    RuntimeConfig,
+    handle_policy_show, handle_pull, handle_push, handle_remote_add, handle_remote_list,
+    handle_remote_remove, handle_remote_rename, handle_remote_set_url, handle_remove,
+    handle_status, handle_token_create, handle_token_list, handle_token_revoke,
+    handle_worktree_add, handle_worktree_info, handle_worktree_list, handle_worktree_remove,
+    AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
 };
 use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
@@ -793,8 +794,11 @@ fn main() -> Result<()> {
                 || async move {
                     let storage = ctx.storage().await?;
                     match command {
-                        WorktreeCommand::List { model } => {
-                            handle_worktree_list(storage, &model).await
+                        WorktreeCommand::Add { model, branch } => {
+                            handle_worktree_add(storage, &model, &branch).await
+                        }
+                        WorktreeCommand::List { model, all } => {
+                            handle_worktree_list(storage, &model, all).await
                         }
                         WorktreeCommand::Info { model, branch } => {
                             handle_worktree_info(storage, &model, &branch).await
@@ -907,6 +911,38 @@ fn main() -> Result<()> {
                                     handle_token_revoke(&mut token_manager, token, name, revoke_user, force).await
                                 }
                             }
+                        }
+                    }
+                },
+            )?;
+        }
+
+        Commands::Remote { command } => {
+            use hyprstream_core::cli::commands::RemoteCommand;
+
+            let ctx = ctx.clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    let storage = ctx.storage().await?;
+                    match command {
+                        RemoteCommand::Add { model, name, url } => {
+                            handle_remote_add(storage, &model, &name, &url).await
+                        }
+                        RemoteCommand::List { model, verbose } => {
+                            handle_remote_list(storage, &model, verbose).await
+                        }
+                        RemoteCommand::Remove { model, name } => {
+                            handle_remote_remove(storage, &model, &name).await
+                        }
+                        RemoteCommand::SetUrl { model, name, url } => {
+                            handle_remote_set_url(storage, &model, &name, &url).await
+                        }
+                        RemoteCommand::Rename { model, old_name, new_name } => {
+                            handle_remote_rename(storage, &model, &old_name, &new_name).await
                         }
                     }
                 },

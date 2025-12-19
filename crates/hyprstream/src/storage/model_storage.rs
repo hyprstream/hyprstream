@@ -5,7 +5,7 @@
 //! while repository operations (worktrees, branches) use local git access.
 
 use anyhow::Result;
-use git2db::service::RegistryClient;
+use git2db::service::{RegistryClient, RepositoryClient};
 use git2db::{GitManager, GitRef, RepoId, TrackedRepository};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -515,6 +515,20 @@ impl ModelStorage {
 
         tracing::info!("Successfully created worktree at {}", result_path.display());
         Ok(result_path)
+    }
+
+    /// Get a repository client for a model
+    ///
+    /// Returns a client that provides repository-level operations (worktrees, branches, etc.)
+    /// through the service layer.
+    pub async fn get_repo_client(
+        &self,
+        model_ref: &ModelRef,
+    ) -> Result<Arc<dyn RepositoryClient>> {
+        self.client
+            .repo(&model_ref.model)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get repository client for '{}': {}", model_ref.model, e))
     }
 
     /// List all worktrees for a model

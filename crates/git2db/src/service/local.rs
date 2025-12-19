@@ -12,7 +12,7 @@ use tracing::{debug, info, instrument};
 
 use crate::{Git2DB, RepoId, TrackedRepository};
 
-use super::client::{RegistryClient, RepositoryClient, ServiceError, WorktreeInfo};
+use super::client::{RegistryClient, RemoteInfo, RepositoryClient, ServiceError, WorktreeInfo};
 use super::request::RegistryRequest;
 
 /// In-process registry service that runs as a tokio task.
@@ -218,6 +218,33 @@ impl LocalService {
                 let result = self.do_list_branches(&repo_id).await;
                 let _ = reply.send(result);
             }
+
+            // === Remote Operations ===
+
+            RegistryRequest::ListRemotes { repo_id, reply } => {
+                let result = self.do_list_remotes(&repo_id).await;
+                let _ = reply.send(result);
+            }
+
+            RegistryRequest::AddRemote { repo_id, name, url, reply } => {
+                let result = self.do_add_remote(&repo_id, &name, &url).await;
+                let _ = reply.send(result);
+            }
+
+            RegistryRequest::RemoveRemote { repo_id, name, reply } => {
+                let result = self.do_remove_remote(&repo_id, &name).await;
+                let _ = reply.send(result);
+            }
+
+            RegistryRequest::SetRemoteUrl { repo_id, name, url, reply } => {
+                let result = self.do_set_remote_url(&repo_id, &name, &url).await;
+                let _ = reply.send(result);
+            }
+
+            RegistryRequest::RenameRemote { repo_id, old_name, new_name, reply } => {
+                let result = self.do_rename_remote(&repo_id, &old_name, &new_name).await;
+                let _ = reply.send(result);
+            }
         }
     }
 
@@ -335,6 +362,65 @@ impl LocalService {
         let branches = handle.branch().list().await?;
         // Convert Branch structs to their names
         Ok(branches.into_iter().map(|b| b.name).collect())
+    }
+
+    // === Remote Operation Implementations ===
+
+    /// List all remotes.
+    async fn do_list_remotes(&self, repo_id: &RepoId) -> Result<Vec<RemoteInfo>, ServiceError> {
+        let handle = self.registry.repo(repo_id)?;
+        let remotes = handle.remote().list().await?;
+        Ok(remotes
+            .into_iter()
+            .map(|r| RemoteInfo {
+                name: r.name,
+                url: r.url,
+                push_url: r.push_url,
+            })
+            .collect())
+    }
+
+    /// Add a remote.
+    async fn do_add_remote(
+        &self,
+        repo_id: &RepoId,
+        name: &str,
+        url: &str,
+    ) -> Result<(), ServiceError> {
+        let handle = self.registry.repo(repo_id)?;
+        handle.remote().add(name, url).await?;
+        Ok(())
+    }
+
+    /// Remove a remote.
+    async fn do_remove_remote(&self, repo_id: &RepoId, name: &str) -> Result<(), ServiceError> {
+        let handle = self.registry.repo(repo_id)?;
+        handle.remote().remove(name).await?;
+        Ok(())
+    }
+
+    /// Set remote URL.
+    async fn do_set_remote_url(
+        &self,
+        repo_id: &RepoId,
+        name: &str,
+        url: &str,
+    ) -> Result<(), ServiceError> {
+        let handle = self.registry.repo(repo_id)?;
+        handle.remote().set_url(name, url).await?;
+        Ok(())
+    }
+
+    /// Rename a remote.
+    async fn do_rename_remote(
+        &self,
+        repo_id: &RepoId,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<(), ServiceError> {
+        let handle = self.registry.repo(repo_id)?;
+        handle.remote().rename(old_name, new_name).await?;
+        Ok(())
     }
 }
 
@@ -586,6 +672,70 @@ impl RepositoryClient for LocalRepositoryClient {
         self.sender
             .send(RegistryRequest::ListBranches {
                 repo_id: self.repo_id.clone(),
+                reply: tx,
+            })
+            .map_err(|_| ServiceError::Unavailable)?;
+        rx.await.map_err(|_| ServiceError::channel("No response"))?
+    }
+
+    // === Remote Operations ===
+
+    async fn list_remotes(&self) -> Result<Vec<RemoteInfo>, ServiceError> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(RegistryRequest::ListRemotes {
+                repo_id: self.repo_id.clone(),
+                reply: tx,
+            })
+            .map_err(|_| ServiceError::Unavailable)?;
+        rx.await.map_err(|_| ServiceError::channel("No response"))?
+    }
+
+    async fn add_remote(&self, name: &str, url: &str) -> Result<(), ServiceError> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(RegistryRequest::AddRemote {
+                repo_id: self.repo_id.clone(),
+                name: name.to_string(),
+                url: url.to_string(),
+                reply: tx,
+            })
+            .map_err(|_| ServiceError::Unavailable)?;
+        rx.await.map_err(|_| ServiceError::channel("No response"))?
+    }
+
+    async fn remove_remote(&self, name: &str) -> Result<(), ServiceError> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(RegistryRequest::RemoveRemote {
+                repo_id: self.repo_id.clone(),
+                name: name.to_string(),
+                reply: tx,
+            })
+            .map_err(|_| ServiceError::Unavailable)?;
+        rx.await.map_err(|_| ServiceError::channel("No response"))?
+    }
+
+    async fn set_remote_url(&self, name: &str, url: &str) -> Result<(), ServiceError> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(RegistryRequest::SetRemoteUrl {
+                repo_id: self.repo_id.clone(),
+                name: name.to_string(),
+                url: url.to_string(),
+                reply: tx,
+            })
+            .map_err(|_| ServiceError::Unavailable)?;
+        rx.await.map_err(|_| ServiceError::channel("No response"))?
+    }
+
+    async fn rename_remote(&self, old_name: &str, new_name: &str) -> Result<(), ServiceError> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(RegistryRequest::RenameRemote {
+                repo_id: self.repo_id.clone(),
+                old_name: old_name.to_string(),
+                new_name: new_name.to_string(),
                 reply: tx,
             })
             .map_err(|_| ServiceError::Unavailable)?;

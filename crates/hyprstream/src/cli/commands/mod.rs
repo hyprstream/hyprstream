@@ -418,15 +418,32 @@ pub enum Commands {
         #[command(subcommand)]
         command: PolicyCommand,
     },
+
+    /// Remote management commands
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommand,
+    },
 }
 
 /// Worktree subcommands
 #[derive(Subcommand)]
 pub enum WorktreeCommand {
+    /// Create a worktree from an existing branch
+    Add {
+        /// Model name
+        model: String,
+        /// Branch name (must exist in bare repo)
+        branch: String,
+    },
+
     /// List all worktrees for a model
     List {
         /// Model name
         model: String,
+        /// Show all branches (including those without worktrees)
+        #[arg(long)]
+        all: bool,
     },
 
     /// Show detailed information about a worktree
@@ -446,5 +463,56 @@ pub enum WorktreeCommand {
         /// Force removal without confirmation
         #[arg(short, long)]
         force: bool,
+    },
+}
+
+/// Remote subcommands
+#[derive(Subcommand)]
+pub enum RemoteCommand {
+    /// Add a new remote
+    Add {
+        /// Model name
+        model: String,
+        /// Remote name (e.g., "private", "upstream")
+        name: String,
+        /// Remote URL (e.g., git@github.com:user/repo.git)
+        url: String,
+    },
+
+    /// List all remotes
+    List {
+        /// Model name
+        model: String,
+        /// Show verbose output (fetch/push URLs)
+        #[arg(short, long)]
+        verbose: bool,
+    },
+
+    /// Remove a remote
+    Remove {
+        /// Model name
+        model: String,
+        /// Remote name to remove
+        name: String,
+    },
+
+    /// Change a remote's URL
+    SetUrl {
+        /// Model name
+        model: String,
+        /// Remote name
+        name: String,
+        /// New URL
+        url: String,
+    },
+
+    /// Rename a remote
+    Rename {
+        /// Model name
+        model: String,
+        /// Current remote name
+        old_name: String,
+        /// New remote name
+        new_name: String,
     },
 }

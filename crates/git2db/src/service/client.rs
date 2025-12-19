@@ -17,6 +17,17 @@ pub struct WorktreeInfo {
     pub driver: String,
 }
 
+/// Remote information returned by list_remotes.
+#[derive(Debug, Clone)]
+pub struct RemoteInfo {
+    /// Remote name (e.g., "origin", "upstream")
+    pub name: String,
+    /// Fetch URL
+    pub url: String,
+    /// Push URL (if different from fetch URL)
+    pub push_url: Option<String>,
+}
+
 /// Transport-agnostic registry client trait.
 ///
 /// Implementations can be in-process (channels) or remote (gRPC, etc.).
@@ -131,6 +142,23 @@ pub trait RepositoryClient: Send + Sync {
 
     /// List all branches.
     async fn list_branches(&self) -> Result<Vec<String>, ServiceError>;
+
+    // === Remote Operations ===
+
+    /// List all remotes.
+    async fn list_remotes(&self) -> Result<Vec<RemoteInfo>, ServiceError>;
+
+    /// Add a new remote.
+    async fn add_remote(&self, name: &str, url: &str) -> Result<(), ServiceError>;
+
+    /// Remove a remote.
+    async fn remove_remote(&self, name: &str) -> Result<(), ServiceError>;
+
+    /// Change a remote's URL.
+    async fn set_remote_url(&self, name: &str, url: &str) -> Result<(), ServiceError>;
+
+    /// Rename a remote.
+    async fn rename_remote(&self, old_name: &str, new_name: &str) -> Result<(), ServiceError>;
 }
 
 /// Service error type wrapping Git2DBError with service-layer concerns.

@@ -7,7 +7,7 @@ use crate::{RepoId, TrackedRepository};
 use std::path::PathBuf;
 use tokio::sync::oneshot;
 
-use super::client::WorktreeInfo;
+use super::client::{RemoteInfo, WorktreeInfo};
 use super::ServiceError;
 
 /// Request types for the registry service.
@@ -114,6 +114,45 @@ pub enum RegistryRequest {
         repo_id: RepoId,
         reply: oneshot::Sender<Result<Vec<String>, ServiceError>>,
     },
+
+    // === Remote Operations ===
+
+    /// List all remotes.
+    ListRemotes {
+        repo_id: RepoId,
+        reply: oneshot::Sender<Result<Vec<RemoteInfo>, ServiceError>>,
+    },
+
+    /// Add a remote.
+    AddRemote {
+        repo_id: RepoId,
+        name: String,
+        url: String,
+        reply: oneshot::Sender<Result<(), ServiceError>>,
+    },
+
+    /// Remove a remote.
+    RemoveRemote {
+        repo_id: RepoId,
+        name: String,
+        reply: oneshot::Sender<Result<(), ServiceError>>,
+    },
+
+    /// Set remote URL.
+    SetRemoteUrl {
+        repo_id: RepoId,
+        name: String,
+        url: String,
+        reply: oneshot::Sender<Result<(), ServiceError>>,
+    },
+
+    /// Rename a remote.
+    RenameRemote {
+        repo_id: RepoId,
+        old_name: String,
+        new_name: String,
+        reply: oneshot::Sender<Result<(), ServiceError>>,
+    },
 }
 
 impl std::fmt::Debug for RegistryRequest {
@@ -185,6 +224,37 @@ impl std::fmt::Debug for RegistryRequest {
             }
             Self::ListBranches { repo_id, .. } => {
                 write!(f, "RegistryRequest::ListBranches {{ repo_id: {:?} }}", repo_id)
+            }
+            Self::ListRemotes { repo_id, .. } => {
+                write!(f, "RegistryRequest::ListRemotes {{ repo_id: {:?} }}", repo_id)
+            }
+            Self::AddRemote { repo_id, name, url, .. } => {
+                write!(
+                    f,
+                    "RegistryRequest::AddRemote {{ repo_id: {:?}, name: {:?}, url: {:?} }}",
+                    repo_id, name, url
+                )
+            }
+            Self::RemoveRemote { repo_id, name, .. } => {
+                write!(
+                    f,
+                    "RegistryRequest::RemoveRemote {{ repo_id: {:?}, name: {:?} }}",
+                    repo_id, name
+                )
+            }
+            Self::SetRemoteUrl { repo_id, name, url, .. } => {
+                write!(
+                    f,
+                    "RegistryRequest::SetRemoteUrl {{ repo_id: {:?}, name: {:?}, url: {:?} }}",
+                    repo_id, name, url
+                )
+            }
+            Self::RenameRemote { repo_id, old_name, new_name, .. } => {
+                write!(
+                    f,
+                    "RegistryRequest::RenameRemote {{ repo_id: {:?}, old: {:?}, new: {:?} }}",
+                    repo_id, old_name, new_name
+                )
             }
         }
     }

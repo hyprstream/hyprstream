@@ -45,6 +45,6 @@ mod client;
 mod local;
 mod request;
 
-pub use client::{RegistryClient, RepositoryClient, ServiceError, WorktreeInfo};
+pub use client::{RegistryClient, RemoteInfo, RepositoryClient, ServiceError, WorktreeInfo};
 pub use local::{LocalClient, LocalRepositoryClient, LocalService};
 pub use request::RegistryRequest;
