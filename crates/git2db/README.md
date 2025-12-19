@@ -144,11 +144,20 @@ handle.staging().add_file("specific_file.txt")?;
 // Remote operations
 handle.remote().fetch("origin").await?;
 handle.remote().push("origin", "main").await?;
+
+// Commit operations
+handle.staging().add_all().await?;
+let oid = handle.commit("My commit message").await?;
+
+// Commit with custom signature
+use git2::Signature;
+let sig = Signature::now("Author", "author@example.com")?;
+let oid = handle.commit_as(&sig, "Custom commit").await?;
 ```
 
 **Escape Hatch** (for operations not yet in RepositoryHandle):
 ```rust
-let repo = handle.open()?;  // Get raw git2::Repository
+let repo = handle.open_repo()?;  // Get raw git2::Repository
 // Use git2 directly...
 ```
 
@@ -274,21 +283,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     handle.branch().checkout("my-feature").await?;
 
     // Make changes and stage
-    handle.staging().add_all()?;
+    handle.staging().add_all().await?;
 
-    // Commit (using escape hatch until commit() API implemented)
-    let repo = handle.open()?;
-    let sig = git2db::GitManager::global().create_signature(None, None)?;
-    let tree = repo.find_tree(repo.index()?.write_tree()?)?;
-    let parent = repo.head()?.peel_to_commit()?;
-    repo.commit(
-        Some("HEAD"),
-        &sig,
-        &sig,
-        "My changes",
-        &tree,
-        &[&parent],
-    )?;
+    // Commit using the new commit API
+    let oid = handle.commit("My changes").await?;
 
     // Push to remote
     handle.remote().push("origin", "my-feature").await?;
@@ -411,11 +409,11 @@ cargo build -p git2db --features overlayfs,xet-storage
 - `branch()` - Branch management
 - `staging()` - Stage operations
 - `remote()` - Remote operations
+- `commit()` - Commit creation
 - Storage driver system (overlay2, vfs)
 - Configuration system
 
 ### In Progress / Planned ⏳
-- `commit()` API - High-level commit creation
 - `merge()` API - Merge operations
 - `rebase()` API - Rebase operations
 - `tag()` API - Tag management

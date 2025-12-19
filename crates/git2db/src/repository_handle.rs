@@ -9,7 +9,7 @@ use crate::registry::{Git2DB, RepoId, TrackedRepository};
 use crate::remote::RemoteManager;
 use crate::storage::{DriverOpts, WorktreeHandle};
 use crate::stage::StageManager;
-use git2::{Oid, Repository};
+use git2::{Oid, Repository, Signature};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -158,13 +158,13 @@ impl<'a> RepositoryHandle<'a> {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// # fn example(repo: &git2db::RepositoryHandle<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    /// # async fn example(repo: &git2db::RepositoryHandle<'_>) -> Result<(), Box<dyn std::error::Error>> {
     /// // Add files to staging area
-    /// repo.staging().add("src/main.rs")?;
-    /// repo.staging().add_all()?;
+    /// repo.staging().add("src/main.rs").await?;
+    /// repo.staging().add_all().await?;
     ///
     /// // Check staged files
-    /// for file in repo.staging().staged_files()? {
+    /// for file in repo.staging().staged_files().await? {
     ///     println!("Staged: {:?}", file.path);
     /// }
     /// # Ok(())
@@ -172,6 +172,150 @@ impl<'a> RepositoryHandle<'a> {
     /// ```
     pub fn staging(&self) -> StageManager<'a> {
         StageManager::new(self.registry, self.repo_id.clone())
+    }
+
+    /// Commit staged changes with default signature
+    ///
+    /// Similar to `git commit -m "<message>"`
+    ///
+    /// This method commits all staged changes using the default signature from
+    /// GitManager configuration. The signature is created from git config or
+    /// the Git2DB configuration.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # async fn example(repo: &git2db::RepositoryHandle<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    /// // Stage changes
+    /// repo.staging().add_all().await?;
+    ///
+    /// // Commit with default signature
+    /// let oid = repo.commit("Update documentation").await?;
+    /// println!("Committed: {}", oid);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// This method will return an error if:
+    /// - There are no staged changes
+    /// - The repository cannot be opened
+    /// - The signature cannot be created (check git config)
+    /// - The commit cannot be created
+    pub async fn commit(&self, message: &str) -> Git2DBResult<Oid> {
+        // Get default signature from the global GitManager
+        let git_manager = crate::manager::GitManager::global();
+        let sig = git_manager.create_signature(None, None)?;
+
+        self.commit_as(&sig, message).await
+    }
+
+    /// Commit staged changes with a specific author/committer
+    ///
+    /// Similar to `git commit -m "<message>" --author="<name> <email>"`
+    ///
+    /// This method commits all staged changes using the provided signature.
+    /// Both author and committer will be set to the provided signature.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # async fn example(repo: &git2db::RepositoryHandle<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    /// use git2::Signature;
+    ///
+    /// // Stage changes
+    /// repo.staging().add("README.md").await?;
+    ///
+    /// // Create custom signature
+    /// let sig = Signature::now("Alice", "alice@example.com")?;
+    ///
+    /// // Commit as specific user
+    /// let oid = repo.commit_as(&sig, "Update docs").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// This method will return an error if:
+    /// - There are no staged changes
+    /// - The repository cannot be opened
+    /// - The commit cannot be created
+    pub async fn commit_as(&self, signature: &Signature<'_>, message: &str) -> Git2DBResult<Oid> {
+        let repo_path = self.worktree()?.to_path_buf();
+        let message = message.to_string();
+        // Clone signature data to move into the blocking task
+        // Note: Signature has a lifetime, so we need to extract the data
+        let sig_name = signature.name().unwrap_or("Unknown").to_string();
+        let sig_email = signature.email().unwrap_or("unknown@example.com").to_string();
+        // Preserve the original timestamp from the signature
+        let sig_time = signature.when();
+        let sig_time_seconds = sig_time.seconds();
+        let sig_time_offset = sig_time.offset_minutes();
+
+        tracing::info!(message = %message, author = %sig_name, "Creating commit");
+
+        tokio::task::spawn_blocking(move || -> Git2DBResult<Oid> {
+            let repo = Repository::open(&repo_path).map_err(|e| {
+                Git2DBError::repository(&repo_path, format!("Failed to open repository: {}", e))
+            })?;
+
+            // Get the current index
+            let mut index = repo
+                .index()
+                .map_err(|e| Git2DBError::internal(format!("Failed to get index: {}", e)))?;
+
+            // Write index to tree
+            let tree_oid = index
+                .write_tree()
+                .map_err(|e| Git2DBError::internal(format!("Failed to write tree: {}", e)))?;
+
+            let tree = repo
+                .find_tree(tree_oid)
+                .map_err(|e| Git2DBError::internal(format!("Failed to find tree: {}", e)))?;
+
+            // Get parent commit (if any)
+            let parent_commits = if let Ok(head) = repo.head() {
+                vec![head.peel_to_commit().map_err(|e| {
+                    Git2DBError::reference("HEAD", format!("Failed to get HEAD commit: {}", e))
+                })?]
+            } else {
+                vec![]
+            };
+
+            let parent_refs: Vec<&git2::Commit> = parent_commits.iter().collect();
+
+            // Check for empty commits (nothing staged that differs from parent)
+            if let Some(parent) = parent_refs.first() {
+                if parent.tree_id() == tree_oid {
+                    return Err(Git2DBError::invalid_operation(
+                        "Nothing to commit: no changes staged",
+                    ));
+                }
+            }
+
+            // Recreate signature in the blocking task, preserving the original timestamp
+            let time = git2::Time::new(sig_time_seconds, sig_time_offset);
+            let sig = Signature::new(&sig_name, &sig_email, &time)
+                .map_err(|e| Git2DBError::internal(format!("Failed to create signature: {}", e)))?;
+
+            // Create the commit
+            let commit_oid = repo
+                .commit(
+                    Some("HEAD"),
+                    &sig,
+                    &sig,
+                    &message,
+                    &tree,
+                    &parent_refs,
+                )
+                .map_err(|e| Git2DBError::internal(format!("Failed to create commit: {}", e)))?;
+
+            Ok(commit_oid)
+        })
+        .await
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
     }
 
     /// List all references (branches and tags) with their OIDs
@@ -475,7 +619,7 @@ impl<'a> RepositoryHandle<'a> {
     /// ```
     ///
     /// Fetch LFS files for the worktree
-    async fn fetch_lfs_files(repo_path: &Path) -> Git2DBResult<()> {
+    pub async fn fetch_lfs_files(repo_path: &Path) -> Git2DBResult<()> {
         use tokio::process::Command;
 
         if !repo_path.exists() {

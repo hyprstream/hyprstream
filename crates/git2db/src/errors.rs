@@ -62,6 +62,10 @@ pub enum Git2DBError {
     #[error("Operation cancelled: {operation}")]
     Cancelled { operation: String },
 
+    /// Invalid operation (e.g., nothing to commit, empty merge)
+    #[error("Invalid operation: {message}")]
+    InvalidOperation { message: String },
+
     /// Internal library errors
     #[error("Internal error: {message}")]
     Internal { message: String },
@@ -93,6 +97,7 @@ impl Git2DBError {
             Self::InvalidPath { message, .. } => message.clone(),
             Self::InvalidRepository { message, .. } => message.clone(),
             Self::Cancelled { operation } => format!("Operation cancelled: {}", operation),
+            Self::InvalidOperation { message } => message.clone(),
             Self::Internal { message } => message.clone(),
             Self::Io(e) => e.to_string(),
             Self::Json(e) => e.to_string(),
@@ -228,6 +233,13 @@ impl Git2DBError {
         }
     }
 
+    /// Create an invalid operation error
+    pub fn invalid_operation<S: Into<String>>(message: S) -> Self {
+        Self::InvalidOperation {
+            message: message.into(),
+        }
+    }
+
     /// Create an internal error
     pub fn internal<S: Into<String>>(message: S) -> Self {
         Self::Internal {
@@ -256,6 +268,7 @@ impl Git2DBError {
             Self::Configuration { .. } => false,
             Self::InvalidPath { .. } => false,
             Self::InvalidRepository { .. } => false,
+            Self::InvalidOperation { .. } => false,
             _ => false,
         }
     }
