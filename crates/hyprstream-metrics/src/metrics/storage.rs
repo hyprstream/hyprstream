@@ -1,9 +1,8 @@
 use crate::aggregation::{AggregateFunction, AggregateResult, GroupBy, TimeWindow};
 use crate::metrics::{MetricRecord, create_record_batch, encode_record_batch};
 use crate::storage::StorageBackend;
-use duckdb::arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
+use duckdb::arrow::array::{Float64Array, Int64Array, StringArray};
 use duckdb::arrow::datatypes::{DataType, Field, Schema};
-use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::Status;

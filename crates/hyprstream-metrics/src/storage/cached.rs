@@ -51,7 +51,7 @@
 //! data consistency between cache and backing store.
 
 use crate::storage::view::ViewDefinition;
-use crate::storage::{Credentials, StorageBackend, duckdb::DuckDbBackend};
+use crate::storage::{Credentials, StorageBackend};
 #[cfg(feature = "adbc")]
 use crate::storage::adbc::AdbcBackend;
 use std::sync::Arc;

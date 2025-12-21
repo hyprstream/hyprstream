@@ -3,9 +3,8 @@ use crate::storage::StorageBackend;
 use datafusion::error::Result;
 use datafusion::logical_expr::{LogicalPlan, TableScan};
 use datafusion::optimizer::optimizer::{OptimizerConfig, OptimizerRule};
-use datafusion_common::{tree_node::Transformed, DFSchema};
+use datafusion_common::tree_node::Transformed;
 use datafusion::sql::TableReference;
-use datafusion::logical_expr::Expr;
 #[cfg(test)]
 use {
     datafusion::datasource::{TableProvider, TableType},

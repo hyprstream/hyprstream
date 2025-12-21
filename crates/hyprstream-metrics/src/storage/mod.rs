@@ -32,7 +32,7 @@ use self::adbc::AdbcBackend;
 pub use datafusion_provider::{DuckDBExec, DuckDBTableProvider};
 
 use ::duckdb::arrow::array::RecordBatch;
-use ::duckdb::arrow::datatypes::{DataType, Field, Schema};
+use ::duckdb::arrow::datatypes::{DataType, Schema};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;

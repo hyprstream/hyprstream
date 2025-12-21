@@ -9,7 +9,7 @@ use crate::query::{DataFusionExecutor, DataFusionPlanner, ExecutorConfig, Query,
 use crate::storage::StorageBackend;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::error::{DataFusionError, Result};
+use datafusion::error::Result;
 use datafusion::physical_plan::ExecutionPlan;
 use futures::Stream;
 use std::collections::HashMap;
@@ -17,7 +17,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, instrument};
 
 /// A cached prepared statement with its physical plan
 #[derive(Clone)]
