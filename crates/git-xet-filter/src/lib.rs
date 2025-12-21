@@ -3,6 +3,20 @@
 //! Provides transparent integration with XET repositories via libgit2 filters.
 //!
 //! This crate can be used standalone or as part of git2db.
+//!
+//! # Feature Flags
+//!
+//! - **`xet-storage`** (disabled by default): Enables actual XET CAS integration.
+//!   Without this feature, only configuration types and error handling are available.
+//!
+//! ## Available without `xet-storage`:
+//! - [`XetConfig`] - Configuration for XET endpoints
+//! - [`XetError`], [`XetErrorKind`], [`Result`] - Error types for handling XET failures
+//!
+//! ## Available with `xet-storage`:
+//! - [`initialize()`] - Register the XET filter with libgit2
+//! - [`is_initialized()`] - Check if filter is registered
+//! - Filter storage and runtime modules
 
 pub mod config;
 pub mod error;

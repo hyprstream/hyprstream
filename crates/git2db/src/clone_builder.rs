@@ -364,31 +364,6 @@ fn get_default_branch(repo: &git2::Repository) -> Git2DBResult<String> {
     Ok("main".to_string())
 }
 
-/// Check existing worktree state (sync, to avoid Send issues with git2::Statuses)
-fn check_existing_worktree(worktree_path: &std::path::Path) -> Git2DBResult<Option<bool>> {
-    // Returns: None = no worktree exists, Some(true) = clean worktree, Some(false) = dirty worktree
-    if !worktree_path.join(".git").exists() {
-        return Ok(None);
-    }
-
-    match git2::Repository::open(worktree_path) {
-        Ok(repo) => {
-            let statuses = repo.statuses(None).map_err(|e| {
-                Git2DBError::repository(worktree_path, format!("Failed to get worktree status: {}", e))
-            })?;
-            Ok(Some(statuses.is_empty()))
-        }
-        Err(_) => {
-            // Invalid/corrupted worktree - clean it up
-            tracing::warn!("Removing corrupted worktree at {:?}", worktree_path);
-            std::fs::remove_dir_all(worktree_path).map_err(|e| {
-                Git2DBError::repository(worktree_path, format!("Failed to remove corrupted worktree: {}", e))
-            })?;
-            Ok(None)
-        }
-    }
-}
-
 /// Create a worktree from a bare repository using the storage driver
 async fn create_worktree(
     driver: &std::sync::Arc<dyn crate::storage::Driver>,
@@ -396,29 +371,6 @@ async fn create_worktree(
     worktree_path: &std::path::Path,
     branch: &str,
 ) -> Git2DBResult<()> {
-    // Check if worktree already exists (sync check to avoid Send issues)
-    match check_existing_worktree(worktree_path)? {
-        Some(true) => {
-            // Clean worktree - safe to reuse
-            tracing::info!("Worktree already exists and is clean at {:?}", worktree_path);
-            // Still run LFS fetch (idempotent)
-            crate::repository_handle::RepositoryHandle::fetch_lfs_files(worktree_path).await?;
-            return Ok(());
-        }
-        Some(false) => {
-            // Dirty worktree - don't destroy user's work!
-            tracing::warn!("Worktree at {:?} has uncommitted changes", worktree_path);
-            return Err(Git2DBError::configuration(format!(
-                "Worktree at {} has uncommitted changes. \
-                 Commit or discard changes before retrying clone.",
-                worktree_path.display()
-            )));
-        }
-        None => {
-            // No worktree or was cleaned up - continue to create
-        }
-    }
-
     // Ensure parent exists
     if let Some(parent) = worktree_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
@@ -426,25 +378,31 @@ async fn create_worktree(
         })?;
     }
 
-    // Use storage driver (proper registry integration)
+    // Use storage driver (strict: errors if path exists)
     let opts = crate::storage::DriverOpts {
         base_repo: bare_repo_path.to_path_buf(),
         worktree_path: worktree_path.to_path_buf(),
         ref_spec: branch.to_string(),
     };
 
-    driver.create_worktree(&opts).await.map_err(|e| {
-        Git2DBError::repository(
+    match driver.create_worktree(&opts).await {
+        Ok(_) => {
+            // LFS fetch (idempotent)
+            crate::repository_handle::RepositoryHandle::fetch_lfs_files(worktree_path).await?;
+            tracing::info!("Created worktree at {:?} for branch '{}'", worktree_path, branch);
+            Ok(())
+        }
+        Err(e) if e.is_worktree_exists() => {
+            // Clone resume: worktree already exists, just fetch LFS
+            tracing::info!("Worktree already exists at {:?}, fetching LFS files", worktree_path);
+            crate::repository_handle::RepositoryHandle::fetch_lfs_files(worktree_path).await?;
+            Ok(())
+        }
+        Err(e) => Err(Git2DBError::repository(
             worktree_path,
             format!("Failed to create worktree for branch '{}': {}", branch, e)
-        )
-    })?;
-
-    // LFS fetch (idempotent)
-    crate::repository_handle::RepositoryHandle::fetch_lfs_files(worktree_path).await?;
-
-    tracing::info!("Created worktree at {:?} for branch '{}'", worktree_path, branch);
-    Ok(())
+        )),
+    }
 }
 
 #[cfg(test)]

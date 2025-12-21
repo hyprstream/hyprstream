@@ -10,6 +10,27 @@ use thiserror::Error;
 /// Result type for git2db operations
 pub type Git2DBResult<T> = std::result::Result<T, Git2DBError>;
 
+/// LFS-specific error kinds for detailed error classification
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LfsErrorKind {
+    /// LFS pointer content is invalid
+    InvalidPointer,
+    /// Failed to parse LFS pointer fields
+    ParseError,
+    /// Failed to convert hash formats
+    HashConversion,
+    /// File size doesn't match pointer metadata
+    SizeMismatch,
+    /// SHA256 hash doesn't match pointer metadata
+    HashMismatch,
+    /// Failed to smudge (download) content
+    SmudgeFailed,
+    /// I/O operation failed
+    IoError,
+    /// Directory is not part of a git repository
+    NotInRepository,
+}
+
 /// Comprehensive error types for git2db operations
 #[derive(Error, Debug)]
 pub enum Git2DBError {
@@ -58,6 +79,10 @@ pub enum Git2DBError {
     #[error("Invalid repository '{name}': {message}")]
     InvalidRepository { name: String, message: String },
 
+    /// Worktree already exists at path
+    #[error("Worktree already exists at {path:?}. Use 'remove' to delete it first.")]
+    WorktreeExists { path: PathBuf },
+
     /// Operation cancelled by user
     #[error("Operation cancelled: {operation}")]
     Cancelled { operation: String },
@@ -69,6 +94,10 @@ pub enum Git2DBError {
     /// Internal library errors
     #[error("Internal error: {message}")]
     Internal { message: String },
+
+    /// LFS operation errors
+    #[error("LFS error ({kind:?}): {message}")]
+    Lfs { kind: LfsErrorKind, message: String },
 
     /// IO errors
     #[error("IO error: {0}")]
@@ -96,9 +125,13 @@ impl Git2DBError {
             Self::Configuration { message, .. } => message.clone(),
             Self::InvalidPath { message, .. } => message.clone(),
             Self::InvalidRepository { message, .. } => message.clone(),
+            Self::WorktreeExists { path } => {
+                format!("Worktree already exists at {}", path.display())
+            }
             Self::Cancelled { operation } => format!("Operation cancelled: {}", operation),
             Self::InvalidOperation { message } => message.clone(),
             Self::Internal { message } => message.clone(),
+            Self::Lfs { message, .. } => message.clone(),
             Self::Io(e) => e.to_string(),
             Self::Json(e) => e.to_string(),
             Self::External(e) => e.to_string(),
@@ -226,6 +259,16 @@ impl Git2DBError {
         }
     }
 
+    /// Create a worktree exists error
+    pub fn worktree_exists<P: Into<PathBuf>>(path: P) -> Self {
+        Self::WorktreeExists { path: path.into() }
+    }
+
+    /// Check if this error is a worktree exists error
+    pub fn is_worktree_exists(&self) -> bool {
+        matches!(self, Self::WorktreeExists { .. })
+    }
+
     /// Create a cancelled operation error
     pub fn cancelled<S: Into<String>>(operation: S) -> Self {
         Self::Cancelled {
@@ -244,6 +287,22 @@ impl Git2DBError {
     pub fn internal<S: Into<String>>(message: S) -> Self {
         Self::Internal {
             message: message.into(),
+        }
+    }
+
+    /// Create an LFS error with specific kind
+    pub fn lfs<S: Into<String>>(kind: LfsErrorKind, message: S) -> Self {
+        Self::Lfs {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// Get LFS error kind if this is an LFS error
+    pub fn lfs_kind(&self) -> Option<LfsErrorKind> {
+        match self {
+            Self::Lfs { kind, .. } => Some(*kind),
+            _ => None,
         }
     }
 
@@ -268,6 +327,7 @@ impl Git2DBError {
             Self::Configuration { .. } => false,
             Self::InvalidPath { .. } => false,
             Self::InvalidRepository { .. } => false,
+            Self::WorktreeExists { .. } => false,
             Self::InvalidOperation { .. } => false,
             _ => false,
         }

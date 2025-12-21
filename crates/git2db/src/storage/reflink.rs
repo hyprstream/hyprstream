@@ -110,6 +110,11 @@ impl Driver for ReflinkDriver {
     
     #[cfg(feature = "reflink")]
     async fn create_worktree(&self, opts: &DriverOpts) -> Git2DBResult<WorktreeHandle> {
+        // Strict: worktree path must not exist
+        if opts.worktree_path.exists() {
+            return Err(Git2DBError::worktree_exists(&opts.worktree_path));
+        }
+
         // Validate inputs
         if !opts.base_repo.exists() {
             return Err(Git2DBError::invalid_path(

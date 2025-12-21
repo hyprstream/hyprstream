@@ -303,22 +303,18 @@ impl StorageBackend for XetStorage {
     }
 
     async fn clean_bytes(&self, data: &[u8]) -> Result<String> {
-        // Delegate to the implementation method
         XetStorage::clean_bytes(self, data).await
     }
 
     async fn smudge_file(&self, pointer: &str, output_path: &Path) -> Result<()> {
-        // Delegate to the implementation method
         XetStorage::smudge_file(self, pointer, output_path).await
     }
 
     async fn smudge_bytes(&self, pointer: &str) -> Result<Vec<u8>> {
-        // Delegate to the implementation method
         XetStorage::smudge_bytes(self, pointer).await
     }
 
     async fn smudge_from_hash(&self, hash: &merklehash::MerkleHash) -> Result<Vec<u8>> {
-        // Delegate to the implementation method
         XetStorage::smudge_from_hash(self, hash).await
     }
 
@@ -327,7 +323,6 @@ impl StorageBackend for XetStorage {
         hash: &merklehash::MerkleHash,
         output_path: &Path,
     ) -> Result<()> {
-        // Delegate to the implementation method
         XetStorage::smudge_from_hash_to_file(self, hash, output_path).await
     }
 }

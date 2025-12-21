@@ -55,9 +55,17 @@ pub mod xet {
     pub use crate::xet_filter::{initialize, is_initialized, last_error, clear_last_error};
 }
 
+// LFS pointer support with XET backend
+#[cfg(feature = "xet-storage")]
+pub mod lfs;
+
 // Re-export main types
 pub use config::{Git2DBConfig, GitSignature, WorktreeConfig};
-pub use errors::{Git2DBError, Git2DBResult};
+pub use errors::{Git2DBError, Git2DBResult, LfsErrorKind};
+
+// Re-export LFS types when xet-storage feature is enabled
+#[cfg(feature = "xet-storage")]
+pub use lfs::{is_lfs_pointer, LfsPointer, LfsSmudge, LfsStorage, ProcessingStats};
 
 // Re-export git2 types for cleaner API boundary
 // Consumers should use git2db::Oid and git2db::Repository instead of git2::Oid and git2::Repository
