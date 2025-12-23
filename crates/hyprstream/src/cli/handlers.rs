@@ -1,15 +1,61 @@
 //! CLI handlers for adaptive ML inference server
 
 use crate::archetypes::capabilities::Query;
+use crate::services::RegistryClient;
 use crate::storage::ModelStorage;
 use crate::training::{CheckpointManager, WeightFormat, WeightSnapshot};
 use ::config::{Config, File};
+use async_trait::async_trait;
+use git2db::{RepoId, TrackedRepository};
+use hyprstream_metrics::checkpoint::manager::{
+    RegistryClient as MetricsRegistryClient, RegistryError as MetricsRegistryError,
+};
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info};
+
+/// Adapter to bridge between hyprstream's RegistryClient and hyprstream_metrics' RegistryClient
+///
+/// This allows using our full-featured RegistryClient with components that only
+/// need the minimal hyprstream_metrics::RegistryClient trait.
+struct MetricsRegistryAdapter {
+    inner: Arc<dyn RegistryClient>,
+}
+
+impl MetricsRegistryAdapter {
+    fn new(client: Arc<dyn RegistryClient>) -> Self {
+        Self { inner: client }
+    }
+}
+
+#[async_trait]
+impl MetricsRegistryClient for MetricsRegistryAdapter {
+    async fn get_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<TrackedRepository>, MetricsRegistryError> {
+        self.inner
+            .get_by_name(name)
+            .await
+            .map_err(|e| MetricsRegistryError::Operation(e.to_string()))
+    }
+
+    async fn register(
+        &self,
+        id: &RepoId,
+        name: Option<&str>,
+        path: &Path,
+    ) -> Result<(), MetricsRegistryError> {
+        self.inner
+            .register(id, name, path)
+            .await
+            .map_err(|e| MetricsRegistryError::Operation(e.to_string()))
+    }
+}
 
 /// Response structure for LoRA inference
 #[derive(Debug, Clone)]
@@ -167,7 +213,9 @@ pub async fn handle_server(
                         flight_addr, dataset_name
                     );
 
-                    let client = registry_client.clone();
+                    // Wrap our RegistryClient in adapter for hyprstream_metrics trait
+                    let adapter: Arc<dyn MetricsRegistryClient> =
+                        Arc::new(MetricsRegistryAdapter::new(registry_client.clone()));
                     let dataset = dataset_name.clone();
                     let flight_port = flight_cfg.port;
                     let flight_host_owned = flight_host.clone();
@@ -179,7 +227,8 @@ pub async fn handle_server(
                             .with_port(flight_port);
 
                         if let Err(e) =
-                            hyprstream_flight::start_flight_server(Some(client), &dataset, config).await
+                            hyprstream_flight::start_flight_server(Some(adapter), &dataset, config)
+                                .await
                         {
                             error!("Flight SQL server error: {}", e);
                         }
@@ -470,7 +519,7 @@ pub async fn handle_write_checkpoint(
     model_id: String,
     _name: Option<String>,
     step: Option<usize>,
-    client: Option<std::sync::Arc<dyn git2db::service::RegistryClient>>,
+    client: Option<std::sync::Arc<dyn crate::services::RegistryClient>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Writing checkpoint for model: {}", model_id);
 

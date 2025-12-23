@@ -30,6 +30,7 @@
 //! - `git2db.adapter_saved` - Adapter saved to repository
 
 pub mod bus;
+pub mod capnp_serde;
 pub mod config;
 pub mod registry;
 pub mod sinks;
@@ -146,6 +147,8 @@ pub enum EventPayload {
         session_id: Option<String>,
         /// Error message
         error: String,
+        /// Error code (optional)
+        error_code: Option<String>,
     },
 
     /// Tool was executed during generation
@@ -307,6 +310,10 @@ pub struct GenerationMetrics {
     pub repetition_ratio: f32,
     /// Number of tokens generated
     pub token_count: u32,
+    /// Tokens generated per second
+    pub tokens_per_second: f32,
+    /// Total generation time in milliseconds
+    pub generation_time_ms: u64,
 }
 
 impl From<crate::runtime::generation_metrics::GenerationQualityMetrics> for GenerationMetrics {
@@ -317,6 +324,28 @@ impl From<crate::runtime::generation_metrics::GenerationQualityMetrics> for Gene
             entropy_variance: m.entropy_variance,
             repetition_ratio: m.repetition_ratio,
             token_count: m.token_count,
+            // These fields are set separately at generation time
+            tokens_per_second: 0.0,
+            generation_time_ms: 0,
+        }
+    }
+}
+
+impl GenerationMetrics {
+    /// Create metrics with timing information from a GenerationQualityMetrics
+    pub fn with_timing(
+        m: crate::runtime::generation_metrics::GenerationQualityMetrics,
+        tokens_per_second: f32,
+        generation_time_ms: u64,
+    ) -> Self {
+        Self {
+            perplexity: m.perplexity,
+            avg_entropy: m.avg_entropy,
+            entropy_variance: m.entropy_variance,
+            repetition_ratio: m.repetition_ratio,
+            token_count: m.token_count,
+            tokens_per_second,
+            generation_time_ms,
         }
     }
 }

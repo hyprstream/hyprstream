@@ -93,10 +93,10 @@ impl ServerState {
     /// Create a new server state with a shared registry client
     ///
     /// This is the preferred method when a shared registry client is available.
-    /// The client should be obtained from `LocalService::start()` in main.rs.
+    /// The client should be obtained from `RegistryZmqClient::new()` in main.rs.
     pub async fn new_with_client(
         config: ServerConfig,
-        client: Arc<dyn git2db::service::RegistryClient>,
+        client: Arc<dyn crate::services::RegistryClient>,
     ) -> Result<Self, anyhow::Error> {
         // Use proper storage paths via StoragePaths (XDG Base Directory spec)
         let storage_paths = crate::storage::paths::StoragePaths::new()?;

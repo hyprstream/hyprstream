@@ -118,9 +118,6 @@ impl SinkConfig {
             SinkType::Nats { url, .. } => {
                 *url = expand_env(url);
             }
-            SinkType::Mcp { endpoint, .. } => {
-                *endpoint = expand_env(endpoint);
-            }
             _ => {}
         }
     }
@@ -151,14 +148,6 @@ pub enum SinkType {
         url: String,
         /// Subject prefix (events published as `{prefix}.{topic}`)
         subject_prefix: String,
-    },
-
-    /// MCP tool invocation
-    Mcp {
-        /// Tool name to invoke
-        tool: String,
-        /// MCP endpoint (IPC or TCP)
-        endpoint: String,
     },
 
     /// Container execution
@@ -266,29 +255,6 @@ sinks:
                 assert_eq!(subject_prefix, "hyprstream.events");
             }
             _ => panic!("expected nats sink"),
-        }
-    }
-
-    #[test]
-    fn test_mcp_config() {
-        let yaml = r#"
-sinks:
-  - name: mcp-validator
-    type: mcp
-    tool: "validate_output"
-    endpoint: "ipc:///tmp/mcp-validator.sock"
-    subscribe: "git2db.commit_created"
-"#;
-
-        let config = SinksConfig::from_yaml(yaml).unwrap();
-        let sink = &config.sinks[0];
-
-        match &sink.sink_type {
-            SinkType::Mcp { tool, endpoint } => {
-                assert_eq!(tool, "validate_output");
-                assert_eq!(endpoint, "ipc:///tmp/mcp-validator.sock");
-            }
-            _ => panic!("expected mcp sink"),
         }
     }
 

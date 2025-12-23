@@ -10,6 +10,6 @@ pub mod manager;
 pub mod recovery;
 pub mod state;
 
-pub use manager::{CheckpointConfig, CheckpointManager};
+pub use manager::{CheckpointConfig, CheckpointManager, RegistryClient, RegistryError};
 pub use recovery::{RecoveryManager, RecoveryStatus};
 pub use state::{Checkpoint, CheckpointMetadata};

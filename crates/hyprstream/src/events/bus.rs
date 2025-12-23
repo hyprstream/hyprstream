@@ -4,7 +4,10 @@
 //! - `inproc://` for in-process messaging (zero-copy)
 //! - `ipc://` for inter-process messaging (MCP tools, containers)
 //! - `tcp://` for network messaging (distributed systems)
+//!
+//! Serialization uses Cap'n Proto for zero-copy performance.
 
+use super::capnp_serde;
 use super::EventEnvelope;
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
@@ -204,12 +207,12 @@ impl EventBus {
 
     /// Publish an event to all subscribers
     ///
-    /// The event is serialized to JSON and sent as a multipart message:
+    /// The event is serialized to Cap'n Proto and sent as a multipart message:
     /// - Frame 0: Topic (for ZeroMQ prefix filtering)
-    /// - Frame 1: JSON payload
+    /// - Frame 1: Cap'n Proto payload
     pub async fn publish(&self, event: &EventEnvelope) -> Result<()> {
         let topic = event.topic.clone();
-        let payload = serde_json::to_vec(event)?;
+        let payload = capnp_serde::serialize_event(event)?;
 
         self.sender
             .send(PublishCommand { topic, payload })
@@ -300,13 +303,13 @@ impl EventSubscriber {
             anyhow!("failed to receive topic: {}", e)
         })?;
 
-        // Receive payload frame
+        // Receive payload frame (Cap'n Proto)
         let payload = self.socket.recv_bytes(0).map_err(|e| {
             warn!("subscriber recv payload error: {}", e);
             anyhow!("failed to receive payload: {}", e)
         })?;
 
-        let event: EventEnvelope = serde_json::from_slice(&payload)
+        let event = capnp_serde::deserialize_event(&payload)
             .map_err(|e| anyhow!("failed to deserialize event: {}", e))?;
 
         trace!("received event {} from topic {}", event.id, event.topic);
@@ -319,13 +322,13 @@ impl EventSubscriber {
     pub fn try_recv(&self) -> Result<Option<EventEnvelope>> {
         // Use non-blocking receive
         match self.socket.recv_bytes(zmq::DONTWAIT) {
-            Ok(topic_bytes) => {
+            Ok(_topic_bytes) => {
                 // Got topic, now get payload (should be immediate)
                 let payload = self.socket.recv_bytes(0).map_err(|e| {
                     anyhow!("failed to receive payload after topic: {}", e)
                 })?;
 
-                let event: EventEnvelope = serde_json::from_slice(&payload)
+                let event = capnp_serde::deserialize_event(&payload)
                     .map_err(|e| anyhow!("failed to deserialize event: {}", e))?;
 
                 trace!("received event {} from topic {}", event.id, event.topic);

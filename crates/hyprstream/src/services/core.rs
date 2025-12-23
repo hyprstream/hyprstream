@@ -5,8 +5,8 @@
 
 use crate::zmq::global_context;
 use anyhow::{anyhow, Result};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
 /// Trait for ZMQ-based services
@@ -50,24 +50,23 @@ impl ServiceRunner {
     /// Returns a handle that can be used to stop the service.
     pub fn run<S: ZmqService>(self, service: S) -> ServiceHandle {
         let endpoint = self.endpoint.clone();
-        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        // Use AtomicBool for shutdown signaling instead of mpsc channel
+        // This avoids the nested runtime anti-pattern
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
 
         let handle = tokio::task::spawn_blocking(move || {
-            Self::service_loop(endpoint, service, shutdown_rx)
+            Self::service_loop(endpoint, service, shutdown_clone)
         });
 
         ServiceHandle {
-            task: handle,
-            shutdown_tx,
+            task: Some(handle),
+            shutdown: Some(shutdown),
         }
     }
 
     /// Internal service loop
-    fn service_loop<S: ZmqService>(
-        endpoint: String,
-        service: S,
-        mut shutdown_rx: mpsc::Receiver<()>,
-    ) {
+    fn service_loop<S: ZmqService>(endpoint: String, service: S, shutdown: Arc<AtomicBool>) {
         let ctx = global_context();
 
         // Create REP socket
@@ -85,6 +84,11 @@ impl ServiceRunner {
             warn!("failed to set receive timeout: {}", e);
         }
 
+        // Set LINGER to 0 for immediate close without blocking
+        if let Err(e) = socket.set_linger(0) {
+            warn!("failed to set socket linger: {}", e);
+        }
+
         // Bind to endpoint
         if let Err(e) = socket.bind(&endpoint) {
             error!(
@@ -98,16 +102,11 @@ impl ServiceRunner {
 
         info!("{} service bound to {}", service.name(), endpoint);
 
-        // Create a runtime for checking the shutdown channel
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to create runtime for service loop");
-
         // Main service loop
+        // No nested runtime needed - AtomicBool check is lock-free
         loop {
-            // Check for shutdown signal
-            if rt.block_on(async { shutdown_rx.try_recv().is_ok() }) {
+            // Check for shutdown signal (lock-free atomic read)
+            if shutdown.load(Ordering::Relaxed) {
                 debug!("{} service received shutdown signal", service.name());
                 break;
             }
@@ -153,20 +152,35 @@ impl ServiceRunner {
 
 /// Handle for a running service
 pub struct ServiceHandle {
-    task: tokio::task::JoinHandle<()>,
-    shutdown_tx: mpsc::Sender<()>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    /// Shutdown signal using AtomicBool (avoids nested runtime anti-pattern)
+    shutdown: Option<Arc<AtomicBool>>,
 }
 
 impl ServiceHandle {
+    /// Create a dummy handle for services that manage their own lifecycle
+    pub fn dummy() -> Self {
+        Self {
+            task: None,
+            shutdown: None,
+        }
+    }
+
     /// Stop the service gracefully
     pub async fn stop(self) {
-        let _ = self.shutdown_tx.send(()).await;
-        let _ = self.task.await;
+        // Signal shutdown via atomic flag (no async needed)
+        if let Some(shutdown) = &self.shutdown {
+            shutdown.store(true, Ordering::Relaxed);
+        }
+        // Wait for task to complete
+        if let Some(task) = self.task {
+            let _ = task.await;
+        }
     }
 
     /// Check if the service is still running
     pub fn is_running(&self) -> bool {
-        !self.task.is_finished()
+        self.task.as_ref().map(|t| !t.is_finished()).unwrap_or(true)
     }
 }
 
@@ -191,6 +205,11 @@ impl ServiceClient {
         socket
             .connect(endpoint)
             .map_err(|e| anyhow!("failed to connect to {}: {}", endpoint, e))?;
+
+        // Set LINGER to 0 for immediate close without blocking
+        socket
+            .set_linger(0)
+            .map_err(|e| anyhow!("failed to set socket linger: {}", e))?;
 
         debug!("ServiceClient connected to {}", endpoint);
 
@@ -259,6 +278,11 @@ impl AsyncServiceClient {
         Self {
             endpoint: endpoint.to_string(),
         }
+    }
+
+    /// Get the endpoint this client is connected to
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 
     /// Send a request and wait for a response asynchronously

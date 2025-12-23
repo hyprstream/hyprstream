@@ -18,7 +18,7 @@ pub mod utils;
 pub use aggregation::{AggregateFunction, AggregateResult, GroupBy, TimeWindow};
 pub use checkpoint::{
     Checkpoint, CheckpointConfig, CheckpointManager, CheckpointMetadata, RecoveryManager,
-    RecoveryStatus,
+    RecoveryStatus, RegistryClient, RegistryError,
 };
 pub use query::{
     CachedStatement, DataFusionExecutor, DataFusionPlanner, ExecutorConfig, Query,

@@ -5,9 +5,9 @@
 //! in an idiomatic Rust way.
 
 use crate::config::HyprConfig;
+use crate::services::RegistryClient;
 use crate::storage::ModelStorage;
 use anyhow::{Context as _, Result};
-use git2db::service::RegistryClient;
 use std::sync::{Arc, Mutex};
 
 /// Application context passed to all command handlers
@@ -19,11 +19,12 @@ use std::sync::{Arc, Mutex};
 /// # Example
 ///
 /// ```rust,ignore
-/// use git2db::service::LocalService;
+/// use crate::services::{RegistryService, RegistryZmqClient};
 ///
 /// // Start registry service ONCE at CLI level
-/// let client = LocalService::start(&models_dir).await?;
-/// let context = AppContext::with_client(config, Arc::new(client));
+/// let _handle = RegistryService::start(&models_dir).await?;
+/// let client: Arc<dyn RegistryClient> = Arc::new(RegistryZmqClient::new());
+/// let context = AppContext::with_client(config, client);
 ///
 /// // Pass to handlers - all share the same registry
 /// handle_server(context.clone()).await?;

@@ -4,7 +4,7 @@
 
 use super::{paths::StoragePaths, ModelId, ModelStorage};
 use anyhow::Result;
-use git2db::service::RegistryClient;
+use crate::services::RegistryClient;
 use std::path::PathBuf;
 use std::sync::Arc;
 

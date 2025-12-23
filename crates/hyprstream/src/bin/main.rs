@@ -23,8 +23,8 @@ use hyprstream_core::cli::{
 use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
 
-// Registry service
-use git2db::service::{LocalService, RegistryClient};
+// Registry service - uses ZMQ-based service from hyprstream_core
+use hyprstream_core::services::{RegistryClient, RegistryService, RegistryZmqClient, ServiceHandle};
 use std::sync::Arc;
 // Tracing imports (feature-gated)
 #[cfg(feature = "otel")]
@@ -200,7 +200,7 @@ fn init_telemetry(provider: TelemetryProvider) -> Result<()> {
     // Set log level based on provider
     let default_log_level = match provider {
         TelemetryProvider::Otlp => "hyprstream=info,opentelemetry=info",
-        TelemetryProvider::Stdout => "hyprstream=debug,opentelemetry=debug",
+        TelemetryProvider::Stdout => "hyprstream=warn",
     };
 
     let filter = EnvFilter::builder()
@@ -247,19 +247,28 @@ fn main() -> Result<()> {
         .context("Configuration validation failed")?;
 
     // Start registry service ONCE at CLI level
-    // This runtime must stay alive to keep LocalService running
+    // This runtime must stay alive to keep ZMQ services running
     let _registry_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("Failed to create registry runtime")?;
 
-    let registry_client: Arc<dyn RegistryClient> = _registry_runtime
+    // Start ZMQ-based registry service and create client
+    // Return both client AND service handle so we can stop it on exit
+    let (registry_client, _service_handle): (Arc<dyn RegistryClient>, ServiceHandle) = _registry_runtime
         .block_on(async {
             let models_dir = config.models_dir();
-            LocalService::start(models_dir).await
+            // Start the registry service (runs on a blocking thread)
+            let service_handle = RegistryService::start(&models_dir)
+                .await
+                .context("Failed to start registry service")?;
+            // Give the service a moment to bind
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            // Create client to communicate with the service
+            let client = Arc::new(RegistryZmqClient::new()) as Arc<dyn RegistryClient>;
+            Ok::<_, anyhow::Error>((client, service_handle))
         })
-        .map(|client| Arc::new(client) as Arc<dyn RegistryClient>)
-        .context("Failed to start registry service")?;
+        .context("Failed to initialize registry")?;
 
     // Create application context with shared registry client
     let ctx = AppContext::with_client(config, registry_client.clone());
@@ -288,7 +297,7 @@ fn main() -> Result<()> {
             // Fallback to simple logging without OpenTelemetry
             let default_log_level = match telemetry_provider {
                 TelemetryProvider::Otlp => "hyprstream=info",
-                TelemetryProvider::Stdout => "hyprstream=debug",
+                TelemetryProvider::Stdout => "hyprstream=warn",
             };
 
             // Check if file logging is enabled via environment variable
@@ -333,7 +342,7 @@ fn main() -> Result<()> {
         // Simple logging without OpenTelemetry support
         let default_log_level = match &cli.command {
             Commands::Server(_) => "hyprstream=info",
-            _ => "hyprstream=debug",
+            _ => "hyprstream=warn",
         };
 
         // Check if file logging is enabled via environment variable
@@ -950,6 +959,11 @@ fn main() -> Result<()> {
         }
 
     };
+
+    // Gracefully stop registry service before exiting
+    _registry_runtime.block_on(async {
+        _service_handle.stop().await;
+    });
 
     Ok(())
 }

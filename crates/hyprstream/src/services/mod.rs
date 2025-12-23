@@ -9,6 +9,7 @@
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │  hyprstream/src/services/                                   │
 //! │  ├── core.rs      ← ZmqService trait, runners, clients     │
+//! │  ├── traits.rs    ← RegistryClient, RepositoryClient traits│
 //! │  ├── registry.rs  ← Registry service (REP) + client (REQ)  │
 //! │  └── inference.rs ← Inference service (REP) + client (REQ) │
 //! └─────────────────────────────────────────────────────────────┘
@@ -46,11 +47,19 @@
 //! ```
 
 mod core;
+mod traits;
+pub mod inference;
+pub mod registry;
 
 pub use core::{
     AsyncServiceClient, ServiceClient, ServiceHandle, ServiceRunner, ZmqService,
 };
 
-// Future: Registry and Inference services will be added here
-// pub mod registry;
-// pub mod inference;
+pub use traits::{
+    RegistryClient, RegistryServiceError, RemoteInfo, RepositoryClient, WorktreeInfo,
+};
+
+pub use inference::{
+    InferenceService, InferenceZmqClient, INFERENCE_ENDPOINT, INFERENCE_STREAM_ENDPOINT,
+};
+pub use registry::{RegistryService, RegistryZmqClient, RepositoryZmqClient, REGISTRY_ENDPOINT};

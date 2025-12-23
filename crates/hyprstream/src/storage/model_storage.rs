@@ -1,11 +1,11 @@
-//! Model storage using git2db registry service
+//! Model storage using ZMQ-based registry service
 //!
 //! This module provides model storage using a shared registry service.
 //! Registry operations (list, clone, register) go through the service,
 //! while repository operations (worktrees, branches) use local git access.
 
 use anyhow::Result;
-use git2db::service::{RegistryClient, RepositoryClient};
+use crate::services::{RegistryClient, RepositoryClient};
 use git2db::{GitManager, GitRef, RepoId, TrackedRepository};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -80,7 +80,7 @@ impl ModelStorage {
         Self::create_with_config(base_dir, git2db::Git2DBConfig::default()).await
     }
 
-    /// Create ModelStorage with configuration, starting a local registry service.
+    /// Create ModelStorage with configuration, starting a ZMQ registry service.
     ///
     /// This is a convenience method for CLI and standalone usage where there's
     /// no shared registry service. For server usage, prefer passing a shared
@@ -89,15 +89,21 @@ impl ModelStorage {
         base_dir: PathBuf,
         _config: git2db::Git2DBConfig,
     ) -> Result<Self> {
-        use git2db::service::LocalService;
+        use crate::services::{RegistryService, RegistryZmqClient};
 
-        // Start local registry service
-        let client = LocalService::start(&base_dir)
+        // Start ZMQ-based registry service
+        let _service_handle = RegistryService::start(&base_dir)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to start registry service: {}", e))?;
 
+        // Give the service a moment to bind
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Create ZMQ client
+        let client: Arc<dyn RegistryClient> = Arc::new(RegistryZmqClient::new());
+
         Ok(Self {
-            client: Arc::new(client),
+            client,
             base_dir,
         })
     }

@@ -7,6 +7,25 @@
 //! - Memory-mapped disk persistence
 //! - FlightSQL interface for embeddings and similarity search
 
+// Cap'n Proto generated modules (must be at crate root for path resolution)
+#[allow(dead_code)]
+#[allow(unused_imports)]
+pub mod events_capnp {
+    include!(concat!(env!("OUT_DIR"), "/events_capnp.rs"));
+}
+
+#[allow(dead_code)]
+#[allow(unused_imports)]
+pub mod inference_capnp {
+    include!(concat!(env!("OUT_DIR"), "/inference_capnp.rs"));
+}
+
+#[allow(dead_code)]
+#[allow(unused_imports)]
+pub mod registry_capnp {
+    include!(concat!(env!("OUT_DIR"), "/registry_capnp.rs"));
+}
+
 pub mod adapters;
 pub mod api;
 pub mod archetypes;
@@ -20,6 +39,7 @@ pub mod git;
 pub mod inference;
 pub mod lora;
 pub mod runtime;
+pub mod schema;
 pub mod server;
 pub mod services;
 pub mod storage;

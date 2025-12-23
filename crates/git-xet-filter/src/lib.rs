@@ -36,6 +36,9 @@ pub mod runtime;
 #[cfg(feature = "xet-storage")]
 pub mod callbacks;
 
+#[cfg(feature = "ssh-transport")]
+pub mod ssh_client;
+
 #[cfg(feature = "xet-storage")]
 use tokio::sync::OnceCell;
 

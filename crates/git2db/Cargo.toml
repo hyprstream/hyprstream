@@ -78,7 +78,7 @@ quickcheck.workspace = true
 quickcheck_macros.workspace = true
 
 [features]
-default = ["reflink"]
+default = ["reflink", "xet-storage"]
 # Enable experimental features
 experimental = []
 # Enable detailed tracing

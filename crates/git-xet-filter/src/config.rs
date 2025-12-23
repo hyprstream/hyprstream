@@ -180,6 +180,48 @@ impl XetConfig {
         // No XET endpoint configured for this URL
         None
     }
+
+    /// Check if the endpoint uses SSH transport
+    pub fn is_ssh_transport(&self) -> bool {
+        self.endpoint.starts_with("ssh://")
+    }
+
+    /// Check if the endpoint uses HTTPS transport
+    pub fn is_https_transport(&self) -> bool {
+        self.endpoint.starts_with("https://") || self.endpoint.starts_with("http://")
+    }
+
+    /// Create the appropriate storage backend based on the endpoint URL.
+    ///
+    /// - `ssh://` endpoints use [`SshStorage`] (requires `ssh-transport` feature)
+    /// - `https://` endpoints use [`XetStorage`]
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let config = XetConfig::new("ssh://user@host/path/to/cas");
+    /// let storage = config.create_storage().await?;
+    /// ```
+    #[cfg(feature = "xet-storage")]
+    pub async fn create_storage(&self) -> crate::error::Result<Box<dyn crate::storage::StorageBackend>> {
+        #[cfg(feature = "ssh-transport")]
+        if self.is_ssh_transport() {
+            let storage = crate::ssh_client::SshStorage::connect(&self.endpoint).await?;
+            return Ok(Box::new(storage));
+        }
+
+        #[cfg(not(feature = "ssh-transport"))]
+        if self.is_ssh_transport() {
+            return Err(crate::error::XetError::new(
+                crate::error::XetErrorKind::InvalidConfig,
+                "SSH transport requires the 'ssh-transport' feature",
+            ));
+        }
+
+        // Default to HTTPS transport
+        let storage = crate::storage::XetStorage::new(self).await?;
+        Ok(Box::new(storage))
+    }
 }
 
 // NOTE: Tests that modify environment variables must run serially to avoid race conditions.

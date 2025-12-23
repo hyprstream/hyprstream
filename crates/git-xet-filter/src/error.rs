@@ -33,6 +33,8 @@ pub enum XetErrorKind {
     IoError,
     /// Runtime or initialization error
     RuntimeError,
+    /// Invalid configuration
+    InvalidConfig,
 }
 
 impl fmt::Display for XetErrorKind {
@@ -44,6 +46,7 @@ impl fmt::Display for XetErrorKind {
             Self::InvalidPointer => write!(f, "InvalidPointer"),
             Self::IoError => write!(f, "IoError"),
             Self::RuntimeError => write!(f, "RuntimeError"),
+            Self::InvalidConfig => write!(f, "InvalidConfig"),
         }
     }
 }

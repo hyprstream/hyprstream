@@ -6,11 +6,9 @@
 //! Note: All sink loops run on blocking threads because ZMQ sockets are not
 //! thread-safe. The subscriber is created on the same thread that will use it.
 
-mod mcp;
 mod nats;
 mod webhook;
 
-pub use mcp::mcp_loop;
 pub use nats::nats_loop;
 pub use webhook::webhook_loop;
 

@@ -39,12 +39,21 @@ cas_object = { workspace = true, optional = true }
 merklehash = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 
+# SSH transport support (optional)
+russh = { version = "0.48", optional = true }
+russh-keys = { version = "0.48", optional = true }
+cas-serve = { path = "../cas-serve", optional = true }
+base64 = { version = "0.22", optional = true }
+dirs = { version = "5.0", optional = true }
+
 [dev-dependencies]
 tokio-test.workspace = true
 tracing-subscriber.workspace = true
 tempfile.workspace = true
 
 [features]
-default = []
+default = ["xet-storage"]
 # Enable XET large file storage support
 xet-storage = ["data", "cas_client", "cas_object", "merklehash", "async-trait"]
+# Enable SSH transport for self-hosted CAS servers
+ssh-transport = ["xet-storage", "russh", "russh-keys", "cas-serve", "base64", "dirs"]

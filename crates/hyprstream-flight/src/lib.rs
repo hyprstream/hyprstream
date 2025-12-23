@@ -23,7 +23,7 @@ pub mod service;
 pub use client::FlightClient;
 pub use service::FlightSqlServer;
 
-use git2db::service::RegistryClient;
+use hyprstream_metrics::RegistryClient;
 use hyprstream_metrics::storage::{duckdb::DuckDbBackend, StorageBackendType};
 use std::collections::HashMap;
 use std::net::SocketAddr;

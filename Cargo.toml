@@ -6,6 +6,7 @@ members = [
     "crates/gittorrent",
     "crates/hyprstream-metrics",
     "crates/hyprstream-flight",
+    "crates/cas-serve",
 ]
 # bitsandbytes-sys is standalone - only built when bnb feature is enabled
 exclude = ["crates/bitsandbytes-sys"]

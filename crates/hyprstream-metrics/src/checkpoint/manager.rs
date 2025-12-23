@@ -3,9 +3,34 @@
 use crate::checkpoint::state::{Checkpoint, CheckpointMetadata, TableCheckpoint};
 use crate::storage::duckdb::DuckDbBackend;
 use crate::storage::StorageBackend;
+use async_trait::async_trait;
 use chrono::Utc;
-use git2db::service::RegistryClient;
-use git2db::{GitManager, RepoId};
+use git2db::{GitManager, RepoId, TrackedRepository};
+
+/// Minimal registry client trait for checkpoint integration.
+///
+/// This is a subset of the full `RegistryClient` trait from hyprstream_core,
+/// containing only the methods needed for checkpoint management.
+#[async_trait]
+pub trait RegistryClient: Send + Sync {
+    /// Get repository by name
+    async fn get_by_name(&self, name: &str) -> Result<Option<TrackedRepository>, RegistryError>;
+
+    /// Register an existing repository
+    async fn register(
+        &self,
+        id: &RepoId,
+        name: Option<&str>,
+        path: &std::path::Path,
+    ) -> Result<(), RegistryError>;
+}
+
+/// Error type for registry operations in checkpoint context
+#[derive(Debug, thiserror::Error)]
+pub enum RegistryError {
+    #[error("Registry operation failed: {0}")]
+    Operation(String),
+}
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;

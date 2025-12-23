@@ -56,6 +56,7 @@ serde_yaml.workspace = true
 git2.workspace = true  # Still needed by git2db internally
 git2db = { path = "../git2db", features = ["overlayfs"] }  # High-level git library with overlayfs
 hyprstream-flight = { path = "../hyprstream-flight" }  # Flight SQL server and client
+hyprstream-metrics = { path = "../hyprstream-metrics" }  # Metrics storage (for RegistryClient trait)
 gittorrent = { workspace = true, optional = true }  # P2P transport
 clap.workspace = true
 tracing.workspace = true
@@ -146,10 +147,10 @@ half.workspace = true
 shellexpand.workspace = true
 
 [features]
-default = ["gittorrent"]
+default = ["gittorrent", "xet"]
 cuda = []
 bnb = ["dep:bitsandbytes-sys"]  # Enable bitsandbytes KV cache quantization (requires compatible ROCm/CUDA)
-xet = ["git2db/xet-storage"]  # Enable XET large file storage (EXPERIMENTAL - has known bugs, disabled by default)
+xet = ["git2db/xet-storage"]  # Enable XET large file storage
 otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:opentelemetry-semantic-conventions", "dep:opentelemetry-stdout"]
 gittorrent = ["dep:gittorrent", "git2db/gittorrent-transport"]  # Enable P2P model sharing via gittorrent transport
 download-libtorch = ["tch/download-libtorch"]

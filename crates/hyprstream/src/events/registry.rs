@@ -129,20 +129,6 @@ impl SinkRegistry {
                     }
                 })
             }
-            SinkType::Mcp { tool, endpoint: mcp_endpoint } => {
-                let tool = tool.clone();
-                let mcp_endpoint = mcp_endpoint.clone();
-                tokio::task::spawn_blocking(move || {
-                    match sinks::create_subscriber(&context, &topic_filter, &endpoint) {
-                        Ok(subscriber) => {
-                            sinks::mcp_loop(subscriber, &tool, &mcp_endpoint);
-                        }
-                        Err(e) => {
-                            error!("failed to create subscriber: {}", e);
-                        }
-                    }
-                })
-            }
             SinkType::Container { image, runtime } => {
                 let image = image.clone();
                 let runtime = runtime.clone();
