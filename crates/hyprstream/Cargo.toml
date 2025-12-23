@@ -119,7 +119,10 @@ chunk_cache.workspace = true
 merklehash.workspace = true
 
 uuid.workspace = true
-zeromq.workspace = true  # Event bus for pub/sub messaging
+tmq.workspace = true  # Tokio ZeroMQ bindings for event bus
+zmq.workspace = true  # Underlying libzmq bindings
+capnp.workspace = true  # Cap'n Proto runtime
+capnp-futures.workspace = true  # Cap'n Proto async support
 glob.workspace = true
 walkdir.workspace = true
 reqwest.workspace = true
@@ -157,6 +160,7 @@ cc.workspace = true
 bindgen.workspace = true
 cxx-build.workspace = true
 pkg-config.workspace = true
+capnpc.workspace = true  # Cap'n Proto schema compiler
 
 [dev-dependencies]
 criterion.workspace = true

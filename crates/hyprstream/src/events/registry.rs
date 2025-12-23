@@ -2,8 +2,11 @@
 //!
 //! The SinkRegistry manages event sinks that receive events from the EventBus.
 //! Sinks are spawned as background tasks and can be registered/unregistered at runtime.
+//!
+//! Note: Sinks run on blocking threads because ZMQ sockets are not thread-safe.
+//! The subscriber is created on the same thread that will use it.
 
-use super::bus::{EventBus, EventSubscriber};
+use super::bus::{EventBus, EventSubscriber, INPROC_ENDPOINT};
 use super::config::{SinkConfig, SinkType};
 use super::sinks;
 use super::EventEnvelope;
@@ -73,26 +76,40 @@ impl SinkRegistry {
             }
         }
 
-        // Create subscriber
-        let subscriber = self
-            .event_bus
-            .subscriber(&config.subscribe)
-            .await
-            .map_err(|e| anyhow!("failed to create subscriber for '{}': {}", name, e))?;
+        // Get context for creating subscriber on blocking thread
+        let context = self.event_bus.context().clone();
+        let topic_filter = config.subscribe.clone();
+        let endpoint = INPROC_ENDPOINT.to_string();
 
-        // Spawn sink task
+        // Spawn sink task on blocking thread
+        // The subscriber is created ON the blocking thread to ensure thread locality
         let task = match &config.sink_type {
             SinkType::InProcess { handler } => {
                 let handler = handler.clone();
-                tokio::spawn(async move {
-                    sinks::in_process_loop(subscriber, &handler).await;
+                tokio::task::spawn_blocking(move || {
+                    // Create subscriber on this thread
+                    match sinks::create_subscriber(&context, &topic_filter, &endpoint) {
+                        Ok(subscriber) => {
+                            sinks::in_process_loop(subscriber, &handler);
+                        }
+                        Err(e) => {
+                            error!("failed to create subscriber: {}", e);
+                        }
+                    }
                 })
             }
             SinkType::Webhook { url, headers } => {
                 let url = url.clone();
                 let headers = headers.clone();
-                tokio::spawn(async move {
-                    sinks::webhook_loop(subscriber, &url, headers).await;
+                tokio::task::spawn_blocking(move || {
+                    match sinks::create_subscriber(&context, &topic_filter, &endpoint) {
+                        Ok(subscriber) => {
+                            sinks::webhook_loop(subscriber, &url, headers);
+                        }
+                        Err(e) => {
+                            error!("failed to create subscriber: {}", e);
+                        }
+                    }
                 })
             }
             SinkType::Nats {
@@ -101,22 +118,43 @@ impl SinkRegistry {
             } => {
                 let url = url.clone();
                 let subject_prefix = subject_prefix.clone();
-                tokio::spawn(async move {
-                    sinks::nats_loop(subscriber, &url, &subject_prefix).await;
+                tokio::task::spawn_blocking(move || {
+                    match sinks::create_subscriber(&context, &topic_filter, &endpoint) {
+                        Ok(subscriber) => {
+                            sinks::nats_loop(subscriber, &url, &subject_prefix);
+                        }
+                        Err(e) => {
+                            error!("failed to create subscriber: {}", e);
+                        }
+                    }
                 })
             }
-            SinkType::Mcp { tool, endpoint } => {
+            SinkType::Mcp { tool, endpoint: mcp_endpoint } => {
                 let tool = tool.clone();
-                let endpoint = endpoint.clone();
-                tokio::spawn(async move {
-                    sinks::mcp_loop(subscriber, &tool, &endpoint).await;
+                let mcp_endpoint = mcp_endpoint.clone();
+                tokio::task::spawn_blocking(move || {
+                    match sinks::create_subscriber(&context, &topic_filter, &endpoint) {
+                        Ok(subscriber) => {
+                            sinks::mcp_loop(subscriber, &tool, &mcp_endpoint);
+                        }
+                        Err(e) => {
+                            error!("failed to create subscriber: {}", e);
+                        }
+                    }
                 })
             }
             SinkType::Container { image, runtime } => {
                 let image = image.clone();
                 let runtime = runtime.clone();
-                tokio::spawn(async move {
-                    sinks::container_loop(subscriber, &image, runtime.as_deref()).await;
+                tokio::task::spawn_blocking(move || {
+                    match sinks::create_subscriber(&context, &topic_filter, &endpoint) {
+                        Ok(subscriber) => {
+                            sinks::container_loop(subscriber, &image, runtime.as_deref());
+                        }
+                        Err(e) => {
+                            error!("failed to create subscriber: {}", e);
+                        }
+                    }
                 })
             }
         };
@@ -138,15 +176,17 @@ impl SinkRegistry {
     ///
     /// This is useful for in-process sinks that need direct access to
     /// application state.
-    pub async fn register_handler<F, Fut>(
+    ///
+    /// Note: The handler runs on a blocking thread. For async work,
+    /// spawn tasks using `tokio::runtime::Handle::try_current()`.
+    pub async fn register_handler<F>(
         &self,
         name: &str,
         topic_filter: &str,
         handler: F,
     ) -> Result<()>
     where
-        F: Fn(EventEnvelope) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = ()> + Send,
+        F: Fn(EventEnvelope) + Send + 'static,
     {
         // Check if already registered
         {
@@ -156,27 +196,29 @@ impl SinkRegistry {
             }
         }
 
-        // Create subscriber
-        let mut subscriber = self
-            .event_bus
-            .subscriber(topic_filter)
-            .await
-            .map_err(|e| anyhow!("failed to create subscriber for '{}': {}", name, e))?;
-
+        let context = self.event_bus.context().clone();
+        let topic_filter_owned = topic_filter.to_string();
+        let endpoint = INPROC_ENDPOINT.to_string();
         let name_clone = name.to_string();
 
-        // Spawn handler task
-        let task = tokio::spawn(async move {
-            loop {
-                match subscriber.recv().await {
-                    Ok(event) => {
-                        handler(event).await;
+        // Spawn handler task on blocking thread
+        let task = tokio::task::spawn_blocking(move || {
+            match sinks::create_subscriber(&context, &topic_filter_owned, &endpoint) {
+                Ok(subscriber) => {
+                    loop {
+                        match subscriber.recv() {
+                            Ok(event) => {
+                                handler(event);
+                            }
+                            Err(e) => {
+                                warn!("sink '{}' recv error: {}", name_clone, e);
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            }
+                        }
                     }
-                    Err(e) => {
-                        warn!("sink '{}' recv error: {}", name_clone, e);
-                        // Brief backoff on error
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    }
+                }
+                Err(e) => {
+                    error!("failed to create subscriber for '{}': {}", name_clone, e);
                 }
             }
         });
@@ -338,10 +380,7 @@ mod tests {
 
         registry
             .register_handler("test-handler", "test", move |_event| {
-                let counter = counter_clone.clone();
-                async move {
-                    counter.fetch_add(1, Ordering::SeqCst);
-                }
+                counter_clone.fetch_add(1, Ordering::SeqCst);
             })
             .await
             .unwrap();

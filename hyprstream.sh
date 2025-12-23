@@ -1,6 +1,8 @@
 #!/bin/bash
 # hyprstream.sh - Launch script with sensible defaults and ENV overrides
 
+#export RUST_LOG=warn
+
 # Server configuration (all overridable via ENV)
 export HYPRSTREAM_SERVER_HOST=${HYPRSTREAM_SERVER_HOST:-0.0.0.0}
 export HYPRSTREAM_CORS_ENABLED=${HYPRSTREAM_CORS_ENABLED:-true}

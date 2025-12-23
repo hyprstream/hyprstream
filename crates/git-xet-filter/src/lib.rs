@@ -42,13 +42,17 @@ use tokio::sync::OnceCell;
 #[cfg(feature = "xet-storage")]
 use std::sync::Arc;
 
-pub use config::XetConfig;
+pub use config::{XetConfig, HUGGINGFACE_XET_ENDPOINT};
 pub use error::{Result, XetError, XetErrorKind};
 
 /// Global filter instance (initialized once)
 #[cfg(feature = "xet-storage")]
 static FILTER_INSTANCE: OnceCell<Arc<filter::XetFilter<filter::Registered>>> =
     OnceCell::const_new();
+
+/// Config used during initialization (stored for later retrieval)
+#[cfg(feature = "xet-storage")]
+static FILTER_CONFIG: OnceCell<XetConfig> = OnceCell::const_new();
 
 /// Initialize XET filter support
 ///
@@ -63,6 +67,20 @@ static FILTER_INSTANCE: OnceCell<Arc<filter::XetFilter<filter::Registered>>> =
 /// - Called with different config after already initialized
 #[cfg(feature = "xet-storage")]
 pub async fn initialize(config: XetConfig) -> Result<()> {
+    // Check if already initialized with different config
+    if let Some(existing) = FILTER_CONFIG.get() {
+        if existing.endpoint != config.endpoint {
+            tracing::warn!(
+                "XET already initialized with endpoint '{}', ignoring new endpoint '{}'",
+                existing.endpoint,
+                config.endpoint
+            );
+        }
+    } else {
+        // Store config for later retrieval (first call wins)
+        let _ = FILTER_CONFIG.set(config.clone());
+    }
+
     FILTER_INSTANCE
         .get_or_try_init(|| async {
             tracing::info!("Initializing XET filter...");
@@ -79,6 +97,14 @@ pub async fn initialize(config: XetConfig) -> Result<()> {
         .await?;
 
     Ok(())
+}
+
+/// Get the XET config used during initialization
+///
+/// Returns `None` if the filter hasn't been initialized yet.
+#[cfg(feature = "xet-storage")]
+pub fn get_config() -> Option<XetConfig> {
+    FILTER_CONFIG.get().cloned()
 }
 
 /// Check if XET filter is initialized
@@ -103,8 +129,8 @@ pub fn is_initialized() -> bool {
 ///     // Git operation failed - check if XET filter has details
 ///     if let Some(xet_error) = xet_filter::last_error() {
 ///         eprintln!("XET filter error: {:?}", xet_error);
-///         eprintln!("Error kind: {:?}", xet_error.kind);
-///         eprintln!("Message: {}", xet_error.message);
+///         eprintln!("Error kind: {:?}", xet_error.kind());
+///         eprintln!("Message: {}", xet_error.message());
 ///     }
 /// }
 /// ```

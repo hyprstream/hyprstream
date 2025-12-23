@@ -27,14 +27,26 @@ pub struct OpaqueGitWriteStream {
 }
 
 // Filter mode constants
+/// Filter mode for cleaning (workdir → ODB)
 pub const GIT_FILTER_CLEAN: c_int = 0;
+/// Filter mode for smudging (ODB → workdir)
 pub const GIT_FILTER_SMUDGE: c_int = 1;
 
+// Filter source flags
+/// Flag indicating operation is towards worktree (checkout operation)
+pub const GIT_FILTER_TO_WORKTREE: u32 = 1 << 0;
+
 // Filter return codes
-pub const GIT_PASSTHROUGH: c_int = -30; // Filter doesn't want to process this file
+/// Filter passthrough - filter declines to process this file
+pub const GIT_PASSTHROUGH: c_int = -30;
 
 // Filter version
+/// Current filter structure version for ABI compatibility
 pub const GIT_FILTER_VERSION: c_uint = 1;
+
+// libgit2 configuration
+/// Memory window size for large file operations (8 MB)
+pub const LIBGIT2_MWINDOW_SIZE: usize = 8 * 1024 * 1024;
 
 // Callback function types
 pub type FilterInitializeFn = extern "C" fn(*mut OpaqueGitFilter) -> c_int;

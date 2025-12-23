@@ -1157,6 +1157,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "capnp"
+version = "0.20.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "053b81915c2ce1629b8fb964f578b18cb39b23ef9d5b24120d0dfc959569a1d9"
+dependencies = [
+ "embedded-io",
+]
+
+[[package]]
+name = "capnp-futures"
+version = "0.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b70b0d44372d42654e3efac38c1643c7b0f9d3a9e9b72b635f942ff3f17e891"
+dependencies = [
+ "capnp",
+ "futures-channel",
+ "futures-util",
+]
+
+[[package]]
+name = "capnpc"
+version = "0.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aa3d5f01e69ed11656d2c7c47bf34327ea9bfb5c85c7de787fcd7b6c5e45b61"
+dependencies = [
+ "capnp",
+]
+
+[[package]]
 name = "caps"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1302,6 +1331,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6fac387a98bb7c37292057cffc56d62ecb629900026402633ae9160df93a8766"
 dependencies = [
  "nom",
+]
+
+[[package]]
+name = "cfg-expr"
+version = "0.15.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d067ad48b8650848b989a59a86c6c36a995d02d2bf778d45c3c5d57bc2718f02"
+dependencies = [
+ "smallvec",
+ "target-lexicon",
 ]
 
 [[package]]
@@ -1778,6 +1817,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
 
 [[package]]
+name = "crossbeam"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1137cd7e7fc0fb5d3c5a8678be38ec56e819125d8d7907411fe24ccb943faca8"
+dependencies = [
+ "crossbeam-channel",
+ "crossbeam-deque",
+ "crossbeam-epoch",
+ "crossbeam-queue",
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-channel"
 version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2061,19 +2113,6 @@ dependencies = [
 
 [[package]]
 name = "dashmap"
-version = "5.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "978747c1d849a7d2ee5e8adc0159961c48fb7e5db2f06af6723b80123bb53856"
-dependencies = [
- "cfg-if 1.0.3",
- "hashbrown 0.14.5",
- "lock_api",
- "once_cell",
- "parking_lot_core 0.9.11",
-]
-
-[[package]]
-name = "dashmap"
 version = "6.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5041cc499144891f3790297212f32a74fb938e5136a14943f338ef9e0ae276cf"
@@ -2215,7 +2254,7 @@ checksum = "187622262ad8f7d16d3be9202b4c1e0116f1c9aa387e5074245538b755261621"
 dependencies = [
  "arrow",
  "async-trait",
- "dashmap 6.1.0",
+ "dashmap",
  "datafusion-common",
  "datafusion-common-runtime",
  "datafusion-datasource",
@@ -2426,7 +2465,7 @@ checksum = "a4cec0a57653bec7b933fb248d3ffa3fa3ab3bd33bd140dc917f714ac036f531"
 dependencies = [
  "arrow",
  "async-trait",
- "dashmap 6.1.0",
+ "dashmap",
  "datafusion-common",
  "datafusion-expr",
  "futures",
@@ -2762,7 +2801,7 @@ checksum = "21ef8e2745583619bd7a49474e8f45fbe98ebb31a133f27802217125a7b3d58d"
 dependencies = [
  "arrow",
  "async-trait",
- "dashmap 6.1.0",
+ "dashmap",
  "datafusion-common",
  "datafusion-common-runtime",
  "datafusion-execution",
@@ -2911,6 +2950,17 @@ dependencies = [
  "block-buffer",
  "crypto-common",
  "subtle",
+]
+
+[[package]]
+name = "dircpy"
+version = "0.3.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a88521b0517f5f9d51d11925d8ab4523497dcf947073fa3231a311b63941131c"
+dependencies = [
+ "jwalk",
+ "log",
+ "walkdir",
 ]
 
 [[package]]
@@ -3081,6 +3131,12 @@ name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
+
+[[package]]
+name = "embedded-io"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
 name = "encode_unicode"
@@ -3535,7 +3591,7 @@ dependencies = [
  "async-trait",
  "cas_client",
  "cas_object",
- "dashmap 6.1.0",
+ "dashmap",
  "data",
  "git2",
  "libc",
@@ -3579,7 +3635,7 @@ dependencies = [
  "cas_object",
  "chrono",
  "config 0.13.4",
- "dashmap 6.1.0",
+ "dashmap",
  "data",
  "git-xet-filter",
  "git2",
@@ -3598,6 +3654,7 @@ dependencies = [
  "safe-path",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -4113,6 +4170,9 @@ dependencies = [
  "bitsandbytes-sys",
  "blake3",
  "bytes",
+ "capnp",
+ "capnp-futures",
+ "capnpc",
  "cas_client",
  "cas_object",
  "cas_types",
@@ -4126,7 +4186,7 @@ dependencies = [
  "cxx",
  "cxx-build",
  "daemonize",
- "dashmap 6.1.0",
+ "dashmap",
  "data",
  "fastrand",
  "futures",
@@ -4179,6 +4239,7 @@ dependencies = [
  "tch",
  "tempfile",
  "thiserror 1.0.69",
+ "tmq",
  "tokenizers",
  "tokio",
  "tokio-rustls",
@@ -4198,7 +4259,7 @@ dependencies = [
  "uuid",
  "walkdir",
  "xdg",
- "zeromq",
+ "zmq",
 ]
 
 [[package]]
@@ -4692,6 +4753,16 @@ dependencies = [
  "serde",
  "serde_json",
  "simple_asn1",
+]
+
+[[package]]
+name = "jwalk"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2735847566356cd2179a2a38264839308f7079fa96e6bd5a42d740460e003c56"
+dependencies = [
+ "crossbeam",
+ "rayon",
 ]
 
 [[package]]
@@ -8844,6 +8915,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "system-deps"
+version = "6.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3e535eb8dded36d55ec13eddacd30dec501792ff23a0b1682c38601b8cf2349"
+dependencies = [
+ "cfg-expr",
+ "heck",
+ "pkg-config",
+ "toml 0.8.23",
+ "version-compare",
+]
+
+[[package]]
 name = "tagptr"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8871,6 +8955,12 @@ name = "target-features"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1bbb9f3c5c463a01705937a24fdabc5047929ac764b2d5b9cf681c1f5041ed5"
+
+[[package]]
+name = "target-lexicon"
+version = "0.12.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61c41af27dd6d1e27b1b16b489db798443478cef1f06a660c96db617ba5de3b1"
 
 [[package]]
 name = "tch"
@@ -9060,6 +9150,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
+name = "tmq"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3f41ac3a42f65436eed7e1afe80dbe8a982dcac2ea4581bf61bc2d3dcfb19a1"
+dependencies = [
+ "futures",
+ "log",
+ "thiserror 1.0.69",
+ "tokio",
+ "zmq",
+]
+
+[[package]]
 name = "tokenizers"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9185,7 +9288,6 @@ checksum = "14307c986784f72ef81c89db7d9e28d6ac26d16213b109ea501696195e6e3ce5"
 dependencies = [
  "bytes",
  "futures-core",
- "futures-io",
  "futures-sink",
  "futures-util",
  "pin-project-lite",
@@ -9775,6 +9877,12 @@ name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+
+[[package]]
+name = "version-compare"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03c2856837ef78f57382f06b2b8563a2f512f7185d732608fd9176cb3b8edf0e"
 
 [[package]]
 name = "version_check"
@@ -10776,30 +10884,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "zeromq"
-version = "0.4.1"
+name = "zeromq-src"
+version = "0.2.6+4.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a4528179201f6eecf211961a7d3276faa61554c82651ecc66387f68fc3004bd"
+checksum = "fc120b771270365d5ed0dfb4baf1005f2243ae1ae83703265cb3504070f4160b"
 dependencies = [
- "async-trait",
- "asynchronous-codec",
- "bytes",
- "crossbeam-queue",
- "dashmap 5.5.3",
- "futures-channel",
- "futures-io",
- "futures-task",
- "futures-util",
- "log",
- "num-traits",
- "once_cell",
- "parking_lot 0.12.4",
- "rand 0.8.5",
- "regex",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "uuid",
+ "cc",
+ "dircpy",
 ]
 
 [[package]]
@@ -10874,6 +10965,28 @@ name = "zlib-rs"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51f936044d677be1a1168fae1d03b583a285a5dd9d8cbf7b24c23aa1fc775235"
+
+[[package]]
+name = "zmq"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd3091dd571fb84a9b3e5e5c6a807d186c411c812c8618786c3c30e5349234e7"
+dependencies = [
+ "bitflags 1.3.2",
+ "libc",
+ "zmq-sys",
+]
+
+[[package]]
+name = "zmq-sys"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e8351dc72494b4d7f5652a681c33634063bbad58046c1689e75270908fdc864"
+dependencies = [
+ "libc",
+ "system-deps",
+ "zeromq-src",
+]
 
 [[package]]
 name = "zopfli"

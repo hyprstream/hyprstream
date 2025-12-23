@@ -71,7 +71,8 @@ impl XetFilter<Unregistered> {
 
         // Creating a CString for attributes
         // Format: "filter=xet" matches .gitattributes entries like "*.safetensors filter=xet"
-        let attributes_cstr = CString::new("filter=xet").unwrap();
+        let attributes_cstr = CString::new("filter=xet")
+            .expect("filter=xet contains no null bytes");
         let attributes_ptr = attributes_cstr.as_ptr() as *const c_char;
 
         // Create filter structure
@@ -101,7 +102,7 @@ impl XetFilter<Unregistered> {
     pub fn register(mut self, priority: i32) -> Result<XetFilter<Registered>> {
         // Ensure libgit2 is fully initialized
         // Calling any git2 function triggers initialization
-        unsafe { git2::opts::set_mwindow_size(8 * 1024 * 1024).ok() };
+        unsafe { git2::opts::set_mwindow_size(crate::ffi::LIBGIT2_MWINDOW_SIZE).ok() };
 
         let name_cstr = CString::new(self.name.as_str())
             .map_err(|_| XetError::new(XetErrorKind::RuntimeError, "Invalid filter name"))?;
@@ -124,7 +125,11 @@ impl XetFilter<Unregistered> {
             }
 
             // Restore our callbacks after git_filter_init (it may have cleared them)
-            (*filter_ptr).attributes = self.attributes_cstr.as_ref().unwrap().as_ptr();
+            (*filter_ptr).attributes = self
+                .attributes_cstr
+                .as_ref()
+                .expect("attributes_cstr set during construction")
+                .as_ptr();
             (*filter_ptr).initialize = Some(crate::callbacks::xet_filter_initialize);
             (*filter_ptr).shutdown = Some(crate::callbacks::xet_filter_shutdown);
             (*filter_ptr).check = Some(crate::callbacks::xet_filter_check);
@@ -135,7 +140,10 @@ impl XetFilter<Unregistered> {
             // Cast to OpaqueGitFilter for the registry
             crate::callbacks::register_payload(
                 filter_ptr as *const crate::ffi::OpaqueGitFilter,
-                *self.payload.take().unwrap(),
+                *self
+                    .payload
+                    .take()
+                    .expect("payload set during construction"),
             );
 
             let result = crate::ffi::git_filter_register(

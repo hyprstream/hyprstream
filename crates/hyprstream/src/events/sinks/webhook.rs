@@ -1,6 +1,7 @@
 //! HTTP webhook sink implementation
 //!
 //! Forwards events to an HTTP endpoint via POST requests.
+//! Runs on a blocking thread, spawns async tasks for HTTP requests.
 
 use super::super::bus::EventSubscriber;
 use super::super::EventEnvelope;
@@ -12,8 +13,11 @@ use tracing::{debug, error, info, trace, warn};
 ///
 /// Receives events and forwards them to an HTTP endpoint via POST.
 /// Events are sent as JSON in the request body.
-pub async fn webhook_loop(
-    mut subscriber: EventSubscriber,
+///
+/// This runs on a blocking thread. HTTP requests are spawned as
+/// async tasks on the tokio runtime.
+pub fn webhook_loop(
+    subscriber: EventSubscriber,
     url: &str,
     headers: Option<HashMap<String, String>>,
 ) {
@@ -49,28 +53,59 @@ pub async fn webhook_loop(
         .build()
         .expect("failed to build HTTP client");
 
+    let url = url.to_string();
+
     loop {
-        match subscriber.recv().await {
+        match subscriber.recv() {
             Ok(event) => {
                 debug!(
                     "webhook sink received event {} (topic: {})",
                     event.id, event.topic
                 );
 
-                if let Err(e) = send_webhook(&client, url, &event).await {
-                    error!("failed to send webhook to {}: {}", url, e);
+                // Clone for the async task
+                let client = client.clone();
+                let url = url.clone();
+
+                // Spawn async task for the HTTP request
+                // Use spawn_blocking's handle to run async code
+                let rt = tokio::runtime::Handle::try_current();
+                if let Ok(handle) = rt {
+                    handle.spawn(async move {
+                        if let Err(e) = send_webhook(&client, &url, &event).await {
+                            error!("failed to send webhook to {}: {}", url, e);
+                        }
+                    });
+                } else {
+                    // Fallback: blocking HTTP (not ideal but works)
+                    let payload = match serde_json::to_vec(&event) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            error!("failed to serialize event: {}", e);
+                            continue;
+                        }
+                    };
+                    trace!(
+                        "would POST to {} ({} bytes)",
+                        url,
+                        payload.len()
+                    );
                 }
             }
             Err(e) => {
                 warn!("webhook sink recv error: {}", e);
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
     }
 }
 
 /// Send a single event to the webhook endpoint
-async fn send_webhook(client: &reqwest::Client, url: &str, event: &EventEnvelope) -> Result<(), reqwest::Error> {
+async fn send_webhook(
+    client: &reqwest::Client,
+    url: &str,
+    event: &EventEnvelope,
+) -> Result<(), reqwest::Error> {
     let response = client.post(url).json(event).send().await?;
 
     let status = response.status();

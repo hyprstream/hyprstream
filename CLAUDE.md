@@ -27,25 +27,25 @@ export LIBTORCH=/path/to/libtorch
 export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
 
 # CPU backend (default)
-cargo build
+cargo build --release
 
 # CUDA backend
-cargo build --no-default-features --features tch-cuda
+cargo build --no-default-features --features tch-cuda --release
 
 # ROCm backend (uses tch-rs fork with HIP support)
-cargo build --no-default-features --features tch-rocm
+cargo build --no-default-features --features tch-rocm --release
 
 # With OpenTelemetry support
-cargo build --features otel
+cargo build --features otel --release
 
 # With XET support (EXPERIMENTAL - disabled by default)
-cargo build --features xet
+cargo build --features xet --release
 
 # Run tests
-cargo test --workspace
+cargo test --workspace --release
 
 # Run examples (used for GPU testing)
-cargo run --example test_cuda
+cargo run --example test_cuda --release
 ```
 
 **Note**: Building requires libtorch (PyTorch C++ library). See README.md for download/installation instructions.

@@ -21,8 +21,10 @@ pub mod inference;
 pub mod lora;
 pub mod runtime;
 pub mod server;
+pub mod services;
 pub mod storage;
 pub mod training;
+pub mod zmq;
 
 // Storage exports removed
 pub use runtime::{

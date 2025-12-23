@@ -131,7 +131,12 @@ half = "2.6.0"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # Messaging
-zeromq = "0.4"  # Pure Rust ZeroMQ for event bus
+tmq = "0.5"  # Tokio ZeroMQ bindings (supports inproc://)
+zmq = "0.10"  # Underlying libzmq bindings
+
+# Cap'n Proto (zero-copy serialization)
+capnp = "0.20"
+capnp-futures = "0.20"
 
 # Utilities
 glob = "0.3"
@@ -168,3 +173,6 @@ version = "1.0"
 
 [workspace.dependencies.pkg-config]
 version = "0.3"
+
+[workspace.dependencies.capnpc]
+version = "0.20"

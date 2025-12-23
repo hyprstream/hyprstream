@@ -4,41 +4,67 @@
 
 use std::cell::RefCell;
 use std::fmt;
+use thiserror::Error;
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<XetError>> = const { RefCell::new(None) };
 }
 
-#[derive(Debug, Clone)]
+/// Error type for XET filter operations
+#[derive(Debug, Clone, Error)]
+#[error("{kind}: {message}")]
 pub struct XetError {
-    pub message: String,
-    pub kind: XetErrorKind,
+    message: String,
+    kind: XetErrorKind,
 }
 
+/// Categories of XET filter errors
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XetErrorKind {
+    /// XET storage backend not initialized
     StorageNotInitialized,
+    /// Failed to upload file to XET CAS
     UploadFailed,
+    /// Failed to download file from XET CAS
     DownloadFailed,
+    /// Invalid or malformed XET pointer
     InvalidPointer,
+    /// I/O or filesystem error
     IoError,
+    /// Runtime or initialization error
     RuntimeError,
 }
 
-impl fmt::Display for XetError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{:?}: {}", self.kind, self.message)
+impl fmt::Display for XetErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StorageNotInitialized => write!(f, "StorageNotInitialized"),
+            Self::UploadFailed => write!(f, "UploadFailed"),
+            Self::DownloadFailed => write!(f, "DownloadFailed"),
+            Self::InvalidPointer => write!(f, "InvalidPointer"),
+            Self::IoError => write!(f, "IoError"),
+            Self::RuntimeError => write!(f, "RuntimeError"),
+        }
     }
 }
 
-impl std::error::Error for XetError {}
-
 impl XetError {
+    /// Create a new XET error with the given kind and message
     pub fn new(kind: XetErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
         }
+    }
+
+    /// Get the error kind
+    pub fn kind(&self) -> XetErrorKind {
+        self.kind
+    }
+
+    /// Get the error message
+    pub fn message(&self) -> &str {
+        &self.message
     }
 
     /// Convert this error to an FFI error code

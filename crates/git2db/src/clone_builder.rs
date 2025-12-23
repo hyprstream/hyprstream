@@ -6,6 +6,56 @@ use crate::errors::{Git2DBError, Git2DBResult};
 use crate::references::GitRef;
 use crate::registry::{Git2DB, RemoteConfig, RepoId};
 
+/// Automatically initialize XET for URLs that have XET support
+///
+/// XET endpoint resolution:
+/// 1. Environment variable (XETHUB_ENDPOINT/GIT2DB_XET_ENDPOINT) - always takes priority
+/// 2. URL pattern matching for known providers (e.g., huggingface.co, hf.co)
+/// 3. None - XET disabled, will use git-lfs
+#[cfg(feature = "xet-storage")]
+async fn maybe_init_xet_for_url(url: &str) -> Git2DBResult<()> {
+    // Check if XET is already initialized
+    if crate::xet_filter::is_initialized() {
+        tracing::debug!(url = %url, "XET filter already initialized");
+        return Ok(());
+    }
+
+    // Get XET config for this URL (if any)
+    let Some(config) = crate::xet_filter::XetConfig::for_url(url) else {
+        tracing::debug!(url = %url, "No XET endpoint configured for URL");
+        return Ok(());
+    };
+
+    // Token is optional for public repos, but log a hint for private repos
+    if config.token.is_none() {
+        tracing::info!(
+            url = %url,
+            "No XET token found. Public repos will work, private repos require authentication. \
+             Set XETHUB_TOKEN or HF_TOKEN environment variable."
+        );
+    }
+
+    // Initialize XET - failures are non-fatal (fallback to Git LFS)
+    tracing::info!(url = %url, "Auto-initializing XET filter");
+
+    match crate::xet_filter::initialize(config).await {
+        Ok(()) => {
+            tracing::info!(url = %url, "XET filter initialized successfully");
+            Ok(())
+        }
+        Err(e) => {
+            // Non-fatal: fallback to Git LFS
+            tracing::warn!(url = %url, error = %e, "XET init failed, falling back to Git LFS");
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(feature = "xet-storage"))]
+async fn maybe_init_xet_for_url(_url: &str) -> Git2DBResult<()> {
+    Ok(())
+}
+
 /// Builder for cloning repositories with fluent configuration
 ///
 /// Provides a chainable interface for configuring clone operations.
@@ -129,6 +179,9 @@ impl<'a> CloneBuilder<'a> {
     ///
     /// Returns the RepoId of the newly cloned repository.
     pub async fn exec(self) -> Git2DBResult<RepoId> {
+        // Auto-initialize XET for URLs with XET support (e.g., HuggingFace)
+        maybe_init_xet_for_url(&self.url).await?;
+
         // Generate repository ID
         let repo_id = RepoId::new();
 

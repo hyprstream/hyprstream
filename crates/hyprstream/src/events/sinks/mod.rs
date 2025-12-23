@@ -2,6 +2,9 @@
 //!
 //! Each sink type has a corresponding loop function that receives events
 //! from an EventSubscriber and forwards them to the appropriate destination.
+//!
+//! Note: All sink loops run on blocking threads because ZMQ sockets are not
+//! thread-safe. The subscriber is created on the same thread that will use it.
 
 mod mcp;
 mod nats;
@@ -12,6 +15,8 @@ pub use nats::nats_loop;
 pub use webhook::webhook_loop;
 
 use super::bus::EventSubscriber;
+use super::EventEnvelope;
+use std::sync::Arc;
 use tracing::{debug, error, info, trace, warn};
 
 /// In-process handler loop
@@ -19,7 +24,9 @@ use tracing::{debug, error, info, trace, warn};
 /// For in-process handlers, we log the events. The actual handler logic
 /// is typically implemented via `SinkRegistry::register_handler()` which
 /// allows custom async closures.
-pub async fn in_process_loop(mut subscriber: EventSubscriber, handler: &str) {
+///
+/// This runs on a blocking thread.
+pub fn in_process_loop(subscriber: EventSubscriber, handler: &str) {
     info!(
         "starting in-process sink '{}' for topic '{}'",
         handler,
@@ -27,7 +34,7 @@ pub async fn in_process_loop(mut subscriber: EventSubscriber, handler: &str) {
     );
 
     loop {
-        match subscriber.recv().await {
+        match subscriber.recv() {
             Ok(event) => {
                 debug!(
                     "in-process handler '{}' received event {} (topic: {})",
@@ -39,7 +46,7 @@ pub async fn in_process_loop(mut subscriber: EventSubscriber, handler: &str) {
             }
             Err(e) => {
                 warn!("in-process handler '{}' recv error: {}", handler, e);
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
     }
@@ -49,11 +56,9 @@ pub async fn in_process_loop(mut subscriber: EventSubscriber, handler: &str) {
 ///
 /// Executes events in a container sandbox. The container receives the event
 /// as JSON on stdin and can emit response events.
-pub async fn container_loop(
-    mut subscriber: EventSubscriber,
-    image: &str,
-    runtime: Option<&str>,
-) {
+///
+/// This runs on a blocking thread.
+pub fn container_loop(subscriber: EventSubscriber, image: &str, runtime: Option<&str>) {
     let runtime = runtime.unwrap_or("podman");
     info!(
         "starting container sink '{}' (runtime: {}) for topic '{}'",
@@ -63,7 +68,7 @@ pub async fn container_loop(
     );
 
     loop {
-        match subscriber.recv().await {
+        match subscriber.recv() {
             Ok(event) => {
                 debug!(
                     "container sink '{}' received event {} (topic: {})",
@@ -90,7 +95,7 @@ pub async fn container_loop(
                 );
 
                 // Placeholder for actual implementation:
-                // let output = tokio::process::Command::new(runtime)
+                // let output = std::process::Command::new(runtime)
                 //     .args(["run", "--rm", "-i", image])
                 //     .stdin(std::process::Stdio::piped())
                 //     .stdout(std::process::Stdio::piped())
@@ -98,23 +103,50 @@ pub async fn container_loop(
             }
             Err(e) => {
                 warn!("container sink '{}' recv error: {}", image, e);
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
     }
+}
+
+/// Create a subscriber on the current thread
+///
+/// This helper creates a subscriber using the provided ZMQ context.
+/// It should be called from within a blocking thread context.
+pub fn create_subscriber(
+    context: &Arc<zmq::Context>,
+    topic_filter: &str,
+    endpoint: &str,
+) -> anyhow::Result<EventSubscriber> {
+    let socket = context
+        .socket(zmq::SUB)
+        .map_err(|e| anyhow::anyhow!("failed to create SUB socket: {}", e))?;
+
+    socket
+        .connect(endpoint)
+        .map_err(|e| anyhow::anyhow!("failed to connect to {}: {}", endpoint, e))?;
+
+    socket
+        .set_subscribe(topic_filter.as_bytes())
+        .map_err(|e| anyhow::anyhow!("failed to subscribe to '{}': {}", topic_filter, e))?;
+
+    debug!(
+        "created subscriber for '{}' connected to {}",
+        topic_filter, endpoint
+    );
+
+    Ok(EventSubscriber::from_socket(socket, topic_filter.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::events::bus::EventBus;
-    use crate::events::{EventEnvelope, EventPayload, EventSource, GenerationMetrics};
-    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_subscriber_creation() {
         let bus = Arc::new(EventBus::new().await.unwrap());
-        let subscriber = bus.subscriber("test").await.unwrap();
+        let subscriber = bus.subscriber("test").unwrap();
         assert_eq!(subscriber.topic_filter(), "test");
     }
 }

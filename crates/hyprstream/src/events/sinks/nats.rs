@@ -2,6 +2,7 @@
 //!
 //! Forwards events to a NATS server for distribution to external consumers.
 //! Events are published to subjects using the format: `{subject_prefix}.{topic}`
+//! Runs on a blocking thread.
 
 use super::super::bus::EventSubscriber;
 use super::super::EventEnvelope;
@@ -15,7 +16,9 @@ use tracing::{debug, error, info, trace, warn};
 /// For example, with subject_prefix="hyprstream.events":
 /// - `inference.generation_complete` → `hyprstream.events.inference.generation_complete`
 /// - `metrics.threshold_breach` → `hyprstream.events.metrics.threshold_breach`
-pub async fn nats_loop(mut subscriber: EventSubscriber, url: &str, subject_prefix: &str) {
+///
+/// This runs on a blocking thread.
+pub fn nats_loop(subscriber: EventSubscriber, url: &str, subject_prefix: &str) {
     info!(
         "starting NATS sink to '{}' (prefix: {}) for topic '{}'",
         url,
@@ -29,7 +32,7 @@ pub async fn nats_loop(mut subscriber: EventSubscriber, url: &str, subject_prefi
 
     // Placeholder loop that demonstrates the intended behavior
     loop {
-        match subscriber.recv().await {
+        match subscriber.recv() {
             Ok(event) => {
                 debug!(
                     "NATS sink received event {} (topic: {})",
@@ -57,7 +60,7 @@ pub async fn nats_loop(mut subscriber: EventSubscriber, url: &str, subject_prefi
             }
             Err(e) => {
                 warn!("NATS sink recv error: {}", e);
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
     }
@@ -83,16 +86,16 @@ impl NatsConnection {
         }
     }
 
-    async fn connect(&mut self) -> anyhow::Result<()> {
-        // self.client = Some(async_nats::connect(&self.url).await?);
+    fn connect(&mut self) -> anyhow::Result<()> {
+        // self.client = Some(nats::connect(&self.url)?);
         Ok(())
     }
 
-    async fn publish(&self, event: &EventEnvelope) -> anyhow::Result<()> {
+    fn publish(&self, event: &EventEnvelope) -> anyhow::Result<()> {
         let subject = format!("{}.{}", self.subject_prefix, event.topic);
         let payload = serde_json::to_vec(event)?;
 
-        // self.client.as_ref().unwrap().publish(&subject, payload.into()).await?;
+        // self.client.as_ref().unwrap().publish(&subject, &payload)?;
         trace!("published to NATS: {} ({} bytes)", subject, payload.len());
         Ok(())
     }
@@ -101,7 +104,6 @@ impl NatsConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{EventPayload, EventSource, GenerationMetrics};
 
     #[test]
     fn test_subject_formatting() {

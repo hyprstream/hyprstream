@@ -100,7 +100,6 @@ pub extern "C" fn xet_filter_check(
         // Check if this is a checkout operation (TO_WORKDIR flag)
         // SAFETY: libgit2 guarantees source is valid for this callback
         let flags = unsafe { git_filter_source_flags(source) };
-        const GIT_FILTER_TO_WORKTREE: u32 = 1 << 0;
 
         if (flags & GIT_FILTER_TO_WORKTREE) != 0 {
             tracing::warn!(
@@ -144,7 +143,11 @@ extern "C" fn xet_stream_write(
     buffer: *const c_char,
     len: size_t,
 ) -> c_int {
-    // SAFETY: stream is our XetWriteStream, buffer is valid for len bytes
+    // SAFETY: This function is a C callback invoked by libgit2.
+    // - `stream` points to our XetWriteStream (first field is GitWriteStreamBase for C compat)
+    // - `buffer` is valid for `len` bytes per libgit2's writestream contract
+    // - The XetWriteStream lifetime is managed by xet_filter_stream (alloc) and xet_stream_free (dealloc)
+    // - We check for null before dereferencing
     unsafe {
         let xet_stream = stream as *mut XetWriteStream;
         if xet_stream.is_null() {
@@ -160,7 +163,11 @@ extern "C" fn xet_stream_write(
 /// Close callback - processes buffered data and writes to next stream
 #[cfg(feature = "xet-storage")]
 extern "C" fn xet_stream_close(stream: *mut GitWriteStreamBase) -> c_int {
-    // SAFETY: stream is our XetWriteStream
+    // SAFETY: This function is a C callback invoked by libgit2.
+    // - `stream` points to our XetWriteStream allocated in xet_filter_stream
+    // - libgit2 guarantees close() is called exactly once before free()
+    // - The mutable reference is exclusive because libgit2 serializes callbacks
+    // - We check for null before dereferencing
     let result = unsafe {
         let xet_stream = stream as *mut XetWriteStream;
         if xet_stream.is_null() {
@@ -226,7 +233,7 @@ fn smudge_data(payload: &XetFilterPayload, input: &[u8], path: &str) -> Result<V
     // Download from XET CAS
     let content = payload
         .runtime
-        .block_on(payload.storage.smudge_pointer(pointer_str))
+        .block_on(payload.storage.smudge_bytes(pointer_str))
         .map_err(|e| XetError::new(XetErrorKind::RuntimeError, format!("Runtime error: {}", e)))?
         .map_err(|e| XetError::new(XetErrorKind::DownloadFailed, format!("Download failed: {}", e)))?;
 
@@ -269,11 +276,12 @@ fn write_to_next(next: *mut OpaqueGitWriteStream, data: &[u8]) -> Result<(), Xet
         return Ok(());
     }
 
-    // SAFETY: next is a valid git_writestream from libgit2
-    // The git_writestream struct has write/close/free function pointers
-    // We need to call the write function through the vtable
+    // SAFETY: `next` is a git_writestream provided by libgit2 in xet_filter_stream.
+    // - The pointer is valid for the duration of our stream operation
+    // - GitWriteStreamBase is the first field of git_writestream (C struct layout)
+    // - The write function pointer is initialized by libgit2
+    // - We check for null before this point
     unsafe {
-        // Cast to our base struct to access vtable
         let ws = next as *mut GitWriteStreamBase;
         let write_fn = (*ws).write;
         let result = write_fn(ws, data.as_ptr() as *const c_char, data.len());
@@ -291,7 +299,11 @@ fn close_next(next: *mut OpaqueGitWriteStream) -> Result<(), XetError> {
         return Ok(());
     }
 
-    // SAFETY: next is a valid git_writestream from libgit2
+    // SAFETY: `next` is a git_writestream provided by libgit2 in xet_filter_stream.
+    // - The pointer remains valid until after close() returns
+    // - GitWriteStreamBase is the first field of git_writestream (C struct layout)
+    // - The close function pointer is initialized by libgit2
+    // - We check for null before this point
     unsafe {
         let ws = next as *mut GitWriteStreamBase;
         let close_fn = (*ws).close;
@@ -310,7 +322,11 @@ extern "C" fn xet_stream_free(stream: *mut GitWriteStreamBase) {
         return;
     }
 
-    // SAFETY: stream was allocated by Box::into_raw in xet_filter_stream
+    // SAFETY: This function is a C callback invoked by libgit2.
+    // - `stream` was allocated by Box::into_raw in xet_filter_stream
+    // - libgit2 guarantees free() is called exactly once after close()
+    // - After this call, the memory is deallocated and the pointer is invalid
+    // - We check for null before dereferencing
     unsafe {
         let xet_stream = stream as *mut XetWriteStream;
         drop(Box::from_raw(xet_stream));

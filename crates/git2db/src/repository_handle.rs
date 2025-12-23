@@ -619,28 +619,15 @@ impl<'a> RepositoryHandle<'a> {
     /// ```
     ///
     /// Fetch LFS files for the worktree
+    ///
+    /// This function tries XET first if initialized (faster for XET-enabled repos),
+    /// then falls back to `git lfs pull` if XET fails or isn't available.
     pub async fn fetch_lfs_files(repo_path: &Path) -> Git2DBResult<()> {
-        use tokio::process::Command;
-
         if !repo_path.exists() {
             return Err(Git2DBError::internal(format!(
                 "Worktree path does not exist: {}",
                 repo_path.display()
             )));
-        }
-
-        let lfs_available = Command::new("git")
-            .args(["lfs", "version"])
-            .output()
-            .await
-            .map(|output| output.status.success())
-            .unwrap_or(false);
-
-        if !lfs_available {
-            tracing::warn!("git-lfs not installed or not in PATH");
-            return Err(Git2DBError::internal(
-                "git-lfs not available. Install with: sudo apt install git-lfs"
-            ));
         }
 
         let gitattributes_path = repo_path.join(".gitattributes");
@@ -659,7 +646,70 @@ impl<'a> RepositoryHandle<'a> {
             return Ok(());
         }
 
-        tracing::info!("Repository uses Git LFS, fetching LFS files (this may take a while for large files)...");
+        // Try XET first if initialized (faster for XET-enabled repos)
+        #[cfg(feature = "xet-storage")]
+        if crate::xet_filter::is_initialized() {
+            tracing::info!("XET initialized, attempting XET fetch for LFS files...");
+            match Self::try_xet_lfs_fetch(repo_path).await {
+                Ok(stats) => {
+                    if stats.processed > 0 || stats.skipped > 0 {
+                        tracing::info!(
+                            "XET fetch complete: {} processed, {} skipped, {} failed",
+                            stats.processed, stats.skipped, stats.failed
+                        );
+                        if stats.failed == 0 {
+                            return Ok(());
+                        }
+                        // Some files failed, fall through to git-lfs for remaining
+                        tracing::warn!("Some files failed via XET, falling back to git-lfs for remaining files");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("XET fetch failed: {}. Falling back to git-lfs...", e);
+                }
+            }
+        }
+
+        // Fallback to git lfs pull
+        Self::run_git_lfs_pull(repo_path).await
+    }
+
+    /// Try to fetch LFS files via XET
+    #[cfg(feature = "xet-storage")]
+    async fn try_xet_lfs_fetch(repo_path: &Path) -> Git2DBResult<crate::lfs::ProcessingStats> {
+        use crate::lfs::LfsStorage;
+
+        // Get the current XET config
+        let config = crate::xet_filter::get_config().ok_or_else(|| {
+            Git2DBError::internal("BUG: XET filter initialized but FILTER_CONFIG was not set")
+        })?;
+
+        let storage = LfsStorage::new(&config).await.map_err(|e| {
+            Git2DBError::internal(format!("Failed to create LFS storage: {}", e))
+        })?;
+
+        storage.process_worktree(repo_path).await
+    }
+
+    /// Run git lfs pull as fallback
+    async fn run_git_lfs_pull(repo_path: &Path) -> Git2DBResult<()> {
+        use tokio::process::Command;
+
+        let lfs_available = Command::new("git")
+            .args(["lfs", "version"])
+            .output()
+            .await
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+
+        if !lfs_available {
+            tracing::warn!("git-lfs not installed or not in PATH");
+            return Err(Git2DBError::internal(
+                "git-lfs not available. Install with: sudo apt install git-lfs"
+            ));
+        }
+
+        tracing::info!("Fetching LFS files via git-lfs (this may take a while for large files)...");
         println!("📥 Downloading LFS files... (this may take a while for large models)");
 
         let mut child = Command::new("git")
@@ -702,7 +752,7 @@ impl<'a> RepositoryHandle<'a> {
             return Err(Git2DBError::internal(error_msg));
         }
 
-        tracing::info!("Successfully fetched LFS files");
+        tracing::info!("Successfully fetched LFS files via git-lfs");
         Ok(())
     }
 
