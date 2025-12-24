@@ -47,11 +47,16 @@ pub fn webhook_loop(
         }
     }
 
-    let client = reqwest::Client::builder()
+    let client = match reqwest::Client::builder()
         .default_headers(header_map)
         .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("failed to build HTTP client");
+        .build() {
+            Ok(client) => client,
+            Err(e) => {
+                error!("Failed to build HTTP client for webhook sink: {}", e);
+                return;
+            }
+        };
 
     let url = url.to_string();
 

@@ -11,7 +11,7 @@ use futures::stream::StreamExt;
 use std::convert::Infallible;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace};
 
 use crate::{
     api::openai_compat::{
@@ -105,7 +105,7 @@ fn extract_cache_owner(headers: &HeaderMap) -> CacheOwner {
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
     {
-        debug!("Using session-based caching for session: {}", session_id);
+        trace!("Using session-based caching for session: {}", session_id);
         CacheOwner::Session(session_id.to_string())
     } else {
         // Stateless request - generate unique ID
@@ -113,7 +113,7 @@ fn extract_cache_owner(headers: &HeaderMap) -> CacheOwner {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        debug!("Using stateless caching for request: {}", request_id);
+        trace!("Using stateless caching for request: {}", request_id);
         CacheOwner::Stateless(request_id)
     }
 }
@@ -143,11 +143,11 @@ async fn extract_user(headers: &HeaderMap, state: &ServerState) -> ExtractUserRe
                 let token_manager = state.token_manager.read().await;
                 match token_manager.validate(token) {
                     Some(record) => {
-                        debug!("Authenticated via Bearer token as user: {}", record.user);
+                        trace!("Authenticated via Bearer token as user: {}", record.user);
                         return ExtractUserResult::Ok(record.user.clone());
                     }
                     None => {
-                        debug!("Invalid or expired Bearer token");
+                        trace!("Invalid or expired Bearer token");
                         return ExtractUserResult::InvalidToken;
                     }
                 }
@@ -159,14 +159,14 @@ async fn extract_user(headers: &HeaderMap, state: &ServerState) -> ExtractUserRe
     if let Some(user_header) = headers.get("x-user") {
         if let Ok(user) = user_header.to_str() {
             if !user.is_empty() {
-                debug!("Using X-User header identity: {}", user);
+                trace!("Using X-User header identity: {}", user);
                 return ExtractUserResult::Ok(user.to_string());
             }
         }
     }
 
     // 3. Default to anonymous
-    debug!("No authentication provided, using anonymous identity");
+    trace!("No authentication provided, using anonymous identity");
     ExtractUserResult::Ok("anonymous".to_string())
 }
 

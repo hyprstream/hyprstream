@@ -202,6 +202,36 @@ pub trait RepositoryClient: Send + Sync {
     /// List all branches.
     async fn list_branches(&self) -> Result<Vec<String>, RegistryServiceError>;
 
+    /// Remove a worktree.
+    async fn remove_worktree(&self, path: &Path) -> Result<(), RegistryServiceError>;
+
+    // === Staging/Commit Operations ===
+
+    /// Stage all changes in the repository.
+    async fn stage_all(&self) -> Result<(), RegistryServiceError>;
+
+    /// Stage specific files.
+    async fn stage_files(&self, files: &[&str]) -> Result<(), RegistryServiceError>;
+
+    /// Commit staged changes with a message.
+    ///
+    /// Returns the commit OID as a string.
+    async fn commit(&self, message: &str) -> Result<String, RegistryServiceError>;
+
+    // === Reference Operations ===
+
+    /// Get the HEAD commit OID.
+    async fn get_head(&self) -> Result<String, RegistryServiceError>;
+
+    /// Get the OID for a named reference.
+    async fn get_ref(&self, ref_name: &str) -> Result<String, RegistryServiceError>;
+
+    /// Update repository from remote (fetch).
+    ///
+    /// # Arguments
+    /// * `refspec` - Optional refspec to fetch (e.g., "refs/heads/main")
+    async fn update(&self, refspec: Option<&str>) -> Result<(), RegistryServiceError>;
+
     // === Remote Operations ===
 
     /// List all remotes.

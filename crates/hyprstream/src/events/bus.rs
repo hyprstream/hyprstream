@@ -171,10 +171,15 @@ impl EventBus {
         }
 
         // Create a runtime for receiving from the async channel
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .build()
-            .expect("Failed to create runtime for publisher task");
+            .build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    error!("Failed to create runtime for publisher task: {}", e);
+                    return;
+                }
+            };
 
         // Process messages
         rt.block_on(async {

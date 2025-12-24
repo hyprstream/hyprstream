@@ -272,7 +272,7 @@ impl LoRAModel {
             .into_iter()
             .map(|s| s.to_string())
             .collect();
-        tracing::debug!(
+        tracing::trace!(
             "Available tensors in SafeTensors file: {:?}",
             available_tensors
         );
@@ -296,7 +296,7 @@ impl LoRAModel {
             });
 
             if let Some(vs_name) = matching_vs_name {
-                tracing::debug!("Found tensor match: '{}' -> '{}'", available_name, vs_name);
+                tracing::trace!("Found tensor match: '{}' -> '{}'", available_name, vs_name);
                 match safetensors.tensor(available_name) {
                     Ok(tensor_data) => {
                         // Convert SafeTensors tensor to raw data for tch loading
@@ -340,7 +340,7 @@ impl LoRAModel {
                         };
 
                         tensors_to_load.insert(vs_name.clone(), tch_tensor);
-                        tracing::debug!(
+                        tracing::trace!(
                             "Prepared tensor '{}' -> '{}' with shape {:?}",
                             available_name,
                             vs_name,
@@ -352,7 +352,7 @@ impl LoRAModel {
                     }
                 }
             } else {
-                tracing::debug!(
+                tracing::trace!(
                     "No VarStore match found for SafeTensors tensor '{}' (expected patterns: {:?})",
                     available_name,
                     vs_tensors.keys().collect::<Vec<_>>()

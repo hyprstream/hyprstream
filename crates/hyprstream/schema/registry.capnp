@@ -43,6 +43,13 @@ struct RegistryRequest {
 
     # Health/Lifecycle
     healthCheck @19 :Void;
+
+    # Remote operations
+    listRemotes @20 :Text;  # repo_id
+    addRemote @21 :AddRemoteRequest;
+    removeRemote @22 :RemoveRemoteRequest;
+    setRemoteUrl @23 :SetRemoteUrlRequest;
+    renameRemote @24 :RenameRemoteRequest;
   }
 }
 
@@ -62,6 +69,7 @@ struct RegistryResponse {
     commitOid @8 :Text;
     refOid @9 :Text;
     health @10 :HealthStatus;
+    remotes @11 :List(RemoteInfo);
   }
 }
 
@@ -179,4 +187,35 @@ struct ErrorInfo {
   message @0 :Text;
   code @1 :Text;
   details @2 :Text;
+}
+
+# Remote Operations
+
+struct RemoteInfo {
+  name @0 :Text;
+  url @1 :Text;
+  pushUrl @2 :Text;
+}
+
+struct AddRemoteRequest {
+  repoId @0 :Text;
+  name @1 :Text;
+  url @2 :Text;
+}
+
+struct RemoveRemoteRequest {
+  repoId @0 :Text;
+  name @1 :Text;
+}
+
+struct SetRemoteUrlRequest {
+  repoId @0 :Text;
+  name @1 :Text;
+  url @2 :Text;
+}
+
+struct RenameRemoteRequest {
+  repoId @0 :Text;
+  oldName @1 :Text;
+  newName @2 :Text;
 }

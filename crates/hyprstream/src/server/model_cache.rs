@@ -353,7 +353,7 @@ impl ModelCache {
                 let to_remove = cache_worktrees.len() - keep_count;
                 for name in cache_worktrees.iter().take(to_remove) {
                     if let Ok(wt) = repo.find_worktree(name) {
-                        info!("Pruning old worktree: {}", name);
+                        debug!("Pruning old worktree: {}", name);
                         let _ =
                             wt.prune(Some(git2::WorktreePruneOptions::new().working_tree(true)));
                     }
