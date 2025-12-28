@@ -7,7 +7,7 @@
 //! - Training service at /training
 
 use anyhow::Result;
-use axum::{response::IntoResponse, routing::get, Json, Router};
+use axum::{middleware as axum_middleware, response::IntoResponse, routing::get, Json, Router};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -19,7 +19,17 @@ pub mod model_cache;
 pub mod routes;
 pub mod state;
 
+pub use middleware::AuthenticatedUser;
 use state::ServerState;
+use axum::Extension;
+
+/// Extract user identity from optional authenticated user extension.
+/// Returns "anonymous" if no authentication present.
+pub fn extract_user(auth_user: Option<&Extension<AuthenticatedUser>>) -> String {
+    auth_user
+        .map(|Extension(u)| u.user.clone())
+        .unwrap_or_else(|| "anonymous".to_string())
+}
 
 /// Create the main application router
 pub fn create_app(state: ServerState) -> Router {
@@ -27,16 +37,26 @@ pub fn create_app(state: ServerState) -> Router {
     let cors_config = state.config.cors.clone();
     let timeout_duration = Duration::from_secs(state.config.request_timeout_secs);
 
-    let mut app = Router::new()
-        // Health check endpoint
+    // Public routes (no auth required)
+    let public_routes = Router::new()
         .route("/", get(health_check))
-        .route("/health", get(health_check))
+        .route("/health", get(health_check));
+
+    // Protected routes (auth required)
+    let protected_routes = Router::new()
         // OpenAI-compatible API routes at /oai/v1
         .nest("/oai/v1", routes::openai::create_router())
         // Model management routes
         .nest("/models", routes::models::create_router())
         // Training service routes
         .nest("/training", routes::training::create_router())
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            middleware::auth_middleware,
+        ));
+
+    let mut app = public_routes
+        .merge(protected_routes)
         // Add middleware (order matters: timeout should be before state)
         .layer(TimeoutLayer::new(timeout_duration))
         .layer(TraceLayer::new_for_http())

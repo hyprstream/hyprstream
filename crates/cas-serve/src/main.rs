@@ -28,7 +28,7 @@ mod protocol;
 use protocol::{ErrorCode, Request, Response};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// Storage path resolution order:
 /// 1. CAS_STORAGE environment variable
@@ -78,8 +78,8 @@ impl CasServer {
     }
 
     async fn handle_get_file(&self, hash: &str) -> Response {
-        // Parse the merkle hash
-        let merkle_hash = match Request::parse_hash(hash) {
+        // Parse the merkle hash (validates format)
+        let _merkle_hash = match Request::parse_hash(hash) {
             Ok(h) => h,
             Err(e) => return Response::error(ErrorCode::InvalidHash, e),
         };

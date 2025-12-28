@@ -8,23 +8,26 @@ use clap::Parser;
 use tracing::info;
 
 // Core application imports
+use hyprstream_core::auth::PolicyManager;
 use hyprstream_core::cli::commands::Commands;
 use hyprstream_core::cli::handlers::handle_server;
 use hyprstream_core::cli::{
     handle_branch, handle_checkout, handle_clone, handle_commit, handle_infer, handle_info,
-    handle_list, handle_lora_train, handle_merge, handle_policy_apply, handle_policy_check,
-    handle_policy_diff, handle_policy_edit, handle_policy_history, handle_policy_rollback,
-    handle_policy_show, handle_pull, handle_push, handle_remote_add, handle_remote_list,
-    handle_remote_remove, handle_remote_rename, handle_remote_set_url, handle_remove,
-    handle_status, handle_token_create, handle_token_list, handle_token_revoke,
-    handle_worktree_add, handle_worktree_info, handle_worktree_list, handle_worktree_remove,
-    AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
+    handle_list, handle_lora_train, handle_merge, handle_policy_apply, handle_policy_apply_template,
+    handle_policy_check, handle_policy_diff, handle_policy_edit, handle_policy_history,
+    handle_policy_list_templates, handle_policy_rollback, handle_policy_show, handle_pull,
+    handle_push, handle_remote_add, handle_remote_list, handle_remote_remove, handle_remote_rename,
+    handle_remote_set_url, handle_remove, handle_status, handle_token_create,
+    handle_worktree_add, handle_worktree_info, handle_worktree_list,
+    handle_worktree_remove, load_or_generate_signing_key, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
 };
 use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
 
-// Registry service - uses ZMQ-based service from hyprstream_core
-use hyprstream_core::services::{RegistryClient, RegistryService, RegistryZmqClient, ServiceHandle};
+// Registry and policy services - uses ZMQ-based services from hyprstream_core
+use hyprstream_core::services::{
+    PolicyService, PolicyZmqClient, RegistryClient, RegistryService, RegistryZmqClient, ServiceHandle,
+};
 use std::sync::Arc;
 // Tracing imports (feature-gated)
 #[cfg(feature = "otel")]
@@ -253,20 +256,50 @@ fn main() -> Result<()> {
         .build()
         .context("Failed to create registry runtime")?;
 
-    // Start ZMQ-based registry service and create client
+    // Start ZMQ-based services: PolicyService first, then RegistryService
     // Return both client AND service handle so we can stop it on exit
-    let (registry_client, _service_handle): (Arc<dyn RegistryClient>, ServiceHandle) = _registry_runtime
+    // Also return keypair for other services (like InferenceService) to use
+    use hyprstream_rpc::{SigningKey, VerifyingKey, RequestIdentity};
+    let (registry_client, _service_handle, signing_key, verifying_key): (Arc<dyn RegistryClient>, ServiceHandle, SigningKey, VerifyingKey) = _registry_runtime
         .block_on(async {
             let models_dir = config.models_dir();
-            // Start the registry service (runs on a blocking thread)
-            let service_handle = RegistryService::start(&models_dir)
+
+            // Load or generate signing key (persisted to .registry/keys/signing.key)
+            let keys_dir = models_dir.join(".registry").join("keys");
+            let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+            let verifying_key = signing_key.verifying_key();
+
+            // Initialize policy manager for authorization
+            // Note: Policy templates should be applied explicitly using CLI commands:
+            //   hyprstream policy apply-template local    # For local full access
+            //   hyprstream policy apply-template public-inference  # For public inference
+            let policies_dir = models_dir.join(".registry").join("policies");
+            let policy_manager = Arc::new(
+                PolicyManager::new(&policies_dir)
+                    .await
+                    .context("Failed to initialize policy manager")?
+            );
+
+            // Start PolicyService FIRST (runs on multi-threaded runtime where block_in_place works)
+            // This service wraps PolicyManager and exposes it over ZMQ
+            let _policy_handle = PolicyService::start(policy_manager, verifying_key)
+                .await
+                .context("Failed to start policy service")?;
+
+            // Create policy client for other services to use
+            let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
+
+            // Start the registry service with policy client (waits for socket binding)
+            let service_handle = RegistryService::start(&models_dir, verifying_key, policy_client)
                 .await
                 .context("Failed to start registry service")?;
-            // Give the service a moment to bind
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            // Create client to communicate with the service
-            let client = Arc::new(RegistryZmqClient::new()) as Arc<dyn RegistryClient>;
-            Ok::<_, anyhow::Error>((client, service_handle))
+            // Create client with signing credentials for service communication
+            // Uses local identity (current OS user) for authorization
+            let client = Arc::new(RegistryZmqClient::new(
+                signing_key.clone(),
+                RequestIdentity::local(),
+            )) as Arc<dyn RegistryClient>;
+            Ok::<_, anyhow::Error>((client, service_handle, signing_key, verifying_key))
         })
         .context("Failed to initialize registry")?;
 
@@ -421,7 +454,7 @@ fn main() -> Result<()> {
             )?
         }
         // Phase 1: Git-style commands
-        Commands::Branch { model, name, from } => {
+        Commands::Branch { model, name, from, policy } => {
             let ctx = ctx.clone();
             with_runtime(
                 RuntimeConfig {
@@ -430,7 +463,7 @@ fn main() -> Result<()> {
                 },
                 || async move {
                     let storage = ctx.storage().await?;
-                    handle_branch(storage, &model, &name, from).await
+                    handle_branch(storage, &model, &name, from, policy).await
                 },
             )?;
         }
@@ -581,6 +614,7 @@ fn main() -> Result<()> {
             };
 
             let ctx = ctx.clone();
+            let signing_key = signing_key.clone();
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_gpu(),
@@ -603,6 +637,8 @@ fn main() -> Result<()> {
                         force_download,
                         max_context,
                         kv_quant,
+                        signing_key,
+                        verifying_key,
                     )
                     .await
                 },
@@ -618,9 +654,15 @@ fn main() -> Result<()> {
                 },
                 || async move {
                     let storage = ctx.storage().await?;
-                    // Pass None for policy_manager - CLI shows full access by default
-                    // TODO: Load PolicyManager from .registry/policies/ for permission-aware list
-                    handle_list(storage, None).await
+
+                    // Load PolicyManager for permission-aware capability display
+                    let registry_path = storage.get_models_dir().join(".registry");
+                    let policies_dir = registry_path.join("policies");
+                    let policy_manager = PolicyManager::new(&policies_dir)
+                        .await
+                        .ok(); // Gracefully fall back to None if policies don't exist
+
+                    handle_list(storage, policy_manager.as_ref()).await
                 },
             )?;
         }
@@ -658,6 +700,7 @@ fn main() -> Result<()> {
             full,
             quiet,
             verbose,
+            policy,
         } => {
             let ctx = ctx.clone();
             with_runtime(
@@ -676,6 +719,7 @@ fn main() -> Result<()> {
                         full,
                         quiet,
                         verbose,
+                        policy,
                     ).await
                 },
             )?;
@@ -803,8 +847,8 @@ fn main() -> Result<()> {
                 || async move {
                     let storage = ctx.storage().await?;
                     match command {
-                        WorktreeCommand::Add { model, branch } => {
-                            handle_worktree_add(storage, &model, &branch).await
+                        WorktreeCommand::Add { model, branch, policy } => {
+                            handle_worktree_add(storage, &model, &branch, policy).await
                         }
                         WorktreeCommand::List { model, all } => {
                             handle_worktree_list(storage, &model, all).await
@@ -860,7 +904,6 @@ fn main() -> Result<()> {
         }
 
         Commands::Policy { command } => {
-            use hyprstream_core::auth::{PolicyManager, TokenManager};
             use hyprstream_core::cli::commands::{PolicyCommand, TokenCommand};
 
             let ctx = ctx.clone();
@@ -903,23 +946,43 @@ fn main() -> Result<()> {
                             handle_policy_check(&policy_manager, &user, &resource, &action).await
                         }
                         PolicyCommand::Token { command: token_cmd } => {
-                            // Initialize token manager
-                            let tokens_path = policies_dir.join("tokens.csv");
-                            let mut token_manager = TokenManager::new(&tokens_path)
-                                .await
-                                .map_err(|e| anyhow::anyhow!("Failed to initialize token manager: {}", e))?;
-
                             match token_cmd {
                                 TokenCommand::Create { user, name, expires, scope, admin } => {
-                                    handle_token_create(&mut token_manager, &user, name, &expires, scope, admin).await
+                                    // Load signing key for JWT token generation
+                                    let keys_dir = registry_path.join("keys");
+                                    let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+                                    handle_token_create(&signing_key, &user, name, &expires, scope, admin).await
                                 }
-                                TokenCommand::List { user } => {
-                                    handle_token_list(&token_manager, user).await
+                                TokenCommand::List { user: _ } => {
+                                    // JWT tokens are stateless - cannot list
+                                    println!("JWT tokens are stateless and cannot be listed.");
+                                    println!();
+                                    println!("Tokens are validated by signature and expiry time.");
+                                    println!("To see who has access, review the policy:");
+                                    println!("  hyprstream policy show");
+                                    Ok(())
                                 }
-                                TokenCommand::Revoke { token, name, revoke_user, force } => {
-                                    handle_token_revoke(&mut token_manager, token, name, revoke_user, force).await
+                                TokenCommand::Revoke { token: _, name: _, revoke_user: _, force: _ } => {
+                                    // JWT tokens cannot be revoked without a blocklist
+                                    println!("JWT tokens cannot be revoked individually.");
+                                    println!();
+                                    println!("Options for token invalidation:");
+                                    println!("  1. Use short expiry times (e.g., --expires 1d)");
+                                    println!("  2. Regenerate the signing key to invalidate all tokens:");
+                                    println!("     rm ~/.local/share/hyprstream/.registry/keys/signing.key");
+                                    println!("  3. Remove user permissions via policy:");
+                                    println!("     hyprstream policy edit");
+                                    println!();
+                                    println!("A token blocklist feature may be added in the future.");
+                                    Ok(())
                                 }
                             }
+                        }
+                        PolicyCommand::ApplyTemplate { template, dry_run } => {
+                            handle_policy_apply_template(&policy_manager, &template, dry_run).await
+                        }
+                        PolicyCommand::ListTemplates => {
+                            handle_policy_list_templates().await
                         }
                     }
                 },

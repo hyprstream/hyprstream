@@ -7,9 +7,10 @@
 //! - **Draft** = Uncommitted changes
 //! - **History** = Previous versions (HEAD~n)
 
-use crate::auth::{Operation, PolicyManager, TokenManager};
+use crate::auth::{jwt, Claims, Operation, PolicyManager};
 use anyhow::{Context, Result};
 use chrono::Duration;
+use ed25519_dalek::SigningKey;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
@@ -435,9 +436,12 @@ pub async fn handle_policy_check(
 
 // === Token handlers ===
 
-/// Handle `policy token create` - Create a new API token
+/// Handle `policy token create` - Create a new JWT API token
+///
+/// Generates a JWT token signed with Ed25519. The token is self-contained
+/// and can be validated statelessly by any server with the public key.
 pub async fn handle_token_create(
-    token_manager: &mut TokenManager,
+    signing_key: &SigningKey,
     user: &str,
     name: Option<String>,
     expires: &str,
@@ -447,34 +451,34 @@ pub async fn handle_token_create(
     // Parse expiration
     let expires_duration = parse_duration(expires)?;
 
-    // Generate name if not provided
+    // Default expiration is 90 days if not specified and not "never"
+    let duration = expires_duration.unwrap_or_else(|| Duration::days(90));
+
+    // Generate name for display (not stored in JWT, just for user reference)
     let name = name.unwrap_or_else(|| {
         format!("token-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"))
     });
 
-    // Create the token
-    let token = token_manager
-        .create_token(user, &name, expires_duration, scopes.clone(), admin)
-        .await
-        .context("Failed to create token")?;
+    // Create JWT claims with prefixed subject (token:user)
+    let prefixed_subject = format!("token:{}", user);
+    let claims = Claims::new(&prefixed_subject, duration, scopes.clone(), admin);
+
+    // Encode and sign the JWT
+    let token = jwt::encode(&claims, signing_key);
 
     // Display the token (only shown once)
     println!();
-    println!("Token created for user '{}':", user);
+    println!("JWT token created for subject '{}':", prefixed_subject);
     println!();
     println!("  {}", token);
     println!();
-    println!("  Name:    {}", name);
+    println!("  Name:    {} (reference only, not in token)", name);
 
-    match expires_duration {
-        Some(d) => {
-            let expires_at = chrono::Utc::now() + d;
-            let days = d.num_days();
-            println!("  Expires: {} ({} days)", expires_at.format("%Y-%m-%d"), days);
-        }
-        None => {
-            println!("  Expires: never");
-        }
+    if let Some(expires_at) = claims.expires_at() {
+        let days = duration.num_days();
+        println!("  Expires: {} ({} days)", expires_at.format("%Y-%m-%d %H:%M UTC"), days);
+    } else {
+        println!("  Expires: never");
     }
 
     if scopes.is_empty() || scopes.contains(&"*".to_string()) {
@@ -483,119 +487,55 @@ pub async fn handle_token_create(
         println!("  Scopes:  {}", scopes.join(", "));
     }
 
+    if admin {
+        println!("  Admin:   yes");
+    }
+
     println!();
     println!("  \x1b[33m⚠️  Save this token now - it cannot be retrieved again.\x1b[0m");
     println!();
     println!("  Usage:");
-    println!("    curl -H \"Authorization: Bearer {}...\" http://localhost:8080/v1/models", &token[..20]);
+    let display_len = std::cmp::min(30, token.len());
+    println!("    curl -H \"Authorization: Bearer {}...\" http://localhost:8080/v1/models", &token[..display_len]);
     println!();
 
     Ok(())
 }
 
-/// Handle `policy token list` - List all API tokens
-pub async fn handle_token_list(
-    token_manager: &TokenManager,
-    user_filter: Option<String>,
-) -> Result<()> {
-    let tokens = match user_filter {
-        Some(ref user) => token_manager.list_for_user(user),
-        None => token_manager.list(),
-    };
 
-    if tokens.is_empty() {
-        println!("No API tokens found.");
-        println!();
-        println!("Create a token with:");
-        println!("  hyprstream policy token create <user>");
-        return Ok(());
-    }
+/// Load or generate the signing key from .registry/keys/signing.key
+pub async fn load_or_generate_signing_key(keys_dir: &Path) -> Result<SigningKey> {
+    let key_path = keys_dir.join("signing.key");
 
-    // Print header
-    println!(
-        "{:<12} {:<12} {:<20} {:<12} {}",
-        "USER", "NAME", "CREATED", "EXPIRES", "SCOPES"
-    );
-    println!("{}", "-".repeat(70));
-
-    for token in tokens {
-        let created = token.created_at.format("%Y-%m-%d").to_string();
-        let expires = match token.expires_at {
-            Some(dt) => dt.format("%Y-%m-%d").to_string(),
-            None => "never".to_string(),
-        };
-        let scopes = if token.scopes.is_empty() || token.scopes == vec!["*".to_string()] {
-            "*".to_string()
-        } else {
-            token.scopes.join(", ")
-        };
-
-        println!(
-            "{:<12} {:<12} {:<20} {:<12} {}",
-            truncate_str(&token.user, 12),
-            truncate_str(&token.name, 12),
-            created,
-            expires,
-            truncate_str(&scopes, 30)
-        );
-    }
-
-    Ok(())
-}
-
-/// Handle `policy token revoke` - Revoke an API token
-pub async fn handle_token_revoke(
-    token_manager: &mut TokenManager,
-    token: Option<String>,
-    name: Option<String>,
-    revoke_user: Option<String>,
-    force: bool,
-) -> Result<()> {
-    // Determine how to find the token
-    let record = if let (Some(user), Some(name)) = (revoke_user, name) {
-        // Revoke by user and name
-        if !force {
-            print!("Revoke token '{}' for user '{}'? [y/N] ", name, user);
-            io::stdout().flush()?;
-
-            let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
-
-            if !input.trim().eq_ignore_ascii_case("y") {
-                println!("Aborted.");
-                return Ok(());
-            }
+    if key_path.exists() {
+        // Load existing key
+        let key_bytes = tokio::fs::read(&key_path).await?;
+        if key_bytes.len() != 32 {
+            anyhow::bail!("Invalid signing key file: expected 32 bytes, got {}", key_bytes.len());
         }
-
-        token_manager.revoke_by_name(&user, &name).await?
-    } else if let Some(token_str) = token {
-        // Revoke by token
-        if !force {
-            let display_token = if token_str.len() > 15 {
-                format!("{}...", &token_str[..15])
-            } else {
-                token_str.clone()
-            };
-            print!("Revoke token '{}'? [y/N] ", display_token);
-            io::stdout().flush()?;
-
-            let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
-
-            if !input.trim().eq_ignore_ascii_case("y") {
-                println!("Aborted.");
-                return Ok(());
-            }
-        }
-
-        token_manager.revoke(&token_str).await?
+        let mut key_array = [0u8; 32];
+        key_array.copy_from_slice(&key_bytes);
+        let signing_key = SigningKey::from_bytes(&key_array);
+        info!("Loaded signing key from {:?}", key_path);
+        Ok(signing_key)
     } else {
-        anyhow::bail!("Must provide either a token or --user and --name");
-    };
+        // Generate new key
+        tokio::fs::create_dir_all(keys_dir).await?;
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        tokio::fs::write(&key_path, signing_key.to_bytes()).await?;
 
-    println!("✓ Token '{}' for user '{}' revoked", record.name, record.user);
+        // Set restrictive permissions on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = tokio::fs::metadata(&key_path).await?.permissions();
+            perms.set_mode(0o600);
+            tokio::fs::set_permissions(&key_path, perms).await?;
+        }
 
-    Ok(())
+        info!("Generated new signing key at {:?}", key_path);
+        Ok(signing_key)
+    }
 }
 
 /// Parse duration string like "30d", "90d", "1y", "never"
@@ -659,7 +599,7 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     }
 }
 
-/// Default policy template for new policy files
+/// Default policy template for new policy files (header only, no rules)
 fn default_policy_template() -> &'static str {
     r#"# Hyprstream Access Control Policy
 # Format: p, subject, resource, action
@@ -677,8 +617,164 @@ fn default_policy_template() -> &'static str {
 # Role assignments (g, user, role):
 # g, alice, trainer                 # Alice has the trainer role
 # g, bob, analyst                   # Bob has the analyst role
-
-# Default permissive policy (remove for production)
-p, *, *, *
 "#
+}
+
+/// Built-in policy template
+pub struct PolicyTemplate {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub rules: &'static str,
+}
+
+/// Get all available policy templates
+pub fn get_templates() -> &'static [PolicyTemplate] {
+    &[
+        PolicyTemplate {
+            name: "local",
+            description: "Full access for local:* users (default for local execution)",
+            rules: r#"# Local user full access
+p, local:*, *, *, *, allow
+"#,
+        },
+        PolicyTemplate {
+            name: "public-inference",
+            description: "Anonymous users can infer and query models",
+            rules: r#"# Public inference access
+p, anonymous, *, model:*, infer, allow
+p, anonymous, *, model:*, query, allow
+"#,
+        },
+        PolicyTemplate {
+            name: "public-read",
+            description: "Anonymous users can query the registry (read-only)",
+            rules: r#"# Public read access (registry only)
+p, anonymous, *, registry:*, query, allow
+"#,
+        },
+    ]
+}
+
+/// Get a template by name
+pub fn get_template(name: &str) -> Option<&'static PolicyTemplate> {
+    get_templates().iter().find(|t| t.name == name)
+}
+
+/// Handle `policy list-templates` - List available templates
+pub async fn handle_policy_list_templates() -> Result<()> {
+    let templates = get_templates();
+
+    println!("Available policy templates:\n");
+    println!("{:<20} {}", "NAME", "DESCRIPTION");
+    println!("{}", "-".repeat(60));
+
+    for template in templates {
+        println!("{:<20} {}", template.name, template.description);
+    }
+
+    println!();
+    println!("Apply with: hyprstream policy apply-template <name>");
+
+    Ok(())
+}
+
+/// Handle `policy apply-template <name>` - Apply a built-in template
+pub async fn handle_policy_apply_template(
+    policy_manager: &PolicyManager,
+    template_name: &str,
+    dry_run: bool,
+) -> Result<()> {
+    let template = get_template(template_name)
+        .ok_or_else(|| anyhow::anyhow!(
+            "Unknown template: '{}'. Use 'hyprstream policy list-templates' to see available templates.",
+            template_name
+        ))?;
+
+    let policy_path = policy_manager.policy_csv_path();
+    let policies_dir = policy_manager.policies_dir();
+    let registry_dir = policies_dir
+        .parent()
+        .context("Could not find .registry directory")?;
+
+    // Read existing policy content
+    let existing_content = if policy_path.exists() {
+        tokio::fs::read_to_string(&policy_path).await?
+    } else {
+        default_policy_template().to_string()
+    };
+
+    // Check if template rules already exist
+    if existing_content.contains(template.rules.trim()) {
+        println!("Template '{}' is already applied.", template_name);
+        return Ok(());
+    }
+
+    // Append the template rules
+    let new_content = format!("{}\n{}", existing_content.trim_end(), template.rules);
+
+    println!("Applying template: {}", template_name);
+    println!("Description: {}", template.description);
+    println!();
+    println!("Rules to add:");
+    for line in template.rules.lines() {
+        if !line.trim().is_empty() && !line.starts_with('#') {
+            println!("  + {}", line);
+        }
+    }
+    println!();
+
+    if dry_run {
+        println!("--dry-run specified, no changes applied.");
+        return Ok(());
+    }
+
+    // Ensure policies directory exists
+    if !policies_dir.exists() {
+        tokio::fs::create_dir_all(&policies_dir).await?;
+    }
+
+    // Write the updated policy
+    tokio::fs::write(&policy_path, &new_content).await?;
+
+    // Validate the new policy
+    print!("Validating policy... ");
+    io::stdout().flush()?;
+
+    match policy_manager.reload().await {
+        Ok(_) => println!("✓ valid"),
+        Err(e) => {
+            // Rollback on validation failure
+            tokio::fs::write(&policy_path, &existing_content).await?;
+            println!("✗ invalid");
+            anyhow::bail!("Policy validation failed: {}. Template not applied.", e);
+        }
+    }
+
+    // Commit the change
+    let commit_msg = format!("policy: apply {} template", template_name);
+
+    Command::new("git")
+        .current_dir(registry_dir)
+        .args(["add", "policies/"])
+        .output()
+        .context("Failed to stage changes")?;
+
+    let commit_result = Command::new("git")
+        .current_dir(registry_dir)
+        .args(["commit", "-m", &commit_msg])
+        .output()
+        .context("Failed to commit")?;
+
+    if !commit_result.status.success() {
+        let stderr = String::from_utf8_lossy(&commit_result.stderr);
+        // Ignore "nothing to commit" errors
+        if !stderr.contains("nothing to commit") {
+            anyhow::bail!("Commit failed: {}", stderr);
+        }
+    }
+
+    println!();
+    println!("✓ Template '{}' applied successfully.", template_name);
+
+    Ok(())
 }

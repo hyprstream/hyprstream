@@ -8,9 +8,10 @@ use datafusion::sql::TableReference;
 #[cfg(test)]
 use {
     datafusion::datasource::{TableProvider, TableType},
-    datafusion::logical_expr::TableSource,
+    datafusion::logical_expr::{Expr, TableSource},
     datafusion::physical_plan::{empty::EmptyExec, ExecutionPlan},
     datafusion::catalog::Session,
+    datafusion_common::DFSchema,
     async_trait::async_trait,
     duckdb::arrow::datatypes::SchemaRef,
 };

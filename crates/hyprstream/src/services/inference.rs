@@ -25,22 +25,125 @@
 //!   │◄──── PUB: StreamComplete ─────│
 //! ```
 
-use crate::config::{FinishReason, GenerationRequest, GenerationResult, ModelInfo};
-use crate::events::{EventBus, EventEnvelope, EventPayload, EventSource, GenerationMetrics};
+use crate::auth::Operation;
+use crate::services::PolicyZmqClient;
+use crate::config::{FinishReason, GenerationRequest, GenerationResult, ModelInfo, TrainingMode};
 use crate::inference_capnp;
 use crate::lora::LoRAConfig;
 use crate::runtime::kv_cache::CacheOwner;
+use crate::runtime::model_config::ModelConfig;
 use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
+use crate::services::rpc_types::InferenceResponse;
+use crate::services::EnvelopeContext;
+use crate::training::{
+    CheckpointConfig, CheckpointManager, ReplayBufferConfig, SelfSupervisedConfig,
+    SelfSupervisedTrainer,
+};
 use crate::zmq::global_context;
 use anyhow::{anyhow, Result};
 use capnp::message::{Builder, ReaderOptions};
+use hyprstream_rpc::prelude::*;
+use hyprstream_rpc::serialize_message;
 use capnp::serialize;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::mpsc;
 use tokio::runtime::Handle;
-use tracing::{error, info, trace, warn};
+use tokenizers::Tokenizer;
+use tracing::{debug, error, info, trace, warn};
+
+// ============================================================================
+// PolicyChecker - Thread-safe wrapper for policy checks from single-threaded runtime
+// ============================================================================
+
+/// Request sent to the policy checker thread
+struct PolicyCheckRequest {
+    subject: String,
+    resource: String,
+    operation: Operation,
+    response_tx: mpsc::Sender<bool>,
+}
+
+/// Pending stream to be executed after REP response is sent.
+///
+/// This solves the streaming deadlock where the service waits for subscription
+/// before returning the response, but the client can't subscribe without
+/// the stream_id from the response.
+struct PendingStream {
+    request: GenerationRequest,
+    stream_id: String,
+    prompt: String, // For training collection
+}
+
+/// Thread-safe policy checker that runs on a dedicated thread with its own runtime.
+///
+/// This allows InferenceService (single-threaded runtime) to call async PolicyZmqClient
+/// without nesting runtimes. The PolicyChecker thread runs a multi-threaded runtime
+/// where TMQ async I/O works properly.
+#[derive(Clone)]
+pub struct PolicyChecker {
+    request_tx: mpsc::Sender<PolicyCheckRequest>,
+}
+
+impl PolicyChecker {
+    /// Create a new PolicyChecker and start its background thread.
+    ///
+    /// The background thread runs a multi-threaded tokio runtime and processes
+    /// policy check requests via synchronous channels.
+    pub fn start(policy_client: PolicyZmqClient) -> Self {
+        let (request_tx, request_rx) = mpsc::channel::<PolicyCheckRequest>();
+
+        std::thread::spawn(move || {
+            // Create a multi-threaded runtime for this thread
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)  // Single worker is enough for policy checks
+                .enable_all()
+                .build()
+                .expect("Failed to create policy checker runtime");
+
+            rt.block_on(async move {
+                // Process requests until the channel is closed
+                while let Ok(req) = request_rx.recv() {
+                    let allowed = policy_client
+                        .check(&req.subject, &req.resource, req.operation)
+                        .await
+                        .unwrap_or(false);
+
+                    // Send response (ignore errors if receiver dropped)
+                    let _ = req.response_tx.send(allowed);
+                }
+            });
+        });
+
+        Self { request_tx }
+    }
+
+    /// Check if subject is allowed to perform operation on resource.
+    ///
+    /// This is synchronous and safe to call from any context (including
+    /// inside `block_on`). Internally sends request to background thread.
+    pub fn check(&self, subject: &str, resource: &str, operation: Operation) -> bool {
+        let (response_tx, response_rx) = mpsc::channel();
+
+        let request = PolicyCheckRequest {
+            subject: subject.to_string(),
+            resource: resource.to_string(),
+            operation,
+            response_tx,
+        };
+
+        // Send request to background thread
+        if self.request_tx.send(request).is_err() {
+            warn!("Policy checker thread died, denying request");
+            return false;
+        }
+
+        // Wait for response (blocking, but background thread does async I/O)
+        response_rx.recv().unwrap_or(false)
+    }
+}
 
 /// Default endpoint for the inference service
 pub const INFERENCE_ENDPOINT: &str = "inproc://hyprstream/inference";
@@ -53,17 +156,44 @@ pub const INFERENCE_STREAM_ENDPOINT: &str = "inproc://hyprstream/inference/strea
 /// Wraps TorchEngine and provides a Cap'n Proto interface over ZMQ.
 /// Runs on a dedicated thread for thread safety with tch-rs types.
 /// Uses RefCell for interior mutability since it runs on a single thread.
+///
+/// # Security
+///
+/// All requests must be wrapped in `SignedEnvelope` and are verified before processing.
+/// The service logs the identity for audit trails.
+///
+/// # Streaming Architecture
+///
+/// Uses a single XPUB socket for all streaming generation:
+/// - Topic-based multiplexing: `stream-{id}` prefix on each message
+/// - XPUB receives subscription events (knows when clients connect)
+/// - No 10ms sleep hack - waits for subscription before streaming
+/// - Clients use XSUB to subscribe to their stream topic
 pub struct InferenceService {
     engine: RefCell<TorchEngine>,
     stream_id_counter: AtomicU64,
-    /// Optional event bus for publishing generation events
-    event_bus: Option<Arc<EventBus>>,
     /// Model identifier for events
     model_id: String,
+    /// Model path for checkpoint management
+    #[allow(dead_code)] // Future: checkpoint management
+    model_path: PathBuf,
     /// Current session ID for events
     session_id: RefCell<Option<String>>,
     /// Runtime handle for async operations (reused instead of creating new runtimes)
+    #[allow(dead_code)] // Reserved for future async operations
     runtime_handle: Handle,
+    /// Single XPUB socket for all streaming (initialized in run_service_loop)
+    xpub_socket: RefCell<Option<zmq::Socket>>,
+    /// Server's Ed25519 verifying key for signature verification
+    server_pubkey: VerifyingKey,
+    /// Nonce cache for replay protection
+    nonce_cache: Arc<InMemoryNonceCache>,
+    /// Policy checker for authorization (runs on separate thread with its own runtime)
+    policy_checker: PolicyChecker,
+    /// Optional self-supervised trainer (initialized from config.json)
+    trainer: Option<Arc<SelfSupervisedTrainer>>,
+    /// Tokenizer for training example collection
+    tokenizer: Option<Arc<Tokenizer>>,
 }
 
 impl InferenceService {
@@ -71,17 +201,19 @@ impl InferenceService {
     pub async fn start(
         model_path: impl AsRef<Path>,
         config: RuntimeConfig,
-        event_bus: Option<Arc<EventBus>>,
+        server_pubkey: VerifyingKey,
+        policy_client: PolicyZmqClient,
     ) -> Result<crate::services::ServiceHandle> {
-        Self::start_at(model_path, config, INFERENCE_ENDPOINT, event_bus).await
+        Self::start_at(model_path, config, server_pubkey, policy_client, INFERENCE_ENDPOINT).await
     }
 
     /// Start the inference service at a specific endpoint
     pub async fn start_at(
         model_path: impl AsRef<Path>,
         config: RuntimeConfig,
+        server_pubkey: VerifyingKey,
+        policy_client: PolicyZmqClient,
         endpoint: &str,
-        event_bus: Option<Arc<EventBus>>,
     ) -> Result<crate::services::ServiceHandle> {
         let model_path = model_path.as_ref().to_path_buf();
         let endpoint_owned = endpoint.to_string();
@@ -90,6 +222,7 @@ impl InferenceService {
             .and_then(|n| n.to_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| "unknown".to_string());
+        let nonce_cache = Arc::new(InMemoryNonceCache::new());
 
         // Use oneshot to get initialization result
         let (init_tx, init_rx) = tokio::sync::oneshot::channel();
@@ -107,13 +240,10 @@ impl InferenceService {
                 };
 
             rt.block_on(async move {
-                match Self::initialize(model_path, config, event_bus, model_id).await {
+                match Self::initialize(model_path, config, model_id, server_pubkey, nonce_cache, policy_client).await {
                     Ok(service) => {
-                        if init_tx.send(Ok(())).is_err() {
-                            tracing::warn!("Failed to send initialization success - receiver dropped");
-                        }
-                        // Run the service loop (this blocks)
-                        Self::run_service_loop(service, &endpoint_owned);
+                        // Pass init_tx to run_service_loop - it signals AFTER socket binding
+                        Self::run_service_loop(service, &endpoint_owned, Some(init_tx));
                     }
                     Err(e) => {
                         if init_tx.send(Err(e)).is_err() {
@@ -139,11 +269,17 @@ impl InferenceService {
     async fn initialize(
         model_path: PathBuf,
         config: RuntimeConfig,
-        event_bus: Option<Arc<EventBus>>,
         model_id: String,
+        server_pubkey: VerifyingKey,
+        nonce_cache: Arc<InMemoryNonceCache>,
+        policy_client: PolicyZmqClient,
     ) -> Result<Self> {
         // Capture runtime handle for reuse in handlers
         let runtime_handle = Handle::current();
+
+        // Start PolicyChecker on a dedicated thread with its own runtime.
+        // This allows synchronous policy checks from within our single-threaded runtime.
+        let policy_checker = PolicyChecker::start(policy_client);
 
         let mut engine = TorchEngine::new(config.clone())?;
         RuntimeEngine::load_model(&mut engine, &model_path).await?;
@@ -159,25 +295,111 @@ impl InferenceService {
             num_layers, max_seq_len
         );
 
+        // Check for training mode in config.json
+        let training_config = ModelConfig::load_training_config(&model_path);
+
+        // Only initialize trainer and tokenizer if training is enabled
+        // This ensures zero memory/compute overhead when not training
+        let (trainer, tokenizer): (Option<Arc<SelfSupervisedTrainer>>, Option<Arc<Tokenizer>>) = if let Some(ref tc) = training_config {
+            if tc.is_enabled() && tc.mode == TrainingMode::SelfSupervised {
+                info!(
+                    "Self-supervised training enabled, target_adapter: {:?}",
+                    tc.target_adapter
+                );
+
+                let ss_config = SelfSupervisedConfig {
+                    learning_rate: tc.learning_rate,
+                    batch_size: tc.batch_size,
+                    min_buffer_size: tc.min_buffer_size,
+                    steps_per_cycle: tc.steps_per_cycle,
+                    ..Default::default()
+                };
+                let buffer_config = ReplayBufferConfig {
+                    min_quality_threshold: tc.min_quality_threshold,
+                    ..Default::default()
+                };
+
+                // Create trainer with optional checkpoint manager
+                let mut trainer = SelfSupervisedTrainer::new(ss_config, buffer_config);
+
+                if let Some(ref target_adapter) = tc.target_adapter {
+                    // Create checkpoint manager for weight persistence
+                    let checkpoint_config = CheckpointConfig {
+                        max_checkpoints: 5,
+                        git_commit_interval: tc.steps_per_cycle * 10, // Commit every 10 cycles
+                        queue_size: 10,
+                    };
+
+                    match CheckpointManager::with_config(
+                        model_path.clone(),
+                        checkpoint_config,
+                        None,
+                    ) {
+                        Ok(mgr) => {
+                            let mgr = mgr.with_target_adapter(target_adapter.clone());
+                            trainer = trainer.with_checkpoint_manager(mgr);
+                            info!(
+                                "Checkpoint manager initialized for adapter: {}",
+                                target_adapter
+                            );
+                        }
+                        Err(e) => {
+                            warn!("Failed to create checkpoint manager: {}", e);
+                        }
+                    }
+                }
+
+                // Get tokenizer only when training is enabled
+                let tokenizer = engine.get_tokenizer().ok().map(Arc::new);
+                (Some(Arc::new(trainer)), tokenizer)
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             engine: RefCell::new(engine),
             stream_id_counter: AtomicU64::new(1),
-            event_bus,
             model_id,
+            model_path,
             session_id: RefCell::new(None),
             runtime_handle,
+            xpub_socket: RefCell::new(None), // Initialized in run_service_loop
+            server_pubkey,
+            nonce_cache,
+            policy_checker,
+            trainer,
+            tokenizer,
         })
     }
 
     /// Run the service loop (blocking)
-    fn run_service_loop(service: Self, endpoint: &str) {
+    ///
+    /// The `ready_tx` channel signals when sockets are bound and the service is ready.
+    /// This ensures callers wait for actual readiness, not just initialization.
+    fn run_service_loop(
+        service: Self,
+        endpoint: &str,
+        ready_tx: Option<tokio::sync::oneshot::Sender<Result<()>>>,
+    ) {
         let ctx = global_context();
 
-        // Create REP socket
+        // Helper to signal error and return
+        let signal_error = |tx: Option<tokio::sync::oneshot::Sender<Result<()>>>, err: anyhow::Error| {
+            if let Some(tx) = tx {
+                let _ = tx.send(Err(err));
+            }
+        };
+
+        // Create REP socket for RPC
         let socket = match ctx.socket(zmq::REP) {
             Ok(s) => s,
             Err(e) => {
-                error!("failed to create REP socket: {}", e);
+                let err = anyhow!("failed to create REP socket: {}", e);
+                error!("{}", err);
+                signal_error(ready_tx, err);
                 return;
             }
         };
@@ -189,11 +411,54 @@ impl InferenceService {
 
         // Bind to endpoint
         if let Err(e) = socket.bind(endpoint) {
-            error!("failed to bind to {}: {}", endpoint, e);
+            let err = anyhow!("failed to bind to {}: {}", endpoint, e);
+            error!("{}", err);
+            signal_error(ready_tx, err);
             return;
         }
 
-        info!("inference service bound to {}", endpoint);
+        // Create single XPUB socket for all streaming
+        // Topic-based multiplexing: clients subscribe to "stream-{id}"
+        let xpub_socket = match ctx.socket(zmq::XPUB) {
+            Ok(s) => s,
+            Err(e) => {
+                let err = anyhow!("failed to create XPUB socket: {}", e);
+                error!("{}", err);
+                signal_error(ready_tx, err);
+                return;
+            }
+        };
+
+        // Enable XPUB_VERBOSE to receive all subscription events
+        // (not just unique ones) - useful for debugging
+        if let Err(e) = xpub_socket.set_xpub_verbose(true) {
+            warn!("failed to set XPUB_VERBOSE: {}", e);
+        }
+
+        // Non-blocking mode for checking subscriptions
+        if let Err(e) = xpub_socket.set_rcvtimeo(0) {
+            warn!("failed to set XPUB receive timeout: {}", e);
+        }
+
+        // Bind XPUB to streaming endpoint
+        if let Err(e) = xpub_socket.bind(INFERENCE_STREAM_ENDPOINT) {
+            let err = anyhow!("failed to bind XPUB to {}: {}", INFERENCE_STREAM_ENDPOINT, e);
+            error!("{}", err);
+            signal_error(ready_tx, err);
+            return;
+        }
+
+        // Store XPUB socket in service for use by handle_generate_stream
+        *service.xpub_socket.borrow_mut() = Some(xpub_socket);
+
+        info!("inference service bound to {} (RPC) and {} (streaming)", endpoint, INFERENCE_STREAM_ENDPOINT);
+
+        // Signal ready AFTER sockets are bound - this is the correct semantics
+        if let Some(tx) = ready_tx {
+            if tx.send(Ok(())).is_err() {
+                warn!("Failed to signal service ready - receiver dropped");
+            }
+        }
 
         // Main service loop
         loop {
@@ -201,16 +466,45 @@ impl InferenceService {
                 Ok(request) => {
                     trace!("inference received request ({} bytes)", request.len());
 
-                    let response = match service.handle_request(&request) {
-                        Ok(resp) => resp,
+                    // Unwrap and verify SignedEnvelope
+                    let (ctx, payload) = match Self::unwrap_envelope(&request, &service.server_pubkey, &*service.nonce_cache) {
+                        Ok((ctx, payload)) => (ctx, payload),
                         Err(e) => {
-                            error!("inference request handling error: {}", e);
-                            service.build_error_response(0, &e.to_string())
+                            warn!("inference envelope verification failed: {}", e);
+                            // Send error response
+                            let response = InferenceResponse::error(0, "envelope verification failed");
+                            if let Err(e) = socket.send(&response, 0) {
+                                error!("failed to send error response: {}", e);
+                            }
+                            continue;
                         }
                     };
 
+                    debug!(
+                        "Inference request from {} (envelope_id={})",
+                        ctx.casbin_subject(),
+                        ctx.request_id
+                    );
+
+                    // Handle request - may return pending stream work
+                    let (response, pending_stream) = match service.handle_request(&ctx, &payload) {
+                        Ok((resp, pending)) => (resp, pending),
+                        Err(e) => {
+                            error!("inference request handling error: {}", e);
+                            (InferenceResponse::error(0, &e.to_string()), None)
+                        }
+                    };
+
+                    // Send response FIRST (before any streaming)
                     if let Err(e) = socket.send(&response, 0) {
                         error!("failed to send response: {}", e);
+                    }
+
+                    // THEN execute any pending stream (after response is sent)
+                    // This solves the streaming deadlock - client can subscribe after
+                    // receiving the stream_id in the response
+                    if let Some(pending) = pending_stream {
+                        service.execute_stream(pending);
                     }
                 }
                 Err(zmq::Error::EAGAIN) => {
@@ -225,96 +519,227 @@ impl InferenceService {
         }
     }
 
+    /// Unwrap and verify a SignedEnvelope from wire bytes.
+    fn unwrap_envelope(
+        request: &[u8],
+        server_pubkey: &VerifyingKey,
+        nonce_cache: &dyn NonceCache,
+    ) -> Result<(EnvelopeContext, Vec<u8>)> {
+        // Deserialize SignedEnvelope from Cap'n Proto
+        let reader = serialize::read_message(
+            &mut std::io::Cursor::new(request),
+            ReaderOptions::default(),
+        )?;
+        let signed_reader = reader.get_root::<hyprstream_rpc::common_capnp::signed_envelope::Reader>()?;
+        let signed = SignedEnvelope::read_from(signed_reader)?;
+
+        // Verify signature and replay protection
+        signed.verify(server_pubkey, nonce_cache)?;
+
+        // Extract context and payload
+        let ctx = EnvelopeContext::from_verified(&signed);
+        let payload = signed.payload().to_vec();
+
+        Ok((ctx, payload))
+    }
+
     /// Generate next stream ID
     fn next_stream_id(&self) -> String {
         let id = self.stream_id_counter.fetch_add(1, Ordering::Relaxed);
         format!("stream-{}", id)
     }
 
-    /// Publish a generation complete event
-    fn publish_generation_complete(&self, result: &GenerationResult) {
-        if let Some(bus) = &self.event_bus {
-            let metrics = GenerationMetrics {
-                perplexity: 0.0,        // Not computed in basic generation
-                avg_entropy: 0.0,       // Not computed in basic generation
-                entropy_variance: 0.0,  // Not computed in basic generation
-                repetition_ratio: 0.0,  // Could be computed but isn't yet
-                token_count: result.tokens_generated as u32,
-                tokens_per_second: result.tokens_per_second,
-                generation_time_ms: result.generation_time_ms,
-            };
+    /// Collect training example after generation if trainer is enabled
+    fn collect_training_example(&self, prompt: &str, result: &GenerationResult) {
+        let trainer = match &self.trainer {
+            Some(t) => t.clone(),
+            None => return,
+        };
 
-            let event = EventEnvelope::new(
-                EventSource::Inference,
-                "inference.generation_complete",
-                EventPayload::GenerationComplete {
-                    model_id: self.model_id.clone(),
-                    session_id: self.session_id.borrow().clone(),
-                    metrics,
-                },
-            );
-
-            // Publish using captured runtime handle
-            let bus_clone = bus.clone();
-            if let Err(e) = self.runtime_handle.block_on(async { bus_clone.publish(&event).await }) {
-                tracing::warn!("Failed to publish generation_complete event: {}", e);
+        let tokenizer = match &self.tokenizer {
+            Some(t) => t.clone(),
+            None => {
+                trace!("No tokenizer available for training example collection");
+                return;
             }
-        }
-    }
+        };
 
-    /// Publish a generation failed event
-    fn publish_generation_failed(&self, error: &str) {
-        if let Some(bus) = &self.event_bus {
-            let event = EventEnvelope::new(
-                EventSource::Inference,
-                "inference.generation_failed",
-                EventPayload::GenerationFailed {
-                    model_id: self.model_id.clone(),
-                    session_id: self.session_id.borrow().clone(),
-                    error: error.to_string(),
-                    error_code: None,
-                },
-            );
+        let quality_metrics = match &result.quality_metrics {
+            Some(qm) => qm.clone(),
+            None => {
+                trace!("No quality metrics available for training example");
+                return;
+            }
+        };
 
-            // Publish using captured runtime handle
-            let bus_clone = bus.clone();
-            if let Err(e) = self.runtime_handle.block_on(async { bus_clone.publish(&event).await }) {
-                tracing::warn!("Failed to publish generation_failed event: {}", e);
+        // Tokenize prompt and response
+        let tokenize = |text: &str| -> Result<Vec<i64>> {
+            let encoding = tokenizer
+                .encode(text, false)
+                .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
+            Ok(encoding.get_ids().iter().map(|&id| id as i64).collect())
+        };
+
+        match (tokenize(prompt), tokenize(&result.text)) {
+            (Ok(prompt_tokens), Ok(response_tokens)) => {
+                let session_id = self.session_id.borrow().clone();
+                let prompt_len = prompt_tokens.len();
+                let response_len = response_tokens.len();
+
+                // Add example and potentially train (async)
+                // Use futures::executor::block_on to avoid nesting tokio runtimes
+                futures::executor::block_on(async {
+                    trainer
+                        .add_example(prompt_tokens, response_tokens, quality_metrics, session_id)
+                        .await;
+
+                    // Trigger training cycle if ready
+                    if trainer.ready_to_train().await {
+                        info!("Training buffer full, triggering training cycle...");
+                        let engine = self.engine.borrow();
+                        match trainer.train_cycle(&*engine).await {
+                            Ok(cycle_result) => {
+                                info!(
+                                    "Training cycle complete: {} steps, mean_loss={:.4}, mean_reward={:.3}",
+                                    cycle_result.steps, cycle_result.total_loss, cycle_result.mean_reward
+                                );
+                            }
+                            Err(e) => warn!("Training cycle failed: {}", e),
+                        }
+                    }
+                });
+
+                trace!(
+                    "Training example collected: prompt_len={}, response_len={}",
+                    prompt_len,
+                    response_len
+                );
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                warn!("Failed to tokenize for training: {}", e);
             }
         }
     }
 
     /// Handle non-streaming generation
     fn handle_generate(&self, request: GenerationRequest) -> Result<GenerationResult> {
-        // Use captured runtime handle instead of creating new runtime
+        // Save prompt for training collection
+        let prompt = request.prompt.clone();
+
+        // Use futures::executor::block_on because we're already inside a tokio runtime
+        // (run_service_loop runs in rt.block_on), and tokio's block_on can't be nested.
+        // futures::executor::block_on works because it's a simple single-threaded executor.
         let engine = self.engine.borrow();
-        let result = self.runtime_handle.block_on(async {
+        let result = futures::executor::block_on(async {
             RuntimeEngine::generate_with_params(&*engine, request).await
         });
 
-        // Publish event based on result
-        match &result {
-            Ok(gen_result) => self.publish_generation_complete(gen_result),
-            Err(e) => self.publish_generation_failed(&e.to_string()),
+        // Collect training example on success
+        if let Ok(gen_result) = &result {
+            self.collect_training_example(&prompt, gen_result);
         }
 
         result
     }
 
-    /// Handle streaming generation
-    fn handle_generate_stream(&self, request: GenerationRequest) -> Result<String> {
+    /// Prepare for streaming generation - returns stream_id immediately.
+    ///
+    /// This is the first phase of streaming that runs BEFORE the REP response is sent.
+    /// The actual streaming happens in `execute_stream` which runs AFTER the response.
+    ///
+    /// This solves the deadlock where:
+    /// - Service waits for subscription before returning response
+    /// - Client can't subscribe without the stream_id from response
+    fn prepare_stream(&self, request: GenerationRequest) -> (String, PendingStream) {
+        let stream_id = self.next_stream_id();
+        let prompt = request.prompt.clone();
+
+        let pending = PendingStream {
+            request,
+            stream_id: stream_id.clone(),
+            prompt,
+        };
+
+        (stream_id, pending)
+    }
+
+    /// Execute streaming generation - called AFTER REP response is sent.
+    ///
+    /// Uses a single XPUB socket with topic-based multiplexing.
+    /// The stream_id is used as the topic prefix for all messages.
+    ///
+    /// # Protocol (with deferred streaming)
+    ///
+    /// 1. Client calls generate_stream via REQ/REP
+    /// 2. Service generates stream_id (prepare_stream)
+    /// 3. Service sends REP response (stream_id, endpoint)
+    /// 4. Client receives response and subscribes to topic "stream-{id}"
+    /// 5. Service waits for subscription (execute_stream - this function)
+    /// 6. Service generates tokens and streams via XPUB
+    fn execute_stream(&self, pending: PendingStream) {
         use futures::StreamExt;
 
-        let stream_id = self.next_stream_id();
-        let stream_endpoint = format!("{}/{}", INFERENCE_STREAM_ENDPOINT, stream_id);
+        let stream_id = pending.stream_id;
+        let request = pending.request;
+        let prompt = pending.prompt;
+        let topic = stream_id.as_bytes().to_vec();
 
-        // Create PUB socket for this stream
-        let ctx = global_context();
-        let pub_socket = ctx.socket(zmq::PUB)?;
-        pub_socket.bind(&stream_endpoint)?;
+        // Get XPUB socket (created in run_service_loop)
+        let xpub_guard = self.xpub_socket.borrow();
+        let xpub = match xpub_guard.as_ref() {
+            Some(socket) => socket,
+            None => {
+                error!("XPUB socket not initialized for streaming");
+                return;
+            }
+        };
 
-        // Small delay to allow subscriber to connect
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        // Wait for subscription event from client
+        // XPUB receives: 0x01 + topic (subscribe) or 0x00 + topic (unsubscribe)
+        // Timeout after 5 seconds if no subscriber
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(5);
+        let mut subscribed = false;
+
+        while start.elapsed() < timeout {
+            match xpub.recv_bytes(zmq::DONTWAIT) {
+                Ok(sub_msg) if !sub_msg.is_empty() => {
+                    let is_subscribe = sub_msg[0] == 0x01;
+                    let sub_topic = &sub_msg[1..];
+
+                    if is_subscribe && sub_topic == topic.as_slice() {
+                        trace!("client subscribed to stream {}", stream_id);
+                        subscribed = true;
+                        break;
+                    }
+                    // Other subscription event, continue waiting
+                }
+                Ok(_) => {} // Empty message, continue
+                Err(zmq::Error::EAGAIN) => {
+                    // No subscription yet, yield briefly
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(e) => {
+                    warn!("XPUB recv error: {}", e);
+                    break;
+                }
+            }
+        }
+
+        if !subscribed {
+            warn!("no subscriber for stream {} after timeout", stream_id);
+            // Continue anyway - client may have subscribed before we started checking
+        }
+
+        // Helper to send topic-prefixed message
+        let send_with_topic = |data: &[u8]| -> Result<(), zmq::Error> {
+            // ZMQ topic filtering uses prefix matching
+            // Message format: topic_bytes + data_bytes
+            let mut msg = Vec::with_capacity(topic.len() + data.len());
+            msg.extend_from_slice(&topic);
+            msg.extend_from_slice(data);
+            xpub.send(&msg, 0)
+        };
 
         // Run the stream
         let engine = self.engine.borrow();
@@ -323,16 +748,21 @@ impl InferenceService {
         match stream_result {
             Ok(mut stream) => {
                 let mut seq_num: u32 = 0;
+                let mut accumulated_text = String::new();
 
-                // Use captured runtime handle instead of creating new runtime
-                self.runtime_handle.block_on(async {
+                // Use futures::executor::block_on because we're already inside a tokio runtime
+                // (run_service_loop runs in rt.block_on), and tokio's block_on can't be nested.
+                futures::executor::block_on(async {
                     while let Some(chunk_result) = stream.next().await {
                         match chunk_result {
                             Ok(text) => {
-                                // Build and send chunk message
+                                // Accumulate text for training
+                                accumulated_text.push_str(&text);
+
+                                // Build and send chunk message with topic prefix
                                 let chunk_bytes =
-                                    self.build_stream_chunk(&stream_id, seq_num, &text);
-                                if let Err(e) = pub_socket.send(&chunk_bytes, 0) {
+                                    InferenceResponse::stream_chunk(&stream_id, seq_num, &text);
+                                if let Err(e) = send_with_topic(&chunk_bytes) {
                                     warn!("failed to send stream chunk: {}", e);
                                     break;
                                 }
@@ -340,8 +770,8 @@ impl InferenceService {
                             }
                             Err(e) => {
                                 let error_bytes =
-                                    self.build_stream_error(&stream_id, seq_num, &e.to_string());
-                                if let Err(send_err) = pub_socket.send(&error_bytes, 0) {
+                                    InferenceResponse::stream_error(&stream_id, seq_num, &e.to_string());
+                                if let Err(send_err) = send_with_topic(&error_bytes) {
                                     tracing::error!("Failed to send stream error: {}", send_err);
                                 }
                                 break;
@@ -351,21 +781,30 @@ impl InferenceService {
 
                     // Send completion
                     let stats = stream.stats();
-                    let complete_bytes = self.build_stream_complete(&stream_id, seq_num, &stats);
-                    if let Err(e) = pub_socket.send(&complete_bytes, 0) {
+                    let complete_bytes = InferenceResponse::stream_complete(&stream_id, seq_num, &stats);
+                    if let Err(e) = send_with_topic(&complete_bytes) {
                         tracing::error!("Failed to send stream completion: {}", e);
                     }
+
+                    // Collect training example from streaming generation
+                    let gen_result = GenerationResult {
+                        text: accumulated_text,
+                        tokens_generated: stats.tokens_generated,
+                        finish_reason: stats.finish_reason.unwrap_or(FinishReason::Stop),
+                        generation_time_ms: stats.generation_time_ms,
+                        tokens_per_second: stats.tokens_per_second,
+                        quality_metrics: stats.quality_metrics,
+                    };
+                    self.collect_training_example(&prompt, &gen_result);
                 });
             }
             Err(e) => {
-                let error_bytes = self.build_stream_error(&stream_id, 0, &e.to_string());
-                if let Err(send_err) = pub_socket.send(&error_bytes, 0) {
+                let error_bytes = InferenceResponse::stream_error(&stream_id, 0, &e.to_string());
+                if let Err(send_err) = send_with_topic(&error_bytes) {
                     tracing::error!("Failed to send initial stream error: {}", send_err);
                 }
             }
         }
-
-        Ok(stream_id)
     }
 
     /// Handle model info request
@@ -396,9 +835,9 @@ impl InferenceService {
 
     /// Handle load LoRA
     fn handle_load_lora(&self, path: &Path) -> Result<()> {
-        // Use captured runtime handle instead of creating new runtime
+        // Use futures::executor::block_on to avoid nesting tokio runtimes
         let mut engine = self.engine.borrow_mut();
-        self.runtime_handle.block_on(async { engine.load_lora_from_file(path).await })
+        futures::executor::block_on(async { engine.load_lora_from_file(path).await })
     }
 
     /// Handle save LoRA
@@ -436,217 +875,6 @@ impl InferenceService {
         self.engine
             .borrow_mut()
             .release_session(&CacheOwner::Session(session_id.to_string()))
-    }
-
-    /// Convert FinishReason enum to capnp
-    fn finish_reason_to_capnp(&self, reason: &FinishReason) -> inference_capnp::FinishReason {
-        match reason {
-            FinishReason::MaxTokens => inference_capnp::FinishReason::MaxTokens,
-            FinishReason::StopToken(_) => inference_capnp::FinishReason::StopToken,
-            FinishReason::EndOfSequence => inference_capnp::FinishReason::EndOfSequence,
-            FinishReason::Error(_) => inference_capnp::FinishReason::Error,
-            FinishReason::Stop => inference_capnp::FinishReason::Stop,
-        }
-    }
-
-    /// Build an error response
-    fn build_error_response(&self, request_id: u64, error: &str) -> Vec<u8> {
-        let mut message = Builder::new_default();
-        let mut response = message.init_root::<inference_capnp::inference_response::Builder>();
-        response.set_request_id(request_id);
-
-        let mut error_info = response.init_error();
-        error_info.set_message(error);
-        error_info.set_code("ERROR");
-        error_info.set_details("");
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message).unwrap_or_default();
-        bytes
-    }
-
-    /// Build a success response
-    fn build_success_response(&self, request_id: u64) -> Vec<u8> {
-        let mut message = Builder::new_default();
-        let mut response = message.init_root::<inference_capnp::inference_response::Builder>();
-        response.set_request_id(request_id);
-        response.set_success(());
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message).unwrap_or_default();
-        bytes
-    }
-
-    /// Build a generation result response
-    fn build_generation_result_response(
-        &self,
-        request_id: u64,
-        result: &GenerationResult,
-    ) -> Vec<u8> {
-        let mut message = Builder::new_default();
-        let mut response = message.init_root::<inference_capnp::inference_response::Builder>();
-        response.set_request_id(request_id);
-
-        let mut gen_result = response.init_generation_result();
-        gen_result.set_text(&result.text);
-        gen_result.set_tokens_generated(result.tokens_generated as u32);
-        gen_result.set_finish_reason(self.finish_reason_to_capnp(&result.finish_reason));
-        gen_result.set_generation_time_ms(result.generation_time_ms);
-        gen_result.set_tokens_per_second(result.tokens_per_second);
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message).unwrap_or_default();
-        bytes
-    }
-
-    /// Build a stream started response
-    fn build_stream_started_response(&self, request_id: u64, stream_id: &str) -> Vec<u8> {
-        let mut message = Builder::new_default();
-        let mut response = message.init_root::<inference_capnp::inference_response::Builder>();
-        response.set_request_id(request_id);
-
-        let mut stream_info = response.init_stream_started();
-        stream_info.set_stream_id(stream_id);
-        stream_info.set_endpoint(&format!("{}/{}", INFERENCE_STREAM_ENDPOINT, stream_id));
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message).unwrap_or_default();
-        bytes
-    }
-
-    /// Build a model info response
-    fn build_model_info_response(&self, request_id: u64, info: &ModelInfo) -> Vec<u8> {
-        let mut message = Builder::new_default();
-        let mut response = message.init_root::<inference_capnp::inference_response::Builder>();
-        response.set_request_id(request_id);
-
-        let mut model_info = response.init_model_info();
-        model_info.set_model_id(&info.name);
-        model_info.set_architecture(&info.architecture);
-        model_info.set_vocab_size(info.vocab_size as u32);
-        model_info.set_hidden_size(info.hidden_size as u32);
-        model_info.set_num_layers(info.num_hidden_layers.unwrap_or(0) as u32);
-        model_info.set_num_heads(info.num_attention_heads.unwrap_or(0) as u32);
-        model_info.set_max_sequence_length(info.context_length as u32);
-        model_info.set_quantization(info.quantization.as_deref().unwrap_or("none"));
-        model_info.set_has_vision(false);
-        model_info.set_lora_loaded(self.engine.borrow().has_lora_model());
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message).unwrap_or_default();
-        bytes
-    }
-
-    /// Build a ready response
-    fn build_ready_response(&self, request_id: u64, ready: bool) -> Vec<u8> {
-        let mut message = Builder::new_default();
-        let mut response = message.init_root::<inference_capnp::inference_response::Builder>();
-        response.set_request_id(request_id);
-        response.set_ready(ready);
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message).unwrap_or_default();
-        bytes
-    }
-
-    /// Build a template result response
-    fn build_template_result_response(&self, request_id: u64, result: &str) -> Vec<u8> {
-        let mut message = Builder::new_default();
-        let mut response = message.init_root::<inference_capnp::inference_response::Builder>();
-        response.set_request_id(request_id);
-        response.set_template_result(result);
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message).unwrap_or_default();
-        bytes
-    }
-
-    /// Build a has LoRA result response
-    fn build_has_lora_response(&self, request_id: u64, has_lora: bool) -> Vec<u8> {
-        let mut message = Builder::new_default();
-        let mut response = message.init_root::<inference_capnp::inference_response::Builder>();
-        response.set_request_id(request_id);
-        response.set_has_lora_result(has_lora);
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message).unwrap_or_default();
-        bytes
-    }
-
-    /// Build a health status response
-    fn build_health_response(&self, request_id: u64) -> Vec<u8> {
-        let mut message = Builder::new_default();
-        let mut response = message.init_root::<inference_capnp::inference_response::Builder>();
-        response.set_request_id(request_id);
-
-        let mut health = response.init_health();
-        health.set_status("healthy");
-        health.set_model_loaded(self.engine.borrow().is_loaded());
-        health.set_kv_cache_usage_percent(0.0);
-        health.set_gpu_memory_used_mb(0);
-        health.set_gpu_memory_total_mb(0);
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message).unwrap_or_default();
-        bytes
-    }
-
-    /// Build a stream chunk message
-    fn build_stream_chunk(&self, stream_id: &str, seq_num: u32, text: &str) -> Vec<u8> {
-        let mut message = Builder::new_default();
-        let mut chunk = message.init_root::<inference_capnp::stream_chunk::Builder>();
-        chunk.set_stream_id(stream_id);
-        chunk.set_sequence_num(seq_num);
-        chunk.set_text(text);
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message).unwrap_or_default();
-        bytes
-    }
-
-    /// Build a stream error message
-    fn build_stream_error(&self, stream_id: &str, seq_num: u32, error: &str) -> Vec<u8> {
-        let mut message = Builder::new_default();
-        let mut chunk = message.init_root::<inference_capnp::stream_chunk::Builder>();
-        chunk.set_stream_id(stream_id);
-        chunk.set_sequence_num(seq_num);
-
-        let mut error_info = chunk.init_error();
-        error_info.set_message(error);
-        error_info.set_code("GENERATION_ERROR");
-        error_info.set_details("");
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message).unwrap_or_default();
-        bytes
-    }
-
-    /// Build a stream complete message
-    fn build_stream_complete(
-        &self,
-        stream_id: &str,
-        seq_num: u32,
-        stats: &crate::runtime::GenerationStats,
-    ) -> Vec<u8> {
-        let mut message = Builder::new_default();
-        let mut chunk = message.init_root::<inference_capnp::stream_chunk::Builder>();
-        chunk.set_stream_id(stream_id);
-        chunk.set_sequence_num(seq_num);
-
-        let mut complete = chunk.init_complete();
-        complete.set_tokens_generated(stats.tokens_generated as u32);
-        let finish_reason = stats
-            .finish_reason
-            .as_ref()
-            .map(|r| self.finish_reason_to_capnp(r))
-            .unwrap_or(inference_capnp::FinishReason::Stop);
-        complete.set_finish_reason(finish_reason);
-        complete.set_generation_time_ms(stats.generation_time_ms);
-        complete.set_tokens_per_second(stats.tokens_per_second);
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message).unwrap_or_default();
-        bytes
     }
 
     /// Parse a generation request from capnp
@@ -704,50 +932,122 @@ impl InferenceService {
 }
 
 impl InferenceService {
-    /// Handle a capnp request and return a capnp response
-    fn handle_request(&self, request: &[u8]) -> Result<Vec<u8>> {
-        // Deserialize request
-        let reader = serialize::read_message(request, ReaderOptions::new())?;
+    /// Check authorization for an operation.
+    ///
+    /// Returns the unauthorized response if the check fails, or None if authorized.
+    /// Uses PolicyChecker which runs on a separate thread with its own runtime.
+    /// This is safe to call from any context (including inside block_on).
+    fn check_auth(
+        &self,
+        ctx: &EnvelopeContext,
+        request_id: u64,
+        resource: &str,
+        operation: Operation,
+    ) -> Option<Vec<u8>> {
+        let subject = ctx.casbin_subject();
+        // PolicyChecker runs on a separate thread with its own runtime,
+        // so this synchronous call is safe even from within our single-threaded runtime.
+        // TMQ async I/O happens on the PolicyChecker thread.
+        let allowed = self.policy_checker.check(&subject, resource, operation);
+
+        if allowed {
+            None // Authorized
+        } else {
+            debug!(
+                "Authorization denied: {} cannot {} on {}",
+                subject,
+                operation.as_str(),
+                resource
+            );
+            Some(InferenceResponse::unauthorized(
+                request_id,
+                &subject,
+                resource,
+                operation.as_str(),
+            ))
+        }
+    }
+
+    /// Handle a capnp request and return a response with optional pending stream.
+    ///
+    /// Returns (response_bytes, pending_stream) where pending_stream is Some
+    /// for streaming requests. The caller should send the response FIRST,
+    /// then execute the pending stream.
+    fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<PendingStream>)> {
+        // Log identity for audit trail
+        trace!(
+            "Inference request from {} (envelope_id={}, authenticated={})",
+            ctx.casbin_subject(),
+            ctx.request_id,
+            ctx.is_authenticated()
+        );
+
+        // Deserialize inner request from payload
+        let reader = serialize::read_message(payload, ReaderOptions::new())?;
         let req = reader.get_root::<inference_capnp::inference_request::Reader>()?;
 
         let request_id = req.get_id();
 
         use inference_capnp::inference_request::Which;
 
+        // Resource for authorization checks
+        let resource = format!("inference:{}", self.model_id);
+
         match req.which()? {
             Which::Generate(gen_req) => {
+                // Authorization: Infer on inference:{model}
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Infer) {
+                    return Ok((resp, None));
+                }
                 let gen_req = gen_req?;
                 let request = self.parse_generation_request(gen_req)?;
 
                 match self.handle_generate(request) {
-                    Ok(result) => Ok(self.build_generation_result_response(request_id, &result)),
-                    Err(e) => Ok(self.build_error_response(request_id, &e.to_string())),
+                    Ok(result) => Ok((InferenceResponse::generation_result(request_id, &result), None)),
+                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
                 }
             }
 
             Which::GenerateStream(gen_req) => {
+                // Authorization: Infer on inference:{model}
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Infer) {
+                    return Ok((resp, None));
+                }
                 let gen_req = gen_req?;
                 let request = self.parse_generation_request(gen_req)?;
 
-                match self.handle_generate_stream(request) {
-                    Ok(stream_id) => {
-                        Ok(self.build_stream_started_response(request_id, &stream_id))
-                    }
-                    Err(e) => Ok(self.build_error_response(request_id, &e.to_string())),
-                }
+                // Prepare stream but don't execute yet - return pending work
+                let (stream_id, pending) = self.prepare_stream(request);
+
+                // Return response with stream_id - client will subscribe, then we execute
+                let response = InferenceResponse::stream_started(request_id, &stream_id, INFERENCE_STREAM_ENDPOINT);
+                Ok((response, Some(pending)))
             }
 
             Which::ModelInfo(()) => {
+                // Authorization: Query on inference:{model}
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
+                    return Ok((resp, None));
+                }
                 let info = self.handle_model_info();
-                Ok(self.build_model_info_response(request_id, &info))
+                let has_lora = self.engine.borrow().has_lora_model();
+                Ok((InferenceResponse::model_info(request_id, &info, has_lora), None))
             }
 
             Which::IsReady(()) => {
+                // Authorization: Query on inference:{model}
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
+                    return Ok((resp, None));
+                }
                 let ready = self.handle_is_ready();
-                Ok(self.build_ready_response(request_id, ready))
+                Ok((InferenceResponse::ready(request_id, ready), None))
             }
 
             Which::ApplyChatTemplate(template_req) => {
+                // Authorization: Query on inference:{model}
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
+                    return Ok((resp, None));
+                }
                 let template_req = template_req?;
                 let messages: Vec<crate::runtime::template_engine::ChatMessage> = template_req
                     .get_messages()?
@@ -763,12 +1063,16 @@ impl InferenceService {
                 let add_generation_prompt = template_req.get_add_generation_prompt();
 
                 match self.handle_apply_chat_template(messages, add_generation_prompt) {
-                    Ok(result) => Ok(self.build_template_result_response(request_id, &result)),
-                    Err(e) => Ok(self.build_error_response(request_id, &e.to_string())),
+                    Ok(result) => Ok((InferenceResponse::template_result(request_id, &result), None)),
+                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
                 }
             }
 
             Which::CreateLora(lora_config) => {
+                // Authorization: Write on inference:{model}
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                    return Ok((resp, None));
+                }
                 let lora_config = lora_config?;
                 let config = LoRAConfig {
                     rank: lora_config.get_rank() as usize,
@@ -783,91 +1087,137 @@ impl InferenceService {
                 };
 
                 match self.handle_create_lora(config) {
-                    Ok(()) => Ok(self.build_success_response(request_id)),
-                    Err(e) => Ok(self.build_error_response(request_id, &e.to_string())),
+                    Ok(()) => Ok((InferenceResponse::success(request_id), None)),
+                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
                 }
             }
 
             Which::LoadLora(path) => {
+                // Authorization: Write on inference:{model}
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                    return Ok((resp, None));
+                }
                 let path = path?.to_str()?;
                 match self.handle_load_lora(Path::new(path)) {
-                    Ok(()) => Ok(self.build_success_response(request_id)),
-                    Err(e) => Ok(self.build_error_response(request_id, &e.to_string())),
+                    Ok(()) => Ok((InferenceResponse::success(request_id), None)),
+                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
                 }
             }
 
             Which::SaveLora(path) => {
+                // Authorization: Write on inference:{model}
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                    return Ok((resp, None));
+                }
                 let path = path?.to_str()?;
                 match self.handle_save_lora(path) {
-                    Ok(()) => Ok(self.build_success_response(request_id)),
-                    Err(e) => Ok(self.build_error_response(request_id, &e.to_string())),
+                    Ok(()) => Ok((InferenceResponse::success(request_id), None)),
+                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
                 }
             }
 
-            Which::UnloadLora(()) => match self.handle_unload_lora() {
-                Ok(()) => Ok(self.build_success_response(request_id)),
-                Err(e) => Ok(self.build_error_response(request_id, &e.to_string())),
-            },
+            Which::UnloadLora(()) => {
+                // Authorization: Write on inference:{model}
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                    return Ok((resp, None));
+                }
+                match self.handle_unload_lora() {
+                    Ok(()) => Ok((InferenceResponse::success(request_id), None)),
+                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
+                }
+            }
 
             Which::HasLora(()) => {
+                // Authorization: Query on inference:{model}
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
+                    return Ok((resp, None));
+                }
                 let has_lora = self.handle_has_lora();
-                Ok(self.build_has_lora_response(request_id, has_lora))
+                Ok((InferenceResponse::has_lora(request_id, has_lora), None))
             }
 
             Which::SetSession(session_id) => {
+                // Authorization: Write on inference:{model}
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                    return Ok((resp, None));
+                }
                 let session_id = session_id?.to_str()?.to_string();
                 match self.handle_set_session(session_id) {
-                    Ok(()) => Ok(self.build_success_response(request_id)),
-                    Err(e) => Ok(self.build_error_response(request_id, &e.to_string())),
+                    Ok(()) => Ok((InferenceResponse::success(request_id), None)),
+                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
                 }
             }
 
             Which::ClearSession(()) => {
+                // Authorization: Write on inference:{model}
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                    return Ok((resp, None));
+                }
                 self.handle_clear_session();
-                Ok(self.build_success_response(request_id))
+                Ok((InferenceResponse::success(request_id), None))
             }
 
             Which::ReleaseSession(session_id) => {
+                // Authorization: Write on inference:{model}
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                    return Ok((resp, None));
+                }
                 let session_id = session_id?.to_str()?;
                 match self.handle_release_session(session_id) {
-                    Ok(()) => Ok(self.build_success_response(request_id)),
-                    Err(e) => Ok(self.build_error_response(request_id, &e.to_string())),
+                    Ok(()) => Ok((InferenceResponse::success(request_id), None)),
+                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
                 }
             }
 
-            Which::HealthCheck(()) => Ok(self.build_health_response(request_id)),
+            Which::HealthCheck(()) => {
+                // Health check is public (no authorization required)
+                let model_loaded = self.engine.borrow().is_loaded();
+                Ok((InferenceResponse::health(request_id, model_loaded), None))
+            }
 
             Which::Shutdown(()) => {
+                // Authorization: Manage on inference (shutdown requires admin)
+                if let Some(resp) = self.check_auth(ctx, request_id, "inference", Operation::Manage) {
+                    return Ok((resp, None));
+                }
                 info!("Inference service shutdown requested");
-                Ok(self.build_success_response(request_id))
+                Ok((InferenceResponse::success(request_id), None))
             }
         }
     }
 }
 
 /// Client for the inference service
+///
+/// # Security
+///
+/// All requests are wrapped in `SignedEnvelope` for authentication:
+/// - Requests are signed with the client's Ed25519 signing key
+/// - The service verifies signatures before processing
+/// - Identity is included for authorization checks
+///
+/// Uses `ZmqClient` internally for TMQ-based async transport with auto-signing.
 pub struct InferenceZmqClient {
-    client: crate::services::AsyncServiceClient,
-    request_id: AtomicU64,
+    /// Unified ZMQ client (TMQ-based, auto-signing)
+    client: crate::services::ZmqClient,
 }
 
 impl InferenceZmqClient {
-    /// Create a new inference client
-    pub fn new() -> Self {
-        Self::with_endpoint(INFERENCE_ENDPOINT)
+    /// Create a new inference client with signing credentials
+    pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
+        Self::with_endpoint(INFERENCE_ENDPOINT, signing_key, identity)
     }
 
     /// Create an inference client connected to a specific endpoint
-    pub fn with_endpoint(endpoint: &str) -> Self {
+    pub fn with_endpoint(endpoint: &str, signing_key: SigningKey, identity: RequestIdentity) -> Self {
         Self {
-            client: crate::services::AsyncServiceClient::new(endpoint),
-            request_id: AtomicU64::new(1),
+            client: crate::services::ZmqClient::new(endpoint, signing_key, identity),
         }
     }
 
-    /// Get the next request ID
+    /// Get the next request ID (delegates to inner client)
     fn next_id(&self) -> u64 {
-        self.request_id.fetch_add(1, Ordering::Relaxed)
+        self.client.next_id()
     }
 
     /// Convert capnp FinishReason to Rust enum
@@ -921,15 +1271,11 @@ impl InferenceZmqClient {
     /// Check if model is ready
     pub async fn is_ready(&self) -> Result<bool> {
         let id = self.next_id();
-
-        let mut message = Builder::new_default();
-        let mut req = message.init_root::<inference_capnp::inference_request::Builder>();
-        req.set_id(id);
-        req.set_is_ready(());
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-
+        let bytes = serialize_message(|msg| {
+            let mut req = msg.init_root::<inference_capnp::inference_request::Builder>();
+            req.set_id(id);
+            req.set_is_ready(());
+        })?;
         let response = self.client.call(bytes).await?;
         self.parse_ready_response(&response)
     }
@@ -937,15 +1283,11 @@ impl InferenceZmqClient {
     /// Get model info
     pub async fn model_info(&self) -> Result<ModelInfo> {
         let id = self.next_id();
-
-        let mut message = Builder::new_default();
-        let mut req = message.init_root::<inference_capnp::inference_request::Builder>();
-        req.set_id(id);
-        req.set_model_info(());
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-
+        let bytes = serialize_message(|msg| {
+            let mut req = msg.init_root::<inference_capnp::inference_request::Builder>();
+            req.set_id(id);
+            req.set_model_info(());
+        })?;
         let response = self.client.call(bytes).await?;
         self.parse_model_info_response(&response)
     }
@@ -953,15 +1295,11 @@ impl InferenceZmqClient {
     /// Health check
     pub async fn health_check(&self) -> Result<()> {
         let id = self.next_id();
-
-        let mut message = Builder::new_default();
-        let mut req = message.init_root::<inference_capnp::inference_request::Builder>();
-        req.set_id(id);
-        req.set_health_check(());
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-
+        let bytes = serialize_message(|msg| {
+            let mut req = msg.init_root::<inference_capnp::inference_request::Builder>();
+            req.set_id(id);
+            req.set_health_check(());
+        })?;
         let response = self.client.call(bytes).await?;
         self.parse_health_response(&response)
     }
@@ -1056,15 +1394,12 @@ impl InferenceZmqClient {
     /// Load a LoRA adapter from file
     pub async fn load_lora(&self, path: &Path) -> Result<()> {
         let id = self.next_id();
-
-        let mut message = Builder::new_default();
-        let mut req = message.init_root::<inference_capnp::inference_request::Builder>();
-        req.set_id(id);
-        req.set_load_lora(&path.to_string_lossy());
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-
+        let path_str = path.to_string_lossy().to_string();
+        let bytes = serialize_message(|msg| {
+            let mut req = msg.init_root::<inference_capnp::inference_request::Builder>();
+            req.set_id(id);
+            req.set_load_lora(&path_str);
+        })?;
         let response = self.client.call(bytes).await?;
         self.parse_success_response(&response)
     }
@@ -1072,15 +1407,11 @@ impl InferenceZmqClient {
     /// Save the current LoRA adapter to file
     pub async fn save_lora(&self, path: &str) -> Result<()> {
         let id = self.next_id();
-
-        let mut message = Builder::new_default();
-        let mut req = message.init_root::<inference_capnp::inference_request::Builder>();
-        req.set_id(id);
-        req.set_save_lora(path);
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-
+        let bytes = serialize_message(|msg| {
+            let mut req = msg.init_root::<inference_capnp::inference_request::Builder>();
+            req.set_id(id);
+            req.set_save_lora(path);
+        })?;
         let response = self.client.call(bytes).await?;
         self.parse_success_response(&response)
     }
@@ -1088,15 +1419,11 @@ impl InferenceZmqClient {
     /// Unload the current LoRA adapter
     pub async fn unload_lora(&self) -> Result<()> {
         let id = self.next_id();
-
-        let mut message = Builder::new_default();
-        let mut req = message.init_root::<inference_capnp::inference_request::Builder>();
-        req.set_id(id);
-        req.set_unload_lora(());
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-
+        let bytes = serialize_message(|msg| {
+            let mut req = msg.init_root::<inference_capnp::inference_request::Builder>();
+            req.set_id(id);
+            req.set_unload_lora(());
+        })?;
         let response = self.client.call(bytes).await?;
         self.parse_success_response(&response)
     }
@@ -1104,15 +1431,11 @@ impl InferenceZmqClient {
     /// Check if a LoRA adapter is loaded
     pub async fn has_lora(&self) -> Result<bool> {
         let id = self.next_id();
-
-        let mut message = Builder::new_default();
-        let mut req = message.init_root::<inference_capnp::inference_request::Builder>();
-        req.set_id(id);
-        req.set_has_lora(());
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-
+        let bytes = serialize_message(|msg| {
+            let mut req = msg.init_root::<inference_capnp::inference_request::Builder>();
+            req.set_id(id);
+            req.set_has_lora(());
+        })?;
         let response = self.client.call(bytes).await?;
         self.parse_has_lora_response(&response)
     }
@@ -1120,15 +1443,11 @@ impl InferenceZmqClient {
     /// Set the current session ID for KV cache management
     pub async fn set_session(&self, session_id: &str) -> Result<()> {
         let id = self.next_id();
-
-        let mut message = Builder::new_default();
-        let mut req = message.init_root::<inference_capnp::inference_request::Builder>();
-        req.set_id(id);
-        req.set_set_session(session_id);
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-
+        let bytes = serialize_message(|msg| {
+            let mut req = msg.init_root::<inference_capnp::inference_request::Builder>();
+            req.set_id(id);
+            req.set_set_session(session_id);
+        })?;
         let response = self.client.call(bytes).await?;
         self.parse_success_response(&response)
     }
@@ -1136,15 +1455,11 @@ impl InferenceZmqClient {
     /// Clear the current session's KV cache
     pub async fn clear_session(&self) -> Result<()> {
         let id = self.next_id();
-
-        let mut message = Builder::new_default();
-        let mut req = message.init_root::<inference_capnp::inference_request::Builder>();
-        req.set_id(id);
-        req.set_clear_session(());
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-
+        let bytes = serialize_message(|msg| {
+            let mut req = msg.init_root::<inference_capnp::inference_request::Builder>();
+            req.set_id(id);
+            req.set_clear_session(());
+        })?;
         let response = self.client.call(bytes).await?;
         self.parse_success_response(&response)
     }
@@ -1152,15 +1467,11 @@ impl InferenceZmqClient {
     /// Release a session's KV cache
     pub async fn release_session(&self, session_id: &str) -> Result<()> {
         let id = self.next_id();
-
-        let mut message = Builder::new_default();
-        let mut req = message.init_root::<inference_capnp::inference_request::Builder>();
-        req.set_id(id);
-        req.set_release_session(session_id);
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-
+        let bytes = serialize_message(|msg| {
+            let mut req = msg.init_root::<inference_capnp::inference_request::Builder>();
+            req.set_id(id);
+            req.set_release_session(session_id);
+        })?;
         let response = self.client.call(bytes).await?;
         self.parse_success_response(&response)
     }
@@ -1168,15 +1479,11 @@ impl InferenceZmqClient {
     /// Request service shutdown
     pub async fn shutdown(&self) -> Result<()> {
         let id = self.next_id();
-
-        let mut message = Builder::new_default();
-        let mut req = message.init_root::<inference_capnp::inference_request::Builder>();
-        req.set_id(id);
-        req.set_shutdown(());
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-
+        let bytes = serialize_message(|msg| {
+            let mut req = msg.init_root::<inference_capnp::inference_request::Builder>();
+            req.set_id(id);
+            req.set_shutdown(());
+        })?;
         let response = self.client.call(bytes).await?;
         self.parse_success_response(&response)
     }
@@ -1196,6 +1503,7 @@ impl InferenceZmqClient {
                     finish_reason: self.parse_finish_reason(result.get_finish_reason()?),
                     generation_time_ms: result.get_generation_time_ms(),
                     tokens_per_second: result.get_tokens_per_second(),
+                    quality_metrics: None, // TODO: Parse from capnp when schema is updated
                 })
             }
             Which::Error(err) => {
@@ -1340,8 +1648,4 @@ impl InferenceZmqClient {
     }
 }
 
-impl Default for InferenceZmqClient {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// Note: Default impl removed - InferenceZmqClient requires signing credentials

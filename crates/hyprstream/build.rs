@@ -42,6 +42,8 @@ fn compile_capnp_schemas() {
         return;
     }
 
+    // Note: common.capnp (identity, envelope) is in hyprstream-rpc crate
+
     // Compile events schema
     let events_schema = schema_dir.join("events.capnp");
     if events_schema.exists() {
@@ -70,5 +72,15 @@ fn compile_capnp_schemas() {
             .file(&registry_schema)
             .run()
             .expect("failed to compile registry.capnp");
+    }
+
+    // Compile policy schema
+    let policy_schema = schema_dir.join("policy.capnp");
+    if policy_schema.exists() {
+        capnpc::CompilerCommand::new()
+            .src_prefix("schema")
+            .file(&policy_schema)
+            .run()
+            .expect("failed to compile policy.capnp");
     }
 }

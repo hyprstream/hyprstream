@@ -887,6 +887,7 @@ impl RuntimeEngine for MockRuntimeEngine {
             tokens_per_second: 50.0,
             finish_reason: crate::config::FinishReason::EndOfSequence,
             generation_time_ms: 100,
+            quality_metrics: None,
         })
     }
 

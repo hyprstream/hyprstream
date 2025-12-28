@@ -64,6 +64,7 @@ impl RepoArchetype for CagContextArchetype {
 }
 
 /// Configuration for a CAG context store
+#[allow(dead_code)] // Future: CAG context integration
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct ContextManifest {
     /// Manifest version
@@ -75,6 +76,7 @@ pub struct ContextManifest {
 }
 
 /// Context store backend configuration
+#[allow(dead_code)] // Future: CAG context integration
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct StoreConfig {
     /// Store type: "duckdb"
@@ -85,6 +87,7 @@ pub struct StoreConfig {
 }
 
 /// Embedding model configuration
+#[allow(dead_code)] // Future: CAG context integration
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct EmbeddingConfig {
     /// Embedding dimension
@@ -95,6 +98,7 @@ pub struct EmbeddingConfig {
 
 impl ContextManifest {
     /// Load context manifest from a repository path
+    #[allow(dead_code)] // Future: CAG context integration
     pub fn load(repo_path: &Path) -> Result<Self, std::io::Error> {
         let manifest_path = repo_path.join("context.json");
         let content = std::fs::read_to_string(&manifest_path)?;

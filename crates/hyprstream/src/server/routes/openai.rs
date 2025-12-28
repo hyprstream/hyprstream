@@ -5,7 +5,7 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Sse},
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
 use futures::stream::StreamExt;
 use std::convert::Infallible;
@@ -21,7 +21,7 @@ use crate::{
     archetypes::capabilities::Infer,
     inference::{InferenceClient, LocalInferenceClient},
     runtime::{CacheOwner, FinishReason, GenerationRequest},
-    server::state::ServerState,
+    server::{state::ServerState, AuthenticatedUser},
 };
 
 /// RAII guard for metrics cleanup
@@ -118,56 +118,18 @@ fn extract_cache_owner(headers: &HeaderMap) -> CacheOwner {
     }
 }
 
-/// Result of user extraction from request headers
-pub enum ExtractUserResult {
-    /// Successfully extracted user identity
-    Ok(String),
-    /// Invalid or expired token
-    InvalidToken,
-}
-
-/// Extract user identity from request headers.
+/// Extract user identity from authenticated user.
 ///
-/// Authentication priority (OpenAI-compatible):
-/// 1. `Authorization: Bearer hypr_...` header (API token)
-/// 2. `X-User` header (internal/trusted requests)
-/// 3. Default to "anonymous"
-///
-/// Returns `InvalidToken` if a Bearer token is provided but invalid.
-async fn extract_user(headers: &HeaderMap, state: &ServerState) -> ExtractUserResult {
-    // 1. Check for Bearer token authentication
-    if let Some(auth_header) = headers.get(header::AUTHORIZATION) {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                // Validate the token
-                let token_manager = state.token_manager.read().await;
-                match token_manager.validate(token) {
-                    Some(record) => {
-                        trace!("Authenticated via Bearer token as user: {}", record.user);
-                        return ExtractUserResult::Ok(record.user.clone());
-                    }
-                    None => {
-                        trace!("Invalid or expired Bearer token");
-                        return ExtractUserResult::InvalidToken;
-                    }
-                }
-            }
-        }
+/// JWT `sub` claim should already contain prefixed subject (e.g., "token:alice").
+/// Returns "anonymous" if no authentication provided.
+fn extract_user_from_auth(auth_user: Option<&AuthenticatedUser>) -> String {
+    if let Some(user) = auth_user {
+        trace!("Using authenticated user: {}", user.user);
+        return user.user.clone();
     }
 
-    // 2. Fallback to X-User header (trusted internal requests)
-    if let Some(user_header) = headers.get("x-user") {
-        if let Ok(user) = user_header.to_str() {
-            if !user.is_empty() {
-                trace!("Using X-User header identity: {}", user);
-                return ExtractUserResult::Ok(user.to_string());
-            }
-        }
-    }
-
-    // 3. Default to anonymous
     trace!("No authentication provided, using anonymous identity");
-    ExtractUserResult::Ok("anonymous".to_string())
+    "anonymous".to_string()
 }
 
 /// Helper: Load model from cache with proper error handling
@@ -326,24 +288,12 @@ pub fn create_router() -> Router<ServerState> {
 /// Handle chat completion requests
 async fn chat_completions(
     State(state): State<ServerState>,
+    auth_user: Option<Extension<AuthenticatedUser>>,
     headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {
-    // Extract user identity from headers (Bearer token or X-User)
-    let user = match extract_user(&headers, &state).await {
-        ExtractUserResult::Ok(user) => user,
-        ExtractUserResult::InvalidToken => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorResponse::new(
-                    "Invalid API key provided",
-                    "invalid_request_error",
-                    "invalid_api_key",
-                )),
-            )
-                .into_response();
-        }
-    };
+    // Extract user identity from JWT (via middleware)
+    let user = extract_user_from_auth(auth_user.as_ref().map(|Extension(u)| u));
 
     // Check permission for inference on this model
     let resource = format!("model:{}", request.model);
@@ -801,26 +751,12 @@ async fn stream_chat(state: ServerState, headers: HeaderMap, request: ChatComple
 /// Handle text completion requests
 async fn completions(
     State(state): State<ServerState>,
-    headers: HeaderMap,
+    auth_user: Option<Extension<AuthenticatedUser>>,
+    _headers: HeaderMap,
     Json(request): Json<CompletionRequest>,
 ) -> impl IntoResponse {
-    // Extract user identity from headers (Bearer token or X-User)
-    let user = match extract_user(&headers, &state).await {
-        ExtractUserResult::Ok(user) => user,
-        ExtractUserResult::InvalidToken => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "error": {
-                        "message": "Invalid API key provided",
-                        "type": "invalid_request_error",
-                        "code": "invalid_api_key"
-                    }
-                })),
-            )
-                .into_response();
-        }
-    };
+    // Extract user identity from JWT (via middleware)
+    let user = extract_user_from_auth(auth_user.as_ref().map(|Extension(u)| u));
 
     // Check permission for inference on this model
     let resource = format!("model:{}", request.model);

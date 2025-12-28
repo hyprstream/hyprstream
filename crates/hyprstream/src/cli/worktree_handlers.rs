@@ -1,5 +1,6 @@
 //! Handlers for worktree management commands
 
+use crate::cli::git_handlers::apply_policy_template_to_model;
 use crate::storage::{ModelRef, ModelStorage};
 use anyhow::Result;
 use std::io::{self, Write};
@@ -10,6 +11,7 @@ pub async fn handle_worktree_add(
     storage: &ModelStorage,
     model: &str,
     branch: &str,
+    policy_template: Option<String>,
 ) -> Result<()> {
     info!("Creating worktree {}/{}", model, branch);
 
@@ -50,6 +52,11 @@ pub async fn handle_worktree_add(
 
     println!("Created worktree {}/{}:", model, branch);
     println!("  Path: {}", worktree_path.display());
+
+    // Apply policy template if specified
+    if let Some(ref template_name) = policy_template {
+        apply_policy_template_to_model(storage, model, template_name).await?;
+    }
 
     Ok(())
 }

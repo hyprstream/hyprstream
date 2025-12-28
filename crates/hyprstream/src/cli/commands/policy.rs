@@ -74,6 +74,18 @@ pub enum PolicyCommand {
         #[command(subcommand)]
         command: TokenCommand,
     },
+
+    /// Apply a built-in policy template
+    ApplyTemplate {
+        /// Template name: local, public-inference, public-read
+        template: String,
+        /// Preview changes without applying
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// List available policy templates
+    ListTemplates,
 }
 
 /// Token management subcommands

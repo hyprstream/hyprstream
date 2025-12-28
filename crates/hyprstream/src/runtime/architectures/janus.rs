@@ -3,6 +3,12 @@
 //! Janus combines vision and language understanding with optional image generation.
 //! It uses a composition pattern to reuse existing language models (typically Llama)
 //! while adding vision encoders and cross-modal alignment.
+//!
+//! NOTE: This module contains vision transformer components that are planned for
+//! future multimodal support. They are currently unused but retained for the
+//! upcoming Janus VLM integration.
+
+#![allow(dead_code)]
 
 use super::{ArchitectureConfig, ModelArchitecture, ModelOperations, VisionEncoderType};
 use super::config::AttentionType;

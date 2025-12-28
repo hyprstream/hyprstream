@@ -121,7 +121,7 @@ g = _, _
 e = some(where (p.eft == allow)) && !some(where (p.eft == deny))
 
 [matchers]
-m = (g(r.sub, p.sub) || p.sub == "*" || r.sub == p.sub) && \
+m = (g(r.sub, p.sub) || keyMatch(r.sub, p.sub)) && \
     (p.dom == "*" || r.dom == p.dom) && \
     keyMatch(r.obj, p.obj) && \
     (p.act == "*" || r.act == p.act)
@@ -581,6 +581,73 @@ impl PolicyManager {
     /// Get the policy.csv path
     pub fn policy_csv_path(&self) -> PathBuf {
         self.policies_dir.join("policy.csv")
+    }
+
+    // ========================================================================
+    // Convenience Methods for Common Policy Configurations
+    // ========================================================================
+
+    /// Enable full access for local users (local:*)
+    ///
+    /// This is the default secure configuration that allows local users
+    /// to access all resources while still requiring authentication.
+    pub async fn enable_local_full_access(&self) -> Result<(), PolicyError> {
+        let policies = [
+            // Registry access
+            ("local:*", "*", "registry", "query", "allow"),
+            ("local:*", "*", "registry", "write", "allow"),
+            ("local:*", "*", "registry:*", "query", "allow"),
+            ("local:*", "*", "registry:*", "write", "allow"),
+            ("local:*", "*", "registry:*", "manage", "allow"),
+            // Inference access
+            ("local:*", "*", "inference", "manage", "allow"),
+            ("local:*", "*", "inference:*", "infer", "allow"),
+            ("local:*", "*", "inference:*", "query", "allow"),
+            ("local:*", "*", "inference:*", "write", "allow"),
+        ];
+
+        for (sub, dom, obj, act, eft) in policies {
+            self.add_policy_with_domain(sub, dom, obj, act, eft).await?;
+        }
+
+        info!("Enabled full access for local users");
+        Ok(())
+    }
+
+    /// Enable public inference access for anonymous users
+    ///
+    /// Use this when exposing an OpenAI-compatible API publicly.
+    /// Only allows inference and query operations, not write or manage.
+    pub async fn enable_public_inference(&self) -> Result<(), PolicyError> {
+        let policies = [
+            ("anonymous", "*", "inference:*", "infer", "allow"),
+            ("anonymous", "*", "inference:*", "query", "allow"),
+        ];
+
+        for (sub, dom, obj, act, eft) in policies {
+            self.add_policy_with_domain(sub, dom, obj, act, eft).await?;
+        }
+
+        info!("Enabled public inference access for anonymous users");
+        Ok(())
+    }
+
+    /// Enable public read-only registry access for anonymous users
+    ///
+    /// Use this when you want to allow anonymous users to browse
+    /// available models without authentication.
+    pub async fn enable_public_read(&self) -> Result<(), PolicyError> {
+        let policies = [
+            ("anonymous", "*", "registry", "query", "allow"),
+            ("anonymous", "*", "registry:*", "query", "allow"),
+        ];
+
+        for (sub, dom, obj, act, eft) in policies {
+            self.add_policy_with_domain(sub, dom, obj, act, eft).await?;
+        }
+
+        info!("Enabled public read access for anonymous users");
+        Ok(())
     }
 
     /// Format policies as a human-readable string for display

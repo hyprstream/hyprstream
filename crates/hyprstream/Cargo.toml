@@ -55,6 +55,7 @@ toml.workspace = true
 serde_yaml.workspace = true
 git2.workspace = true  # Still needed by git2db internally
 git2db = { path = "../git2db", features = ["overlayfs"] }  # High-level git library with overlayfs
+hyprstream-rpc = { path = "../hyprstream-rpc" }  # RPC infrastructure (Cap'n Proto + ZMQ)
 hyprstream-flight = { path = "../hyprstream-flight" }  # Flight SQL server and client
 hyprstream-metrics = { path = "../hyprstream-metrics" }  # Metrics storage (for RegistryClient trait)
 gittorrent = { workspace = true, optional = true }  # P2P transport
@@ -137,6 +138,8 @@ fastrand.workspace = true                # Fast random number generation for sam
 xdg.workspace = true                     # XDG Base Directory specification
 blake3.workspace = true                  # Fast cryptographic hashing for checksums
 tempfile.workspace = true                # Temporary files for model conversion
+base64.workspace = true                  # JWT token encoding
+ed25519-dalek.workspace = true           # JWT Ed25519 signatures
 
 # HTTP API dependencies
 axum.workspace = true

@@ -3,7 +3,7 @@
 //! Provides efficient domain detection with caching to avoid
 //! repeated filesystem scans.
 
-use super::capabilities::{Capability, CapabilitySet, Context, Infer, Query, Serve, Train};
+use super::capabilities::{Capability, CapabilitySet};
 use super::{builtin_archetypes, RepoArchetype};
 use dashmap::DashMap;
 use std::collections::HashMap;

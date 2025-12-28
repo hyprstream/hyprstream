@@ -13,6 +13,7 @@ pub use server::{CorsConfig, SamplingParamDefaults, ServerConfig, ServerConfigBu
 // Export root configuration and builder (defined below in this module)
 // Note: HyprConfig and HyprConfigBuilder are exported automatically as pub structs
 
+use crate::runtime::generation_metrics::GenerationQualityMetrics;
 use crate::storage::paths::StoragePaths;
 use config::{Config, ConfigError, Environment, File};
 use serde::{Deserialize, Serialize};
@@ -953,6 +954,9 @@ pub struct GenerationResult {
     pub finish_reason: FinishReason,
     pub generation_time_ms: u64,
     pub tokens_per_second: f32,
+    /// Quality metrics for self-supervised training
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality_metrics: Option<GenerationQualityMetrics>,
 }
 
 /// Why generation stopped

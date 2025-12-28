@@ -7,6 +7,8 @@ members = [
     "crates/hyprstream-metrics",
     "crates/hyprstream-flight",
     "crates/cas-serve",
+    "crates/hyprstream-rpc",
+    "crates/hyprstream-rpc-derive",
 ]
 # bitsandbytes-sys is standalone - only built when bnb feature is enabled
 exclude = ["crates/bitsandbytes-sys"]
@@ -132,7 +134,7 @@ half = "2.6.0"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # Messaging
-tmq = "0.5"  # Tokio ZeroMQ bindings (supports inproc://)
+tmq = { path = "/home/birdetta/tmq" }  # Local TMQ with XPUB/XSUB support
 zmq = "0.10"  # Underlying libzmq bindings
 
 # Cap'n Proto (zero-copy serialization)
@@ -149,6 +151,17 @@ blake3 = "1.5"
 sha2 = "0.10"  # SHA256 validation for LFS files
 shellexpand = "3.1.1"
 caps = "0.5"  # Linux capabilities for privilege detection
+whoami = "1.5"  # OS username detection
+
+# Cryptography (for signed envelopes, DH key exchange, stream HMAC)
+base64 = "0.22"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.12"
+hmac = "0.12"
+zeroize = { version = "1", features = ["derive"] }
+subtle = "2"
+p256 = "0.13"  # FIPS mode alternative to X25519
 
 # Dev dependencies
 proptest = "1.0"

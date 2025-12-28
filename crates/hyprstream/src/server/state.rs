@@ -3,20 +3,20 @@
 use super::model_cache::ModelCache;
 use crate::{
     api::training_service::TrainingService,
-    auth::{PolicyManager, TokenManager},
-    events::{EventBus, SinkRegistry, SinksConfig},
+    auth::PolicyManager,
     storage::ModelStorage,
     training::SelfSupervisedTrainer,
 };
 use dashmap::DashMap;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 // Re-export config types so other server modules can access them via server::state
 pub use crate::config::{CorsConfig, SamplingParamDefaults, ServerConfig};
 
-// Re-export context storage types when metrics feature is enabled
-#[cfg(feature = "metrics")]
+// Re-export context storage types
 pub use hyprstream_metrics::storage::context::{ContextRecord, ContextStore, SearchResult};
 
 /// Shared server state
@@ -44,17 +44,13 @@ pub struct ServerState {
     /// Policy manager for RBAC/ABAC access control
     pub policy_manager: Arc<PolicyManager>,
 
-    /// Token manager for API key authentication
-    pub token_manager: Arc<RwLock<TokenManager>>,
+    /// Ed25519 signing key for creating JWT tokens
+    pub signing_key: Arc<SigningKey>,
 
-    /// Event bus for pub/sub messaging
-    pub event_bus: Arc<EventBus>,
+    /// Ed25519 verifying key for validating JWT tokens (derived from signing_key)
+    pub verifying_key: Arc<VerifyingKey>,
 
-    /// Sink registry for managing event consumers
-    pub sink_registry: Arc<SinkRegistry>,
-
-    /// Context store for RAG/CAG (optional, requires metrics feature)
-    #[cfg(feature = "metrics")]
+    /// Context store for RAG/CAG (optional)
     pub context_store: Option<Arc<ContextStore<hyprstream_metrics::storage::duckdb::DuckDbBackend>>>,
 }
 
@@ -81,6 +77,41 @@ impl Default for Metrics {
             avg_latency_ms: Arc::new(RwLock::new(0.0)),
             active_requests: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
+    }
+}
+
+/// Load or generate Ed25519 signing key from .registry/keys/signing.key
+async fn load_or_generate_signing_key(keys_dir: &Path) -> Result<SigningKey, anyhow::Error> {
+    let key_path = keys_dir.join("signing.key");
+
+    if key_path.exists() {
+        // Load existing key
+        let key_bytes = tokio::fs::read(&key_path).await?;
+        if key_bytes.len() != 32 {
+            anyhow::bail!("Invalid signing key file: expected 32 bytes, got {}", key_bytes.len());
+        }
+        let mut key_array = [0u8; 32];
+        key_array.copy_from_slice(&key_bytes);
+        let signing_key = SigningKey::from_bytes(&key_array);
+        tracing::info!("Loaded signing key from {:?}", key_path);
+        Ok(signing_key)
+    } else {
+        // Generate new key
+        tokio::fs::create_dir_all(keys_dir).await?;
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        tokio::fs::write(&key_path, signing_key.to_bytes()).await?;
+
+        // Set restrictive permissions on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = tokio::fs::metadata(&key_path).await?.permissions();
+            perms.set_mode(0o600);
+            tokio::fs::set_permissions(&key_path, perms).await?;
+        }
+
+        tracing::info!("Generated new signing key at {:?}", key_path);
+        Ok(signing_key)
     }
 }
 
@@ -148,43 +179,27 @@ impl ServerState {
         model_storage: Arc<ModelStorage>,
     ) -> Result<Self, anyhow::Error> {
         // Initialize policy manager from .registry/policies/
+        // Security: If policy loading fails, the server must NOT start with permissive defaults.
+        // This prevents corrupted/missing policy files from silently disabling authorization.
         let registry_path = model_storage.get_models_dir().join(".registry");
         let policies_dir = registry_path.join("policies");
         tracing::info!("Initializing policy manager from: {:?}", policies_dir);
         let policy_manager = Arc::new(
             PolicyManager::new(&policies_dir)
                 .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!(
-                        "Failed to load policies from {:?}: {}. Using permissive defaults.",
-                        policies_dir,
-                        e
-                    );
-                    // Fall back to permissive policy manager synchronously
-                    // This is safe since we're already in an async context
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current()
-                            .block_on(PolicyManager::permissive())
-                            .expect("Failed to create permissive policy manager")
-                    })
-                }),
+                .map_err(|e| anyhow::anyhow!(
+                    "Failed to load policies from {:?}: {}. Server cannot start without valid policies.",
+                    policies_dir,
+                    e
+                ))?,
         );
 
-        // Initialize token manager from .registry/policies/tokens.csv
-        let tokens_path = policies_dir.join("tokens.csv");
-        tracing::info!("Initializing token manager from: {:?}", tokens_path);
-        let token_manager = Arc::new(RwLock::new(
-            TokenManager::new(&tokens_path)
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!(
-                        "Failed to load tokens from {:?}: {}. Starting with empty token store.",
-                        tokens_path,
-                        e
-                    );
-                    TokenManager::in_memory()
-                }),
-        ));
+        // Load or generate signing key for JWT tokens
+        let keys_dir = registry_path.join("keys");
+        let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+        let verifying_key = signing_key.verifying_key();
+        let signing_key = Arc::new(signing_key);
+        let verifying_key = Arc::new(verifying_key);
 
         // Initialize training service
         let training_service = Arc::new(TrainingService::new());
@@ -217,41 +232,6 @@ impl ServerState {
         // Initialize self-supervised trainers map (trainers are created lazily per model)
         let trainers = Arc::new(DashMap::new());
 
-        // Initialize event bus for pub/sub messaging
-        let event_bus = Arc::new(EventBus::new().await.map_err(|e| {
-            anyhow::anyhow!("failed to initialize event bus: {}", e)
-        })?);
-        tracing::info!("Event bus initialized with endpoints: {:?}", event_bus.endpoints());
-
-        // Initialize sink registry
-        let sink_registry = Arc::new(SinkRegistry::new(event_bus.clone()));
-
-        // Load sink configuration from .registry/event_sinks.yaml
-        let sinks_config_path = registry_path.join("event_sinks.yaml");
-        if sinks_config_path.exists() {
-            match SinksConfig::load(&sinks_config_path) {
-                Ok(sinks_config) => {
-                    tracing::info!(
-                        "Loading {} event sinks from {:?}",
-                        sinks_config.sinks.len(),
-                        sinks_config_path
-                    );
-                    for sink_config in sinks_config.sinks {
-                        if let Err(e) = sink_registry.register(sink_config.clone()).await {
-                            tracing::warn!(
-                                "Failed to register sink '{}': {}",
-                                sink_config.name,
-                                e
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to load sinks config: {}. Continuing without event sinks.", e);
-                }
-            }
-        }
-
         Ok(Self {
             model_cache,
             model_storage,
@@ -260,10 +240,8 @@ impl ServerState {
             config: Arc::new(config),
             metrics,
             policy_manager,
-            token_manager,
-            event_bus,
-            sink_registry,
-            #[cfg(feature = "metrics")]
+            signing_key,
+            verifying_key,
             context_store: None, // Initialize via enable_context_store() if needed
         })
     }
@@ -289,7 +267,6 @@ impl ServerState {
     ///
     /// # Returns
     /// A mutable reference to the initialized ContextStore
-    #[cfg(feature = "metrics")]
     pub async fn enable_context_store(
         &mut self,
         db_path: &str,
@@ -299,7 +276,7 @@ impl ServerState {
         use hyprstream_metrics::storage::duckdb::DuckDbBackend;
         use hyprstream_metrics::StorageBackend;
 
-        let backend = Arc::new(DuckDbBackend::new(db_path)?);
+        let backend = Arc::new(DuckDbBackend::new(db_path.to_string(), std::collections::HashMap::new(), None)?);
         backend.init().await.map_err(|e| anyhow::anyhow!("Failed to init DuckDB: {}", e))?;
         backend.create_table("context", &context_schema(embedding_dim)).await
             .map_err(|e| anyhow::anyhow!("Failed to create context table: {}", e))?;
@@ -317,7 +294,6 @@ impl ServerState {
     }
 
     /// Get the context store if initialized
-    #[cfg(feature = "metrics")]
     pub fn get_context_store(&self) -> Option<&Arc<ContextStore<hyprstream_metrics::storage::duckdb::DuckDbBackend>>> {
         self.context_store.as_ref()
     }

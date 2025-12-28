@@ -65,6 +65,9 @@ pub enum Commands {
         /// Create from specific ref
         #[arg(long)]
         from: Option<String>,
+        /// Apply a policy template to the new branch (local, public-inference, public-read)
+        #[arg(long)]
+        policy: Option<String>,
     },
 
     /// Switch branches or checkout specific commit/tag
@@ -282,6 +285,10 @@ pub enum Commands {
         /// Verbose output
         #[arg(long, short = 'v')]
         verbose: bool,
+
+        /// Apply a policy template to the cloned model (local, public-inference, public-read)
+        #[arg(long)]
+        policy: Option<String>,
     },
 
     /// Push changes to remote
@@ -435,6 +442,9 @@ pub enum WorktreeCommand {
         model: String,
         /// Branch name (must exist in bare repo)
         branch: String,
+        /// Apply a policy template to the worktree (local, public-inference, public-read)
+        #[arg(long)]
+        policy: Option<String>,
     },
 
     /// List all worktrees for a model

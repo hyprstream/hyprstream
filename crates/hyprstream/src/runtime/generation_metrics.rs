@@ -9,6 +9,7 @@
 //! - Entropy variance: Consistency of confidence (lower = more consistent)
 //! - Repetition ratio: N-gram repetition detection (lower = less repetitive)
 
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 /// Size of ring buffer for n-gram detection
@@ -256,7 +257,7 @@ impl GenerationMetricsAccumulator {
 /// - Quality scoring in self-supervised RL
 /// - Monitoring generation quality
 /// - Detecting degraded model performance
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct GenerationQualityMetrics {
     /// Perplexity: exp(-avg_log_prob)
     /// Lower = model is more confident in its generations

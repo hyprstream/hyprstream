@@ -5,7 +5,7 @@
 //! while repository operations (worktrees, branches) use local git access.
 
 use anyhow::Result;
-use crate::services::{RegistryClient, RepositoryClient};
+use crate::services::{PolicyZmqClient, RegistryClient, RepositoryClient};
 use git2db::{GitManager, GitRef, RepoId, TrackedRepository};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -85,22 +85,36 @@ impl ModelStorage {
     /// This is a convenience method for CLI and standalone usage where there's
     /// no shared registry service. For server usage, prefer passing a shared
     /// RegistryClient via `new()`.
+    ///
+    /// Note: This generates a transient keypair for the service. For production
+    /// usage, the signing key should be loaded from configuration.
     pub async fn create_with_config(
         base_dir: PathBuf,
         _config: git2db::Git2DBConfig,
     ) -> Result<Self> {
         use crate::services::{RegistryService, RegistryZmqClient};
+        use hyprstream_rpc::{generate_signing_keypair, RequestIdentity};
 
-        // Start ZMQ-based registry service
-        let _service_handle = RegistryService::start(&base_dir)
+        // Generate keypair for this service instance
+        // TODO: Load from configuration for production
+        let (signing_key, verifying_key) = generate_signing_keypair();
+
+        // Create policy client that connects to the already-running PolicyService
+        // (PolicyService should be started by main.rs before any ModelStorage is created)
+        // If PolicyService isn't running, policy checks will fail gracefully
+        let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
+
+        // Start ZMQ-based registry service (waits for socket binding)
+        let _service_handle = RegistryService::start(&base_dir, verifying_key, policy_client)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to start registry service: {}", e))?;
 
-        // Give the service a moment to bind
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-        // Create ZMQ client
-        let client: Arc<dyn RegistryClient> = Arc::new(RegistryZmqClient::new());
+        // Create ZMQ client with signing credentials
+        // Use local identity (current OS user) for internal model storage operations
+        let client: Arc<dyn RegistryClient> = Arc::new(RegistryZmqClient::new(
+            signing_key,
+            RequestIdentity::local(),
+        ));
 
         Ok(Self {
             client,

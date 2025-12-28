@@ -1,19 +1,20 @@
 //! Handlers for git-style CLI commands
 
 use crate::cli::commands::model::GitInfo;
-use crate::config::{GenerationRequest, TrainingMode};
-// Sampling config now loaded via builder pattern
-use crate::runtime::model_config::ModelConfig;
+use crate::config::GenerationRequest;
+use crate::inference_capnp;
 use crate::runtime::template_engine::ChatMessage;
-use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
-use crate::storage::{CheckoutOptions, GitRef, ModelRef, ModelStorage};
-use crate::training::{
-    checkpoint::{CheckpointConfig, CheckpointManager},
-    ReplayBufferConfig, SelfSupervisedConfig, SelfSupervisedTrainer,
+use crate::runtime::RuntimeConfig;
+use crate::services::{
+    InferenceService, InferenceZmqClient, PolicyZmqClient, INFERENCE_ENDPOINT,
 };
+use crate::zmq::global_context;
+use crate::storage::{CheckoutOptions, GitRef, ModelRef, ModelStorage};
 use anyhow::{bail, Result};
+use capnp::message::ReaderOptions;
+use capnp::serialize;
+use hyprstream_rpc::prelude::*;
 use std::io::{self, Write};
-use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 /// Handle branch command
@@ -22,6 +23,7 @@ pub async fn handle_branch(
     model: &str,
     branch_name: &str,
     from_ref: Option<String>,
+    policy_template: Option<String>,
 ) -> Result<()> {
     info!("Creating branch {} for model {}", branch_name, model);
 
@@ -39,6 +41,11 @@ pub async fn handle_branch(
     // Create worktree for the branch
     let worktree_path = storage.create_worktree(&model_ref, branch_name).await?;
     println!("✓ Created worktree at {}", worktree_path.display());
+
+    // Apply policy template if specified
+    if let Some(ref template_name) = policy_template {
+        apply_policy_template_to_model(storage, model, template_name).await?;
+    }
 
     // Show helpful next steps
     println!("\n→ Next steps:");
@@ -791,7 +798,7 @@ pub async fn handle_list(
 
 /// Handle clone command
 pub async fn handle_clone(
-    _storage: &ModelStorage,
+    storage: &ModelStorage,
     repo_url: &str,
     name: Option<String>,
     branch: Option<String>,
@@ -799,6 +806,7 @@ pub async fn handle_clone(
     full: bool,
     quiet: bool,
     verbose: bool,
+    policy_template: Option<String>,
 ) -> Result<()> {
     if !quiet {
         info!("Cloning model from {}", repo_url);
@@ -839,6 +847,11 @@ pub async fn handle_clone(
         println!("✅ Model '{}' cloned successfully!", cloned.model_name);
         println!("   Model ID: {}", cloned.model_id);
         println!("   Location: {}", cloned.model_path.display());
+    }
+
+    // Apply policy template if specified
+    if let Some(ref template_name) = policy_template {
+        apply_policy_template_to_model(storage, &cloned.model_name, template_name).await?;
     }
 
     Ok(())
@@ -1225,7 +1238,109 @@ pub async fn handle_info(
     Ok(())
 }
 
+/// Apply a policy template to a model's registry
+///
+/// This is a helper used by branch, clone, and worktree commands to apply
+/// policy templates when the --policy flag is specified.
+pub async fn apply_policy_template_to_model(
+    storage: &ModelStorage,
+    model: &str,
+    template_name: &str,
+) -> Result<()> {
+    use crate::auth::PolicyManager;
+    use crate::cli::policy_handlers::get_template;
+    use std::process::Command;
+
+    let template = get_template(template_name)
+        .ok_or_else(|| anyhow::anyhow!(
+            "Unknown policy template: '{}'. Available templates: local, public-inference, public-read",
+            template_name
+        ))?;
+
+    // Get the policies directory for this model's registry
+    let registry_path = storage.get_models_dir().join(".registry");
+    let policies_dir = registry_path.join("policies");
+
+    // Ensure policies directory exists
+    if !policies_dir.exists() {
+        tokio::fs::create_dir_all(&policies_dir).await?;
+    }
+
+    let policy_path = policies_dir.join("policy.csv");
+
+    // Read existing policy content or create default
+    let existing_content = if policy_path.exists() {
+        tokio::fs::read_to_string(&policy_path).await?
+    } else {
+        default_policy_header().to_string()
+    };
+
+    // Check if template rules already exist
+    if existing_content.contains(template.rules.trim()) {
+        println!("✓ Policy template '{}' already applied", template_name);
+        return Ok(());
+    }
+
+    // Append the template rules
+    let new_content = format!("{}\n{}", existing_content.trim_end(), template.rules);
+
+    // Write the updated policy
+    tokio::fs::write(&policy_path, &new_content).await?;
+
+    // Validate the new policy
+    let policy_manager = PolicyManager::new(&policies_dir)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to validate policy: {}", e))?;
+
+    // Reload to validate
+    if let Err(e) = policy_manager.reload().await {
+        // Rollback on validation failure
+        tokio::fs::write(&policy_path, &existing_content).await?;
+        bail!("Policy validation failed: {}. Template not applied.", e);
+    }
+
+    // Commit the change
+    let commit_msg = format!("policy: apply {} template for model {}", template_name, model);
+
+    Command::new("git")
+        .current_dir(&registry_path)
+        .args(["add", "policies/"])
+        .output()
+        .ok();
+
+    Command::new("git")
+        .current_dir(&registry_path)
+        .args(["commit", "-m", &commit_msg])
+        .output()
+        .ok();
+
+    println!("✓ Applied policy template: {}", template_name);
+    println!("  {}", template.description);
+
+    Ok(())
+}
+
+/// Default policy header for new policy files
+fn default_policy_header() -> &'static str {
+    r#"# Hyprstream Access Control Policy
+# Format: p, subject, resource, action
+#
+# Subjects: user names or role names
+# Resources: model:<name>, data:<name>, or * for all
+# Actions: infer, train, query, write, serve, manage, or * for all
+"#
+}
+
 /// Handle infer command
+///
+/// Runs inference via InferenceService, which:
+/// - Enforces authorization via PolicyManager
+/// - Auto-loads adapters from model directory
+/// - Handles self-supervised training if configured in config.json
+///
+/// # Parameters
+/// - `signing_key`: Ed25519 signing key for request authentication
+/// - `verifying_key`: Ed25519 verifying key for signature verification
 pub async fn handle_infer(
     storage: &ModelStorage,
     model_ref_str: &str,
@@ -1241,25 +1356,22 @@ pub async fn handle_infer(
     _force_download: bool,
     max_context: Option<usize>,
     kv_quant: crate::cli::commands::KVQuantArg,
+    signing_key: SigningKey,
+    verifying_key: VerifyingKey,
 ) -> Result<()> {
     info!(
-        "Running base model inference: model={}, prompt_len={}",
+        "Running inference via service: model={}, prompt_len={}",
         model_ref_str,
         prompt.len()
     );
 
-    // Parse model reference
+    // Parse model reference and get path
     let model_ref = ModelRef::parse(model_ref_str)?;
-
-    // Get model path
     let storage_paths = crate::storage::StoragePaths::new()?;
     let models_dir = storage_paths.models_dir()?;
     let model_path = match storage.get_model_path(&model_ref).await {
         Ok(path) => path,
-        Err(_) => {
-            // Fallback to direct path lookup
-            models_dir.join(&model_ref.model)
-        }
+        Err(_) => models_dir.join(&model_ref.model),
     };
 
     if !model_path.exists() {
@@ -1270,250 +1382,49 @@ pub async fn handle_infer(
 
     info!("Using model at: {}", model_path.display());
 
-    // Initialize inference engine with max_context and kv_quant from CLI/env
-    // Clap handles precedence: CLI args > env vars > defaults
+    // PolicyService is already running (started by main.rs).
+    // Create policy client with the same keypair to connect to it.
+    let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
+
+    // Configure runtime
     let mut runtime_config = RuntimeConfig::default();
-    runtime_config.max_context = max_context;  // From clap (already merged CLI > env)
-    runtime_config.kv_quant_type = kv_quant.into();  // From clap (already merged CLI > env)
-    let mut engine = TorchEngine::new(runtime_config)?;
+    runtime_config.max_context = max_context;
+    runtime_config.kv_quant_type = kv_quant.into();
 
-    // Load the model
-    let load_start = std::time::Instant::now();
-    RuntimeEngine::load_model(&mut engine, &model_path)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to load model: {}", e))?;
-    let load_time = load_start.elapsed();
-    info!("Model loaded in {:.2}s", load_time.as_secs_f64());
+    // Start InferenceService (loads model, adapters, trainer automatically)
+    let service_handle = InferenceService::start_at(
+        &model_path,
+        runtime_config,
+        verifying_key,
+        policy_client,
+        INFERENCE_ENDPOINT,
+    )
+    .await?;
 
-    // Auto-load adapters from the model directory
-    let adapter_manager = crate::storage::AdapterManager::new(&model_path);
-    let adapters = adapter_manager.list_adapters()?;
+    // Create client for service communication
+    let client = InferenceZmqClient::new(signing_key, RequestIdentity::local());
 
-    if !adapters.is_empty() {
-        println!("\n→ Loading adapters:");
+    // Apply chat template to the prompt via service
+    let messages = vec![ChatMessage {
+        role: "user".to_string(),
+        content: prompt.to_string(),
+    }];
 
-        // Flag to track LoRA model initialization state across adapter loading iterations.
-        // The LoRA model structure must be initialized before individual adapter weights
-        // can be loaded. This is done once for the first valid adapter configuration.
-        let mut lora_model_initialized = false;
-
-        for adapter_info in &adapters {
-            tracing::info!(
-                "[{}] {} ({:.1} KB)",
-                adapter_info.index,
-                adapter_info.name,
-                adapter_info.size as f64 / 1024.0
-            );
-
-            // Parse adapter configuration from JSON file.
-            // Each adapter has an associated .config.json file containing metadata
-            // like rank, alpha scaling factor, and training parameters.
-            let config_path = adapter_info.path.with_extension("config.json");
-            let adapter_config = match std::fs::read_to_string(&config_path) {
-                Ok(content) => {
-                    match serde_json::from_str::<crate::storage::AdapterConfig>(&content) {
-                        Ok(config) => config,
-                        Err(parse_error) => {
-                            tracing::error!(
-                                config_path = %config_path.display(),
-                                error = %parse_error,
-                                "Failed to deserialize adapter configuration - JSON structure may be invalid"
-                            );
-                            tracing::warn!(
-                                "Failed to parse config for adapter [{}] {} - skipping",
-                                adapter_info.index,
-                                adapter_info.name
-                            );
-                            continue;
-                        }
-                    }
-                }
-                Err(io_error) => {
-                    tracing::warn!(
-                        config_path = %config_path.display(),
-                        error = %io_error,
-                        adapter_name = %adapter_info.name,
-                        "Adapter configuration file not found - adapter may be corrupted"
-                    );
-                    tracing::warn!(
-                        "No config found for adapter [{}] {} - skipping",
-                        adapter_info.index,
-                        adapter_info.name
-                    );
-                    continue;
-                }
-            };
-
-            // Initialize LoRA model structure on first successful adapter.
-            // This creates the VarStore and module mapping required for gradient tracking.
-            // All adapters share the same LoRA model structure but have different weights.
-            if !lora_model_initialized {
-                tracing::info!(
-                    rank = adapter_config.rank,
-                    alpha = adapter_config.alpha,
-                    learning_rate = adapter_config.learning_rate,
-                    "Initializing LoRA model structure with configuration from first adapter"
-                );
-
-                // Create LoRA config with comprehensive target modules
-                // The engine will auto-detect which modules are actually present in the SafeTensors file
-                let lora_config = crate::lora::LoRAConfig {
-                    rank: adapter_config.rank as usize, // Convert u32 to usize
-                    alpha: adapter_config.alpha,
-                    dropout: 0.1, // Standard dropout rate for LoRA training
-                    // Use comprehensive target modules - engine will filter based on what's available
-                    target_modules: vec![
-                        "q_proj".to_string(),
-                        "k_proj".to_string(),
-                        "v_proj".to_string(),
-                        "o_proj".to_string(),
-                        "gate_proj".to_string(),
-                        "up_proj".to_string(),
-                        "down_proj".to_string(),
-                    ],
-                    learning_rate: adapter_config.learning_rate as f32, // Convert f64 to f32
-                };
-
-                match engine.create_lora(lora_config) {
-                    Ok(_) => {
-                        tracing::info!("LoRA model structure initialized successfully - ready to load adapter weights");
-                        lora_model_initialized = true;
-                    }
-                    Err(init_error) => {
-                        tracing::error!(
-                            error = %init_error,
-                            "Failed to initialize LoRA model structure - adapters cannot be loaded"
-                        );
-                        tracing::error!("Failed to initialize LoRA model - skipping all adapters");
-                        break;
-                    }
-                }
-            }
-
-            // Load adapter weights into the initialized LoRA model.
-            // This loads the actual trained LoRA A and B matrices from SafeTensors format.
-            match engine.load_lora_weights(adapter_info.path.to_str().unwrap()) {
-                Ok(_) => {
-                    tracing::info!(
-                        adapter_path = %adapter_info.path.display(),
-                        adapter_name = %adapter_info.name,
-                        adapter_size_kb = adapter_info.size as f64 / 1024.0,
-                        "Successfully loaded LoRA adapter weights"
-                    );
-                    tracing::info!(
-                        "Successfully loaded adapter [{}] {}",
-                        adapter_info.index,
-                        adapter_info.name
-                    );
-                }
-                Err(load_error) => {
-                    tracing::warn!(
-                        adapter_path = %adapter_info.path.display(),
-                        adapter_name = %adapter_info.name,
-                        error = %load_error,
-                        "Failed to load LoRA adapter weights - SafeTensors file may be corrupted"
-                    );
-                    tracing::warn!(
-                        "Failed to load adapter [{}] {} - continuing without it",
-                        adapter_info.index,
-                        adapter_info.name
-                    );
-                }
-            }
-        }
-
-        tracing::info!(
-            total_adapters = adapters.len(),
-            "Completed LoRA adapter loading process"
-        );
-        tracing::info!("Completed processing {} adapters", adapters.len());
-    } else {
-        tracing::info!("No LoRA adapters found in model directory - using base model only");
-    }
-
-    // Note: Do NOT clear active_lora here - adapter loading above correctly sets it.
-    // The loaded adapter weights should persist for inference + training.
-
-    // Check for training mode in config.json
-    let training_config = ModelConfig::load_training_config(&model_path);
-    let trainer: Option<Arc<SelfSupervisedTrainer>> = if let Some(ref tc) = training_config {
-        if tc.is_enabled() && tc.mode == TrainingMode::SelfSupervised {
-            info!(
-                "Self-supervised training enabled, target_adapter: {:?}",
-                tc.target_adapter
-            );
-            let ss_config = SelfSupervisedConfig {
-                learning_rate: tc.learning_rate,
-                batch_size: tc.batch_size,
-                min_buffer_size: tc.min_buffer_size,
-                steps_per_cycle: tc.steps_per_cycle,
-                ..Default::default()
-            };
-            let buffer_config = ReplayBufferConfig {
-                min_quality_threshold: tc.min_quality_threshold,
-                ..Default::default()
-            };
-
-            // Create trainer with checkpoint manager if target_adapter is set
-            let mut trainer = SelfSupervisedTrainer::new(ss_config, buffer_config);
-
-            if let Some(ref target_adapter) = tc.target_adapter {
-                // Create checkpoint manager for weight persistence
-                let checkpoint_config = CheckpointConfig {
-                    max_checkpoints: 5,
-                    git_commit_interval: tc.steps_per_cycle * 10, // Commit every 10 cycles
-                    queue_size: 10,
-                };
-
-                match CheckpointManager::with_config(
-                    model_path.clone(),
-                    checkpoint_config,
-                    None,
-                ) {
-                    Ok(checkpoint_mgr) => {
-                        let checkpoint_mgr =
-                            checkpoint_mgr.with_target_adapter(target_adapter.clone());
-                        trainer = trainer.with_checkpoint_manager(checkpoint_mgr);
-                        info!(
-                            "Checkpoint manager initialized, target_adapter: {}",
-                            target_adapter
-                        );
-                    }
-                    Err(e) => {
-                        warn!("Failed to create checkpoint manager: {}", e);
-                    }
-                }
-            }
-
-            Some(Arc::new(trainer))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    // Apply chat template to the prompt
-    let formatted_prompt = {
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: prompt.to_string(),
-        }];
-
-        match RuntimeEngine::apply_chat_template(&engine, &messages, true) {
-            Ok(formatted) => formatted,
-            Err(e) => {
-                tracing::warn!("Could not apply chat template: {}. Using raw prompt.", e);
-                prompt.to_string()
-            }
+    let formatted_prompt = match client.apply_chat_template(&messages, true).await {
+        Ok(formatted) => formatted,
+        Err(e) => {
+            tracing::warn!("Could not apply chat template: {}. Using raw prompt.", e);
+            prompt.to_string()
         }
     };
 
-    // Keep a copy for training (prompt is moved into request builder)
-    let formatted_prompt_for_training = formatted_prompt.clone();
-
+    // Build generation request
     let mut request_builder = GenerationRequest::builder(formatted_prompt)
-        .apply_config(&crate::config::SamplingParams::from_model_path(&model_path).await.unwrap_or_default())
+        .apply_config(
+            &crate::config::SamplingParams::from_model_path(&model_path)
+                .await
+                .unwrap_or_default(),
+        )
         .temperature(temperature.unwrap_or(0.7))
         .top_p(top_p.unwrap_or(0.95))
         .top_k(top_k)
@@ -1534,93 +1445,111 @@ pub async fn handle_infer(
         request.max_tokens, request.temperature, request.top_p, request.top_k, request.repeat_penalty
     );
 
-    use futures::StreamExt;
-
-    let mut text_stream = engine.generate(request)?;
-
-    // Collect full response text (needed for training)
-    let mut full_response = String::new();
-
+    // Generate via service (handles adapter loading, training collection, auth)
     if stream {
-        println!();
-        while let Some(text_chunk) = text_stream.next().await {
-            let chunk = text_chunk?;
-            full_response.push_str(&chunk);
-            print!("{}", chunk);
-            let _ = io::stdout().flush();
-        }
-        println!();
-    } else {
-        while let Some(text_chunk) = text_stream.next().await {
-            full_response.push_str(&text_chunk?);
-        }
-        println!("\n{}", full_response);
-    }
+        // Streaming via ZMQ pub/sub
+        let (stream_id, endpoint) = client.generate_stream(&request).await?;
+        info!("Streaming started: stream_id={}, endpoint={}", stream_id, endpoint);
 
-    let stats = text_stream.stats();
-    info!(
-        "Generated {} tokens in {}ms ({:.2} tokens/sec)",
-        stats.tokens_generated, stats.generation_time_ms, stats.tokens_per_second
-    );
-    if let Some(ref qm) = stats.quality_metrics {
-        info!(
-            "Quality metrics: perplexity={:.2}, entropy={:.2}, entropy_var={:.4}, repetition={:.3}",
-            qm.perplexity, qm.avg_entropy, qm.entropy_variance, qm.repetition_ratio
-        );
-    }
+        // Subscribe to stream chunks using global context
+        // (inproc:// only works within the same ZMQ context)
+        let ctx = global_context();
+        let subscriber = ctx.socket(zmq::SUB)?;
+        subscriber.connect(&endpoint)?;
+        subscriber.set_subscribe(stream_id.as_bytes())?;
+        subscriber.set_rcvtimeo(30000)?; // 30s timeout
 
-    // Collect training example if self-supervised training is enabled
-    if let Some(ref trainer) = trainer {
-        if let Some(ref qm) = stats.quality_metrics {
-            // Tokenize prompt and response for training using public tokenizer
-            match engine.get_tokenizer() {
-                Ok(tokenizer) => {
-                    let tokenize = |text: &str| -> Result<Vec<i64>> {
-                        let encoding = tokenizer
-                            .encode(text, false)
-                            .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
-                        Ok(encoding.get_ids().iter().map(|&id| id as i64).collect())
+        println!();
+        loop {
+            match subscriber.recv_bytes(0) {
+                Ok(msg) => {
+                    // Message format: topic_bytes + capnp_bytes
+                    // Topic is the stream_id, followed by Cap'n Proto StreamChunk
+                    let topic_len = stream_id.as_bytes().len();
+                    if msg.len() <= topic_len {
+                        continue; // Too short, skip
+                    }
+
+                    // Parse Cap'n Proto StreamChunk after the topic prefix
+                    let chunk_bytes = &msg[topic_len..];
+                    let reader = match serialize::read_message(
+                        &mut std::io::Cursor::new(chunk_bytes),
+                        ReaderOptions::default(),
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!("Failed to parse stream chunk: {}", e);
+                            continue;
+                        }
                     };
 
-                    match (tokenize(&formatted_prompt_for_training), tokenize(&full_response)) {
-                        (Ok(prompt_tokens), Ok(response_tokens)) => {
-                            trainer
-                                .add_example(prompt_tokens, response_tokens, qm.clone(), None)
-                                .await;
+                    let chunk = match reader.get_root::<inference_capnp::stream_chunk::Reader>() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!("Failed to get stream chunk root: {}", e);
+                            continue;
+                        }
+                    };
 
-                            info!(
-                                "Training example collected (perplexity={:.2}, buffer_size={})",
-                                qm.perplexity,
-                                trainer.replay_buffer.len().await
-                            );
-
-                            // Check if ready to train and trigger training cycle
-                            if trainer.ready_to_train().await {
-                                info!("Training cycle triggered...");
-                                match trainer.train_cycle(&engine).await {
-                                    Ok(result) => {
-                                        info!(
-                                            "Training cycle complete: {} steps, mean_loss={:.4}, mean_reward={:.3}",
-                                            result.steps, result.total_loss, result.mean_reward
-                                        );
-                                    }
-                                    Err(e) => {
-                                        warn!("Training cycle failed: {}", e);
-                                    }
-                                }
+                    // Handle the union variant
+                    use inference_capnp::stream_chunk::Which;
+                    match chunk.which() {
+                        Ok(Which::Text(text)) => {
+                            if let Ok(t) = text {
+                                print!("{}", t.to_str().unwrap_or(""));
+                                let _ = io::stdout().flush();
                             }
                         }
-                        (Err(e), _) | (_, Err(e)) => {
-                            warn!("Failed to tokenize for training: {}", e);
+                        Ok(Which::Complete(_stats)) => {
+                            // Stream completed
+                            break;
+                        }
+                        Ok(Which::Error(error_info)) => {
+                            if let Ok(e) = error_info {
+                                if let Ok(msg) = e.get_message() {
+                                    warn!("Stream error: {}", msg.to_str().unwrap_or("unknown"));
+                                }
+                            }
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("Failed to parse chunk variant: {:?}", e);
+                            continue;
                         }
                     }
                 }
+                Err(zmq::Error::EAGAIN) => {
+                    // Timeout waiting for stream
+                    warn!("Stream timeout");
+                    break;
+                }
                 Err(e) => {
-                    warn!("Failed to get tokenizer for training: {}", e);
+                    warn!("Stream error: {}", e);
+                    break;
                 }
             }
         }
+        println!();
+    } else {
+        // Non-streaming: get full response
+        let result = client.generate(&request).await?;
+
+        println!("\n{}", result.text);
+        info!(
+            "Generated {} tokens in {}ms ({:.2} tokens/sec)",
+            result.tokens_generated, result.generation_time_ms, result.tokens_per_second
+        );
+
+        if let Some(ref qm) = result.quality_metrics {
+            info!(
+                "Quality metrics: perplexity={:.2}, entropy={:.2}, entropy_var={:.4}, repetition={:.3}",
+                qm.perplexity, qm.avg_entropy, qm.entropy_variance, qm.repetition_ratio
+            );
+        }
     }
+
+    // Stop the service
+    service_handle.stop().await;
 
     Ok(())
 }

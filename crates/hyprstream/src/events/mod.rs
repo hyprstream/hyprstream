@@ -1,23 +1,11 @@
-//! Event-driven pub/sub system for hyprstream
+//! Event types for hyprstream
 //!
-//! This module provides a ZeroMQ-based event bus for pub/sub messaging between
-//! components (inference, metrics, training, git2db) and external sinks
-//! (webhooks, NATS, MCP tools, containers).
-//!
-//! # Architecture
-//!
-//! ```text
-//! Event Sources                    Event Bus (ZeroMQ)              Sinks
-//! ─────────────                    ──────────────────              ─────
-//! Inference ────────┐              inproc://hyprstream/events      ┌──── Webhook
-//! Metrics ──────────┼──── PUB ────────────────────────────── SUB ──┼──── NATS
-//! Training ─────────┤                                              ├──── MCP Tool
-//! Git2db ───────────┘                                              └──── Container
-//! ```
+//! This module defines event types for P2P messaging between hyprstream instances.
+//! Events will be delivered via DHT-based peer discovery (future work).
 //!
 //! # Topics
 //!
-//! Events are published to topics using dot-notation:
+//! Events use dot-notation topics:
 //! - `inference.generation_complete` - Generation completed with metrics
 //! - `inference.generation_failed` - Generation failed with error
 //! - `metrics.threshold_breach` - Quality metric threshold breached
@@ -29,19 +17,9 @@
 //! - `git2db.commit_created` - Commit created
 //! - `git2db.adapter_saved` - Adapter saved to repository
 
-pub mod bus;
-pub mod capnp_serde;
-pub mod config;
-pub mod registry;
-pub mod sinks;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-
-pub use bus::{EventBus, EventSubscriber};
-pub use config::{SinkConfig, SinkType, SinksConfig};
-pub use registry::SinkRegistry;
 
 /// Source of an event
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -3,13 +3,13 @@
 //! Uses Casbin for policy-based access control with policies
 //! stored in the `.registry/policies/` directory.
 //!
-//! Also provides API token authentication via `TokenManager`.
+//! Also provides JWT token authentication with Ed25519 signatures.
 
+pub mod jwt;
 mod policy_manager;
-mod token_manager;
 
+pub use jwt::{Claims, JwtError, TOKEN_PREFIX, ADMIN_TOKEN_PREFIX};
 pub use policy_manager::{PolicyManager, PolicyError};
-pub use token_manager::{TokenManager, TokenRecord, TokenSummary, TokenError, TOKEN_PREFIX, ADMIN_TOKEN_PREFIX};
 
 /// Operation types that can be controlled via policies
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

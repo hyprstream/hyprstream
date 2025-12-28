@@ -1,12 +1,12 @@
 //! Model management endpoints
 
-use crate::{server::state::ServerState, storage::paths::StoragePaths};
+use crate::{auth::Operation, server::{self, state::ServerState, AuthenticatedUser}, storage::paths::StoragePaths};
 use axum::{
     extract::{Json, Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
 use chrono;
 use serde::{Deserialize, Serialize};
@@ -52,7 +52,20 @@ struct ModelListItem {
 }
 
 /// List all available models
-async fn list_models(State(state): State<ServerState>) -> impl IntoResponse {
+async fn list_models(
+    State(state): State<ServerState>,
+    auth_user: Option<Extension<AuthenticatedUser>>,
+) -> impl IntoResponse {
+    let user = server::extract_user(auth_user.as_ref());
+    if !state.policy_manager.check(&user, "registry:*", Operation::Query).await {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": format!("Permission denied: user '{}' cannot query registry", user)
+            })),
+        ).into_response();
+    }
+
     match state.model_storage.list_models().await {
         Ok(models) => {
             // Transform the raw model data into a cleaner response format
@@ -91,8 +104,20 @@ async fn list_models(State(state): State<ServerState>) -> impl IntoResponse {
 /// Get information about a specific model
 async fn get_model_info(
     State(state): State<ServerState>,
+    auth_user: Option<Extension<AuthenticatedUser>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    let user = server::extract_user(auth_user.as_ref());
+    let resource = format!("model:{}", id);
+    if !state.policy_manager.check(&user, &resource, Operation::Query).await {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": format!("Permission denied: user '{}' cannot query '{}'", user, resource)
+            })),
+        ).into_response();
+    }
+
     // Parse model reference
     use crate::storage::model_ref::ModelRef;
     if let Ok(model_ref) = ModelRef::parse(&id) {
@@ -122,9 +147,20 @@ async fn get_model_info(
 
 /// Download a model from a registry
 async fn download_model(
-    State(_state): State<ServerState>,
+    State(state): State<ServerState>,
+    auth_user: Option<Extension<AuthenticatedUser>>,
     Json(request): Json<DownloadModelRequest>,
 ) -> impl IntoResponse {
+    let user = server::extract_user(auth_user.as_ref());
+    if !state.policy_manager.check(&user, "registry:*", Operation::Write).await {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": format!("Permission denied: user '{}' cannot write to registry", user)
+            })),
+        ).into_response();
+    }
+
     // Basic validation - must be a non-empty string
     let uri = request.uri.clone();
     if uri.is_empty() {
@@ -185,7 +221,22 @@ async fn download_model(
 }
 
 /// Load a model into the engine pool
-async fn load_model(State(state): State<ServerState>, Path(id): Path<String>) -> impl IntoResponse {
+async fn load_model(
+    State(state): State<ServerState>,
+    auth_user: Option<Extension<AuthenticatedUser>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let user = server::extract_user(auth_user.as_ref());
+    let resource = format!("model:{}", id);
+    if !state.policy_manager.check(&user, &resource, Operation::Manage).await {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": format!("Permission denied: user '{}' cannot manage '{}'", user, resource)
+            })),
+        ).into_response();
+    }
+
     // Parse model reference
     let model_ref = match crate::storage::ModelRef::parse(&id) {
         Ok(model_ref) => model_ref,
@@ -225,9 +276,21 @@ async fn load_model(State(state): State<ServerState>, Path(id): Path<String>) ->
 
 /// Unload a model from the engine pool
 async fn unload_model(
-    State(_state): State<ServerState>,
+    State(state): State<ServerState>,
+    auth_user: Option<Extension<AuthenticatedUser>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    let user = server::extract_user(auth_user.as_ref());
+    let resource = format!("model:{}", id);
+    if !state.policy_manager.check(&user, &resource, Operation::Manage).await {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": format!("Permission denied: user '{}' cannot manage '{}'", user, resource)
+            })),
+        ).into_response();
+    }
+
     Json(serde_json::json!({
         "status": "unloaded",
         "id": id
@@ -236,7 +299,20 @@ async fn unload_model(
 }
 
 /// Refresh the model cache (rescans disk for models)
-async fn refresh_cache(State(_state): State<ServerState>) -> impl IntoResponse {
+async fn refresh_cache(
+    State(state): State<ServerState>,
+    auth_user: Option<Extension<AuthenticatedUser>>,
+) -> impl IntoResponse {
+    let user = server::extract_user(auth_user.as_ref());
+    if !state.policy_manager.check(&user, "registry:*", Operation::Manage).await {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": format!("Permission denied: user '{}' cannot manage registry", user)
+            })),
+        ).into_response();
+    }
+
     // Cache is automatically maintained
     Json(serde_json::json!({
         "status": "success",
@@ -246,7 +322,20 @@ async fn refresh_cache(State(_state): State<ServerState>) -> impl IntoResponse {
 }
 
 /// Get cache statistics
-async fn cache_stats(State(state): State<ServerState>) -> impl IntoResponse {
+async fn cache_stats(
+    State(state): State<ServerState>,
+    auth_user: Option<Extension<AuthenticatedUser>>,
+) -> impl IntoResponse {
+    let user = server::extract_user(auth_user.as_ref());
+    if !state.policy_manager.check(&user, "registry:*", Operation::Query).await {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": format!("Permission denied: user '{}' cannot query registry", user)
+            })),
+        ).into_response();
+    }
+
     let stats = state.model_cache.stats().await;
     Json(serde_json::json!({
         "cached_models": stats.cached_models,

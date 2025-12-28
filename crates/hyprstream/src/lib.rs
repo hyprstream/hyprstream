@@ -8,6 +8,7 @@
 //! - FlightSQL interface for embeddings and similarity search
 
 // Cap'n Proto generated modules (must be at crate root for path resolution)
+// Note: common_capnp is in hyprstream-rpc crate (envelope types)
 #[allow(dead_code)]
 #[allow(unused_imports)]
 pub mod events_capnp {
@@ -24,6 +25,12 @@ pub mod inference_capnp {
 #[allow(unused_imports)]
 pub mod registry_capnp {
     include!(concat!(env!("OUT_DIR"), "/registry_capnp.rs"));
+}
+
+#[allow(dead_code)]
+#[allow(unused_imports)]
+pub mod policy_capnp {
+    include!(concat!(env!("OUT_DIR"), "/policy_capnp.rs"));
 }
 
 pub mod adapters;
@@ -80,5 +87,5 @@ pub use runtime::TorchEngine as HyprStreamEngine;
 // Export init function from runtime
 pub use runtime::create_engine as init;
 
-// Event bus exports
-pub use events::{EventBus, EventEnvelope, EventPayload, EventSource, SinkRegistry};
+// Event types exports
+pub use events::{EventEnvelope, EventPayload, EventSource};

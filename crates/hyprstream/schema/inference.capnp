@@ -80,6 +80,15 @@ struct GenerationResult {
   finishReason @2 :FinishReason;
   generationTimeMs @3 :UInt64;
   tokensPerSecond @4 :Float32;
+  qualityMetrics @5 :QualityMetrics;
+}
+
+# Quality metrics for self-supervised training
+struct QualityMetrics {
+  perplexity @0 :Float32;
+  avgEntropy @1 :Float32;
+  entropyVariance @2 :Float32;
+  repetitionRatio @3 :Float32;
 }
 
 enum FinishReason {
@@ -113,6 +122,7 @@ struct StreamStats {
   finishReason @1 :FinishReason;
   generationTimeMs @2 :UInt64;
   tokensPerSecond @3 :Float32;
+  qualityMetrics @4 :QualityMetrics;
 }
 
 # Chat Template

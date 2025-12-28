@@ -4340,6 +4340,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum 0.7.9",
+ "base64 0.22.1",
  "bincode",
  "bindgen 0.70.1",
  "bitflags 2.9.4",
@@ -4364,6 +4365,7 @@ dependencies = [
  "daemonize",
  "dashmap",
  "data",
+ "ed25519-dalek",
  "fastrand",
  "futures",
  "futures-util",
@@ -4375,6 +4377,7 @@ dependencies = [
  "hex",
  "hyprstream-flight",
  "hyprstream-metrics",
+ "hyprstream-rpc",
  "image",
  "indicatif",
  "json-threat-protection",
@@ -4514,6 +4517,44 @@ dependencies = [
  "tonic 0.13.1",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "hyprstream-rpc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "capnp",
+ "capnpc",
+ "ed25519-dalek",
+ "futures",
+ "hex",
+ "hkdf",
+ "hmac",
+ "hyprstream-rpc-derive",
+ "p256",
+ "rand 0.8.5",
+ "sha2",
+ "subtle",
+ "thiserror 1.0.69",
+ "tmq",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "whoami",
+ "x25519-dalek",
+ "zeroize",
+ "zmq",
+]
+
+[[package]]
+name = "hyprstream-rpc-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.111",
 ]
 
 [[package]]
@@ -9740,8 +9781,6 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 [[package]]
 name = "tmq"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3f41ac3a42f65436eed7e1afe80dbe8a982dcac2ea4581bf61bc2d3dcfb19a1"
 dependencies = [
  "futures",
  "log",

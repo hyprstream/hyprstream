@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 
+// Re-export RemoteInfo from rpc_types for public API
+pub use super::rpc_types::RemoteInfo;
+
 /// Worktree information returned by list_worktrees.
 #[derive(Debug, Clone)]
 pub struct WorktreeInfo {
@@ -18,17 +21,6 @@ pub struct WorktreeInfo {
     pub branch: Option<String>,
     /// Storage driver name
     pub driver: String,
-}
-
-/// Remote information returned by list_remotes.
-#[derive(Debug, Clone)]
-pub struct RemoteInfo {
-    /// Remote name (e.g., "origin", "upstream")
-    pub name: String,
-    /// Fetch URL
-    pub url: String,
-    /// Push URL (if different from fetch URL)
-    pub push_url: Option<String>,
 }
 
 /// Service error type for registry operations.

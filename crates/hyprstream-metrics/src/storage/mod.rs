@@ -233,9 +233,6 @@ impl StorageBackend for StorageBackendType {
                 Ok(StorageBackendType::Cached(CachedStorageBackend::new(
                     cache,
                     store,
-                    options.get("max_duration_secs")
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(3600),
                 )))
             }
             _ => Err(Status::invalid_argument("Invalid engine type")),

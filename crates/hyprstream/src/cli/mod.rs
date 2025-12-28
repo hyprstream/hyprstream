@@ -16,18 +16,19 @@ pub mod worktree_handlers;
 
 pub use context::AppContext;
 pub use git_handlers::{
-    handle_branch, handle_checkout, handle_clone, handle_commit, handle_infer, handle_info,
-    handle_list, handle_lora_train, handle_merge, handle_pull, handle_push, handle_remove,
-    handle_status, MergeOptions,
+    apply_policy_template_to_model, handle_branch, handle_checkout, handle_clone, handle_commit,
+    handle_infer, handle_info, handle_list, handle_lora_train, handle_merge, handle_pull,
+    handle_push, handle_remove, handle_status, MergeOptions,
 };
 pub use handlers::{handle_config, handle_server, FlightServerConfig};
 pub use worktree_handlers::{
     handle_worktree_add, handle_worktree_info, handle_worktree_list, handle_worktree_remove,
 };
 pub use policy_handlers::{
-    handle_policy_apply, handle_policy_check, handle_policy_diff, handle_policy_edit,
-    handle_policy_history, handle_policy_rollback, handle_policy_show,
-    handle_token_create, handle_token_list, handle_token_revoke,
+    handle_policy_apply, handle_policy_apply_template, handle_policy_check, handle_policy_diff,
+    handle_policy_edit, handle_policy_history, handle_policy_list_templates, handle_policy_rollback,
+    handle_policy_show, handle_token_create,
+    get_template, get_templates, load_or_generate_signing_key, PolicyTemplate,
 };
 pub use remote_handlers::{
     handle_remote_add, handle_remote_list, handle_remote_remove, handle_remote_rename,

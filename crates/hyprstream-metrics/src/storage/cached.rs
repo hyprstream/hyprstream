@@ -3,7 +3,6 @@
 //! This module provides a caching layer on top of any storage backend:
 //! - Fast access to frequently used data
 //! - Write-through caching for consistency
-//! - Configurable cache duration
 //! - Support for any StorageBackend as cache or store
 //!
 //! # Configuration
@@ -26,7 +25,6 @@
 //! enabled = true
 //! engine = "duckdb"
 //! connection = ":memory:"
-//! max_duration_secs = 3600
 //! options = {
 //!     threads = "2"
 //! }
@@ -43,8 +41,7 @@
 //!   --enable-cache \
 //!   --cache-engine duckdb \
 //!   --cache-connection ":memory:" \
-//!   --cache-options threads=2 \
-//!   --cache-max-duration 3600
+//!   --cache-options threads=2
 //! ```
 //!
 //! The implementation follows standard caching patterns while ensuring
@@ -77,8 +74,6 @@ pub struct CachedStorageBackend {
     cache: Arc<dyn StorageBackend>,
     /// Persistent storage backend for data
     store: Arc<dyn StorageBackend>,
-    /// Maximum cache entry lifetime in seconds
-    max_duration_secs: u64,
 }
 
 impl CachedStorageBackend {
@@ -87,22 +82,18 @@ impl CachedStorageBackend {
     /// This method sets up a two-tier storage system with:
     /// - A fast cache layer for frequent access
     /// - A persistent backing store
-    /// - Configurable cache duration
     ///
     /// # Arguments
     ///
     /// * `cache` - Fast storage backend for caching
     /// * `store` - Persistent storage backend
-    /// * `max_duration_secs` - Maximum cache entry lifetime in seconds
     pub fn new(
         cache: Arc<dyn StorageBackend>,
         store: Arc<dyn StorageBackend>,
-        max_duration_secs: u64,
     ) -> Self {
         Self {
             cache,
             store,
-            max_duration_secs,
         }
     }
 }
