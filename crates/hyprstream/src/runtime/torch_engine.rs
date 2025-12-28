@@ -14,7 +14,7 @@ use serde_json;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU32, AtomicUsize, Ordering},
     Arc, Mutex, PoisonError,
 };
 use tch::{nn::VarStore, Device, Tensor};
@@ -71,6 +71,9 @@ pub struct TorchEngine {
     /// Cached tokenizer vocabulary size for lock-free access
     /// 0 means not yet initialized
     tokenizer_vocab_size: Arc<AtomicUsize>,
+    /// Cached EOS token ID for lock-free access
+    /// 0 means not yet initialized (actual EOS tokens are typically > 0)
+    eos_token_id: Arc<AtomicU32>,
     /// KV cache registry for session-based cache isolation
     /// Enables concurrent inference across multiple sessions
     kv_cache_registry: Option<Arc<crate::runtime::kv_cache::KVCacheRegistry>>,
@@ -378,6 +381,7 @@ impl TorchEngine {
             lora_trainer: Arc::new(Mutex::new(None)),
             sampler: TensorSampler::new(device),
             tokenizer_vocab_size: Arc::new(AtomicUsize::new(0)),
+            eos_token_id: Arc::new(AtomicU32::new(0)),
             kv_cache_registry: None, // Initialized after model load when config is known
             active_cache_owner: Arc::new(Mutex::new(None)),
         })
@@ -662,10 +666,21 @@ impl TorchEngine {
 
             let config_json: serde_json::Value = serde_json::from_str(&config_content)?;
 
-            // TODO: Load special tokens configuration using tokenizer's built-in methods
-
             // Parse template configuration
             let template_config = TemplateEngine::from_tokenizer_config(&config_json)?;
+
+            // Cache EOS token ID for lock-free access during generation
+            if let Some(ref eos_str) = template_config.eos_token {
+                let tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
+                if let Some(ref tokenizer) = *tokenizer_guard {
+                    if let Some(eos_id) = tokenizer.token_to_id(eos_str) {
+                        self.eos_token_id.store(eos_id, Ordering::Relaxed);
+                        info!("Cached EOS token: '{}' -> ID {}", eos_str, eos_id);
+                    } else {
+                        warn!("EOS token '{}' not found in tokenizer vocabulary", eos_str);
+                    }
+                }
+            }
 
             // Create template engine
             let template_engine = TemplateEngine::new(template_config)?;
@@ -770,19 +785,11 @@ impl TorchEngine {
         formatted
     }
 
-    /// Check if a token ID is a special EOS token using tokenizer's built-in detection
+    /// Check if a token ID is the EOS token (lock-free using cached ID)
     pub fn is_eos_token(&self, token_id: usize) -> bool {
-        if let Ok(tokenizer_guard) = self.tokenizer.lock() {
-            if let Some(ref tokenizer) = *tokenizer_guard {
-                // Check if it's the tokenizer's EOS token
-                if let Some(eos_token) = tokenizer.get_added_tokens_decoder().get(&(token_id as u32)) {
-                    return eos_token.content == "<|im_end|>" || eos_token.content == "</s>";
-                }
-            }
-        }
-
-        // Fallback: check if it's a common EOS token
-        token_id as u32 == 2 // Common </s> token ID
+        let cached_eos = self.eos_token_id.load(Ordering::Relaxed);
+        // cached_eos == 0 means not initialized; actual EOS tokens are > 0
+        cached_eos > 0 && token_id as u32 == cached_eos
     }
 
     /// Get the tokenizer for streaming decoding - CoW makes this cheap!
@@ -1045,6 +1052,7 @@ impl RuntimeEngine for TorchEngine {
             seed: None,
             images: Vec::new(),
             timeout: None,
+            collect_metrics: false, // Default: off for performance
         };
 
         let result = self.generate_with_params(request).await?;
@@ -1075,6 +1083,12 @@ impl RuntimeEngine for TorchEngine {
             generation_time_ms: stats.generation_time_ms,
             tokens_per_second: stats.tokens_per_second,
             quality_metrics: stats.quality_metrics,
+            prefill_tokens: stats.prefill_tokens,
+            prefill_time_ms: stats.prefill_time_ms,
+            prefill_tokens_per_sec: stats.prefill_tokens_per_sec,
+            inference_tokens: stats.inference_tokens,
+            inference_time_ms: stats.inference_time_ms,
+            inference_tokens_per_sec: stats.inference_tokens_per_sec,
         })
     }
 
@@ -2166,15 +2180,26 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
 
-/// Statistics about text generation
+/// Statistics about text generation with separate prefill/inference metrics
 #[derive(Debug, Clone)]
 pub struct GenerationStats {
+    // Overall metrics
     pub tokens_generated: usize,
     pub generation_time_ms: u64,
     pub tokens_per_second: f32,
     pub finish_reason: Option<FinishReason>,
     /// Quality metrics captured during generation (for self-supervised training)
     pub quality_metrics: Option<crate::runtime::generation_metrics::GenerationQualityMetrics>,
+
+    // Prefill metrics (processing the prompt)
+    pub prefill_tokens: usize,
+    pub prefill_time_ms: u64,
+    pub prefill_tokens_per_sec: f32,
+
+    // Inference metrics (generating new tokens, excluding prefill)
+    pub inference_tokens: usize,
+    pub inference_time_ms: u64,
+    pub inference_tokens_per_sec: f32,
 }
 
 /// Stream that yields decoded UTF-8 text chunks during generation.
@@ -2226,8 +2251,17 @@ pub struct TextStream<'a> {
     // Timeout handling
     timeout_ms: Option<u64>,
 
+    /// Whether to collect per-token quality metrics (expensive - ~10x overhead)
+    collect_metrics: bool,
+
     /// Metrics accumulator for self-supervised training quality signals
     metrics_accumulator: crate::runtime::generation_metrics::GenerationMetricsAccumulator,
+
+    // Timing for prefill/inference separation
+    /// Time spent on prefill (processing prompt), set after first forward pass
+    prefill_time_ms: Option<u64>,
+    /// Timestamp when first token was sampled (after prefill completes)
+    first_token_time: Option<std::time::Instant>,
 }
 
 impl<'a> TextStream<'a> {
@@ -2306,13 +2340,36 @@ impl<'a> TextStream<'a> {
             finished: false,
             finish_reason: None,
             timeout_ms: request.timeout,
+            collect_metrics: request.collect_metrics,
             metrics_accumulator: crate::runtime::generation_metrics::GenerationMetricsAccumulator::new(),
+            prefill_time_ms: None,
+            first_token_time: None,
         })
     }
 
     /// Get generation statistics (call after stream exhausted)
     pub fn stats(&self) -> GenerationStats {
-        let generation_time = self.start_time.elapsed();
+        let total_time = self.start_time.elapsed();
+
+        // Prefill metrics
+        let prefill_time_ms = self.prefill_time_ms.unwrap_or(0);
+        let prefill_tokens = self.prompt_len;
+        let prefill_tokens_per_sec = if prefill_time_ms > 0 {
+            (prefill_tokens as f32 * 1000.0) / prefill_time_ms as f32
+        } else {
+            0.0
+        };
+
+        // Inference metrics (time since first token was sampled)
+        let inference_time_ms = self.first_token_time
+            .map(|t| t.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        let inference_tokens = self.tokens_generated;
+        let inference_tokens_per_sec = if inference_time_ms > 0 {
+            (inference_tokens as f32 * 1000.0) / inference_time_ms as f32
+        } else {
+            0.0
+        };
 
         // Finalize quality metrics from accumulator
         let quality_metrics = if !self.metrics_accumulator.is_empty() {
@@ -2323,14 +2380,22 @@ impl<'a> TextStream<'a> {
 
         GenerationStats {
             tokens_generated: self.tokens_generated,
-            generation_time_ms: generation_time.as_millis() as u64,
-            tokens_per_second: if generation_time.as_secs_f32() > 0.0 {
-                self.tokens_generated as f32 / generation_time.as_secs_f32()
+            generation_time_ms: total_time.as_millis() as u64,
+            tokens_per_second: if total_time.as_secs_f32() > 0.0 {
+                self.tokens_generated as f32 / total_time.as_secs_f32()
             } else {
                 0.0
             },
             finish_reason: self.finish_reason.clone(),
             quality_metrics,
+
+            // Separate prefill/inference metrics
+            prefill_tokens,
+            prefill_time_ms,
+            prefill_tokens_per_sec,
+            inference_tokens,
+            inference_time_ms,
+            inference_tokens_per_sec,
         }
     }
 
@@ -2343,8 +2408,27 @@ impl<'a> TextStream<'a> {
         };
 
         let logits = if self.tokens_generated == 0 {
-            tracing::debug!("🔵 Initial forward: prompt_len={}", self.prompt_len);
-            self.engine.forward(&self.prompt_tokens)?
+            // PREFILL: Process full prompt and capture timing
+            let prefill_start = std::time::Instant::now();
+            let result = self.engine.forward(&self.prompt_tokens)?;
+            let prefill_elapsed = prefill_start.elapsed();
+
+            // Store prefill timing
+            self.prefill_time_ms = Some(prefill_elapsed.as_millis() as u64);
+            self.first_token_time = Some(std::time::Instant::now());
+
+            tracing::info!(
+                "📊 PREFILL: {} tokens in {:?} ({:.2} tok/sec)",
+                self.prompt_tokens.len(),
+                prefill_elapsed,
+                if prefill_elapsed.as_secs_f32() > 0.0 {
+                    self.prompt_tokens.len() as f32 / prefill_elapsed.as_secs_f32()
+                } else {
+                    0.0
+                }
+            );
+
+            result
         } else {
             let last_token = self.last_generated.expect("last_generated should be set");
 
@@ -2441,9 +2525,10 @@ impl<'a> TextStream<'a> {
             );
         }
 
-        // Capture metrics for self-supervised training (minimal overhead)
-        // Compute log_prob and entropy from logits tensor
-        {
+        // Capture metrics for self-supervised training (EXPENSIVE - only if explicitly enabled)
+        // Computes softmax + entropy over full vocabulary (~150K) with GPU->CPU syncs
+        // This adds ~10x overhead per token, so only enable for training
+        if self.collect_metrics {
             // Get last token's logits (already squeezed to 1D in sampler, but handle 2D case)
             let last_logits = if logits.dim() > 1 {
                 let shape = logits.size();
@@ -2600,18 +2685,8 @@ impl<'a> Stream for TextStream<'a> {
                         self.recent_tokens.pop_front();
                     }
 
-                    // Debug info
-                    let token_str = if let Ok(guard) = self.engine.tokenizer.lock() {
-                        if let Some(ref tok) = *guard {
-                            tok.decode(&[next_token], false).unwrap_or_else(|_| "<decode error>".to_string())
-                        } else {
-                            "<no tokenizer>".to_string()
-                        }
-                    } else {
-                        "<lock error>".to_string()
-                    };
-
-                    tracing::debug!("Token {} (raw: {:?}) -> buffering (incomplete UTF-8)", next_token, token_str);
+                    // Simple trace without expensive tokenizer lock or decode
+                    tracing::trace!("Token {} -> buffering (incomplete UTF-8)", next_token);
                     continue;
                 }
                 Err(e) => {

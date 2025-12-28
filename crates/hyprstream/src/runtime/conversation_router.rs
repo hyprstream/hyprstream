@@ -888,6 +888,13 @@ impl RuntimeEngine for MockRuntimeEngine {
             finish_reason: crate::config::FinishReason::EndOfSequence,
             generation_time_ms: 100,
             quality_metrics: None,
+            // Prefill/inference metrics not tracked in router
+            prefill_tokens: 0,
+            prefill_time_ms: 0,
+            prefill_tokens_per_sec: 0.0,
+            inference_tokens: 0,
+            inference_time_ms: 0,
+            inference_tokens_per_sec: 0.0,
         })
     }
 

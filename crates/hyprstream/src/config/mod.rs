@@ -526,6 +526,10 @@ pub struct GenerationRequest {
     // Async configuration fields
     #[serde(default)]
     pub timeout: Option<u64>, // Duration in milliseconds
+    /// Enable quality metrics collection for self-supervised training.
+    /// Default: false (disabled for performance - metrics add ~10x overhead)
+    #[serde(default)]
+    pub collect_metrics: bool,
 }
 
 /// Unified sampling parameters with Option fields for clean precedence merging.
@@ -679,6 +683,7 @@ pub struct GenerationRequestBuilder {
     prompt: String,
     params: SamplingParams,
     images: Vec<String>,
+    collect_metrics: bool,
 }
 
 impl GenerationRequestBuilder {
@@ -687,6 +692,7 @@ impl GenerationRequestBuilder {
             prompt: prompt.into(),
             params: SamplingParams::default(),
             images: vec![],
+            collect_metrics: false, // Default: off for performance
         }
     }
 
@@ -764,6 +770,12 @@ impl GenerationRequestBuilder {
         }
     }
 
+    /// Enable quality metrics collection (expensive - ~10x slowdown)
+    pub fn collect_metrics(mut self, value: bool) -> Self {
+        self.collect_metrics = value;
+        self
+    }
+
     pub fn build(self) -> GenerationRequest {
         let resolved = self.params.resolve();
         GenerationRequest {
@@ -778,6 +790,7 @@ impl GenerationRequestBuilder {
             seed: resolved.seed.map(|s| s as u32),
             images: self.images,
             timeout: Some(resolved.timeout_ms),
+            collect_metrics: self.collect_metrics,
         }
     }
 }
@@ -829,6 +842,7 @@ impl From<&GenerationConfig> for GenerationRequest {
             images: vec![],  // No images in conversion
             seed: config.seed,
             timeout: None, // Not in GenerationConfig
+            collect_metrics: false, // Default: off for performance
         }
     }
 }
@@ -957,6 +971,22 @@ pub struct GenerationResult {
     /// Quality metrics for self-supervised training
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quality_metrics: Option<GenerationQualityMetrics>,
+
+    // Prefill metrics (processing the prompt)
+    #[serde(default)]
+    pub prefill_tokens: usize,
+    #[serde(default)]
+    pub prefill_time_ms: u64,
+    #[serde(default)]
+    pub prefill_tokens_per_sec: f32,
+
+    // Inference metrics (generating new tokens, excluding prefill)
+    #[serde(default)]
+    pub inference_tokens: usize,
+    #[serde(default)]
+    pub inference_time_ms: u64,
+    #[serde(default)]
+    pub inference_tokens_per_sec: f32,
 }
 
 /// Why generation stopped

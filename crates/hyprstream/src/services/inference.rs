@@ -794,6 +794,14 @@ impl InferenceService {
                         generation_time_ms: stats.generation_time_ms,
                         tokens_per_second: stats.tokens_per_second,
                         quality_metrics: stats.quality_metrics,
+                        // Prefill metrics
+                        prefill_tokens: stats.prefill_tokens,
+                        prefill_time_ms: stats.prefill_time_ms,
+                        prefill_tokens_per_sec: stats.prefill_tokens_per_sec,
+                        // Inference metrics
+                        inference_tokens: stats.inference_tokens,
+                        inference_time_ms: stats.inference_time_ms,
+                        inference_tokens_per_sec: stats.inference_tokens_per_sec,
                     };
                     self.collect_training_example(&prompt, &gen_result);
                 });
@@ -927,6 +935,7 @@ impl InferenceService {
             seed,
             images,
             timeout,
+            collect_metrics: false, // Default: off for performance
         })
     }
 }
@@ -1504,6 +1513,14 @@ impl InferenceZmqClient {
                     generation_time_ms: result.get_generation_time_ms(),
                     tokens_per_second: result.get_tokens_per_second(),
                     quality_metrics: None, // TODO: Parse from capnp when schema is updated
+                    // Prefill metrics
+                    prefill_tokens: result.get_prefill_tokens() as usize,
+                    prefill_time_ms: result.get_prefill_time_ms(),
+                    prefill_tokens_per_sec: result.get_prefill_tokens_per_sec(),
+                    // Inference metrics
+                    inference_tokens: result.get_inference_tokens() as usize,
+                    inference_time_ms: result.get_inference_time_ms(),
+                    inference_tokens_per_sec: result.get_inference_tokens_per_sec(),
                 })
             }
             Which::Error(err) => {

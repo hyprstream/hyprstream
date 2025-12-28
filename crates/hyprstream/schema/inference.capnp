@@ -81,6 +81,14 @@ struct GenerationResult {
   generationTimeMs @3 :UInt64;
   tokensPerSecond @4 :Float32;
   qualityMetrics @5 :QualityMetrics;
+  # Prefill metrics (processing prompt)
+  prefillTokens @6 :UInt32;
+  prefillTimeMs @7 :UInt64;
+  prefillTokensPerSec @8 :Float32;
+  # Inference metrics (generating tokens)
+  inferenceTokens @9 :UInt32;
+  inferenceTimeMs @10 :UInt64;
+  inferenceTokensPerSec @11 :Float32;
 }
 
 # Quality metrics for self-supervised training

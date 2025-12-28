@@ -637,29 +637,21 @@ impl LlamaAttention {
         let q_len = score_shape[2]; // query sequence length
         let k_len = score_shape[3]; // key sequence length
 
-        // Create causal mask where future positions are -inf
-        // This prevents the model from attending to future tokens
-        if q_len > 1 || k_len > 1 {
-            // Create a lower triangular mask
-            // For KV cache case: q_len=1, k_len=full_seq, we need a mask of [1, k_len]
-            // where all positions are allowed (since they're all past positions)
-            let mask = if q_len == 1 && k_len > 1 {
-                // Single query attending to all past keys - all positions valid
-                Tensor::ones([q_len, k_len], (scores.kind(), scores.device()))
-            } else {
-                // Standard causal mask for multiple queries
-                Tensor::ones([q_len, k_len], (scores.kind(), scores.device())).tril(0)
-                // Lower triangular (1s at and below diagonal, 0s above)
-            };
+        // Apply causal mask only when processing multiple query tokens (prompt phase)
+        // For autoregressive generation (q_len=1), all past positions are valid - no mask needed
+        if q_len > 1 {
+            // Standard causal mask for multiple queries (e.g., processing prompt)
+            // Lower triangular: 1s at and below diagonal, 0s above
+            let mask = Tensor::ones([q_len, k_len], (scores.kind(), scores.device())).tril(0);
 
             // Expand mask to match scores dimensions [batch, heads, q_len, k_len]
             let mask = mask.unsqueeze(0).unsqueeze(0).expand_as(&scores);
 
             // Apply mask: set future positions (where mask=0) to -inf
-            // Use masked_fill to set positions where mask == 0 to -10000
             let mask_value = -10000.0f64;
             scores = scores.masked_fill(&mask.eq(0.0), mask_value);
         }
+        // When q_len=1 (KV cache autoregressive), skip mask - all past positions valid
 
         // Apply sliding window mask if configured (Gemma3)
         if let Some(window_size) = self.sliding_window {
@@ -674,37 +666,38 @@ impl LlamaAttention {
     }
 
     /// Apply sliding window mask for local attention layers
+    /// Optimized to use GPU-native ops instead of O(n²) CPU loop
     fn apply_sliding_window_mask(&self, scores: &Tensor, window_size: usize) -> Result<Tensor> {
         let (batch_size, num_heads, seq_len, _) = dims4(scores)?;
         let device = scores.device();
         let dtype = scores.kind();
 
-        // Create sliding window mask
-        // Each position can only attend to window_size positions before it
-        let mut mask_values = vec![0f32; (seq_len * seq_len) as usize];
-        for i in 0..seq_len {
-            for j in 0..seq_len {
-                // Can attend to positions within window_size before current position
-                // and the current position itself
-                if j <= i && i - j < window_size as i64 {
-                    mask_values[(i * seq_len + j) as usize] = 0.0;
-                } else {
-                    // Mask out positions outside the window with large negative value
-                    mask_values[(i * seq_len + j) as usize] = -10000.0;
-                }
-            }
-        }
+        // Create sliding window mask using GPU-native tril/triu operations
+        // Valid positions: j <= i (causal) AND i - j < window_size (in window)
 
-        // Create mask tensor and broadcast to match scores shape
-        let mask = Tensor::from_slice(&mask_values)
-            .reshape([seq_len, seq_len])
-            .to(device)
-            .to_dtype(dtype, false, false)
-            .unsqueeze(0) // [1, seq, seq]
-            .unsqueeze(0) // [1, 1, seq, seq]
+        // Causal mask: lower triangular (j <= i)
+        let causal = Tensor::ones([seq_len, seq_len], (dtype, device)).tril(0);
+
+        // Window mask: upper triangular starting from -(window_size-1)
+        // This keeps positions where j >= i - window_size + 1
+        let window = Tensor::ones([seq_len, seq_len], (dtype, device))
+            .triu(1 - window_size as i64);
+
+        // Valid = causal AND window (element-wise multiplication of 0/1 masks)
+        let valid_mask = &causal * &window;
+
+        // Convert to additive mask: 0 where valid, -10000 where invalid
+        // invalid = 1 - valid, then scale by -10000
+        let additive_mask = (Tensor::ones([seq_len, seq_len], (dtype, device)) - valid_mask)
+            * (-10000.0f64);
+
+        // Broadcast to [batch, heads, seq, seq]
+        let mask = additive_mask
+            .unsqueeze(0)
+            .unsqueeze(0)
             .expand([batch_size, num_heads, seq_len, seq_len], false);
 
-        // Add mask to scores (masked positions get large negative values)
+        // Add mask to scores
         broadcast_add(scores, &mask)
     }
 }
@@ -1625,6 +1618,18 @@ impl ModelOperations for LlamaModel {
             )
         };
 
+        // PERF: Lock KV cache ONCE before the layer loop (not 28 times inside!)
+        // This reduces lock overhead from O(layers) to O(1) per forward pass.
+        let cache_guard = self.kv_cache.as_ref().map(|cache_ref| {
+            match cache_ref.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    tracing::warn!("KV cache lock poisoned, recovering");
+                    poisoned.into_inner()
+                }
+            }
+        });
+
         for (idx, layer) in self.layers.iter().enumerate() {
             let residual = hidden_states.shallow_clone();
             // tracing::debug!("Processing layer {}, hidden_states shape: {:?}", idx, hidden_states.size());
@@ -1633,8 +1638,7 @@ impl ModelOperations for LlamaModel {
             hidden_states = layer.input_layernorm.forward(&hidden_states)?;
 
             // Handle KV cache per layer with proper start_pos
-            let attn_output = if let Some(cache_ref) = self.kv_cache.as_ref() {
-                let cache_manager = cache_ref.lock().unwrap();  // Lock is immutable since with_layer_cache takes &self
+            let attn_output = if let Some(ref cache_manager) = cache_guard {
                 if let Some(result) = cache_manager.with_layer_cache(idx, |layer_cache| {
                     tracing::trace!(
                         "Layer {}: Using KV cache, cache_pos={}",

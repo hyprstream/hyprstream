@@ -435,6 +435,14 @@ impl InferenceResponse {
         gen_result.set_finish_reason(Self::finish_reason_to_capnp(&result.finish_reason));
         gen_result.set_generation_time_ms(result.generation_time_ms);
         gen_result.set_tokens_per_second(result.tokens_per_second);
+        // Prefill metrics
+        gen_result.set_prefill_tokens(result.prefill_tokens as u32);
+        gen_result.set_prefill_time_ms(result.prefill_time_ms);
+        gen_result.set_prefill_tokens_per_sec(result.prefill_tokens_per_sec);
+        // Inference metrics
+        gen_result.set_inference_tokens(result.inference_tokens as u32);
+        gen_result.set_inference_time_ms(result.inference_time_ms);
+        gen_result.set_inference_tokens_per_sec(result.inference_tokens_per_sec);
 
         let mut bytes = Vec::new();
         serialize::write_message(&mut bytes, &msg).unwrap_or_default();

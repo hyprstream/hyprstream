@@ -85,7 +85,8 @@ impl TensorSampler {
             penalized_logits
         };
 
-        // Step 3: Apply temperature scaling with consistent precision
+        // Step 3: Apply temperature scaling
+        // Use scalar division directly - tch-rs handles precision correctly with f64
         let scaled_logits = if temperature <= 0.0 || temperature.is_nan() || temperature.is_infinite() {
             // Invalid temperature: use greedy decoding (temperature → 0 means argmax)
             filtered_logits
@@ -93,12 +94,8 @@ impl TensorSampler {
             // Temperature is effectively 1.0, no scaling needed
             filtered_logits
         } else {
-            // FIX: Create temperature tensor with same precision as logits to prevent precision loss
-            let temp_tensor = Tensor::from_slice(&[temperature])
-                .to_device(self.device)
-                .to_kind(filtered_logits.kind());  // Match logits precision exactly
-            // Use tensor division instead of scalar division to maintain precision
-            filtered_logits / temp_tensor
+            // Scalar division avoids tensor allocation per token
+            filtered_logits / (temperature as f64)
         };
 
         // Step 4: Convert to probabilities with numerical stability
@@ -184,15 +181,11 @@ impl TensorSampler {
         Ok(result)
     }
 
-    /// Stable softmax computation on GPU
+    /// Softmax computation using PyTorch's optimized fused kernel
     fn softmax_stable(&self, logits: &Tensor) -> Result<Tensor> {
-        // Compute softmax with numerical stability: exp(x - max(x))
-        let max_logit = logits.max();
-        let shifted_logits = logits - &max_logit;
-        let exp_logits = shifted_logits.exp();
-        let sum_exp = exp_logits.sum(logits.kind());  // Preserve input precision
-
-        Ok(&exp_logits / &sum_exp)
+        // Use PyTorch's native softmax - it's a single fused kernel that handles
+        // numerical stability internally (subtracts max before exp)
+        Ok(logits.softmax(-1, logits.kind()))
     }
 
     /// Apply top-k filtering to logits (before softmax)
@@ -256,17 +249,10 @@ impl TensorSampler {
         let mut filtered_probs = Tensor::zeros_like(probs);
         let _ = filtered_probs.scatter_(-1, &sorted_indices, &filtered_sorted);
 
-        // Renormalize (with safety check for zero sum)
+        // Renormalize - top-p filtering always keeps at least one token (highest prob)
+        // so sum > 0, avoiding the need for GPU-CPU sync to check
         let sum = filtered_probs.sum(filtered_probs.kind());
-        let sum_scalar = sum.double_value(&[]);
-
-        if sum_scalar <= 0.0 || sum_scalar.is_nan() || sum_scalar.is_infinite() {
-            // If filtering removed all probability mass, keep original distribution
-            // This can happen with very small top_p values
-            Ok(probs.shallow_clone())
-        } else {
-            Ok(&filtered_probs / &sum)
-        }
+        Ok(&filtered_probs / &sum)
     }
 
     /// Sample from multinomial distribution on GPU

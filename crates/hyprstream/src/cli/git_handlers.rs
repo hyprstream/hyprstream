@@ -1536,8 +1536,16 @@ pub async fn handle_infer(
 
         println!("\n{}", result.text);
         info!(
-            "Generated {} tokens in {}ms ({:.2} tokens/sec)",
+            "Generated {} tokens in {}ms ({:.2} tokens/sec overall)",
             result.tokens_generated, result.generation_time_ms, result.tokens_per_second
+        );
+        info!(
+            "  Prefill: {} tokens in {}ms ({:.2} tokens/sec)",
+            result.prefill_tokens, result.prefill_time_ms, result.prefill_tokens_per_sec
+        );
+        info!(
+            "  Inference: {} tokens in {}ms ({:.2} tokens/sec)",
+            result.inference_tokens, result.inference_time_ms, result.inference_tokens_per_sec
         );
 
         if let Some(ref qm) = result.quality_metrics {
