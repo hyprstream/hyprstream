@@ -825,6 +825,8 @@ impl LayerKVCache {
                 keys: Some(cached_keys),
                 values: Some(cached_values),
             } => {
+                // Return views only - the .contiguous() in attention (after transposes)
+                // will handle memory layout. Avoids double-copying K/V per layer.
                 let keys_slice = cached_keys.narrow(1, 0, self.seq_pos as i64);
                 let values_slice = cached_values.narrow(1, 0, self.seq_pos as i64);
                 Ok((keys_slice, values_slice))

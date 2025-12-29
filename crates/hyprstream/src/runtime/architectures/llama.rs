@@ -441,13 +441,15 @@ impl LlamaAttention {
         let scores = self.compute_attention_scores(&q, &k_expanded)?;
 
         // V: [batch, seq, heads, dim] -> [batch, heads, seq, dim]
-        let v = v_expanded.transpose(1, 2);
+        // PERF: .contiguous() forces optimal memory layout for matmul on ROCm/AMD
+        let v = v_expanded.transpose(1, 2).contiguous();
 
         // Apply attention to values: [batch, heads, seq, seq] x [batch, heads, seq, dim] = [batch, heads, seq, dim]
         let attn_output = scores.matmul(&v);
 
         // Transpose back: [batch, heads, seq, dim] -> [batch, seq, heads, dim]
-        let attn_output = attn_output.transpose(1, 2);
+        // PERF: .contiguous() before reshape ensures optimal memory access
+        let attn_output = attn_output.transpose(1, 2).contiguous();
 
         // Reshape to combine heads: [batch, seq, heads*dim]
         let attn_output =
@@ -624,9 +626,10 @@ impl LlamaAttention {
         let scale = 1.0 / (self.head_dim as f32).sqrt();
 
         // Q: [batch, seq, heads, dim] -> [batch, heads, seq, dim]
-        let q = q.transpose(1, 2);
+        // PERF: .contiguous() forces optimal memory layout for matmul on ROCm/AMD
+        let q = q.transpose(1, 2).contiguous();
         // K: [batch, seq, heads, dim] -> [batch, heads, seq, dim] -> [batch, heads, dim, seq]
-        let k = k.transpose(1, 2).transpose(2, 3);
+        let k = k.transpose(1, 2).transpose(2, 3).contiguous();
 
         // Compute attention scores: [batch, heads, seq, seq]
         let mut scores = q.matmul(&k) * (scale as f64);

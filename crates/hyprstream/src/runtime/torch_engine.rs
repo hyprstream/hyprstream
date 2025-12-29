@@ -2216,10 +2216,8 @@ pub struct TextStream<'a> {
     recent_tokens: VecDeque<i64>,
     repeat_last_n: usize,
 
-    temperature: f32,
-    top_p: f32,
-    top_k: Option<usize>,
-    repeat_penalty: f32,
+    // PERF: Individual sampling params removed - now stored in sampling_params field below
+    // This avoids struct recreation per token while keeping backward compatibility
 
     max_tokens: usize,
     stop_token_ids: Vec<u32>,
@@ -2256,6 +2254,16 @@ pub struct TextStream<'a> {
 
     /// Metrics accumulator for self-supervised training quality signals
     metrics_accumulator: crate::runtime::generation_metrics::GenerationMetricsAccumulator,
+
+    // PERF: Cached values to avoid per-token recomputation
+    /// Pre-created sampling params - avoids struct creation per token
+    sampling_params: SamplingParams,
+    /// Cached tokenizer vocab size - avoids lock acquisition per token
+    vocab_size: usize,
+    /// Cached model vocab size (from logits shape) - set after first forward
+    model_vocab_size: usize,
+    /// Reusable buffer for recent_tokens when VecDeque wraps around
+    recent_tokens_buffer: Vec<i64>,
 
     // Timing for prefill/inference separation
     /// Time spent on prefill (processing prompt), set after first forward pass
@@ -2318,16 +2326,23 @@ impl<'a> TextStream<'a> {
             tokenizer_ref.decode_stream(false) // skip_special_tokens=false
         };
 
+        // PERF: Pre-create sampling params to avoid struct allocation per token
+        let sampling_params = SamplingParams {
+            temperature: request.temperature,
+            top_p: request.top_p,
+            top_k: request.top_k,
+            repeat_penalty: request.repeat_penalty,
+        };
+
+        // PERF: Cache vocab_size to avoid lock acquisition per token
+        let vocab_size = engine.get_vocab_size();
+
         Ok(Self {
             engine,
             prompt_tokens,
             last_generated: None,
             recent_tokens: VecDeque::with_capacity(repeat_last_n),
             repeat_last_n,
-            temperature: request.temperature,
-            top_p: request.top_p,
-            top_k: request.top_k,
-            repeat_penalty: request.repeat_penalty,
             max_tokens: request.max_tokens,
             stop_token_ids,
             tokenizer: tokenizer_arc,
@@ -2342,6 +2357,11 @@ impl<'a> TextStream<'a> {
             timeout_ms: request.timeout,
             collect_metrics: request.collect_metrics,
             metrics_accumulator: crate::runtime::generation_metrics::GenerationMetricsAccumulator::new(),
+            // PERF: Cached values initialized here, avoid per-token recomputation
+            sampling_params,
+            vocab_size,
+            model_vocab_size: 0, // Set after first forward pass from logits shape
+            recent_tokens_buffer: Vec::with_capacity(repeat_last_n),
             prefill_time_ms: None,
             first_token_time: None,
         })
@@ -2457,9 +2477,18 @@ impl<'a> TextStream<'a> {
         // Solution: Use model vocab directly. The sampler will only pick valid tokens anyway.
         // The tokenizer's get_vocab_size() should match model vocab if properly configured.
 
-        let vocab_size = self.engine.get_vocab_size();
-        let logits_shape = logits.size();
-        let model_vocab_size = logits_shape[logits_shape.len() - 1] as usize;
+        // PERF: Use cached vocab_size - avoids lock acquisition per token
+        let vocab_size = self.vocab_size;
+
+        // PERF: Cache model_vocab_size on first call (from logits shape)
+        let model_vocab_size = if self.model_vocab_size == 0 {
+            let logits_shape = logits.size();
+            let size = logits_shape[logits_shape.len() - 1] as usize;
+            self.model_vocab_size = size;
+            size
+        } else {
+            self.model_vocab_size
+        };
 
         if vocab_size == 0 {
             // Tokenizer not loaded - this should never happen during generation
@@ -2493,19 +2522,19 @@ impl<'a> TextStream<'a> {
         // The truncation to vocab_size is necessary to prevent out-of-bounds,
         // but may be filtering out valid year token IDs.
 
-        let params = SamplingParams {
-            temperature: self.temperature,
-            top_p: self.top_p,
-            top_k: self.top_k,
-            repeat_penalty: self.repeat_penalty,
-        };
+        // PERF: Use pre-created sampling params - avoids struct allocation per token
+        let params = &self.sampling_params;
 
+        // PERF: Optimize VecDeque slice handling
         let (slice1, slice2) = self.recent_tokens.as_slices();
         let next_token = if slice2.is_empty() {
-            self.engine.sample_token_with_params(&logits, &params, slice1)?
+            // Fast path: VecDeque is contiguous, use slice directly
+            self.engine.sample_token_with_params(&logits, params, slice1)?
         } else {
-            let recent_tokens_vec: Vec<i64> = self.recent_tokens.iter().copied().collect();
-            self.engine.sample_token_with_params(&logits, &params, &recent_tokens_vec)?
+            // Slow path: VecDeque wrapped around, use pre-allocated buffer
+            self.recent_tokens_buffer.clear();
+            self.recent_tokens_buffer.extend(self.recent_tokens.iter().copied());
+            self.engine.sample_token_with_params(&logits, params, &self.recent_tokens_buffer)?
         };
 
         // Validate sampled token is within model vocabulary
