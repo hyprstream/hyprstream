@@ -134,7 +134,7 @@ half = "2.6.0"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # Messaging
-tmq = { path = "/home/birdetta/tmq" }  # Local TMQ with XPUB/XSUB support
+tmq = { git = "https://github.com/hyprstream/tmq", branch = "xpubsub" }  # TMQ with XPUB/XSUB support
 zmq = "0.10"  # Underlying libzmq bindings
 
 # Cap'n Proto (zero-copy serialization)
