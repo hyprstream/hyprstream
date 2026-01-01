@@ -58,6 +58,7 @@
 mod core;
 mod traits;
 pub mod inference;
+pub mod model;
 pub mod policy;
 pub mod registry;
 pub mod rpc_types;
@@ -70,11 +71,13 @@ pub use traits::{
     RegistryClient, RegistryServiceError, RemoteInfo, RepositoryClient, WorktreeInfo,
 };
 
-pub use inference::{
-    InferenceService, InferenceZmqClient, INFERENCE_ENDPOINT, INFERENCE_STREAM_ENDPOINT,
-};
+pub use inference::{InferenceService, InferenceZmqClient, INFERENCE_ENDPOINT};
 pub use registry::{
     RegistryOps, RegistryService, RegistryZmq, RegistryZmqClient, RepositoryZmqClient,
     REGISTRY_ENDPOINT,
 };
 pub use policy::{PolicyService, PolicyZmqClient, POLICY_ENDPOINT};
+pub use model::{
+    LoadedModelInfo, ModelHealthInfo, ModelService, ModelServiceConfig, ModelStatusInfo,
+    ModelZmqClient, MODEL_ENDPOINT,
+};

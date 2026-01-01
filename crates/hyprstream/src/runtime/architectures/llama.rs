@@ -437,11 +437,17 @@ impl LlamaAttention {
             (k_for_attn, v_for_attn)
         };
 
+        // Manual attention implementation
+        // Note: SDPA was tested but:
+        // - efficient_attention panics on this ROCm/libtorch version
+        // - math_attention is slower than manual (~12 tok/sec vs ~70 tok/sec prefill)
+        // See plan file for detailed analysis and future work.
+
         // Compute attention scores
         let scores = self.compute_attention_scores(&q, &k_expanded)?;
 
         // V: [batch, seq, heads, dim] -> [batch, heads, seq, dim]
-        // PERF: .contiguous() forces optimal memory layout for matmul on ROCm/AMD
+        // PERF: .contiguous() required for optimal batched matmul on ROCm/AMD
         let v = v_expanded.transpose(1, 2).contiguous();
 
         // Apply attention to values: [batch, heads, seq, seq] x [batch, heads, seq, dim] = [batch, heads, seq, dim]
@@ -626,7 +632,7 @@ impl LlamaAttention {
         let scale = 1.0 / (self.head_dim as f32).sqrt();
 
         // Q: [batch, seq, heads, dim] -> [batch, heads, seq, dim]
-        // PERF: .contiguous() forces optimal memory layout for matmul on ROCm/AMD
+        // PERF: .contiguous() required for optimal batched matmul on ROCm/AMD
         let q = q.transpose(1, 2).contiguous();
         // K: [batch, seq, heads, dim] -> [batch, heads, seq, dim] -> [batch, heads, dim, seq]
         let k = k.transpose(1, 2).transpose(2, 3).contiguous();

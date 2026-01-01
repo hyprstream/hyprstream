@@ -83,4 +83,14 @@ fn compile_capnp_schemas() {
             .run()
             .expect("failed to compile policy.capnp");
     }
+
+    // Compile model schema
+    let model_schema = schema_dir.join("model.capnp");
+    if model_schema.exists() {
+        capnpc::CompilerCommand::new()
+            .src_prefix("schema")
+            .file(&model_schema)
+            .run()
+            .expect("failed to compile model.capnp");
+    }
 }

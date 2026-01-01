@@ -2,6 +2,7 @@
 
 use crate::config::{
     FinishReason, GenerationConfig, GenerationRequest, GenerationResult, ModelInfo, RuntimeConfig,
+    TemplatedPrompt,
 };
 use crate::runtime::tensor_sampling::TensorSampler;
 use crate::runtime::template_engine::{ChatMessage, TemplateEngine};
@@ -1041,7 +1042,7 @@ impl RuntimeEngine for TorchEngine {
         );
 
         let request = GenerationRequest {
-            prompt: formatted_prompt,
+            prompt: TemplatedPrompt::new(formatted_prompt),
             max_tokens,
             temperature: self.generation_config.temperature,
             top_p: self.generation_config.top_p,
@@ -2274,7 +2275,7 @@ pub struct TextStream<'a> {
 
 impl<'a> TextStream<'a> {
     fn new(engine: &'a TorchEngine, request: GenerationRequest) -> Result<Self> {
-        let prompt_tokens = engine.tokenize(&request.prompt)?;
+        let prompt_tokens = engine.tokenize(request.prompt.as_str())?;
         let prompt_len = prompt_tokens.len();
 
         let tokenizer = engine.get_tokenizer()?;

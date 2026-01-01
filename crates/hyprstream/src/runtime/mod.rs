@@ -16,7 +16,7 @@ pub use crate::config::{
 };
 
 pub mod architectures; // Architecture-specific model implementations (includes Janus placeholder utils)
-pub mod conversation_router; // Seamless model evolution and routing
+// REMOVED: pub mod conversation_router; // Dead code - VDB TemporalStreamingLayer removed
 pub mod generation_metrics; // Quality metrics for self-supervised training
 pub mod kv_quant; // KV cache quantization types
 pub mod tensor_sampling; // Device-agnostic tensor-based sampling
@@ -71,12 +71,8 @@ pub enum ModelBuilderConfig {
     Default,
 }
 
-// Conversation routing exports
-pub use conversation_router::{
-    AdaptationTrigger, AdaptationType, ConversationContext, ConversationResponse,
-    ConversationRouter, ConversationSession, ConversationTurn, ModelPool, ModelState, PoolStats,
-    RoutingConfig,
-};
+// REMOVED: Conversation routing exports - dead code
+// pub use conversation_router::{...};
 
 // LoRA and adapter exports
 // LoRA wrapper removed - using direct PyTorch implementation

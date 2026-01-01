@@ -1,7 +1,7 @@
 //! LoRA training implementation with PyTorch backend
 
 use super::{ChatTemplateDataLoader, TrainingDataset};
-use crate::config::GenerationRequest;
+use crate::config::{GenerationRequest, TemplatedPrompt};
 use crate::storage::{AdapterConfig, AdapterManager};
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -187,7 +187,7 @@ impl LoRATrainer {
             // Simulate forward pass - in reality this would generate logits
             // and compute cross-entropy loss against target tokens
             let request = GenerationRequest {
-                prompt: input.to_string(),
+                prompt: TemplatedPrompt::new(input.to_string()),
                 max_tokens: 50,
                 temperature: 0.7,
                 top_p: 0.9,
@@ -254,7 +254,7 @@ impl LoRATrainer {
         for (input, _target) in batch {
             // Generate without updating weights
             let request = GenerationRequest {
-                prompt: input.to_string(),
+                prompt: TemplatedPrompt::new(input.to_string()),
                 max_tokens: 50,
                 temperature: 0.7,
                 top_p: 0.9,

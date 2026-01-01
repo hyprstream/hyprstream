@@ -84,7 +84,7 @@ async fn start_training(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{}", lora_id);
-    if !state.policy_manager.check(&user, &resource, Operation::Train).await {
+    if !state.policy_client.check(&user, &resource, Operation::Train).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -121,7 +121,7 @@ async fn stop_training(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{}", lora_id);
-    if !state.policy_manager.check(&user, &resource, Operation::Train).await {
+    if !state.policy_client.check(&user, &resource, Operation::Train).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -154,7 +154,7 @@ async fn get_status(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{}", lora_id);
-    if !state.policy_manager.check(&user, &resource, Operation::Query).await {
+    if !state.policy_client.check(&user, &resource, Operation::Query).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -185,7 +185,7 @@ async fn submit_samples(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{}", lora_id);
-    if !state.policy_manager.check(&user, &resource, Operation::Train).await {
+    if !state.policy_client.check(&user, &resource, Operation::Train).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -230,7 +230,7 @@ async fn write_checkpoint(
 
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{}", req.model_id);
-    if !state.policy_manager.check(&user, &resource, Operation::Write).await {
+    if !state.policy_client.check(&user, &resource, Operation::Write).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -337,7 +337,7 @@ async fn commit_checkpoint(
 
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{}", model_id);
-    if !state.policy_manager.check(&user, &resource, Operation::Write).await {
+    if !state.policy_client.check(&user, &resource, Operation::Write).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -411,7 +411,7 @@ async fn start_pretraining(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{}", req.model_id);
-    if !state.policy_manager.check(&user, &resource, Operation::Train).await {
+    if !state.policy_client.check(&user, &resource, Operation::Train).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({

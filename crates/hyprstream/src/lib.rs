@@ -33,6 +33,12 @@ pub mod policy_capnp {
     include!(concat!(env!("OUT_DIR"), "/policy_capnp.rs"));
 }
 
+#[allow(dead_code)]
+#[allow(unused_imports)]
+pub mod model_capnp {
+    include!(concat!(env!("OUT_DIR"), "/model_capnp.rs"));
+}
+
 pub mod adapters;
 pub mod api;
 pub mod archetypes;
@@ -56,23 +62,14 @@ pub mod zmq;
 // Storage exports removed
 pub use runtime::{
     AdaptationMode,
-    AdaptationTrigger,
-    AdaptationType,
+    // REMOVED: AdaptationTrigger, AdaptationType, ConversationContext, ConversationResponse,
+    // ConversationRouter, ConversationSession, ConversationTurn, ModelPool, ModelState,
+    // PoolStats, RoutingConfig - dead code from conversation_router
     AdapterMetrics,
-    ConversationContext,
-    ConversationResponse,
-    // Model Evolution System exports
-    ConversationRouter,
-    ConversationSession,
-    ConversationTurn,
     FinishReason,
     GenerationRequest,
     GenerationResult,
     ModelInfo,
-    ModelPool,
-    ModelState,
-    PoolStats,
-    RoutingConfig,
     RuntimeConfig,
     RuntimeEngine,
     TorchEngine,

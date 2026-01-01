@@ -448,7 +448,9 @@ impl HyprConfig {
     }
 
     /// Create generation request from config + prompt
-    pub fn create_request(&self, prompt: String) -> GenerationRequest {
+    ///
+    /// Note: The prompt should already be templated (via apply_chat_template).
+    pub fn create_request(&self, prompt: TemplatedPrompt) -> GenerationRequest {
         let mut request = GenerationRequest::from(&self.generation);
         request.prompt = prompt;
         request
@@ -507,10 +509,49 @@ pub struct ModelInfo {
     pub quantization: Option<String>,
 }
 
+/// A prompt string that has been processed through the chat template engine.
+/// This newtype prevents accidentally passing untemplated strings to generation.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct TemplatedPrompt(String);
+
+impl TemplatedPrompt {
+    /// Create from a templated string. Only call after template application.
+    pub fn new(s: String) -> Self {
+        Self(s)
+    }
+
+    /// Get the prompt as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume and return the inner string.
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+
+    /// Get the length of the prompt in bytes.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Check if the prompt is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Display for TemplatedPrompt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Generation request with all parameters
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GenerationRequest {
-    pub prompt: String,
+    pub prompt: TemplatedPrompt,
     pub max_tokens: usize,
     pub temperature: f32,
     pub top_p: f32,
@@ -779,7 +820,7 @@ impl GenerationRequestBuilder {
     pub fn build(self) -> GenerationRequest {
         let resolved = self.params.resolve();
         GenerationRequest {
-            prompt: self.prompt,
+            prompt: TemplatedPrompt::new(self.prompt),
             max_tokens: resolved.max_tokens,
             temperature: resolved.temperature,
             top_p: resolved.top_p,
@@ -831,7 +872,7 @@ impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
 impl From<&GenerationConfig> for GenerationRequest {
     fn from(config: &GenerationConfig) -> Self {
         Self {
-            prompt: String::new(),
+            prompt: TemplatedPrompt::new(String::new()),
             max_tokens: config.max_tokens,
             temperature: config.temperature,
             top_p: config.top_p,
@@ -871,7 +912,7 @@ mod tests {
             .max_tokens(1000)
             .build();
 
-        assert_eq!(request.prompt, "test prompt");
+        assert_eq!(request.prompt, TemplatedPrompt::new("test prompt".to_string()));
         assert_eq!(request.temperature, 0.8);
         assert_eq!(request.top_k, Some(30));
         assert_eq!(request.max_tokens, 1000);
@@ -935,7 +976,7 @@ mod tests {
             .max_tokens(512)
             .build();
 
-        assert_eq!(request.prompt, "test prompt");
+        assert_eq!(request.prompt, TemplatedPrompt::new("test prompt".to_string()));
         assert_eq!(request.temperature, 0.8);
         assert_eq!(request.max_tokens, 512);
         assert_eq!(request.top_p, 0.95);

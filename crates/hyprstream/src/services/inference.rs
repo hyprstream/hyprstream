@@ -53,6 +53,7 @@ use std::sync::mpsc;
 use tokio::runtime::Handle;
 use tokenizers::Tokenizer;
 use tracing::{debug, error, info, trace, warn};
+use uuid::Uuid;
 
 // ============================================================================
 // PolicyChecker - Thread-safe wrapper for policy checks from single-threaded runtime
@@ -74,7 +75,7 @@ struct PolicyCheckRequest {
 struct PendingStream {
     request: GenerationRequest,
     stream_id: String,
-    prompt: String, // For training collection
+    prompt: String, // For training collection (stored as String for simplicity)
 }
 
 /// Thread-safe policy checker that runs on a dedicated thread with its own runtime.
@@ -148,8 +149,9 @@ impl PolicyChecker {
 /// Default endpoint for the inference service
 pub const INFERENCE_ENDPOINT: &str = "inproc://hyprstream/inference";
 
-/// Endpoint for streaming chunks
-pub const INFERENCE_STREAM_ENDPOINT: &str = "inproc://hyprstream/inference/stream";
+// Note: Stream endpoints are now dynamically generated per InferenceService instance
+// using UUIDs (e.g., inproc://hyprstream/inference/stream/{uuid}).
+// Each service binds to its own unique endpoint to prevent bind conflicts.
 
 /// ZMQ-based inference service
 ///
@@ -194,6 +196,8 @@ pub struct InferenceService {
     trainer: Option<Arc<SelfSupervisedTrainer>>,
     /// Tokenizer for training example collection
     tokenizer: Option<Arc<Tokenizer>>,
+    /// Unique stream endpoint for this service instance (each InferenceService has its own)
+    stream_endpoint: String,
 }
 
 impl InferenceService {
@@ -359,6 +363,10 @@ impl InferenceService {
             (None, None)
         };
 
+        // Generate unique stream endpoint for this service instance
+        // Each InferenceService gets its own XPUB endpoint (UUID-based)
+        let stream_endpoint = format!("inproc://hyprstream/inference/stream/{}", Uuid::new_v4());
+
         Ok(Self {
             engine: RefCell::new(engine),
             stream_id_counter: AtomicU64::new(1),
@@ -372,6 +380,7 @@ impl InferenceService {
             policy_checker,
             trainer,
             tokenizer,
+            stream_endpoint,
         })
     }
 
@@ -440,9 +449,9 @@ impl InferenceService {
             warn!("failed to set XPUB receive timeout: {}", e);
         }
 
-        // Bind XPUB to streaming endpoint
-        if let Err(e) = xpub_socket.bind(INFERENCE_STREAM_ENDPOINT) {
-            let err = anyhow!("failed to bind XPUB to {}: {}", INFERENCE_STREAM_ENDPOINT, e);
+        // Bind XPUB to this service's unique streaming endpoint
+        if let Err(e) = xpub_socket.bind(&service.stream_endpoint) {
+            let err = anyhow!("failed to bind XPUB to {}: {}", service.stream_endpoint, e);
             error!("{}", err);
             signal_error(ready_tx, err);
             return;
@@ -451,7 +460,7 @@ impl InferenceService {
         // Store XPUB socket in service for use by handle_generate_stream
         *service.xpub_socket.borrow_mut() = Some(xpub_socket);
 
-        info!("inference service bound to {} (RPC) and {} (streaming)", endpoint, INFERENCE_STREAM_ENDPOINT);
+        info!("inference service bound to {} (RPC) and {} (streaming)", endpoint, service.stream_endpoint);
 
         // Signal ready AFTER sockets are bound - this is the correct semantics
         if let Some(tx) = ready_tx {
@@ -636,7 +645,7 @@ impl InferenceService {
 
         // Collect training example on success
         if let Ok(gen_result) = &result {
-            self.collect_training_example(&prompt, gen_result);
+            self.collect_training_example(prompt.as_str(), gen_result);
         }
 
         result
@@ -652,7 +661,7 @@ impl InferenceService {
     /// - Client can't subscribe without the stream_id from response
     fn prepare_stream(&self, request: GenerationRequest) -> (String, PendingStream) {
         let stream_id = self.next_stream_id();
-        let prompt = request.prompt.clone();
+        let prompt = request.prompt.as_str().to_string(); // Convert to String for training
 
         let pending = PendingStream {
             request,
@@ -890,7 +899,8 @@ impl InferenceService {
         &self,
         reader: inference_capnp::generation_request::Reader,
     ) -> Result<GenerationRequest> {
-        let prompt = reader.get_prompt()?.to_str()?.to_string();
+        use crate::config::TemplatedPrompt;
+        let prompt = TemplatedPrompt::new(reader.get_prompt()?.to_str()?.to_string());
         let max_tokens = reader.get_max_tokens() as usize;
         let temperature = reader.get_temperature();
         let top_p = reader.get_top_p();
@@ -1029,7 +1039,7 @@ impl InferenceService {
                 let (stream_id, pending) = self.prepare_stream(request);
 
                 // Return response with stream_id - client will subscribe, then we execute
-                let response = InferenceResponse::stream_started(request_id, &stream_id, INFERENCE_STREAM_ENDPOINT);
+                let response = InferenceResponse::stream_started(request_id, &stream_id, &self.stream_endpoint);
                 Ok((response, Some(pending)))
             }
 
@@ -1206,9 +1216,10 @@ impl InferenceService {
 /// - Identity is included for authorization checks
 ///
 /// Uses `ZmqClient` internally for TMQ-based async transport with auto-signing.
+#[derive(Clone)]
 pub struct InferenceZmqClient {
     /// Unified ZMQ client (TMQ-based, auto-signing)
-    client: crate::services::ZmqClient,
+    client: std::sync::Arc<crate::services::ZmqClient>,
 }
 
 impl InferenceZmqClient {
@@ -1220,7 +1231,7 @@ impl InferenceZmqClient {
     /// Create an inference client connected to a specific endpoint
     pub fn with_endpoint(endpoint: &str, signing_key: SigningKey, identity: RequestIdentity) -> Self {
         Self {
-            client: crate::services::ZmqClient::new(endpoint, signing_key, identity),
+            client: std::sync::Arc::new(crate::services::ZmqClient::new(endpoint, signing_key, identity)),
         }
     }
 
@@ -1252,7 +1263,7 @@ impl InferenceZmqClient {
         req.set_id(id);
 
         let mut gen_req = req.init_generate();
-        gen_req.set_prompt(&request.prompt);
+        gen_req.set_prompt(request.prompt.as_str());
         gen_req.set_max_tokens(request.max_tokens as u32);
         gen_req.set_temperature(request.temperature);
         gen_req.set_top_p(request.top_p);
@@ -1324,7 +1335,7 @@ impl InferenceZmqClient {
         req.set_id(id);
 
         let mut gen_req = req.init_generate_stream();
-        gen_req.set_prompt(&request.prompt);
+        gen_req.set_prompt(request.prompt.as_str());
         gen_req.set_max_tokens(request.max_tokens as u32);
         gen_req.set_temperature(request.temperature);
         gen_req.set_top_p(request.top_p);

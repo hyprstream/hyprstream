@@ -20,7 +20,7 @@ pub fn create_router() -> Router<ServerState> {
         .route("/:id/load", post(load_model))
         .route("/:id/unload", post(unload_model))
         .route("/cache/refresh", post(refresh_cache))
-        .route("/cache/stats", get(cache_stats))
+        // REMOVED: .route("/cache/stats", get(cache_stats)) - ModelCache replaced by ZMQ
 }
 
 /// Request to download a model
@@ -57,7 +57,7 @@ async fn list_models(
     auth_user: Option<Extension<AuthenticatedUser>>,
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
-    if !state.policy_manager.check(&user, "registry:*", Operation::Query).await {
+    if !state.policy_client.check(&user, "registry:*", Operation::Query).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -109,7 +109,7 @@ async fn get_model_info(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{}", id);
-    if !state.policy_manager.check(&user, &resource, Operation::Query).await {
+    if !state.policy_client.check(&user, &resource, Operation::Query).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -152,7 +152,7 @@ async fn download_model(
     Json(request): Json<DownloadModelRequest>,
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
-    if !state.policy_manager.check(&user, "registry:*", Operation::Write).await {
+    if !state.policy_client.check(&user, "registry:*", Operation::Write).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -228,7 +228,7 @@ async fn load_model(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{}", id);
-    if !state.policy_manager.check(&user, &resource, Operation::Manage).await {
+    if !state.policy_client.check(&user, &resource, Operation::Manage).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -282,7 +282,7 @@ async fn unload_model(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{}", id);
-    if !state.policy_manager.check(&user, &resource, Operation::Manage).await {
+    if !state.policy_client.check(&user, &resource, Operation::Manage).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -304,7 +304,7 @@ async fn refresh_cache(
     auth_user: Option<Extension<AuthenticatedUser>>,
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
-    if !state.policy_manager.check(&user, "registry:*", Operation::Manage).await {
+    if !state.policy_client.check(&user, "registry:*", Operation::Manage).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -321,25 +321,4 @@ async fn refresh_cache(
     .into_response()
 }
 
-/// Get cache statistics
-async fn cache_stats(
-    State(state): State<ServerState>,
-    auth_user: Option<Extension<AuthenticatedUser>>,
-) -> impl IntoResponse {
-    let user = server::extract_user(auth_user.as_ref());
-    if !state.policy_manager.check(&user, "registry:*", Operation::Query).await {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": format!("Permission denied: user '{}' cannot query registry", user)
-            })),
-        ).into_response();
-    }
-
-    let stats = state.model_cache.stats().await;
-    Json(serde_json::json!({
-        "cached_models": stats.cached_models,
-        "max_size": stats.max_size
-    }))
-    .into_response()
-}
+// REMOVED: cache_stats endpoint - ModelCache replaced by ZMQ ModelService

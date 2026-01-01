@@ -145,18 +145,20 @@ pub async fn handle_server(
     ctx: crate::cli::AppContext,
     flight_config: Option<FlightServerConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::services::{ModelService, ModelServiceConfig, ModelZmqClient, PolicyZmqClient};
+    use crate::storage::ModelStorage;
+    use hyprstream_rpc::RequestIdentity;
+
     let config = ctx.config();
 
     // Clone git2db config and set DHT mode to Server for full P2P participation
-    let git2db_config = {
-        let mut cfg = config.git2db.clone();
-        #[cfg(feature = "gittorrent")]
-        {
-            cfg.gittorrent.dht_mode = gittorrent::DhtMode::Server;
-            info!("DHT mode set to Server for full P2P participation");
-        }
-        cfg
-    };
+    #[allow(unused_mut)]
+    let mut git2db_config = config.git2db.clone();
+    #[cfg(feature = "gittorrent")]
+    {
+        git2db_config.gittorrent.dht_mode = gittorrent::DhtMode::Server;
+        info!("DHT mode set to Server for full P2P participation");
+    }
 
     // Use server config from HyprConfig
     let server_config = config.server.clone();
@@ -166,12 +168,59 @@ pub async fn handle_server(
     let port = server_config.port;
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
 
-    // Create server state - use shared client if available, otherwise start internal service
-    let server_state = if let Some(client) = ctx.registry_client() {
-        crate::server::state::ServerState::new_with_client(server_config, client.clone()).await?
+    // Get storage paths
+    let storage_paths = crate::storage::StoragePaths::new()?;
+    let models_dir = if let Ok(dir) = std::env::var("HYPRSTREAM_MODELS_DIR") {
+        std::path::PathBuf::from(dir)
     } else {
-        crate::server::state::ServerState::new_with_git2db(server_config, git2db_config).await?
+        storage_paths.models_dir()?
     };
+
+    // Create ModelStorage - use shared client if available, otherwise start internal service
+    let model_storage = if let Some(client) = ctx.registry_client() {
+        Arc::new(ModelStorage::new(client.clone(), models_dir.clone()))
+    } else {
+        Arc::new(ModelStorage::create_with_config(models_dir.clone(), git2db_config).await?)
+    };
+
+    // Get signing key and verifying key from registry (loaded in main.rs)
+    let keys_dir = models_dir.join(".registry").join("keys");
+    let signing_key = crate::cli::load_or_generate_signing_key(&keys_dir).await?;
+    let verifying_key = signing_key.verifying_key();
+
+    // Create PolicyZmqClient (PolicyService is already started in main.rs)
+    let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
+
+    // Start ModelService
+    let model_service_config = ModelServiceConfig {
+        max_models: server_config.max_cached_models,
+        max_context: server_config.max_context,
+        kv_quant: server_config.kv_quant.into(),
+    };
+
+    let _model_service_handle = ModelService::start(
+        model_service_config,
+        signing_key.clone(),
+        verifying_key,
+        policy_client.clone(),
+        model_storage.clone(),
+    )
+    .await?;
+
+    info!("ModelService started at {}", crate::services::MODEL_ENDPOINT);
+
+    // Create ModelZmqClient for ServerState
+    let model_client = ModelZmqClient::new(signing_key.clone(), RequestIdentity::local());
+
+    // Create server state with ZMQ clients
+    let server_state = crate::server::state::ServerState::new(
+        server_config,
+        model_client,
+        policy_client,
+        model_storage,
+        signing_key,
+    )
+    .await?;
 
     info!("Starting Hyprstream HTTP server on {}", addr);
     info!("OpenAI-compatible API available at http://{}/oai/v1", addr);
