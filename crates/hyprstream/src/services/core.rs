@@ -648,7 +648,7 @@ mod tests {
         }
 
         let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message).unwrap();
+        serialize::write_message(&mut bytes, &message).expect("test: serialize message");
         bytes
     }
 
@@ -662,20 +662,20 @@ mod tests {
 
         // Start the service (waits for socket binding)
         let runner = ServiceRunner::new(endpoint, verifying_key);
-        let handle = runner.run(EchoService).await.unwrap();
+        let handle = runner.run(EchoService).await.expect("test: start service");
 
         // Create signed request
         let request = create_signed_request(&signing_key, b"hello");
 
         // Test the service
         let response = tokio::task::spawn_blocking(move || {
-            let client = ServiceClient::connect(endpoint).unwrap();
+            let client = ServiceClient::connect(endpoint).expect("test: connect client");
             client.call(&request)
         })
         .await
-        .unwrap();
+        .expect("test: spawn blocking");
 
-        let response = response.unwrap();
+        let response = response.expect("test: service call");
         // Response should start with "from <user>:"
         let response_str = String::from_utf8_lossy(&response);
         assert!(response_str.contains("hello"), "Response should contain 'hello': {}", response_str);
@@ -693,14 +693,14 @@ mod tests {
 
         // Start the service (waits for socket binding)
         let runner = ServiceRunner::new(endpoint, verifying_key);
-        let handle = runner.run(EchoService).await.unwrap();
+        let handle = runner.run(EchoService).await.expect("test: start service");
 
         // Create signed request
         let request = create_signed_request(&signing_key, b"async hello");
 
         // Test async client
         let client = AsyncServiceClient::new(endpoint);
-        let response = client.call(request).await.unwrap();
+        let response = client.call(request).await.expect("test: async call");
         let response_str = String::from_utf8_lossy(&response);
         assert!(response_str.contains("async hello"), "Response should contain 'async hello': {}", response_str);
 
@@ -718,21 +718,21 @@ mod tests {
 
         // Start the service with wrong key (waits for socket binding)
         let runner = ServiceRunner::new(endpoint, wrong_verifying_key);
-        let handle = runner.run(EchoService).await.unwrap();
+        let handle = runner.run(EchoService).await.expect("test: start service");
 
         // Create signed request with different key
         let request = create_signed_request(&signing_key, b"should fail");
 
         // Test the service - should get empty response (error)
         let response = tokio::task::spawn_blocking(move || {
-            let client = ServiceClient::connect(endpoint).unwrap();
+            let client = ServiceClient::connect(endpoint).expect("test: connect client");
             client.call(&request)
         })
         .await
-        .unwrap();
+        .expect("test: spawn blocking");
 
         // Response should be empty (verification failure)
-        assert!(response.unwrap().is_empty(), "Invalid signature should return empty response");
+        assert!(response.expect("test: get response").is_empty(), "Invalid signature should return empty response");
 
         handle.stop().await;
     }

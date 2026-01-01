@@ -121,8 +121,12 @@ impl ModelService {
         policy_client: PolicyZmqClient,
         model_storage: Arc<ModelStorage>,
     ) -> Self {
-        let cache_size = NonZeroUsize::new(config.max_models)
-            .unwrap_or_else(|| NonZeroUsize::new(5).unwrap());
+        // SAFETY: 5 is a valid non-zero value
+        const DEFAULT_CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(5) {
+            Some(n) => n,
+            None => unreachable!(),
+        };
+        let cache_size = NonZeroUsize::new(config.max_models).unwrap_or(DEFAULT_CACHE_SIZE);
 
         Self {
             loaded_models: RwLock::new(LruCache::new(cache_size)),

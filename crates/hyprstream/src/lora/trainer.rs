@@ -169,7 +169,7 @@ impl LoRATrainer {
         self.total_tokens += labels.size()[0] as u64 * labels.size()[1] as u64;
 
         // Update best loss
-        if self.best_loss.is_none() || loss_value < self.best_loss.unwrap() {
+        if self.best_loss.map_or(true, |best| loss_value < best) {
             self.best_loss = Some(loss_value);
         }
 

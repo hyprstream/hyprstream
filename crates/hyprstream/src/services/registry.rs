@@ -2368,20 +2368,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_registry_service_health_check() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("test: create temp dir");
 
         // Generate keypair for signing/verification
         let (signing_key, verifying_key) = generate_signing_keypair();
 
         // Create a permissive policy manager and start PolicyService first
-        let policy_manager = Arc::new(PolicyManager::permissive().await.unwrap());
+        let policy_manager = Arc::new(PolicyManager::permissive().await.expect("test: create policy manager"));
         let _policy_handle = PolicyService::start_at(
             policy_manager,
             verifying_key,
             "inproc://test-policy",
         )
         .await
-        .unwrap();
+        .expect("test: start policy service");
 
         // Create policy client for RegistryService
         let policy_client = PolicyZmqClient::new_at(
@@ -2398,7 +2398,7 @@ mod tests {
             "inproc://test-registry",
         )
         .await
-        .unwrap();
+        .expect("test: start registry service");
 
         // Create signed client with matching key and local identity
         let client = RegistryZmqClient::with_endpoint(

@@ -220,18 +220,18 @@ mod tests {
 
     #[test]
     fn test_jsonl_loading() {
-        let temp_dir = tempdir().unwrap();
+        let temp_dir = tempdir().expect("test: create temp dir");
         let data_path = temp_dir.path().join("train.jsonl");
 
         let content = r#"{"input": "What is 2+2?", "output": "4"}
 {"input": "Hello", "output": "Hi there!"}
 "#;
-        std::fs::write(&data_path, content).unwrap();
+        std::fs::write(&data_path, content).expect("test: write training data");
 
-        let dataset = TrainingDataset::from_jsonl(&data_path).unwrap();
+        let dataset = TrainingDataset::from_jsonl(&data_path).expect("test: load dataset");
         assert_eq!(dataset.len(), 2);
-        assert_eq!(dataset.get(0).unwrap().input, "What is 2+2?");
-        assert_eq!(dataset.get(0).unwrap().output, "4");
+        assert_eq!(dataset.get(0).expect("test: get sample").input, "What is 2+2?");
+        assert_eq!(dataset.get(0).expect("test: get sample").output, "4");
     }
 
     #[test]

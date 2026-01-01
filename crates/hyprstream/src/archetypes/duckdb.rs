@@ -106,9 +106,9 @@ mod tests {
 
     #[test]
     fn test_detect_with_duckdb_file() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
         let db_path = temp.path().join("metrics.duckdb");
-        fs::write(&db_path, valid_duckdb_data()).unwrap();
+        fs::write(&db_path, valid_duckdb_data()).expect("test: write duckdb");
 
         let archetype = DuckDbArchetype;
         assert!(archetype.detect(temp.path()));
@@ -116,11 +116,11 @@ mod tests {
 
     #[test]
     fn test_detect_with_duckdb_in_subdir() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
         let db_dir = temp.path().join("db");
-        fs::create_dir(&db_dir).unwrap();
+        fs::create_dir(&db_dir).expect("test: create subdir");
         let db_path = db_dir.join("metrics.duckdb");
-        fs::write(&db_path, valid_duckdb_data()).unwrap();
+        fs::write(&db_path, valid_duckdb_data()).expect("test: write duckdb");
 
         let archetype = DuckDbArchetype;
         assert!(archetype.detect(temp.path()));
@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn test_no_detect_empty_dir() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
 
         let archetype = DuckDbArchetype;
         assert!(!archetype.detect(temp.path()));
@@ -136,10 +136,10 @@ mod tests {
 
     #[test]
     fn test_no_detect_small_file() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
         // Small file should not be detected (potential spoof)
         let db_path = temp.path().join("metrics.duckdb");
-        fs::write(&db_path, "dummy").unwrap();
+        fs::write(&db_path, "dummy").expect("test: write small file");
 
         let archetype = DuckDbArchetype;
         assert!(!archetype.detect(temp.path()));

@@ -732,10 +732,9 @@ impl JanusModel {
         let mut _gen_weights = HashMap::new();
 
         for (key, tensor) in weights {
-            if key.starts_with("language_model.") {
+            if let Some(suffix) = key.strip_prefix("language_model.") {
                 // Remove prefix for language model
-                let new_key = key.strip_prefix("language_model.").unwrap().to_string();
-                language_weights.insert(new_key, tensor.shallow_clone());
+                language_weights.insert(suffix.to_string(), tensor.shallow_clone());
             } else if key.starts_with("vision_model.") {
                 vision_weights.insert(key.clone(), tensor.shallow_clone());
             } else if key.starts_with("aligner.") {

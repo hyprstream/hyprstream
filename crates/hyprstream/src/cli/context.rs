@@ -119,7 +119,7 @@ impl AppContext {
             .map_err(|_| anyhow::anyhow!("Storage was already initialized by another thread"))?;
 
         // Return reference to the newly initialized storage
-        Ok(self.storage.get().unwrap())
+        Ok(self.storage.get().expect("storage was just initialized"))
     }
 
     /// Create storage immediately (for testing or pre-initialization)

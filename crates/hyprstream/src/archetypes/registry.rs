@@ -268,9 +268,9 @@ mod tests {
 
     #[test]
     fn test_detect_model() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
         // Valid model config requires model_type or architectures field
-        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#).unwrap();
+        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#).expect("test: write config");
 
         let registry = ArchetypeRegistry::new();
         let detected = registry.detect(temp.path());
@@ -281,8 +281,8 @@ mod tests {
 
     #[test]
     fn test_detect_dataset() {
-        let temp = TempDir::new().unwrap();
-        fs::write(temp.path().join("dataset_infos.json"), "{}").unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
+        fs::write(temp.path().join("dataset_infos.json"), "{}").expect("test: write marker");
 
         let registry = ArchetypeRegistry::new();
         let detected = registry.detect(temp.path());
@@ -298,8 +298,8 @@ mod tests {
 
     #[test]
     fn test_detect_duckdb() {
-        let temp = TempDir::new().unwrap();
-        fs::write(temp.path().join("metrics.duckdb"), valid_duckdb_data()).unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
+        fs::write(temp.path().join("metrics.duckdb"), valid_duckdb_data()).expect("test: write duckdb");
 
         let registry = ArchetypeRegistry::new();
         let detected = registry.detect(temp.path());
@@ -310,10 +310,10 @@ mod tests {
 
     #[test]
     fn test_detect_multiple() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
         // Both model and database
-        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#).unwrap();
-        fs::write(temp.path().join("metrics.duckdb"), valid_duckdb_data()).unwrap();
+        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#).expect("test: write config");
+        fs::write(temp.path().join("metrics.duckdb"), valid_duckdb_data()).expect("test: write duckdb");
 
         let registry = ArchetypeRegistry::new();
         let detected = registry.detect(temp.path());
@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn test_cache_invalidation() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
 
         let registry = ArchetypeRegistry::new();
 
@@ -335,7 +335,7 @@ mod tests {
         assert!(detected.is_empty());
 
         // Add a valid model config
-        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#).unwrap();
+        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#).expect("test: write config");
 
         // Still cached as empty
         let detected = registry.detect(temp.path());
@@ -350,12 +350,12 @@ mod tests {
 
     #[test]
     fn test_detect_cag_context() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
         fs::write(
             temp.path().join("context.json"),
             r#"{"version": 1, "store": {"type": "duckdb", "path": "ctx.db"}, "embedding": {"dimension": 384, "model": "test"}}"#,
         )
-        .unwrap();
+        .expect("test: write context");
 
         let registry = ArchetypeRegistry::new();
         let detected = registry.detect(temp.path());
@@ -366,14 +366,14 @@ mod tests {
 
     #[test]
     fn test_detect_model_with_cag() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
         // Model + CAG context - model requires valid config
-        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#).unwrap();
+        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#).expect("test: write config");
         fs::write(
             temp.path().join("context.json"),
             r#"{"version": 1, "store": {"type": "duckdb", "path": "ctx.db"}, "embedding": {"dimension": 384, "model": "test"}}"#,
         )
-        .unwrap();
+        .expect("test: write context");
 
         let registry = ArchetypeRegistry::new();
         let detected = registry.detect(temp.path());
@@ -393,8 +393,8 @@ mod tests {
 
     #[test]
     fn test_detected_domains_type_safe_has() {
-        let temp = TempDir::new().unwrap();
-        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#).unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
+        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#).expect("test: write config");
 
         let registry = ArchetypeRegistry::new();
         let detected = registry.detect(temp.path());
@@ -411,8 +411,8 @@ mod tests {
 
     #[test]
     fn test_detected_domains_string_has() {
-        let temp = TempDir::new().unwrap();
-        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#).unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
+        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#).expect("test: write config");
 
         let registry = ArchetypeRegistry::new();
         let detected = registry.detect(temp.path()).to_detected_domains();
@@ -426,13 +426,13 @@ mod tests {
 
     #[test]
     fn test_detected_domains_display() {
-        let temp = TempDir::new().unwrap();
-        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#).unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
+        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#).expect("test: write config");
         fs::write(
             temp.path().join("context.json"),
             r#"{"version": 1, "store": {"type": "duckdb", "path": "ctx.db"}, "embedding": {"dimension": 384, "model": "test"}}"#,
         )
-        .unwrap();
+        .expect("test: write context");
 
         let registry = ArchetypeRegistry::new();
         let domains = registry.detect(temp.path()).to_detected_domains();

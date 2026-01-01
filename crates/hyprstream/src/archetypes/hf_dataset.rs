@@ -129,9 +129,9 @@ mod tests {
 
     #[test]
     fn test_detect_with_dataset_infos() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
         let marker_path = temp.path().join("dataset_infos.json");
-        fs::write(&marker_path, "{}").unwrap();
+        fs::write(&marker_path, "{}").expect("test: write marker");
 
         let archetype = HfDatasetArchetype;
         assert!(archetype.detect(temp.path()));
@@ -139,9 +139,9 @@ mod tests {
 
     #[test]
     fn test_detect_with_dataset_json() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
         let marker_path = temp.path().join("dataset.json");
-        fs::write(&marker_path, "{}").unwrap();
+        fs::write(&marker_path, "{}").expect("test: write marker");
 
         let archetype = HfDatasetArchetype;
         assert!(archetype.detect(temp.path()));
@@ -149,9 +149,9 @@ mod tests {
 
     #[test]
     fn test_detect_with_parquet() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
         let parquet_path = temp.path().join("train.parquet");
-        fs::write(&parquet_path, valid_parquet_data()).unwrap();
+        fs::write(&parquet_path, valid_parquet_data()).expect("test: write parquet");
 
         let archetype = HfDatasetArchetype;
         assert!(archetype.detect(temp.path()));
@@ -159,11 +159,11 @@ mod tests {
 
     #[test]
     fn test_detect_with_parquet_in_subdir() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
         let data_dir = temp.path().join("data");
-        fs::create_dir(&data_dir).unwrap();
+        fs::create_dir(&data_dir).expect("test: create dir");
         let parquet_path = data_dir.join("train.parquet");
-        fs::write(&parquet_path, valid_parquet_data()).unwrap();
+        fs::write(&parquet_path, valid_parquet_data()).expect("test: write parquet");
 
         let archetype = HfDatasetArchetype;
         assert!(archetype.detect(temp.path()));
@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn test_no_detect_empty_dir() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
 
         let archetype = HfDatasetArchetype;
         assert!(!archetype.detect(temp.path()));
@@ -179,10 +179,10 @@ mod tests {
 
     #[test]
     fn test_no_detect_invalid_parquet() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
         // Parquet file without valid PAR1 header should not match
         let parquet_path = temp.path().join("train.parquet");
-        fs::write(&parquet_path, "dummy").unwrap();
+        fs::write(&parquet_path, "dummy").expect("test: write parquet");
 
         let archetype = HfDatasetArchetype;
         assert!(!archetype.detect(temp.path()));
@@ -190,10 +190,10 @@ mod tests {
 
     #[test]
     fn test_no_detect_invalid_json() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
         // Invalid JSON should not match
         let marker_path = temp.path().join("dataset_infos.json");
-        fs::write(&marker_path, "not valid json").unwrap();
+        fs::write(&marker_path, "not valid json").expect("test: write marker");
 
         let archetype = HfDatasetArchetype;
         assert!(!archetype.detect(temp.path()));

@@ -67,8 +67,12 @@ impl ModelCache {
         max_context: Option<usize>,
         kv_quant: KVQuantArg,
     ) -> Result<Self> {
-        let cache_size =
-            NonZeroUsize::new(max_size).unwrap_or_else(|| NonZeroUsize::new(5).unwrap());
+        // SAFETY: 5 is a valid non-zero value
+        const DEFAULT_CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(5) {
+            Some(n) => n,
+            None => unreachable!(),
+        };
+        let cache_size = NonZeroUsize::new(max_size).unwrap_or(DEFAULT_CACHE_SIZE);
 
         let git_manager = Arc::new(GitManager::new(git_config));
 

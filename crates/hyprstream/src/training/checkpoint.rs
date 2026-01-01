@@ -216,16 +216,19 @@ impl CheckpointManager {
                 #[cfg(target_os = "linux")]
                 {
                     use std::process::Command;
+                    let source_str = source.to_str()
+                        .ok_or_else(|| anyhow!("source path is not valid UTF-8"))?;
+                    let checkpoint_str = checkpoint_path.to_str()
+                        .ok_or_else(|| anyhow!("checkpoint path is not valid UTF-8"))?;
                     let result = Command::new("cp")
-                        .args([
-                            "--reflink=auto",
-                            source.to_str().unwrap(),
-                            checkpoint_path.to_str().unwrap(),
-                        ])
+                        .args(["--reflink=auto", source_str, checkpoint_str])
                         .output();
 
-                    if result.is_err() || !result.unwrap().status.success() {
-                        fs::copy(source, &checkpoint_path).await?;
+                    match result {
+                        Ok(output) if output.status.success() => {}
+                        _ => {
+                            fs::copy(source, &checkpoint_path).await?;
+                        }
                     }
                 }
                 #[cfg(not(target_os = "linux"))]
@@ -291,16 +294,19 @@ impl CheckpointManager {
         #[cfg(target_os = "linux")]
         {
             use std::process::Command;
+            let checkpoint_str = checkpoint_path.to_str()
+                .ok_or_else(|| anyhow!("checkpoint path is not valid UTF-8"))?;
+            let adapter_str = adapter_path.to_str()
+                .ok_or_else(|| anyhow!("adapter path is not valid UTF-8"))?;
             let result = Command::new("cp")
-                .args([
-                    "--reflink=auto",
-                    checkpoint_path.to_str().unwrap(),
-                    adapter_path.to_str().unwrap(),
-                ])
+                .args(["--reflink=auto", checkpoint_str, adapter_str])
                 .output();
 
-            if result.is_err() || !result.unwrap().status.success() {
-                fs::copy(checkpoint_path, &adapter_path).await?;
+            match result {
+                Ok(output) if output.status.success() => {}
+                _ => {
+                    fs::copy(checkpoint_path, &adapter_path).await?;
+                }
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -569,16 +575,19 @@ impl CheckpointManager {
                 #[cfg(target_os = "linux")]
                 {
                     use std::process::Command;
+                    let source_str = source.to_str()
+                        .ok_or_else(|| anyhow!("source path is not valid UTF-8"))?;
+                    let dest_str = dest.to_str()
+                        .ok_or_else(|| anyhow!("dest path is not valid UTF-8"))?;
                     let result = Command::new("cp")
-                        .args([
-                            "--reflink=auto",
-                            source.to_str().unwrap(),
-                            dest.to_str().unwrap(),
-                        ])
+                        .args(["--reflink=auto", source_str, dest_str])
                         .output();
 
-                    if result.is_err() || !result.unwrap().status.success() {
-                        fs::copy(source, &dest).await?;
+                    match result {
+                        Ok(output) if output.status.success() => {}
+                        _ => {
+                            fs::copy(source, &dest).await?;
+                        }
                     }
                 }
 
@@ -679,12 +688,8 @@ impl CheckpointManager {
             .map_err(|e| anyhow::anyhow!("Failed to create signature: {}", e))?;
 
         let parent_commit = repo.head()?.peel_to_commit()?;
-        let message = if branch_name.is_some() {
-            format!(
-                "Training checkpoint step {} (branch: {})",
-                step,
-                branch_name.as_ref().unwrap()
-            )
+        let message = if let Some(name) = branch_name.as_ref() {
+            format!("Training checkpoint step {} (branch: {})", step, name)
         } else {
             format!("Training checkpoint step {}", step)
         };

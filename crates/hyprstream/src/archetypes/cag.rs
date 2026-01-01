@@ -116,7 +116,7 @@ mod tests {
 
     #[test]
     fn test_detect_with_context_json() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
         let manifest_path = temp.path().join("context.json");
         fs::write(
             &manifest_path,
@@ -132,7 +132,7 @@ mod tests {
                 }
             }"#,
         )
-        .unwrap();
+        .expect("test: write manifest");
 
         let archetype = CagContextArchetype;
         assert!(archetype.detect(temp.path()));
@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn test_no_detect_empty_dir() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
 
         let archetype = CagContextArchetype;
         assert!(!archetype.detect(temp.path()));
@@ -148,9 +148,9 @@ mod tests {
 
     #[test]
     fn test_no_detect_invalid_json() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
         let manifest_path = temp.path().join("context.json");
-        fs::write(&manifest_path, "not valid json").unwrap();
+        fs::write(&manifest_path, "not valid json").expect("test: write invalid json");
 
         let archetype = CagContextArchetype;
         assert!(!archetype.detect(temp.path()));
@@ -158,9 +158,9 @@ mod tests {
 
     #[test]
     fn test_no_detect_missing_version() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
         let manifest_path = temp.path().join("context.json");
-        fs::write(&manifest_path, r#"{"store": {}}"#).unwrap();
+        fs::write(&manifest_path, r#"{"store": {}}"#).expect("test: write manifest");
 
         let archetype = CagContextArchetype;
         assert!(!archetype.detect(temp.path()));
@@ -180,7 +180,7 @@ mod tests {
 
     #[test]
     fn test_load_manifest() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
         let manifest_path = temp.path().join("context.json");
         fs::write(
             &manifest_path,
@@ -196,9 +196,9 @@ mod tests {
                 }
             }"#,
         )
-        .unwrap();
+        .expect("test: write manifest");
 
-        let manifest = ContextManifest::load(temp.path()).unwrap();
+        let manifest = ContextManifest::load(temp.path()).expect("test: load manifest");
         assert_eq!(manifest.version, 1);
         assert_eq!(manifest.store.store_type, "duckdb");
         assert_eq!(manifest.store.path, "context.duckdb");

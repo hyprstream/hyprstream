@@ -117,6 +117,10 @@ impl LoRATrainer {
 
         engine.load_lora_from_file(&adapter_path).await?;
 
+        // Pre-convert path to string for repeated use in training loop
+        let adapter_path_str = adapter_path.to_str()
+            .ok_or_else(|| anyhow::anyhow!("adapter path is not valid UTF-8"))?;
+
         // Training loop
         let mut step = 0;
         let total_steps = (train_dataset_len / self.config.batch_size) * self.config.num_epochs;
@@ -148,7 +152,7 @@ impl LoRATrainer {
 
                 if step % self.config.save_every == 0 {
                     tracing::info!("Saving checkpoint at step {}", step);
-                    engine.save_lora_weights(adapter_path.to_str().unwrap())?;
+                    engine.save_lora_weights(adapter_path_str)?;
                 }
 
                 if step % self.config.eval_every == 0 && !val_dataset.is_empty() {
@@ -160,7 +164,7 @@ impl LoRATrainer {
 
         // Final save
         tracing::info!("Saving final adapter weights...");
-        engine.save_lora_weights(adapter_path.to_str().unwrap())?;
+        engine.save_lora_weights(adapter_path_str)?;
 
         tracing::info!("Training complete! Adapter saved to: {:?}", adapter_path);
 

@@ -204,7 +204,7 @@ mod tests {
         let caps = CapabilitySet::model();
         let detected = DetectionResult::Detected(caps.clone());
 
-        let result_caps = detected.capabilities().unwrap();
+        let result_caps = detected.capabilities().expect("test: get capabilities");
         assert!(result_caps.has::<Infer>());
         assert!(result_caps.has::<Train>());
         assert!(result_caps.has::<Serve>());

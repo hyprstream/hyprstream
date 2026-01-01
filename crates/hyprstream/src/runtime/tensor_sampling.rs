@@ -331,7 +331,7 @@ mod tests {
             None,
             1.0,
             &[],
-        ).unwrap();
+        ).expect("test: sample token");
 
         // Should select token 4 (highest logit = 5.0)
         assert_eq!(token, 4);
@@ -342,8 +342,8 @@ mod tests {
         let sampler = TensorSampler::new(Device::Cpu);
         let logits = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 2.5, 1.5]);
 
-        let filtered = sampler.apply_top_k_to_logits(&logits, 2).unwrap();
-        let filtered_vec: Vec<f32> = Vec::try_from(filtered).unwrap();
+        let filtered = sampler.apply_top_k_to_logits(&logits, 2).expect("test: apply top-k");
+        let filtered_vec: Vec<f32> = Vec::try_from(filtered).expect("test: convert to vec");
 
         // Only top 2 logits should be kept (rest should be -inf)
         // Index 2 (3.0) and 3 (2.5) are highest
@@ -368,7 +368,7 @@ mod tests {
             None,
             10.0,  // High penalty
             &[4],  // Previous token was 4
-        ).unwrap();
+        ).expect("test: sample token with penalty");
 
         // Should NOT select token 4 despite it having highest logit
         assert_ne!(token, 4, "Repetition penalty not applied");
@@ -385,10 +385,10 @@ mod tests {
             &logits,
             2.0,  // 2x penalty
             &[4, 4, 4],  // Token 4 appeared 3 times (but penalty is uniform, not exponential)
-        ).unwrap();
+        ).expect("test: apply repetition penalty");
 
-        let penalized_vec: Vec<f32> = Vec::try_from(penalized).unwrap();
-        let original_vec: Vec<f32> = Vec::try_from(logits).unwrap();
+        let penalized_vec: Vec<f32> = Vec::try_from(penalized).expect("test: convert to vec");
+        let original_vec: Vec<f32> = Vec::try_from(logits).expect("test: convert to vec");
 
         // Token 4 should be penalized with UNIFORM penalty (frequency ignored)
         // Original: 5.0, Penalized: 5.0 / 2.0 = 2.5

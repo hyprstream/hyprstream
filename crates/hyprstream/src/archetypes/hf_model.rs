@@ -98,9 +98,9 @@ mod tests {
 
     #[test]
     fn test_detect_with_config_json() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
         let config_path = temp.path().join("config.json");
-        fs::write(&config_path, r#"{"model_type": "llama"}"#).unwrap();
+        fs::write(&config_path, r#"{"model_type": "llama"}"#).expect("test: write config");
 
         let archetype = HfModelArchetype;
         assert!(archetype.detect(temp.path()));
@@ -108,9 +108,9 @@ mod tests {
 
     #[test]
     fn test_detect_with_safetensors() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
         let weights_path = temp.path().join("model.safetensors");
-        fs::write(&weights_path, "dummy").unwrap();
+        fs::write(&weights_path, "dummy").expect("test: write weights");
 
         let archetype = HfModelArchetype;
         assert!(archetype.detect(temp.path()));
@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn test_no_detect_empty_dir() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
 
         let archetype = HfModelArchetype;
         assert!(!archetype.detect(temp.path()));
@@ -140,9 +140,9 @@ mod tests {
     #[test]
     fn test_no_detect_empty_config_json() {
         // Security test: empty config.json should NOT grant HfModel domain
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
         let config_path = temp.path().join("config.json");
-        fs::write(&config_path, "{}").unwrap();
+        fs::write(&config_path, "{}").expect("test: write config");
 
         let archetype = HfModelArchetype;
         assert!(!archetype.detect(temp.path()));
@@ -151,9 +151,9 @@ mod tests {
     #[test]
     fn test_no_detect_invalid_config_json() {
         // Security test: config.json without model_type/architectures should NOT match
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
         let config_path = temp.path().join("config.json");
-        fs::write(&config_path, r#"{"some_field": "value"}"#).unwrap();
+        fs::write(&config_path, r#"{"some_field": "value"}"#).expect("test: write config");
 
         let archetype = HfModelArchetype;
         assert!(!archetype.detect(temp.path()));
@@ -162,9 +162,9 @@ mod tests {
     #[test]
     fn test_detect_with_architectures_field() {
         // config.json with architectures field should match
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("test: create temp dir");
         let config_path = temp.path().join("config.json");
-        fs::write(&config_path, r#"{"architectures": ["Qwen2ForCausalLM"]}"#).unwrap();
+        fs::write(&config_path, r#"{"architectures": ["Qwen2ForCausalLM"]}"#).expect("test: write config");
 
         let archetype = HfModelArchetype;
         assert!(archetype.detect(temp.path()));

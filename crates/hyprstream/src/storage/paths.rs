@@ -126,11 +126,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_storage_paths() {
-        let storage = StoragePaths::new().unwrap();
+        let storage = StoragePaths::new().expect("test: create storage paths");
 
         // Test directory creation
-        let models_dir = storage.models_dir().unwrap();
-        let loras_dir = storage.loras_dir().unwrap();
+        let models_dir = storage.models_dir().expect("test: get models dir");
+        let loras_dir = storage.loras_dir().expect("test: get loras dir");
 
         assert!(models_dir.exists());
         assert!(loras_dir.exists());

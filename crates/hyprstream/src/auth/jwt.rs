@@ -273,7 +273,7 @@ mod tests {
         let token = encode(&claims, &signing_key);
         assert!(token.starts_with(TOKEN_PREFIX));
 
-        let decoded = decode(&token, &verifying_key).unwrap();
+        let decoded = decode(&token, &verifying_key).expect("test: decode token");
         assert_eq!(decoded.sub, "alice");
         assert_eq!(decoded.scope, vec!["model:*"]);
         assert!(!decoded.admin);
@@ -289,7 +289,7 @@ mod tests {
         assert!(token.starts_with(ADMIN_TOKEN_PREFIX));
         assert!(is_admin_token(&token));
 
-        let decoded = decode(&token, &verifying_key).unwrap();
+        let decoded = decode(&token, &verifying_key).expect("test: decode admin token");
         assert!(decoded.admin);
     }
 
@@ -397,7 +397,7 @@ mod tests {
         let claims = Claims::new("alice", Duration::hours(1), vec!["test".to_string()], false);
         let token = encode(&claims, &signing_key);
 
-        let decoded = decode_unverified(&token).unwrap();
+        let decoded = decode_unverified(&token).expect("test: decode unverified token");
         assert_eq!(decoded.sub, "alice");
     }
 }

@@ -554,7 +554,7 @@ impl LlamaAttention {
                 e.insert(rope);
             }
 
-            let rope = cache.get_mut(&key).unwrap();
+            let rope = cache.get_mut(&key).expect("rope was just inserted");
 
             // Apply RoPE with the actual position_ids
             rope.forward(tensor, Some(position_ids))
@@ -1312,8 +1312,8 @@ impl LlamaModel {
         };
 
         // Use different RoPE theta for local vs global layers if configured
-        let rope_theta = if layer_type == "local" && config.rope_local_base_freq.is_some() {
-            config.rope_local_base_freq.unwrap()
+        let rope_theta = if layer_type == "local" {
+            config.rope_local_base_freq.unwrap_or(config.rope_theta)
         } else {
             config.rope_theta
         };
@@ -1992,7 +1992,7 @@ impl ModelOperations for LlamaModel {
 
     fn clear_kv_cache(&self) {
         if let Some(cache_ref) = self.kv_cache.as_ref() {
-            let cache_manager = cache_ref.lock().unwrap();
+            let cache_manager = cache_ref.lock().expect("kv cache mutex poisoned");
             cache_manager.clear_all();
         }
     }
@@ -2000,7 +2000,7 @@ impl ModelOperations for LlamaModel {
     fn kv_cache_memory_usage(&self) -> usize {
         self.kv_cache
             .as_ref()
-            .map(|cache_ref| cache_ref.lock().unwrap().memory_usage())
+            .map(|cache_ref| cache_ref.lock().expect("kv cache mutex poisoned").memory_usage())
             .unwrap_or(0)
     }
 

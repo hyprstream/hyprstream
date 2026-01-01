@@ -609,10 +609,10 @@ impl LayerKVCache {
             let keys_to_quantize = kb.narrow(1, 0, *buffer_len as i64);
             let values_to_quantize = vb.narrow(1, 0, *buffer_len as i64);
 
-            if keys_quantized.is_some() {
+            if let (Some(kq), Some(vq)) = (keys_quantized.as_ref(), values_quantized.as_ref()) {
                 // Merge: dequantize existing + concat buffer + requantize
-                let existing_keys = keys_quantized.as_ref().unwrap().to_tensor()?;
-                let existing_values = values_quantized.as_ref().unwrap().to_tensor()?;
+                let existing_keys = kq.to_tensor()?;
+                let existing_values = vq.to_tensor()?;
 
                 let merged_keys = Tensor::cat(&[existing_keys, keys_to_quantize], 1);
                 let merged_values = Tensor::cat(&[existing_values, values_to_quantize], 1);
@@ -752,7 +752,7 @@ impl LayerKVCache {
                         ));
                     }
 
-                    let kb = keys_buffer.as_ref().unwrap();
+                    let kb = keys_buffer.as_ref().expect("buffer was just created");
 
                     // Check if buffer needs to grow
                     let buf_capacity = kb.size()[1] as usize;
@@ -848,12 +848,11 @@ impl LayerKVCache {
                 let total_len = *quantized_len + *buffer_len;
 
                 // Check if we have a valid cached dequantized view
-                if *dequant_valid_len == total_len
-                    && dequant_keys.is_some()
-                    && dequant_values.is_some()
-                {
-                    let dk = dequant_keys.as_ref().unwrap();
-                    let dv = dequant_values.as_ref().unwrap();
+                if let (true, Some(dk), Some(dv)) = (
+                    *dequant_valid_len == total_len,
+                    dequant_keys.as_ref(),
+                    dequant_values.as_ref(),
+                ) {
                     return Ok((dk.shallow_clone(), dv.shallow_clone()));
                 }
 
@@ -862,9 +861,9 @@ impl LayerKVCache {
                 let mut value_parts: Vec<Tensor> = Vec::new();
 
                 // Part 1: Dequantized historical data
-                if let Some(kq) = keys_quantized {
+                if let (Some(kq), Some(vq)) = (keys_quantized.as_ref(), values_quantized.as_ref()) {
                     key_parts.push(kq.to_tensor()?);
-                    value_parts.push(values_quantized.as_ref().unwrap().to_tensor()?);
+                    value_parts.push(vq.to_tensor()?);
                 }
 
                 // Part 2: Buffer data

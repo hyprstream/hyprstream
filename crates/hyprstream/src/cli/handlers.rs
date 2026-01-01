@@ -591,7 +591,7 @@ pub async fn handle_write_checkpoint(
     let step = step.unwrap_or_else(|| {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("system clock before UNIX epoch")
             .as_secs() as usize
     });
 

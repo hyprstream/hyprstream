@@ -346,11 +346,11 @@ mod tests {
     #[test]
     fn test_rope_basic() {
         let device = Device::Cpu;
-        let mut rope = RoPE::new(64, 10000.0, 2048, device).unwrap();
+        let mut rope = RoPE::new(64, 10000.0, 2048, device).expect("test: create rope");
 
         // Create test tensor: [batch=1, seq=8, heads=2, dim=64]
         let x = Tensor::randn(&[1, 8, 2, 64], (Kind::Float, device));
-        let result = rope.forward(&x, None).unwrap();
+        let result = rope.forward(&x, None).expect("test: rope forward");
 
         assert_eq!(result.size(), x.size());
     }
@@ -359,11 +359,11 @@ mod tests {
     fn test_rope_with_large_base() {
         let device = Device::Cpu;
         // Test with a large base value (e.g., for models with extended context)
-        let mut rope = RoPE::new(128, 1000000.0, 4096, device).unwrap();
+        let mut rope = RoPE::new(128, 1000000.0, 4096, device).expect("test: create rope");
 
         // Create test tensor: [batch=1, seq=16, heads=32, dim=128]
         let x = Tensor::randn(&[1, 16, 32, 128], (Kind::Float, device));
-        let result = rope.forward(&x, None).unwrap();
+        let result = rope.forward(&x, None).expect("test: rope forward");
 
         assert_eq!(result.size(), x.size());
         assert_eq!(rope.base(), 1000000.0);
@@ -385,22 +385,22 @@ mod tests {
     #[test]
     fn test_rope_shape_broadcasting() {
         let device = Device::Cpu;
-        let mut rope = RoPE::new(64, 10000.0, 2048, device).unwrap();
+        let mut rope = RoPE::new(64, 10000.0, 2048, device).expect("test: create rope");
 
         // Test the exact shape from the error: [1, 6, 32, 64]
         let x = Tensor::randn(&[1, 6, 32, 64], (Kind::Float, device));
-        let result = rope.forward(&x, None).unwrap();
+        let result = rope.forward(&x, None).expect("test: rope forward");
 
         assert_eq!(result.size(), vec![1, 6, 32, 64]);
 
         // Test with different batch dimensions
         let x2 = Tensor::randn(&[2, 8, 16, 64], (Kind::Float, device));
-        let result2 = rope.forward(&x2, None).unwrap();
+        let result2 = rope.forward(&x2, None).expect("test: rope forward");
         assert_eq!(result2.size(), vec![2, 8, 16, 64]);
 
         // Test 3D tensor (no batch dimension)
         let x3 = Tensor::randn(&[10, 4, 64], (Kind::Float, device));
-        let result3 = rope.forward(&x3, None).unwrap();
+        let result3 = rope.forward(&x3, None).expect("test: rope forward");
         assert_eq!(result3.size(), vec![10, 4, 64]);
     }
 }

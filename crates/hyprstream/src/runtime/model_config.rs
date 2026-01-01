@@ -4,11 +4,23 @@
 //! resolving the current chaos of multiple override points.
 
 use anyhow::Result;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::LazyLock;
 use tch::Tensor;
 use tracing::info;
+
+/// Regex for extracting numeric version from model type strings
+static VERSION_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(\d+)").expect("valid regex pattern")
+});
+
+/// Regex for extracting layer indices from weight key names
+static LAYER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"layers\.(\d+)").expect("valid regex pattern")
+});
 
 /// Unified model configuration that combines all sources
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -322,7 +334,7 @@ impl ModelConfig {
             }
 
             // Try generic number extraction as fallback
-            if let Some(captures) = regex::Regex::new(r"(\d+)").unwrap().captures(model_type) {
+            if let Some(captures) = VERSION_REGEX.captures(model_type) {
                 if let Ok(version) = captures[1].parse::<u32>() {
                     return version;
                 }
@@ -366,7 +378,7 @@ impl ModelConfig {
     fn count_layers(weights: &HashMap<String, Tensor>) -> usize {
         let mut max_layer = 0;
         for key in weights.keys() {
-            if let Some(captures) = regex::Regex::new(r"layers\.(\d+)").unwrap().captures(key) {
+            if let Some(captures) = LAYER_REGEX.captures(key) {
                 if let Ok(layer_idx) = captures[1].parse::<usize>() {
                     max_layer = max_layer.max(layer_idx + 1);
                 }

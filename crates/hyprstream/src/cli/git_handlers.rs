@@ -317,8 +317,8 @@ pub async fn handle_commit(
             // Parse "Name <email>" format
             let re = regex::Regex::new(r"^(.+?)\s*<(.+?)>$")?;
             if let Some(captures) = re.captures(&author_str) {
-                let name = captures.get(1).unwrap().as_str().trim();
-                let email = captures.get(2).unwrap().as_str().trim();
+                let name = captures.get(1).expect("capture group 1 exists after match").as_str().trim();
+                let email = captures.get(2).expect("capture group 2 exists after match").as_str().trim();
                 git2::Signature::now(name, email)?
             } else {
                 anyhow::bail!(
@@ -478,7 +478,9 @@ pub async fn handle_lora_train(
         let adapter_path = adapter_manager
             .adapters_dir
             .join(format!("{}.safetensors", indexed_adapter_name));
-        engine.save_lora_weights(adapter_path.to_str().unwrap())?;
+        let adapter_path_str = adapter_path.to_str()
+            .ok_or_else(|| anyhow::anyhow!("adapter path is not valid UTF-8"))?;
+        engine.save_lora_weights(adapter_path_str)?;
 
         let config_path = adapter_manager
             .adapters_dir
@@ -612,7 +614,9 @@ pub async fn handle_lora_train(
     let adapter_path = adapter_manager
         .adapters_dir
         .join(format!("{}.safetensors", indexed_adapter_name));
-    engine.save_lora_weights(adapter_path.to_str().unwrap())?;
+    let adapter_path_str = adapter_path.to_str()
+        .ok_or_else(|| anyhow::anyhow!("adapter path is not valid UTF-8"))?;
+    engine.save_lora_weights(adapter_path_str)?;
 
     // Save config
     let config_path = adapter_manager
@@ -785,7 +789,7 @@ pub async fn handle_list(
 
         println!(
             "{:<30} {:<16} {:<16} {:<15} {:<8} {:<6} {:<10}",
-            metadata.display_name.as_ref().unwrap(), domains_str, access_str, git_ref, commit, status, size_str
+            metadata.display_name.as_deref().unwrap_or("unnamed"), domains_str, access_str, git_ref, commit, status, size_str
         );
     }
 
@@ -1179,9 +1183,9 @@ pub async fn handle_info(
                     print!("  [{}] {} ({:.1} KB)", adapter.index, adapter.name, size_kb);
 
                     // Show config info if available and verbose mode is on
-                    if verbose && adapter.config_path.is_some() {
+                    if let (true, Some(config_path)) = (verbose, adapter.config_path.as_ref()) {
                         if let Ok(config_content) =
-                            std::fs::read_to_string(adapter.config_path.as_ref().unwrap())
+                            std::fs::read_to_string(config_path)
                         {
                             if let Ok(config) = serde_json::from_str::<crate::storage::AdapterConfig>(
                                 &config_content,

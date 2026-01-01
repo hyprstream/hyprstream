@@ -42,7 +42,7 @@ impl MemoryWeightProvider {
 
 impl WeightProvider for MemoryWeightProvider {
     fn get_tensor(&self, name: &str) -> Result<Tensor> {
-        let weights = self.weights.lock().unwrap();
+        let weights = self.weights.lock().expect("weight cache mutex poisoned");
         weights
             .get(name)
             .map(|t| t.shallow_clone())
@@ -50,12 +50,12 @@ impl WeightProvider for MemoryWeightProvider {
     }
 
     fn has_tensor(&self, name: &str) -> bool {
-        let weights = self.weights.lock().unwrap();
+        let weights = self.weights.lock().expect("weight cache mutex poisoned");
         weights.contains_key(name)
     }
 
     fn tensor_names(&self) -> Vec<String> {
-        let weights = self.weights.lock().unwrap();
+        let weights = self.weights.lock().expect("weight cache mutex poisoned");
         weights.keys().cloned().collect()
     }
 
