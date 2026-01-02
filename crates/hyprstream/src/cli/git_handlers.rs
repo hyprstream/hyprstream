@@ -831,21 +831,50 @@ pub async fn handle_clone(
         }
     }
 
-    // Create clone options struct to pass to storage layer
-    let clone_opts = crate::storage::CloneOptions {
-        branch,
-        depth: if full { 0 } else { depth },
-        quiet,
-        verbose,
+    // Determine model name from URL or use provided name
+    let model_name = if let Some(n) = name {
+        n
+    } else {
+        let extracted = repo_url
+            .split('/')
+            .next_back()
+            .unwrap_or("")
+            .trim_end_matches(".git")
+            .to_string();
+
+        if extracted.is_empty() {
+            anyhow::bail!(
+                "Cannot derive model name from URL '{}'. Please provide --name.",
+                repo_url
+            );
+        }
+        extracted
     };
 
-    // Use the existing working implementation that handles LFS properly
-    let cloned = crate::storage::operations::clone_model_with_options(
-        repo_url,
-        name.as_deref(),
-        None,  // model_id
-        clone_opts
-    ).await?;
+    // Use the passed storage directly (which has the shared registry client)
+    // This avoids starting a second registry service
+    storage.add_model(&model_name, repo_url).await?;
+
+    let model_ref = ModelRef::new(model_name.clone());
+    let model_path = storage.get_model_path(&model_ref).await?;
+
+    // Handle branch checkout if specified
+    if let Some(ref branch_name) = branch {
+        if !quiet {
+            println!("   Checking out branch: {}", branch_name);
+        }
+        // Branch/tag checkout is handled at the worktree level by git2db
+        info!("Model '{}' requested branch/tag '{}'", model_name, branch_name);
+    }
+
+    // Generate a model ID for compatibility (matches operations.rs behavior)
+    let model_id = crate::storage::ModelId::new();
+
+    let cloned = crate::storage::ClonedModel {
+        model_id,
+        model_path,
+        model_name,
+    };
 
     if !quiet {
         println!("✅ Model '{}' cloned successfully!", cloned.model_name);

@@ -145,6 +145,7 @@ impl XetStorage {
                 config.compression,
                 config.token.as_ref().map(|t| (t.clone(), u64::MAX)),
                 None,
+                "hyprstream".to_string(),
             )
             .map_err(|e| {
                 XetError::new(
@@ -220,12 +221,12 @@ impl XetStorage {
             )
         })?;
 
-        use cas_client::{FileProvider, OutputProvider};
+        use cas_client::{FileProvider, SeekingOutputProvider};
         self.downloader
             .smudge_file_from_hash(
                 &merkle_hash,
                 output_path.to_string_lossy().into(),
-                &OutputProvider::File(FileProvider::new(output_path.to_path_buf())),
+                SeekingOutputProvider::File(FileProvider::new(output_path.to_path_buf())),
                 None,
                 None,
             )
@@ -266,12 +267,12 @@ impl XetStorage {
             )
         })?;
 
-        use cas_client::{FileProvider, OutputProvider};
+        use cas_client::{FileProvider, SeekingOutputProvider};
         self.downloader
             .smudge_file_from_hash(
                 &merkle_hash,
                 temp_file.path().to_string_lossy().into(),
-                &OutputProvider::File(FileProvider::new(temp_file.path().to_path_buf())),
+                SeekingOutputProvider::File(FileProvider::new(temp_file.path().to_path_buf())),
                 None,
                 None,
             )
@@ -305,12 +306,12 @@ impl XetStorage {
             )
         })?;
 
-        use cas_client::{FileProvider, OutputProvider};
+        use cas_client::{FileProvider, SeekingOutputProvider};
         self.downloader
             .smudge_file_from_hash(
                 hash,
                 temp_file.path().to_string_lossy().into(),
-                &OutputProvider::File(FileProvider::new(temp_file.path().to_path_buf())),
+                SeekingOutputProvider::File(FileProvider::new(temp_file.path().to_path_buf())),
                 None,
                 None,
             )
@@ -340,12 +341,12 @@ impl XetStorage {
         hash: &merklehash::MerkleHash,
         output_path: &Path,
     ) -> Result<()> {
-        use cas_client::{FileProvider, OutputProvider};
+        use cas_client::{FileProvider, SeekingOutputProvider};
         self.downloader
             .smudge_file_from_hash(
                 hash,
                 output_path.to_string_lossy().into(),
-                &OutputProvider::File(FileProvider::new(output_path.to_path_buf())),
+                SeekingOutputProvider::File(FileProvider::new(output_path.to_path_buf())),
                 None,
                 None,
             )
@@ -365,7 +366,7 @@ impl XetStorage {
 #[async_trait]
 impl StorageBackend for XetStorage {
     async fn clean_file(&self, path: &Path) -> Result<String> {
-        let (xet_info, _metrics) = data::data_client::clean_file(self.upload_session.clone(), path)
+        let (xet_info, _metrics) = data::data_client::clean_file(self.upload_session.clone(), path, "")
             .await
             .map_err(|e| {
                 XetError::new(XetErrorKind::UploadFailed, format!("Clean failed: {}", e))

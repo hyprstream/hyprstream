@@ -36,6 +36,14 @@ impl std::fmt::Display for ModelId {
     }
 }
 
+/// Result of cloning a model repository
+#[derive(Debug, Clone)]
+pub struct ClonedModel {
+    pub model_id: ModelId,
+    pub model_path: PathBuf,
+    pub model_name: String,
+}
+
 /// Model metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelMetadata {

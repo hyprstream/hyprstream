@@ -151,15 +151,6 @@ pub async fn handle_server(
 
     let config = ctx.config();
 
-    // Clone git2db config and set DHT mode to Server for full P2P participation
-    #[allow(unused_mut)]
-    let mut git2db_config = config.git2db.clone();
-    #[cfg(feature = "gittorrent")]
-    {
-        git2db_config.gittorrent.dht_mode = gittorrent::DhtMode::Server;
-        info!("DHT mode set to Server for full P2P participation");
-    }
-
     // Use server config from HyprConfig
     let server_config = config.server.clone();
 
@@ -176,12 +167,8 @@ pub async fn handle_server(
         storage_paths.models_dir()?
     };
 
-    // Create ModelStorage - use shared client if available, otherwise start internal service
-    let model_storage = if let Some(client) = ctx.registry_client() {
-        Arc::new(ModelStorage::new(client.clone(), models_dir.clone()))
-    } else {
-        Arc::new(ModelStorage::create_with_config(models_dir.clone(), git2db_config).await?)
-    };
+    // Create ModelStorage using shared registry client (never starts duplicate service)
+    let model_storage = Arc::new(ModelStorage::new(ctx.registry().clone(), models_dir.clone()));
 
     // Get signing key and verifying key from registry (loaded in main.rs)
     let keys_dir = models_dir.join(".registry").join("keys");
@@ -228,63 +215,60 @@ pub async fn handle_server(
     // Start Flight SQL server if dataset is specified
     if let Some(ref flight_cfg) = flight_config {
         if let Some(ref dataset_name) = flight_cfg.dataset {
-            if let Some(registry_client) = ctx.registry_client() {
-                // Check if dataset has FLIGHT_SQL capability
-                let dataset_ref = crate::storage::ModelRef::parse(dataset_name)
-                    .unwrap_or_else(|_| crate::storage::ModelRef::new(dataset_name.clone()));
+            // Check if dataset has FLIGHT_SQL capability
+            let dataset_ref = crate::storage::ModelRef::parse(dataset_name)
+                .unwrap_or_else(|_| crate::storage::ModelRef::new(dataset_name.clone()));
 
-                // Get the dataset path from the storage
-                let storage_paths = crate::storage::StoragePaths::new()?;
-                let models_dir = storage_paths.models_dir()?;
+            // Get the dataset path from the storage
+            let storage_paths = crate::storage::StoragePaths::new()?;
+            let models_dir = storage_paths.models_dir()?;
 
-                // Try to find the dataset worktree path
-                let dataset_path = models_dir
-                    .join(&dataset_ref.model)
-                    .join("worktrees")
-                    .join(dataset_ref.git_ref_str().unwrap_or_else(|| "main".to_string()));
+            // Try to find the dataset worktree path
+            let dataset_path = models_dir
+                .join(&dataset_ref.model)
+                .join("worktrees")
+                .join(dataset_ref.git_ref_str().unwrap_or_else(|| "main".to_string()));
 
-                // Check for QUERY capability using type-safe API
-                let archetype_registry = crate::archetypes::global_registry();
-                let detected = archetype_registry.detect(&dataset_path);
-                let domains = detected.to_detected_domains();
+            // Check for QUERY capability using type-safe API
+            let archetype_registry = crate::archetypes::global_registry();
+            let detected = archetype_registry.detect(&dataset_path);
+            let domains = detected.to_detected_domains();
 
-                if !domains.has::<Query>() {
-                    error!(
-                        "Cannot start Flight SQL server: dataset '{}' does not have FLIGHT_SQL capability. Detected archetypes: {:?}",
-                        dataset_name, detected.archetypes
-                    );
-                } else {
-                    let flight_host = flight_cfg.host.as_ref().unwrap_or(&host);
-                    let flight_addr = format!("{}:{}", flight_host, flight_cfg.port);
-
-                    info!(
-                        "Starting Flight SQL server on {} for dataset '{}'",
-                        flight_addr, dataset_name
-                    );
-
-                    // Wrap our RegistryClient in adapter for hyprstream_metrics trait
-                    let adapter: Arc<dyn MetricsRegistryClient> =
-                        Arc::new(MetricsRegistryAdapter::new(registry_client.clone()));
-                    let dataset = dataset_name.clone();
-                    let flight_port = flight_cfg.port;
-                    let flight_host_owned = flight_host.clone();
-
-                    // Start Flight SQL server in background
-                    tokio::spawn(async move {
-                        let config = hyprstream_flight::FlightConfig::default()
-                            .with_host(flight_host_owned)
-                            .with_port(flight_port);
-
-                        if let Err(e) =
-                            hyprstream_flight::start_flight_server(Some(adapter), &dataset, config)
-                                .await
-                        {
-                            error!("Flight SQL server error: {}", e);
-                        }
-                    });
-                }
+            if !domains.has::<Query>() {
+                error!(
+                    "Cannot start Flight SQL server: dataset '{}' does not have FLIGHT_SQL capability. Detected archetypes: {:?}",
+                    dataset_name, detected.archetypes
+                );
             } else {
-                error!("Cannot start Flight SQL server: no registry client available");
+                let flight_host = flight_cfg.host.as_ref().unwrap_or(&host);
+                let flight_addr = format!("{}:{}", flight_host, flight_cfg.port);
+
+                info!(
+                    "Starting Flight SQL server on {} for dataset '{}'",
+                    flight_addr, dataset_name
+                );
+
+                // Wrap our RegistryClient in adapter for hyprstream_metrics trait
+                let registry_client = ctx.registry();
+                let adapter: Arc<dyn MetricsRegistryClient> =
+                    Arc::new(MetricsRegistryAdapter::new(registry_client.clone()));
+                let dataset = dataset_name.clone();
+                let flight_port = flight_cfg.port;
+                let flight_host_owned = flight_host.clone();
+
+                // Start Flight SQL server in background
+                tokio::spawn(async move {
+                    let config = hyprstream_flight::FlightConfig::default()
+                        .with_host(flight_host_owned)
+                        .with_port(flight_port);
+
+                    if let Err(e) =
+                        hyprstream_flight::start_flight_server(Some(adapter), &dataset, config)
+                            .await
+                    {
+                        error!("Flight SQL server error: {}", e);
+                    }
+                });
             }
         }
     }

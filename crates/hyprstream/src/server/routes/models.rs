@@ -200,24 +200,60 @@ async fn download_model(
         }
     };
 
-    // Use shared operation
-    match crate::storage::operations::clone_model(&request.uri, request.name.as_deref(), None).await
-    {
-        Ok(cloned) => Json(DownloadModelResponse {
-            id: cloned.model_id.to_string(),
-            name: cloned.model_name,
-            status: "downloaded".to_string(),
-            path: cloned.model_path.to_string_lossy().to_string(),
-        })
-        .into_response(),
-        Err(e) => (
+    // Derive model name from URL if not provided
+    let model_name = request.name.clone().unwrap_or_else(|| {
+        request
+            .uri
+            .split('/')
+            .next_back()
+            .unwrap_or("")
+            .trim_end_matches(".git")
+            .to_string()
+    });
+
+    if model_name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Cannot derive model name from URI. Please provide a name."
+            })),
+        )
+            .into_response();
+    }
+
+    // Use shared model storage (backed by registry client, no duplicate service)
+    if let Err(e) = state.model_storage.add_model(&model_name, &request.uri).await {
+        return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
                 "error": format!("Failed to download model: {}", e)
             })),
         )
-            .into_response(),
+            .into_response();
     }
+
+    // Get model path for response
+    let model_ref = crate::storage::ModelRef::new(model_name.clone());
+    let model_path = match state.model_storage.get_model_path(&model_ref).await {
+        Ok(path) => path,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("Model cloned but failed to get path: {}", e)
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    Json(DownloadModelResponse {
+        id: crate::storage::ModelId::new().to_string(),
+        name: model_name,
+        status: "downloaded".to_string(),
+        path: model_path.to_string_lossy().to_string(),
+    })
+    .into_response()
 }
 
 /// Load a model into the engine pool

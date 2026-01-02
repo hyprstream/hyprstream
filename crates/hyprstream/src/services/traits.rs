@@ -92,6 +92,27 @@ pub trait RegistryClient: Send + Sync {
         None
     }
 
+    // === Convenience Helpers ===
+
+    /// Check if a repository exists by name (sync, cache-only).
+    ///
+    /// Returns `true` if the repository exists in the cache, `false` otherwise.
+    /// If no cache is available, returns `false` (use `exists_async` for reliable check).
+    fn exists(&self, name: &str) -> bool {
+        if let Some(repos) = self.cached_list() {
+            repos.iter().any(|t| t.name.as_ref() == Some(&name.to_string()))
+        } else {
+            false
+        }
+    }
+
+    /// Check if a repository exists by name (async, reliable).
+    ///
+    /// Queries the service if not in cache. Use this when you need a definitive answer.
+    async fn exists_async(&self, name: &str) -> bool {
+        self.get_by_name(name).await.ok().flatten().is_some()
+    }
+
     // === Mutation (always through channel) ===
 
     /// Clone a repository from URL.

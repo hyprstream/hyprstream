@@ -12,18 +12,13 @@ pub mod adapter_manager;
 pub mod errors;
 pub mod model_ref;
 pub mod model_storage;
-pub mod operations;
 pub mod paths;
 
 // Re-export types for backward compatibility
 pub use adapter_manager::{AdapterConfig, AdapterInfo, AdapterManager};
 pub use errors::{ModelRefError, ModelRefResult};
 pub use model_ref::{validate_model_name, GitRef, ModelRef};
-pub use model_storage::{ModelId, ModelMetadata, ModelStorage};
-pub use operations::{
-    clone_model, clone_model_with_client, clone_model_with_options, list_models,
-    list_models_with_client, CloneOptions, ClonedModel,
-};
+pub use model_storage::{ClonedModel, ModelId, ModelMetadata, ModelStorage};
 pub use paths::StoragePaths;
 
 // Compatibility types (moved from model_registry)
