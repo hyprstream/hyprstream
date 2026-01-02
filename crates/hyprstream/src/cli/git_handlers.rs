@@ -855,17 +855,24 @@ pub async fn handle_clone(
     // This avoids starting a second registry service
     storage.add_model(&model_name, repo_url).await?;
 
-    let model_ref = ModelRef::new(model_name.clone());
-    let model_path = storage.get_model_path(&model_ref).await?;
+    // Create default worktree so the model appears in list
+    // Use requested branch or fall back to default branch (usually "main")
+    let worktree_branch = if let Some(ref b) = branch {
+        b.clone()
+    } else {
+        storage
+            .get_default_branch(&ModelRef::new(model_name.clone()))
+            .await
+            .unwrap_or_else(|_| "main".to_string())
+    };
 
-    // Handle branch checkout if specified
-    if let Some(ref branch_name) = branch {
-        if !quiet {
-            println!("   Checking out branch: {}", branch_name);
-        }
-        // Branch/tag checkout is handled at the worktree level by git2db
-        info!("Model '{}' requested branch/tag '{}'", model_name, branch_name);
+    if !quiet {
+        println!("   Creating worktree for branch: {}", worktree_branch);
     }
+    let model_ref = ModelRef::new(model_name.clone());
+    storage.create_worktree(&model_ref, &worktree_branch).await?;
+
+    let model_path = storage.get_model_path(&model_ref).await?;
 
     // Generate a model ID for compatibility (matches operations.rs behavior)
     let model_id = crate::storage::ModelId::new();

@@ -1,7 +1,8 @@
 # HyprStream: LLM Inference Engine with Git-based Model Management
 
 [![Rust](https://github.com/hyprstream/hyprstream/actions/workflows/rust.yml/badge.svg)](https://github.com/hyprstream/hyprstream/actions/workflows/rust.yml)
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE-AGPLV3)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE-MIT)
 
 ## Overview
 
@@ -53,31 +54,30 @@ Hyprstream uses feature flags to select the PyTorch backend:
 export TAG=latest-cuda-129 # or latest-rocm-6.4, latest-cpu, etc.
 ```
 
-1. Pull model(s):
+1. Setup policies:
+
+```
+# WARNING: this allows all local systems users administrative access to hyprstream.
+$ sudo docker run --rm -it -v hyprstream-models:/root/.local/share/hyprstream hyprstreamv-rocm policy apply-template local
+```
+
+2. Pull model(s):
 
 ```
 $ sudo docker run --rm -it -v hyprstream-models:/root/.local/share/hyprstream hyprstream:$TAG clone https://huggingface.co/qwen/qwen3-0.6b
 ```
 
-2. Test inference and GPU initialization
+3. Test inference and GPU initialization
 
 ```
-$ sudo docker run --rm -it -v hyprstream-models:/root/.local/share/hyprstream hyprstream:$TAG infer --prompt "hello world" qwen3-0.6b
+$ sudo docker run --rm -it -v hyprstream-models:/root/.local/share/hyprstream hyprstream:$TAG infer --prompt "hello world" qwen3-0.6b:main
 ```
 
 
-3. Deploy openai compatible server:
+4. Deploy openai compatible server:
 
 ```
-$ sudo docker run --rm -it -v hyprstream-models:/root/.local/share/hyprstream h --device=/dev/kfd --device=/dev/dri hyprstream:$TAG
-```
-
-Interactive shell:
-
-```
-$ sudo docker run --rm -it --device=/dev/kfd --device=/dev/dri --entrypoint=bash hyprstreamv
-$ hyprstream clone https://huggingface.co/qwen/qwen3-0.6b
-$ hyprstream infer --prompt "hello world" --max-tokens 1024 qwen3-0.6b
+$ sudo docker run --rm -it -v hyprstream-models:/root/.local/share/hyprstream --device=/dev/kfd --device=/dev/dri hyprstream:$TAG server
 ```
 
 ### Building Docker images
@@ -124,9 +124,9 @@ unzip libtorch-cxx11-abi-shared-with-deps-2.8.0+cu129.zip
 wget https://download.pytorch.org/libtorch/nightly/cu130/libtorch-shared-with-deps-latest.zip
 unzip libtorch-shared-with-deps-latest.zip
 
-# ROCm 7.0 Nightly
-wget https://download.pytorch.org/libtorch/nightly/rocm7.0/libtorch-shared-with-deps-latest.zip
-unzip libtorch-shared-with-deps-latest.zip
+# ROCm 6.4
+wget https://download.pytorch.org/libtorch/rocm6.4/libtorch-shared-with-deps-2.8.0%2Brocm6.4.zip
+unzip libtorch-shared-with-deps-2.8.0%2Brocm6.4.zip
 ```
 
 **Option C: Use Existing PyTorch Installation**
@@ -171,24 +171,11 @@ cargo build --release
 ```bash
 # Set CUDA version for automatic download
 export TORCH_CUDA_VERSION=cu118  # or cu121, cu124
-cargo build --release --no-default-features --features tch-cuda
-
-# Or with manual CUDA libtorch
-export LIBTORCH=/path/to/libtorch-cuda
-export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
-cargo build --release --no-default-features --features tch-cuda
+cargo build --release
 ```
 
 **ROCm Backend (AMD GPUs)**
 ```bash
-# Download ROCm libtorch (must be done manually)
-# Visit: https://pytorch.org/get-started/locally/
-# Select: Linux > Libtorch > C++/Java > ROCm
-
-# ROCm 7.0 Nightly
-wget https://download.pytorch.org/libtorch/nightly/rocm7.0/libtorch-shared-with-deps-latest.zip
-unzip libtorch-shared-with-deps-latest.zip
-
 # Set environment variables
 export ROCM_PATH=/opt/rocm
 export LIBTORCH=/path/to/libtorch-rocm
@@ -196,10 +183,7 @@ export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
 export PYTORCH_ROCM_ARCH=gfx90a  # or gfx1100, gfx1101, etc.
 
 # Build with ROCm feature
-cargo build --release --no-default-features --features tch-rocm
-
-# Alternative: Use the automated script (tested with ROCm 6.4 & ROCm 7.0 nightly)
-./build-rocm.sh release
+cargo build --release
 ```
 
 #### 5. Run
@@ -222,8 +206,8 @@ cargo build --release
 # CUDA + OpenTelemetry
 cargo build --release --no-default-features --features tch-cuda,otel
 
-# ROCm + GitTorrent P2P transport
-cargo build --release --no-default-features --features tch-rocm,gittorrent
+# ROCm + XET support
+cargo build --release --no-default-features --features tch-rocm,xet
 ```
 
 ## Quick Start
@@ -284,68 +268,6 @@ hyprstream infer qwen3-small:main \
     --max-tokens 1024
 ```
 
-### LoRA Adapter Training
-
-Status: Experimental
-
-HyprStream provides LoRA (Low-Rank Adaptation) training via the `lt` command, with full git integration for version control:
-
-```bash
-# Create and train a LoRA adapter
-hyprstream lt qwen3-small \
-    --adapter coding_assistant \
-    --rank 16 \
-    --learning-rate 1e-4 \
-    --batch-size 4 \
-    --epochs 10
-
-# Interactive training mode (learns from conversations)
-hyprstream lt qwen3-small \
-    --adapter interactive_tutor \
-    --interactive
-
-# Training with custom data file (JSONL format)
-hyprstream lt qwen3-small \
-    --adapter domain_expert \
-    --data training_samples.jsonl \
-    --rank 32 \
-    --epochs 5
-
-# Use existing training configuration
-hyprstream lt qwen3-small \
-    --adapter advanced_model \
-    --config training_config.json
-```
-
-#### Git Integration for LoRA Training
-
-LoRA adapters are stored as files and version-controlled with git:
-
-```bash
-# Training creates adapter files in model/adapters/ directory
-hyprstream lt qwen3-small --adapter coding_assistant
-
-# Check status shows new adapter files
-hyprstream status qwen3-small
-
-# Commit trained adapter to git
-hyprstream commit qwen3-small -m "Add coding assistant adapter"
-
-# Use git branches for experimental work (standard git workflow)
-# This uses git2db's branch management
-hyprstream checkout qwen3-small -b experiment-1
-hyprstream lt qwen3-small --adapter experimental_model
-hyprstream commit qwen3-small -m "Experimental adapter"
-```
-
-#### Training Data Format
-
-Training data should be in JSONL format:
-```json
-{"input": "What is machine learning?", "output": "Machine learning is a subset of AI that enables computers to learn from data."}
-{"input": "Explain neural networks", "output": "Neural networks are computational models inspired by biological neural networks."}
-```
-
 ## Architecture
 
 ### System Components
@@ -366,50 +288,6 @@ graph TD
     Engine --> Inference[Inference Pipeline]
     Inference --> KVCache[KV Cache]
     Inference --> Sampling[Sampling]
-```
-
-### Key Design Decisions
-
-1. **Git-based Storage**: Models are stored as native Git repositories:
-   - Full version control and rollback
-   - Efficient large file handling via XET
-   - Compatible with Hugging Face Hub
-   - P2P model distribution via GitTorrent transport
-
-2. **File-based Adapters**: LoRA adapters are stored as files within model repositories:
-   - Adapters live in `model/adapters/` directory as `.safetensors` files
-   - Simple indexed naming (e.g., `00_base.safetensors`, `01_coding.safetensors`)
-   - Committed to git for full version control
-   - Stackable and composable for model customization
-
-3. **Checkpoint Management**: Training progress is tracked through Git:
-   - Automatic commits at intervals
-   - Milestone tagging
-   - Training metrics in commit messages
-   - Easy rollback to previous states
-
-## Model References (ModelRef)
-
-HyprStream uses a flexible ModelRef syntax for referencing models and their versions:
-
-- **`model-name`** - Reference model by name (uses registry's pinned commit)
-- **`model-name:branch`** - Reference specific branch (e.g., `qwen3:main`)
-- **`model-name:tag`** - Reference specific tag/version (e.g., `qwen3:v1.0`)
-- **`model-name:commit`** - Reference specific commit (e.g., `qwen3:abc123`)
-
-Examples:
-```bash
-# Use the default version
-hyprstream infer llama3 --prompt "Hello"
-
-# Use a specific branch
-hyprstream infer llama3:experimental --prompt "Hello"
-
-# Use a specific release tag
-hyprstream infer llama3:v2.0 --prompt "Hello"
-
-# Use a specific commit for reproducibility
-hyprstream infer llama3:f3a8b92 --prompt "Hello"
 ```
 
 ## Supported Models
@@ -517,28 +395,101 @@ export HYPRSTREAM_USE_MMAP=true
 export HYPRSTREAM_GENERATION_TIMEOUT=120
 ```
 
-### Runtime Configuration for GPU Backends
+## Security & Authentication
 
-**For CUDA builds:**
+Hyprstream implements layered security-in-depth with a built-in policy engine, Ed25519-signed ZMQ+CapnProto RPC requests at the application layer and CURVE encryption.
+
+
+## Policy Engine
+
+**Quick Start:**
 ```bash
-# Ensure CUDA libraries are in path
-export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
+# View current policy
+hyprstream policy show
 
-# Optional: Specify GPU device
-export CUDA_VISIBLE_DEVICES=0,1
+# Check if a user has permission
+hyprstream policy check alice model:qwen3-small infer
+
+# Create an API token
+hyprstream policy token create \
+  --user alice \
+  --name "dev-token" \
+  --expires 30d \
+  --scope "model:*"
+
+# Apply a built-in template -- allow all local users access to all actions on all resources
+hyprstream policy apply-template local
 ```
 
-**For ROCm builds:**
-```bash
-# ROCm/HIP configuration
-export ROCM_PATH=/opt/rocm
-export PYTORCH_ROCM_ARCH=gfx90a  # or your GPU architecture
-export LIBTORCH=/path/to/libtorch-rocm
-export LD_LIBRARY_PATH=$LIBTORCH/lib:$ROCM_PATH/lib:$LD_LIBRARY_PATH
+**Built-in Templates:**
+- `local` - Full access for local users (default)
+- `public-inference` - Anonymous inference access
+- `public-read` - Anonymous read-only registry access
 
-# Optional: Specify GPU device
-export HIP_VISIBLE_DEVICES=0,1
+**REST API Authentication:**
+```bash
+# Create a token
+hyprstream policy token create --user alice --name "my-token" --expires 1d
+
+# Use with API requests
+curl -H "Authorization: Bearer hypr_eyJ..." http://localhost:8080/v1/models
 ```
+
+See [docs/security.md](docs/security.md) for detailed documentation.
+See [docs/architecture.md](docs/architecture.md) for detailed architecture documentation.
+
+## Telemetry & Observability
+
+HyprStream supports OpenTelemetry for distributed tracing, enabled via the `otel` feature flag.
+
+### Building with OpenTelemetry
+
+```bash
+# Build with otel support
+cargo build --features otel --release
+
+# Combine with other features
+cargo build --no-default-features --features tch-cuda,otel --release
+```
+
+### OpenTelemetry Configuration
+
+| Environment Variable | Purpose | Default |
+|---------------------|---------|---------|
+| `HYPRSTREAM_OTEL_ENABLE` | Enable/disable telemetry | `false` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP backend endpoint | `http://localhost:4317` |
+| `OTEL_SERVICE_NAME` | Service name in traces | `hyprstream` |
+| `HYPRSTREAM_LOG_DIR` | File logging directory | None (console only) |
+
+### Usage Examples
+
+**Local development (stdout exporter):**
+```bash
+export HYPRSTREAM_OTEL_ENABLE=true
+export RUST_LOG=hyprstream=debug
+hyprstream server --port 8080
+# Spans printed to console
+```
+
+**Production (OTLP to Jaeger/Tempo):**
+```bash
+export HYPRSTREAM_OTEL_ENABLE=true
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+export OTEL_SERVICE_NAME=hyprstream-prod
+hyprstream server --port 8080
+```
+
+**File logging (separate from OTEL):**
+```bash
+export HYPRSTREAM_LOG_DIR=/var/log/hyprstream
+hyprstream server --port 8080
+# Creates daily-rotated logs at /var/log/hyprstream/hyprstream.log
+```
+
+### Exporter Modes
+
+- **OTLP**: Used automatically when running `server` command; sends traces to backends like Jaeger, Tempo, or Datadog
+- **Stdout**: Used for CLI commands; prints spans to console for debugging
 
 ## Contributing
 
@@ -546,7 +497,24 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## License
 
-GNU Affero General Public License v3.0 - See [LICENSE](LICENSE) for details.
+This project uses a dual-licensing model:
+
+**AGPL-3.0** - The main application and crates providing APIs:
+- `hyprstream` (main application)
+- `hyprstream-metrics`
+- `hyprstream-flight`
+
+See [LICENSE-AGPLV3](LICENSE-AGPLV3) for details.
+
+**MIT** - Library crates for broader reuse:
+- `git2db` - Git repository management
+- `gittorrent` - P2P git transport
+- `git-xet-filter` - XET large file storage filter
+- `cas-serve` - CAS server for XET over SSH
+- `hyprstream-rpc` - RPC infrastructure
+- `hyprstream-rpc-derive` - RPC derive macros
+
+See [LICENSE-MIT](LICENSE-MIT) for details.
 
 ## Acknowledgments
 
