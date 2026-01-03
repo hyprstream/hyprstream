@@ -1,6 +1,6 @@
 //! Git remote helper protocol implementation
 
-use crate::types::{GitHash, GitRef};
+use crate::types::GitRef;
 use std::collections::HashMap;
 
 /// Git remote helper capabilities
@@ -95,6 +95,7 @@ impl GitRemoteHelper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::GitHash;
 
     #[test]
     fn test_parse_command() {

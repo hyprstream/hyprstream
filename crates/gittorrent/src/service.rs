@@ -676,8 +676,8 @@ impl GitTorrentService {
 
         // Create refs for branches
         for (branch_name, commit_hash) in &metadata.branches {
-            // Convert SHA256 back to git2::Oid (will fail until git2 supports SHA256)
-            if let Ok(oid) = crate::git::objects::sha256_to_oid(commit_hash) {
+            // Convert hash back to git2::Oid
+            if let Ok(oid) = git2::Oid::from_str(commit_hash.as_str()) {
                 let ref_name = format!("refs/heads/{}", branch_name);
 
                 // Create the reference
@@ -689,7 +689,7 @@ impl GitTorrentService {
 
         // Set HEAD to the default branch
         if let Some(main_commit) = metadata.branches.get("main").or_else(|| metadata.branches.get("master")) {
-            if let Ok(oid) = crate::git::objects::sha256_to_oid(main_commit) {
+            if let Ok(oid) = git2::Oid::from_str(main_commit.as_str()) {
                 if let Err(e) = repo.set_head_detached(oid) {
                     tracing::warn!("Failed to set HEAD: {}", e);
                 }

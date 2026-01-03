@@ -624,8 +624,9 @@ pub async fn write_git_object(repo: &Repository, object_data: &[u8]) -> Result<(
 
 /// Set repository HEAD to a specific commit
 pub async fn set_head_to_commit(repo: &Repository, commit_hash: Sha256Hash) -> Result<()> {
-    // Convert SHA256 to OID (temporary until git2 supports SHA256)
-    let oid = sha256_to_oid(&commit_hash)?;
+    // Convert hash to OID
+    let oid = Oid::from_str(commit_hash.as_str())
+        .map_err(|e| Error::other(format!("Cannot convert hash to Oid: {}", e)))?;
 
     // Find the commit object
     let commit = repo.find_commit(oid)?;
