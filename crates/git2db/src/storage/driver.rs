@@ -220,7 +220,9 @@ impl WorktreeHandle {
         if self.repo.is_none() {
             self.repo = Some(self.open_repository()?);
         }
-        Ok(self.repo.as_mut().unwrap())
+        self.repo
+            .as_mut()
+            .ok_or_else(|| Git2DBError::internal("Repository not initialized"))
     }
 
     /// Get the current HEAD reference

@@ -694,7 +694,9 @@ impl LfsStorage {
             let storage = self.clone();
 
             let task = tokio::spawn(async move {
-                let _permit = semaphore.acquire().await.unwrap();
+                let _permit = semaphore.acquire().await.map_err(|_| {
+                    Git2DBError::internal("Semaphore closed during batch processing")
+                })?;
                 storage
                     .smudge_file_in_place(&lfs_file)
                     .await

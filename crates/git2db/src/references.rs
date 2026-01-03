@@ -63,24 +63,20 @@ impl GitRef {
         }
 
         // Check for tag prefix
-        if ref_str.starts_with("refs/tags/") {
-            let tag_name = ref_str.strip_prefix("refs/tags/").unwrap();
+        if let Some(tag_name) = ref_str.strip_prefix("refs/tags/") {
             return Ok(GitRef::Tag(tag_name.to_string()));
         }
 
-        if ref_str.starts_with("tags/") {
-            let tag_name = ref_str.strip_prefix("tags/").unwrap();
+        if let Some(tag_name) = ref_str.strip_prefix("tags/") {
             return Ok(GitRef::Tag(tag_name.to_string()));
         }
 
         // Check for branch prefix
-        if ref_str.starts_with("refs/heads/") {
-            let branch_name = ref_str.strip_prefix("refs/heads/").unwrap();
+        if let Some(branch_name) = ref_str.strip_prefix("refs/heads/") {
             return Ok(GitRef::Branch(branch_name.to_string()));
         }
 
-        if ref_str.starts_with("origin/") {
-            let branch_name = ref_str.strip_prefix("origin/").unwrap();
+        if let Some(branch_name) = ref_str.strip_prefix("origin/") {
             return Ok(GitRef::Branch(branch_name.to_string()));
         }
 

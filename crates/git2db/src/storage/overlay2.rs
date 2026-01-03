@@ -399,8 +399,10 @@ impl Overlay2Driver {
             .output()
             .await;
 
-        if fusermount_output.is_ok() && fusermount_output.unwrap().status.success() {
-            return Ok(());
+        if let Ok(output) = fusermount_output {
+            if output.status.success() {
+                return Ok(());
+            }
         }
 
         // Fallback to umount
