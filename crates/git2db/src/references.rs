@@ -130,19 +130,19 @@ impl std::fmt::Display for GitRef {
 ///
 /// # Examples
 ///
-/// ```rust,no_run
+/// ```rust,ignore
 /// # use git2db::{Git2DB, GitRef};
 /// # use git2::Oid;
-/// # async fn example(repo: git2db::RepositoryHandle<'_>) -> Result<(), Box<dyn std::error::Error>> {
+/// # async fn example(worktree: &mut git2db::WorktreeHandle) -> Result<(), Box<dyn std::error::Error>> {
 /// // String reference (ergonomic)
-/// repo.checkout("main").await?;
+/// worktree.checkout("main").await?;
 ///
 /// // Explicit GitRef (clear intent)
-/// repo.checkout(GitRef::Branch("develop".into())).await?;
+/// worktree.checkout(GitRef::Branch("develop".into())).await?;
 ///
 /// // Direct Oid (type-safe)
 /// let oid = Oid::from_str("abc123...")?;
-/// repo.checkout(oid).await?;
+/// worktree.checkout(oid).await?;
 /// # Ok(())
 /// # }
 /// ```

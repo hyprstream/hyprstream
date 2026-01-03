@@ -382,7 +382,7 @@ mod tests {
 
         // Apply penalty to token 4 (highest logit = 5.0)
         let penalized = sampler.apply_repetition_penalty(
-            &logits,
+            logits.shallow_clone(),
             2.0,  // 2x penalty
             &[4, 4, 4],  // Token 4 appeared 3 times (but penalty is uniform, not exponential)
         ).expect("test: apply repetition penalty");

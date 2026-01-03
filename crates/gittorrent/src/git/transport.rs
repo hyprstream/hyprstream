@@ -262,12 +262,27 @@ mod tests {
         let config = GitTorrentConfig::default();
         let service = Arc::new(GitTorrentService::new(config).await.unwrap());
 
+        // Test with a short string (not a valid hash) - should parse as Username
         let transport = GittorrentTransport::new(
             "gittorrent://abc123def456",
+            service.clone()
+        ).unwrap();
+        assert!(matches!(transport.url, GitTorrentUrl::Username { .. }));
+
+        // Test with a valid 40-char SHA1 - should parse as Commit
+        // Note: GitTorrentUrl currently only accepts 64-char (SHA256) for Commit variant
+        // When we update GitTorrentUrl to support SHA1, this can be enabled:
+        // let transport = GittorrentTransport::new(
+        //     "gittorrent://0123456789abcdef0123456789abcdef01234567",
+        //     service.clone()
+        // ).unwrap();
+        // assert!(matches!(transport.url, GitTorrentUrl::Commit { .. }));
+
+        // For now, test with a 64-char SHA256
+        let transport = GittorrentTransport::new(
+            "gittorrent://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             service
         ).unwrap();
-
-        // Just verify it was created successfully
         assert!(matches!(transport.url, GitTorrentUrl::Commit { .. }));
     }
 }

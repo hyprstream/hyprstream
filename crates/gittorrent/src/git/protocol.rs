@@ -1,6 +1,6 @@
 //! Git remote helper protocol implementation
 
-use crate::types::GitRef;
+use crate::types::{GitHash, GitRef};
 use std::collections::HashMap;
 
 /// Git remote helper capabilities
@@ -47,7 +47,7 @@ impl GitRemoteHelper {
     pub fn new(refs: Vec<GitRef>) -> Self {
         let refs = refs
             .into_iter()
-            .map(|git_ref| (git_ref.name, git_ref.sha256.to_string()))
+            .map(|git_ref| (git_ref.name, git_ref.hash.to_hex()))
             .collect();
 
         GitRemoteHelper { refs }
@@ -95,7 +95,6 @@ impl GitRemoteHelper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Sha256Hash;
 
     #[test]
     fn test_parse_command() {
@@ -120,14 +119,15 @@ mod tests {
 
     #[test]
     fn test_git_remote_helper() {
+        // Test with SHA1 hashes (40 hex chars) - current git format
         let refs = vec![
             GitRef {
                 name: "refs/heads/main".to_string(),
-                sha256: Sha256Hash::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+                hash: GitHash::from_hex("0123456789abcdef0123456789abcdef01234567").unwrap(),
             },
             GitRef {
                 name: "HEAD".to_string(),
-                sha256: Sha256Hash::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+                hash: GitHash::from_hex("0123456789abcdef0123456789abcdef01234567").unwrap(),
             },
         ];
 

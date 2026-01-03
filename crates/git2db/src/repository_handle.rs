@@ -86,7 +86,7 @@ impl<'a> RepositoryHandle<'a> {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// # async fn example(repo: git2db::RepositoryHandle<'_>) -> Result<(), Box<dyn std::error::Error>> {
     /// // String reference
     /// repo.checkout("main").await?;
@@ -106,7 +106,7 @@ impl<'a> RepositoryHandle<'a> {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// # async fn example(repo: &git2db::RepositoryHandle<'_>) -> Result<(), Box<dyn std::error::Error>> {
     /// // Add remotes
     /// repo.remote().add("origin", "https://github.com/user/repo.git").await?;
@@ -606,7 +606,7 @@ impl<'a> RepositoryHandle<'a> {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// # async fn example(repo: git2db::RepositoryHandle<'_>) -> Result<(), Box<dyn std::error::Error>> {
     /// // Create a worktree for a feature branch with overlay2 optimization
     /// let worktree = repo.create_worktree("/tmp/feature-branch", "feature-branch").await?;

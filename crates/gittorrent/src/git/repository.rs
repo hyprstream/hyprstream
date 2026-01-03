@@ -3,7 +3,7 @@
 //! This module provides the core Git operations using libgit2 instead of shell commands.
 //! Uses the Repository pattern to encapsulate Git operations with clean separation.
 
-use crate::{types::Sha256Hash, Result};
+use crate::{types::{GitHash, Sha256Hash}, Result};
 use git2::{Oid, Repository as Git2Repository};
 use std::path::Path;
 
@@ -31,8 +31,8 @@ impl Repository {
     }
 
     /// Check if object exists in repository
-    pub fn has_object(&self, sha256: &Sha256Hash) -> Result<bool> {
-        let oid = Oid::from_str(sha256.as_str())?;
+    pub fn has_object(&self, hash: &GitHash) -> Result<bool> {
+        let oid = Oid::from_str(&hash.to_hex())?;
         Ok(self.inner.odb()?.exists(oid))
     }
 
@@ -46,7 +46,7 @@ impl Repository {
                 if let Some(target) = reference.target() {
                     refs.push(crate::types::GitRef {
                         name: name.to_string(),
-                        sha256: Sha256Hash::new(target.to_string())?,
+                        hash: GitHash::from_hex(&target.to_string())?,
                     });
                 }
             }
@@ -177,8 +177,9 @@ mod tests {
         // Test our Repository wrapper
         let repo = Repository::open(repo_path)?;
 
-        let sha256 = Sha256Hash::new(commit_id.to_string())?;
-        assert!(repo.has_object(&sha256)?);
+        // Use GitHash which supports SHA1 (40-char) from git2
+        let hash = GitHash::from_hex(&commit_id.to_string())?;
+        assert!(repo.has_object(&hash)?);
 
         let refs = repo.references()?;
         assert!(!refs.is_empty());

@@ -26,6 +26,6 @@ build-from-source = ["dep:git2"]
 [build-dependencies]
 bindgen = { version = "0.70", optional = true }
 pkg-config = "0.3"
-git2 = { version = "0.19", optional = true }
+git2 = { version = "0.20.3", optional = true }
 
 [dev-dependencies]

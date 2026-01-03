@@ -36,6 +36,9 @@ pub enum Error {
     #[error("Invalid SHA256: {0}")]
     InvalidSha256(String),
 
+    #[error("Invalid git hash (expected 40 or 64 hex chars): {0}")]
+    InvalidHash(String),
+
     #[error("Invalid mutable key: {0}")]
     InvalidMutableKey(String),
 

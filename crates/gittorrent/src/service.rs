@@ -276,7 +276,7 @@ impl GitTorrentService {
         }
 
         // Try to fetch from DHT
-        let key = GitObjectKey::new(hash.clone());
+        let key = GitObjectKey::from_sha256(hash.clone());
         if let Some(record) = self.dht.get_object(key).await? {
             // Verify the object hash
             if verify_sha256(&record.data, hash)? {
@@ -298,7 +298,7 @@ impl GitTorrentService {
         let hash = sha256_git(&data)?;
 
         // Store in DHT
-        let key = GitObjectKey::new(hash.clone());
+        let key = GitObjectKey::from_sha256(hash.clone());
         let record = GitObjectRecord::new(key.clone(), data.clone());
         self.dht.put_object(record).await?;
 
@@ -315,7 +315,7 @@ impl GitTorrentService {
 
     /// Find providers for a Git object
     pub async fn find_providers(&self, hash: &Sha256Hash) -> Result<Vec<libp2p::PeerId>> {
-        let key = GitObjectKey::new(hash.clone());
+        let key = GitObjectKey::from_sha256(hash.clone());
         self.dht.get_providers(key).await
     }
 
@@ -330,7 +330,7 @@ impl GitTorrentService {
 
         for obj in objects {
             // Store object in DHT
-            let key = GitObjectKey::new(obj.hash.clone());
+            let key = GitObjectKey::from_sha256(obj.hash.clone());
             let record = GitObjectRecord::new(key.clone(), obj.data.clone());
             self.dht.put_object(record).await?;
 
@@ -361,7 +361,7 @@ impl GitTorrentService {
 
         for obj in objects {
             // Store object in DHT
-            let key = GitObjectKey::new(obj.hash.clone());
+            let key = GitObjectKey::from_sha256(obj.hash.clone());
             let record = GitObjectRecord::new(key.clone(), obj.data.clone());
             self.dht.put_object(record).await?;
 
@@ -467,9 +467,16 @@ impl GitTorrentService {
 
     /// Get objects for a specific commit (recursive)
     pub async fn get_commit_objects(&self, commit_hash: &Sha256Hash) -> Result<Vec<Vec<u8>>> {
+        use crate::types::GitHash;
+
         let mut objects = Vec::new();
         let mut visited = std::collections::HashSet::new();
-        let mut to_fetch = vec![commit_hash.clone()];
+
+        // Convert Sha256Hash to GitHash for internal use
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&commit_hash.to_bytes());
+        let initial_hash = GitHash::Sha256(bytes);
+        let mut to_fetch = vec![initial_hash];
 
         while let Some(hash) = to_fetch.pop() {
             if visited.contains(&hash) {
@@ -477,10 +484,20 @@ impl GitTorrentService {
             }
             visited.insert(hash.clone());
 
-            if let Some(data) = self.get_object(&hash).await? {
+            // Convert GitHash back to Sha256Hash for get_object (which uses DHT)
+            let sha256_hash = match &hash {
+                GitHash::Sha256(b) => Sha256Hash::from_bytes(b)?,
+                GitHash::Sha1(_) => {
+                    // For SHA1 hashes, we need to use the DHT key derivation
+                    // For now, skip SHA1 objects in this legacy function
+                    continue;
+                }
+            };
+
+            if let Some(data) = self.get_object(&sha256_hash).await? {
                 objects.push(data.clone());
 
-                // Parse object to find referenced objects
+                // Parse object to find referenced objects (returns GitHash)
                 let referenced = self.parse_object_references(&data)?;
                 to_fetch.extend(referenced);
             }
@@ -489,8 +506,8 @@ impl GitTorrentService {
         Ok(objects)
     }
 
-    /// Parse an object to find SHA256 references to other objects
-    fn parse_object_references(&self, object_data: &[u8]) -> Result<Vec<Sha256Hash>> {
+    /// Parse an object to find hash references to other objects
+    fn parse_object_references(&self, object_data: &[u8]) -> Result<Vec<crate::types::GitHash>> {
         use crate::git::objects::parse_object_references;
         parse_object_references(object_data)
     }

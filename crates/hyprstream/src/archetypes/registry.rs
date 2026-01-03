@@ -263,6 +263,7 @@ pub fn global_registry() -> Arc<ArchetypeRegistry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archetypes::{Context, Infer, Query, Serve, Train};
     use std::fs;
     use tempfile::TempDir;
 

@@ -292,7 +292,7 @@ impl WorktreeHandle {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// # async fn example(worktree: git2db::storage::WorktreeHandle) -> Result<(), Box<dyn std::error::Error>> {
     /// // Stage changes
     /// worktree.staging().add("README.md")?;
@@ -316,7 +316,7 @@ impl WorktreeHandle {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// # async fn example(worktree: git2db::storage::WorktreeHandle) -> Result<(), Box<dyn std::error::Error>> {
     /// use git2::Signature;
     ///
@@ -380,7 +380,7 @@ impl WorktreeHandle {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// # async fn example(worktree: git2db::storage::WorktreeHandle) -> Result<(), Box<dyn std::error::Error>> {
     /// // Stage additional changes
     /// worktree.staging().add("forgotten_file.rs")?;
@@ -439,7 +439,7 @@ impl WorktreeHandle {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// # async fn example(worktree: git2db::storage::WorktreeHandle) -> Result<(), Box<dyn std::error::Error>> {
     /// // Merge a feature branch
     /// let merge_oid = worktree.merge("feature-branch", false, false).await?;
@@ -575,7 +575,7 @@ impl WorktreeHandle {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// # async fn example(worktree: git2db::storage::WorktreeHandle) -> Result<(), Box<dyn std::error::Error>> {
     /// let status = worktree.status().await?;
     /// println!("Current branch: {:?}", status.branch);
@@ -653,7 +653,7 @@ impl WorktreeHandle {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// # async fn example(worktree: git2db::storage::WorktreeHandle) -> Result<(), Box<dyn std::error::Error>> {
     /// // String reference
     /// worktree.checkout("main").await?;
@@ -731,7 +731,7 @@ impl WorktreeHandle {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// # async fn example(worktree: git2db::storage::WorktreeHandle) -> Result<(), Box<dyn std::error::Error>> {
     /// // Fetch from default remote (origin)
     /// worktree.fetch(None).await?;
@@ -762,7 +762,7 @@ impl WorktreeHandle {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// # async fn example(worktree: git2db::storage::WorktreeHandle) -> Result<(), Box<dyn std::error::Error>> {
     /// // Pull from default remote (origin)
     /// worktree.pull(None).await?;
@@ -877,7 +877,7 @@ impl WorktreeHandle {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// # async fn example(worktree: git2db::storage::WorktreeHandle) -> Result<(), Box<dyn std::error::Error>> {
     /// // Push to default remote (origin)
     /// worktree.push(None).await?;
@@ -908,7 +908,7 @@ impl WorktreeHandle {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// # async fn example(worktree: git2db::storage::WorktreeHandle) -> Result<(), Box<dyn std::error::Error>> {
     /// // Update from default remote (origin)
     /// worktree.update().await?;

@@ -20,9 +20,9 @@ license = "AGPL-3.0"
 repository = "https://github.com/hyprstream/hyprstream.git"
 
 [workspace.dependencies]
-# Core Git operations
-git2 = { version = "0.19", features = ["vendored-libgit2"] }
-libgit2-sys = "0.17"
+# Core Git operations (0.20.3 for CVE-2024-24577 fix in libgit2 1.9.2)
+git2 = { version = "0.20.3", features = ["vendored-libgit2"] }
+libgit2-sys = "0.18"
 libc = "0.2"
 
 # Async runtime

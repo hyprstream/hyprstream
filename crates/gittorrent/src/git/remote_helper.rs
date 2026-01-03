@@ -691,7 +691,10 @@ mod tests {
     async fn test_connect_command() {
         let mut helper = GitRemoteHelper::new().await.unwrap();
 
-        let result = helper.handle_connect(&["git-upload-pack", "gittorrent://example.com/user/repo"]).await;
+        // Set remote URL first (as would be done during argument parsing)
+        helper.remote_url = Some(GitTorrentUrl::parse("gittorrent://example.com/user/repo").unwrap());
+
+        let result = helper.handle_connect(&["git-upload-pack"]).await;
         assert!(result.is_ok());
         assert!(helper.remote_url.is_some());
     }

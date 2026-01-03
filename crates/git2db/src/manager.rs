@@ -725,9 +725,10 @@ mod tests {
         let stats = manager.cache_stats();
         assert_eq!(stats.total_entries, 0);
 
-        // Add some dummy cache entries
+        // Create a temp dir with an actual git repository
         let temp_dir = TempDir::new().unwrap();
         let test_path = temp_dir.path();
+        git2::Repository::init(test_path).expect("test: init git repo");
         let cache1 = manager.get_repository(test_path).unwrap();
         let cache2 = manager.get_repository(test_path).unwrap();
 
@@ -747,14 +748,17 @@ mod tests {
         let config = test_config();
         let manager = GitManager::new(config);
 
-        let base_dir = Path::new("/tmp/base");
+        // Use an actual temp directory for base_dir
+        let temp_dir = TempDir::new().unwrap();
+        let base_dir = temp_dir.path();
 
         // Valid relative path
         let result = manager.validate_path(base_dir, Path::new("valid/file.txt"));
         assert!(result.is_ok());
 
         // Absolute path within base
-        let result = manager.validate_path(base_dir, Path::new("/tmp/base/file.txt"));
+        let absolute_path = base_dir.join("file.txt");
+        let result = manager.validate_path(base_dir, &absolute_path);
         assert!(result.is_ok());
 
         // Absolute path outside base should fail
@@ -768,10 +772,17 @@ mod tests {
         let manager = Arc::new(GitManager::new(config));
 
         let mut handles = Vec::new();
-        let temp_dirs: Vec<TempDir> = (0..5).map(|_| TempDir::new().unwrap()).collect();
+        let temp_dirs: Vec<TempDir> = (0..5)
+            .map(|_| {
+                let dir = TempDir::new().unwrap();
+                git2::Repository::init(dir.path()).expect("test: init git repo");
+                dir
+            })
+            .collect();
 
         // Create concurrent repository operations
-        for temp_dir in temp_dirs {
+        // Iterate by reference to keep temp_dirs alive
+        for temp_dir in &temp_dirs {
             let manager_clone = manager.clone();
             let path = temp_dir.path().to_path_buf();
 
@@ -787,6 +798,8 @@ mod tests {
             let result = handle.await.unwrap();
             assert!(result.is_ok());
         }
+
+        // temp_dirs dropped here, after all operations complete
     }
 
     #[test]

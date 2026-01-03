@@ -1,6 +1,6 @@
 //! Git object utilities for GitTorrent SHA256 operations
 
-use crate::{types::{Sha256Hash, GitRefs}, Result, Error};
+use crate::{types::{GitHash, Sha256Hash, GitRefs}, Result, Error};
 use crate::crypto::hash::sha256_git;
 use std::path::Path;
 use std::collections::HashMap;
@@ -181,8 +181,8 @@ fn create_git_object(repo: &Repository, obj: &git2::Object) -> Result<GitObject>
 /// Git commit object data
 #[derive(Debug, Clone)]
 pub struct CommitObject {
-    pub tree_hash: Sha256Hash,
-    pub parent_hashes: Vec<Sha256Hash>,
+    pub tree_hash: GitHash,
+    pub parent_hashes: Vec<GitHash>,
     pub author: String,
     pub committer: String,
     pub message: String,
@@ -193,7 +193,7 @@ pub struct CommitObject {
 pub struct TreeEntry {
     pub mode: TreeEntryMode,
     pub name: String,
-    pub hash: Sha256Hash,
+    pub hash: GitHash,
 }
 
 /// Tree entry modes
@@ -241,10 +241,10 @@ pub fn parse_commit_object(data: &[u8]) -> Result<CommitObject> {
         }
 
         if let Some(hash_str) = line.strip_prefix("tree ") {
-            // Expect full SHA256 hash (64 hex characters)
-            tree_hash = Some(Sha256Hash::new(hash_str.trim())?);
+            // Parse hash (supports both SHA1 and SHA256)
+            tree_hash = Some(GitHash::from_hex(hash_str.trim())?);
         } else if let Some(hash_str) = line.strip_prefix("parent ") {
-            parent_hashes.push(Sha256Hash::new(hash_str.trim())?);
+            parent_hashes.push(GitHash::from_hex(hash_str.trim())?);
         } else if let Some(author_str) = line.strip_prefix("author ") {
             author = author_str.to_string();
         } else if let Some(committer_str) = line.strip_prefix("committer ") {
@@ -299,15 +299,16 @@ pub fn parse_tree_object(data: &[u8]) -> Result<TreeObject> {
             _ => return Err(Error::other(format!("Unknown tree entry mode: {}", mode_str))),
         };
 
-        // SHA256 hash is 32 bytes after the null terminator
-        if content.len() < null_pos + 1 + 32 {
-            return Err(Error::other("Tree entry missing SHA256 hash"));
+        // Hash is either 20 bytes (SHA1) or 32 bytes (SHA256) after the null terminator
+        // Git currently uses SHA1 (20 bytes), but may switch to SHA256 (32 bytes) in the future
+        let hash_size = 20; // SHA1 for now
+        if content.len() < null_pos + 1 + hash_size {
+            return Err(Error::other("Tree entry missing hash"));
         }
 
-        let hash_bytes = &content[null_pos + 1..null_pos + 1 + 32];
-        // Expect full SHA256 hash (32 bytes = 64 hex characters)
+        let hash_bytes = &content[null_pos + 1..null_pos + 1 + hash_size];
         let hash_hex = hex::encode(hash_bytes);
-        let hash = Sha256Hash::new(hash_hex)?;
+        let hash = GitHash::from_hex(&hash_hex)?;
 
         entries.push(TreeEntry {
             mode,
@@ -316,7 +317,7 @@ pub fn parse_tree_object(data: &[u8]) -> Result<TreeObject> {
         });
 
         // Move to next entry
-        content = &content[null_pos + 1 + 20..];
+        content = &content[null_pos + 1 + hash_size..];
     }
 
     Ok(TreeObject { entries })
@@ -340,7 +341,7 @@ pub fn parse_blob_object(data: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Parse object references from git object data
-pub fn parse_object_references(object_data: &[u8]) -> Result<Vec<Sha256Hash>> {
+pub fn parse_object_references(object_data: &[u8]) -> Result<Vec<GitHash>> {
     // Determine object type and parse accordingly
     let null_pos = object_data.iter().position(|&b| b == 0)
         .ok_or_else(|| Error::other("Invalid git object format"))?;
@@ -395,26 +396,45 @@ pub async fn write_objects(repo_path: &Path, objects: &[GitObject]) -> Result<()
     Ok(())
 }
 
-/// Convert git2::Oid to SHA256 hash
-/// Note: git2 currently only supports SHA1, so this will need updating when git2 supports SHA256
+/// Convert git2::Oid to GitHash (supports both SHA1 and SHA256)
+pub fn oid_to_hash(oid: Oid) -> Result<GitHash> {
+    // git2 Oid.to_string() returns the hex representation
+    // SHA1 = 40 hex chars, SHA256 = 64 hex chars
+    GitHash::from_hex(&oid.to_string())
+}
+
+/// Convert GitHash back to git2::Oid
+/// Note: git2 currently only supports SHA1, so SHA256 hashes will fail
+pub fn hash_to_oid(hash: &GitHash) -> Result<Oid> {
+    // git2 0.20.3 still primarily uses SHA1 Oids
+    // SHA256 support in libgit2 1.9.2 is available but not yet exposed in git2-rs
+    match hash {
+        GitHash::Sha1(_) => {
+            Oid::from_str(&hash.to_hex())
+                .map_err(|e| Error::other(format!("Cannot convert hash to Oid: {}", e)))
+        }
+        GitHash::Sha256(_) => {
+            // SHA256 git repos are not yet widely supported
+            // When git2 exposes SHA256 Oid support, this will work
+            Err(Error::other("SHA256 Oids not yet supported by git2-rs"))
+        }
+    }
+}
+
+// Keep legacy function for backwards compatibility during migration
+#[deprecated(note = "Use oid_to_hash instead - it supports both SHA1 and SHA256")]
 pub fn oid_to_sha256(oid: Oid) -> Result<Sha256Hash> {
-    // When git2 supports SHA256, this should directly convert
-    // For now, we assume all Oids will be replaced with proper SHA256 handling
     let oid_str = oid.to_string();
     if oid_str.len() == 64 {
-        // Already a SHA256
         Sha256Hash::new(oid_str)
     } else {
-        // SHA1 - return error as we no longer support SHA1
         Err(Error::other("SHA1 hashes are no longer supported, use SHA256"))
     }
 }
 
-/// Convert SHA256 hash back to git2::Oid
-/// Note: This will need updating when git2 supports SHA256
+// Keep legacy function for backwards compatibility during migration
+#[deprecated(note = "Use hash_to_oid instead - it supports GitHash enum")]
 pub fn sha256_to_oid(hash: &Sha256Hash) -> Result<Oid> {
-    // When git2 supports SHA256, this should work directly
-    // For now, this will likely fail as git2 expects SHA1
     Oid::from_str(hash.as_str()).map_err(|e| Error::other(format!("Cannot convert SHA256 to Oid (git2 limitation): {}", e)))
 }
 
@@ -430,7 +450,7 @@ pub async fn publish_repository(repo_path: &Path, dht: &crate::dht::GitTorrentDh
 
     // 2. Store each object in DHT
     for obj in &objects {
-        let key = GitObjectKey::new(obj.hash.clone());
+        let key = GitObjectKey::from_sha256(obj.hash.clone());
         let record = GitObjectRecord::new(key.clone(), obj.data.clone());
 
         // Store object
@@ -471,7 +491,7 @@ pub async fn clone_commit(
     tracing::info!("Cloning commit {} to {:?}", commit_hash, target_path);
 
     // 1. Fetch and parse the commit object
-    let commit_key = GitObjectKey::new(commit_hash.clone());
+    let commit_key = GitObjectKey::from_sha256(commit_hash.clone());
     let commit_record = dht.get_object(commit_key).await?
         .ok_or_else(|| crate::Error::not_found("Commit not found"))?;
 
@@ -495,7 +515,7 @@ pub async fn clone_commit(
 
 /// Recursively checkout a tree from the DHT
 pub fn checkout_tree<'a>(
-    tree_hash: Sha256Hash,
+    tree_hash: GitHash,
     path: &'a Path,
     dht: &'a crate::dht::GitTorrentDht
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
@@ -619,10 +639,10 @@ pub async fn set_head_to_commit(repo: &Repository, commit_hash: Sha256Hash) -> R
 
 /// Fetch commit history (breadth-first traversal)
 pub async fn fetch_commit_history(
-    commit_hash: Sha256Hash,
+    commit_hash: GitHash,
     dht: &crate::dht::GitTorrentDht,
     max_depth: Option<u32>
-) -> Result<Vec<Sha256Hash>> {
+) -> Result<Vec<GitHash>> {
     use crate::dht::GitObjectKey;
 
     let mut commits = Vec::new();
@@ -660,9 +680,9 @@ pub async fn extract_git_refs(repo_path: &Path) -> Result<GitRefs> {
         let reference = reference?;
         if let Some(name) = reference.name() {
             if let Some(target) = reference.target() {
-                // Convert git2 Oid to SHA256 (temporary until git2 supports SHA256)
-                let sha256 = oid_to_sha256(target)?;
-                refs_map.insert(name.to_string(), sha256);
+                // Convert git2 Oid to GitHash (supports SHA1 and SHA256)
+                let hash = oid_to_hash(target)?;
+                refs_map.insert(name.to_string(), hash);
             }
         }
     }
@@ -697,7 +717,7 @@ pub async fn store_git_refs(
     // Create a special key for references: "refs:" + commit_hash
     let refs_key_str = format!("refs:{}", commit_hash);
     let refs_key_hash = crate::crypto::hash::sha256_data(refs_key_str.as_bytes())?;
-    let refs_key = GitObjectKey::new(refs_key_hash);
+    let refs_key = GitObjectKey::from_sha256(refs_key_hash);
 
     // Store in DHT
     let record = GitObjectRecord::new(refs_key.clone(), refs_data);
@@ -718,7 +738,7 @@ pub async fn retrieve_git_refs(
     // Create references key
     let refs_key_str = format!("refs:{}", commit_hash);
     let refs_key_hash = crate::crypto::hash::sha256_data(refs_key_str.as_bytes())?;
-    let refs_key = GitObjectKey::new(refs_key_hash);
+    let refs_key = GitObjectKey::from_sha256(refs_key_hash);
 
     // Retrieve from DHT
     if let Some(record) = dht.get_object(refs_key).await? {
@@ -772,9 +792,9 @@ pub async fn restore_git_refs(repo_path: &Path, refs: &GitRefs) -> Result<()> {
     let repo = Repository::open(repo_path)?;
 
     // Restore each reference
-    for (ref_name, sha256_hash) in &refs.refs {
-        // Convert SHA256 back to OID (temporary)
-        let oid = sha256_to_oid(sha256_hash)?;
+    for (ref_name, git_hash) in &refs.refs {
+        // Convert GitHash back to OID
+        let oid = hash_to_oid(git_hash)?;
 
         // Create the reference
         if let Err(e) = repo.reference(ref_name, oid, true, "Restored from GitTorrent") {
