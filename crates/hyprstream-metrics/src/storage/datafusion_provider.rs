@@ -129,6 +129,8 @@ pub struct DuckDBExec {
     projection: Option<Vec<usize>>,
     filters: Vec<Expr>,
     limit: Option<usize>,
+    /// Cached plan properties
+    properties: datafusion::physical_plan::PlanProperties,
 }
 
 impl std::fmt::Debug for DuckDBExec {
@@ -153,6 +155,10 @@ impl DuckDBExec {
         filters: Vec<Expr>,
         limit: Option<usize>,
     ) -> Self {
+        use datafusion::physical_plan::Partitioning;
+        use datafusion::physical_expr::EquivalenceProperties;
+        use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+
         // Compute projected schema
         let projected_schema = if let Some(ref proj) = projection {
             let fields: Vec<_> = proj
@@ -164,6 +170,14 @@ impl DuckDBExec {
             schema.clone()
         };
 
+        // Create properties with the correct schema
+        let properties = datafusion::physical_plan::PlanProperties::new(
+            EquivalenceProperties::new(projected_schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+
         Self {
             backend,
             table_name,
@@ -172,6 +186,7 @@ impl DuckDBExec {
             projection,
             filters,
             limit,
+            properties,
         }
     }
 
@@ -240,22 +255,7 @@ impl datafusion::physical_plan::ExecutionPlan for DuckDBExec {
     }
 
     fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
-        // Use a static reference for properties
-        // This is a simplified implementation
-        static PROPERTIES: std::sync::OnceLock<datafusion::physical_plan::PlanProperties> =
-            std::sync::OnceLock::new();
-        PROPERTIES.get_or_init(|| {
-            use datafusion::physical_plan::Partitioning;
-            use datafusion::physical_expr::EquivalenceProperties;
-            use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-
-            datafusion::physical_plan::PlanProperties::new(
-                EquivalenceProperties::new(Arc::new(datafusion::arrow::datatypes::Schema::empty())),
-                Partitioning::UnknownPartitioning(1),
-                EmissionType::Incremental,
-                Boundedness::Bounded,
-            )
-        })
+        &self.properties
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

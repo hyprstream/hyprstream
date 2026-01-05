@@ -297,7 +297,6 @@ mod tests {
     use super::*;
     use crate::storage::duckdb::DuckDbBackend;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use futures::StreamExt;
 
     #[tokio::test]
     async fn test_orchestrator_prepare_and_execute() -> Result<()> {

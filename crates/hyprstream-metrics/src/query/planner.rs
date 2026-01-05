@@ -78,9 +78,10 @@ impl DataFusionPlanner {
         let tables = storage.list_tables().await.map_err(|e| Into::<DataFusionError>::into(StatusWrapper(e)))?;
         for table_name in tables {
             let schema = storage.get_table_schema(&table_name).await.map_err(|e| Into::<DataFusionError>::into(StatusWrapper(e)))?;
+            // Use vec![vec![]] to provide one empty partition (required by MemTable)
             planner.ctx.register_table(
                 &table_name,
-                Arc::new(MemTable::try_new(schema, vec![])?),
+                Arc::new(MemTable::try_new(schema, vec![vec![]])?),
             )?;
         }
 
