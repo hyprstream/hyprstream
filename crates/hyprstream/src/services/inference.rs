@@ -98,11 +98,17 @@ impl PolicyChecker {
 
         std::thread::spawn(move || {
             // Create a multi-threaded runtime for this thread
-            let rt = tokio::runtime::Builder::new_multi_thread()
+            let rt = match tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)  // Single worker is enough for policy checks
                 .enable_all()
                 .build()
-                .expect("Failed to create policy checker runtime");
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!("Failed to create policy checker runtime: {}", e);
+                    return;
+                }
+            };
 
             rt.block_on(async move {
                 // Process requests until the channel is closed

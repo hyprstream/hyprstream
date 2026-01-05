@@ -129,7 +129,10 @@ impl Claims {
 pub fn encode(claims: &Claims, signing_key: &SigningKey) -> String {
     // Encode header and payload
     let header_b64 = URL_SAFE_NO_PAD.encode(JWT_HEADER);
-    let payload_json = serde_json::to_string(claims).expect("Claims serialization cannot fail");
+    let payload_json = serde_json::to_string(claims).unwrap_or_else(|e| {
+        tracing::error!("JWT claims serialization failed: {}", e);
+        "{}".to_string()
+    });
     let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
 
     // Create signing input

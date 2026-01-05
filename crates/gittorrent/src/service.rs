@@ -656,10 +656,11 @@ impl GitTorrentService {
             format_version: 1, // Current format version
             object_stats,
             size_bytes: total_size,
+            // SAFETY: Only fails if system time is before Unix epoch (1970)
             last_updated: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
             publisher: None, // Could be set from git config in future
             refs: ref_names,
             lfs_chunks: vec![], // No LFS support yet

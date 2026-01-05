@@ -23,8 +23,9 @@
 
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(any(feature = "bnb", test))]
 use tch::Device;
@@ -166,9 +167,7 @@ impl KVCacheRegistry {
         // Try to get existing cache first (fast path)
         if let Some(cache) = self.caches.get(&owner) {
             // Update access time
-            if let Ok(guard) = cache.lock() {
-                guard.touch();
-            }
+            cache.lock().touch();
             return cache.clone();
         }
 
@@ -229,13 +228,10 @@ impl KVCacheRegistry {
                     return None;
                 }
 
-                if let Ok(guard) = entry.value().lock() {
-                    let last_access = guard.last_access();
-                    let memory = guard.memory_usage();
-                    Some((owner, last_access, memory))
-                } else {
-                    None
-                }
+                let guard = entry.value().lock();
+                let last_access = guard.last_access();
+                let memory = guard.memory_usage();
+                Some((owner, last_access, memory))
             })
             .collect();
 
@@ -258,13 +254,7 @@ impl KVCacheRegistry {
     pub fn total_memory_usage(&self) -> usize {
         self.caches
             .iter()
-            .map(|entry| {
-                entry
-                    .value()
-                    .lock()
-                    .map(|g| g.memory_usage())
-                    .unwrap_or(0)
-            })
+            .map(|entry| entry.value().lock().memory_usage())
             .sum()
     }
 
@@ -752,7 +742,9 @@ impl LayerKVCache {
                         ));
                     }
 
-                    let kb = keys_buffer.as_ref().expect("buffer was just created");
+                    let kb = keys_buffer.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("Internal error: keys buffer not initialized")
+                    })?;
 
                     // Check if buffer needs to grow
                     let buf_capacity = kb.size()[1] as usize;

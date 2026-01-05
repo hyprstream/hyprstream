@@ -71,8 +71,9 @@ impl XetFilter<Unregistered> {
 
         // Creating a CString for attributes
         // Format: "filter=xet" matches .gitattributes entries like "*.safetensors filter=xet"
+        // SAFETY: "filter=xet" is a static literal with no null bytes
         let attributes_cstr = CString::new("filter=xet")
-            .expect("filter=xet contains no null bytes");
+            .map_err(|_| XetError::new(XetErrorKind::RuntimeError, "Invalid attributes string"))?;
         let attributes_ptr = attributes_cstr.as_ptr() as *const c_char;
 
         // Create filter structure
@@ -128,7 +129,7 @@ impl XetFilter<Unregistered> {
             (*filter_ptr).attributes = self
                 .attributes_cstr
                 .as_ref()
-                .expect("attributes_cstr set during construction")
+                .ok_or_else(|| XetError::new(XetErrorKind::RuntimeError, "attributes_cstr not set"))?
                 .as_ptr();
             (*filter_ptr).initialize = Some(crate::callbacks::xet_filter_initialize);
             (*filter_ptr).shutdown = Some(crate::callbacks::xet_filter_shutdown);
@@ -138,12 +139,13 @@ impl XetFilter<Unregistered> {
 
             // Store payload in global registry using filter instance pointer
             // Cast to OpaqueGitFilter for the registry
+            let payload = self
+                .payload
+                .take()
+                .ok_or_else(|| XetError::new(XetErrorKind::RuntimeError, "payload not set"))?;
             crate::callbacks::register_payload(
                 filter_ptr as *const crate::ffi::OpaqueGitFilter,
-                *self
-                    .payload
-                    .take()
-                    .expect("payload set during construction"),
+                *payload,
             );
 
             let result = crate::ffi::git_filter_register(

@@ -2451,7 +2451,9 @@ impl<'a> TextStream<'a> {
 
             result
         } else {
-            let last_token = self.last_generated.expect("last_generated should be set");
+            let last_token = self.last_generated.ok_or_else(|| {
+                anyhow::anyhow!("Internal error: last_generated not set after {} tokens", self.tokens_generated)
+            })?;
 
             if self.tokens_generated.is_multiple_of(50) {
                 tracing::debug!(

@@ -380,15 +380,17 @@ mod tests {
         let sampler = TensorSampler::new(Device::Cpu);
         let logits = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0]);
 
+        // Save original values before penalty (shallow_clone shares storage, so save first)
+        let original_vec: Vec<f32> = Vec::try_from(&logits).expect("test: convert to vec");
+
         // Apply penalty to token 4 (highest logit = 5.0)
         let penalized = sampler.apply_repetition_penalty(
-            logits.shallow_clone(),
+            logits,  // Pass ownership directly
             2.0,  // 2x penalty
             &[4, 4, 4],  // Token 4 appeared 3 times (but penalty is uniform, not exponential)
         ).expect("test: apply repetition penalty");
 
         let penalized_vec: Vec<f32> = Vec::try_from(penalized).expect("test: convert to vec");
-        let original_vec: Vec<f32> = Vec::try_from(logits).expect("test: convert to vec");
 
         // Token 4 should be penalized with UNIFORM penalty (frequency ignored)
         // Original: 5.0, Penalized: 5.0 / 2.0 = 2.5

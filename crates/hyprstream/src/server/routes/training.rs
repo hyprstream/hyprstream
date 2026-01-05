@@ -286,10 +286,11 @@ async fn write_checkpoint(
     // Get step number
     let step = req.step.unwrap_or_else(|| {
         use std::time::{SystemTime, UNIX_EPOCH};
+        // SAFETY: Only fails if system time is before Unix epoch (1970)
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_secs() as usize
+            .map(|d| d.as_secs() as usize)
+            .unwrap_or(0)
     });
 
     // Create dummy weight snapshot (would need actual implementation)

@@ -531,91 +531,10 @@ impl ZmqClient {
     }
 }
 
-/// Client for REQ/REP services
-///
-/// Note: ServiceClient is not thread-safe because ZMQ sockets are not thread-safe.
-/// Create a new client for each thread/task that needs to communicate with the service.
-pub struct ServiceClient {
-    socket: zmq::Socket,
-    endpoint: String,
-}
-
-impl ServiceClient {
-    /// Connect to a service at the given endpoint
-    pub fn connect(endpoint: &str) -> Result<Self> {
-        let ctx = global_context();
-
-        let socket = ctx
-            .socket(zmq::REQ)
-            .map_err(|e| anyhow!("failed to create REQ socket: {}", e))?;
-
-        socket
-            .connect(endpoint)
-            .map_err(|e| anyhow!("failed to connect to {}: {}", endpoint, e))?;
-
-        // Set LINGER to 0 for immediate close without blocking
-        socket
-            .set_linger(0)
-            .map_err(|e| anyhow!("failed to set socket linger: {}", e))?;
-
-        debug!("ServiceClient connected to {}", endpoint);
-
-        Ok(Self {
-            socket,
-            endpoint: endpoint.to_string(),
-        })
-    }
-
-    /// Send a request and wait for a response
-    ///
-    /// This is a blocking call.
-    pub fn call(&self, request: &[u8]) -> Result<Vec<u8>> {
-        self.socket
-            .send(request, 0)
-            .map_err(|e| anyhow!("failed to send request: {}", e))?;
-
-        let response = self
-            .socket
-            .recv_bytes(0)
-            .map_err(|e| anyhow!("failed to receive response: {}", e))?;
-
-        trace!(
-            "ServiceClient {} call completed ({} bytes response)",
-            self.endpoint,
-            response.len()
-        );
-
-        Ok(response)
-    }
-
-    /// Send a request and wait for a response with timeout
-    pub fn call_with_timeout(&self, request: &[u8], timeout_ms: i32) -> Result<Vec<u8>> {
-        // Set receive timeout
-        self.socket
-            .set_rcvtimeo(timeout_ms)
-            .map_err(|e| anyhow!("failed to set timeout: {}", e))?;
-
-        self.socket
-            .send(request, 0)
-            .map_err(|e| anyhow!("failed to send request: {}", e))?;
-
-        let response = self
-            .socket
-            .recv_bytes(0)
-            .map_err(|e| anyhow!("failed to receive response (timeout={}ms): {}", timeout_ms, e))?;
-
-        // Reset timeout
-        let _ = self.socket.set_rcvtimeo(-1);
-
-        Ok(response)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use hyprstream_rpc::crypto::generate_signing_keypair;
-    use hyprstream_rpc::transport::AsyncServiceClient;
 
     struct EchoService;
 
@@ -633,28 +552,8 @@ mod tests {
         }
     }
 
-    /// Create a signed envelope with the given payload
-    fn create_signed_request(signing_key: &SigningKey, payload: &[u8]) -> Vec<u8> {
-        use capnp::message::Builder;
-        use capnp::serialize;
-
-        let envelope = RequestEnvelope::local(payload.to_vec());
-        let signed = SignedEnvelope::new_signed(envelope, signing_key);
-
-        let mut message = Builder::new_default();
-        {
-            let mut builder = message.init_root::<hyprstream_rpc::common_capnp::signed_envelope::Builder>();
-            signed.write_to(&mut builder);
-        }
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message).expect("test: serialize message");
-        bytes
-    }
-
     #[tokio::test]
     async fn test_service_runner() {
-        // Use a unique endpoint for this test
         let endpoint = "inproc://test-echo-service";
 
         // Generate keypair for this test
@@ -664,45 +563,13 @@ mod tests {
         let runner = ServiceRunner::new(endpoint, verifying_key);
         let handle = runner.run(EchoService).await.expect("test: start service");
 
-        // Create signed request
-        let request = create_signed_request(&signing_key, b"hello");
+        // Use ZmqClient directly (handles signing internally)
+        let client = ZmqClient::new(endpoint, signing_key, RequestIdentity::local());
+        let response = client.call(b"hello".to_vec()).await.expect("test: call");
 
-        // Test the service
-        let response = tokio::task::spawn_blocking(move || {
-            let client = ServiceClient::connect(endpoint).expect("test: connect client");
-            client.call(&request)
-        })
-        .await
-        .expect("test: spawn blocking");
-
-        let response = response.expect("test: service call");
         // Response should start with "from <user>:"
         let response_str = String::from_utf8_lossy(&response);
         assert!(response_str.contains("hello"), "Response should contain 'hello': {}", response_str);
-
-        // Stop the service
-        handle.stop().await;
-    }
-
-    #[tokio::test]
-    async fn test_async_client() {
-        let endpoint = "inproc://test-async-echo";
-
-        // Generate keypair for this test
-        let (signing_key, verifying_key) = generate_signing_keypair();
-
-        // Start the service (waits for socket binding)
-        let runner = ServiceRunner::new(endpoint, verifying_key);
-        let handle = runner.run(EchoService).await.expect("test: start service");
-
-        // Create signed request
-        let request = create_signed_request(&signing_key, b"async hello");
-
-        // Test async client
-        let client = AsyncServiceClient::new(endpoint);
-        let response = client.call(request).await.expect("test: async call");
-        let response_str = String::from_utf8_lossy(&response);
-        assert!(response_str.contains("async hello"), "Response should contain 'async hello': {}", response_str);
 
         // Stop the service
         handle.stop().await;
@@ -720,19 +587,12 @@ mod tests {
         let runner = ServiceRunner::new(endpoint, wrong_verifying_key);
         let handle = runner.run(EchoService).await.expect("test: start service");
 
-        // Create signed request with different key
-        let request = create_signed_request(&signing_key, b"should fail");
-
-        // Test the service - should get empty response (error)
-        let response = tokio::task::spawn_blocking(move || {
-            let client = ServiceClient::connect(endpoint).expect("test: connect client");
-            client.call(&request)
-        })
-        .await
-        .expect("test: spawn blocking");
+        // Sign with different key than service expects
+        let client = ZmqClient::new(endpoint, signing_key, RequestIdentity::local());
+        let response = client.call(b"should fail".to_vec()).await.expect("test: call");
 
         // Response should be empty (verification failure)
-        assert!(response.expect("test: get response").is_empty(), "Invalid signature should return empty response");
+        assert!(response.is_empty(), "Invalid signature should return empty response");
 
         handle.stop().await;
     }

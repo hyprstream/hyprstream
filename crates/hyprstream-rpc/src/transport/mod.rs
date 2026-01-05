@@ -3,15 +3,12 @@
 //! This module provides:
 //! - `Transport` / `AsyncTransport` traits for generic transport abstraction
 //! - `TransportConfig` for unified endpoint configuration
-//! - `ZmqTransport` / `AsyncServiceClient` for ZMQ-based communication
 
 mod traits;
-mod zmq;
 
 use std::path::PathBuf;
 
 pub use traits::{AsyncTransport, Transport};
-pub use zmq::{AsyncServiceClient, ZmqTransport};
 
 /// ZMQ endpoint configuration.
 ///

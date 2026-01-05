@@ -4601,6 +4601,7 @@ dependencies = [
  "hmac",
  "hyprstream-rpc-derive",
  "p256",
+ "parking_lot 0.12.4",
  "rand 0.8.5",
  "sha2",
  "subtle",

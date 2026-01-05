@@ -67,21 +67,30 @@ pub struct StorageConfig {
 
 impl Default for StorageConfig {
     fn default() -> Self {
-        let storage_paths = StoragePaths::new().expect("Failed to initialize storage paths");
+        // Try to get XDG-compliant paths, fall back to current directory
+        let (models_dir, loras_dir, cache_dir, config_dir) = match StoragePaths::new() {
+            Ok(storage_paths) => (
+                storage_paths.models_dir().unwrap_or_else(|_| PathBuf::from("./models")),
+                storage_paths.loras_dir().unwrap_or_else(|_| PathBuf::from("./loras")),
+                storage_paths.cache_dir().unwrap_or_else(|_| PathBuf::from("./cache")),
+                storage_paths.config_dir().unwrap_or_else(|_| PathBuf::from("./config")),
+            ),
+            Err(e) => {
+                tracing::warn!("XDG paths unavailable: {}, using local directories", e);
+                (
+                    PathBuf::from("./models"),
+                    PathBuf::from("./loras"),
+                    PathBuf::from("./cache"),
+                    PathBuf::from("./config"),
+                )
+            }
+        };
 
         Self {
-            models_dir: storage_paths
-                .models_dir()
-                .unwrap_or_else(|_| PathBuf::from("./models")),
-            loras_dir: storage_paths
-                .loras_dir()
-                .unwrap_or_else(|_| PathBuf::from("./loras")),
-            cache_dir: storage_paths
-                .cache_dir()
-                .unwrap_or_else(|_| PathBuf::from("./cache")),
-            config_dir: storage_paths
-                .config_dir()
-                .unwrap_or_else(|_| PathBuf::from("./config")),
+            models_dir,
+            loras_dir,
+            cache_dir,
+            config_dir,
         }
     }
 }

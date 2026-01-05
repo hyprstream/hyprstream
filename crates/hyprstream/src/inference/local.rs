@@ -80,10 +80,19 @@ impl LocalInferenceService {
         // 2. GPU operations benefit from thread isolation
         // 3. Matches git2db's LocalService pattern
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+            let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("Failed to create service runtime");
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = init_tx.send(Err(InferenceError::Internal(format!(
+                        "Failed to create runtime: {}",
+                        e
+                    ))));
+                    return;
+                }
+            };
 
             rt.block_on(async move {
                 // Load model
@@ -93,7 +102,7 @@ impl LocalInferenceService {
                         service.run().await;
                     }
                     Err(e) => {
-                        let _ = init_tx.send(Err(e));
+                        let _ = init_tx.send(Err(InferenceError::Internal(e.to_string())));
                     }
                 }
             });

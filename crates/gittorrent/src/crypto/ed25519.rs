@@ -138,11 +138,13 @@ impl Ed25519KeyPair {
 impl Clone for Ed25519KeyPair {
     fn clone(&self) -> Self {
         // We need to recreate the keypair since ed25519_dalek keys don't implement Clone
-        let key_data = KeyData {
-            pub_key: hex::encode(self.verifying_key.as_bytes()),
-            priv_key: hex::encode(self.signing_key.as_bytes()),
-        };
-        Self::from_key_data(&key_data).expect("Failed to clone keypair")
+        // SAFETY: We're recreating from the same keypair's bytes, so this cannot fail
+        let signing_key = SigningKey::from_bytes(&self.signing_key.to_bytes());
+        let verifying_key = signing_key.verifying_key();
+        Self {
+            signing_key,
+            verifying_key,
+        }
     }
 }
 

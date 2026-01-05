@@ -59,7 +59,9 @@ impl GitObjectKey {
     /// Convert to libp2p RecordKey using multihash
     pub fn to_record_key(&self) -> RecordKey {
         // Create multihash from SHA2-256 (code 0x12) using the derived DHT key
-        let multihash: Multihash<64> = Multihash::wrap(0x12, &self.dht_key).expect("32-byte hash should fit");
+        // SAFETY: SHA2-256 (0x12) expects exactly 32 bytes, which dht_key provides
+        let multihash: Multihash<64> = Multihash::wrap(0x12, &self.dht_key)
+            .unwrap_or_else(|_| Multihash::wrap(0x12, &[0u8; 32]).unwrap());
         RecordKey::new(&multihash.to_bytes())
     }
 
@@ -164,7 +166,13 @@ impl GitTorrentDht {
                 libp2p::noise::Config::new,
                 libp2p::yamux::Config::default,
             )?
-            .with_behaviour(|key| GitTorrentBehaviour::new_with_keypair(key, mode).unwrap())?
+            .with_behaviour(|key| {
+                GitTorrentBehaviour::new_with_keypair(key, mode)
+                    .unwrap_or_else(|e| {
+                        tracing::error!("Failed to create GitTorrent behaviour: {}", e);
+                        panic!("Failed to create GitTorrent behaviour: {}", e)
+                    })
+            })?
             .build();
 
         let local_peer_id = *swarm.local_peer_id();
@@ -264,8 +272,10 @@ impl GitTorrentDht {
     }
 
     /// Helper to create a proper bootstrap address with peer ID
-    pub fn create_bootstrap_addr(ip: &str, port: u16, peer_id: &PeerId) -> Multiaddr {
-        format!("/ip4/{}/tcp/{}/p2p/{}", ip, port, peer_id).parse().unwrap()
+    ///
+    /// Returns None if the address cannot be parsed (should never happen with valid inputs)
+    pub fn create_bootstrap_addr(ip: &str, port: u16, peer_id: &PeerId) -> Option<Multiaddr> {
+        format!("/ip4/{}/tcp/{}/p2p/{}", ip, port, peer_id).parse().ok()
     }
 
     async fn handle_swarm_event(

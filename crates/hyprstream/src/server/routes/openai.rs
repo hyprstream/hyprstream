@@ -187,16 +187,15 @@ async fn resolve_model_path(
 
 /// Helper: Add no-cache headers to response
 fn add_no_cache_headers(response: &mut axum::response::Response) {
+    use axum::http::HeaderValue;
     let headers = response.headers_mut();
     headers.insert(
         header::CACHE_CONTROL,
-        "no-cache, no-store, must-revalidate"
-            .parse()
-            .expect("static header value is valid"),
+        HeaderValue::from_static("no-cache, no-store, must-revalidate"),
     );
     headers.insert(
         header::PRAGMA,
-        "no-cache".parse().expect("static header value is valid"),
+        HeaderValue::from_static("no-cache"),
     );
 }
 
@@ -728,7 +727,7 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                 } else {
                     // Send data chunk
                     Ok(axum::response::sse::Event::default()
-                        .data(serde_json::to_string(&json).expect("JSON value always serializes")))
+                        .data(serde_json::to_string(&json).unwrap_or_else(|_| "{}".to_string())))
                 }
             }
             Err(e) => {
@@ -749,7 +748,7 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
         .headers_mut()
         .insert(
             header::EXPIRES,
-            "0".parse().expect("static header value is valid"),
+            axum::http::HeaderValue::from_static("0"),
         );
 
     response

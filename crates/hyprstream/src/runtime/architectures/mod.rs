@@ -345,7 +345,7 @@ pub trait ModelOperations: Send {
     /// the model uses them for inference.
     fn set_kv_cache(
         &mut self,
-        _cache: std::sync::Arc<std::sync::Mutex<crate::runtime::kv_cache::KVCacheManager>>,
+        _cache: std::sync::Arc<parking_lot::Mutex<crate::runtime::kv_cache::KVCacheManager>>,
     ) {
         // Default: no-op for models without configurable cache
     }
@@ -353,14 +353,14 @@ pub trait ModelOperations: Send {
     /// Get the current KV cache (for external management)
     fn get_kv_cache(
         &self,
-    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::runtime::kv_cache::KVCacheManager>>> {
+    ) -> Option<std::sync::Arc<parking_lot::Mutex<crate::runtime::kv_cache::KVCacheManager>>> {
         None // Default: no cache
     }
 
     /// Take ownership of the KV cache (removes it from the model)
     fn take_kv_cache(
         &mut self,
-    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::runtime::kv_cache::KVCacheManager>>> {
+    ) -> Option<std::sync::Arc<parking_lot::Mutex<crate::runtime::kv_cache::KVCacheManager>>> {
         None // Default: no cache
     }
 }

@@ -146,7 +146,7 @@ pub struct JanusModel {
 
     /// Optimization: Cache last vision encoding
     /// Uses Mutex instead of RefCell for thread safety (Send requirement)
-    vision_cache: std::sync::Mutex<Option<(Vec<u8>, Tensor)>>,  // (input_hash, features)
+    vision_cache: parking_lot::Mutex<Option<(Vec<u8>, Tensor)>>,  // (input_hash, features)
 }
 
 /// Vision encoder implementations
@@ -713,7 +713,7 @@ impl JanusModel {
             dtype,
             architecture,
             config,
-            vision_cache: std::sync::Mutex::new(None),
+            vision_cache: parking_lot::Mutex::new(None),
         })
     }
 

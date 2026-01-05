@@ -30,6 +30,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 whoami = { workspace = true }
 hex = { workspace = true }
+parking_lot = { workspace = true }
 
 # Cryptography (for signed envelopes, DH key exchange, stream HMAC)
 ed25519-dalek = { workspace = true }

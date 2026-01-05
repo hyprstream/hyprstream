@@ -13,13 +13,14 @@ use tch::Tensor;
 use tracing::info;
 
 /// Regex for extracting numeric version from model type strings
-static VERSION_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(\d+)").expect("valid regex pattern")
+/// SAFETY: These patterns are compile-time constants that are guaranteed valid
+static VERSION_REGEX: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    Regex::new(r"(\d+)").ok()
 });
 
 /// Regex for extracting layer indices from weight key names
-static LAYER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"layers\.(\d+)").expect("valid regex pattern")
+static LAYER_REGEX: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    Regex::new(r"layers\.(\d+)").ok()
 });
 
 /// Unified model configuration that combines all sources
@@ -334,9 +335,11 @@ impl ModelConfig {
             }
 
             // Try generic number extraction as fallback
-            if let Some(captures) = VERSION_REGEX.captures(model_type) {
-                if let Ok(version) = captures[1].parse::<u32>() {
-                    return version;
+            if let Some(ref regex) = *VERSION_REGEX {
+                if let Some(captures) = regex.captures(model_type) {
+                    if let Ok(version) = captures[1].parse::<u32>() {
+                        return version;
+                    }
                 }
             }
         }
@@ -377,10 +380,12 @@ impl ModelConfig {
 
     fn count_layers(weights: &HashMap<String, Tensor>) -> usize {
         let mut max_layer = 0;
-        for key in weights.keys() {
-            if let Some(captures) = LAYER_REGEX.captures(key) {
-                if let Ok(layer_idx) = captures[1].parse::<usize>() {
-                    max_layer = max_layer.max(layer_idx + 1);
+        if let Some(ref regex) = *LAYER_REGEX {
+            for key in weights.keys() {
+                if let Some(captures) = regex.captures(key) {
+                    if let Ok(layer_idx) = captures[1].parse::<usize>() {
+                        max_layer = max_layer.max(layer_idx + 1);
+                    }
                 }
             }
         }

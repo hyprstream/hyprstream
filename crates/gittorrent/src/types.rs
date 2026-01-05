@@ -133,8 +133,11 @@ impl MutableKey {
     }
 
     /// Convert to bytes
+    ///
+    /// Returns empty Vec if hex decoding fails (should never happen as
+    /// MutableKey is validated in constructor)
     pub fn to_bytes(&self) -> Vec<u8> {
-        hex::decode(&self.0).expect("MutableKey should always be valid hex")
+        hex::decode(&self.0).unwrap_or_default()
     }
 }
 
@@ -167,8 +170,11 @@ impl Sha256Hash {
     }
 
     /// Convert to bytes
+    ///
+    /// Returns empty Vec if hex decoding fails (should never happen as
+    /// Sha256Hash is validated in constructor)
     pub fn to_bytes(&self) -> Vec<u8> {
-        hex::decode(&self.0).expect("SHA256 hash should always be valid hex")
+        hex::decode(&self.0).unwrap_or_default()
     }
 }
 

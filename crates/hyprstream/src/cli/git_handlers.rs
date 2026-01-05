@@ -317,8 +317,13 @@ pub async fn handle_commit(
             // Parse "Name <email>" format
             let re = regex::Regex::new(r"^(.+?)\s*<(.+?)>$")?;
             if let Some(captures) = re.captures(&author_str) {
-                let name = captures.get(1).expect("capture group 1 exists after match").as_str().trim();
-                let email = captures.get(2).expect("capture group 2 exists after match").as_str().trim();
+                // SAFETY: capture groups 1 and 2 exist because regex matched
+                let name = captures.get(1)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid author format: missing name"))?
+                    .as_str().trim();
+                let email = captures.get(2)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid author format: missing email"))?
+                    .as_str().trim();
                 git2::Signature::now(name, email)?
             } else {
                 anyhow::bail!(

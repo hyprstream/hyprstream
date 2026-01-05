@@ -48,8 +48,11 @@ impl SharedSecret {
     pub fn derive_hmac_key(&self, request_id: u64, info: &[u8]) -> [u8; 32] {
         let hk = Hkdf::<Sha256>::new(Some(&request_id.to_le_bytes()), self.as_bytes());
         let mut okm = [0u8; 32];
-        hk.expand(info, &mut okm)
-            .expect("32 bytes is a valid length for HKDF-SHA256");
+        // SAFETY: HKDF-SHA256 can output up to 255*32=8160 bytes, so 32 is always valid
+        if hk.expand(info, &mut okm).is_err() {
+            // Fallback to zeroed key (should never happen for 32-byte output)
+            okm = [0u8; 32];
+        }
         okm
     }
 }
@@ -280,15 +283,13 @@ mod p256_impl {
                 expected: 33, // compressed
                 actual: bytes.len(),
             })?;
-            let pubkey = PublicKey::from_encoded_point(&point);
-            if pubkey.is_some().into() {
-                Ok(P256PublicKey(pubkey.unwrap()))
-            } else {
-                Err(EnvelopeError::InvalidPublicKey {
+            let pubkey: Option<PublicKey> = PublicKey::from_encoded_point(&point).into();
+            pubkey
+                .map(P256PublicKey)
+                .ok_or(EnvelopeError::InvalidPublicKey {
                     expected: 33,
                     actual: bytes.len(),
                 })
-            }
         }
 
         fn pubkey_to_bytes(pubkey: &Self::PublicKey) -> Vec<u8> {

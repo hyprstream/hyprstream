@@ -286,10 +286,11 @@ impl RequestEnvelope {
         let mut nonce = [0u8; 16];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
 
+        // SAFETY: Only fails if system time is before Unix epoch (1970)
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("time went backwards")
-            .as_millis() as i64;
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
 
         Self {
             request_id: next_request_id(),
@@ -351,7 +352,9 @@ impl RequestEnvelope {
         }
 
         let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message).expect("serialization should not fail");
+        if let Err(e) = serialize::write_message(&mut bytes, &message) {
+            tracing::error!("RequestEnvelope serialization failed: {}", e);
+        }
         bytes
     }
 }
@@ -411,7 +414,8 @@ pub trait NonceCache: Send + Sync {
 ///
 /// # Thread Safety
 ///
-/// Uses `RwLock` for concurrent access. Suitable for moderate load.
+/// Uses `parking_lot::RwLock` for concurrent access (non-poisoning).
+/// Suitable for moderate load.
 /// For high-throughput scenarios, consider a lock-free or sharded implementation.
 ///
 /// # Memory Usage
@@ -420,7 +424,7 @@ pub trait NonceCache: Send + Sync {
 /// when the limit is reached.
 pub struct InMemoryNonceCache {
     /// Map of nonce -> timestamp when it was first seen
-    seen: std::sync::RwLock<std::collections::HashMap<[u8; 16], i64>>,
+    seen: parking_lot::RwLock<std::collections::HashMap<[u8; 16], i64>>,
     /// Maximum age for entries (in milliseconds)
     max_age_ms: i64,
     /// Maximum number of entries before cleanup
@@ -441,7 +445,7 @@ impl InMemoryNonceCache {
     /// - Max entries: 100,000
     pub fn new() -> Self {
         Self {
-            seen: std::sync::RwLock::new(std::collections::HashMap::new()),
+            seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             max_age_ms: MAX_TIMESTAMP_AGE_MS,
             max_entries: 100_000,
         }
@@ -450,7 +454,7 @@ impl InMemoryNonceCache {
     /// Create a new cache with custom settings.
     pub fn with_config(max_age_ms: i64, max_entries: usize) -> Self {
         Self {
-            seen: std::sync::RwLock::new(std::collections::HashMap::new()),
+            seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             max_age_ms,
             max_entries,
         }
@@ -458,7 +462,7 @@ impl InMemoryNonceCache {
 
     /// Remove expired entries.
     fn cleanup(&self, now: i64) {
-        let mut seen = self.seen.write().unwrap();
+        let mut seen = self.seen.write();
 
         // Remove entries older than max_age
         seen.retain(|_, timestamp| now - *timestamp <= self.max_age_ms);
@@ -479,21 +483,22 @@ impl InMemoryNonceCache {
 
 impl NonceCache for InMemoryNonceCache {
     fn check_and_insert(&self, nonce: &[u8; 16]) -> bool {
+        // SAFETY: Only fails if system time is before Unix epoch (1970)
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("time went backwards")
-            .as_millis() as i64;
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
 
         // Fast path: check if already seen (read lock)
         {
-            let seen = self.seen.read().unwrap();
+            let seen = self.seen.read();
             if seen.contains_key(nonce) {
                 return false;
             }
         }
 
         // Slow path: insert (write lock)
-        let mut seen = self.seen.write().unwrap();
+        let mut seen = self.seen.write();
 
         // Double-check after acquiring write lock
         if seen.contains_key(nonce) {
@@ -565,10 +570,11 @@ impl SignedEnvelope {
         }
 
         // 2. Check timestamp window
+        // SAFETY: Only fails if system time is before Unix epoch (1970)
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("time went backwards")
-            .as_millis() as i64;
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
 
         let age = now - self.envelope.timestamp;
         if age > MAX_TIMESTAMP_AGE_MS {
@@ -796,8 +802,8 @@ impl FromCapnp for ResponseEnvelope {
 mod tests {
     use super::*;
     use crate::crypto::signing::generate_signing_keypair;
+    use parking_lot::Mutex;
     use std::collections::HashSet;
-    use std::sync::Mutex;
 
     /// Simple in-memory nonce cache for testing.
     struct TestNonceCache {
@@ -814,7 +820,7 @@ mod tests {
 
     impl NonceCache for TestNonceCache {
         fn check_and_insert(&self, nonce: &[u8; 16]) -> bool {
-            self.seen.lock().unwrap().insert(*nonce)
+            self.seen.lock().insert(*nonce)
         }
     }
 

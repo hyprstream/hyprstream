@@ -2,7 +2,7 @@
 
 use super::{ArchitectureConfig, ModelArchitecture, ModelOperations};
 // use super::lora_adapter::ArchitectureAwareLoRAAdapter; // Module removed
-use crate::runtime::rope::{RoPE, RoPEManager};
+use crate::runtime::rope::RoPE;
 use crate::runtime::tensor_helpers::{
     broadcast_add, broadcast_mul, dims3, dims4, scalar_tensor, square_tensor,
 };
@@ -271,12 +271,8 @@ pub struct LlamaModel {
     /// This is set when lm_head is None but embed_tokens is Some
     lm_head_transposed: Option<Tensor>,
 
-    // KV cache for efficient generation (thread-safe with Mutex)
-    kv_cache: Option<std::sync::Arc<std::sync::Mutex<crate::runtime::kv_cache::KVCacheManager>>>,
-
-    // RoPE manager for position encoding (unused, RoPE handled at layer level)
-    #[allow(dead_code)]
-    rope_manager: std::sync::Arc<std::sync::Mutex<RoPEManager>>,
+    // KV cache for efficient generation (thread-safe with parking_lot::Mutex)
+    kv_cache: Option<std::sync::Arc<parking_lot::Mutex<crate::runtime::kv_cache::KVCacheManager>>>,
 
     // VarStore for training (if model was created with training support)
     vs: Option<nn::VarStore>,
@@ -554,7 +550,10 @@ impl LlamaAttention {
                 e.insert(rope);
             }
 
-            let rope = cache.get_mut(&key).expect("rope was just inserted");
+            // SAFETY: We just inserted the key above, so it must exist
+            let rope = cache.get_mut(&key).ok_or_else(|| {
+                anyhow!("Internal error: RoPE cache entry missing for layer {}", self.layer_idx)
+            })?;
 
             // Apply RoPE with the actual position_ids
             rope.forward(tensor, Some(position_ids))
@@ -861,7 +860,6 @@ impl LlamaModel {
             lm_head: None,
             lm_head_transposed: None,
             kv_cache: None, // Cache initialized on first use
-            rope_manager: std::sync::Arc::new(std::sync::Mutex::new(RoPEManager::new())),
             vs: None, // No VarStore for safetensors loading
         })
     }
@@ -1017,7 +1015,7 @@ impl LlamaModel {
                 config.max_position_embeddings,
                 kv_quant_type
             );
-            Some(std::sync::Arc::new(std::sync::Mutex::new(
+            Some(std::sync::Arc::new(parking_lot::Mutex::new(
                 crate::runtime::kv_cache::KVCacheManager::new(
                     layers.len(),
                     config.max_position_embeddings,
@@ -1038,7 +1036,6 @@ impl LlamaModel {
             lm_head,
             lm_head_transposed,
             kv_cache,
-            rope_manager: std::sync::Arc::new(std::sync::Mutex::new(RoPEManager::new())),
             vs: None, // No VarStore for weight loading - weights are stored directly
         })
     }
@@ -1629,15 +1626,7 @@ impl ModelOperations for LlamaModel {
 
         // PERF: Lock KV cache ONCE before the layer loop (not 28 times inside!)
         // This reduces lock overhead from O(layers) to O(1) per forward pass.
-        let cache_guard = self.kv_cache.as_ref().map(|cache_ref| {
-            match cache_ref.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => {
-                    tracing::warn!("KV cache lock poisoned, recovering");
-                    poisoned.into_inner()
-                }
-            }
-        });
+        let cache_guard = self.kv_cache.as_ref().map(|cache_ref| cache_ref.lock());
 
         for (idx, layer) in self.layers.iter().enumerate() {
             let residual = hidden_states.shallow_clone();
@@ -1831,7 +1820,7 @@ impl ModelOperations for LlamaModel {
 
             // Handle KV cache per layer with proper start_pos
             let attn_output = if let Some(cache_ref) = self.kv_cache.as_ref() {
-                let cache_manager = cache_ref.lock().expect("Failed to lock KV cache");
+                let cache_manager = cache_ref.lock();
                 if let Some(result) = cache_manager.with_layer_cache(idx, |layer_cache| {
                     layer.self_attn.forward(
                         &hidden_states,
@@ -1992,7 +1981,7 @@ impl ModelOperations for LlamaModel {
 
     fn clear_kv_cache(&self) {
         if let Some(cache_ref) = self.kv_cache.as_ref() {
-            let cache_manager = cache_ref.lock().expect("kv cache mutex poisoned");
+            let cache_manager = cache_ref.lock();
             cache_manager.clear_all();
         }
     }
@@ -2000,26 +1989,26 @@ impl ModelOperations for LlamaModel {
     fn kv_cache_memory_usage(&self) -> usize {
         self.kv_cache
             .as_ref()
-            .map(|cache_ref| cache_ref.lock().expect("kv cache mutex poisoned").memory_usage())
+            .map(|cache_ref| cache_ref.lock().memory_usage())
             .unwrap_or(0)
     }
 
     fn set_kv_cache(
         &mut self,
-        cache: std::sync::Arc<std::sync::Mutex<crate::runtime::kv_cache::KVCacheManager>>,
+        cache: std::sync::Arc<parking_lot::Mutex<crate::runtime::kv_cache::KVCacheManager>>,
     ) {
         self.kv_cache = Some(cache);
     }
 
     fn get_kv_cache(
         &self,
-    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::runtime::kv_cache::KVCacheManager>>> {
+    ) -> Option<std::sync::Arc<parking_lot::Mutex<crate::runtime::kv_cache::KVCacheManager>>> {
         self.kv_cache.clone()
     }
 
     fn take_kv_cache(
         &mut self,
-    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::runtime::kv_cache::KVCacheManager>>> {
+    ) -> Option<std::sync::Arc<parking_lot::Mutex<crate::runtime::kv_cache::KVCacheManager>>> {
         self.kv_cache.take()
     }
 }

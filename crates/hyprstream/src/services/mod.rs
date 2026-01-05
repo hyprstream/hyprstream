@@ -64,7 +64,7 @@ pub mod registry;
 pub mod rpc_types;
 
 pub use core::{
-    EnvelopeContext, ServiceClient, ServiceHandle, ServiceRunner, ZmqClient, ZmqService,
+    EnvelopeContext, ServiceHandle, ServiceRunner, ZmqClient, ZmqService,
 };
 
 pub use traits::{

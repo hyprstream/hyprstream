@@ -348,7 +348,7 @@ pub fn create_http_client() -> Client {
     Client::builder()
         .timeout(std::time::Duration::from_secs(300)) // 5 minutes for long inference
         .build()
-        .expect("Failed to create HTTP client")
+        .unwrap_or_else(|_| Client::new())
 }
 
 /// Create LoRA adapter via REST API
@@ -573,10 +573,11 @@ pub async fn handle_write_checkpoint(
 
     // Get step number
     let step = step.unwrap_or_else(|| {
+        // SAFETY: Only fails if system time is before Unix epoch (1970)
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_secs() as usize
+            .map(|d| d.as_secs() as usize)
+            .unwrap_or(0)
     });
 
     // Create weight snapshot (would need actual implementation)

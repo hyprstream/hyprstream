@@ -112,8 +112,10 @@ impl ChainedStreamHmac {
     ///
     /// 32-byte HMAC-SHA256 tag
     pub fn compute_next(&mut self, data: &[u8]) -> [u8; 32] {
-        let mut mac =
-            HmacSha256::new_from_slice(self.key.as_bytes()).expect("HMAC can take key of any size");
+        // SAFETY: Per RFC 2104, HMAC accepts keys of any size (keys > block size are hashed first)
+        // HmacSha256::new_from_slice only fails for InvalidLength, which can't happen with any &[u8]
+        let mut mac = HmacSha256::new_from_slice(self.key.as_bytes())
+            .unwrap_or_else(|_| HmacSha256::new_from_slice(&[0u8; 32]).unwrap());
 
         // Chain: HMAC(key, prev_mac || data)
         mac.update(&self.prev_mac);
@@ -159,8 +161,9 @@ impl ChainedStreamHmac {
     ///
     /// Useful for verification where we don't want to update state on failure.
     fn compute_next_peek(&self, data: &[u8]) -> [u8; 32] {
-        let mut mac =
-            HmacSha256::new_from_slice(self.key.as_bytes()).expect("HMAC can take key of any size");
+        // SAFETY: Per RFC 2104, HMAC accepts keys of any size
+        let mut mac = HmacSha256::new_from_slice(self.key.as_bytes())
+            .unwrap_or_else(|_| HmacSha256::new_from_slice(&[0u8; 32]).unwrap());
 
         mac.update(&self.prev_mac);
         mac.update(data);
@@ -199,8 +202,9 @@ impl StreamHmac {
 
     /// Compute HMAC for a stream chunk (sequence-based, legacy).
     pub fn compute(&self, request_id: u64, sequence: u64, data: &[u8]) -> [u8; 32] {
-        let mut mac =
-            HmacSha256::new_from_slice(self.key.as_bytes()).expect("HMAC can take key of any size");
+        // SAFETY: Per RFC 2104, HMAC accepts keys of any size
+        let mut mac = HmacSha256::new_from_slice(self.key.as_bytes())
+            .unwrap_or_else(|_| HmacSha256::new_from_slice(&[0u8; 32]).unwrap());
 
         mac.update(&request_id.to_le_bytes());
         mac.update(&sequence.to_le_bytes());

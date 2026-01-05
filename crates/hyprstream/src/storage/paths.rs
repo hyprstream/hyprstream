@@ -114,12 +114,6 @@ impl StoragePaths {
     }
 }
 
-impl Default for StoragePaths {
-    fn default() -> Self {
-        Self::new().expect("Failed to initialize storage paths")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

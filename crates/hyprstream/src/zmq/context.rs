@@ -5,7 +5,7 @@
 
 use once_cell::sync::Lazy;
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Environment variable for configuring ZMQ IO threads
 const ZMQ_IO_THREADS_ENV: &str = "HYPRSTREAM_ZMQ_IO_THREADS";
@@ -33,8 +33,9 @@ static ZMQ_CONTEXT: Lazy<Arc<zmq::Context>> = Lazy::new(|| {
     debug!("initializing global ZMQ context with {} IO thread(s)", io_threads);
 
     let ctx = zmq::Context::new();
-    ctx.set_io_threads(io_threads)
-        .expect("failed to set ZMQ IO threads");
+    if let Err(e) = ctx.set_io_threads(io_threads) {
+        warn!("Failed to set ZMQ IO threads to {}: {}, using default", io_threads, e);
+    }
 
     Arc::new(ctx)
 });
