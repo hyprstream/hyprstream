@@ -466,7 +466,12 @@ impl GitInfo {
     }
 
     /// Create GitInfo from a bare repository path
-    /// This works with bare repos (unlike status which requires worktrees)
+    ///
+    /// This works with bare repos (unlike status which requires worktrees).
+    ///
+    /// **Note**: The `is_dirty` field is ALWAYS false from this function because
+    /// bare repositories have no working directory. Use `ModelStorage::list_worktrees()`
+    /// or `ModelMetadata::is_dirty` for accurate dirty status detection.
     pub fn from_bare_repo(repo_path: &std::path::Path) -> Option<Self> {
         // Try to open as a bare repository
         let repo = git2db::GitManager::global()
@@ -515,8 +520,8 @@ impl GitInfo {
             (None, None, None)
         };
 
-        // For bare repos, we can't check if it's dirty (no working tree)
-        // So we'll assume clean for display purposes
+        // WARNING: For bare repos, we can't check if it's dirty (no working tree)
+        // This value should NOT be used - use ModelMetadata::is_dirty instead
         let is_dirty = false;
 
         Some(GitInfo {

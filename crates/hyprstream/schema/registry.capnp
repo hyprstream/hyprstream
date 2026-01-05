@@ -118,6 +118,7 @@ struct WorktreeInfo {
   branchName @1 :Text;
   headOid @2 :Text;
   isLocked @3 :Bool;
+  isDirty @4 :Bool;
 }
 
 # Branch Request

@@ -9,15 +9,16 @@ use tracing::info;
 
 // Core application imports
 use hyprstream_core::auth::PolicyManager;
-use hyprstream_core::cli::commands::Commands;
+use hyprstream_core::cli::commands::{Commands, TrainingAction};
 use hyprstream_core::cli::handlers::handle_server;
 use hyprstream_core::cli::{
     handle_branch, handle_checkout, handle_clone, handle_commit, handle_infer, handle_info,
-    handle_list, handle_lora_train, handle_merge, handle_policy_apply, handle_policy_apply_template,
+    handle_list, handle_merge, handle_policy_apply, handle_policy_apply_template,
     handle_policy_check, handle_policy_diff, handle_policy_edit, handle_policy_history,
     handle_policy_list_templates, handle_policy_rollback, handle_policy_show, handle_pull,
     handle_push, handle_remote_add, handle_remote_list, handle_remote_remove, handle_remote_rename,
     handle_remote_set_url, handle_remove, handle_status, handle_token_create,
+    handle_training_batch, handle_training_checkpoint, handle_training_infer, handle_training_init,
     handle_worktree_add, handle_worktree_info, handle_worktree_list,
     handle_worktree_remove, load_or_generate_signing_key, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
 };
@@ -549,19 +550,9 @@ fn main() -> Result<()> {
             )?;
         }
 
-        Commands::LoraTrain {
-            model,
-            branch,
-            adapter,
-            index,
-            rank,
-            learning_rate,
-            batch_size,
-            epochs,
-            config,
-            training_mode,
-        } => {
+        Commands::Training(cmd) => {
             let ctx = ctx.clone();
+            let signing_key = signing_key.clone();
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_gpu(),
@@ -569,20 +560,118 @@ fn main() -> Result<()> {
                 },
                 || async move {
                     let storage = ctx.storage().await?;
-                    handle_lora_train(
-                        storage,
-                        &model,
-                        branch,
-                        adapter,
-                        index,
-                        rank,
-                        learning_rate,
-                        batch_size,
-                        epochs,
-                        config,
-                        training_mode,
-                    )
-                    .await
+                    match cmd.action {
+                        TrainingAction::Init {
+                            model,
+                            branch,
+                            adapter,
+                            index,
+                            rank,
+                            alpha,
+                            mode,
+                            learning_rate,
+                        } => {
+                            handle_training_init(
+                                storage,
+                                &model,
+                                branch,
+                                adapter,
+                                index,
+                                rank,
+                                alpha,
+                                &mode,
+                                learning_rate,
+                            )
+                            .await
+                        }
+                        TrainingAction::Infer {
+                            model,
+                            prompt,
+                            image,
+                            max_tokens,
+                            temperature,
+                            top_p,
+                            top_k,
+                            repeat_penalty,
+                            stream,
+                            max_context,
+                            kv_quant,
+                        } => {
+                            // Read prompt from stdin if not provided
+                            let prompt_text = match prompt {
+                                Some(p) => p,
+                                None => {
+                                    use std::io::Read;
+                                    let mut buffer = String::new();
+                                    std::io::stdin().read_to_string(&mut buffer)?;
+                                    buffer.trim().to_string()
+                                }
+                            };
+                            handle_training_infer(
+                                storage,
+                                &model,
+                                &prompt_text,
+                                image,
+                                max_tokens,
+                                temperature,
+                                top_p,
+                                top_k,
+                                repeat_penalty,
+                                stream,
+                                max_context,
+                                kv_quant,
+                                signing_key,
+                                verifying_key,
+                            )
+                            .await
+                        }
+                        TrainingAction::Batch {
+                            model,
+                            input,
+                            input_dir,
+                            pattern,
+                            format,
+                            max_tokens,
+                            chunk_size,
+                            skip,
+                            limit,
+                            progress_interval,
+                            checkpoint_interval,
+                            test_set,
+                            max_context,
+                            kv_quant,
+                        } => {
+                            handle_training_batch(
+                                storage,
+                                &model,
+                                input,
+                                input_dir,
+                                &pattern,
+                                &format,
+                                max_tokens,
+                                chunk_size,
+                                skip,
+                                limit,
+                                progress_interval,
+                                checkpoint_interval,
+                                test_set,
+                                max_context,
+                                kv_quant,
+                                signing_key,
+                                verifying_key,
+                            )
+                            .await
+                        }
+                        TrainingAction::Checkpoint {
+                            model,
+                            message,
+                            push,
+                            remote,
+                        } => {
+                            handle_training_checkpoint(storage, &model, message, push, &remote)
+                                .await
+                        }
+                    }
                 },
             )?;
         }

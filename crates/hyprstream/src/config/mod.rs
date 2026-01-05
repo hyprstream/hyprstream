@@ -1055,11 +1055,11 @@ pub enum FinishReason {
 
 /// Model-level training mode configuration (embedded in config.json under "hyprstream_training")
 ///
-/// This allows inference to automatically collect training examples when enabled.
-/// The training mode is set via `hyprstream lt --training-mode self_supervised`.
+/// This allows inference to automatically adapt models when enabled.
+/// The training mode is set via `hyprstream training set test_time_training`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HyprstreamTrainingConfig {
-    /// Training mode: disabled, self_supervised, supervised
+    /// Training mode: disabled, test_time_training, supervised
     #[serde(default)]
     pub mode: TrainingMode,
 
@@ -1070,15 +1070,11 @@ pub struct HyprstreamTrainingConfig {
     #[serde(default = "default_training_learning_rate")]
     pub learning_rate: f64,
 
-    /// Batch size for training
+    /// Batch size for training (used by supervised mode)
     #[serde(default = "default_training_batch_size")]
     pub batch_size: usize,
 
-    /// Minimum examples in buffer before training triggers
-    #[serde(default = "default_training_min_buffer_size")]
-    pub min_buffer_size: usize,
-
-    /// Training steps per training cycle
+    /// Training steps per cycle (used by supervised mode)
     #[serde(default = "default_training_steps_per_cycle")]
     pub steps_per_cycle: usize,
 
@@ -1090,9 +1086,61 @@ pub struct HyprstreamTrainingConfig {
     #[serde(default)]
     pub train_base_model: bool,
 
-    /// Trigger training after N examples collected
-    #[serde(default = "default_training_train_after")]
-    pub train_after_examples: usize,
+    /// TTT-specific configuration (for TestTimeTraining mode)
+    #[serde(default)]
+    pub ttt: TTTTrainingConfig,
+}
+
+/// TTT-specific configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TTTTrainingConfig {
+    /// Learning rate for TTT adaptation (higher than fine-tuning)
+    #[serde(default = "default_ttt_learning_rate")]
+    pub learning_rate: f64,
+
+    /// Number of gradient steps per input
+    #[serde(default = "default_ttt_gradient_steps")]
+    pub gradient_steps: usize,
+
+    /// Maximum gradient norm for clipping
+    #[serde(default = "default_ttt_max_grad_norm")]
+    pub max_grad_norm: f64,
+
+    /// Minimum input length (tokens) to trigger TTT
+    #[serde(default = "default_ttt_min_input_length")]
+    pub min_input_length: usize,
+
+    /// Maximum input length to process for TTT
+    #[serde(default = "default_ttt_max_context")]
+    pub max_ttt_context: usize,
+}
+
+fn default_ttt_learning_rate() -> f64 {
+    3e-4
+}
+fn default_ttt_gradient_steps() -> usize {
+    3
+}
+fn default_ttt_max_grad_norm() -> f64 {
+    1.0
+}
+fn default_ttt_min_input_length() -> usize {
+    32
+}
+fn default_ttt_max_context() -> usize {
+    512
+}
+
+impl Default for TTTTrainingConfig {
+    fn default() -> Self {
+        Self {
+            learning_rate: default_ttt_learning_rate(),
+            gradient_steps: default_ttt_gradient_steps(),
+            max_grad_norm: default_ttt_max_grad_norm(),
+            min_input_length: default_ttt_min_input_length(),
+            max_ttt_context: default_ttt_max_context(),
+        }
+    }
 }
 
 impl HyprstreamTrainingConfig {
@@ -1109,24 +1157,24 @@ impl Default for HyprstreamTrainingConfig {
             target_adapter: None,
             learning_rate: default_training_learning_rate(),
             batch_size: default_training_batch_size(),
-            min_buffer_size: default_training_min_buffer_size(),
             steps_per_cycle: default_training_steps_per_cycle(),
             min_quality_threshold: default_training_min_quality(),
             train_base_model: false,
-            train_after_examples: default_training_train_after(),
+            ttt: TTTTrainingConfig::default(),
         }
     }
 }
 
-/// Training mode for self-supervised learning
+/// Training mode configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TrainingMode {
     /// Training disabled (default)
     #[default]
     Disabled,
-    /// Self-supervised training using generation quality metrics
-    SelfSupervised,
+    /// Test-Time Training: adapts to input context before generation
+    /// Research-valid approach based on TTT-E2E
+    TestTimeTraining,
     /// Supervised training with explicit training data
     Supervised,
 }
@@ -1138,15 +1186,9 @@ fn default_training_learning_rate() -> f64 {
 fn default_training_batch_size() -> usize {
     4
 }
-fn default_training_min_buffer_size() -> usize {
-    100
-}
 fn default_training_steps_per_cycle() -> usize {
     10
 }
 fn default_training_min_quality() -> f32 {
     0.3
-}
-fn default_training_train_after() -> usize {
-    100
 }

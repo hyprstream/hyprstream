@@ -5,11 +5,13 @@ pub mod git;
 pub mod model;
 pub mod policy;
 pub mod server;
+pub mod training;
 
 pub use flight::FlightArgs;
 pub use git::{GitAction, GitCommand};
 pub use policy::{PolicyCommand, TokenCommand};
 pub use server::{ServerCliArgs, ServerCommand};
+pub use training::{TrainingAction, TrainingCommand};
 
 use clap::{Subcommand, ValueEnum};
 
@@ -139,53 +141,16 @@ pub enum Commands {
         verbose: bool,
     },
 
-    /// LoRA training (shorthand for 'lora train')
-    #[command(name = "lt")]
-    LoraTrain {
-        /// Model reference
-        model: String,
+    /// Training management commands
+    ///
+    /// Commands for TTT (Test-Time Training) and LoRA adapter management:
+    /// - `training init` - Initialize adapter for training
+    /// - `training infer` - Inference with TTT (dirty writes to adapters)
+    /// - `training batch` - Batch training with checkpoints
+    /// - `training checkpoint` - Commit dirty adapter changes
+    Training(TrainingCommand),
 
-        /// Create new branch for isolated training
-        /// Creates a new branch from the model ref and trains in a dedicated worktree
-        #[arg(long, short = 'B')]
-        branch: Option<String>,
-
-        /// Adapter name (will be auto-prefixed with index)
-        #[arg(long)]
-        adapter: Option<String>,
-
-        /// Explicit index for adapter (auto-increments if not specified)
-        #[arg(long)]
-        index: Option<u32>,
-
-        /// LoRA rank (default: 16)
-        #[arg(long, short = 'r')]
-        rank: Option<u32>,
-
-        /// Learning rate (default: 1e-4)
-        #[arg(long, short = 'l')]
-        learning_rate: Option<f32>,
-
-        /// Batch size (default: 4)
-        #[arg(long, short = 'b')]
-        batch_size: Option<usize>,
-
-        /// Number of epochs (default: 10)
-        #[arg(long, short = 'e')]
-        epochs: Option<usize>,
-
-        /// Training configuration file (overrides CLI args)
-        #[arg(long)]
-        config: Option<String>,
-
-        /// Set training mode for self-supervised learning: self_supervised, supervised, disabled
-        /// When set to self_supervised, inference will automatically collect training examples
-        /// and trigger training cycles based on quality metrics.
-        #[arg(long, short = 'T')]
-        training_mode: Option<String>,
-    },
-
-    /// Run inference with a model
+    /// Run inference with a model (read-only, no training)
     Infer {
         /// Model reference (e.g., "Qwen3-4B", "qwen/qwen-2b", "model:branch")
         model: String,

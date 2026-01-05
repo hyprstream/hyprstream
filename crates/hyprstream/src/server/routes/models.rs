@@ -131,6 +131,7 @@ async fn get_model_info(
                 updated_at: chrono::Utc::now().timestamp(),
                 size_bytes: None,
                 tags: vec![],
+                is_dirty: false, // Not available for single model lookup
             };
             return Json(metadata).into_response();
         }

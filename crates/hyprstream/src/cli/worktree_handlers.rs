@@ -72,6 +72,11 @@ pub async fn handle_worktree_list(
     let model_ref = ModelRef::new(model.to_string());
     let worktrees = storage.list_worktrees(&model_ref).await?;
 
+    // Helper to check if a branch has a worktree
+    let has_worktree = |branch: &str| -> bool {
+        worktrees.iter().any(|wt| wt.branch.as_deref() == Some(branch))
+    };
+
     if show_all {
         // Show all branches including those without worktrees
         let repo_client = storage.get_repo_client(&model_ref).await?;
@@ -85,12 +90,11 @@ pub async fn handle_worktree_list(
 
         println!("Branches for {}:\n", model);
         for branch in &all_branches {
-            let has_worktree = worktrees.contains(branch);
-            let status = if has_worktree { "[active]" } else { "[no worktree]" };
+            let status = if has_worktree(branch) { "[active]" } else { "[no worktree]" };
             println!("  {} {}", branch, status);
         }
 
-        let inactive_count = all_branches.iter().filter(|b| !worktrees.contains(*b)).count();
+        let inactive_count = all_branches.iter().filter(|b| !has_worktree(b)).count();
         if inactive_count > 0 {
             println!("\nCreate a worktree with:");
             println!("  hyprstream worktree add {} <branch>", model);
@@ -108,14 +112,11 @@ pub async fn handle_worktree_list(
 
         println!("Worktrees for {}:\n", model);
 
-        for branch_name in worktrees {
-            println!("  {} ({})", branch_name, model);
-
-            // Get worktree path
-            if let Ok(path) = storage.get_worktree_path(&model_ref, &branch_name).await {
-                println!("    Path: {}", path.display());
-            }
-
+        for wt in &worktrees {
+            let branch_name = wt.branch.as_deref().unwrap_or("<unnamed>");
+            let dirty_marker = if wt.is_dirty { " [dirty]" } else { "" };
+            println!("  {} ({}){}", branch_name, model, dirty_marker);
+            println!("    Path: {}", wt.path.display());
             println!();
         }
     }

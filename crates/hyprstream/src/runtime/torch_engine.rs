@@ -191,6 +191,11 @@ impl TorchEngine {
         }
     }
 
+    /// Get the device this engine is using for computation
+    pub fn device(&self) -> Device {
+        self.device
+    }
+
     // ============================================================================
     // Session-Based KV Cache Management
     // ============================================================================

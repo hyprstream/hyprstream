@@ -12,13 +12,17 @@ pub mod git_handlers;
 pub mod handlers;
 pub mod policy_handlers;
 pub mod remote_handlers;
+pub mod training_handlers;
 pub mod worktree_handlers;
 
 pub use context::AppContext;
 pub use git_handlers::{
     apply_policy_template_to_model, handle_branch, handle_checkout, handle_clone, handle_commit,
-    handle_infer, handle_info, handle_list, handle_lora_train, handle_merge, handle_pull,
+    handle_infer, handle_info, handle_list, handle_merge, handle_pull,
     handle_push, handle_remove, handle_status, MergeOptions,
+};
+pub use training_handlers::{
+    handle_training_batch, handle_training_checkpoint, handle_training_infer, handle_training_init,
 };
 pub use handlers::{handle_config, handle_server, FlightServerConfig};
 pub use worktree_handlers::{

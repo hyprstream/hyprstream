@@ -35,10 +35,7 @@ use crate::runtime::model_config::ModelConfig;
 use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
 use crate::services::rpc_types::InferenceResponse;
 use crate::services::EnvelopeContext;
-use crate::training::{
-    CheckpointConfig, CheckpointManager, ReplayBufferConfig, SelfSupervisedConfig,
-    SelfSupervisedTrainer,
-};
+use crate::training::{TTTConfig, TestTimeTrainer};
 use crate::zmq::global_context;
 use anyhow::{anyhow, Result};
 use capnp::message::{Builder, ReaderOptions};
@@ -198,9 +195,9 @@ pub struct InferenceService {
     nonce_cache: Arc<InMemoryNonceCache>,
     /// Policy checker for authorization (runs on separate thread with its own runtime)
     policy_checker: PolicyChecker,
-    /// Optional self-supervised trainer (initialized from config.json)
-    trainer: Option<Arc<SelfSupervisedTrainer>>,
-    /// Tokenizer for training example collection
+    /// Optional TTT trainer (initialized from config.json)
+    ttt_trainer: Option<Arc<TestTimeTrainer>>,
+    /// Tokenizer for TTT adaptation
     tokenizer: Option<Arc<Tokenizer>>,
     /// Unique stream endpoint for this service instance (each InferenceService has its own)
     stream_endpoint: String,
@@ -308,66 +305,37 @@ impl InferenceService {
         // Check for training mode in config.json
         let training_config = ModelConfig::load_training_config(&model_path);
 
-        // Only initialize trainer and tokenizer if training is enabled
-        // This ensures zero memory/compute overhead when not training
-        let (trainer, tokenizer): (Option<Arc<SelfSupervisedTrainer>>, Option<Arc<Tokenizer>>) = if let Some(ref tc) = training_config {
-            if tc.is_enabled() && tc.mode == TrainingMode::SelfSupervised {
-                info!(
-                    "Self-supervised training enabled, target_adapter: {:?}",
-                    tc.target_adapter
-                );
+        // Only initialize TTT trainer and tokenizer if TTT is enabled
+        // This ensures zero memory/compute overhead when not using TTT
+        let (ttt_trainer, tokenizer): (Option<Arc<TestTimeTrainer>>, Option<Arc<Tokenizer>>) =
+            if let Some(ref tc) = training_config {
+                if tc.is_enabled() && tc.mode == TrainingMode::TestTimeTraining {
+                    info!(
+                        "Test-Time Training enabled: lr={}, steps={}",
+                        tc.ttt.learning_rate, tc.ttt.gradient_steps
+                    );
 
-                let ss_config = SelfSupervisedConfig {
-                    learning_rate: tc.learning_rate,
-                    batch_size: tc.batch_size,
-                    min_buffer_size: tc.min_buffer_size,
-                    steps_per_cycle: tc.steps_per_cycle,
-                    ..Default::default()
-                };
-                let buffer_config = ReplayBufferConfig {
-                    min_quality_threshold: tc.min_quality_threshold,
-                    ..Default::default()
-                };
-
-                // Create trainer with optional checkpoint manager
-                let mut trainer = SelfSupervisedTrainer::new(ss_config, buffer_config);
-
-                if let Some(ref target_adapter) = tc.target_adapter {
-                    // Create checkpoint manager for weight persistence
-                    let checkpoint_config = CheckpointConfig {
-                        max_checkpoints: 5,
-                        git_commit_interval: tc.steps_per_cycle * 10, // Commit every 10 cycles
-                        queue_size: 10,
+                    let ttt_config = TTTConfig {
+                        learning_rate: tc.ttt.learning_rate,
+                        gradient_steps: tc.ttt.gradient_steps,
+                        max_grad_norm: tc.ttt.max_grad_norm,
+                        min_input_length: tc.ttt.min_input_length,
+                        max_ttt_context: tc.ttt.max_ttt_context,
+                        enabled: true,
                     };
 
-                    match CheckpointManager::with_config(
-                        model_path.clone(),
-                        checkpoint_config,
-                        None,
-                    ) {
-                        Ok(mgr) => {
-                            let mgr = mgr.with_target_adapter(target_adapter.clone());
-                            trainer = trainer.with_checkpoint_manager(mgr);
-                            info!(
-                                "Checkpoint manager initialized for adapter: {}",
-                                target_adapter
-                            );
-                        }
-                        Err(e) => {
-                            warn!("Failed to create checkpoint manager: {}", e);
-                        }
-                    }
-                }
+                    let device = engine.device();
+                    let trainer = TestTimeTrainer::new(ttt_config, device);
 
-                // Get tokenizer only when training is enabled
-                let tokenizer = engine.get_tokenizer().ok().map(Arc::new);
-                (Some(Arc::new(trainer)), tokenizer)
+                    // Get tokenizer for input tokenization
+                    let tokenizer = engine.get_tokenizer().ok().map(Arc::new);
+                    (Some(Arc::new(trainer)), tokenizer)
+                } else {
+                    (None, None)
+                }
             } else {
                 (None, None)
-            }
-        } else {
-            (None, None)
-        };
+            };
 
         // Generate unique stream endpoint for this service instance
         // Each InferenceService gets its own XPUB endpoint (UUID-based)
@@ -384,7 +352,7 @@ impl InferenceService {
             server_pubkey,
             nonce_cache,
             policy_checker,
-            trainer,
+            ttt_trainer,
             tokenizer,
             stream_endpoint,
         })
@@ -564,9 +532,9 @@ impl InferenceService {
         format!("stream-{}", id)
     }
 
-    /// Collect training example after generation if trainer is enabled
-    fn collect_training_example(&self, prompt: &str, result: &GenerationResult) {
-        let trainer = match &self.trainer {
+    /// Apply TTT adaptation if enabled (adapts model to input BEFORE generation)
+    fn apply_ttt_adaptation(&self, prompt: &str) {
+        let ttt_trainer = match &self.ttt_trainer {
             Some(t) => t.clone(),
             None => return,
         };
@@ -574,87 +542,53 @@ impl InferenceService {
         let tokenizer = match &self.tokenizer {
             Some(t) => t.clone(),
             None => {
-                trace!("No tokenizer available for training example collection");
+                trace!("No tokenizer available for TTT adaptation");
                 return;
             }
         };
 
-        let quality_metrics = match &result.quality_metrics {
-            Some(qm) => qm.clone(),
-            None => {
-                trace!("No quality metrics available for training example");
+        // Tokenize prompt for TTT
+        let encoding = match tokenizer.encode(prompt, false) {
+            Ok(enc) => enc,
+            Err(e) => {
+                warn!("Failed to tokenize for TTT: {}", e);
                 return;
             }
         };
 
-        // Tokenize prompt and response
-        let tokenize = |text: &str| -> Result<Vec<i64>> {
-            let encoding = tokenizer
-                .encode(text, false)
-                .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
-            Ok(encoding.get_ids().iter().map(|&id| id as i64).collect())
-        };
+        let input_tokens: Vec<u32> = encoding.get_ids().to_vec();
 
-        match (tokenize(prompt), tokenize(&result.text)) {
-            (Ok(prompt_tokens), Ok(response_tokens)) => {
-                let session_id = self.session_id.borrow().clone();
-                let prompt_len = prompt_tokens.len();
-                let response_len = response_tokens.len();
-
-                // Add example and potentially train (async)
-                // Use futures::executor::block_on to avoid nesting tokio runtimes
-                futures::executor::block_on(async {
-                    trainer
-                        .add_example(prompt_tokens, response_tokens, quality_metrics, session_id)
-                        .await;
-
-                    // Trigger training cycle if ready
-                    if trainer.ready_to_train().await {
-                        info!("Training buffer full, triggering training cycle...");
-                        let engine = self.engine.borrow();
-                        match trainer.train_cycle(&*engine).await {
-                            Ok(cycle_result) => {
-                                info!(
-                                    "Training cycle complete: {} steps, mean_loss={:.4}, mean_reward={:.3}",
-                                    cycle_result.steps, cycle_result.total_loss, cycle_result.mean_reward
-                                );
-                            }
-                            Err(e) => warn!("Training cycle failed: {}", e),
-                        }
-                    }
-                });
-
-                trace!(
-                    "Training example collected: prompt_len={}, response_len={}",
-                    prompt_len,
-                    response_len
-                );
+        // Apply TTT adaptation BEFORE generation
+        let engine = self.engine.borrow();
+        match ttt_trainer.adapt(&*engine, &input_tokens) {
+            Ok(result) => {
+                if result.skipped {
+                    trace!("TTT skipped: {:?}", result.skip_reason);
+                } else {
+                    debug!(
+                        "TTT adaptation: steps={}, loss_improvement={:.4}, time={}ms",
+                        result.steps_performed, result.loss_improvement, result.adaptation_time_ms
+                    );
+                }
             }
-            (Err(e), _) | (_, Err(e)) => {
-                warn!("Failed to tokenize for training: {}", e);
+            Err(e) => {
+                warn!("TTT adaptation failed: {}", e);
             }
         }
     }
 
     /// Handle non-streaming generation
     fn handle_generate(&self, request: GenerationRequest) -> Result<GenerationResult> {
-        // Save prompt for training collection
-        let prompt = request.prompt.clone();
+        // Apply TTT adaptation BEFORE generation (if enabled)
+        self.apply_ttt_adaptation(request.prompt.as_str());
 
         // Use futures::executor::block_on because we're already inside a tokio runtime
         // (run_service_loop runs in rt.block_on), and tokio's block_on can't be nested.
         // futures::executor::block_on works because it's a simple single-threaded executor.
         let engine = self.engine.borrow();
-        let result = futures::executor::block_on(async {
+        futures::executor::block_on(async {
             RuntimeEngine::generate_with_params(&*engine, request).await
-        });
-
-        // Collect training example on success
-        if let Ok(gen_result) = &result {
-            self.collect_training_example(prompt.as_str(), gen_result);
-        }
-
-        result
+        })
     }
 
     /// Prepare for streaming generation - returns stream_id immediately.
@@ -698,6 +632,9 @@ impl InferenceService {
         let request = pending.request;
         let prompt = pending.prompt;
         let topic = stream_id.as_bytes().to_vec();
+
+        // Apply TTT adaptation BEFORE streaming generation (if enabled)
+        self.apply_ttt_adaptation(&prompt);
 
         // Get XPUB socket (created in run_service_loop)
         let xpub_guard = self.xpub_socket.borrow();
@@ -763,7 +700,6 @@ impl InferenceService {
         match stream_result {
             Ok(mut stream) => {
                 let mut seq_num: u32 = 0;
-                let mut accumulated_text = String::new();
 
                 // Use futures::executor::block_on because we're already inside a tokio runtime
                 // (run_service_loop runs in rt.block_on), and tokio's block_on can't be nested.
@@ -771,9 +707,6 @@ impl InferenceService {
                     while let Some(chunk_result) = stream.next().await {
                         match chunk_result {
                             Ok(text) => {
-                                // Accumulate text for training
-                                accumulated_text.push_str(&text);
-
                                 // Build and send chunk message with topic prefix
                                 let chunk_bytes =
                                     InferenceResponse::stream_chunk(&stream_id, seq_num, &text);
@@ -800,25 +733,6 @@ impl InferenceService {
                     if let Err(e) = send_with_topic(&complete_bytes) {
                         tracing::error!("Failed to send stream completion: {}", e);
                     }
-
-                    // Collect training example from streaming generation
-                    let gen_result = GenerationResult {
-                        text: accumulated_text,
-                        tokens_generated: stats.tokens_generated,
-                        finish_reason: stats.finish_reason.unwrap_or(FinishReason::Stop),
-                        generation_time_ms: stats.generation_time_ms,
-                        tokens_per_second: stats.tokens_per_second,
-                        quality_metrics: stats.quality_metrics,
-                        // Prefill metrics
-                        prefill_tokens: stats.prefill_tokens,
-                        prefill_time_ms: stats.prefill_time_ms,
-                        prefill_tokens_per_sec: stats.prefill_tokens_per_sec,
-                        // Inference metrics
-                        inference_tokens: stats.inference_tokens,
-                        inference_time_ms: stats.inference_time_ms,
-                        inference_tokens_per_sec: stats.inference_tokens_per_sec,
-                    };
-                    self.collect_training_example(&prompt, &gen_result);
                 });
             }
             Err(e) => {

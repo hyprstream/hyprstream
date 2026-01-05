@@ -735,25 +735,33 @@ impl RegistryService {
             let registry = self.registry.read()
                 .map_err(|_| anyhow!("registry lock poisoned"))?;
             let handle = registry.repo(&id)?;
-            let worktrees = handle.get_worktrees().await?;
-            Ok(worktrees
-                .into_iter()
-                .map(|wt| {
-                    // Extract branch name from worktree path (last component)
-                    let branch_name = wt
-                        .path()
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .map(|s| s.to_string());
+            let mut worktrees = handle.get_worktrees().await?;
 
-                    WorktreeData {
-                        path: wt.path().to_path_buf(),
-                        branch_name,
-                        head_oid: String::new(),
-                        is_locked: false,
-                    }
-                })
-                .collect())
+            let mut result = Vec::with_capacity(worktrees.len());
+            for wt in &mut worktrees {
+                // Extract branch name from worktree path (last component)
+                let branch_name = wt
+                    .path()
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string());
+
+                // Use WorktreeHandle::status() - single source of truth for dirty status
+                let status = wt.status().await.ok();
+                let is_dirty = status.as_ref().map(|s| !s.is_clean).unwrap_or(false);
+                let head_oid = status
+                    .and_then(|s| s.head.map(|h| h.to_string()))
+                    .unwrap_or_default();
+
+                result.push(WorktreeData {
+                    path: wt.path().to_path_buf(),
+                    branch_name,
+                    head_oid,
+                    is_locked: false,
+                    is_dirty,
+                });
+            }
+            Ok(result)
         })
     }
 
@@ -1571,6 +1579,7 @@ impl RepositoryZmqClient {
                         path: PathBuf::from(path_str),
                         branch,
                         driver: "zmq".to_string(), // Default driver name for ZMQ-fetched worktrees
+                        is_dirty: wt.get_is_dirty(),
                     });
                 }
                 Ok(result)

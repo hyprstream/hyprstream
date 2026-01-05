@@ -55,6 +55,7 @@ pub struct WorktreeData {
     pub branch_name: Option<String>,
     pub head_oid: String,
     pub is_locked: bool,
+    pub is_dirty: bool,
 }
 
 // Manual FromCapnp for WorktreeData since it has PathBuf
@@ -70,6 +71,7 @@ impl FromCapnp for WorktreeData {
             },
             head_oid: reader.get_head_oid()?.to_str()?.to_string(),
             is_locked: reader.get_is_locked(),
+            is_dirty: reader.get_is_dirty(),
         })
     }
 }
@@ -84,6 +86,7 @@ impl ToCapnp for WorktreeData {
         }
         builder.set_head_oid(&self.head_oid);
         builder.set_is_locked(self.is_locked);
+        builder.set_is_dirty(self.is_dirty);
     }
 }
 

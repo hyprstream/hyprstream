@@ -405,306 +405,6 @@ fn print_model_status(model_name: &str, status: &git2db::RepositoryStatus, verbo
     }
 }
 
-/// Handle lt (LoRA training) command
-pub async fn handle_lora_train(
-    storage: &ModelStorage,
-    model_ref_str: &str,
-    branch_name: Option<String>,
-    adapter_name: Option<String>,
-    index: Option<u32>,
-    rank: Option<u32>,
-    learning_rate: Option<f32>,
-    batch_size: Option<usize>,
-    epochs: Option<usize>,
-    config: Option<String>,
-    training_mode: Option<String>,
-) -> Result<()> {
-    let model_ref = ModelRef::parse(model_ref_str)?;
-
-    // WORKFLOW 2: New branch + worktree for isolated training
-    if let Some(new_branch) = branch_name {
-        info!("Creating isolated training environment: branch {} from {}", new_branch, model_ref.git_ref.display_name());
-
-        // 1. Create branch from model_ref's git_ref
-        let from_ref = model_ref.git_ref.to_ref_string();
-        storage.create_branch(&model_ref, &new_branch, from_ref.as_deref()).await?;
-
-        println!("✓ Created branch {} from {}", new_branch, model_ref.git_ref.display_name());
-
-        // 2. Create worktree for new branch
-        let worktree_path = storage.create_worktree(&model_ref, &new_branch).await?;
-        println!("✓ Created worktree at {}", worktree_path.display());
-
-        // 3. Train adapter in worktree
-        let adapter_manager = crate::storage::AdapterManager::new(&worktree_path);
-        adapter_manager.ensure_adapters_dir()?;
-
-        let adapter_base_name = adapter_name.as_deref().unwrap_or("default");
-        let indexed_adapter_name = adapter_manager.create_indexed_name(adapter_base_name, index)?;
-
-        println!("\n→ Training adapter {} in isolated worktree", indexed_adapter_name);
-
-        // Create adapter configuration
-        let adapter_config = crate::storage::AdapterConfig {
-            rank: rank.unwrap_or(16),
-            alpha: 32.0,
-            learning_rate: learning_rate.unwrap_or(1e-4) as f64,
-            batch_size: batch_size.unwrap_or(4),
-            epochs: epochs.unwrap_or(10),
-            model_ref: format!("{}:{}", model_ref.model, new_branch),
-            training_data: None,
-            ..Default::default()
-        };
-
-        // Load model and train
-        let config = crate::config::RuntimeConfig::default();
-        let mut engine = crate::runtime::TorchEngine::new(config)?;
-        crate::runtime::RuntimeEngine::load_model(&mut engine, &worktree_path).await?;
-
-        let lora_config = crate::lora::LoRAConfig {
-            rank: adapter_config.rank as usize,
-            alpha: adapter_config.alpha,
-            dropout: 0.1,
-            target_modules: vec![
-                "q_proj".to_string(),
-                "k_proj".to_string(),
-                "v_proj".to_string(),
-                "o_proj".to_string(),
-                "gate_proj".to_string(),
-                "up_proj".to_string(),
-                "down_proj".to_string(),
-            ],
-            learning_rate: adapter_config.learning_rate as f32,
-        };
-
-        engine.create_lora(lora_config)?;
-
-        // Save adapter
-        let adapter_path = adapter_manager
-            .adapters_dir
-            .join(format!("{}.safetensors", indexed_adapter_name));
-        let adapter_path_str = adapter_path.to_str()
-            .ok_or_else(|| anyhow::anyhow!("adapter path is not valid UTF-8"))?;
-        engine.save_lora_weights(adapter_path_str)?;
-
-        let config_path = adapter_manager
-            .adapters_dir
-            .join(format!("{}.config.json", indexed_adapter_name));
-        let config_json = serde_json::to_string_pretty(&adapter_config)?;
-        std::fs::write(&config_path, config_json)?;
-
-        println!("\n✓ Initialized adapter: adapters/{}.safetensors", indexed_adapter_name);
-        println!("✓ Created config: adapters/{}.config.json", indexed_adapter_name);
-
-        // Save training mode to config.json if specified
-        if let Some(ref mode_str) = training_mode {
-            save_training_mode_config(&worktree_path, mode_str, &indexed_adapter_name, learning_rate, batch_size)?;
-        }
-
-        println!("\n✓ Isolated training complete!");
-        println!("\n→ Next steps:");
-        println!("  cd {}", worktree_path.display());
-        println!("  hyprstream status {}:{}", model_ref.model, new_branch);
-        println!("  hyprstream commit {}:{} -a -m \"Add {} adapter\"", model_ref.model, new_branch, indexed_adapter_name);
-
-        return Ok(());
-    }
-
-    // WORKFLOW 1: Train on existing worktree
-
-    // Verify worktree exists for the specified branch
-    let branch_name = match &model_ref.git_ref {
-        git2db::GitRef::Branch(name) => name.clone(),
-        git2db::GitRef::DefaultBranch => {
-            let base_ref = ModelRef::new(model_ref.model.clone());
-            storage.get_default_branch(&base_ref).await?
-        }
-        _ => {
-            return Err(anyhow::anyhow!(
-                "LoRA training requires a branch reference. Use model:branch format (e.g., {}:main)",
-                model_ref.model
-            ));
-        }
-    };
-
-    // Get worktree path (this verifies it exists)
-    let model_path = storage.get_worktree_path(&model_ref, &branch_name).await
-        .map_err(|e| anyhow::anyhow!(
-            "Worktree '{}' does not exist for model '{}'. Create it first with:\n  hyprstream branch {} {}\nError: {}",
-            branch_name, model_ref.model, model_ref.model, branch_name, e
-        ))?;
-
-    println!(
-        "Starting LoRA adapter initialization for {}:{}",
-        model_ref.model, branch_name
-    );
-    println!("Worktree: {}", model_path.display());
-
-    let adapter_manager = crate::storage::AdapterManager::new(&model_path);
-
-    // Determine adapter name and create indexed name
-    let adapter_base_name = adapter_name.as_deref().unwrap_or("default");
-    let indexed_adapter_name = adapter_manager.create_indexed_name(adapter_base_name, index)?;
-
-    // Create adapter configuration
-    let mut adapter_config = crate::storage::AdapterConfig {
-        rank: rank.unwrap_or(16),
-        alpha: 32.0,
-        learning_rate: learning_rate.unwrap_or(1e-4) as f64,
-        batch_size: batch_size.unwrap_or(4),
-        epochs: epochs.unwrap_or(10),
-        model_ref: model_ref.to_string(),
-        training_data: None,
-        ..Default::default()
-    };
-
-    // Add metadata
-    adapter_config.metadata.insert(
-        "branch".to_string(),
-        branch_name.clone(),
-    );
-
-    // Display configuration
-    println!("\n→ Adapter configuration:");
-    println!("  Name: {}", indexed_adapter_name);
-    println!("  Rank: {}", adapter_config.rank);
-    println!("  Learning rate: {}", adapter_config.learning_rate);
-    println!("  Batch size: {}", adapter_config.batch_size);
-    println!("  Epochs: {}", adapter_config.epochs);
-
-    // Show current adapter stack
-    let existing_adapters = adapter_manager.list_adapters()?;
-    if !existing_adapters.is_empty() {
-        println!("\n→ Existing adapter stack:");
-        for adapter in &existing_adapters {
-            println!("  [{}] {}", adapter.index, adapter.name);
-        }
-    }
-
-    if let Some(cfg) = &config {
-        println!("  Config override: {}", cfg);
-    }
-
-    // Load the model to get proper dimensions
-    tracing::info!("Loading model to determine LoRA structure for adapter creation");
-    let config = crate::config::RuntimeConfig::default();
-    let mut engine = crate::runtime::TorchEngine::new(config)?;
-    crate::runtime::RuntimeEngine::load_model(&mut engine, &model_path).await?;
-
-    // Create LoRA configuration with proper target modules
-    let lora_config = crate::lora::LoRAConfig {
-        rank: adapter_config.rank as usize,
-        alpha: adapter_config.alpha,
-        dropout: 0.1,
-        // Use comprehensive target modules for full model adaptation
-        target_modules: vec![
-            "q_proj".to_string(),
-            "k_proj".to_string(),
-            "v_proj".to_string(),
-            "o_proj".to_string(),
-            "gate_proj".to_string(),
-            "up_proj".to_string(),
-            "down_proj".to_string(),
-        ],
-        learning_rate: adapter_config.learning_rate as f32,
-    };
-
-    // Create LoRA model structure using proper model dimensions
-    engine.create_lora(lora_config.clone())?;
-
-    // Ensure adapters directory exists
-    adapter_manager.ensure_adapters_dir()?;
-
-    // Save the initialized LoRA weights
-    let adapter_path = adapter_manager
-        .adapters_dir
-        .join(format!("{}.safetensors", indexed_adapter_name));
-    let adapter_path_str = adapter_path.to_str()
-        .ok_or_else(|| anyhow::anyhow!("adapter path is not valid UTF-8"))?;
-    engine.save_lora_weights(adapter_path_str)?;
-
-    // Save config
-    let config_path = adapter_manager
-        .adapters_dir
-        .join(format!("{}.config.json", indexed_adapter_name));
-    let config_json = serde_json::to_string_pretty(&adapter_config)?;
-    std::fs::write(&config_path, config_json)?;
-
-    println!(
-        "\n✓ Initialized adapter: adapters/{}.safetensors",
-        indexed_adapter_name
-    );
-    println!(
-        "✓ Created config: adapters/{}.config.json",
-        indexed_adapter_name
-    );
-
-    // Save training mode to config.json if specified
-    if let Some(ref mode_str) = training_mode {
-        save_training_mode_config(&model_path, mode_str, &indexed_adapter_name, learning_rate, batch_size)?;
-    }
-
-    println!("\n✓ Adapter initialization complete!");
-    println!("\n→ Next steps:");
-    println!("  1. Check status: hyprstream status {}", model_ref.model);
-    println!("  2. Test inference: hyprstream infer {}", model_ref.model);
-    println!(
-        "  3. Commit changes: hyprstream commit {} -m \"Added {} adapter\"",
-        model_ref.model, indexed_adapter_name
-    );
-
-    Ok(())
-}
-
-/// Helper function to save training mode configuration to config.json
-fn save_training_mode_config(
-    model_path: &std::path::Path,
-    mode_str: &str,
-    target_adapter: &str,
-    learning_rate: Option<f32>,
-    batch_size: Option<usize>,
-) -> Result<()> {
-    use crate::config::{HyprstreamTrainingConfig, TrainingMode};
-    use crate::runtime::model_config::ModelConfig;
-
-    let mode = match mode_str.to_lowercase().as_str() {
-        "self_supervised" | "self-supervised" => TrainingMode::SelfSupervised,
-        "supervised" => TrainingMode::Supervised,
-        "disabled" | "off" | "none" => TrainingMode::Disabled,
-        _ => {
-            warn!("Unknown training mode '{}', defaulting to disabled", mode_str);
-            TrainingMode::Disabled
-        }
-    };
-
-    let training_config = HyprstreamTrainingConfig {
-        mode: mode.clone(),
-        target_adapter: Some(target_adapter.to_string()),
-        learning_rate: learning_rate.unwrap_or(1e-4) as f64,
-        batch_size: batch_size.unwrap_or(4),
-        // Use sensible defaults for training (not Rust's Default which is 0)
-        min_buffer_size: 1,   // Train after first quality example
-        steps_per_cycle: 10,  // 10 training steps per cycle
-        min_quality_threshold: 0.3,
-        train_after_examples: 1,  // Start training immediately
-        train_base_model: false,
-    };
-
-    ModelConfig::save_training_config(model_path, &training_config)?;
-
-    match mode {
-        TrainingMode::Disabled => println!("✓ Training mode set to: disabled"),
-        TrainingMode::SelfSupervised => {
-            println!("✓ Training mode set to: self_supervised");
-            println!("  → Inference will automatically collect training examples");
-            println!("  → Training cycles will trigger after {} high-quality examples", training_config.min_buffer_size);
-        }
-        TrainingMode::Supervised => println!("✓ Training mode set to: supervised"),
-    }
-
-    Ok(())
-}
-
 /// Handle list command
 pub async fn handle_list(
     storage: &ModelStorage,
@@ -779,7 +479,9 @@ pub async fn handle_list(
 
         let domains_str = domains.domains_display();
 
-        let (git_ref, commit, status) = match git_info {
+        // Get git ref and commit from GitInfo, but use metadata.is_dirty from service layer
+        // (GitInfo::from_bare_repo can't detect dirty status - bare repos have no working dir)
+        let (git_ref, commit) = match git_info {
             Some(git) => (
                 git.current_ref
                     .clone()
@@ -787,10 +489,10 @@ pub async fn handle_list(
                 git.short_commit
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string()),
-                if git.is_dirty { "dirty" } else { "clean" },
             ),
-            None => ("n/a".to_string(), "n/a".to_string(), "n/a"),
+            None => ("n/a".to_string(), "n/a".to_string()),
         };
+        let status = if metadata.is_dirty { "dirty" } else { "clean" };
 
         println!(
             "{:<30} {:<16} {:<16} {:<15} {:<8} {:<6} {:<10}",
@@ -1381,7 +1083,9 @@ fn default_policy_header() -> &'static str {
 /// Runs inference via InferenceService, which:
 /// - Enforces authorization via PolicyManager
 /// - Auto-loads adapters from model directory
-/// - Handles self-supervised training if configured in config.json
+/// - **Training is always DISABLED** - this is a read-only inference command
+///
+/// For inference with training (TTT), use `hyprstream training infer` instead.
 ///
 /// # Parameters
 /// - `signing_key`: Ed25519 signing key for request authentication
@@ -1404,8 +1108,11 @@ pub async fn handle_infer(
     signing_key: SigningKey,
     verifying_key: VerifyingKey,
 ) -> Result<()> {
+    use crate::config::TrainingMode;
+    use crate::runtime::model_config::ModelConfig;
+
     info!(
-        "Running inference via service: model={}, prompt_len={}",
+        "Running read-only inference via service: model={}, prompt_len={}",
         model_ref_str,
         prompt.len()
     );
@@ -1427,6 +1134,23 @@ pub async fn handle_infer(
 
     info!("Using model at: {}", model_path.display());
 
+    // CRITICAL: Force training mode to Disabled for CLI infer command
+    // This ensures hyprstream infer is ALWAYS read-only, regardless of model config.
+    // For training inference, use `hyprstream training infer` instead.
+    if let Some(mut training_config) = ModelConfig::load_training_config(&model_path) {
+        if training_config.mode != TrainingMode::Disabled {
+            debug!(
+                "Model has training mode {:?}, overriding to Disabled for read-only infer",
+                training_config.mode
+            );
+            training_config.mode = TrainingMode::Disabled;
+            // Save temporarily to ensure InferenceService sees Disabled mode
+            if let Err(e) = ModelConfig::save_training_config(&model_path, &training_config) {
+                warn!("Could not save disabled training config: {}", e);
+            }
+        }
+    }
+
     // PolicyService is already running (started by main.rs).
     // Create policy client with the same keypair to connect to it.
     let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
@@ -1435,6 +1159,7 @@ pub async fn handle_infer(
     let mut runtime_config = RuntimeConfig::default();
     runtime_config.max_context = max_context;
     runtime_config.kv_quant_type = kv_quant.into();
+    // Note: Training mode is already forced to Disabled in the config file above
 
     // Start InferenceService (loads model, adapters, trainer automatically)
     let service_handle = InferenceService::start_at(

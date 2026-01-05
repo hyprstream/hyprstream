@@ -21,6 +21,8 @@ pub struct WorktreeInfo {
     pub branch: Option<String>,
     /// Storage driver name
     pub driver: String,
+    /// Whether the worktree has uncommitted changes
+    pub is_dirty: bool,
 }
 
 /// Service error type for registry operations.

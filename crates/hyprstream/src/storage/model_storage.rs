@@ -5,7 +5,7 @@
 //! while repository operations (worktrees, branches) use local git access.
 
 use anyhow::Result;
-use crate::services::{PolicyZmqClient, RegistryClient, RepositoryClient};
+use crate::services::{PolicyZmqClient, RegistryClient, RepositoryClient, WorktreeInfo};
 use git2db::{GitManager, GitRef, RepoId, TrackedRepository};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -54,6 +54,8 @@ pub struct ModelMetadata {
     pub updated_at: i64,
     pub size_bytes: Option<u64>,
     pub tags: Vec<String>,
+    /// Whether the worktree has uncommitted changes
+    pub is_dirty: bool,
 }
 
 #[derive(Debug)]
@@ -226,7 +228,13 @@ impl ModelStorage {
                 // Enumerate all worktrees for this model
                 match self.list_worktrees(&base_ref).await {
                     Ok(worktrees) => {
-                        for branch_name in worktrees {
+                        for wt in worktrees {
+                            // Skip worktrees without branch names
+                            let branch_name = match wt.branch {
+                                Some(ref b) => b.clone(),
+                                None => continue,
+                            };
+
                             // Create model:branch reference
                             let model_ref = ModelRef::with_ref(
                                 name.clone(),
@@ -242,6 +250,7 @@ impl ModelStorage {
                                 updated_at: chrono::Utc::now().timestamp(),
                                 size_bytes: None,  // Removed expensive directory size calculation
                                 tags: vec![],
+                                is_dirty: wt.is_dirty,
                             };
 
                             result.push((model_ref, metadata));
@@ -561,23 +570,15 @@ impl ModelStorage {
 
     /// List all worktrees for a model
     ///
-    /// Returns the list of actual worktrees that exist on disk. If no worktrees
-    /// exist, returns an empty list (does not include phantom default branch).
-    pub async fn list_worktrees(&self, model_ref: &ModelRef) -> Result<Vec<String>> {
+    /// Returns the full WorktreeInfo for each worktree, including dirty status.
+    /// If no worktrees exist, returns an empty list.
+    pub async fn list_worktrees(&self, model_ref: &ModelRef) -> Result<Vec<WorktreeInfo>> {
         // Use RepositoryClient to get worktrees via service layer
         let repo_client = self.client.repo(&model_ref.model).await
             .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
 
-        let worktree_infos = repo_client.list_worktrees().await
-            .map_err(|e| anyhow::anyhow!("Failed to list worktrees: {}", e))?;
-
-        // Extract branch names from WorktreeInfo
-        let result: Vec<String> = worktree_infos
-            .into_iter()
-            .filter_map(|wt| wt.branch)
-            .collect();
-
-        Ok(result)
+        repo_client.list_worktrees().await
+            .map_err(|e| anyhow::anyhow!("Failed to list worktrees: {}", e))
     }
 
 
