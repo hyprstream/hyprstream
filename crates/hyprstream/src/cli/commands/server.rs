@@ -130,6 +130,18 @@ pub struct ServerCommand {
     #[arg(short, long, value_name = "FILE")]
     pub config: Option<PathBuf>,
 
+    /// Dataset name to serve via Flight SQL (enables Flight SQL server)
+    #[arg(long, env = "HYPRSTREAM_DATASET")]
+    pub dataset: Option<String>,
+
+    /// Flight SQL server port (default: 50051)
+    #[arg(long, env = "HYPRSTREAM_FLIGHT_PORT", default_value = "50051")]
+    pub flight_port: u16,
+
+    /// Flight SQL server host (default: same as HTTP server host)
+    #[arg(long, env = "HYPRSTREAM_FLIGHT_HOST")]
+    pub flight_host: Option<String>,
+
     #[command(flatten)]
     pub server: ServerCliArgs,
 

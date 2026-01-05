@@ -1,5 +1,6 @@
 //! Middleware for authentication, logging, and request processing
 
+use crate::auth::jwt;
 use crate::server::state::ServerState;
 use axum::{
     extract::{Request, State},
@@ -8,47 +9,72 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use std::time::Instant;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-/// API key authentication middleware
+/// Authenticated identity extracted from token
+#[derive(Debug, Clone)]
+pub struct AuthenticatedUser {
+    /// Username (from JWT sub claim)
+    pub user: String,
+    /// Whether this is an admin token
+    pub is_admin: bool,
+    /// Resource scopes
+    pub scopes: Vec<String>,
+}
+
+/// JWT authentication middleware
+///
+/// Validates JWT tokens (hypr_eyJ...) via Ed25519 signature verification.
+///
+/// On success, inserts `AuthenticatedUser` into request extensions.
+/// JWT `sub` claim should contain prefixed subject (e.g., "token:alice").
 pub async fn auth_middleware(
     State(state): State<ServerState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
-    // Check if API key is configured
-    if let Some(ref expected_key) = state.config.api_key {
-        // Get API key from Authorization header
-        let auth_header = request
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok());
+    // Get JWT token from Authorization header
+    let token = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "));
 
-        let api_key = auth_header
-            .and_then(|h| h.strip_prefix("Bearer "))
-            .or_else(|| {
-                // Also check X-API-Key header
-                request
-                    .headers()
-                    .get("x-api-key")
-                    .and_then(|v| v.to_str().ok())
-            });
+    // If no token provided, allow anonymous access
+    let Some(token) = token else {
+        return next.run(request).await;
+    };
 
-        match api_key {
-            Some(key) if key == expected_key => {
-                // Valid API key, proceed
+    // Try JWT validation (stateless)
+    if jwt::has_valid_prefix(token) && token.contains('.') {
+        match jwt::decode(token, &state.verifying_key) {
+            Ok(claims) => {
+                debug!("JWT validated for user: {}", claims.sub);
+                let user = AuthenticatedUser {
+                    user: claims.sub.clone(),
+                    is_admin: claims.admin,
+                    scopes: claims.scope.clone(),
+                };
+                request.extensions_mut().insert(user);
+                return next.run(request).await;
             }
-            Some(_) => {
-                warn!("Invalid API key attempt");
-                return (StatusCode::UNAUTHORIZED, "Invalid API key").into_response();
+            Err(jwt::JwtError::Expired) => {
+                debug!("JWT expired");
+                return (StatusCode::UNAUTHORIZED, "Token expired").into_response();
             }
-            None => {
-                return (StatusCode::UNAUTHORIZED, "API key required").into_response();
+            Err(jwt::JwtError::InvalidSignature) => {
+                debug!("JWT signature invalid");
+                return (StatusCode::UNAUTHORIZED, "Invalid token signature").into_response();
+            }
+            Err(e) => {
+                debug!("JWT validation failed: {}", e);
+                return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
             }
         }
     }
 
-    next.run(request).await
+    warn!("Invalid token format");
+    (StatusCode::UNAUTHORIZED, "Invalid token format").into_response()
 }
 
 /// Request logging middleware
@@ -113,8 +139,6 @@ pub fn cors_layer(config: &crate::server::state::CorsConfig) -> tower_http::cors
             header::REFERER,
             header::ORIGIN,
             header::CONNECTION,
-            // Custom API headers
-            HeaderName::from_static("x-api-key"),
             // OpenAI SDK headers (x-stainless-*)
             HeaderName::from_static("x-stainless-arch"),
             HeaderName::from_static("x-stainless-lang"),

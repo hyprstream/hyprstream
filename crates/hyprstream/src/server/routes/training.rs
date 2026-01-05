@@ -3,7 +3,8 @@
 use crate::{
     api::{TrainingSample, TrainingStatus},
     api::training_service::TrainingConfig,
-    server::state::ServerState,
+    auth::Operation,
+    server::{self, state::ServerState, AuthenticatedUser},
     training::{CheckpointManager, WeightFormat, WeightSnapshot},
 };
 use axum::{
@@ -11,7 +12,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -77,9 +78,21 @@ struct PreTrainingRequest {
 /// Start training for a LoRA adapter
 async fn start_training(
     State(state): State<ServerState>,
+    auth_user: Option<Extension<AuthenticatedUser>>,
     Path(lora_id): Path<String>,
     Json(config): Json<TrainingConfig>,
 ) -> impl IntoResponse {
+    let user = server::extract_user(auth_user.as_ref());
+    let resource = format!("model:{}", lora_id);
+    if !state.policy_client.check(&user, &resource, Operation::Train).await.unwrap_or(false) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": format!("Permission denied: user '{}' cannot train '{}'", user, resource)
+            })),
+        ).into_response();
+    }
+
     match state
         .training_service
         .start_auto_training(&lora_id, config)
@@ -103,8 +116,20 @@ async fn start_training(
 /// Stop training for a LoRA adapter
 async fn stop_training(
     State(state): State<ServerState>,
+    auth_user: Option<Extension<AuthenticatedUser>>,
     Path(lora_id): Path<String>,
 ) -> impl IntoResponse {
+    let user = server::extract_user(auth_user.as_ref());
+    let resource = format!("model:{}", lora_id);
+    if !state.policy_client.check(&user, &resource, Operation::Train).await.unwrap_or(false) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": format!("Permission denied: user '{}' cannot train '{}'", user, resource)
+            })),
+        ).into_response();
+    }
+
     match state.training_service.stop_auto_training(&lora_id).await {
         Ok(_) => Json(serde_json::json!({
             "status": "stopped",
@@ -124,8 +149,20 @@ async fn stop_training(
 /// Get training status
 async fn get_status(
     State(state): State<ServerState>,
+    auth_user: Option<Extension<AuthenticatedUser>>,
     Path(lora_id): Path<String>,
 ) -> impl IntoResponse {
+    let user = server::extract_user(auth_user.as_ref());
+    let resource = format!("model:{}", lora_id);
+    if !state.policy_client.check(&user, &resource, Operation::Query).await.unwrap_or(false) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": format!("Permission denied: user '{}' cannot query '{}'", user, resource)
+            })),
+        ).into_response();
+    }
+
     match state.training_service.get_training_status(&lora_id).await {
         Ok(status) => Json(status).into_response(),
         Err(_) => Json(TrainingStatus {
@@ -142,9 +179,21 @@ async fn get_status(
 /// Submit training samples
 async fn submit_samples(
     State(state): State<ServerState>,
+    auth_user: Option<Extension<AuthenticatedUser>>,
     Path(lora_id): Path<String>,
     Json(request): Json<SubmitSamplesRequest>,
 ) -> impl IntoResponse {
+    let user = server::extract_user(auth_user.as_ref());
+    let resource = format!("model:{}", lora_id);
+    if !state.policy_client.check(&user, &resource, Operation::Train).await.unwrap_or(false) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": format!("Permission denied: user '{}' cannot train '{}'", user, resource)
+            })),
+        ).into_response();
+    }
+
     let mut submitted = 0;
 
     for sample in request.samples {
@@ -173,26 +222,25 @@ async fn submit_samples(
 
 /// Write checkpoint to filesystem (no Git)
 async fn write_checkpoint(
-    State(_state): State<ServerState>,
+    State(state): State<ServerState>,
+    auth_user: Option<Extension<AuthenticatedUser>>,
     Json(req): Json<CheckpointRequest>,
 ) -> impl IntoResponse {
-    use crate::config::HyprConfig;
-    use crate::storage::{ModelRef, ModelStorage};
+    use crate::storage::ModelRef;
 
-    // Load model storage
-    let config = HyprConfig::load().unwrap_or_default();
-    let storage = match ModelStorage::create(config.models_dir().to_path_buf()).await {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("Failed to create storage: {}", e)
-                })),
-            )
-                .into_response();
-        }
-    };
+    let user = server::extract_user(auth_user.as_ref());
+    let resource = format!("model:{}", req.model_id);
+    if !state.policy_client.check(&user, &resource, Operation::Write).await.unwrap_or(false) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": format!("Permission denied: user '{}' cannot write '{}'", user, resource)
+            })),
+        ).into_response();
+    }
+
+    // Use the shared model storage from server state
+    let storage = &state.model_storage;
 
     // Resolve model path
     let model_ref = match ModelRef::parse(&req.model_id) {
@@ -238,10 +286,11 @@ async fn write_checkpoint(
     // Get step number
     let step = req.step.unwrap_or_else(|| {
         use std::time::{SystemTime, UNIX_EPOCH};
+        // SAFETY: Only fails if system time is before Unix epoch (1970)
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as usize
+            .map(|d| d.as_secs() as usize)
+            .unwrap_or(0)
     });
 
     // Create dummy weight snapshot (would need actual implementation)
@@ -269,9 +318,35 @@ async fn write_checkpoint(
 
 /// Commit checkpoint to Git
 async fn commit_checkpoint(
-    State(_state): State<ServerState>,
+    State(state): State<ServerState>,
+    auth_user: Option<Extension<AuthenticatedUser>>,
     Json(req): Json<CommitRequest>,
 ) -> impl IntoResponse {
+    // Extract model_id from checkpoint path for auth check
+    let checkpoint_path = PathBuf::from(&req.checkpoint_path);
+    let model_id = checkpoint_path
+        .parent()
+        .and_then(|p| {
+            if p.file_name() == Some(std::ffi::OsStr::new(".checkpoints")) {
+                p.parent().and_then(|mp| mp.file_name())
+            } else {
+                p.file_name()
+            }
+        })
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let user = server::extract_user(auth_user.as_ref());
+    let resource = format!("model:{}", model_id);
+    if !state.policy_client.check(&user, &resource, Operation::Write).await.unwrap_or(false) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": format!("Permission denied: user '{}' cannot write '{}'", user, resource)
+            })),
+        ).into_response();
+    }
+
     let checkpoint_path = PathBuf::from(&req.checkpoint_path);
 
     // Get model path (parent of .checkpoints directory)
@@ -331,9 +406,21 @@ async fn commit_checkpoint(
 
 /// Start pre-training
 async fn start_pretraining(
-    State(_state): State<ServerState>,
+    State(state): State<ServerState>,
+    auth_user: Option<Extension<AuthenticatedUser>>,
     Json(req): Json<PreTrainingRequest>,
 ) -> impl IntoResponse {
+    let user = server::extract_user(auth_user.as_ref());
+    let resource = format!("model:{}", req.model_id);
+    if !state.policy_client.check(&user, &resource, Operation::Train).await.unwrap_or(false) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": format!("Permission denied: user '{}' cannot train '{}'", user, resource)
+            })),
+        ).into_response();
+    }
+
     // For now, return a session ID
     // Full implementation would spawn a training task
     let session_id = uuid::Uuid::new_v4().to_string();

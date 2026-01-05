@@ -347,13 +347,13 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = TemplateEngine::new(config).unwrap();
+        let engine = TemplateEngine::new(config).expect("test: create template engine");
         let messages = vec![ChatMessage {
             role: "user".to_string(),
             content: "Hello".to_string(),
         }];
 
-        let result = engine.apply_chat_template(&messages, Some(true)).unwrap();
+        let result = engine.apply_chat_template(&messages, Some(true)).expect("test: apply template");
         assert!(result.contains("<|im_start|>user"));
         assert!(result.contains("Hello"));
         assert!(result.contains("<|im_start|>assistant"));
@@ -382,7 +382,7 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = TemplateEngine::new(config).unwrap();
+        let engine = TemplateEngine::new(config).expect("test: create template engine");
         let messages = vec![
             ChatMessage {
                 role: "system".to_string(),
@@ -398,7 +398,7 @@ mod tests {
             },
         ];
 
-        let result = engine.apply_chat_template(&messages, Some(true)).unwrap();
+        let result = engine.apply_chat_template(&messages, Some(true)).expect("test: apply template");
 
         // Verify the template was processed correctly
         assert!(result.contains("System: You are a helpful assistant."));
@@ -426,7 +426,7 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = TemplateEngine::new(config).unwrap();
+        let engine = TemplateEngine::new(config).expect("test: create template engine");
         let messages = vec![
             ChatMessage {
                 role: "system".to_string(),
@@ -442,7 +442,7 @@ mod tests {
             },
         ];
 
-        let result = engine.apply_chat_template(&messages, Some(false)).unwrap();
+        let result = engine.apply_chat_template(&messages, Some(false)).expect("test: apply template");
         assert!(result.contains("[SYSTEM] Configure the model"));
         assert!(result.contains("[USER] What's 2+2?"));
         assert!(result.contains("[ASSISTANT] 4"));
@@ -461,7 +461,7 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = TemplateEngine::new(config).unwrap();
+        let engine = TemplateEngine::new(config).expect("test: create template engine");
         let messages = vec![
             ChatMessage {
                 role: "user".to_string(),
@@ -469,7 +469,7 @@ mod tests {
             },
         ];
 
-        let result = engine.apply_chat_template(&messages, Some(false)).unwrap();
+        let result = engine.apply_chat_template(&messages, Some(false)).expect("test: apply template");
         assert!(result.contains("Hello World"));
         assert!(!result.contains("  Hello World  "));
     }

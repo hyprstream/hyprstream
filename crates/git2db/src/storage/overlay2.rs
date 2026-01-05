@@ -19,6 +19,7 @@ inventory::submit!(DriverFactory::new(
 /// Overlay2 storage driver (Linux overlayfs)
 ///
 /// Automatically tries mount methods in order: kernel → userns → fuse
+#[allow(dead_code)] // Constructed via inventory::submit! when overlayfs feature enabled
 pub struct Overlay2Driver;
 
 #[async_trait]
@@ -45,6 +46,11 @@ impl Driver for Overlay2Driver {
   
   #[cfg(feature = "overlayfs")]
     async fn create_worktree(&self, opts: &DriverOpts) -> Git2DBResult<WorktreeHandle> {
+        // Strict: worktree path must not exist
+        if opts.worktree_path.exists() {
+            return Err(Git2DBError::worktree_exists(&opts.worktree_path));
+        }
+
         // Validate inputs
         if !opts.base_repo.exists() {
             return Err(Git2DBError::invalid_path(
@@ -393,8 +399,10 @@ impl Overlay2Driver {
             .output()
             .await;
 
-        if fusermount_output.is_ok() && fusermount_output.unwrap().status.success() {
-            return Ok(());
+        if let Ok(output) = fusermount_output {
+            if output.status.success() {
+                return Ok(());
+            }
         }
 
         // Fallback to umount

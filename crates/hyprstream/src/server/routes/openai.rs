@@ -2,26 +2,27 @@
 
 use axum::{
     extract::{Json, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Sse},
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
 use futures::stream::StreamExt;
 use std::convert::Infallible;
-use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, info};
+use tracing::{error, info, trace};
 
 use crate::{
     api::openai_compat::{
         ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, CompletionChoice,
         CompletionRequest, CompletionResponse, EmbeddingRequest, ListModelsResponse, Model, Usage,
     },
-    runtime::{FinishReason, GenerationRequest, RuntimeEngine, TorchEngine},
-    server::state::ServerState,
+    archetypes::capabilities::Infer,
+    auth::Operation,
+    config::GenerationRequest,
+    runtime::{CacheOwner, FinishReason},
+    server::{state::ServerState, AuthenticatedUser},
 };
 
 /// RAII guard for metrics cleanup
@@ -78,10 +79,6 @@ impl ErrorResponse {
         }
     }
 
-    #[allow(dead_code)]
-    fn internal_error(message: impl Into<String>) -> Self {
-        Self::new(message, "internal_error", "generation_failed")
-    }
 }
 
 // validate_chat_request removed - validation now handled by streaming pipeline
@@ -91,47 +88,48 @@ impl ErrorResponse {
 // - max_tokens → enforced by generation loop (safe)
 // Rate limiting should be handled at middleware layer, not per-endpoint
 
-/// Helper: Load model from cache with proper error handling
-async fn load_model_or_error(
-    state: &ServerState,
-    model_name: &str,
-) -> Result<Arc<Mutex<TorchEngine>>, impl IntoResponse> {
-    match state.model_cache.get_or_load(model_name).await {
-        Ok(engine) => Ok(engine),
-        Err(e) => {
-            error!("Failed to load model '{}': {}", model_name, e);
-
-            let (status, error_response) = if e.to_string().contains("not found") {
-                (
-                    StatusCode::NOT_FOUND,
-                    ErrorResponse::new(
-                        format!("Model '{}' not found", model_name),
-                        "model_not_found",
-                        "invalid_model",
-                    ),
-                )
-            } else if e.to_string().contains("failed to load") {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorResponse::new(
-                        format!("Model '{}' failed to load: {}", model_name, e),
-                        "model_load_error",
-                        "internal_error",
-                    ),
-                )
-            } else {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorResponse::internal_error(e.to_string()),
-                )
-            };
-
-            Err((status, Json(error_response)).into_response())
-        }
+/// Extract cache owner from request headers.
+///
+/// Session management:
+/// - `x-session-id` header: Uses session-based caching (context preserved)
+/// - No header: Generates a stateless request ID (context not preserved)
+///
+/// The session ID is used to route the request to the appropriate KV cache,
+/// allowing multiple concurrent sessions to have isolated context.
+fn extract_cache_owner(headers: &HeaderMap) -> CacheOwner {
+    if let Some(session_id) = headers
+        .get("x-session-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+    {
+        trace!("Using session-based caching for session: {}", session_id);
+        CacheOwner::Session(session_id.to_string())
+    } else {
+        // Stateless request - generate unique ID
+        let request_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        trace!("Using stateless caching for request: {}", request_id);
+        CacheOwner::Stateless(request_id)
     }
 }
 
-/// Helper: Resolve model name to filesystem path
+/// Extract user identity from authenticated user.
+///
+/// JWT `sub` claim should already contain prefixed subject (e.g., "token:alice").
+/// Returns "anonymous" if no authentication provided.
+fn extract_user_from_auth(auth_user: Option<&AuthenticatedUser>) -> String {
+    if let Some(user) = auth_user {
+        trace!("Using authenticated user: {}", user.user);
+        return user.user.clone();
+    }
+
+    trace!("No authentication provided, using anonymous identity");
+    "anonymous".to_string()
+}
+
+/// Helper: Resolve model name to filesystem path (also validates inference capability)
 async fn resolve_model_path(
     state: &ServerState,
     model_name: &str,
@@ -152,7 +150,29 @@ async fn resolve_model_path(
     };
 
     match state.model_storage.get_model_path(&model_ref).await {
-        Ok(path) => Ok(path),
+        Ok(path) => {
+            // Check if model has INFERENCE capability
+            let archetype_registry = crate::archetypes::global_registry();
+            let detected = archetype_registry.detect(&path);
+
+            let domains = detected.to_detected_domains();
+            if !domains.has::<Infer>() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new(
+                        format!(
+                            "Model '{}' does not support inference. Detected domains: {:?}",
+                            model_name, domains.domains
+                        ),
+                        "capability_error",
+                        "inference_not_supported",
+                    )),
+                )
+                    .into_response());
+            }
+
+            Ok(path)
+        }
         Err(e) => Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse::new(
@@ -167,12 +187,16 @@ async fn resolve_model_path(
 
 /// Helper: Add no-cache headers to response
 fn add_no_cache_headers(response: &mut axum::response::Response) {
+    use axum::http::HeaderValue;
     let headers = response.headers_mut();
     headers.insert(
         header::CACHE_CONTROL,
-        "no-cache, no-store, must-revalidate".parse().unwrap(),
+        HeaderValue::from_static("no-cache, no-store, must-revalidate"),
     );
-    headers.insert(header::PRAGMA, "no-cache".parse().unwrap());
+    headers.insert(
+        header::PRAGMA,
+        HeaderValue::from_static("no-cache"),
+    );
 }
 
 /// Create OpenAI API router
@@ -187,14 +211,56 @@ pub fn create_router() -> Router<ServerState> {
 /// Handle chat completion requests
 async fn chat_completions(
     State(state): State<ServerState>,
+    auth_user: Option<Extension<AuthenticatedUser>>,
+    headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {
+    // Extract user identity from JWT (via middleware)
+    let user = extract_user_from_auth(auth_user.as_ref().map(|Extension(u)| u));
+
+    // Check permission for inference on this model via ZMQ
+    let resource = format!("model:{}", request.model);
+    match state
+        .policy_client
+        .check(&user, &resource, Operation::Infer)
+        .await
+    {
+        Ok(allowed) if !allowed => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse::new(
+                    format!("Permission denied: user '{}' cannot infer on '{}'", user, request.model),
+                    "permission_denied",
+                    "insufficient_permissions",
+                )),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            error!("Policy check failed: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    format!("Policy check failed: {}", e),
+                    "policy_error",
+                    "internal_error",
+                )),
+            )
+                .into_response();
+        }
+        _ => {} // allowed
+    }
+
+    // Extract session/request ID for KV cache routing
+    let cache_owner = extract_cache_owner(&headers);
+
     // Debug log the incoming request
     info!(
-        "Chat completion request - model: {}, stream: {:?}, messages: {} msgs",
+        "Chat completion request - model: {}, stream: {:?}, messages: {} msgs, cache: {:?}",
         request.model,
         request.stream,
-        request.messages.len()
+        request.messages.len(),
+        cache_owner
     );
 
     // Log if streaming is defaulting
@@ -204,9 +270,9 @@ async fn chat_completions(
         is_streaming, request.stream
     );
 
-    if request.stream.unwrap_or(false) {
+    if is_streaming {
         info!("Handling streaming request");
-        return stream_chat(state, request).await.into_response();
+        return stream_chat(state, headers, request).await.into_response();
     }
     info!("Handling non-streaming request");
 
@@ -222,40 +288,41 @@ async fn chat_completions(
 
     let start_time = std::time::Instant::now();
 
-    let engine = match load_model_or_error(&state, &request.model).await {
-        Ok(engine) => engine,
-        Err(response) => return response.into_response(),
-    };
-
-    info!("Formatting messages with template...");
-    let formatted_prompt = match format_messages_with_template(&request.messages, &engine).await {
-        Ok(prompt) => {
-            info!(
-                "Template formatting successful, prompt preview: {}",
-                &prompt.chars().take(200).collect::<String>()
-            );
-            prompt
-        }
-        Err(e) => {
-            error!("Template formatting failed: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    e,
-                    "template_error",
-                    "template_formatting_failed",
-                )),
-            )
-                .into_response();
-        }
-    };
-
+    // Resolve model path (also validates inference capability)
     let model_path = match resolve_model_path(&state, &request.model).await {
         Ok(path) => path,
         Err(response) => return response.into_response(),
     };
 
-    let gen_request = GenerationRequest::builder(formatted_prompt)
+    // Apply chat template via ZMQ ModelService
+    info!("Applying chat template via ModelService...");
+    let templated_prompt = match state
+        .model_client
+        .apply_chat_template(&request.model, &request.messages, true)
+        .await
+    {
+        Ok(prompt) => prompt,
+        Err(e) => {
+            error!("Failed to apply chat template: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    format!("Failed to apply chat template: {}", e),
+                    "template_error",
+                    "internal_error",
+                )),
+            )
+                .into_response();
+        }
+    };
+    info!(
+        "Template applied, prompt length: {}, preview: {}",
+        templated_prompt.len(),
+        &templated_prompt.as_str().chars().take(200).collect::<String>()
+    );
+
+    // Build generation request with templated prompt
+    let gen_request = GenerationRequest::builder(templated_prompt.as_str())
         .apply_config(&(&state.config.sampling_defaults).into())
         .apply_config(&crate::config::SamplingParams::from_model_path(&model_path).await.unwrap_or_default())
         .apply_config(&(&request).into())
@@ -270,10 +337,9 @@ async fn chat_completions(
         "Starting generation with prompt length: {}",
         gen_request.prompt.len()
     );
-    let result = {
-        let engine_guard = engine.lock().await;
-        engine_guard.generate_with_params(gen_request).await
-    };
+
+    // Call inference via ZMQ ModelService
+    let result = state.model_client.infer(&request.model, &gen_request).await;
 
     info!("Generation completed - success: {}", result.is_ok());
 
@@ -339,8 +405,8 @@ async fn chat_completions(
     }
 }
 
-/// Handle streaming chat completions using TextStream
-async fn stream_chat(state: ServerState, request: ChatCompletionRequest) -> impl IntoResponse {
+/// Handle streaming chat completions via ZMQ PUB/SUB
+async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompletionRequest) -> impl IntoResponse {
     // Create channel for SSE events
     let (tx, rx) = mpsc::channel::<Result<serde_json::Value, anyhow::Error>>(100);
 
@@ -360,8 +426,6 @@ async fn stream_chat(state: ServerState, request: ChatCompletionRequest) -> impl
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     tokio::spawn(async move {
-        use futures::StreamExt;
-
         // Ensure metrics are decremented on all exit paths
         let _metrics_guard = MetricsGuard::new(&state.metrics);
 
@@ -382,43 +446,25 @@ async fn stream_chat(state: ServerState, request: ChatCompletionRequest) -> impl
             }
         };
 
-        // Get engine from model cache
-        let engine_arc = match state.model_cache.get_or_load(&model_name).await {
-            Ok(engine) => engine,
-            Err(e) => {
-                let error_msg = if e.to_string().contains("not found") {
-                    format!("Model '{}' not found", model_name)
-                } else {
-                    e.to_string()
-                };
-                let _ = tx.send(Err(anyhow::anyhow!(error_msg))).await;
-                return;
-            }
-        };
-
-        // Format messages BEFORE locking the engine to avoid deadlock
-        info!("Formatting messages for streaming...");
-        let prompt = match format_messages_with_template(&messages, &engine_arc).await {
-            Ok(p) => {
-                info!(
-                    "Streaming template formatting successful, prompt length: {}",
-                    p.len()
-                );
-                p
+        // Apply chat template via ZMQ ModelService
+        info!("Applying chat template for streaming...");
+        let templated_prompt = match state.model_client
+            .apply_chat_template(&model_name, &messages, true)
+            .await
+        {
+            Ok(prompt) => {
+                info!("Streaming template applied, prompt length: {}", prompt.len());
+                prompt
             }
             Err(e) => {
                 error!("Template formatting failed in streaming: {}", e);
-                let _ = tx
-                    .send(Err(anyhow::anyhow!("Template formatting failed: {}", e)))
-                    .await;
+                let _ = tx.send(Err(anyhow::anyhow!("Template formatting failed: {}", e))).await;
                 return;
             }
         };
 
-        // NOW lock the engine for generation
-        let engine = engine_arc.lock().await;
-
-        let gen_request = GenerationRequest::builder(prompt)
+        // Build generation request
+        let gen_request = GenerationRequest::builder(templated_prompt.as_str())
             .apply_config(&(&defaults).into())
             .apply_config(&crate::config::SamplingParams::from_model_path(&model_path).await.unwrap_or_default())
             .apply_config(&(&request).into())
@@ -430,20 +476,54 @@ async fn stream_chat(state: ServerState, request: ChatCompletionRequest) -> impl
             gen_request.max_tokens, gen_request.temperature, gen_request.top_p, gen_request.top_k, gen_request.repeat_penalty
         );
 
-        // Create text stream - handles all decoding internally
-        let mut text_stream = match engine.generate(gen_request) {
-            Ok(stream) => stream,
+        // Start ZMQ stream - returns (zmq_stream_id, endpoint)
+        let (zmq_stream_id, endpoint) = match state.model_client.infer_stream(&model_name, &gen_request).await {
+            Ok((id, ep)) => {
+                info!("ZMQ stream started: id={}, endpoint={}", id, ep);
+                (id, ep)
+            }
             Err(e) => {
-                error!("Failed to create text stream: {}", e);
-                let _ = tx.send(Err(e)).await;
+                error!("Failed to start ZMQ stream: {}", e);
+                let _ = tx.send(Err(anyhow::anyhow!("Generation failed: {}", e))).await;
                 return;
             }
         };
 
+        // Create ZMQ SUB socket and subscribe to stream topic
+        let ctx = crate::zmq::global_context();
+        let sub_socket = match ctx.socket(zmq::SUB) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to create SUB socket: {}", e);
+                let _ = tx.send(Err(anyhow::anyhow!("Failed to create stream socket: {}", e))).await;
+                return;
+            }
+        };
+
+        if let Err(e) = sub_socket.connect(&endpoint) {
+            error!("Failed to connect to stream endpoint: {}", e);
+            let _ = tx.send(Err(anyhow::anyhow!("Failed to connect to stream: {}", e))).await;
+            return;
+        }
+
+        if let Err(e) = sub_socket.set_subscribe(zmq_stream_id.as_bytes()) {
+            error!("Failed to subscribe to stream: {}", e);
+            let _ = tx.send(Err(anyhow::anyhow!("Failed to subscribe to stream: {}", e))).await;
+            return;
+        }
+
+        // Set receive timeout to allow periodic cancellation checks (100ms)
+        if let Err(e) = sub_socket.set_rcvtimeo(100) {
+            error!("Failed to set socket timeout: {}", e);
+            // Continue without timeout - less responsive to cancellation but still works
+        }
+
+        // OpenAI-style stream ID for SSE responses
+        let sse_stream_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+
         // Send initial role message
-        let stream_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
         let initial_msg = serde_json::json!({
-            "id": stream_id,
+            "id": sse_stream_id,
             "object": "chat.completion.chunk",
             "created": chrono::Utc::now().timestamp(),
             "model": model_name,
@@ -458,80 +538,182 @@ async fn stream_chat(state: ServerState, request: ChatCompletionRequest) -> impl
         });
         let _ = tx.send(Ok(initial_msg)).await;
 
-        // Consume text chunks from stream
-        info!("Starting streaming generation...");
-        while let Some(text_result) = text_stream.next().await {
-            match text_result {
-                Ok(text) => {
-                    // Send text chunk
-                    let chunk = serde_json::json!({
-                        "id": stream_id,
-                        "object": "chat.completion.chunk",
-                        "created": chrono::Utc::now().timestamp(),
-                        "model": model_name,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {
-                                "content": text
-                            },
-                            "finish_reason": null
-                        }]
-                    });
+        // ZMQ receive loop - forward tokens to SSE
+        info!("Starting ZMQ streaming receive loop...");
+        let topic_len = zmq_stream_id.len();
 
-                    if tx.send(Ok(chunk)).await.is_err() {
-                        // Client disconnected - drop the stream to stop generation
-                        info!("Client disconnected during streaming");
-                        break;
+        loop {
+            // Check if client disconnected (channel closed)
+            if tx.is_closed() {
+                info!("Client disconnected, stopping stream");
+                break;
+            }
+
+            match sub_socket.recv_bytes(0) {
+                Ok(msg) => {
+                    // Strip topic prefix to get Cap'n Proto data
+                    if msg.len() <= topic_len {
+                        continue; // Empty message after topic
+                    }
+                    let data = &msg[topic_len..];
+
+                    // Parse Cap'n Proto StreamChunk
+                    use capnp::message::ReaderOptions;
+                    use capnp::serialize;
+                    use crate::inference_capnp;
+
+                    let reader = match serialize::read_message(
+                        &mut std::io::Cursor::new(data),
+                        ReaderOptions::default(),
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            error!("Failed to parse stream chunk: {}", e);
+                            continue;
+                        }
+                    };
+
+                    let chunk = match reader.get_root::<inference_capnp::stream_chunk::Reader>() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            error!("Failed to get stream chunk root: {}", e);
+                            continue;
+                        }
+                    };
+
+                    // Extract chunk data into owned values BEFORE any await
+                    // (capnp readers contain raw pointers and cannot be held across await points)
+                    use inference_capnp::stream_chunk::Which;
+                    enum ChunkAction {
+                        SendText(String),
+                        Complete { finish_reason: String, gen_time_ms: u64, toks_per_sec: f32, toks_gen: u32 },
+                        Error(String),
+                        Continue,
+                    }
+
+                    let action = match chunk.which() {
+                        Ok(Which::Text(text_result)) => {
+                            match text_result {
+                                Ok(t) => ChunkAction::SendText(t.to_string().unwrap_or_default()),
+                                Err(_) => ChunkAction::Continue,
+                            }
+                        }
+                        Ok(Which::Complete(stats_result)) => {
+                            if let Ok(stats) = stats_result {
+                                let toks = stats.get_tokens_generated();
+                                let fr = match stats.get_finish_reason() {
+                                    Ok(inference_capnp::FinishReason::MaxTokens) => "length",
+                                    _ => "stop",
+                                };
+                                ChunkAction::Complete {
+                                    finish_reason: fr.to_string(),
+                                    gen_time_ms: stats.get_generation_time_ms(),
+                                    toks_per_sec: stats.get_tokens_per_second(),
+                                    toks_gen: toks,
+                                }
+                            } else {
+                                ChunkAction::Complete {
+                                    finish_reason: "stop".to_string(),
+                                    gen_time_ms: 0,
+                                    toks_per_sec: 0.0,
+                                    toks_gen: 0,
+                                }
+                            }
+                        }
+                        Ok(Which::Error(error_result)) => {
+                            let msg = if let Ok(err) = error_result {
+                                err.get_message()
+                                    .ok()
+                                    .and_then(|r| r.to_str().ok())
+                                    .unwrap_or("Unknown error")
+                                    .to_string()
+                            } else {
+                                "Stream error".to_string()
+                            };
+                            ChunkAction::Error(msg)
+                        }
+                        Err(e) => {
+                            error!("Failed to parse stream chunk variant: {:?}", e);
+                            ChunkAction::Continue
+                        }
+                    };
+                    // chunk is now dropped, safe to use awaits
+
+                    match action {
+                        ChunkAction::SendText(text) => {
+                            let sse_chunk = serde_json::json!({
+                                "id": sse_stream_id,
+                                "object": "chat.completion.chunk",
+                                "created": chrono::Utc::now().timestamp(),
+                                "model": model_name,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {
+                                        "content": text
+                                    },
+                                    "finish_reason": null
+                                }]
+                            });
+
+                            if tx.send(Ok(sse_chunk)).await.is_err() {
+                                info!("Client disconnected during streaming");
+                                break;
+                            }
+                        }
+                        ChunkAction::Complete { finish_reason, gen_time_ms, toks_per_sec, toks_gen } => {
+                            info!(
+                                "Streaming complete: {} tokens in {}ms ({:.2} tok/s)",
+                                toks_gen,
+                                gen_time_ms,
+                                toks_per_sec
+                            );
+
+                            state.metrics.total_tokens.fetch_add(
+                                toks_gen as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+
+                            let completion_msg = serde_json::json!({
+                                "id": sse_stream_id,
+                                "object": "chat.completion.chunk",
+                                "created": chrono::Utc::now().timestamp(),
+                                "model": model_name,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {},
+                                    "finish_reason": finish_reason
+                                }]
+                            });
+                            let _ = tx.send(Ok(completion_msg)).await;
+
+                            let _ = tx.send(Ok(serde_json::json!({"done": true}))).await;
+                            break;
+                        }
+                        ChunkAction::Error(error_msg) => {
+                            error!("Stream error: {}", error_msg);
+                            let _ = tx.send(Err(anyhow::anyhow!("Generation error: {}", error_msg))).await;
+                            break;
+                        }
+                        ChunkAction::Continue => {
+                            continue;
+                        }
                     }
                 }
+                Err(zmq::Error::EAGAIN) => {
+                    // Timeout - yield and check for cancellation
+                    tokio::task::yield_now().await;
+                    continue;
+                }
                 Err(e) => {
-                    // Generation error
-                    error!("Generation error: {}", e);
-                    let _ = tx.send(Err(e)).await;
-                    return;
+                    error!("ZMQ recv error: {}", e);
+                    let _ = tx.send(Err(anyhow::anyhow!("Stream receive error: {}", e))).await;
+                    break;
                 }
             }
         }
 
-        // Get final statistics
-        let stats = text_stream.stats();
-        info!(
-            "Streaming generation completed with {} tokens in {}ms ({:.2} tokens/sec)",
-            stats.tokens_generated, stats.generation_time_ms, stats.tokens_per_second
-        );
-
-        // Update metrics
-        state.metrics.total_tokens.fetch_add(
-            stats.tokens_generated as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-
-        // Send completion message with finish reason
-        let finish_reason = match stats.finish_reason {
-            Some(FinishReason::MaxTokens) => "length",
-            Some(FinishReason::StopToken(_)) => "stop",
-            Some(FinishReason::EndOfSequence) => "stop",
-            Some(FinishReason::Stop) => "stop",
-            Some(FinishReason::Error(_)) => "stop",
-            None => "stop",
-        };
-
-        let completion_msg = serde_json::json!({
-            "id": stream_id,
-            "object": "chat.completion.chunk",
-            "created": chrono::Utc::now().timestamp(),
-            "model": model_name,
-            "choices": [{
-                "index": 0,
-                "delta": {},
-                "finish_reason": finish_reason
-            }]
-        });
-        let _ = tx.send(Ok(completion_msg)).await;
-
-        // Send [DONE] message
-        let _ = tx.send(Ok(serde_json::json!({"done": true}))).await;
-
+        // Explicit socket cleanup
+        let _ = sub_socket.disconnect(&endpoint);
         // Metrics are automatically decremented by MetricsGuard drop
     });
 
@@ -545,7 +727,7 @@ async fn stream_chat(state: ServerState, request: ChatCompletionRequest) -> impl
                 } else {
                     // Send data chunk
                     Ok(axum::response::sse::Event::default()
-                        .data(serde_json::to_string(&json).unwrap()))
+                        .data(serde_json::to_string(&json).unwrap_or_else(|_| "{}".to_string())))
                 }
             }
             Err(e) => {
@@ -564,7 +746,10 @@ async fn stream_chat(state: ServerState, request: ChatCompletionRequest) -> impl
     add_no_cache_headers(&mut response);
     response
         .headers_mut()
-        .insert(header::EXPIRES, "0".parse().unwrap());
+        .insert(
+            header::EXPIRES,
+            axum::http::HeaderValue::from_static("0"),
+        );
 
     response
 }
@@ -572,8 +757,46 @@ async fn stream_chat(state: ServerState, request: ChatCompletionRequest) -> impl
 /// Handle text completion requests
 async fn completions(
     State(state): State<ServerState>,
+    auth_user: Option<Extension<AuthenticatedUser>>,
+    _headers: HeaderMap,
     Json(request): Json<CompletionRequest>,
 ) -> impl IntoResponse {
+    // Extract user identity from JWT (via middleware)
+    let user = extract_user_from_auth(auth_user.as_ref().map(|Extension(u)| u));
+
+    // Check permission for inference on this model
+    let resource = format!("model:{}", request.model);
+    match state
+        .policy_client
+        .check(&user, &resource, Operation::Infer)
+        .await
+    {
+        Ok(allowed) if !allowed => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse::new(
+                    format!("Permission denied: user '{}' cannot infer on '{}'", user, request.model),
+                    "permission_denied",
+                    "insufficient_permissions",
+                )),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            error!("Policy check failed: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    format!("Policy check failed: {}", e),
+                    "policy_error",
+                    "internal_error",
+                )),
+            )
+                .into_response();
+        }
+        _ => {} // allowed
+    }
+
     // Update metrics (use RAII guard for automatic cleanup)
     state
         .metrics
@@ -585,13 +808,13 @@ async fn completions(
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _metrics_guard = MetricsGuard::new(&state.metrics);
 
-    // Get engine from model cache (using helper)
-    let engine = match load_model_or_error(&state, &request.model).await {
-        Ok(engine) => engine,
+    // Resolve model path (also validates inference capability)
+    let model_path = match resolve_model_path(&state, &request.model).await {
+        Ok(path) => path,
         Err(response) => return response.into_response(),
     };
 
-    // Convert raw prompt to chat format and apply template
+    // Convert raw prompt to chat format and apply template via ZMQ ModelService
     // The completions endpoint expects raw text, but modern models need templated input
     let messages = vec![ChatMessage {
         role: "user".to_string(),
@@ -599,31 +822,27 @@ async fn completions(
         function_call: None,
     }];
 
-    let formatted_prompt = match format_messages_with_template(&messages, &engine).await {
+    let templated_prompt = match state
+        .model_client
+        .apply_chat_template(&request.model, &messages, true)
+        .await
+    {
         Ok(prompt) => prompt,
         Err(e) => {
             error!("Template formatting failed for completions endpoint: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": {
-                        "message": format!("Template formatting failed: {}", e),
-                        "type": "template_error",
-                        "code": "template_formatting_failed"
-                    }
-                })),
+                Json(ErrorResponse::new(
+                    format!("Template formatting failed: {}", e),
+                    "template_error",
+                    "template_formatting_failed",
+                )),
             )
                 .into_response();
         }
     };
 
-    // Get model path (using helper)
-    let model_path = match resolve_model_path(&state, &request.model).await {
-        Ok(path) => path,
-        Err(response) => return response.into_response(),
-    };
-
-    let gen_request = GenerationRequest::builder(formatted_prompt)
+    let gen_request = GenerationRequest::builder(templated_prompt.as_str())
         .apply_config(&(&state.config.sampling_defaults).into())
         .apply_config(&crate::config::SamplingParams::from_model_path(&model_path).await.unwrap_or_default())
         .apply_config(&(&request).into())
@@ -634,10 +853,8 @@ async fn completions(
         gen_request.max_tokens, gen_request.temperature, gen_request.top_p, gen_request.top_k, gen_request.repeat_penalty
     );
 
-    let result = {
-        let engine = engine.lock().await;
-        engine.generate_with_params(gen_request).await
-    };
+    // Call inference via ZMQ ModelService
+    let result = state.model_client.infer(&request.model, &gen_request).await;
 
     // Metrics automatically decremented by MetricsGuard on drop
 
@@ -721,10 +938,8 @@ async fn list_models(State(state): State<ServerState>) -> impl IntoResponse {
                     owned_by_parts.push(metadata.tags.join(", "));
                 }
 
-                // Check if this model is cached (by model:branch name)
-                if state.model_cache.is_cached_by_name(&model_id).await {
-                    owned_by_parts.push("cached".to_string());
-                }
+                // Note: Model caching is now handled by ModelService internally
+                // The "cached" status is no longer exposed at the HTTP layer
 
                 let owned_by = owned_by_parts.join(" ");
 
@@ -751,47 +966,4 @@ async fn list_models(State(state): State<ServerState>) -> impl IntoResponse {
     response
 }
 
-/// Format chat messages into a prompt using template engine
-async fn format_messages_with_template(
-    messages: &[ChatMessage],
-    engine: &Arc<Mutex<TorchEngine>>,
-) -> Result<String, String> {
-    // Log messages for debugging
-    for (i, msg) in messages.iter().enumerate() {
-        info!(
-            "Message {}: role={}, content={:?}",
-            i,
-            msg.role,
-            msg.content.as_ref().map(|c| {
-                if c.len() <= 100 {
-                    c.as_str()
-                } else {
-                    // Find the last character boundary before or at position 100
-                    match c.char_indices().nth(99) {
-                        Some((idx, _)) => &c[..idx],
-                        None => c.as_str(), // Less than 100 characters
-                    }
-                }
-            })
-        );
-    }
-
-    // Convert OpenAI messages to template engine format
-    let template_messages: Vec<crate::runtime::template_engine::ChatMessage> = messages
-        .iter()
-        .map(|msg| crate::runtime::template_engine::ChatMessage {
-            role: msg.role.clone(),
-            content: msg.content.as_ref().unwrap_or(&String::new()).clone(),
-        })
-        .collect();
-
-    info!("Acquiring engine lock for template formatting...");
-    // Apply the engine's template formatting
-    let engine_guard = engine.lock().await;
-    info!("Engine lock acquired, applying template...");
-    let result = engine_guard
-        .apply_chat_template(&template_messages, true)
-        .map_err(|e| format!("Failed to apply chat template: {}", e));
-    info!("Template application complete: {:?}", result.is_ok());
-    result
-}
+// REMOVED: format_messages_with_template - replaced by model_client.apply_chat_template()

@@ -8,16 +8,28 @@ use clap::Parser;
 use tracing::info;
 
 // Core application imports
-use hyprstream_core::cli::commands::Commands;
+use hyprstream_core::auth::PolicyManager;
+use hyprstream_core::cli::commands::{Commands, TrainingAction};
 use hyprstream_core::cli::handlers::handle_server;
 use hyprstream_core::cli::{
     handle_branch, handle_checkout, handle_clone, handle_commit, handle_infer, handle_info,
-    handle_list, handle_lora_train, handle_merge, handle_pull, handle_push, handle_remove,
-    handle_status, handle_worktree_info, handle_worktree_list,
-    handle_worktree_remove, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
+    handle_list, handle_merge, handle_policy_apply, handle_policy_apply_template,
+    handle_policy_check, handle_policy_diff, handle_policy_edit, handle_policy_history,
+    handle_policy_list_templates, handle_policy_rollback, handle_policy_show, handle_pull,
+    handle_push, handle_remote_add, handle_remote_list, handle_remote_remove, handle_remote_rename,
+    handle_remote_set_url, handle_remove, handle_status, handle_token_create,
+    handle_training_batch, handle_training_checkpoint, handle_training_infer, handle_training_init,
+    handle_worktree_add, handle_worktree_info, handle_worktree_list,
+    handle_worktree_remove, load_or_generate_signing_key, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
 };
 use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
+
+// Registry and policy services - uses ZMQ-based services from hyprstream_core
+use hyprstream_core::services::{
+    PolicyService, PolicyZmqClient, RegistryClient, RegistryService, RegistryZmqClient, ServiceHandle,
+};
+use std::sync::Arc;
 // Tracing imports (feature-gated)
 #[cfg(feature = "otel")]
 use opentelemetry::trace::TracerProvider;
@@ -122,8 +134,11 @@ where
 }
 
 /// Server command handler - requires multi-threaded runtime for GPU
-async fn handle_server_cmd(ctx: AppContext) -> Result<()> {
-    handle_server(ctx)
+async fn handle_server_cmd(
+    ctx: AppContext,
+    flight_config: Option<hyprstream_core::cli::FlightServerConfig>,
+) -> Result<()> {
+    handle_server(ctx, flight_config)
         .await
         .map_err(|e| anyhow::anyhow!("{}", e))
 }
@@ -189,7 +204,7 @@ fn init_telemetry(provider: TelemetryProvider) -> Result<()> {
     // Set log level based on provider
     let default_log_level = match provider {
         TelemetryProvider::Otlp => "hyprstream=info,opentelemetry=info",
-        TelemetryProvider::Stdout => "hyprstream=debug,opentelemetry=debug",
+        TelemetryProvider::Stdout => "hyprstream=warn",
     };
 
     let filter = EnvFilter::builder()
@@ -235,8 +250,62 @@ fn main() -> Result<()> {
         .validate()
         .context("Configuration validation failed")?;
 
-    // Create application context
-    let ctx = AppContext::new(config);
+    // Start registry service ONCE at CLI level
+    // This runtime must stay alive to keep ZMQ services running
+    let _registry_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("Failed to create registry runtime")?;
+
+    // Start ZMQ-based services: PolicyService first, then RegistryService
+    // Return both client AND service handle so we can stop it on exit
+    // Also return keypair for other services (like InferenceService) to use
+    use hyprstream_rpc::{SigningKey, VerifyingKey, RequestIdentity};
+    let (registry_client, _service_handle, signing_key, verifying_key): (Arc<dyn RegistryClient>, ServiceHandle, SigningKey, VerifyingKey) = _registry_runtime
+        .block_on(async {
+            let models_dir = config.models_dir();
+
+            // Load or generate signing key (persisted to .registry/keys/signing.key)
+            let keys_dir = models_dir.join(".registry").join("keys");
+            let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+            let verifying_key = signing_key.verifying_key();
+
+            // Initialize policy manager for authorization
+            // Note: Policy templates should be applied explicitly using CLI commands:
+            //   hyprstream policy apply-template local    # For local full access
+            //   hyprstream policy apply-template public-inference  # For public inference
+            let policies_dir = models_dir.join(".registry").join("policies");
+            let policy_manager = Arc::new(
+                PolicyManager::new(&policies_dir)
+                    .await
+                    .context("Failed to initialize policy manager")?
+            );
+
+            // Start PolicyService FIRST (runs on multi-threaded runtime where block_in_place works)
+            // This service wraps PolicyManager and exposes it over ZMQ
+            let _policy_handle = PolicyService::start(policy_manager, verifying_key)
+                .await
+                .context("Failed to start policy service")?;
+
+            // Create policy client for other services to use
+            let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
+
+            // Start the registry service with policy client (waits for socket binding)
+            let service_handle = RegistryService::start(&models_dir, verifying_key, policy_client)
+                .await
+                .context("Failed to start registry service")?;
+            // Create client with signing credentials for service communication
+            // Uses local identity (current OS user) for authorization
+            let client = Arc::new(RegistryZmqClient::new(
+                signing_key.clone(),
+                RequestIdentity::local(),
+            )) as Arc<dyn RegistryClient>;
+            Ok::<_, anyhow::Error>((client, service_handle, signing_key, verifying_key))
+        })
+        .context("Failed to initialize registry")?;
+
+    // Create application context with shared registry client
+    let ctx = AppContext::with_client(config, registry_client.clone());
 
     // Keep the guard alive for the entire program lifetime
     // Dropping the guard stops the background logging thread
@@ -262,7 +331,7 @@ fn main() -> Result<()> {
             // Fallback to simple logging without OpenTelemetry
             let default_log_level = match telemetry_provider {
                 TelemetryProvider::Otlp => "hyprstream=info",
-                TelemetryProvider::Stdout => "hyprstream=debug",
+                TelemetryProvider::Stdout => "hyprstream=warn",
             };
 
             // Check if file logging is enabled via environment variable
@@ -307,7 +376,7 @@ fn main() -> Result<()> {
         // Simple logging without OpenTelemetry support
         let default_log_level = match &cli.command {
             Commands::Server(_) => "hyprstream=info",
-            _ => "hyprstream=debug",
+            _ => "hyprstream=warn",
         };
 
         // Check if file logging is enabled via environment variable
@@ -364,8 +433,17 @@ fn main() -> Result<()> {
                 info!("Using GPU device {} from CLI", gpu_device);
             }
 
-            // Create context with merged config (CLI args override file config)
-            let ctx = AppContext::new(config);
+            // Create Flight SQL server config if dataset is specified
+            let flight_config = cmd.dataset.as_ref().map(|dataset| {
+                hyprstream_core::cli::FlightServerConfig {
+                    dataset: Some(dataset.clone()),
+                    port: cmd.flight_port,
+                    host: cmd.flight_host.clone(),
+                }
+            });
+
+            // Create context with merged config and shared registry client
+            let ctx = AppContext::with_client(config, registry_client.clone());
 
             let ctx = ctx.clone();
             with_runtime(
@@ -373,11 +451,11 @@ fn main() -> Result<()> {
                     device: DeviceConfig::request_gpu(),
                     multi_threaded: true,
                 },
-                || handle_server_cmd(ctx),
+                || handle_server_cmd(ctx, flight_config),
             )?
         }
         // Phase 1: Git-style commands
-        Commands::Branch { model, name, from } => {
+        Commands::Branch { model, name, from, policy } => {
             let ctx = ctx.clone();
             with_runtime(
                 RuntimeConfig {
@@ -386,7 +464,7 @@ fn main() -> Result<()> {
                 },
                 || async move {
                     let storage = ctx.storage().await?;
-                    handle_branch(storage, &model, &name, from).await
+                    handle_branch(storage, &model, &name, from, policy).await
                 },
             )?;
         }
@@ -472,18 +550,9 @@ fn main() -> Result<()> {
             )?;
         }
 
-        Commands::LoraTrain {
-            model,
-            branch,
-            adapter,
-            index,
-            rank,
-            learning_rate,
-            batch_size,
-            epochs,
-            config,
-        } => {
+        Commands::Training(cmd) => {
             let ctx = ctx.clone();
+            let signing_key = signing_key.clone();
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_gpu(),
@@ -491,19 +560,118 @@ fn main() -> Result<()> {
                 },
                 || async move {
                     let storage = ctx.storage().await?;
-                    handle_lora_train(
-                        storage,
-                        &model,
-                        branch,
-                        adapter,
-                        index,
-                        rank,
-                        learning_rate,
-                        batch_size,
-                        epochs,
-                        config,
-                    )
-                    .await
+                    match cmd.action {
+                        TrainingAction::Init {
+                            model,
+                            branch,
+                            adapter,
+                            index,
+                            rank,
+                            alpha,
+                            mode,
+                            learning_rate,
+                        } => {
+                            handle_training_init(
+                                storage,
+                                &model,
+                                branch,
+                                adapter,
+                                index,
+                                rank,
+                                alpha,
+                                &mode,
+                                learning_rate,
+                            )
+                            .await
+                        }
+                        TrainingAction::Infer {
+                            model,
+                            prompt,
+                            image,
+                            max_tokens,
+                            temperature,
+                            top_p,
+                            top_k,
+                            repeat_penalty,
+                            stream,
+                            max_context,
+                            kv_quant,
+                        } => {
+                            // Read prompt from stdin if not provided
+                            let prompt_text = match prompt {
+                                Some(p) => p,
+                                None => {
+                                    use std::io::Read;
+                                    let mut buffer = String::new();
+                                    std::io::stdin().read_to_string(&mut buffer)?;
+                                    buffer.trim().to_string()
+                                }
+                            };
+                            handle_training_infer(
+                                storage,
+                                &model,
+                                &prompt_text,
+                                image,
+                                max_tokens,
+                                temperature,
+                                top_p,
+                                top_k,
+                                repeat_penalty,
+                                stream,
+                                max_context,
+                                kv_quant,
+                                signing_key,
+                                verifying_key,
+                            )
+                            .await
+                        }
+                        TrainingAction::Batch {
+                            model,
+                            input,
+                            input_dir,
+                            pattern,
+                            format,
+                            max_tokens,
+                            chunk_size,
+                            skip,
+                            limit,
+                            progress_interval,
+                            checkpoint_interval,
+                            test_set,
+                            max_context,
+                            kv_quant,
+                        } => {
+                            handle_training_batch(
+                                storage,
+                                &model,
+                                input,
+                                input_dir,
+                                &pattern,
+                                &format,
+                                max_tokens,
+                                chunk_size,
+                                skip,
+                                limit,
+                                progress_interval,
+                                checkpoint_interval,
+                                test_set,
+                                max_context,
+                                kv_quant,
+                                signing_key,
+                                verifying_key,
+                            )
+                            .await
+                        }
+                        TrainingAction::Checkpoint {
+                            model,
+                            message,
+                            push,
+                            remote,
+                        } => {
+                            handle_training_checkpoint(storage, &model, message, push, &remote)
+                                .await
+                        }
+                    }
                 },
             )?;
         }
@@ -523,7 +691,19 @@ fn main() -> Result<()> {
             max_context,
             kv_quant,
         } => {
+            // Read prompt from stdin if not provided via --prompt
+            let prompt = match prompt {
+                Some(p) => p,
+                None => {
+                    use std::io::Read;
+                    let mut buffer = String::new();
+                    std::io::stdin().read_to_string(&mut buffer)?;
+                    buffer.trim().to_string()
+                }
+            };
+
             let ctx = ctx.clone();
+            let signing_key = signing_key.clone();
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_gpu(),
@@ -546,6 +726,8 @@ fn main() -> Result<()> {
                         force_download,
                         max_context,
                         kv_quant,
+                        signing_key,
+                        verifying_key,
                     )
                     .await
                 },
@@ -561,7 +743,15 @@ fn main() -> Result<()> {
                 },
                 || async move {
                     let storage = ctx.storage().await?;
-                    handle_list(storage).await
+
+                    // Load PolicyManager for permission-aware capability display
+                    let registry_path = storage.get_models_dir().join(".registry");
+                    let policies_dir = registry_path.join("policies");
+                    let policy_manager = PolicyManager::new(&policies_dir)
+                        .await
+                        .ok(); // Gracefully fall back to None if policies don't exist
+
+                    handle_list(storage, policy_manager.as_ref()).await
                 },
             )?;
         }
@@ -599,6 +789,7 @@ fn main() -> Result<()> {
             full,
             quiet,
             verbose,
+            policy,
         } => {
             let ctx = ctx.clone();
             with_runtime(
@@ -617,6 +808,7 @@ fn main() -> Result<()> {
                         full,
                         quiet,
                         verbose,
+                        policy,
                     ).await
                 },
             )?;
@@ -744,8 +936,11 @@ fn main() -> Result<()> {
                 || async move {
                     let storage = ctx.storage().await?;
                     match command {
-                        WorktreeCommand::List { model } => {
-                            handle_worktree_list(storage, &model).await
+                        WorktreeCommand::Add { model, branch, policy } => {
+                            handle_worktree_add(storage, &model, &branch, policy).await
+                        }
+                        WorktreeCommand::List { model, all } => {
+                            handle_worktree_list(storage, &model, all).await
                         }
                         WorktreeCommand::Info { model, branch } => {
                             handle_worktree_info(storage, &model, &branch).await
@@ -757,7 +952,170 @@ fn main() -> Result<()> {
                 },
             )?;
         }
+
+        Commands::Flight(args) => {
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    use hyprstream_flight::client::{
+                        format_batches_as_csv, format_batches_as_json, format_batches_as_table,
+                        FlightClient,
+                    };
+
+                    let mut client = FlightClient::connect(&args.addr)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Failed to connect: {}", e))?;
+
+                    if let Some(sql) = args.query {
+                        let batches = client
+                            .query(&sql)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Query failed: {}", e))?;
+
+                        let output = match args.format.as_str() {
+                            "csv" => format_batches_as_csv(&batches),
+                            "json" => format_batches_as_json(&batches)
+                                .map_err(|e| anyhow::anyhow!("JSON format error: {}", e))?,
+                            _ => format_batches_as_table(&batches),
+                        };
+                        print!("{}", output);
+                    } else {
+                        // Interactive REPL mode - TODO: implement readline-based REPL
+                        println!("Connected to Flight SQL server at {}", args.addr);
+                        println!("Interactive mode not yet implemented. Use --query to execute SQL.");
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+
+        Commands::Policy { command } => {
+            use hyprstream_core::cli::commands::{PolicyCommand, TokenCommand};
+
+            let ctx = ctx.clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    // Get the policies directory from the registry
+                    let storage = ctx.storage().await?;
+                    let registry_path = storage.get_models_dir().join(".registry");
+                    let policies_dir = registry_path.join("policies");
+
+                    // Initialize policy manager
+                    let policy_manager = PolicyManager::new(&policies_dir)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Failed to initialize policy manager: {}", e))?;
+
+                    match command {
+                        PolicyCommand::Show { raw } => {
+                            handle_policy_show(&policy_manager, raw).await
+                        }
+                        PolicyCommand::History { count, oneline } => {
+                            handle_policy_history(&policy_manager, count, oneline).await
+                        }
+                        PolicyCommand::Edit => {
+                            handle_policy_edit(&policy_manager).await
+                        }
+                        PolicyCommand::Diff { against } => {
+                            handle_policy_diff(&policy_manager, against).await
+                        }
+                        PolicyCommand::Apply { dry_run, message } => {
+                            handle_policy_apply(&policy_manager, dry_run, message).await
+                        }
+                        PolicyCommand::Rollback { git_ref, dry_run } => {
+                            handle_policy_rollback(&policy_manager, &git_ref, dry_run).await
+                        }
+                        PolicyCommand::Check { user, resource, action } => {
+                            handle_policy_check(&policy_manager, &user, &resource, &action).await
+                        }
+                        PolicyCommand::Token { command: token_cmd } => {
+                            match token_cmd {
+                                TokenCommand::Create { user, name, expires, scope, admin } => {
+                                    // Load signing key for JWT token generation
+                                    let keys_dir = registry_path.join("keys");
+                                    let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+                                    handle_token_create(&signing_key, &user, name, &expires, scope, admin).await
+                                }
+                                TokenCommand::List { user: _ } => {
+                                    // JWT tokens are stateless - cannot list
+                                    println!("JWT tokens are stateless and cannot be listed.");
+                                    println!();
+                                    println!("Tokens are validated by signature and expiry time.");
+                                    println!("To see who has access, review the policy:");
+                                    println!("  hyprstream policy show");
+                                    Ok(())
+                                }
+                                TokenCommand::Revoke { token: _, name: _, revoke_user: _, force: _ } => {
+                                    // JWT tokens cannot be revoked without a blocklist
+                                    println!("JWT tokens cannot be revoked individually.");
+                                    println!();
+                                    println!("Options for token invalidation:");
+                                    println!("  1. Use short expiry times (e.g., --expires 1d)");
+                                    println!("  2. Regenerate the signing key to invalidate all tokens:");
+                                    println!("     rm ~/.local/share/hyprstream/.registry/keys/signing.key");
+                                    println!("  3. Remove user permissions via policy:");
+                                    println!("     hyprstream policy edit");
+                                    println!();
+                                    println!("A token blocklist feature may be added in the future.");
+                                    Ok(())
+                                }
+                            }
+                        }
+                        PolicyCommand::ApplyTemplate { template, dry_run } => {
+                            handle_policy_apply_template(&policy_manager, &template, dry_run).await
+                        }
+                        PolicyCommand::ListTemplates => {
+                            handle_policy_list_templates().await
+                        }
+                    }
+                },
+            )?;
+        }
+
+        Commands::Remote { command } => {
+            use hyprstream_core::cli::commands::RemoteCommand;
+
+            let ctx = ctx.clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    let storage = ctx.storage().await?;
+                    match command {
+                        RemoteCommand::Add { model, name, url } => {
+                            handle_remote_add(storage, &model, &name, &url).await
+                        }
+                        RemoteCommand::List { model, verbose } => {
+                            handle_remote_list(storage, &model, verbose).await
+                        }
+                        RemoteCommand::Remove { model, name } => {
+                            handle_remote_remove(storage, &model, &name).await
+                        }
+                        RemoteCommand::SetUrl { model, name, url } => {
+                            handle_remote_set_url(storage, &model, &name, &url).await
+                        }
+                        RemoteCommand::Rename { model, old_name, new_name } => {
+                            handle_remote_rename(storage, &model, &old_name, &new_name).await
+                        }
+                    }
+                },
+            )?;
+        }
+
     };
+
+    // Gracefully stop registry service before exiting
+    _registry_runtime.block_on(async {
+        _service_handle.stop().await;
+    });
 
     Ok(())
 }

@@ -16,7 +16,8 @@ pub use crate::config::{
 };
 
 pub mod architectures; // Architecture-specific model implementations (includes Janus placeholder utils)
-pub mod conversation_router; // Seamless model evolution and routing
+// REMOVED: pub mod conversation_router; // Dead code - VDB TemporalStreamingLayer removed
+pub mod generation_metrics; // Quality metrics for self-supervised training
 pub mod kv_quant; // KV cache quantization types
 pub mod tensor_sampling; // Device-agnostic tensor-based sampling
 pub mod image_utils; // Image loading and preprocessing for multimodal models
@@ -34,6 +35,12 @@ pub mod weight_provider; // Weight provider for streaming large models
 
 // Primary exports - use TorchEngine as default
 pub use torch_engine::{TorchEngine, TextStream, GenerationStats};
+
+// KV cache exports for multi-session support
+pub use kv_cache::{CacheConfig, CacheOwner, KVCacheManager, KVCacheRegistry};
+
+// Generation metrics exports for self-supervised training
+pub use generation_metrics::{GenerationMetricsAccumulator, GenerationQualityMetrics, SessionMetrics};
 
 #[derive(Debug, Clone)]
 pub struct MistralEngine;
@@ -64,12 +71,8 @@ pub enum ModelBuilderConfig {
     Default,
 }
 
-// Conversation routing exports
-pub use conversation_router::{
-    AdaptationTrigger, AdaptationType, ConversationContext, ConversationResponse,
-    ConversationRouter, ConversationSession, ConversationTurn, ModelPool, ModelState, PoolStats,
-    RoutingConfig,
-};
+// REMOVED: Conversation routing exports - dead code
+// pub use conversation_router::{...};
 
 // LoRA and adapter exports
 // LoRA wrapper removed - using direct PyTorch implementation

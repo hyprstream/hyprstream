@@ -1,11 +1,17 @@
 pub mod chat;
 pub mod config;
+pub mod flight;
 pub mod git;
 pub mod model;
+pub mod policy;
 pub mod server;
+pub mod training;
 
+pub use flight::FlightArgs;
 pub use git::{GitAction, GitCommand};
+pub use policy::{PolicyCommand, TokenCommand};
 pub use server::{ServerCliArgs, ServerCommand};
+pub use training::{TrainingAction, TrainingCommand};
 
 use clap::{Subcommand, ValueEnum};
 
@@ -48,6 +54,9 @@ pub enum Commands {
     /// Start the Hyprstream server
     Server(ServerCommand),
 
+    /// Flight SQL client to query datasets
+    Flight(FlightArgs),
+
     // Phase 1: Git-style commands at top level
     /// Create a new branch
     Branch {
@@ -58,6 +67,9 @@ pub enum Commands {
         /// Create from specific ref
         #[arg(long)]
         from: Option<String>,
+        /// Apply a policy template to the new branch (local, public-inference, public-read)
+        #[arg(long)]
+        policy: Option<String>,
     },
 
     /// Switch branches or checkout specific commit/tag
@@ -129,54 +141,23 @@ pub enum Commands {
         verbose: bool,
     },
 
-    /// LoRA training (shorthand for 'lora train')
-    #[command(name = "lt")]
-    LoraTrain {
-        /// Model reference
-        model: String,
+    /// Training management commands
+    ///
+    /// Commands for TTT (Test-Time Training) and LoRA adapter management:
+    /// - `training init` - Initialize adapter for training
+    /// - `training infer` - Inference with TTT (dirty writes to adapters)
+    /// - `training batch` - Batch training with checkpoints
+    /// - `training checkpoint` - Commit dirty adapter changes
+    Training(TrainingCommand),
 
-        /// Create new branch for isolated training
-        /// Creates a new branch from the model ref and trains in a dedicated worktree
-        #[arg(long, short = 'B')]
-        branch: Option<String>,
-
-        /// Adapter name (will be auto-prefixed with index)
-        #[arg(long)]
-        adapter: Option<String>,
-
-        /// Explicit index for adapter (auto-increments if not specified)
-        #[arg(long)]
-        index: Option<u32>,
-
-        /// LoRA rank (default: 16)
-        #[arg(long, short = 'r')]
-        rank: Option<u32>,
-
-        /// Learning rate (default: 1e-4)
-        #[arg(long, short = 'l')]
-        learning_rate: Option<f32>,
-
-        /// Batch size (default: 4)
-        #[arg(long, short = 'b')]
-        batch_size: Option<usize>,
-
-        /// Number of epochs (default: 10)
-        #[arg(long, short = 'e')]
-        epochs: Option<usize>,
-
-        /// Training configuration file (overrides CLI args)
-        #[arg(long)]
-        config: Option<String>,
-    },
-
-    /// Run inference with a model
+    /// Run inference with a model (read-only, no training)
     Infer {
         /// Model reference (e.g., "Qwen3-4B", "qwen/qwen-2b", "model:branch")
         model: String,
 
-        /// Prompt text
+        /// Prompt text (reads from stdin if not provided)
         #[arg(short, long)]
-        prompt: String,
+        prompt: Option<String>,
 
         /// Image file path for multimodal models (e.g., --image /path/to/image.jpg)
         #[arg(short = 'i', long)]
@@ -269,6 +250,10 @@ pub enum Commands {
         /// Verbose output
         #[arg(long, short = 'v')]
         verbose: bool,
+
+        /// Apply a policy template to the cloned model (local, public-inference, public-read)
+        #[arg(long)]
+        policy: Option<String>,
     },
 
     /// Push changes to remote
@@ -399,15 +384,41 @@ pub enum Commands {
         #[command(subcommand)]
         command: WorktreeCommand,
     },
+
+    /// Policy management commands for RBAC/ABAC access control
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
+
+    /// Remote management commands
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommand,
+    },
 }
 
 /// Worktree subcommands
 #[derive(Subcommand)]
 pub enum WorktreeCommand {
+    /// Create a worktree from an existing branch
+    Add {
+        /// Model name
+        model: String,
+        /// Branch name (must exist in bare repo)
+        branch: String,
+        /// Apply a policy template to the worktree (local, public-inference, public-read)
+        #[arg(long)]
+        policy: Option<String>,
+    },
+
     /// List all worktrees for a model
     List {
         /// Model name
         model: String,
+        /// Show all branches (including those without worktrees)
+        #[arg(long)]
+        all: bool,
     },
 
     /// Show detailed information about a worktree
@@ -427,5 +438,56 @@ pub enum WorktreeCommand {
         /// Force removal without confirmation
         #[arg(short, long)]
         force: bool,
+    },
+}
+
+/// Remote subcommands
+#[derive(Subcommand)]
+pub enum RemoteCommand {
+    /// Add a new remote
+    Add {
+        /// Model name
+        model: String,
+        /// Remote name (e.g., "private", "upstream")
+        name: String,
+        /// Remote URL (e.g., git@github.com:user/repo.git)
+        url: String,
+    },
+
+    /// List all remotes
+    List {
+        /// Model name
+        model: String,
+        /// Show verbose output (fetch/push URLs)
+        #[arg(short, long)]
+        verbose: bool,
+    },
+
+    /// Remove a remote
+    Remove {
+        /// Model name
+        model: String,
+        /// Remote name to remove
+        name: String,
+    },
+
+    /// Change a remote's URL
+    SetUrl {
+        /// Model name
+        model: String,
+        /// Remote name
+        name: String,
+        /// New URL
+        url: String,
+    },
+
+    /// Rename a remote
+    Rename {
+        /// Model name
+        model: String,
+        /// Current remote name
+        old_name: String,
+        /// New remote name
+        new_name: String,
     },
 }

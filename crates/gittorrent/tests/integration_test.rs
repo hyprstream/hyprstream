@@ -115,7 +115,7 @@ mod tests {
 
         assert!(parsed_commit.message.contains("Test parsing commit"));
         assert!(parsed_commit.author.contains("Test Parser"));
-        assert!(!parsed_commit.tree_hash.as_str().is_empty());
+        assert!(!parsed_commit.tree_hash.to_hex().is_empty());
 
         // Find and parse the tree object
         let tree_obj = objects.iter().find(|obj| obj.object_type == GitObjectType::Tree).unwrap();

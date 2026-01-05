@@ -140,9 +140,6 @@ pub struct ServerConfig {
     #[serde(default = "default_true")]
     pub enable_metrics: bool,
 
-    #[serde(default)]
-    pub api_key: Option<String>,
-
     #[serde(default = "default_max_tokens_limit")]
     pub max_tokens_limit: usize,
 
@@ -240,7 +237,6 @@ impl Default for ServerConfig {
             preload_models: Vec::new(),
             enable_logging: true,
             enable_metrics: true,
-            api_key: None,
             max_tokens_limit: default_max_tokens_limit(),
             request_timeout_secs: default_request_timeout_secs(),
             max_concurrent_requests: default_max_concurrent_requests(),
@@ -314,11 +310,6 @@ impl ServerConfigBuilder {
 
     pub fn enable_metrics(mut self, enabled: bool) -> Self {
         self.config.enable_metrics = enabled;
-        self
-    }
-
-    pub fn api_key(mut self, key: impl Into<String>) -> Self {
-        self.config.api_key = Some(key.into());
         self
     }
 
@@ -474,10 +465,6 @@ impl ServerConfigBuilder {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
-        }
-
-        if let Ok(api_key) = std::env::var("HYPRSTREAM_API_KEY") {
-            self.config.api_key = Some(api_key);
         }
 
         // CORS

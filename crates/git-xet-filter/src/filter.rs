@@ -45,6 +45,7 @@ pub struct XetFilter<State = Unregistered> {
 
 /// Filter payload stored in libgit2's filter->payload field
 #[cfg(feature = "xet-storage")]
+#[derive(Clone)]
 pub struct XetFilterPayload {
     pub storage: Arc<dyn StorageBackend>,
     pub runtime: Arc<XetRuntime>,
@@ -68,8 +69,11 @@ impl XetFilter<Unregistered> {
         // Create payload
         let payload = Box::new(XetFilterPayload { storage, runtime });
 
-        // creating a CString for attributes
-        let attributes_cstr = CString::new("xet").unwrap();
+        // Creating a CString for attributes
+        // Format: "filter=xet" matches .gitattributes entries like "*.safetensors filter=xet"
+        // SAFETY: "filter=xet" is a static literal with no null bytes
+        let attributes_cstr = CString::new("filter=xet")
+            .map_err(|_| XetError::new(XetErrorKind::RuntimeError, "Invalid attributes string"))?;
         let attributes_ptr = attributes_cstr.as_ptr() as *const c_char;
 
         // Create filter structure
@@ -97,9 +101,9 @@ impl XetFilter<Unregistered> {
     ///
     /// Transitions to Registered state on success
     pub fn register(mut self, priority: i32) -> Result<XetFilter<Registered>> {
-        // Ensure libgit2 is initialized by accessing git2::Version
-        // This forces the git2 crate to initialize libgit2
-        let _ = git2::Version::get();
+        // Ensure libgit2 is fully initialized
+        // Calling any git2 function triggers initialization
+        unsafe { git2::opts::set_mwindow_size(crate::ffi::LIBGIT2_MWINDOW_SIZE).ok() };
 
         let name_cstr = CString::new(self.name.as_str())
             .map_err(|_| XetError::new(XetErrorKind::RuntimeError, "Invalid filter name"))?;
@@ -107,15 +111,6 @@ impl XetFilter<Unregistered> {
         // SAFETY: We're passing a stable pointer to a Pin<Box<GitFilter>>
         // which will not move. The payload is also boxed and won't move.
         unsafe {
-            // Initialize the global filter registry if not already done
-            // This is idempotent - safe to call multiple times
-            let global_init_result = crate::ffi::git_filter_global_init();
-            if global_init_result < 0 {
-                tracing::debug!("git_filter_global_init returned {} (might already be initialized)", global_init_result);
-            } else {
-                tracing::info!("Initialized libgit2 filter registry");
-            }
-
             // Try to unregister first in case it's already registered
             let unregister_result = crate::ffi::git_filter_unregister(name_cstr.as_ptr());
             if unregister_result == 0 {
@@ -124,14 +119,33 @@ impl XetFilter<Unregistered> {
 
             let filter_ptr = Pin::as_mut(&mut self.inner).get_unchecked_mut() as *mut GitFilter;
 
-            // Don't call git_filter_init - it might overwrite our callbacks
-            // Our struct is already properly initialized in XetFilter::new()
+            // Initialize the filter structure with libgit2's expected defaults
+            let init_result = crate::ffi::git_filter_init(filter_ptr, crate::ffi::GIT_FILTER_VERSION);
+            if init_result < 0 {
+                tracing::warn!("git_filter_init returned {} (continuing anyway)", init_result);
+            }
+
+            // Restore our callbacks after git_filter_init (it may have cleared them)
+            (*filter_ptr).attributes = self
+                .attributes_cstr
+                .as_ref()
+                .ok_or_else(|| XetError::new(XetErrorKind::RuntimeError, "attributes_cstr not set"))?
+                .as_ptr();
+            (*filter_ptr).initialize = Some(crate::callbacks::xet_filter_initialize);
+            (*filter_ptr).shutdown = Some(crate::callbacks::xet_filter_shutdown);
+            (*filter_ptr).check = Some(crate::callbacks::xet_filter_check);
+            (*filter_ptr).stream = Some(crate::callbacks::xet_filter_stream);
+            (*filter_ptr).cleanup = Some(crate::callbacks::xet_filter_cleanup);
 
             // Store payload in global registry using filter instance pointer
             // Cast to OpaqueGitFilter for the registry
+            let payload = self
+                .payload
+                .take()
+                .ok_or_else(|| XetError::new(XetErrorKind::RuntimeError, "payload not set"))?;
             crate::callbacks::register_payload(
                 filter_ptr as *const crate::ffi::OpaqueGitFilter,
-                *self.payload.take().unwrap(),
+                *payload,
             );
 
             let result = crate::ffi::git_filter_register(

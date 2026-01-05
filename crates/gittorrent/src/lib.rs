@@ -9,9 +9,7 @@ pub mod error;
 pub mod git;
 // Using libp2p for P2P networking directly in DHT module
 pub mod types;
-pub mod xet_integration;
 pub mod service;
-pub mod lfs_xet;
 pub mod daemon;
 
 // Re-export commonly used types

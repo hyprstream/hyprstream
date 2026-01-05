@@ -1,0 +1,67 @@
+[package]
+name = "hyprstream-flight"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+repository = "https://github.com/hyprstream/hyprstream"
+description = "Arrow Flight SQL server for hyprstream-metrics"
+
+[lib]
+name = "hyprstream_flight"
+path = "src/lib.rs"
+
+# Binary removed - hyprstream-flight is now a library
+# Use `hyprstream flight` command instead (via hyprstream CLI)
+
+[dependencies]
+# Core metrics library
+hyprstream-metrics = { path = "../hyprstream-metrics" }
+
+# Git registry service
+git2db = { path = "../git2db" }
+
+# Arrow Flight - use v56 to match DuckDB 1.4.3 + DataFusion 50
+arrow = "56.2.0"
+arrow-array = "56.2.0"
+arrow-schema = "56.2.0"
+arrow-ipc = "56.2.0"
+arrow-flight = { version = "56.0.0", features = ["flight-sql-experimental", "tls-ring"] }
+
+# Server - use tonic 0.13 to match arrow-flight 56
+tonic = { version = "0.13", features = ["transport", "codegen", "prost", "tls-ring", "server", "channel"] }
+tokio-rustls = "0.26.1"
+rustls = "0.23.1"
+rustls-pemfile = "2.1.0"
+prost = "0.13"
+
+# CLI
+clap = { version = "4.4", features = ["derive", "env"] }
+daemonize = "0.5.0"
+config = "0.15"
+
+# Async runtime
+tokio = { version = "1.43.0", features = ["rt-multi-thread", "signal", "fs"] }
+futures = { version = "0.3.31", features = ["alloc"] }
+async-trait = "0.1"
+async-stream = "0.3"
+tokio-stream = "0.1.17"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bytes = "1.9.0"
+
+# Error handling
+thiserror = "2.0"
+
+# Utilities
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-log = "0.2"
+tracing-appender = "0.2"
+nix = "0.27"
+users = "0.11"
+rlimit = "0.10"
+num_cpus = "1.16"
+anyhow = "1.0.95"
+parking_lot = "0.12"

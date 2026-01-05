@@ -1,26 +1,33 @@
 //! Server state management
 
-use super::model_cache::ModelCache;
 use crate::{
     api::training_service::TrainingService,
+    services::{ModelZmqClient, PolicyZmqClient},
     storage::ModelStorage,
 };
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 // Re-export config types so other server modules can access them via server::state
 pub use crate::config::{CorsConfig, SamplingParamDefaults, ServerConfig};
 
+// Re-export context storage types
+pub use hyprstream_metrics::storage::context::{ContextRecord, ContextStore, SearchResult};
+
 /// Shared server state
 #[derive(Clone)]
 pub struct ServerState {
-    /// Model cache for UUID-based model caching with LRU eviction
-    pub model_cache: Arc<ModelCache>,
+    /// Model client for inference operations via ZMQ
+    pub model_client: ModelZmqClient,
+
+    /// Policy client for authorization checks via ZMQ
+    pub policy_client: PolicyZmqClient,
 
     /// Model storage for managing downloaded models
     pub model_storage: Arc<ModelStorage>,
 
-    /// Training service for auto-regressive learning
+    /// Training service for supervised learning
     pub training_service: Arc<TrainingService>,
 
     /// Server configuration (from unified config system)
@@ -28,6 +35,15 @@ pub struct ServerState {
 
     /// Metrics collector
     pub metrics: Arc<Metrics>,
+
+    /// Ed25519 signing key for creating JWT tokens
+    pub signing_key: Arc<SigningKey>,
+
+    /// Ed25519 verifying key for validating JWT tokens (derived from signing_key)
+    pub verifying_key: Arc<VerifyingKey>,
+
+    /// Context store for RAG/CAG (optional)
+    pub context_store: Option<Arc<ContextStore<hyprstream_metrics::storage::duckdb::DuckDbBackend>>>,
 }
 
 /// Metrics collector
@@ -57,55 +73,31 @@ impl Default for Metrics {
 }
 
 impl ServerState {
-    /// Create a new server state
-    pub async fn new(config: ServerConfig) -> Result<Self, anyhow::Error> {
-        Self::new_with_git2db(config, git2db::config::Git2DBConfig::default()).await
-    }
-
-    /// Create a new server state with custom git2db configuration
-    pub async fn new_with_git2db(
+    /// Create a new server state with ZMQ clients
+    ///
+    /// This is the primary method for creating server state with ZMQ-based services.
+    /// The model_client and policy_client should be created after starting their
+    /// respective services in main.rs.
+    pub async fn new(
         config: ServerConfig,
-        git2db_config: git2db::config::Git2DBConfig,
+        model_client: ModelZmqClient,
+        policy_client: PolicyZmqClient,
+        model_storage: Arc<ModelStorage>,
+        signing_key: SigningKey,
     ) -> Result<Self, anyhow::Error> {
-        // Use proper storage paths via StoragePaths (XDG Base Directory spec)
-        let storage_paths = crate::storage::paths::StoragePaths::new()?;
-
-        // Allow environment override but use proper XDG paths by default
-        let models_dir = if let Ok(dir) = std::env::var("HYPRSTREAM_MODELS_DIR") {
-            std::path::PathBuf::from(dir)
-        } else {
-            storage_paths.models_dir()?
-        };
-
-        let _loras_dir = if let Ok(dir) = std::env::var("HYPRSTREAM_LORA_DIR") {
-            std::path::PathBuf::from(dir)
-        } else {
-            storage_paths.loras_dir()?
-        };
-
-        tracing::info!("Initializing model storage at: {:?}", models_dir);
-        let model_storage =
-            Arc::new(ModelStorage::create_with_config(models_dir.clone(), git2db_config).await?);
+        let verifying_key = signing_key.verifying_key();
+        let signing_key = Arc::new(signing_key);
+        let verifying_key = Arc::new(verifying_key);
 
         // Initialize training service
         let training_service = Arc::new(TrainingService::new());
-
-        // Initialize model cache using git2db's worktree management
-        // Pass max_context to limit KV cache allocation and reduce GPU memory
-        // Pass kv_quant for KV cache quantization (reduces memory by 50-75%)
-        let model_cache = Arc::new(ModelCache::new(
-            config.max_cached_models,
-            model_storage.clone(),
-            config.max_context,
-            config.kv_quant,
-        )?);
 
         // Preload models for faster first request
         if !config.preload_models.is_empty() {
             tracing::info!("Preloading {} models", config.preload_models.len());
             for model_name in &config.preload_models {
                 tracing::info!("Preloading model: {}", model_name);
-                match model_cache.get_or_load(model_name).await {
+                match model_client.load(model_name).await {
                     Ok(_) => tracing::info!("Preloaded: {}", model_name),
                     Err(e) => tracing::warn!("Failed to preload model '{}': {}", model_name, e),
                 }
@@ -116,11 +108,15 @@ impl ServerState {
         let metrics = Arc::new(Metrics::default());
 
         Ok(Self {
-            model_cache,
+            model_client,
+            policy_client,
             model_storage,
             training_service,
             config: Arc::new(config),
             metrics,
+            signing_key,
+            verifying_key,
+            context_store: None, // Initialize via enable_context_store() if needed
         })
     }
 
@@ -132,6 +128,48 @@ impl ServerState {
             "avg_latency_ms": *self.metrics.avg_latency_ms.read().await,
             "active_requests": self.metrics.active_requests.load(std::sync::atomic::Ordering::Relaxed),
         })
+    }
+
+    /// Enable context storage for RAG/CAG functionality.
+    ///
+    /// This initializes a context store using DuckDB for embedding storage.
+    /// Call this during server initialization if RAG/CAG is needed.
+    ///
+    /// # Arguments
+    /// - `db_path` - Path to DuckDB database (use ":memory:" for in-memory)
+    /// - `embedding_dim` - Dimension of embeddings (e.g., 768 for many models)
+    ///
+    /// # Returns
+    /// A mutable reference to the initialized ContextStore
+    pub async fn enable_context_store(
+        &mut self,
+        db_path: &str,
+        embedding_dim: i32,
+    ) -> Result<(), anyhow::Error> {
+        use hyprstream_metrics::storage::context::{context_schema, ContextStore};
+        use hyprstream_metrics::storage::duckdb::DuckDbBackend;
+        use hyprstream_metrics::StorageBackend;
+
+        let backend = Arc::new(DuckDbBackend::new(db_path.to_string(), std::collections::HashMap::new(), None)?);
+        backend.init().await.map_err(|e| anyhow::anyhow!("Failed to init DuckDB: {}", e))?;
+        backend.create_table("context", &context_schema(embedding_dim)).await
+            .map_err(|e| anyhow::anyhow!("Failed to create context table: {}", e))?;
+
+        let store = ContextStore::new(backend, "context", embedding_dim);
+        self.context_store = Some(Arc::new(store));
+
+        tracing::info!(
+            "Context store enabled with embedding_dim={} at {}",
+            embedding_dim,
+            db_path
+        );
+
+        Ok(())
+    }
+
+    /// Get the context store if initialized
+    pub fn get_context_store(&self) -> Option<&Arc<ContextStore<hyprstream_metrics::storage::duckdb::DuckDbBackend>>> {
+        self.context_store.as_ref()
     }
 }
 

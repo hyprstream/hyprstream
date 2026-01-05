@@ -1,0 +1,56 @@
+[package]
+name = "hyprstream-rpc"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT"
+repository.workspace = true
+description = "RPC infrastructure for hyprstream services (Cap'n Proto + ZMQ)"
+
+[dependencies]
+# Re-export derive macros
+hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }
+
+# Cap'n Proto serialization
+capnp = { workspace = true }
+
+# ZMQ transport
+tmq = { workspace = true }
+zmq = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Utilities
+tracing = { workspace = true }
+whoami = { workspace = true }
+hex = { workspace = true }
+parking_lot = { workspace = true }
+
+# Cryptography (for signed envelopes, DH key exchange, stream HMAC)
+ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+hkdf = { workspace = true }
+hmac = { workspace = true }
+zeroize = { workspace = true }
+subtle = { workspace = true }
+rand = { workspace = true }
+
+# FIPS mode (optional)
+p256 = { workspace = true, optional = true }
+
+[features]
+default = []
+fips = ["p256"]
+
+[build-dependencies]
+capnpc = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }

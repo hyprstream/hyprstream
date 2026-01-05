@@ -1,10 +1,10 @@
 [package]
 name = "bitsandbytes-sys"
 version = "0.1.0"
-edition.workspace = true
+edition = "2021"
 description = "Rust FFI bindings for bitsandbytes quantization library"
 license = "MIT"
-repository.workspace = true
+repository = "https://github.com/hyprstream/hyprstream.git"
 keywords = ["quantization", "llm", "cuda", "rocm", "ffi"]
 categories = ["external-ffi-bindings", "science"]
 
@@ -24,8 +24,8 @@ build-from-source = ["dep:git2"]
 [dependencies]
 
 [build-dependencies]
-bindgen = { workspace = true, optional = true }
-pkg-config.workspace = true
-git2 = { version = "0.19", optional = true }
+bindgen = { version = "0.70", optional = true }
+pkg-config = "0.3"
+git2 = { version = "0.20.3", optional = true }
 
 [dev-dependencies]

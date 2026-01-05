@@ -2,13 +2,20 @@
 
 use crate::cli::commands::model::GitInfo;
 use crate::config::GenerationRequest;
-// Sampling config now loaded via builder pattern
+use crate::inference_capnp;
 use crate::runtime::template_engine::ChatMessage;
-use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
+use crate::runtime::RuntimeConfig;
+use crate::services::{
+    InferenceService, InferenceZmqClient, PolicyZmqClient, INFERENCE_ENDPOINT,
+};
+use crate::zmq::global_context;
 use crate::storage::{CheckoutOptions, GitRef, ModelRef, ModelStorage};
 use anyhow::{bail, Result};
+use capnp::message::ReaderOptions;
+use capnp::serialize;
+use hyprstream_rpc::prelude::*;
 use std::io::{self, Write};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Handle branch command
 pub async fn handle_branch(
@@ -16,16 +23,14 @@ pub async fn handle_branch(
     model: &str,
     branch_name: &str,
     from_ref: Option<String>,
+    policy_template: Option<String>,
 ) -> Result<()> {
     info!("Creating branch {} for model {}", branch_name, model);
 
     let model_ref = ModelRef::new(model.to_string());
 
-    // Create branch using git2db directly
-    let repo_id = storage.resolve_repo_id(&model_ref).await?;
-    let registry = storage.registry().await;
-    let handle = registry.repo(&repo_id)?;
-    handle.branch().create(branch_name, from_ref.as_deref()).await?;
+    // Create branch using ModelStorage helper
+    storage.create_branch(&model_ref, branch_name, from_ref.as_deref()).await?;
 
     println!("✓ Created branch {}", branch_name);
 
@@ -36,6 +41,11 @@ pub async fn handle_branch(
     // Create worktree for the branch
     let worktree_path = storage.create_worktree(&model_ref, branch_name).await?;
     println!("✓ Created worktree at {}", worktree_path.display());
+
+    // Apply policy template if specified
+    if let Some(ref template_name) = policy_template {
+        apply_policy_template_to_model(storage, model, template_name).await?;
+    }
 
     // Show helpful next steps
     println!("\n→ Next steps:");
@@ -307,8 +317,13 @@ pub async fn handle_commit(
             // Parse "Name <email>" format
             let re = regex::Regex::new(r"^(.+?)\s*<(.+?)>$")?;
             if let Some(captures) = re.captures(&author_str) {
-                let name = captures.get(1).unwrap().as_str().trim();
-                let email = captures.get(2).unwrap().as_str().trim();
+                // SAFETY: capture groups 1 and 2 exist because regex matched
+                let name = captures.get(1)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid author format: missing name"))?
+                    .as_str().trim();
+                let email = captures.get(2)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid author format: missing email"))?
+                    .as_str().trim();
                 git2::Signature::now(name, email)?
             } else {
                 anyhow::bail!(
@@ -390,249 +405,10 @@ fn print_model_status(model_name: &str, status: &git2db::RepositoryStatus, verbo
     }
 }
 
-/// Handle lt (LoRA training) command
-pub async fn handle_lora_train(
-    storage: &ModelStorage,
-    model_ref_str: &str,
-    branch_name: Option<String>,
-    adapter_name: Option<String>,
-    index: Option<u32>,
-    rank: Option<u32>,
-    learning_rate: Option<f32>,
-    batch_size: Option<usize>,
-    epochs: Option<usize>,
-    config: Option<String>,
-) -> Result<()> {
-    let model_ref = ModelRef::parse(model_ref_str)?;
-
-    // WORKFLOW 2: New branch + worktree for isolated training
-    if let Some(new_branch) = branch_name {
-        info!("Creating isolated training environment: branch {} from {}", new_branch, model_ref.git_ref.display_name());
-
-        // 1. Create branch from model_ref's git_ref
-        let repo_id = storage.resolve_repo_id(&model_ref).await?;
-        let registry = storage.registry().await;
-        let handle = registry.repo(&repo_id)?;
-
-        let from_ref = model_ref.git_ref.to_ref_string();
-        handle.branch().create(&new_branch, from_ref.as_deref()).await?;
-
-        println!("✓ Created branch {} from {}", new_branch, model_ref.git_ref.display_name());
-
-        // 2. Create worktree for new branch
-        let worktree_path = storage.create_worktree(&model_ref, &new_branch).await?;
-        println!("✓ Created worktree at {}", worktree_path.display());
-
-        // 3. Train adapter in worktree
-        let adapter_manager = crate::storage::AdapterManager::new(&worktree_path);
-        adapter_manager.ensure_adapters_dir()?;
-
-        let adapter_base_name = adapter_name.as_deref().unwrap_or("default");
-        let indexed_adapter_name = adapter_manager.create_indexed_name(adapter_base_name, index)?;
-
-        println!("\n→ Training adapter {} in isolated worktree", indexed_adapter_name);
-
-        // Create adapter configuration
-        let adapter_config = crate::storage::AdapterConfig {
-            rank: rank.unwrap_or(16),
-            alpha: 32.0,
-            learning_rate: learning_rate.unwrap_or(1e-4) as f64,
-            batch_size: batch_size.unwrap_or(4),
-            epochs: epochs.unwrap_or(10),
-            model_ref: format!("{}:{}", model_ref.model, new_branch),
-            training_data: None,
-            ..Default::default()
-        };
-
-        // Load model and train
-        let config = crate::config::RuntimeConfig::default();
-        let mut engine = crate::runtime::TorchEngine::new(config)?;
-        crate::runtime::RuntimeEngine::load_model(&mut engine, &worktree_path).await?;
-
-        let lora_config = crate::lora::LoRAConfig {
-            rank: adapter_config.rank as usize,
-            alpha: adapter_config.alpha,
-            dropout: 0.1,
-            target_modules: vec![
-                "q_proj".to_string(),
-                "k_proj".to_string(),
-                "v_proj".to_string(),
-                "o_proj".to_string(),
-                "gate_proj".to_string(),
-                "up_proj".to_string(),
-                "down_proj".to_string(),
-            ],
-            learning_rate: adapter_config.learning_rate as f32,
-        };
-
-        engine.create_lora(lora_config)?;
-
-        // Save adapter
-        let adapter_path = adapter_manager
-            .adapters_dir
-            .join(format!("{}.safetensors", indexed_adapter_name));
-        engine.save_lora_weights(adapter_path.to_str().unwrap())?;
-
-        let config_path = adapter_manager
-            .adapters_dir
-            .join(format!("{}.config.json", indexed_adapter_name));
-        let config_json = serde_json::to_string_pretty(&adapter_config)?;
-        std::fs::write(&config_path, config_json)?;
-
-        println!("\n✓ Initialized adapter: adapters/{}.safetensors", indexed_adapter_name);
-        println!("✓ Created config: adapters/{}.config.json", indexed_adapter_name);
-
-        println!("\n✓ Isolated training complete!");
-        println!("\n→ Next steps:");
-        println!("  cd {}", worktree_path.display());
-        println!("  hyprstream status {}:{}", model_ref.model, new_branch);
-        println!("  hyprstream commit {}:{} -a -m \"Add {} adapter\"", model_ref.model, new_branch, indexed_adapter_name);
-
-        return Ok(());
-    }
-
-    // WORKFLOW 1: Train on existing worktree
-
-    // Verify worktree exists for the specified branch
-    let branch_name = match &model_ref.git_ref {
-        git2db::GitRef::Branch(name) => name.clone(),
-        git2db::GitRef::DefaultBranch => {
-            let base_ref = ModelRef::new(model_ref.model.clone());
-            storage.get_default_branch(&base_ref).await?
-        }
-        _ => {
-            return Err(anyhow::anyhow!(
-                "LoRA training requires a branch reference. Use model:branch format (e.g., {}:main)",
-                model_ref.model
-            ));
-        }
-    };
-
-    // Get worktree path (this verifies it exists)
-    let model_path = storage.get_worktree_path(&model_ref, &branch_name).await
-        .map_err(|e| anyhow::anyhow!(
-            "Worktree '{}' does not exist for model '{}'. Create it first with:\n  hyprstream branch {} {}\nError: {}",
-            branch_name, model_ref.model, model_ref.model, branch_name, e
-        ))?;
-
-    println!(
-        "Starting LoRA adapter initialization for {}:{}",
-        model_ref.model, branch_name
-    );
-    println!("Worktree: {}", model_path.display());
-
-    let adapter_manager = crate::storage::AdapterManager::new(&model_path);
-
-    // Determine adapter name and create indexed name
-    let adapter_base_name = adapter_name.as_deref().unwrap_or("default");
-    let indexed_adapter_name = adapter_manager.create_indexed_name(adapter_base_name, index)?;
-
-    // Create adapter configuration
-    let mut adapter_config = crate::storage::AdapterConfig {
-        rank: rank.unwrap_or(16),
-        alpha: 32.0,
-        learning_rate: learning_rate.unwrap_or(1e-4) as f64,
-        batch_size: batch_size.unwrap_or(4),
-        epochs: epochs.unwrap_or(10),
-        model_ref: model_ref.to_string(),
-        training_data: None,
-        ..Default::default()
-    };
-
-    // Add metadata
-    adapter_config.metadata.insert(
-        "branch".to_string(),
-        branch_name.clone(),
-    );
-
-    // Display configuration
-    println!("\n→ Adapter configuration:");
-    println!("  Name: {}", indexed_adapter_name);
-    println!("  Rank: {}", adapter_config.rank);
-    println!("  Learning rate: {}", adapter_config.learning_rate);
-    println!("  Batch size: {}", adapter_config.batch_size);
-    println!("  Epochs: {}", adapter_config.epochs);
-
-    // Show current adapter stack
-    let existing_adapters = adapter_manager.list_adapters()?;
-    if !existing_adapters.is_empty() {
-        println!("\n→ Existing adapter stack:");
-        for adapter in &existing_adapters {
-            println!("  [{}] {}", adapter.index, adapter.name);
-        }
-    }
-
-    if let Some(cfg) = &config {
-        println!("  Config override: {}", cfg);
-    }
-
-    // Load the model to get proper dimensions
-    tracing::info!("Loading model to determine LoRA structure for adapter creation");
-    let config = crate::config::RuntimeConfig::default();
-    let mut engine = crate::runtime::TorchEngine::new(config)?;
-    crate::runtime::RuntimeEngine::load_model(&mut engine, &model_path).await?;
-
-    // Create LoRA configuration with proper target modules
-    let lora_config = crate::lora::LoRAConfig {
-        rank: adapter_config.rank as usize,
-        alpha: adapter_config.alpha,
-        dropout: 0.1,
-        // Use comprehensive target modules for full model adaptation
-        target_modules: vec![
-            "q_proj".to_string(),
-            "k_proj".to_string(),
-            "v_proj".to_string(),
-            "o_proj".to_string(),
-            "gate_proj".to_string(),
-            "up_proj".to_string(),
-            "down_proj".to_string(),
-        ],
-        learning_rate: adapter_config.learning_rate as f32,
-    };
-
-    // Create LoRA model structure using proper model dimensions
-    engine.create_lora(lora_config.clone())?;
-
-    // Ensure adapters directory exists
-    adapter_manager.ensure_adapters_dir()?;
-
-    // Save the initialized LoRA weights
-    let adapter_path = adapter_manager
-        .adapters_dir
-        .join(format!("{}.safetensors", indexed_adapter_name));
-    engine.save_lora_weights(adapter_path.to_str().unwrap())?;
-
-    // Save config
-    let config_path = adapter_manager
-        .adapters_dir
-        .join(format!("{}.config.json", indexed_adapter_name));
-    let config_json = serde_json::to_string_pretty(&adapter_config)?;
-    std::fs::write(&config_path, config_json)?;
-
-    println!(
-        "\n✓ Initialized adapter: adapters/{}.safetensors",
-        indexed_adapter_name
-    );
-    println!(
-        "✓ Created config: adapters/{}.config.json",
-        indexed_adapter_name
-    );
-
-    println!("\n✓ Adapter initialization complete!");
-    println!("\n→ Next steps:");
-    println!("  1. Check status: hyprstream status {}", model_ref.model);
-    println!("  2. Test inference: hyprstream infer {}", model_ref.model);
-    println!(
-        "  3. Commit changes: hyprstream commit {} -m \"Added {} adapter\"",
-        model_ref.model, indexed_adapter_name
-    );
-
-    Ok(())
-}
-
 /// Handle list command
 pub async fn handle_list(
     storage: &ModelStorage,
+    policy_manager: Option<&crate::auth::PolicyManager>,
 ) -> Result<()> {
     info!("Listing models");
 
@@ -644,11 +420,19 @@ pub async fn handle_list(
         return Ok(());
     }
 
+    // Get current user for permission checks (OS user for CLI)
+    let current_user = users::get_current_username()
+        .map(|u| u.to_string_lossy().to_string())
+        .unwrap_or_else(|| "anonymous".to_string());
+
     // Get storage paths for model directories
     let storage_paths = crate::storage::StoragePaths::new()?;
     let models_dir = storage_paths.models_dir()?;
 
-    // Collect models with git info
+    // Get archetype registry for capability detection
+    let archetype_registry = crate::archetypes::global_registry();
+
+    // Collect models with git info and capabilities
     let mut git_repos = Vec::new();
     for (model_ref, metadata) in models {
         // Get git info from the bare repository
@@ -659,24 +443,45 @@ pub async fn handle_list(
 
         let git_info = GitInfo::from_bare_repo(&bare_repo_path);
 
-        git_repos.push((model_ref, metadata, git_info));
+        // Detect capabilities from worktree path
+        let worktree_path = models_dir
+            .join(&model_ref.model)
+            .join("worktrees")
+            .join(model_ref.git_ref_str().unwrap_or_else(|| "main".to_string()));
+        let detected = archetype_registry.detect(&worktree_path);
+        let domains = detected.to_detected_domains();
+
+        // Compute access string based on user permissions
+        let resource = format!("model:{}", model_ref.model);
+        let access_str = if let Some(pm) = policy_manager {
+            crate::auth::capabilities_to_access_string(pm, &current_user, &resource, &domains.capabilities)
+        } else {
+            // No policy manager = full access (show all capabilities)
+            domains.capabilities.to_ids().join(",")
+        };
+
+        git_repos.push((model_ref, metadata, git_info, domains, access_str));
     }
 
-    // Table format - the nice format you liked!
+    // Table format with DOMAINS and ACCESS columns
     println!(
-        "{:<30} {:<15} {:<8} {:<6} {:<10}",
-        "MODEL NAME", "REF", "COMMIT", "STATUS", "SIZE"
+        "{:<30} {:<16} {:<16} {:<15} {:<8} {:<6} {:<10}",
+        "MODEL NAME", "DOMAINS", "ACCESS", "REF", "COMMIT", "STATUS", "SIZE"
     );
-    println!("{}", "-".repeat(75));
+    println!("{}", "-".repeat(111));
 
-    for (_model_ref, metadata, git_info) in &git_repos {
+    for (_model_ref, metadata, git_info, domains, access_str) in &git_repos {
         let size_str = if let Some(size) = metadata.size_bytes {
             format!("{:.1}GB", size as f64 / (1024.0 * 1024.0 * 1024.0))
         } else {
             "n/a".to_string()
         };
 
-        let (git_ref, commit, status) = match git_info {
+        let domains_str = domains.domains_display();
+
+        // Get git ref and commit from GitInfo, but use metadata.is_dirty from service layer
+        // (GitInfo::from_bare_repo can't detect dirty status - bare repos have no working dir)
+        let (git_ref, commit) = match git_info {
             Some(git) => (
                 git.current_ref
                     .clone()
@@ -684,14 +489,14 @@ pub async fn handle_list(
                 git.short_commit
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string()),
-                if git.is_dirty { "dirty" } else { "clean" },
             ),
-            None => ("n/a".to_string(), "n/a".to_string(), "n/a"),
+            None => ("n/a".to_string(), "n/a".to_string()),
         };
+        let status = if metadata.is_dirty { "dirty" } else { "clean" };
 
         println!(
-            "{:<30} {:<15} {:<8} {:<6} {:<10}",
-            metadata.display_name.as_ref().unwrap(), git_ref, commit, status, size_str
+            "{:<30} {:<16} {:<16} {:<15} {:<8} {:<6} {:<10}",
+            metadata.display_name.as_deref().unwrap_or("unnamed"), domains_str, access_str, git_ref, commit, status, size_str
         );
     }
 
@@ -704,7 +509,7 @@ pub async fn handle_list(
 
 /// Handle clone command
 pub async fn handle_clone(
-    _storage: &ModelStorage,
+    storage: &ModelStorage,
     repo_url: &str,
     name: Option<String>,
     branch: Option<String>,
@@ -712,6 +517,7 @@ pub async fn handle_clone(
     full: bool,
     quiet: bool,
     verbose: bool,
+    policy_template: Option<String>,
 ) -> Result<()> {
     if !quiet {
         info!("Cloning model from {}", repo_url);
@@ -732,26 +538,67 @@ pub async fn handle_clone(
         }
     }
 
-    // Create clone options struct to pass to storage layer
-    let clone_opts = crate::storage::CloneOptions {
-        branch,
-        depth: if full { 0 } else { depth },
-        quiet,
-        verbose,
+    // Determine model name from URL or use provided name
+    let model_name = if let Some(n) = name {
+        n
+    } else {
+        let extracted = repo_url
+            .split('/')
+            .next_back()
+            .unwrap_or("")
+            .trim_end_matches(".git")
+            .to_string();
+
+        if extracted.is_empty() {
+            anyhow::bail!(
+                "Cannot derive model name from URL '{}'. Please provide --name.",
+                repo_url
+            );
+        }
+        extracted
     };
 
-    // Use the existing working implementation that handles LFS properly
-    let cloned = crate::storage::operations::clone_model_with_options(
-        repo_url,
-        name.as_deref(),
-        None,  // model_id
-        clone_opts
-    ).await?;
+    // Use the passed storage directly (which has the shared registry client)
+    // This avoids starting a second registry service
+    storage.add_model(&model_name, repo_url).await?;
+
+    // Create default worktree so the model appears in list
+    // Use requested branch or fall back to default branch (usually "main")
+    let worktree_branch = if let Some(ref b) = branch {
+        b.clone()
+    } else {
+        storage
+            .get_default_branch(&ModelRef::new(model_name.clone()))
+            .await
+            .unwrap_or_else(|_| "main".to_string())
+    };
+
+    if !quiet {
+        println!("   Creating worktree for branch: {}", worktree_branch);
+    }
+    let model_ref = ModelRef::new(model_name.clone());
+    storage.create_worktree(&model_ref, &worktree_branch).await?;
+
+    let model_path = storage.get_model_path(&model_ref).await?;
+
+    // Generate a model ID for compatibility (matches operations.rs behavior)
+    let model_id = crate::storage::ModelId::new();
+
+    let cloned = crate::storage::ClonedModel {
+        model_id,
+        model_path,
+        model_name,
+    };
 
     if !quiet {
         println!("✅ Model '{}' cloned successfully!", cloned.model_name);
         println!("   Model ID: {}", cloned.model_id);
         println!("   Location: {}", cloned.model_path.display());
+    }
+
+    // Apply policy template if specified
+    if let Some(ref template_name) = policy_template {
+        apply_policy_template_to_model(storage, &cloned.model_name, template_name).await?;
     }
 
     Ok(())
@@ -872,6 +719,20 @@ pub async fn handle_info(
 
         println!("Reference: {}", display_ref);
         println!("Path: {}", model_path.display());
+
+        // Detect and display archetypes
+        let archetype_registry = crate::archetypes::global_registry();
+        let detected = archetype_registry.detect(&model_path);
+
+        if !detected.is_empty() {
+            println!("\nArchetypes:");
+            for archetype in &detected.archetypes {
+                println!("  - {}", archetype);
+            }
+            println!("Capabilities: {}", detected.capabilities);
+        } else {
+            println!("\nArchetypes: None detected");
+        }
     }
 
     // Get bare repository information
@@ -1065,9 +926,9 @@ pub async fn handle_info(
                     print!("  [{}] {} ({:.1} KB)", adapter.index, adapter.name, size_kb);
 
                     // Show config info if available and verbose mode is on
-                    if verbose && adapter.config_path.is_some() {
+                    if let (true, Some(config_path)) = (verbose, adapter.config_path.as_ref()) {
                         if let Ok(config_content) =
-                            std::fs::read_to_string(adapter.config_path.as_ref().unwrap())
+                            std::fs::read_to_string(config_path)
                         {
                             if let Ok(config) = serde_json::from_str::<crate::storage::AdapterConfig>(
                                 &config_content,
@@ -1124,7 +985,111 @@ pub async fn handle_info(
     Ok(())
 }
 
+/// Apply a policy template to a model's registry
+///
+/// This is a helper used by branch, clone, and worktree commands to apply
+/// policy templates when the --policy flag is specified.
+pub async fn apply_policy_template_to_model(
+    storage: &ModelStorage,
+    model: &str,
+    template_name: &str,
+) -> Result<()> {
+    use crate::auth::PolicyManager;
+    use crate::cli::policy_handlers::get_template;
+    use std::process::Command;
+
+    let template = get_template(template_name)
+        .ok_or_else(|| anyhow::anyhow!(
+            "Unknown policy template: '{}'. Available templates: local, public-inference, public-read",
+            template_name
+        ))?;
+
+    // Get the policies directory for this model's registry
+    let registry_path = storage.get_models_dir().join(".registry");
+    let policies_dir = registry_path.join("policies");
+
+    // Ensure policies directory exists
+    if !policies_dir.exists() {
+        tokio::fs::create_dir_all(&policies_dir).await?;
+    }
+
+    let policy_path = policies_dir.join("policy.csv");
+
+    // Read existing policy content or create default
+    let existing_content = if policy_path.exists() {
+        tokio::fs::read_to_string(&policy_path).await?
+    } else {
+        default_policy_header().to_string()
+    };
+
+    // Check if template rules already exist
+    if existing_content.contains(template.rules.trim()) {
+        println!("✓ Policy template '{}' already applied", template_name);
+        return Ok(());
+    }
+
+    // Append the template rules
+    let new_content = format!("{}\n{}", existing_content.trim_end(), template.rules);
+
+    // Write the updated policy
+    tokio::fs::write(&policy_path, &new_content).await?;
+
+    // Validate the new policy
+    let policy_manager = PolicyManager::new(&policies_dir)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to validate policy: {}", e))?;
+
+    // Reload to validate
+    if let Err(e) = policy_manager.reload().await {
+        // Rollback on validation failure
+        tokio::fs::write(&policy_path, &existing_content).await?;
+        bail!("Policy validation failed: {}. Template not applied.", e);
+    }
+
+    // Commit the change
+    let commit_msg = format!("policy: apply {} template for model {}", template_name, model);
+
+    Command::new("git")
+        .current_dir(&registry_path)
+        .args(["add", "policies/"])
+        .output()
+        .ok();
+
+    Command::new("git")
+        .current_dir(&registry_path)
+        .args(["commit", "-m", &commit_msg])
+        .output()
+        .ok();
+
+    println!("✓ Applied policy template: {}", template_name);
+    println!("  {}", template.description);
+
+    Ok(())
+}
+
+/// Default policy header for new policy files
+fn default_policy_header() -> &'static str {
+    r#"# Hyprstream Access Control Policy
+# Format: p, subject, resource, action
+#
+# Subjects: user names or role names
+# Resources: model:<name>, data:<name>, or * for all
+# Actions: infer, train, query, write, serve, manage, or * for all
+"#
+}
+
 /// Handle infer command
+///
+/// Runs inference via InferenceService, which:
+/// - Enforces authorization via PolicyManager
+/// - Auto-loads adapters from model directory
+/// - **Training is always DISABLED** - this is a read-only inference command
+///
+/// For inference with training (TTT), use `hyprstream training infer` instead.
+///
+/// # Parameters
+/// - `signing_key`: Ed25519 signing key for request authentication
+/// - `verifying_key`: Ed25519 verifying key for signature verification
 pub async fn handle_infer(
     storage: &ModelStorage,
     model_ref_str: &str,
@@ -1140,25 +1105,25 @@ pub async fn handle_infer(
     _force_download: bool,
     max_context: Option<usize>,
     kv_quant: crate::cli::commands::KVQuantArg,
+    signing_key: SigningKey,
+    verifying_key: VerifyingKey,
 ) -> Result<()> {
+    use crate::config::TrainingMode;
+    use crate::runtime::model_config::ModelConfig;
+
     info!(
-        "Running base model inference: model={}, prompt_len={}",
+        "Running read-only inference via service: model={}, prompt_len={}",
         model_ref_str,
         prompt.len()
     );
 
-    // Parse model reference
+    // Parse model reference and get path
     let model_ref = ModelRef::parse(model_ref_str)?;
-
-    // Get model path
     let storage_paths = crate::storage::StoragePaths::new()?;
     let models_dir = storage_paths.models_dir()?;
     let model_path = match storage.get_model_path(&model_ref).await {
         Ok(path) => path,
-        Err(_) => {
-            // Fallback to direct path lookup
-            models_dir.join(&model_ref.model)
-        }
+        Err(_) => models_dir.join(&model_ref.model),
     };
 
     if !model_path.exists() {
@@ -1169,191 +1134,67 @@ pub async fn handle_infer(
 
     info!("Using model at: {}", model_path.display());
 
-    // Initialize inference engine with max_context and kv_quant from CLI/env
-    // Clap handles precedence: CLI args > env vars > defaults
-    let mut runtime_config = RuntimeConfig::default();
-    runtime_config.max_context = max_context;  // From clap (already merged CLI > env)
-    runtime_config.kv_quant_type = kv_quant.into();  // From clap (already merged CLI > env)
-    let mut engine = TorchEngine::new(runtime_config)?;
-
-    // Load the model
-    let load_start = std::time::Instant::now();
-    RuntimeEngine::load_model(&mut engine, &model_path)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to load model: {}", e))?;
-    let load_time = load_start.elapsed();
-    info!("Model loaded in {:.2}s", load_time.as_secs_f64());
-
-    // Auto-load adapters from the model directory
-    let adapter_manager = crate::storage::AdapterManager::new(&model_path);
-    let adapters = adapter_manager.list_adapters()?;
-
-    if !adapters.is_empty() {
-        println!("\n→ Loading adapters:");
-
-        // Flag to track LoRA model initialization state across adapter loading iterations.
-        // The LoRA model structure must be initialized before individual adapter weights
-        // can be loaded. This is done once for the first valid adapter configuration.
-        let mut lora_model_initialized = false;
-
-        for adapter_info in &adapters {
-            tracing::info!(
-                "[{}] {} ({:.1} KB)",
-                adapter_info.index,
-                adapter_info.name,
-                adapter_info.size as f64 / 1024.0
+    // CRITICAL: Force training mode to Disabled for CLI infer command
+    // This ensures hyprstream infer is ALWAYS read-only, regardless of model config.
+    // For training inference, use `hyprstream training infer` instead.
+    if let Some(mut training_config) = ModelConfig::load_training_config(&model_path) {
+        if training_config.mode != TrainingMode::Disabled {
+            debug!(
+                "Model has training mode {:?}, overriding to Disabled for read-only infer",
+                training_config.mode
             );
-
-            // Parse adapter configuration from JSON file.
-            // Each adapter has an associated .config.json file containing metadata
-            // like rank, alpha scaling factor, and training parameters.
-            let config_path = adapter_info.path.with_extension("config.json");
-            let adapter_config = match std::fs::read_to_string(&config_path) {
-                Ok(content) => {
-                    match serde_json::from_str::<crate::storage::AdapterConfig>(&content) {
-                        Ok(config) => config,
-                        Err(parse_error) => {
-                            tracing::error!(
-                                config_path = %config_path.display(),
-                                error = %parse_error,
-                                "Failed to deserialize adapter configuration - JSON structure may be invalid"
-                            );
-                            tracing::warn!(
-                                "Failed to parse config for adapter [{}] {} - skipping",
-                                adapter_info.index,
-                                adapter_info.name
-                            );
-                            continue;
-                        }
-                    }
-                }
-                Err(io_error) => {
-                    tracing::warn!(
-                        config_path = %config_path.display(),
-                        error = %io_error,
-                        adapter_name = %adapter_info.name,
-                        "Adapter configuration file not found - adapter may be corrupted"
-                    );
-                    tracing::warn!(
-                        "No config found for adapter [{}] {} - skipping",
-                        adapter_info.index,
-                        adapter_info.name
-                    );
-                    continue;
-                }
-            };
-
-            // Initialize LoRA model structure on first successful adapter.
-            // This creates the VarStore and module mapping required for gradient tracking.
-            // All adapters share the same LoRA model structure but have different weights.
-            if !lora_model_initialized {
-                tracing::info!(
-                    rank = adapter_config.rank,
-                    alpha = adapter_config.alpha,
-                    learning_rate = adapter_config.learning_rate,
-                    "Initializing LoRA model structure with configuration from first adapter"
-                );
-
-                // Create LoRA config with comprehensive target modules
-                // The engine will auto-detect which modules are actually present in the SafeTensors file
-                let lora_config = crate::lora::LoRAConfig {
-                    rank: adapter_config.rank as usize, // Convert u32 to usize
-                    alpha: adapter_config.alpha,
-                    dropout: 0.1, // Standard dropout rate for LoRA training
-                    // Use comprehensive target modules - engine will filter based on what's available
-                    target_modules: vec![
-                        "q_proj".to_string(),
-                        "k_proj".to_string(),
-                        "v_proj".to_string(),
-                        "o_proj".to_string(),
-                        "gate_proj".to_string(),
-                        "up_proj".to_string(),
-                        "down_proj".to_string(),
-                    ],
-                    learning_rate: adapter_config.learning_rate as f32, // Convert f64 to f32
-                };
-
-                match engine.create_lora(lora_config) {
-                    Ok(_) => {
-                        tracing::info!("LoRA model structure initialized successfully - ready to load adapter weights");
-                        lora_model_initialized = true;
-                    }
-                    Err(init_error) => {
-                        tracing::error!(
-                            error = %init_error,
-                            "Failed to initialize LoRA model structure - adapters cannot be loaded"
-                        );
-                        tracing::error!("Failed to initialize LoRA model - skipping all adapters");
-                        break;
-                    }
-                }
-            }
-
-            // Load adapter weights into the initialized LoRA model.
-            // This loads the actual trained LoRA A and B matrices from SafeTensors format.
-            match engine.load_lora_weights(adapter_info.path.to_str().unwrap()) {
-                Ok(_) => {
-                    tracing::info!(
-                        adapter_path = %adapter_info.path.display(),
-                        adapter_name = %adapter_info.name,
-                        adapter_size_kb = adapter_info.size as f64 / 1024.0,
-                        "Successfully loaded LoRA adapter weights"
-                    );
-                    tracing::info!(
-                        "Successfully loaded adapter [{}] {}",
-                        adapter_info.index,
-                        adapter_info.name
-                    );
-                }
-                Err(load_error) => {
-                    tracing::warn!(
-                        adapter_path = %adapter_info.path.display(),
-                        adapter_name = %adapter_info.name,
-                        error = %load_error,
-                        "Failed to load LoRA adapter weights - SafeTensors file may be corrupted"
-                    );
-                    tracing::warn!(
-                        "Failed to load adapter [{}] {} - continuing without it",
-                        adapter_info.index,
-                        adapter_info.name
-                    );
-                }
+            training_config.mode = TrainingMode::Disabled;
+            // Save temporarily to ensure InferenceService sees Disabled mode
+            if let Err(e) = ModelConfig::save_training_config(&model_path, &training_config) {
+                warn!("Could not save disabled training config: {}", e);
             }
         }
-
-        tracing::info!(
-            total_adapters = adapters.len(),
-            "Completed LoRA adapter loading process"
-        );
-        tracing::info!("Completed processing {} adapters", adapters.len());
-    } else {
-        tracing::info!("No LoRA adapters found in model directory - using base model only");
     }
 
-    // Clear any previously loaded LoRA (in case of manual loads)
-    {
-        let mut lora_guard = engine.active_lora.lock().unwrap();
-        *lora_guard = None;
-    }
+    // PolicyService is already running (started by main.rs).
+    // Create policy client with the same keypair to connect to it.
+    let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
 
-    // Apply chat template to the prompt
-    let formatted_prompt = {
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: prompt.to_string(),
-        }];
+    // Configure runtime
+    let mut runtime_config = RuntimeConfig::default();
+    runtime_config.max_context = max_context;
+    runtime_config.kv_quant_type = kv_quant.into();
+    // Note: Training mode is already forced to Disabled in the config file above
 
-        match RuntimeEngine::apply_chat_template(&engine, &messages, true) {
-            Ok(formatted) => formatted,
-            Err(e) => {
-                tracing::warn!("Could not apply chat template: {}. Using raw prompt.", e);
-                prompt.to_string()
-            }
+    // Start InferenceService (loads model, adapters, trainer automatically)
+    let service_handle = InferenceService::start_at(
+        &model_path,
+        runtime_config,
+        verifying_key,
+        policy_client,
+        INFERENCE_ENDPOINT,
+    )
+    .await?;
+
+    // Create client for service communication
+    let client = InferenceZmqClient::new(signing_key, RequestIdentity::local());
+
+    // Apply chat template to the prompt via service
+    let messages = vec![ChatMessage {
+        role: "user".to_string(),
+        content: prompt.to_string(),
+    }];
+
+    let formatted_prompt = match client.apply_chat_template(&messages, true).await {
+        Ok(formatted) => formatted,
+        Err(e) => {
+            tracing::warn!("Could not apply chat template: {}. Using raw prompt.", e);
+            prompt.to_string()
         }
     };
 
+    // Build generation request
     let mut request_builder = GenerationRequest::builder(formatted_prompt)
-        .apply_config(&crate::config::SamplingParams::from_model_path(&model_path).await.unwrap_or_default())
+        .apply_config(
+            &crate::config::SamplingParams::from_model_path(&model_path)
+                .await
+                .unwrap_or_default(),
+        )
         .temperature(temperature.unwrap_or(0.7))
         .top_p(top_p.unwrap_or(0.95))
         .top_k(top_k)
@@ -1374,30 +1215,119 @@ pub async fn handle_infer(
         request.max_tokens, request.temperature, request.top_p, request.top_k, request.repeat_penalty
     );
 
-    use futures::StreamExt;
-
-    let mut text_stream = engine.generate(request)?;
-
+    // Generate via service (handles adapter loading, training collection, auth)
     if stream {
+        // Streaming via ZMQ pub/sub
+        let (stream_id, endpoint) = client.generate_stream(&request).await?;
+        info!("Streaming started: stream_id={}, endpoint={}", stream_id, endpoint);
+
+        // Subscribe to stream chunks using global context
+        // (inproc:// only works within the same ZMQ context)
+        let ctx = global_context();
+        let subscriber = ctx.socket(zmq::SUB)?;
+        subscriber.connect(&endpoint)?;
+        subscriber.set_subscribe(stream_id.as_bytes())?;
+        subscriber.set_rcvtimeo(30000)?; // 30s timeout
+
         println!();
-        while let Some(text_chunk) = text_stream.next().await {
-            print!("{}", text_chunk?);
-            let _ = io::stdout().flush();
+        loop {
+            match subscriber.recv_bytes(0) {
+                Ok(msg) => {
+                    // Message format: topic_bytes + capnp_bytes
+                    // Topic is the stream_id, followed by Cap'n Proto StreamChunk
+                    let topic_len = stream_id.as_bytes().len();
+                    if msg.len() <= topic_len {
+                        continue; // Too short, skip
+                    }
+
+                    // Parse Cap'n Proto StreamChunk after the topic prefix
+                    let chunk_bytes = &msg[topic_len..];
+                    let reader = match serialize::read_message(
+                        &mut std::io::Cursor::new(chunk_bytes),
+                        ReaderOptions::default(),
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!("Failed to parse stream chunk: {}", e);
+                            continue;
+                        }
+                    };
+
+                    let chunk = match reader.get_root::<inference_capnp::stream_chunk::Reader>() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!("Failed to get stream chunk root: {}", e);
+                            continue;
+                        }
+                    };
+
+                    // Handle the union variant
+                    use inference_capnp::stream_chunk::Which;
+                    match chunk.which() {
+                        Ok(Which::Text(text)) => {
+                            if let Ok(t) = text {
+                                print!("{}", t.to_str().unwrap_or(""));
+                                let _ = io::stdout().flush();
+                            }
+                        }
+                        Ok(Which::Complete(_stats)) => {
+                            // Stream completed
+                            break;
+                        }
+                        Ok(Which::Error(error_info)) => {
+                            if let Ok(e) = error_info {
+                                if let Ok(msg) = e.get_message() {
+                                    warn!("Stream error: {}", msg.to_str().unwrap_or("unknown"));
+                                }
+                            }
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("Failed to parse chunk variant: {:?}", e);
+                            continue;
+                        }
+                    }
+                }
+                Err(zmq::Error::EAGAIN) => {
+                    // Timeout waiting for stream
+                    warn!("Stream timeout");
+                    break;
+                }
+                Err(e) => {
+                    warn!("Stream error: {}", e);
+                    break;
+                }
+            }
         }
         println!();
-        let stats = text_stream.stats();
-        info!("Generated {} tokens in {}ms ({:.2} tokens/sec)",
-              stats.tokens_generated, stats.generation_time_ms, stats.tokens_per_second);
     } else {
-        let mut full_text = String::new();
-        while let Some(text_chunk) = text_stream.next().await {
-            full_text.push_str(&text_chunk?);
+        // Non-streaming: get full response
+        let result = client.generate(&request).await?;
+
+        println!("\n{}", result.text);
+        info!(
+            "Generated {} tokens in {}ms ({:.2} tokens/sec overall)",
+            result.tokens_generated, result.generation_time_ms, result.tokens_per_second
+        );
+        info!(
+            "  Prefill: {} tokens in {}ms ({:.2} tokens/sec)",
+            result.prefill_tokens, result.prefill_time_ms, result.prefill_tokens_per_sec
+        );
+        info!(
+            "  Inference: {} tokens in {}ms ({:.2} tokens/sec)",
+            result.inference_tokens, result.inference_time_ms, result.inference_tokens_per_sec
+        );
+
+        if let Some(ref qm) = result.quality_metrics {
+            info!(
+                "Quality metrics: perplexity={:.2}, entropy={:.2}, entropy_var={:.4}, repetition={:.3}",
+                qm.perplexity, qm.avg_entropy, qm.entropy_variance, qm.repetition_ratio
+            );
         }
-        println!("\n{}", full_text);
-        let stats = text_stream.stats();
-        info!("Generated {} tokens in {}ms ({:.2} tokens/sec)",
-              stats.tokens_generated, stats.generation_time_ms, stats.tokens_per_second);
     }
+
+    // Stop the service
+    service_handle.stop().await;
 
     Ok(())
 }
@@ -1417,24 +1347,23 @@ pub async fn handle_push(
     let branch_name = branch.as_deref();
     let model_ref = ModelRef::new(model.to_string());
 
-    // Use git2db API for push
-    let repo_id = storage.resolve_repo_id(&model_ref).await?;
-    let registry = storage.registry().await;
-    let handle = registry.repo(&repo_id)?;
+    // Open repository for push operations
+    let repo = storage.open_repo(&model_ref).await?;
 
-    // Create a temporary worktree for push operations
-    let temp_dir = tempfile::tempdir()?;
-    let worktree_path = temp_dir.path();
-    let mut worktree = handle.create_worktree(worktree_path, "temp-push").await?;
+    // Get current branch or specified branch
+    let push_branch = if let Some(b) = branch_name {
+        b.to_string()
+    } else {
+        repo.head()?
+            .shorthand()
+            .ok_or_else(|| anyhow::anyhow!("Could not determine current branch"))?
+            .to_string()
+    };
 
-    // Push current branch (worktree.push only takes remote parameter)
-    worktree.push(Some(remote_name)).await?;
-
-    // Note: The old code was trying to push specific branches, but WorktreeHandle.push()
-    // only operates on the current branch of the worktree. For multi-branch support,
-    // we'd need to checkout branches first or use different approach.
-
-    worktree.cleanup().await?;
+    // Find remote and push
+    let mut remote = repo.find_remote(remote_name)?;
+    let refspec = format!("refs/heads/{}:refs/heads/{}", push_branch, push_branch);
+    remote.push(&[&refspec], None)?;
 
     println!("✓ Pushed model {} to {}", model, remote_name);
     if let Some(b) = branch_name {
@@ -1461,24 +1390,46 @@ pub async fn handle_pull(
     let branch_name = branch.as_deref();
     let model_ref = ModelRef::new(model.to_string());
 
-    // Use git2db API for pull
-    let repo_id = storage.resolve_repo_id(&model_ref).await?;
-    let registry = storage.registry().await;
-    let handle = registry.repo(&repo_id)?;
+    // Open repository for pull operations
+    let repo = storage.open_repo(&model_ref).await?;
 
-    // Create a temporary worktree for pull operations
-    let temp_dir = tempfile::tempdir()?;
-    let worktree_path = temp_dir.path();
-    let mut worktree = handle.create_worktree(worktree_path, "temp-pull").await?;
+    // Fetch from remote
+    let mut remote = repo.find_remote(remote_name)?;
+    remote.fetch(&["refs/heads/*:refs/remotes/origin/*"], None, None)?;
 
-    // Pull current branch (worktree.pull only takes remote parameter)
-    worktree.pull(Some(remote_name)).await?;
+    // Get current branch or specified branch
+    let pull_branch = if let Some(b) = branch_name {
+        b.to_string()
+    } else {
+        repo.head()?
+            .shorthand()
+            .ok_or_else(|| anyhow::anyhow!("Could not determine current branch"))?
+            .to_string()
+    };
 
-    // Note: The old code was trying to pull specific branches, but WorktreeHandle.pull()
-    // only operates on the current branch of the worktree. For multi-branch support,
-    // we'd need to checkout branches first or use different approach.
+    // Get the remote tracking branch
+    let remote_ref = format!("refs/remotes/{}/{}", remote_name, pull_branch);
+    let fetch_head = repo.find_reference(&remote_ref)?;
+    let fetch_commit = repo.reference_to_annotated_commit(&fetch_head)?;
 
-    worktree.cleanup().await?;
+    // Merge the fetched changes
+    let (analysis, _) = repo.merge_analysis(&[&fetch_commit])?;
+
+    if analysis.is_up_to_date() {
+        println!("✓ Already up to date");
+    } else if analysis.is_fast_forward() {
+        // Fast-forward merge
+        let refname = format!("refs/heads/{}", pull_branch);
+        let mut reference = repo.find_reference(&refname)?;
+        reference.set_target(fetch_commit.id(), "Fast-forward")?;
+        repo.set_head(&refname)?;
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
+        println!("✓ Fast-forwarded to latest");
+    } else if analysis.is_normal() {
+        // Normal merge
+        repo.merge(&[&fetch_commit], None, None)?;
+        println!("✓ Merged remote changes");
+    }
 
     println!("✓ Pulled latest changes for model {}", model);
     println!("  Remote: {}", remote_name);
@@ -1873,10 +1824,7 @@ async fn handle_merge_conflict_resolution(
     }
 
     // Open repository
-    let repo_id = storage.resolve_repo_id(&target_ref).await?;
-    let registry = storage.registry().await;
-    let handle = registry.repo(&repo_id)?;
-    let repo = handle.open_repo()?;
+    let repo = storage.open_repo(&target_ref).await?;
 
     if options.abort {
         // Abort merge: restore pre-merge state
@@ -1973,22 +1921,71 @@ pub async fn handle_remove(
         ));
     }
 
-    let model_ref = ModelRef::new(model.to_string());
+    // Parse model reference to handle model:branch format
+    let model_ref = ModelRef::parse(model)?;
 
+    // Check if a specific branch/worktree was specified
+    let is_worktree_removal = !matches!(model_ref.git_ref, crate::storage::GitRef::DefaultBranch);
+
+    if is_worktree_removal {
+        // Removing a specific worktree, not the entire model
+        let branch = model_ref.git_ref.display_name();
+        info!("Removing worktree {} for model {}", branch, model_ref.model);
+
+        // Check if the worktree exists
+        let worktree_path = match storage.get_model_path(&model_ref).await {
+            Ok(path) => path,
+            Err(_) => {
+                println!("❌ Worktree '{}' not found for model '{}'", branch, model_ref.model);
+                return Ok(());
+            }
+        };
+
+        if !worktree_path.exists() {
+            println!("❌ Worktree '{}' not found for model '{}'", branch, model_ref.model);
+            return Ok(());
+        }
+
+        // Show what will be removed
+        println!("Worktree '{}:{}' removal plan:", model_ref.model, branch);
+        println!("  📁 Remove worktree at: {}", worktree_path.display());
+
+        // Confirmation prompt unless forced
+        if !force {
+            print!("Are you sure you want to remove worktree '{}:{}'? [y/N]: ", model_ref.model, branch);
+            io::stdout().flush()?;
+
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            let input = input.trim().to_lowercase();
+
+            if input != "y" && input != "yes" {
+                println!("Removal cancelled");
+                return Ok(());
+            }
+        }
+
+        // Remove the worktree
+        storage.remove_worktree(&ModelRef::new(model_ref.model.clone()), &branch).await?;
+        println!("✓ Worktree '{}:{}' removed successfully", model_ref.model, branch);
+        return Ok(());
+    }
+
+    // Removing the entire model (no branch specified)
     // Check if model exists in registry
     let registry_exists = storage.get_model_path(&model_ref).await.is_ok();
 
-    // Check if model exists in filesystem
-    let model_path = storage.get_models_dir().join(model);
+    // Check if model exists in filesystem (model directory)
+    let model_path = storage.get_models_dir().join(&model_ref.model);
     let files_exist = model_path.exists();
 
     if !registry_exists && !files_exist {
-        println!("❌ Model '{}' not found in registry or filesystem", model);
+        println!("❌ Model '{}' not found in registry or filesystem", model_ref.model);
         return Ok(());
     }
 
     // Show what will be removed
-    println!("Model '{}' removal plan:", model);
+    println!("Model '{}' removal plan:", model_ref.model);
     if registry_exists && !files_only {
         println!("  🗂️  Remove from git registry (submodule)");
     }
@@ -2029,7 +2026,7 @@ pub async fn handle_remove(
 
     // Confirmation prompt unless forced
     if !force {
-        print!("Are you sure you want to remove model '{}'? [y/N]: ", model);
+        print!("Are you sure you want to remove model '{}'? [y/N]: ", model_ref.model);
         io::stdout().flush()?;
 
         let mut input = String::new();
@@ -2046,10 +2043,10 @@ pub async fn handle_remove(
     if registry_exists && !files_only {
         match storage.remove_model(&model_ref).await {
             Ok(_) => {
-                println!("✓ Removed '{}' from git registry", model);
+                println!("✓ Removed '{}' from git registry", model_ref.model);
             }
             Err(e) => {
-                eprintln!("❌ Failed to remove '{}' from git registry: {}", model, e);
+                eprintln!("❌ Failed to remove '{}' from git registry: {}", model_ref.model, e);
                 if !files_only {
                     return Err(e);
                 }
@@ -2103,6 +2100,6 @@ pub async fn handle_remove(
         }
     }
 
-    println!("✓ Model '{}' removed successfully", model);
+    println!("✓ Model '{}' removed successfully", model_ref.model);
     Ok(())
 }

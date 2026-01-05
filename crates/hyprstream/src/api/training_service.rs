@@ -335,6 +335,14 @@ impl TrainingService {
             finish_reason: crate::config::FinishReason::Stop,
             generation_time_ms: 0,
             tokens_per_second: 0.0,
+            quality_metrics: None,
+            // Prefill/inference metrics not tracked in training service
+            prefill_tokens: 0,
+            prefill_time_ms: 0,
+            prefill_tokens_per_sec: 0.0,
+            inference_tokens: 0,
+            inference_time_ms: 0,
+            inference_tokens_per_sec: 0.0,
         })
     }
 

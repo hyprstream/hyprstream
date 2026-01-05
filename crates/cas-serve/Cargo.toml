@@ -1,0 +1,39 @@
+[package]
+name = "cas-serve"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT"
+repository.workspace = true
+description = "CAS server for stdin/stdout transport - enables XET over SSH"
+
+[lib]
+name = "cas_serve"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cas-serve"
+path = "src/main.rs"
+
+[dependencies]
+# XET core dependencies
+merklehash.workspace = true
+
+# Async runtime
+tokio = { workspace = true, features = ["rt-multi-thread", "io-util", "macros", "io-std", "fs"] }
+
+# Serialization - using JSON for simplicity and debuggability
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Utilities
+base64 = "0.22"
+dirs = "5.0"
+shellexpand = "3.1"

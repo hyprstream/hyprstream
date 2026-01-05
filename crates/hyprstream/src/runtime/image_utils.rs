@@ -282,7 +282,7 @@ mod tests {
         let config = ImagePreprocessConfig::default();
         let device = Device::Cpu;
 
-        let image = create_fallback_image(&config, device).unwrap();
+        let image = create_fallback_image(&config, device).expect("test: create fallback image");
 
         // Check shape
         assert_eq!(image.size(), &[1, 3, 384, 384]);
@@ -299,7 +299,7 @@ mod tests {
         let mean = [0.5, 0.5, 0.5];
         let std = [0.5, 0.5, 0.5];
 
-        let normalized = normalize_tensor(&tensor, &mean, &std).unwrap();
+        let normalized = normalize_tensor(&tensor, &mean, &std).expect("test: normalize tensor");
 
         // After normalization: (1.0 - 0.5) / 0.5 = 1.0
         let expected = Tensor::ones(&[3, 224, 224], (Kind::Float, device));
@@ -312,7 +312,7 @@ mod tests {
         let config = ImagePreprocessConfig::default();
         let device = Device::Cpu;
 
-        let image = ImageInput::fallback(&config, device).unwrap();
+        let image = ImageInput::fallback(&config, device).expect("test: create fallback image");
 
         assert!(image.is_fallback());
         assert!(image.path.is_none());

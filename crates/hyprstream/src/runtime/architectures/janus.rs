@@ -3,6 +3,12 @@
 //! Janus combines vision and language understanding with optional image generation.
 //! It uses a composition pattern to reuse existing language models (typically Llama)
 //! while adding vision encoders and cross-modal alignment.
+//!
+//! NOTE: This module contains vision transformer components that are planned for
+//! future multimodal support. They are currently unused but retained for the
+//! upcoming Janus VLM integration.
+
+#![allow(dead_code)]
 
 use super::{ArchitectureConfig, ModelArchitecture, ModelOperations, VisionEncoderType};
 use super::config::AttentionType;
@@ -140,7 +146,7 @@ pub struct JanusModel {
 
     /// Optimization: Cache last vision encoding
     /// Uses Mutex instead of RefCell for thread safety (Send requirement)
-    vision_cache: std::sync::Mutex<Option<(Vec<u8>, Tensor)>>,  // (input_hash, features)
+    vision_cache: parking_lot::Mutex<Option<(Vec<u8>, Tensor)>>,  // (input_hash, features)
 }
 
 /// Vision encoder implementations
@@ -707,7 +713,7 @@ impl JanusModel {
             dtype,
             architecture,
             config,
-            vision_cache: std::sync::Mutex::new(None),
+            vision_cache: parking_lot::Mutex::new(None),
         })
     }
 
@@ -726,10 +732,9 @@ impl JanusModel {
         let mut _gen_weights = HashMap::new();
 
         for (key, tensor) in weights {
-            if key.starts_with("language_model.") {
+            if let Some(suffix) = key.strip_prefix("language_model.") {
                 // Remove prefix for language model
-                let new_key = key.strip_prefix("language_model.").unwrap().to_string();
-                language_weights.insert(new_key, tensor.shallow_clone());
+                language_weights.insert(suffix.to_string(), tensor.shallow_clone());
             } else if key.starts_with("vision_model.") {
                 vision_weights.insert(key.clone(), tensor.shallow_clone());
             } else if key.starts_with("aligner.") {

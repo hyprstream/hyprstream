@@ -1,14 +1,61 @@
 //! CLI handlers for adaptive ML inference server
 
+use crate::archetypes::capabilities::Query;
+use crate::services::RegistryClient;
 use crate::storage::ModelStorage;
 use crate::training::{CheckpointManager, WeightFormat, WeightSnapshot};
 use ::config::{Config, File};
+use async_trait::async_trait;
+use git2db::{RepoId, TrackedRepository};
+use hyprstream_metrics::checkpoint::manager::{
+    RegistryClient as MetricsRegistryClient, RegistryError as MetricsRegistryError,
+};
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info};
+
+/// Adapter to bridge between hyprstream's RegistryClient and hyprstream_metrics' RegistryClient
+///
+/// This allows using our full-featured RegistryClient with components that only
+/// need the minimal hyprstream_metrics::RegistryClient trait.
+struct MetricsRegistryAdapter {
+    inner: Arc<dyn RegistryClient>,
+}
+
+impl MetricsRegistryAdapter {
+    fn new(client: Arc<dyn RegistryClient>) -> Self {
+        Self { inner: client }
+    }
+}
+
+#[async_trait]
+impl MetricsRegistryClient for MetricsRegistryAdapter {
+    async fn get_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<TrackedRepository>, MetricsRegistryError> {
+        self.inner
+            .get_by_name(name)
+            .await
+            .map_err(|e| MetricsRegistryError::Operation(e.to_string()))
+    }
+
+    async fn register(
+        &self,
+        id: &RepoId,
+        name: Option<&str>,
+        path: &Path,
+    ) -> Result<(), MetricsRegistryError> {
+        self.inner
+            .register(id, name, path)
+            .await
+            .map_err(|e| MetricsRegistryError::Operation(e.to_string()))
+    }
+}
 
 /// Response structure for LoRA inference
 #[derive(Debug, Clone)]
@@ -83,36 +130,150 @@ pub async fn execute_sparse_query(
     Ok(())
 }
 
-pub async fn handle_server(ctx: crate::cli::AppContext) -> Result<(), Box<dyn std::error::Error>> {
-    let config = ctx.config();
+/// Flight SQL configuration for the server
+#[derive(Debug, Clone, Default)]
+pub struct FlightServerConfig {
+    /// Dataset name to serve via Flight SQL
+    pub dataset: Option<String>,
+    /// Flight SQL server port
+    pub port: u16,
+    /// Flight SQL server host (defaults to HTTP server host if not specified)
+    pub host: Option<String>,
+}
 
-    // Clone git2db config and set DHT mode to Server for full P2P participation
-    let git2db_config = {
-        let mut cfg = config.git2db.clone();
-        #[cfg(feature = "gittorrent")]
-        {
-            cfg.gittorrent.dht_mode = gittorrent::DhtMode::Server;
-            info!("DHT mode set to Server for full P2P participation");
-        }
-        cfg
-    };
+pub async fn handle_server(
+    ctx: crate::cli::AppContext,
+    flight_config: Option<FlightServerConfig>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::services::{ModelService, ModelServiceConfig, ModelZmqClient, PolicyZmqClient};
+    use crate::storage::ModelStorage;
+    use hyprstream_rpc::RequestIdentity;
+
+    let config = ctx.config();
 
     // Use server config from HyprConfig
     let server_config = config.server.clone();
 
-    // Get host and port for addr binding
-    let host = &server_config.host;
+    // Get host and port for addr binding (clone host before moving server_config)
+    let host = server_config.host.clone();
     let port = server_config.port;
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
 
-    // Create server state with git2db config (DHT mode set to Server)
-    let server_state =
-        crate::server::state::ServerState::new_with_git2db(server_config, git2db_config).await?;
+    // Get storage paths
+    let storage_paths = crate::storage::StoragePaths::new()?;
+    let models_dir = if let Ok(dir) = std::env::var("HYPRSTREAM_MODELS_DIR") {
+        std::path::PathBuf::from(dir)
+    } else {
+        storage_paths.models_dir()?
+    };
+
+    // Create ModelStorage using shared registry client (never starts duplicate service)
+    let model_storage = Arc::new(ModelStorage::new(ctx.registry().clone(), models_dir.clone()));
+
+    // Get signing key and verifying key from registry (loaded in main.rs)
+    let keys_dir = models_dir.join(".registry").join("keys");
+    let signing_key = crate::cli::load_or_generate_signing_key(&keys_dir).await?;
+    let verifying_key = signing_key.verifying_key();
+
+    // Create PolicyZmqClient (PolicyService is already started in main.rs)
+    let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
+
+    // Start ModelService
+    let model_service_config = ModelServiceConfig {
+        max_models: server_config.max_cached_models,
+        max_context: server_config.max_context,
+        kv_quant: server_config.kv_quant.into(),
+    };
+
+    let _model_service_handle = ModelService::start(
+        model_service_config,
+        signing_key.clone(),
+        verifying_key,
+        policy_client.clone(),
+        model_storage.clone(),
+    )
+    .await?;
+
+    info!("ModelService started at {}", crate::services::MODEL_ENDPOINT);
+
+    // Create ModelZmqClient for ServerState
+    let model_client = ModelZmqClient::new(signing_key.clone(), RequestIdentity::local());
+
+    // Create server state with ZMQ clients
+    let server_state = crate::server::state::ServerState::new(
+        server_config,
+        model_client,
+        policy_client,
+        model_storage,
+        signing_key,
+    )
+    .await?;
 
     info!("Starting Hyprstream HTTP server on {}", addr);
     info!("OpenAI-compatible API available at http://{}/oai/v1", addr);
 
-    // Start server (TLS configuration would come from config.server.tls if needed)
+    // Start Flight SQL server if dataset is specified
+    if let Some(ref flight_cfg) = flight_config {
+        if let Some(ref dataset_name) = flight_cfg.dataset {
+            // Check if dataset has FLIGHT_SQL capability
+            let dataset_ref = crate::storage::ModelRef::parse(dataset_name)
+                .unwrap_or_else(|_| crate::storage::ModelRef::new(dataset_name.clone()));
+
+            // Get the dataset path from the storage
+            let storage_paths = crate::storage::StoragePaths::new()?;
+            let models_dir = storage_paths.models_dir()?;
+
+            // Try to find the dataset worktree path
+            let dataset_path = models_dir
+                .join(&dataset_ref.model)
+                .join("worktrees")
+                .join(dataset_ref.git_ref_str().unwrap_or_else(|| "main".to_string()));
+
+            // Check for QUERY capability using type-safe API
+            let archetype_registry = crate::archetypes::global_registry();
+            let detected = archetype_registry.detect(&dataset_path);
+            let domains = detected.to_detected_domains();
+
+            if !domains.has::<Query>() {
+                error!(
+                    "Cannot start Flight SQL server: dataset '{}' does not have FLIGHT_SQL capability. Detected archetypes: {:?}",
+                    dataset_name, detected.archetypes
+                );
+            } else {
+                let flight_host = flight_cfg.host.as_ref().unwrap_or(&host);
+                let flight_addr = format!("{}:{}", flight_host, flight_cfg.port);
+
+                info!(
+                    "Starting Flight SQL server on {} for dataset '{}'",
+                    flight_addr, dataset_name
+                );
+
+                // Wrap our RegistryClient in adapter for hyprstream_metrics trait
+                let registry_client = ctx.registry();
+                let adapter: Arc<dyn MetricsRegistryClient> =
+                    Arc::new(MetricsRegistryAdapter::new(registry_client.clone()));
+                let dataset = dataset_name.clone();
+                let flight_port = flight_cfg.port;
+                let flight_host_owned = flight_host.clone();
+
+                // Start Flight SQL server in background
+                tokio::spawn(async move {
+                    let config = hyprstream_flight::FlightConfig::default()
+                        .with_host(flight_host_owned)
+                        .with_port(flight_port);
+
+                    if let Err(e) =
+                        hyprstream_flight::start_flight_server(Some(adapter), &dataset, config)
+                            .await
+                    {
+                        error!("Flight SQL server error: {}", e);
+                    }
+                });
+            }
+        }
+    }
+
+    // Start HTTP server (blocks until shutdown)
     crate::server::start_server(addr, server_state).await?;
 
     Ok(())
@@ -187,7 +348,7 @@ pub fn create_http_client() -> Client {
     Client::builder()
         .timeout(std::time::Duration::from_secs(300)) // 5 minutes for long inference
         .build()
-        .expect("Failed to create HTTP client")
+        .unwrap_or_else(|_| Client::new())
 }
 
 /// Create LoRA adapter via REST API
@@ -391,12 +552,17 @@ pub async fn handle_write_checkpoint(
     model_id: String,
     _name: Option<String>,
     step: Option<usize>,
+    client: Option<std::sync::Arc<dyn crate::services::RegistryClient>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Writing checkpoint for model: {}", model_id);
 
-    // Load model storage
+    // Load model storage - use shared client if provided, otherwise start internal service
     let config = crate::config::HyprConfig::load().unwrap_or_default();
-    let storage = ModelStorage::create(config.models_dir().to_path_buf()).await?;
+    let storage = if let Some(client) = client {
+        ModelStorage::new(client, config.models_dir().to_path_buf())
+    } else {
+        ModelStorage::create(config.models_dir().to_path_buf()).await?
+    };
 
     // Resolve model path
     let model_ref = crate::storage::ModelRef::parse(&model_id)?;
@@ -407,10 +573,11 @@ pub async fn handle_write_checkpoint(
 
     // Get step number
     let step = step.unwrap_or_else(|| {
+        // SAFETY: Only fails if system time is before Unix epoch (1970)
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as usize
+            .map(|d| d.as_secs() as usize)
+            .unwrap_or(0)
     });
 
     // Create weight snapshot (would need actual implementation)

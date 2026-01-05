@@ -1,4 +1,7 @@
-//! DHT implementation using libp2p Kademlia for SHA256 Git objects
+//! DHT implementation using libp2p Kademlia for Git objects
+//!
+//! Supports both SHA1 (legacy) and SHA256 (modern) git objects.
+//! DHT keys are derived using domain separation per libp2p Kademlia spec.
 
 use libp2p::{
     kad::{self, QueryResult, Record, RecordKey},
@@ -9,7 +12,7 @@ use multihash::Multihash;
 use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
 use futures::stream::StreamExt;
-use crate::{error::Result, types::Sha256Hash};
+use crate::{error::Result, types::{GitHash, Sha256Hash}};
 
 pub mod behaviour;
 pub mod storage;
@@ -27,26 +30,49 @@ pub enum DhtMode {
     Server,
 }
 
-/// Git SHA256 hash as a DHT key
+/// Git object hash as a DHT key
+///
+/// Uses `GitHash::to_dht_key()` for domain separation between SHA1 and SHA256.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct GitObjectKey(pub Sha256Hash);
+pub struct GitObjectKey {
+    /// Original git hash (SHA1 or SHA256)
+    git_hash: GitHash,
+    /// Derived DHT key (256-bit, from to_dht_key())
+    dht_key: [u8; 32],
+}
 
 impl GitObjectKey {
-    /// Create a new Git object key from SHA256 hash
-    pub fn new(hash: Sha256Hash) -> Self {
-        Self(hash)
+    /// Create a new Git object key from a GitHash
+    pub fn new(hash: GitHash) -> Self {
+        let dht_key = hash.to_dht_key();
+        Self { git_hash: hash, dht_key }
+    }
+
+    /// Create from a Sha256Hash (legacy compatibility)
+    pub fn from_sha256(hash: Sha256Hash) -> Self {
+        // Convert Sha256Hash to GitHash::Sha256
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&hash.to_bytes());
+        Self::new(GitHash::Sha256(bytes))
     }
 
     /// Convert to libp2p RecordKey using multihash
     pub fn to_record_key(&self) -> RecordKey {
-        // Create multihash from SHA2-256 (code 0x12)
-        let multihash: Multihash<64> = Multihash::wrap(0x12, &self.0.to_bytes()).expect("32-byte hash should fit");
+        // Create multihash from SHA2-256 (code 0x12) using the derived DHT key
+        // SAFETY: SHA2-256 (0x12) expects exactly 32 bytes, which dht_key provides
+        let multihash: Multihash<64> = Multihash::wrap(0x12, &self.dht_key)
+            .unwrap_or_else(|_| Multihash::wrap(0x12, &[0u8; 32]).unwrap());
         RecordKey::new(&multihash.to_bytes())
     }
 
-    /// Get the SHA256 hash
-    pub fn hash(&self) -> &Sha256Hash {
-        &self.0
+    /// Get the original GitHash
+    pub fn git_hash(&self) -> &GitHash {
+        &self.git_hash
+    }
+
+    /// Get the derived DHT key (256-bit)
+    pub fn dht_key(&self) -> &[u8; 32] {
+        &self.dht_key
     }
 }
 
@@ -140,7 +166,13 @@ impl GitTorrentDht {
                 libp2p::noise::Config::new,
                 libp2p::yamux::Config::default,
             )?
-            .with_behaviour(|key| GitTorrentBehaviour::new_with_keypair(key, mode).unwrap())?
+            .with_behaviour(|key| {
+                GitTorrentBehaviour::new_with_keypair(key, mode)
+                    .unwrap_or_else(|e| {
+                        tracing::error!("Failed to create GitTorrent behaviour: {}", e);
+                        panic!("Failed to create GitTorrent behaviour: {}", e)
+                    })
+            })?
             .build();
 
         let local_peer_id = *swarm.local_peer_id();
@@ -240,8 +272,10 @@ impl GitTorrentDht {
     }
 
     /// Helper to create a proper bootstrap address with peer ID
-    pub fn create_bootstrap_addr(ip: &str, port: u16, peer_id: &PeerId) -> Multiaddr {
-        format!("/ip4/{}/tcp/{}/p2p/{}", ip, port, peer_id).parse().unwrap()
+    ///
+    /// Returns None if the address cannot be parsed (should never happen with valid inputs)
+    pub fn create_bootstrap_addr(ip: &str, port: u16, peer_id: &PeerId) -> Option<Multiaddr> {
+        format!("/ip4/{}/tcp/{}/p2p/{}", ip, port, peer_id).parse().ok()
     }
 
     async fn handle_swarm_event(

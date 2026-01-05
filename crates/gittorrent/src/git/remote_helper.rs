@@ -6,7 +6,6 @@
 //! Usage: git clone gittorrent://example.com/user/repo
 
 use crate::service::{GitTorrentService, GitTorrentConfig};
-use crate::lfs_xet::LfsXetManager;
 use crate::{Result, Error, GitTorrentUrl};
 
 use std::path::{Path, PathBuf};
@@ -17,8 +16,6 @@ use std::collections::HashMap;
 pub struct GitRemoteHelper {
     /// GitTorrent service instance
     service: GitTorrentService,
-    /// LFS-XET manager
-    lfs_manager: Option<LfsXetManager>,
     /// Remote repository URL
     remote_url: Option<GitTorrentUrl>,
     /// Local repository path
@@ -40,7 +37,6 @@ impl GitRemoteHelper {
 
         Ok(Self {
             service,
-            lfs_manager: None,
             remote_url: None,
             local_repo: None,
             capabilities: vec![
@@ -331,11 +327,7 @@ impl GitRemoteHelper {
 
     /// Set local repository path
     pub fn set_local_repo(&mut self, path: PathBuf) -> Result<()> {
-        self.local_repo = Some(path.clone());
-
-        // Initialize LFS-XET manager for this repository
-        self.lfs_manager = Some(LfsXetManager::new(&path));
-
+        self.local_repo = Some(path);
         Ok(())
     }
 
@@ -436,14 +428,6 @@ impl GitRemoteHelper {
         dst_ref: &str,
     ) -> Result<()> {
         tracing::info!("Pushing {} to {} for repository", src_ref, dst_ref);
-
-        // Process LFS files with XET if manager is available
-        if let Some(lfs_manager) = &self.lfs_manager {
-            let converted_files = lfs_manager.convert_lfs_files(local_repo).await?;
-            if !converted_files.is_empty() {
-                tracing::info!("Converted {} LFS files to XET format", converted_files.len());
-            }
-        }
 
         // Announce repository to P2P network
         self.service.announce_repository(local_repo).await?;
@@ -707,7 +691,10 @@ mod tests {
     async fn test_connect_command() {
         let mut helper = GitRemoteHelper::new().await.unwrap();
 
-        let result = helper.handle_connect(&["git-upload-pack", "gittorrent://example.com/user/repo"]).await;
+        // Set remote URL first (as would be done during argument parsing)
+        helper.remote_url = Some(GitTorrentUrl::parse("gittorrent://example.com/user/repo").unwrap());
+
+        let result = helper.handle_connect(&["git-upload-pack"]).await;
         assert!(result.is_ok());
         assert!(helper.remote_url.is_some());
     }
@@ -719,6 +706,5 @@ mod tests {
 
         helper.set_local_repo(temp_dir.path().to_path_buf()).unwrap();
         assert!(helper.local_repo.is_some());
-        assert!(helper.lfs_manager.is_some());
     }
 }

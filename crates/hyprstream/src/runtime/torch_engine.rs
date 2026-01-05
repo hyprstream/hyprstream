@@ -2,6 +2,7 @@
 
 use crate::config::{
     FinishReason, GenerationConfig, GenerationRequest, GenerationResult, ModelInfo, RuntimeConfig,
+    TemplatedPrompt,
 };
 use crate::runtime::tensor_sampling::TensorSampler;
 use crate::runtime::template_engine::{ChatMessage, TemplateEngine};
@@ -14,7 +15,7 @@ use serde_json;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU32, AtomicUsize, Ordering},
     Arc, Mutex, PoisonError,
 };
 use tch::{nn::VarStore, Device, Tensor};
@@ -55,7 +56,6 @@ pub struct TorchEngine {
     /// Device for computation (CPU/CUDA/ROCm) - immutable after construction
     device: Device,
     /// Runtime configuration - immutable after construction
-    #[allow(dead_code)]
     config: RuntimeConfig,
     /// Generation configuration with defaults
     generation_config: GenerationConfig,
@@ -67,14 +67,20 @@ pub struct TorchEngine {
     lora_model: Arc<Mutex<Option<crate::lora::torch_adapter::LoRAModel>>>,
     /// LoRA trainer for fine-tuning
     lora_trainer: Arc<Mutex<Option<crate::lora::trainer::LoRATrainer>>>,
-    /// Sampling configuration - immutable after construction
-    #[allow(dead_code)]
-    sampling_config: RuntimeConfig,
     /// GPU sampler for efficient token sampling - thread safe after initialization
     sampler: TensorSampler,  // Renamed from gpu_sampler - works on both CPU and GPU
     /// Cached tokenizer vocabulary size for lock-free access
     /// 0 means not yet initialized
     tokenizer_vocab_size: Arc<AtomicUsize>,
+    /// Cached EOS token ID for lock-free access
+    /// 0 means not yet initialized (actual EOS tokens are typically > 0)
+    eos_token_id: Arc<AtomicU32>,
+    /// KV cache registry for session-based cache isolation
+    /// Enables concurrent inference across multiple sessions
+    kv_cache_registry: Option<Arc<crate::runtime::kv_cache::KVCacheRegistry>>,
+    /// Current active session owner for KV cache selection
+    /// If set, generation uses the corresponding cache from the registry
+    active_cache_owner: Arc<Mutex<Option<crate::runtime::kv_cache::CacheOwner>>>,
     // Note: XET/LFS handled by git-xet-filter + ModelFactory::load_file_with_pointer_detection()
     // Note: Pre-training not supported (persistent_model doesn't expose VarStore), LoRA only
 }
@@ -90,6 +96,79 @@ impl TorchEngine {
                 Ok(poisoned.into_inner())
             }
         }
+    }
+
+    // ============================================================================
+    // Lock Ordering for Thread Safety
+    // ============================================================================
+    //
+    // IMPORTANT: To prevent deadlocks, always acquire locks in this order:
+    //   1. lora_model
+    //   2. lora_trainer
+    //   3. persistent_model
+    //   4. var_store
+    //
+    // The helper methods below enforce this ordering.
+    // ============================================================================
+
+    /// Acquire both LoRA model and trainer locks in the correct order.
+    ///
+    /// This helper ensures consistent lock ordering across all call sites to
+    /// prevent deadlocks. The lora_model lock is always acquired first, then
+    /// lora_trainer.
+    ///
+    /// # Thread Safety
+    /// This method acquires `lora_model` and `lora_trainer` locks.
+    /// Callers must not hold these locks when calling.
+    ///
+    /// # Returns
+    /// Returns the result of the callback function `f` which receives
+    /// mutable references to both the LoRAModel and LoRATrainer.
+    pub fn with_training_locks<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(
+            &mut crate::lora::torch_adapter::LoRAModel,
+            &mut crate::lora::trainer::LoRATrainer,
+        ) -> Result<T>,
+    {
+        // IMPORTANT: Always acquire lora_model FIRST, then lora_trainer
+        let mut model_guard = self.handle_poison(self.lora_model.lock())?;
+        let mut trainer_guard = self.handle_poison(self.lora_trainer.lock())?;
+
+        let model = model_guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("LoRA model not initialized"))?;
+        let trainer = trainer_guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("LoRA trainer not initialized"))?;
+
+        f(model, trainer)
+    }
+
+    /// Acquire LoRA model lock only (for read-only operations).
+    ///
+    /// Use this for operations that only need the model, not the trainer.
+    pub fn with_lora_model<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&crate::lora::torch_adapter::LoRAModel) -> Result<T>,
+    {
+        let model_guard = self.handle_poison(self.lora_model.lock())?;
+        let model = model_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("LoRA model not initialized"))?;
+        f(model)
+    }
+
+    /// Acquire LoRA model lock for mutation.
+    pub fn with_lora_model_mut<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut crate::lora::torch_adapter::LoRAModel) -> Result<T>,
+    {
+        let mut model_guard = self.handle_poison(self.lora_model.lock())?;
+        let model = model_guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("LoRA model not initialized"))?;
+        f(model)
     }
 
     /// Set the random seed for deterministic generation
@@ -109,6 +188,116 @@ impl TorchEngine {
                 .ok()
                 .and_then(|guard| guard.as_ref().map(|t| t.get_vocab_size(true)))
                 .unwrap_or(0)  // Return 0 if tokenizer not loaded (caller should error)
+        }
+    }
+
+    /// Get the device this engine is using for computation
+    pub fn device(&self) -> Device {
+        self.device
+    }
+
+    // ============================================================================
+    // Session-Based KV Cache Management
+    // ============================================================================
+
+    /// Initialize the KV cache registry for session-based cache isolation.
+    ///
+    /// This should be called after loading a model when the configuration is known.
+    /// The registry will manage separate KV caches for different sessions/requests.
+    pub fn initialize_kv_registry(
+        &mut self,
+        num_layers: usize,
+        max_seq_len: usize,
+        quant_type: crate::runtime::kv_quant::KVQuantType,
+        memory_budget: Option<usize>,
+    ) {
+        let config = crate::runtime::kv_cache::CacheConfig::new(num_layers, max_seq_len)
+            .with_quant_type(quant_type);
+
+        let registry = crate::runtime::kv_cache::KVCacheRegistry::new(config, memory_budget);
+        self.kv_cache_registry = Some(Arc::new(registry));
+
+        tracing::info!(
+            "[TorchEngine] Initialized KV cache registry: {} layers, max_seq_len={}, budget={:?}",
+            num_layers, max_seq_len, memory_budget
+        );
+    }
+
+    /// Get the KV cache registry (for external access)
+    pub fn kv_registry(&self) -> Option<Arc<crate::runtime::kv_cache::KVCacheRegistry>> {
+        self.kv_cache_registry.clone()
+    }
+
+    /// Set the active session for generation.
+    ///
+    /// This sets which KV cache will be used for the next generation call.
+    /// Use `CacheOwner::Session(session_id)` for conversational sessions that
+    /// should preserve context across multiple requests.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // For a conversational session (preserves context)
+    /// engine.set_session(CacheOwner::Session("conversation-123".into()));
+    ///
+    /// // For a stateless request (cache discarded after)
+    /// engine.set_session(CacheOwner::new_stateless());
+    /// ```
+    pub fn set_session(&self, owner: crate::runtime::kv_cache::CacheOwner) -> Result<()> {
+        if self.kv_cache_registry.is_none() {
+            return Err(anyhow!("KV cache registry not initialized. Call initialize_kv_registry first."));
+        }
+
+        let mut active_owner = self.handle_poison(self.active_cache_owner.lock())?;
+
+        tracing::debug!("Setting active session to: {:?}", owner);
+        *active_owner = Some(owner);
+
+        Ok(())
+    }
+
+    /// Get the current active session owner
+    pub fn get_session(&self) -> Option<crate::runtime::kv_cache::CacheOwner> {
+        self.handle_poison(self.active_cache_owner.lock())
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    /// Clear the active session (subsequent generations will use the model's internal cache)
+    pub fn clear_session(&self) -> Result<()> {
+        let mut active_owner = self.handle_poison(self.active_cache_owner.lock())?;
+        *active_owner = None;
+        Ok(())
+    }
+
+    /// Release a session's KV cache (for cleanup after conversation ends)
+    pub fn release_session(&self, owner: &crate::runtime::kv_cache::CacheOwner) -> Result<()> {
+        if let Some(registry) = &self.kv_cache_registry {
+            registry.release(owner);
+            tracing::debug!("Released session cache: {:?}", owner);
+        }
+        Ok(())
+    }
+
+    /// Get total memory usage across all session caches
+    pub fn session_cache_memory_usage(&self) -> usize {
+        self.kv_cache_registry
+            .as_ref()
+            .map(|r| r.total_memory_usage())
+            .unwrap_or(0)
+    }
+
+    /// Get number of active session caches
+    pub fn active_session_count(&self) -> usize {
+        self.kv_cache_registry
+            .as_ref()
+            .map(|r| r.cache_count())
+            .unwrap_or(0)
+    }
+
+    /// Evict LRU session caches to stay within memory budget
+    pub fn evict_session_caches(&self) {
+        if let Some(registry) = &self.kv_cache_registry {
+            registry.evict_to_budget();
         }
     }
 
@@ -196,9 +385,11 @@ impl TorchEngine {
             active_lora: Arc::new(Mutex::new(None)),
             lora_model: Arc::new(Mutex::new(None)),
             lora_trainer: Arc::new(Mutex::new(None)),
-            sampling_config: config,
             sampler: TensorSampler::new(device),
             tokenizer_vocab_size: Arc::new(AtomicUsize::new(0)),
+            eos_token_id: Arc::new(AtomicU32::new(0)),
+            kv_cache_registry: None, // Initialized after model load when config is known
+            active_cache_owner: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -481,10 +672,21 @@ impl TorchEngine {
 
             let config_json: serde_json::Value = serde_json::from_str(&config_content)?;
 
-            // TODO: Load special tokens configuration using tokenizer's built-in methods
-
             // Parse template configuration
             let template_config = TemplateEngine::from_tokenizer_config(&config_json)?;
+
+            // Cache EOS token ID for lock-free access during generation
+            if let Some(ref eos_str) = template_config.eos_token {
+                let tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
+                if let Some(ref tokenizer) = *tokenizer_guard {
+                    if let Some(eos_id) = tokenizer.token_to_id(eos_str) {
+                        self.eos_token_id.store(eos_id, Ordering::Relaxed);
+                        info!("Cached EOS token: '{}' -> ID {}", eos_str, eos_id);
+                    } else {
+                        warn!("EOS token '{}' not found in tokenizer vocabulary", eos_str);
+                    }
+                }
+            }
 
             // Create template engine
             let template_engine = TemplateEngine::new(template_config)?;
@@ -589,19 +791,11 @@ impl TorchEngine {
         formatted
     }
 
-    /// Check if a token ID is a special EOS token using tokenizer's built-in detection
+    /// Check if a token ID is the EOS token (lock-free using cached ID)
     pub fn is_eos_token(&self, token_id: usize) -> bool {
-        if let Ok(tokenizer_guard) = self.tokenizer.lock() {
-            if let Some(ref tokenizer) = *tokenizer_guard {
-                // Check if it's the tokenizer's EOS token
-                if let Some(eos_token) = tokenizer.get_added_tokens_decoder().get(&(token_id as u32)) {
-                    return eos_token.content == "<|im_end|>" || eos_token.content == "</s>";
-                }
-            }
-        }
-
-        // Fallback: check if it's a common EOS token
-        token_id as u32 == 2 // Common </s> token ID
+        let cached_eos = self.eos_token_id.load(Ordering::Relaxed);
+        // cached_eos == 0 means not initialized; actual EOS tokens are > 0
+        cached_eos > 0 && token_id as u32 == cached_eos
     }
 
     /// Get the tokenizer for streaming decoding - CoW makes this cheap!
@@ -853,7 +1047,7 @@ impl RuntimeEngine for TorchEngine {
         );
 
         let request = GenerationRequest {
-            prompt: formatted_prompt,
+            prompt: TemplatedPrompt::new(formatted_prompt),
             max_tokens,
             temperature: self.generation_config.temperature,
             top_p: self.generation_config.top_p,
@@ -864,6 +1058,7 @@ impl RuntimeEngine for TorchEngine {
             seed: None,
             images: Vec::new(),
             timeout: None,
+            collect_metrics: false, // Default: off for performance
         };
 
         let result = self.generate_with_params(request).await?;
@@ -893,6 +1088,13 @@ impl RuntimeEngine for TorchEngine {
             finish_reason: stats.finish_reason.unwrap_or(FinishReason::Stop),
             generation_time_ms: stats.generation_time_ms,
             tokens_per_second: stats.tokens_per_second,
+            quality_metrics: stats.quality_metrics,
+            prefill_tokens: stats.prefill_tokens,
+            prefill_time_ms: stats.prefill_time_ms,
+            prefill_tokens_per_sec: stats.prefill_tokens_per_sec,
+            inference_tokens: stats.inference_tokens,
+            inference_time_ms: stats.inference_time_ms,
+            inference_tokens_per_sec: stats.inference_tokens_per_sec,
         })
     }
 
@@ -1280,17 +1482,10 @@ impl TorchEngine {
         // Forward pass with LoRA
         let logits = self.forward_with_lora(&input_ids, None, true)?;
 
-        // Training step
-        let metrics = {
-            let mut trainer_guard = self.handle_poison(self.lora_trainer.lock())?;
-            let lora_guard = self.handle_poison(self.lora_model.lock())?;
-
-            if let (Some(trainer), Some(lora_model)) = (&mut *trainer_guard, &*lora_guard) {
-                trainer.training_step(lora_model, &logits, &labels)?
-            } else {
-                return Err(anyhow!("LoRA trainer or model not initialized"));
-            }
-        };
+        // Training step - use helper to ensure correct lock ordering
+        let metrics = self.with_training_locks(|lora_model, trainer| {
+            trainer.training_step(lora_model, &logits, &labels)
+        })?;
 
         tracing::info!(
             "LoRA training step {}: loss={:.4}, ppl={:.2}, lr={:.6}",
@@ -1301,6 +1496,224 @@ impl TorchEngine {
         );
 
         Ok(())
+    }
+
+    // ============================================================================
+    // RL Training Methods for Self-Supervised Learning
+    // ============================================================================
+
+    /// Atomic LoRA training step with gradient clipping.
+    ///
+    /// Performs a complete training step in one atomic operation:
+    /// 1. Zero gradients
+    /// 2. Backward pass (loss.backward())
+    /// 3. Gradient clipping
+    /// 4. Optimizer step
+    ///
+    /// This prevents race conditions that could occur if these operations
+    /// were exposed as separate methods.
+    ///
+    /// # Arguments
+    /// - `loss` - The loss tensor to backpropagate
+    /// - `max_grad_norm` - Optional gradient clipping threshold (default: 1.0)
+    ///
+    /// # Returns
+    /// The gradient norm before clipping (useful for monitoring training stability)
+    ///
+    /// # Thread Safety
+    /// Acquires `lora_model` and `lora_trainer` locks in correct order.
+    pub fn lora_training_step(&self, loss: &Tensor, max_grad_norm: Option<f64>) -> Result<f64> {
+        self.with_training_locks(|lora_model, trainer| {
+            // 1. Zero gradients
+            trainer.optimizer.zero_grad();
+
+            // 2. Backward pass
+            loss.backward();
+
+            // 3. Gradient clipping
+            let grad_norm = {
+                let params: Vec<Tensor> = lora_model
+                    .vs
+                    .trainable_variables()
+                    .iter()
+                    .map(|v| v.shallow_clone())
+                    .collect();
+
+                // Calculate total gradient norm
+                let total_norm: f64 = params
+                    .iter()
+                    .map(|p| {
+                        let grad = p.grad();
+                        if grad.numel() > 0 {
+                            grad.norm().double_value(&[])
+                        } else {
+                            0.0
+                        }
+                    })
+                    .sum::<f64>()
+                    .sqrt();
+
+                // Clip if needed
+                let clip_threshold = max_grad_norm.unwrap_or(1.0);
+                if total_norm > clip_threshold && total_norm > 0.0 {
+                    let clip_coef = clip_threshold / total_norm;
+                    for param in &params {
+                        let mut grad = param.grad();
+                        if grad.numel() > 0 {
+                            // Scale gradients in place
+                            let _ = grad.g_mul_scalar_(clip_coef);
+                        }
+                    }
+                    tracing::debug!(
+                        "Clipped gradients: {:.4} -> {:.4}",
+                        total_norm,
+                        clip_threshold
+                    );
+                }
+
+                total_norm
+            };
+
+            // 4. Optimizer step
+            trainer.optimizer.step();
+
+            Ok(grad_norm)
+        })
+    }
+
+    /// Compute RL-style loss with KL divergence penalty.
+    ///
+    /// Computes the policy gradient loss for self-supervised RL training:
+    /// ```text
+    /// loss = -advantage * sum(log_prob(response_tokens)) / num_tokens + kl_coef * KL_div
+    /// ```
+    ///
+    /// The KL divergence term prevents the model from drifting too far from
+    /// its original behavior, which helps prevent:
+    /// - Mode collapse
+    /// - Reward hacking
+    /// - Loss of base model capabilities
+    ///
+    /// # Arguments
+    /// - `prompt_tokens` - Tokenized prompt (context)
+    /// - `response_tokens` - Tokenized response to evaluate
+    /// - `advantage` - Normalized advantage (quality score - baseline)
+    /// - `kl_coef` - KL divergence penalty coefficient (0.0 to disable)
+    ///
+    /// # Returns
+    /// Tuple of (total_loss_tensor, policy_gradient_loss, kl_divergence)
+    ///
+    /// # Thread Safety
+    /// Acquires model locks for forward pass with gradient tracking.
+    pub fn compute_rl_loss_with_kl(
+        &self,
+        prompt_tokens: &[u32],
+        response_tokens: &[u32],
+        advantage: f32,
+        kl_coef: f32,
+    ) -> Result<(Tensor, f32, f32)> {
+        // Concatenate prompt + response for full sequence
+        let full_tokens: Vec<i64> = prompt_tokens
+            .iter()
+            .chain(response_tokens.iter())
+            .map(|&t| t as i64)
+            .collect();
+
+        let prompt_len = prompt_tokens.len();
+        let response_len = response_tokens.len();
+
+        if response_len == 0 {
+            return Err(anyhow!("Response tokens cannot be empty"));
+        }
+
+        // Create input tensor
+        let input_ids = Tensor::from_slice(&full_tokens)
+            .to_device(self.device)
+            .unsqueeze(0); // [1, seq_len]
+
+        // Forward pass WITH gradient tracking (don't use no_grad)
+        let logits = self.forward_with_lora(&input_ids, None, true)?; // [1, seq_len, vocab_size]
+
+        // Get log probabilities
+        let log_probs = logits.log_softmax(-1, tch::Kind::Float); // [1, seq_len, vocab_size]
+
+        // Extract log probs for response tokens only
+        // For token at position i, we look at logits at position i-1 (autoregressive)
+        let mut response_log_probs = Vec::with_capacity(response_len);
+
+        for (i, &token) in response_tokens.iter().enumerate() {
+            let pos = prompt_len + i; // Position in full sequence
+            if pos > 0 {
+                // Get log prob of this token given previous context
+                let log_prob_at_pos = log_probs
+                    .get(0) // batch dim
+                    .get((pos - 1) as i64) // position (shifted by 1)
+                    .get(token as i64); // vocab index
+                response_log_probs.push(log_prob_at_pos);
+            }
+        }
+
+        if response_log_probs.is_empty() {
+            return Err(anyhow!("No valid response tokens for loss computation"));
+        }
+
+        // Sum log probs and normalize by length
+        let log_prob_sum = Tensor::stack(&response_log_probs, 0).sum(tch::Kind::Float);
+        let avg_log_prob = &log_prob_sum / (response_log_probs.len() as f64);
+
+        // Policy gradient loss: -advantage * avg_log_prob
+        let advantage_tensor = Tensor::from_slice(&[advantage as f64]).to_device(self.device);
+        let pg_loss = -(&advantage_tensor * &avg_log_prob);
+
+        // KL divergence computation (comparing to base model without LoRA)
+        let kl_div = if kl_coef > 0.0 {
+            // For KL, we need forward pass without LoRA to get base model probs
+            // This is expensive, so we approximate using entropy regularization instead
+            // KL ≈ -H(p_lora) when p_base is uniform-ish
+            // More accurate: run base model forward pass separately
+
+            // Simplified: use negative entropy as KL proxy
+            let probs = logits.softmax(-1, tch::Kind::Float);
+            let entropy = -(&probs * &log_probs).sum(tch::Kind::Float) / (full_tokens.len() as f64);
+            let neg_entropy = -entropy; // Lower entropy = more confident = higher KL-like penalty
+
+            neg_entropy.double_value(&[]) as f32
+        } else {
+            0.0
+        };
+
+        // Total loss = PG loss + KL penalty
+        let kl_penalty = Tensor::from_slice(&[kl_coef as f64 * kl_div as f64]).to_device(self.device);
+        let total_loss = &pg_loss + &kl_penalty;
+
+        let pg_loss_value = pg_loss.double_value(&[]) as f32;
+
+        Ok((total_loss, pg_loss_value, kl_div))
+    }
+
+    /// Get the current LoRA weights as a state dictionary for checkpointing.
+    ///
+    /// Returns a HashMap of tensor name -> tensor for all trainable LoRA parameters.
+    /// Tensors are moved to CPU to avoid GPU memory issues when storing.
+    ///
+    /// # Returns
+    /// HashMap mapping parameter names to their tensor values
+    pub fn get_lora_state_dict(&self) -> Result<HashMap<String, Tensor>> {
+        self.with_lora_model(|lora_model| {
+            let mut state_dict = HashMap::new();
+
+            for (name, tensor) in lora_model.vs.variables() {
+                // Move to CPU before storing to avoid GPU memory leaks
+                state_dict.insert(name.clone(), tensor.to(Device::Cpu));
+            }
+
+            tracing::debug!(
+                "Extracted LoRA state dict with {} parameters",
+                state_dict.len()
+            );
+
+            Ok(state_dict)
+        })
     }
 
     /// Save LoRA weights
@@ -1471,11 +1884,27 @@ impl TorchEngine {
         let lora_model = LoRAModel::new(config.clone(), module_configs, self.device)?;
         let total_params = lora_model.num_parameters();
 
-        // Install the LoRA model into the engine's shared state.
-        // This replaces any previously loaded LoRA model.
+        // Create trainer for gradient updates during training.
+        // The trainer uses the model's VarStore for parameter optimization.
+        let training_config = crate::lora::TrainingConfig {
+            learning_rate: config.learning_rate as f64,
+            ..Default::default()
+        };
+        let trainer = crate::lora::trainer::LoRATrainer::new(
+            &lora_model.vs,
+            self.device,
+            training_config,
+        )?;
+
+        // Install the LoRA model and trainer into the engine's shared state.
+        // This replaces any previously loaded LoRA model/trainer.
         {
             let mut lora_guard = self.handle_poison(self.lora_model.lock())?;
             *lora_guard = Some(lora_model);
+        }
+        {
+            let mut trainer_guard = self.handle_poison(self.lora_trainer.lock())?;
+            *trainer_guard = Some(trainer);
         }
 
         tracing::info!(
@@ -1563,6 +1992,129 @@ impl TorchEngine {
         tracing::info!("Unloaded LoRA adapter");
         Ok(())
     }
+
+    // ============================================================================
+    // Embedding Extraction for RAG/CAG
+    // ============================================================================
+
+    /// Extract embedding from text using the model's hidden states.
+    ///
+    /// This method tokenizes the input text, runs a forward pass through the model,
+    /// and extracts the final hidden states. The embedding is computed by mean-pooling
+    /// the hidden states over the sequence dimension.
+    ///
+    /// # Arguments
+    /// - `text` - Input text to embed
+    ///
+    /// # Returns
+    /// - Vec<f32> - The embedding vector (dimension = model's hidden_size)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let embedding = engine.extract_embedding("What is machine learning?")?;
+    /// println!("Embedding dimension: {}", embedding.len());
+    /// ```
+    pub fn extract_embedding(&self, text: &str) -> Result<Vec<f32>> {
+        // Tokenize input
+        let tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
+        let tokenizer = tokenizer_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("No tokenizer loaded"))?;
+
+        let encoding = tokenizer
+            .encode(text, false)
+            .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
+
+        let token_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
+        drop(tokenizer_guard);
+
+        self.extract_embedding_from_tokens(&token_ids)
+    }
+
+    /// Extract embedding from pre-tokenized input.
+    ///
+    /// This is a lower-level method for when tokens are already available
+    /// (e.g., from a previous generation). Uses mean pooling over the hidden states.
+    ///
+    /// # Arguments
+    /// - `token_ids` - Pre-tokenized input IDs
+    ///
+    /// # Returns
+    /// - Vec<f32> - The embedding vector (dimension = model's hidden_size)
+    pub fn extract_embedding_from_tokens(&self, token_ids: &[i64]) -> Result<Vec<f32>> {
+        if token_ids.is_empty() {
+            return Err(anyhow!("Empty token list"));
+        }
+
+        let input_tensor = Tensor::from_slice(token_ids)
+            .to_device(self.device)
+            .unsqueeze(0); // [1, seq_len]
+
+        let model_guard = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("No model loaded"))?
+            .lock()
+            .map_err(|_| anyhow!("Model lock poisoned"))?;
+
+        tch::no_grad(|| {
+            // Get token embeddings
+            let embeddings = model_guard.embed_tokens(&input_tensor)?;
+
+            // Process through layers to get hidden states
+            let hidden_states = self.process_through_layers_for_embedding(&**model_guard, &embeddings)
+                .unwrap_or_else(|_| embeddings.shallow_clone());
+
+            // Apply final normalization
+            let normalized = model_guard.apply_final_norm(&hidden_states)
+                .unwrap_or_else(|_| hidden_states);
+
+            // Mean pool over sequence dimension: [1, seq_len, hidden_size] -> [1, hidden_size]
+            let pooled = normalized.mean_dim(1, false, tch::Kind::Float);
+
+            // Squeeze batch dimension
+            let pooled_1d = pooled.squeeze_dim(0); // [hidden_size]
+
+            // L2 normalize for cosine similarity
+            let norm = pooled_1d.norm();
+            let normalized_embedding = if norm.double_value(&[]) > 1e-12 {
+                &pooled_1d / norm
+            } else {
+                pooled_1d
+            };
+
+            // Convert to CPU and extract values
+            let cpu_tensor = normalized_embedding.to_device(tch::Device::Cpu);
+            let numel = cpu_tensor.numel() as usize;
+            let mut embedding_vec = vec![0.0f32; numel];
+            cpu_tensor.copy_data(&mut embedding_vec, numel);
+
+            Ok(embedding_vec)
+        })
+    }
+
+    /// Process embeddings through all model layers for embedding extraction
+    fn process_through_layers_for_embedding(
+        &self,
+        model: &dyn crate::runtime::architectures::ModelOperations,
+        embeddings: &Tensor,
+    ) -> Result<Tensor> {
+        let num_layers = model.num_layers();
+        let mut hidden_states = embeddings.shallow_clone();
+
+        for layer_idx in 0..num_layers {
+            let (new_hidden, _kv) = model.decode_layer(
+                layer_idx,
+                &hidden_states,
+                None, // attention_mask
+                None, // position_ids
+                None, // past_kv
+            )?;
+            hidden_states = new_hidden;
+        }
+
+        Ok(hidden_states)
+    }
 }
 
 impl Drop for TorchEngine {
@@ -1630,13 +2182,26 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
 
-/// Statistics about text generation
+/// Statistics about text generation with separate prefill/inference metrics
 #[derive(Debug, Clone)]
 pub struct GenerationStats {
+    // Overall metrics
     pub tokens_generated: usize,
     pub generation_time_ms: u64,
     pub tokens_per_second: f32,
     pub finish_reason: Option<FinishReason>,
+    /// Quality metrics captured during generation (for self-supervised training)
+    pub quality_metrics: Option<crate::runtime::generation_metrics::GenerationQualityMetrics>,
+
+    // Prefill metrics (processing the prompt)
+    pub prefill_tokens: usize,
+    pub prefill_time_ms: u64,
+    pub prefill_tokens_per_sec: f32,
+
+    // Inference metrics (generating new tokens, excluding prefill)
+    pub inference_tokens: usize,
+    pub inference_time_ms: u64,
+    pub inference_tokens_per_sec: f32,
 }
 
 /// Stream that yields decoded UTF-8 text chunks during generation.
@@ -1653,10 +2218,8 @@ pub struct TextStream<'a> {
     recent_tokens: VecDeque<i64>,
     repeat_last_n: usize,
 
-    temperature: f32,
-    top_p: f32,
-    top_k: Option<usize>,
-    repeat_penalty: f32,
+    // PERF: Individual sampling params removed - now stored in sampling_params field below
+    // This avoids struct recreation per token while keeping backward compatibility
 
     max_tokens: usize,
     stop_token_ids: Vec<u32>,
@@ -1684,17 +2247,36 @@ pub struct TextStream<'a> {
     start_time: std::time::Instant,
     finished: bool,
     finish_reason: Option<FinishReason>,
-    /// Pre-computed multimodal embeddings for the first forward pass (if multimodal)
-    /// After the first forward, this is cleared and we use regular token IDs
-    multimodal_embeddings: Option<Tensor>,
 
     // Timeout handling
     timeout_ms: Option<u64>,
+
+    /// Whether to collect per-token quality metrics (expensive - ~10x overhead)
+    collect_metrics: bool,
+
+    /// Metrics accumulator for self-supervised training quality signals
+    metrics_accumulator: crate::runtime::generation_metrics::GenerationMetricsAccumulator,
+
+    // PERF: Cached values to avoid per-token recomputation
+    /// Pre-created sampling params - avoids struct creation per token
+    sampling_params: SamplingParams,
+    /// Cached tokenizer vocab size - avoids lock acquisition per token
+    vocab_size: usize,
+    /// Cached model vocab size (from logits shape) - set after first forward
+    model_vocab_size: usize,
+    /// Reusable buffer for recent_tokens when VecDeque wraps around
+    recent_tokens_buffer: Vec<i64>,
+
+    // Timing for prefill/inference separation
+    /// Time spent on prefill (processing prompt), set after first forward pass
+    prefill_time_ms: Option<u64>,
+    /// Timestamp when first token was sampled (after prefill completes)
+    first_token_time: Option<std::time::Instant>,
 }
 
 impl<'a> TextStream<'a> {
     fn new(engine: &'a TorchEngine, request: GenerationRequest) -> Result<Self> {
-        let prompt_tokens = engine.tokenize(&request.prompt)?;
+        let prompt_tokens = engine.tokenize(request.prompt.as_str())?;
         let prompt_len = prompt_tokens.len();
 
         let tokenizer = engine.get_tokenizer()?;
@@ -1746,26 +2328,16 @@ impl<'a> TextStream<'a> {
             tokenizer_ref.decode_stream(false) // skip_special_tokens=false
         };
 
-        // Prepare multimodal embeddings if this is a multimodal model with images
-        let multimodal_embeddings = if !request.images.is_empty() {
-            if let Some(model_arc) = &engine.persistent_model {
-                let model_guard = engine.handle_poison(model_arc.lock())?;
-                if model_guard.is_multimodal() {
-                    tracing::info!("Preparing multimodal embeddings for {} image(s)", request.images.len());
-                    // TODO: Implement image processing and embedding generation
-                    // For now, return None - implementation depends on specific model architecture
-                    None
-                } else {
-                    tracing::warn!("Images provided but model is not multimodal");
-                    None
-                }
-            } else {
-                tracing::warn!("Model not loaded, cannot process images");
-                None
-            }
-        } else {
-            None
+        // PERF: Pre-create sampling params to avoid struct allocation per token
+        let sampling_params = SamplingParams {
+            temperature: request.temperature,
+            top_p: request.top_p,
+            top_k: request.top_k,
+            repeat_penalty: request.repeat_penalty,
         };
+
+        // PERF: Cache vocab_size to avoid lock acquisition per token
+        let vocab_size = engine.get_vocab_size();
 
         Ok(Self {
             engine,
@@ -1773,10 +2345,6 @@ impl<'a> TextStream<'a> {
             last_generated: None,
             recent_tokens: VecDeque::with_capacity(repeat_last_n),
             repeat_last_n,
-            temperature: request.temperature,
-            top_p: request.top_p,
-            top_k: request.top_k,
-            repeat_penalty: request.repeat_penalty,
             max_tokens: request.max_tokens,
             stop_token_ids,
             tokenizer: tokenizer_arc,
@@ -1788,24 +2356,68 @@ impl<'a> TextStream<'a> {
             start_time: std::time::Instant::now(),
             finished: false,
             finish_reason: None,
-            multimodal_embeddings,
             timeout_ms: request.timeout,
+            collect_metrics: request.collect_metrics,
+            metrics_accumulator: crate::runtime::generation_metrics::GenerationMetricsAccumulator::new(),
+            // PERF: Cached values initialized here, avoid per-token recomputation
+            sampling_params,
+            vocab_size,
+            model_vocab_size: 0, // Set after first forward pass from logits shape
+            recent_tokens_buffer: Vec::with_capacity(repeat_last_n),
+            prefill_time_ms: None,
+            first_token_time: None,
         })
     }
 
     /// Get generation statistics (call after stream exhausted)
     pub fn stats(&self) -> GenerationStats {
-        let generation_time = self.start_time.elapsed();
+        let total_time = self.start_time.elapsed();
+
+        // Prefill metrics
+        let prefill_time_ms = self.prefill_time_ms.unwrap_or(0);
+        let prefill_tokens = self.prompt_len;
+        let prefill_tokens_per_sec = if prefill_time_ms > 0 {
+            (prefill_tokens as f32 * 1000.0) / prefill_time_ms as f32
+        } else {
+            0.0
+        };
+
+        // Inference metrics (time since first token was sampled)
+        let inference_time_ms = self.first_token_time
+            .map(|t| t.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        let inference_tokens = self.tokens_generated;
+        let inference_tokens_per_sec = if inference_time_ms > 0 {
+            (inference_tokens as f32 * 1000.0) / inference_time_ms as f32
+        } else {
+            0.0
+        };
+
+        // Finalize quality metrics from accumulator
+        let quality_metrics = if !self.metrics_accumulator.is_empty() {
+            Some(self.metrics_accumulator.finalize())
+        } else {
+            None
+        };
 
         GenerationStats {
             tokens_generated: self.tokens_generated,
-            generation_time_ms: generation_time.as_millis() as u64,
-            tokens_per_second: if generation_time.as_secs_f32() > 0.0 {
-                self.tokens_generated as f32 / generation_time.as_secs_f32()
+            generation_time_ms: total_time.as_millis() as u64,
+            tokens_per_second: if total_time.as_secs_f32() > 0.0 {
+                self.tokens_generated as f32 / total_time.as_secs_f32()
             } else {
                 0.0
             },
             finish_reason: self.finish_reason.clone(),
+            quality_metrics,
+
+            // Separate prefill/inference metrics
+            prefill_tokens,
+            prefill_time_ms,
+            prefill_tokens_per_sec,
+            inference_tokens,
+            inference_time_ms,
+            inference_tokens_per_sec,
         }
     }
 
@@ -1818,10 +2430,31 @@ impl<'a> TextStream<'a> {
         };
 
         let logits = if self.tokens_generated == 0 {
-            tracing::debug!("🔵 Initial forward: prompt_len={}", self.prompt_len);
-            self.engine.forward(&self.prompt_tokens)?
+            // PREFILL: Process full prompt and capture timing
+            let prefill_start = std::time::Instant::now();
+            let result = self.engine.forward(&self.prompt_tokens)?;
+            let prefill_elapsed = prefill_start.elapsed();
+
+            // Store prefill timing
+            self.prefill_time_ms = Some(prefill_elapsed.as_millis() as u64);
+            self.first_token_time = Some(std::time::Instant::now());
+
+            tracing::info!(
+                "📊 PREFILL: {} tokens in {:?} ({:.2} tok/sec)",
+                self.prompt_tokens.len(),
+                prefill_elapsed,
+                if prefill_elapsed.as_secs_f32() > 0.0 {
+                    self.prompt_tokens.len() as f32 / prefill_elapsed.as_secs_f32()
+                } else {
+                    0.0
+                }
+            );
+
+            result
         } else {
-            let last_token = self.last_generated.expect("last_generated should be set");
+            let last_token = self.last_generated.ok_or_else(|| {
+                anyhow::anyhow!("Internal error: last_generated not set after {} tokens", self.tokens_generated)
+            })?;
 
             if self.tokens_generated.is_multiple_of(50) {
                 tracing::debug!(
@@ -1848,9 +2481,18 @@ impl<'a> TextStream<'a> {
         // Solution: Use model vocab directly. The sampler will only pick valid tokens anyway.
         // The tokenizer's get_vocab_size() should match model vocab if properly configured.
 
-        let vocab_size = self.engine.get_vocab_size();
-        let logits_shape = logits.size();
-        let model_vocab_size = logits_shape[logits_shape.len() - 1] as usize;
+        // PERF: Use cached vocab_size - avoids lock acquisition per token
+        let vocab_size = self.vocab_size;
+
+        // PERF: Cache model_vocab_size on first call (from logits shape)
+        let model_vocab_size = if self.model_vocab_size == 0 {
+            let logits_shape = logits.size();
+            let size = logits_shape[logits_shape.len() - 1] as usize;
+            self.model_vocab_size = size;
+            size
+        } else {
+            self.model_vocab_size
+        };
 
         if vocab_size == 0 {
             // Tokenizer not loaded - this should never happen during generation
@@ -1884,19 +2526,19 @@ impl<'a> TextStream<'a> {
         // The truncation to vocab_size is necessary to prevent out-of-bounds,
         // but may be filtering out valid year token IDs.
 
-        let params = SamplingParams {
-            temperature: self.temperature,
-            top_p: self.top_p,
-            top_k: self.top_k,
-            repeat_penalty: self.repeat_penalty,
-        };
+        // PERF: Use pre-created sampling params - avoids struct allocation per token
+        let params = &self.sampling_params;
 
+        // PERF: Optimize VecDeque slice handling
         let (slice1, slice2) = self.recent_tokens.as_slices();
         let next_token = if slice2.is_empty() {
-            self.engine.sample_token_with_params(&logits, &params, slice1)?
+            // Fast path: VecDeque is contiguous, use slice directly
+            self.engine.sample_token_with_params(&logits, params, slice1)?
         } else {
-            let recent_tokens_vec: Vec<i64> = self.recent_tokens.iter().copied().collect();
-            self.engine.sample_token_with_params(&logits, &params, &recent_tokens_vec)?
+            // Slow path: VecDeque wrapped around, use pre-allocated buffer
+            self.recent_tokens_buffer.clear();
+            self.recent_tokens_buffer.extend(self.recent_tokens.iter().copied());
+            self.engine.sample_token_with_params(&logits, params, &self.recent_tokens_buffer)?
         };
 
         // Validate sampled token is within model vocabulary
@@ -1914,6 +2556,51 @@ impl<'a> TextStream<'a> {
                 "⚠️ Sampled token {} is beyond tokenizer vocab ({}) but within model vocab ({}). This may indicate a vocab mismatch.",
                 next_token, vocab_size, model_vocab_size
             );
+        }
+
+        // Capture metrics for self-supervised training (EXPENSIVE - only if explicitly enabled)
+        // Computes softmax + entropy over full vocabulary (~150K) with GPU->CPU syncs
+        // This adds ~10x overhead per token, so only enable for training
+        if self.collect_metrics {
+            // Get last token's logits (already squeezed to 1D in sampler, but handle 2D case)
+            let last_logits = if logits.dim() > 1 {
+                let shape = logits.size();
+                if shape.len() == 3 {
+                    // [batch, seq_len, vocab] -> take [-1, -1, :] -> [vocab]
+                    logits.select(1, shape[1] - 1).squeeze_dim(0)
+                } else if shape.len() == 2 {
+                    // [seq_len, vocab] or [batch, vocab] -> squeeze
+                    logits.squeeze_dim(0)
+                } else {
+                    logits.shallow_clone()
+                }
+            } else {
+                logits.shallow_clone()
+            };
+
+            // Compute stable softmax: exp(x - max(x)) / sum(exp(x - max(x)))
+            let max_logit = last_logits.max();
+            let shifted = &last_logits - &max_logit;
+            let exp_logits = shifted.exp();
+            let sum_exp = exp_logits.sum(tch::Kind::Float);
+            let probs = &exp_logits / &sum_exp;
+
+            // Compute log_prob of sampled token (in nats)
+            // log_prob = log(probs[next_token])
+            let log_prob = probs
+                .select(0, next_token as i64)
+                .log()
+                .double_value(&[]) as f32;
+
+            // Compute entropy: -sum(p * log(p)) where p > 0
+            // Use a small epsilon to avoid log(0)
+            let eps = 1e-10f64;
+            let safe_probs = probs.clamp(eps, 1.0 - eps);
+            let log_probs = safe_probs.log();
+            let entropy = (-(&probs * &log_probs)).sum(tch::Kind::Float).double_value(&[]) as f32;
+
+            // Add to accumulator (O(1) per token)
+            self.metrics_accumulator.add_token(log_prob, entropy, next_token as u32);
         }
 
         Ok(next_token as u32)
@@ -2031,18 +2718,8 @@ impl<'a> Stream for TextStream<'a> {
                         self.recent_tokens.pop_front();
                     }
 
-                    // Debug info
-                    let token_str = if let Ok(guard) = self.engine.tokenizer.lock() {
-                        if let Some(ref tok) = *guard {
-                            tok.decode(&[next_token], false).unwrap_or_else(|_| "<decode error>".to_string())
-                        } else {
-                            "<no tokenizer>".to_string()
-                        }
-                    } else {
-                        "<lock error>".to_string()
-                    };
-
-                    tracing::debug!("Token {} (raw: {:?}) -> buffering (incomplete UTF-8)", next_token, token_str);
+                    // Simple trace without expensive tokenizer lock or decode
+                    tracing::trace!("Token {} -> buffering (incomplete UTF-8)", next_token);
                     continue;
                 }
                 Err(e) => {

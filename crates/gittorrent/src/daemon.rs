@@ -321,8 +321,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let repo_dir = temp_dir.path().join("test-repo");
 
-        // Create a basic Git repository structure
-        tokio::fs::create_dir_all(&repo_dir.join(".git")).await.unwrap();
+        // Create a proper Git repository using git2
+        git2::Repository::init(&repo_dir).unwrap();
         tokio::fs::write(repo_dir.join("README.md"), "# Test Repository").await.unwrap();
 
         let config = DaemonConfig {

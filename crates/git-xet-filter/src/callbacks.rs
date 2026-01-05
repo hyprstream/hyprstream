@@ -1,4 +1,7 @@
 //! C callback implementations for libgit2 filter
+//!
+//! Implements a streaming filter using git_writestream.
+//! Data flows: source -> our writestream -> process -> next writestream
 
 #[cfg(feature = "xet-storage")]
 use dashmap::DashMap;
@@ -13,7 +16,7 @@ use std::sync::Arc;
 use std::ffi::CStr;
 
 #[cfg(feature = "xet-storage")]
-use libc::c_int;
+use libc::{c_char, c_int, size_t};
 
 #[cfg(feature = "xet-storage")]
 use crate::ffi::*;
@@ -22,7 +25,7 @@ use crate::ffi::*;
 use crate::filter::XetFilterPayload;
 
 #[cfg(feature = "xet-storage")]
-use crate::error::{FfiResult, XetError, XetErrorKind};
+use crate::error::{XetError, XetErrorKind};
 
 /// Global payload registry
 ///
@@ -56,17 +59,6 @@ pub(crate) fn unregister_payload(filter_ptr: *const OpaqueGitFilter) -> Option<A
 fn get_payload(filter_ptr: *const OpaqueGitFilter) -> Option<Arc<XetFilterPayload>> {
     let key = filter_ptr as usize;
     PAYLOAD_REGISTRY.get(&key).map(|entry| entry.value().clone())
-}
-
-// Implement Clone for XetFilterPayload
-#[cfg(feature = "xet-storage")]
-impl Clone for XetFilterPayload {
-    fn clone(&self) -> Self {
-        Self {
-            storage: self.storage.clone(),
-            runtime: self.runtime.clone(),
-        }
-    }
 }
 
 /// Initialize callback (called once when filter is first used)
@@ -108,7 +100,6 @@ pub extern "C" fn xet_filter_check(
         // Check if this is a checkout operation (TO_WORKDIR flag)
         // SAFETY: libgit2 guarantees source is valid for this callback
         let flags = unsafe { git_filter_source_flags(source) };
-        const GIT_FILTER_TO_WORKTREE: u32 = 1 << 0;
 
         if (flags & GIT_FILTER_TO_WORKTREE) != 0 {
             tracing::warn!(
@@ -123,7 +114,226 @@ pub extern "C" fn xet_filter_check(
     0
 }
 
-/// Stream callback (performs actual filtering)
+// ============================================================================
+// Custom Writestream Implementation
+// ============================================================================
+
+/// XET writestream - buffers data and processes on close
+#[cfg(feature = "xet-storage")]
+#[repr(C)]
+struct XetWriteStream {
+    /// Base writestream (must be first field for C compatibility)
+    base: GitWriteStreamBase,
+    /// Buffered input data
+    buffer: Vec<u8>,
+    /// Next stream to write to
+    next: *mut OpaqueGitWriteStream,
+    /// Filter mode (clean or smudge)
+    mode: c_int,
+    /// File path being filtered
+    path: String,
+    /// Payload with storage backend
+    payload: Arc<XetFilterPayload>,
+}
+
+/// Write callback - buffers incoming data
+#[cfg(feature = "xet-storage")]
+extern "C" fn xet_stream_write(
+    stream: *mut GitWriteStreamBase,
+    buffer: *const c_char,
+    len: size_t,
+) -> c_int {
+    // SAFETY: This function is a C callback invoked by libgit2.
+    // - `stream` points to our XetWriteStream (first field is GitWriteStreamBase for C compat)
+    // - `buffer` is valid for `len` bytes per libgit2's writestream contract
+    // - The XetWriteStream lifetime is managed by xet_filter_stream (alloc) and xet_stream_free (dealloc)
+    // - We check for null before dereferencing
+    unsafe {
+        let xet_stream = stream as *mut XetWriteStream;
+        if xet_stream.is_null() {
+            return -1;
+        }
+
+        let data = std::slice::from_raw_parts(buffer as *const u8, len);
+        (*xet_stream).buffer.extend_from_slice(data);
+    }
+    0
+}
+
+/// Close callback - processes buffered data and writes to next stream
+#[cfg(feature = "xet-storage")]
+extern "C" fn xet_stream_close(stream: *mut GitWriteStreamBase) -> c_int {
+    // SAFETY: This function is a C callback invoked by libgit2.
+    // - `stream` points to our XetWriteStream allocated in xet_filter_stream
+    // - libgit2 guarantees close() is called exactly once before free()
+    // - The mutable reference is exclusive because libgit2 serializes callbacks
+    // - We check for null before dereferencing
+    let result = unsafe {
+        let xet_stream = stream as *mut XetWriteStream;
+        if xet_stream.is_null() {
+            return -1;
+        }
+
+        let stream_ref = &mut *xet_stream;
+        process_and_write(stream_ref)
+    };
+
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            tracing::error!("XET stream close error: {}", e);
+            -1
+        }
+    }
+}
+
+/// Process buffered data and write to next stream
+#[cfg(feature = "xet-storage")]
+fn process_and_write(stream: &mut XetWriteStream) -> Result<(), XetError> {
+    let input = &stream.buffer;
+
+    // Process based on mode
+    let output = if stream.mode == GIT_FILTER_SMUDGE {
+        // Smudge: XET pointer -> file content
+        smudge_data(&stream.payload, input, &stream.path)?
+    } else {
+        // Clean: file content -> XET pointer
+        clean_data(&stream.payload, input, &stream.path)?
+    };
+
+    // Write output to next stream
+    write_to_next(stream.next, &output)?;
+
+    // Close next stream
+    close_next(stream.next)?;
+
+    Ok(())
+}
+
+/// Smudge: convert XET pointer to file content
+#[cfg(feature = "xet-storage")]
+fn smudge_data(payload: &XetFilterPayload, input: &[u8], path: &str) -> Result<Vec<u8>, XetError> {
+    // Convert to string to check if it's a pointer
+    let pointer_str = match std::str::from_utf8(input) {
+        Ok(s) => s,
+        Err(_) => {
+            // Not valid UTF-8, pass through as-is
+            tracing::debug!("XET smudge {}: not UTF-8, passing through", path);
+            return Ok(input.to_vec());
+        }
+    };
+
+    // Check if it's actually a pointer
+    if !payload.storage.is_pointer(pointer_str) {
+        // Not a pointer, pass through as-is
+        tracing::debug!("XET smudge {}: not a pointer, passing through", path);
+        return Ok(input.to_vec());
+    }
+
+    // Download from XET CAS
+    let content = payload
+        .runtime
+        .block_on(payload.storage.smudge_bytes(pointer_str))
+        .map_err(|e| XetError::new(XetErrorKind::RuntimeError, format!("Runtime error: {}", e)))?
+        .map_err(|e| XetError::new(XetErrorKind::DownloadFailed, format!("Download failed: {}", e)))?;
+
+    tracing::debug!("XET smudge {}: pointer -> {} bytes", path, content.len());
+    Ok(content)
+}
+
+/// Clean: convert file content to XET pointer
+#[cfg(feature = "xet-storage")]
+fn clean_data(payload: &XetFilterPayload, input: &[u8], path: &str) -> Result<Vec<u8>, XetError> {
+    if input.is_empty() {
+        // Empty file - pass through
+        return Ok(Vec::new());
+    }
+
+    // Write to temporary file for upload
+    let temp_file = tempfile::NamedTempFile::new().map_err(|e| {
+        XetError::new(XetErrorKind::IoError, format!("Failed to create temp file: {}", e))
+    })?;
+
+    std::fs::write(temp_file.path(), input).map_err(|e| {
+        XetError::new(XetErrorKind::IoError, format!("Failed to write temp file: {}", e))
+    })?;
+
+    // Upload to XET CAS
+    let pointer = payload
+        .runtime
+        .block_on(payload.storage.clean_file(temp_file.path()))
+        .map_err(|e| XetError::new(XetErrorKind::RuntimeError, format!("Runtime error: {}", e)))?
+        .map_err(|e| XetError::new(XetErrorKind::UploadFailed, format!("Upload failed: {}", e)))?;
+
+    tracing::debug!("XET clean {}: {} bytes -> pointer", path, input.len());
+    Ok(pointer.into_bytes())
+}
+
+/// Write data to next stream using the writestream vtable
+#[cfg(feature = "xet-storage")]
+fn write_to_next(next: *mut OpaqueGitWriteStream, data: &[u8]) -> Result<(), XetError> {
+    if next.is_null() || data.is_empty() {
+        return Ok(());
+    }
+
+    // SAFETY: `next` is a git_writestream provided by libgit2 in xet_filter_stream.
+    // - The pointer is valid for the duration of our stream operation
+    // - GitWriteStreamBase is the first field of git_writestream (C struct layout)
+    // - The write function pointer is initialized by libgit2
+    // - We check for null before this point
+    unsafe {
+        let ws = next as *mut GitWriteStreamBase;
+        let write_fn = (*ws).write;
+        let result = write_fn(ws, data.as_ptr() as *const c_char, data.len());
+        if result < 0 {
+            return Err(XetError::new(XetErrorKind::IoError, "Write to next stream failed"));
+        }
+    }
+    Ok(())
+}
+
+/// Close the next stream
+#[cfg(feature = "xet-storage")]
+fn close_next(next: *mut OpaqueGitWriteStream) -> Result<(), XetError> {
+    if next.is_null() {
+        return Ok(());
+    }
+
+    // SAFETY: `next` is a git_writestream provided by libgit2 in xet_filter_stream.
+    // - The pointer remains valid until after close() returns
+    // - GitWriteStreamBase is the first field of git_writestream (C struct layout)
+    // - The close function pointer is initialized by libgit2
+    // - We check for null before this point
+    unsafe {
+        let ws = next as *mut GitWriteStreamBase;
+        let close_fn = (*ws).close;
+        let result = close_fn(ws);
+        if result < 0 {
+            return Err(XetError::new(XetErrorKind::IoError, "Close next stream failed"));
+        }
+    }
+    Ok(())
+}
+
+/// Free callback - deallocates the stream
+#[cfg(feature = "xet-storage")]
+extern "C" fn xet_stream_free(stream: *mut GitWriteStreamBase) {
+    if stream.is_null() {
+        return;
+    }
+
+    // SAFETY: This function is a C callback invoked by libgit2.
+    // - `stream` was allocated by Box::into_raw in xet_filter_stream
+    // - libgit2 guarantees free() is called exactly once after close()
+    // - After this call, the memory is deallocated and the pointer is invalid
+    // - We check for null before dereferencing
+    unsafe {
+        let xet_stream = stream as *mut XetWriteStream;
+        drop(Box::from_raw(xet_stream));
+    }
+}
+
+/// Stream callback (creates our custom writestream)
 ///
 /// # Safety
 /// This function is called by libgit2 with valid pointers. All pointer parameters
@@ -132,7 +342,7 @@ pub extern "C" fn xet_filter_check(
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[cfg(feature = "xet-storage")]
 pub extern "C" fn xet_filter_stream(
-    _out: *mut *mut OpaqueGitWriteStream,
+    out: *mut *mut OpaqueGitWriteStream,
     filter: *mut OpaqueGitFilter,
     _payload_ptr: *mut *mut libc::c_void,
     source: *const OpaqueGitFilterSource,
@@ -146,12 +356,14 @@ pub extern "C" fn xet_filter_stream(
     let path = unsafe {
         let path_ptr = git_filter_source_path(source);
         if path_ptr.is_null() {
-            return XetError::new(XetErrorKind::IoError, "Null path").to_ffi_code();
+            tracing::error!("XET filter: null path");
+            return -1;
         }
         match CStr::from_ptr(path_ptr).to_str() {
-            Ok(s) => s,
+            Ok(s) => s.to_string(),
             Err(_) => {
-                return XetError::new(XetErrorKind::IoError, "Invalid UTF-8 in path").to_ffi_code()
+                tracing::error!("XET filter: invalid UTF-8 in path");
+                return -1;
             }
         }
     };
@@ -160,162 +372,43 @@ pub extern "C" fn xet_filter_stream(
     let payload = match get_payload(filter) {
         Some(p) => p,
         None => {
-            return XetError::new(
-                XetErrorKind::StorageNotInitialized,
-                format!("XET storage not initialized for filter {:p}", filter),
-            )
-            .to_ffi_code();
+            tracing::error!("XET storage not initialized for filter {:p}", filter);
+            return -1;
         }
     };
 
-    match mode {
-        GIT_FILTER_CLEAN => {
-            tracing::debug!("XET clean: {}", path);
-            xet_clean_stream(&payload, source, next, path).to_ffi_code()
-        }
-        GIT_FILTER_SMUDGE => {
-            tracing::debug!("XET smudge: {}", path);
-            xet_smudge_stream(&payload, source, next, path).to_ffi_code()
-        }
-        _ => XetError::new(XetErrorKind::RuntimeError, "Unknown filter mode").to_ffi_code(),
+    tracing::debug!(
+        "XET filter stream: mode={}, path={}",
+        if mode == GIT_FILTER_SMUDGE { "smudge" } else { "clean" },
+        path
+    );
+
+    // Create our custom writestream
+    let xet_stream = Box::new(XetWriteStream {
+        base: GitWriteStreamBase {
+            write: xet_stream_write,
+            close: xet_stream_close,
+            free: xet_stream_free,
+        },
+        buffer: Vec::new(),
+        next,
+        mode,
+        path,
+        payload,
+    });
+
+    // Convert to raw pointer and return
+    // SAFETY: Box::into_raw creates a stable pointer
+    // libgit2 will call free() when done
+    unsafe {
+        *out = Box::into_raw(xet_stream) as *mut OpaqueGitWriteStream;
     }
+
+    0
 }
 
 /// Cleanup callback (releases per-source resources)
 #[cfg(feature = "xet-storage")]
-pub extern "C" fn xet_filter_cleanup(_filter: *mut OpaqueGitFilter, payload: *mut libc::c_void) {
-    if !payload.is_null() {
-        // Currently we don't use per-source payload
-    }
-}
-
-/// Clean stream: file → XET pointer
-/// Reads file content from git's internal buffer, uploads to CAS, writes pointer
-#[cfg(feature = "xet-storage")]
-fn xet_clean_stream(
-    payload: &XetFilterPayload,
-    source: *const OpaqueGitFilterSource,
-    output: *mut OpaqueGitWriteStream,
-    path: &str,
-) -> crate::error::Result<()> {
-
-    // Read input data from git's buffer
-    let input_data = unsafe {
-        let buf_ptr = crate::ffi::git_filter_source_buffer(source);
-        if buf_ptr.is_null() {
-            return Err(XetError::new(
-                XetErrorKind::IoError,
-                "Failed to read filter source buffer",
-            ));
-        }
-        let buf = &*buf_ptr;
-        if buf.ptr.is_null() || buf.size == 0 {
-            // Empty file - write empty pointer
-            let mut output_wrapper = GitWriteStream::from_raw(output);
-            output_wrapper.write(b"").map_err(|e| {
-                XetError::new(XetErrorKind::IoError, format!("Write failed: {}", e))
-            })?;
-            return Ok(());
-        }
-        std::slice::from_raw_parts(buf.ptr as *const u8, buf.size)
-    };
-
-    // Write to temporary file for upload
-    let temp_file = tempfile::NamedTempFile::new().map_err(|e| {
-        XetError::new(
-            XetErrorKind::IoError,
-            format!("Failed to create temp file: {}", e),
-        )
-    })?;
-
-    std::fs::write(temp_file.path(), input_data).map_err(|e| {
-        XetError::new(
-            XetErrorKind::IoError,
-            format!("Failed to write temp file: {}", e),
-        )
-    })?;
-
-    // Upload to XET CAS
-    let pointer = payload
-        .runtime
-        .block_on(payload.storage.clean_file(temp_file.path()))??;
-
-    tracing::debug!("XET clean {}: {} bytes -> pointer", path, input_data.len());
-
-    // Write pointer to output
-    let mut output_wrapper = unsafe { GitWriteStream::from_raw(output) };
-    output_wrapper
-        .write(pointer.as_bytes())
-        .map_err(|e| XetError::new(XetErrorKind::IoError, format!("Write failed: {}", e)))?;
-
-    Ok(())
-}
-
-/// Smudge stream: XET pointer → file
-/// Reads pointer from git's internal buffer, downloads from CAS, writes file content
-#[cfg(feature = "xet-storage")]
-fn xet_smudge_stream(
-    payload: &XetFilterPayload,
-    source: *const OpaqueGitFilterSource,
-    output: *mut OpaqueGitWriteStream,
-    path: &str,
-) -> crate::error::Result<()> {
-    // Read pointer from git's buffer
-    let pointer_data = unsafe {
-        let buf_ptr = crate::ffi::git_filter_source_buffer(source);
-        if buf_ptr.is_null() {
-            return Err(XetError::new(
-                XetErrorKind::IoError,
-                "Failed to read filter source buffer",
-            ));
-        }
-        let buf = &*buf_ptr;
-        if buf.ptr.is_null() || buf.size == 0 {
-            // Empty file - pass through
-            let mut output_wrapper = GitWriteStream::from_raw(output);
-            output_wrapper.write(b"").map_err(|e| {
-                XetError::new(XetErrorKind::IoError, format!("Write failed: {}", e))
-            })?;
-            return Ok(());
-        }
-        std::slice::from_raw_parts(buf.ptr as *const u8, buf.size)
-    };
-
-    // Convert to string to check if it's a pointer
-    let pointer_str = std::str::from_utf8(pointer_data).map_err(|e| {
-        XetError::new(
-            XetErrorKind::InvalidPointer,
-            format!("Pointer data is not valid UTF-8: {}", e),
-        )
-    })?;
-
-    // Check if it's actually a pointer
-    if !payload.storage.is_pointer(pointer_str) {
-        // Not a pointer, pass through as-is
-        tracing::debug!("XET smudge {}: not a pointer, passing through", path);
-        let mut output_wrapper = unsafe { GitWriteStream::from_raw(output) };
-        output_wrapper.write(pointer_data).map_err(|e| {
-            XetError::new(XetErrorKind::IoError, format!("Write failed: {}", e))
-        })?;
-        return Ok(());
-    }
-
-    // Download from XET CAS
-    let content = payload
-        .runtime
-        .block_on(payload.storage.smudge_pointer(pointer_str))??;
-
-    tracing::debug!(
-        "XET smudge {}: pointer -> {} bytes",
-        path,
-        content.len()
-    );
-
-    // Write content to output
-    let mut output_wrapper = unsafe { GitWriteStream::from_raw(output) };
-    output_wrapper
-        .write(&content)
-        .map_err(|e| XetError::new(XetErrorKind::IoError, format!("Write failed: {}", e)))?;
-
-    Ok(())
+pub extern "C" fn xet_filter_cleanup(_filter: *mut OpaqueGitFilter, _payload: *mut libc::c_void) {
+    // Currently we don't use per-source payload
 }

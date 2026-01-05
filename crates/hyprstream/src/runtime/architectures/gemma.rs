@@ -642,8 +642,8 @@ impl GemmaModel {
         tracing::info!("  - GELU PyTorch tanh activation");
         tracing::info!("  - Sliding window attention (512 tokens)");
         tracing::info!(
-            "  - QK-norm with scalar {}",
-            config.query_pre_attn_scalar.unwrap()
+            "  - QK-norm with scalar {:?}",
+            config.query_pre_attn_scalar
         );
         tracing::info!(
             "  - RoPE theta: global={}, local={}",
@@ -1245,14 +1245,14 @@ mod tests {
         let kv_tensor = Tensor::randn(&[1, 21, 1024], (DType::Float, device));
 
         // Reshape for key/value (MQA)
-        let reshaped = model.reshape_for_attention(&kv_tensor, true).unwrap();
+        let reshaped = model.reshape_for_attention(&kv_tensor, true).expect("test: reshape kv");
         assert_eq!(reshaped.size(), &[1, 21, 4, 256]); // 4 KV heads, 256 head_dim
 
         // Test tensor for query with shape [1, 21, 4096] (16 * 256)
         let q_tensor = Tensor::randn(&[1, 21, 4096], (DType::Float, device));
 
         // Reshape for query
-        let reshaped = model.reshape_for_attention(&q_tensor, false).unwrap();
+        let reshaped = model.reshape_for_attention(&q_tensor, false).expect("test: reshape q");
         assert_eq!(reshaped.size(), &[1, 21, 16, 256]); // 16 Q heads, 256 head_dim
     }
 
@@ -1279,7 +1279,7 @@ mod tests {
         let kv = Tensor::randn(&[2, 10, 4, 256], (DType::Float, device));
 
         // Expand to match 16 query heads
-        let expanded = attn.expand_kv_for_mqa(&kv).unwrap();
+        let expanded = attn.expand_kv_for_mqa(&kv).expect("test: expand kv for mqa");
         assert_eq!(expanded.size(), &[2, 10, 16, 256]);
     }
 }

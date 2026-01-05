@@ -13,6 +13,7 @@ pub use server::{CorsConfig, SamplingParamDefaults, ServerConfig, ServerConfigBu
 // Export root configuration and builder (defined below in this module)
 // Note: HyprConfig and HyprConfigBuilder are exported automatically as pub structs
 
+use crate::runtime::generation_metrics::GenerationQualityMetrics;
 use crate::storage::paths::StoragePaths;
 use config::{Config, ConfigError, Environment, File};
 use serde::{Deserialize, Serialize};
@@ -66,21 +67,30 @@ pub struct StorageConfig {
 
 impl Default for StorageConfig {
     fn default() -> Self {
-        let storage_paths = StoragePaths::new().expect("Failed to initialize storage paths");
+        // Try to get XDG-compliant paths, fall back to current directory
+        let (models_dir, loras_dir, cache_dir, config_dir) = match StoragePaths::new() {
+            Ok(storage_paths) => (
+                storage_paths.models_dir().unwrap_or_else(|_| PathBuf::from("./models")),
+                storage_paths.loras_dir().unwrap_or_else(|_| PathBuf::from("./loras")),
+                storage_paths.cache_dir().unwrap_or_else(|_| PathBuf::from("./cache")),
+                storage_paths.config_dir().unwrap_or_else(|_| PathBuf::from("./config")),
+            ),
+            Err(e) => {
+                tracing::warn!("XDG paths unavailable: {}, using local directories", e);
+                (
+                    PathBuf::from("./models"),
+                    PathBuf::from("./loras"),
+                    PathBuf::from("./cache"),
+                    PathBuf::from("./config"),
+                )
+            }
+        };
 
         Self {
-            models_dir: storage_paths
-                .models_dir()
-                .unwrap_or_else(|_| PathBuf::from("./models")),
-            loras_dir: storage_paths
-                .loras_dir()
-                .unwrap_or_else(|_| PathBuf::from("./loras")),
-            cache_dir: storage_paths
-                .cache_dir()
-                .unwrap_or_else(|_| PathBuf::from("./cache")),
-            config_dir: storage_paths
-                .config_dir()
-                .unwrap_or_else(|_| PathBuf::from("./config")),
+            models_dir,
+            loras_dir,
+            cache_dir,
+            config_dir,
         }
     }
 }
@@ -447,7 +457,9 @@ impl HyprConfig {
     }
 
     /// Create generation request from config + prompt
-    pub fn create_request(&self, prompt: String) -> GenerationRequest {
+    ///
+    /// Note: The prompt should already be templated (via apply_chat_template).
+    pub fn create_request(&self, prompt: TemplatedPrompt) -> GenerationRequest {
         let mut request = GenerationRequest::from(&self.generation);
         request.prompt = prompt;
         request
@@ -506,10 +518,49 @@ pub struct ModelInfo {
     pub quantization: Option<String>,
 }
 
+/// A prompt string that has been processed through the chat template engine.
+/// This newtype prevents accidentally passing untemplated strings to generation.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct TemplatedPrompt(String);
+
+impl TemplatedPrompt {
+    /// Create from a templated string. Only call after template application.
+    pub fn new(s: String) -> Self {
+        Self(s)
+    }
+
+    /// Get the prompt as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume and return the inner string.
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+
+    /// Get the length of the prompt in bytes.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Check if the prompt is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Display for TemplatedPrompt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Generation request with all parameters
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GenerationRequest {
-    pub prompt: String,
+    pub prompt: TemplatedPrompt,
     pub max_tokens: usize,
     pub temperature: f32,
     pub top_p: f32,
@@ -525,6 +576,10 @@ pub struct GenerationRequest {
     // Async configuration fields
     #[serde(default)]
     pub timeout: Option<u64>, // Duration in milliseconds
+    /// Enable quality metrics collection for self-supervised training.
+    /// Default: false (disabled for performance - metrics add ~10x overhead)
+    #[serde(default)]
+    pub collect_metrics: bool,
 }
 
 /// Unified sampling parameters with Option fields for clean precedence merging.
@@ -678,6 +733,7 @@ pub struct GenerationRequestBuilder {
     prompt: String,
     params: SamplingParams,
     images: Vec<String>,
+    collect_metrics: bool,
 }
 
 impl GenerationRequestBuilder {
@@ -686,6 +742,7 @@ impl GenerationRequestBuilder {
             prompt: prompt.into(),
             params: SamplingParams::default(),
             images: vec![],
+            collect_metrics: false, // Default: off for performance
         }
     }
 
@@ -763,10 +820,16 @@ impl GenerationRequestBuilder {
         }
     }
 
+    /// Enable quality metrics collection (expensive - ~10x slowdown)
+    pub fn collect_metrics(mut self, value: bool) -> Self {
+        self.collect_metrics = value;
+        self
+    }
+
     pub fn build(self) -> GenerationRequest {
         let resolved = self.params.resolve();
         GenerationRequest {
-            prompt: self.prompt,
+            prompt: TemplatedPrompt::new(self.prompt),
             max_tokens: resolved.max_tokens,
             temperature: resolved.temperature,
             top_p: resolved.top_p,
@@ -777,6 +840,7 @@ impl GenerationRequestBuilder {
             seed: resolved.seed.map(|s| s as u32),
             images: self.images,
             timeout: Some(resolved.timeout_ms),
+            collect_metrics: self.collect_metrics,
         }
     }
 }
@@ -817,7 +881,7 @@ impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
 impl From<&GenerationConfig> for GenerationRequest {
     fn from(config: &GenerationConfig) -> Self {
         Self {
-            prompt: String::new(),
+            prompt: TemplatedPrompt::new(String::new()),
             max_tokens: config.max_tokens,
             temperature: config.temperature,
             top_p: config.top_p,
@@ -828,6 +892,7 @@ impl From<&GenerationConfig> for GenerationRequest {
             images: vec![],  // No images in conversion
             seed: config.seed,
             timeout: None, // Not in GenerationConfig
+            collect_metrics: false, // Default: off for performance
         }
     }
 }
@@ -856,7 +921,7 @@ mod tests {
             .max_tokens(1000)
             .build();
 
-        assert_eq!(request.prompt, "test prompt");
+        assert_eq!(request.prompt, TemplatedPrompt::new("test prompt".to_string()));
         assert_eq!(request.temperature, 0.8);
         assert_eq!(request.top_k, Some(30));
         assert_eq!(request.max_tokens, 1000);
@@ -920,7 +985,7 @@ mod tests {
             .max_tokens(512)
             .build();
 
-        assert_eq!(request.prompt, "test prompt");
+        assert_eq!(request.prompt, TemplatedPrompt::new("test prompt".to_string()));
         assert_eq!(request.temperature, 0.8);
         assert_eq!(request.max_tokens, 512);
         assert_eq!(request.top_p, 0.95);
@@ -953,6 +1018,25 @@ pub struct GenerationResult {
     pub finish_reason: FinishReason,
     pub generation_time_ms: u64,
     pub tokens_per_second: f32,
+    /// Quality metrics for self-supervised training
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality_metrics: Option<GenerationQualityMetrics>,
+
+    // Prefill metrics (processing the prompt)
+    #[serde(default)]
+    pub prefill_tokens: usize,
+    #[serde(default)]
+    pub prefill_time_ms: u64,
+    #[serde(default)]
+    pub prefill_tokens_per_sec: f32,
+
+    // Inference metrics (generating new tokens, excluding prefill)
+    #[serde(default)]
+    pub inference_tokens: usize,
+    #[serde(default)]
+    pub inference_time_ms: u64,
+    #[serde(default)]
+    pub inference_tokens_per_sec: f32,
 }
 
 /// Why generation stopped
@@ -963,4 +1047,148 @@ pub enum FinishReason {
     EndOfSequence,
     Error(String),
     Stop,
+}
+
+// =============================================================================
+// Training Mode Configuration (Phase D)
+// =============================================================================
+
+/// Model-level training mode configuration (embedded in config.json under "hyprstream_training")
+///
+/// This allows inference to automatically adapt models when enabled.
+/// The training mode is set via `hyprstream training set test_time_training`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HyprstreamTrainingConfig {
+    /// Training mode: disabled, test_time_training, supervised
+    #[serde(default)]
+    pub mode: TrainingMode,
+
+    /// Target adapter to train (e.g., "01_coding")
+    pub target_adapter: Option<String>,
+
+    /// Learning rate for training
+    #[serde(default = "default_training_learning_rate")]
+    pub learning_rate: f64,
+
+    /// Batch size for training (used by supervised mode)
+    #[serde(default = "default_training_batch_size")]
+    pub batch_size: usize,
+
+    /// Training steps per cycle (used by supervised mode)
+    #[serde(default = "default_training_steps_per_cycle")]
+    pub steps_per_cycle: usize,
+
+    /// Minimum quality score to keep examples (0.0-1.0)
+    #[serde(default = "default_training_min_quality")]
+    pub min_quality_threshold: f32,
+
+    /// Enable training on base model weights (vs LoRA only)
+    #[serde(default)]
+    pub train_base_model: bool,
+
+    /// TTT-specific configuration (for TestTimeTraining mode)
+    #[serde(default)]
+    pub ttt: TTTTrainingConfig,
+}
+
+/// TTT-specific configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TTTTrainingConfig {
+    /// Learning rate for TTT adaptation (higher than fine-tuning)
+    #[serde(default = "default_ttt_learning_rate")]
+    pub learning_rate: f64,
+
+    /// Number of gradient steps per input
+    #[serde(default = "default_ttt_gradient_steps")]
+    pub gradient_steps: usize,
+
+    /// Maximum gradient norm for clipping
+    #[serde(default = "default_ttt_max_grad_norm")]
+    pub max_grad_norm: f64,
+
+    /// Minimum input length (tokens) to trigger TTT
+    #[serde(default = "default_ttt_min_input_length")]
+    pub min_input_length: usize,
+
+    /// Maximum input length to process for TTT
+    #[serde(default = "default_ttt_max_context")]
+    pub max_ttt_context: usize,
+}
+
+fn default_ttt_learning_rate() -> f64 {
+    3e-4
+}
+fn default_ttt_gradient_steps() -> usize {
+    3
+}
+fn default_ttt_max_grad_norm() -> f64 {
+    1.0
+}
+fn default_ttt_min_input_length() -> usize {
+    32
+}
+fn default_ttt_max_context() -> usize {
+    512
+}
+
+impl Default for TTTTrainingConfig {
+    fn default() -> Self {
+        Self {
+            learning_rate: default_ttt_learning_rate(),
+            gradient_steps: default_ttt_gradient_steps(),
+            max_grad_norm: default_ttt_max_grad_norm(),
+            min_input_length: default_ttt_min_input_length(),
+            max_ttt_context: default_ttt_max_context(),
+        }
+    }
+}
+
+impl HyprstreamTrainingConfig {
+    /// Check if training is enabled (mode != Disabled)
+    pub fn is_enabled(&self) -> bool {
+        self.mode != TrainingMode::Disabled
+    }
+}
+
+impl Default for HyprstreamTrainingConfig {
+    fn default() -> Self {
+        Self {
+            mode: TrainingMode::default(),
+            target_adapter: None,
+            learning_rate: default_training_learning_rate(),
+            batch_size: default_training_batch_size(),
+            steps_per_cycle: default_training_steps_per_cycle(),
+            min_quality_threshold: default_training_min_quality(),
+            train_base_model: false,
+            ttt: TTTTrainingConfig::default(),
+        }
+    }
+}
+
+/// Training mode configuration
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingMode {
+    /// Training disabled (default)
+    #[default]
+    Disabled,
+    /// Test-Time Training: adapts to input context before generation
+    /// Research-valid approach based on TTT-E2E
+    TestTimeTraining,
+    /// Supervised training with explicit training data
+    Supervised,
+}
+
+// Default functions for HyprstreamTrainingConfig
+fn default_training_learning_rate() -> f64 {
+    1e-5
+}
+fn default_training_batch_size() -> usize {
+    4
+}
+fn default_training_steps_per_cycle() -> usize {
+    10
+}
+fn default_training_min_quality() -> f32 {
+    0.3
 }

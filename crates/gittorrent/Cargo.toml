@@ -53,8 +53,8 @@ config = "0.13"
 dirs = "5.0"
 toml = "0.8"
 
-# Git utilities
-git2 = "0.19"
+# Git utilities (0.20.3 for CVE-2024-24577 fix in libgit2 1.9.2)
+git2.workspace = true
 
 # Using libp2p for P2P networking and DHT
 

@@ -4,11 +4,24 @@
 //! resolving the current chaos of multiple override points.
 
 use anyhow::Result;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::LazyLock;
 use tch::Tensor;
 use tracing::info;
+
+/// Regex for extracting numeric version from model type strings
+/// SAFETY: These patterns are compile-time constants that are guaranteed valid
+static VERSION_REGEX: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    Regex::new(r"(\d+)").ok()
+});
+
+/// Regex for extracting layer indices from weight key names
+static LAYER_REGEX: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    Regex::new(r"layers\.(\d+)").ok()
+});
 
 /// Unified model configuration that combines all sources
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -322,9 +335,11 @@ impl ModelConfig {
             }
 
             // Try generic number extraction as fallback
-            if let Some(captures) = regex::Regex::new(r"(\d+)").unwrap().captures(model_type) {
-                if let Ok(version) = captures[1].parse::<u32>() {
-                    return version;
+            if let Some(ref regex) = *VERSION_REGEX {
+                if let Some(captures) = regex.captures(model_type) {
+                    if let Ok(version) = captures[1].parse::<u32>() {
+                        return version;
+                    }
                 }
             }
         }
@@ -365,10 +380,12 @@ impl ModelConfig {
 
     fn count_layers(weights: &HashMap<String, Tensor>) -> usize {
         let mut max_layer = 0;
-        for key in weights.keys() {
-            if let Some(captures) = regex::Regex::new(r"layers\.(\d+)").unwrap().captures(key) {
-                if let Ok(layer_idx) = captures[1].parse::<usize>() {
-                    max_layer = max_layer.max(layer_idx + 1);
+        if let Some(ref regex) = *LAYER_REGEX {
+            for key in weights.keys() {
+                if let Some(captures) = regex.captures(key) {
+                    if let Ok(layer_idx) = captures[1].parse::<usize>() {
+                        max_layer = max_layer.max(layer_idx + 1);
+                    }
                 }
             }
         }
@@ -479,5 +496,60 @@ impl Default for ModelConfig {
             use_flash_attention: true,
             use_kv_cache: true,
         }
+    }
+}
+
+// =============================================================================
+// Training Configuration Load/Save (Phase D)
+// =============================================================================
+
+impl ModelConfig {
+    /// Load hyprstream training config from the model's config.json
+    ///
+    /// Extracts the `hyprstream_training` section if present, otherwise returns None.
+    pub fn load_training_config(
+        model_path: &Path,
+    ) -> Option<crate::config::HyprstreamTrainingConfig> {
+        let config_path = model_path.join("config.json");
+        if !config_path.exists() {
+            return None;
+        }
+
+        let content = std::fs::read_to_string(&config_path).ok()?;
+        let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+        // Extract hyprstream_training section if present
+        json.get("hyprstream_training")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+
+    /// Save hyprstream training config to the model's config.json
+    ///
+    /// Preserves all other fields in config.json, only updates/inserts `hyprstream_training`.
+    pub fn save_training_config(
+        model_path: &Path,
+        training_config: &crate::config::HyprstreamTrainingConfig,
+    ) -> Result<()> {
+        let config_path = model_path.join("config.json");
+
+        // Read existing config
+        let content = std::fs::read_to_string(&config_path)?;
+        let mut json: serde_json::Value = serde_json::from_str(&content)?;
+
+        // Update or insert hyprstream_training section
+        json["hyprstream_training"] = serde_json::to_value(training_config)?;
+
+        // Write back with pretty formatting
+        let output = serde_json::to_string_pretty(&json)?;
+        std::fs::write(&config_path, output)?;
+
+        info!(
+            "✅ Training config saved to {}: mode={:?}, target_adapter={:?}",
+            config_path.display(),
+            training_config.mode,
+            training_config.target_adapter
+        );
+
+        Ok(())
     }
 }

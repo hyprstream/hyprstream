@@ -4,9 +4,10 @@
 //! allowing models larger than system memory to be loaded.
 
 use anyhow::{anyhow, Result};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tch::{Device, Kind as DType, Tensor};
 use tokio::sync::RwLock;
 use tracing::info;
@@ -42,7 +43,7 @@ impl MemoryWeightProvider {
 
 impl WeightProvider for MemoryWeightProvider {
     fn get_tensor(&self, name: &str) -> Result<Tensor> {
-        let weights = self.weights.lock().unwrap();
+        let weights = self.weights.lock();
         weights
             .get(name)
             .map(|t| t.shallow_clone())
@@ -50,12 +51,12 @@ impl WeightProvider for MemoryWeightProvider {
     }
 
     fn has_tensor(&self, name: &str) -> bool {
-        let weights = self.weights.lock().unwrap();
+        let weights = self.weights.lock();
         weights.contains_key(name)
     }
 
     fn tensor_names(&self) -> Vec<String> {
-        let weights = self.weights.lock().unwrap();
+        let weights = self.weights.lock();
         weights.keys().cloned().collect()
     }
 

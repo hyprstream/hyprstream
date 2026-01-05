@@ -7,14 +7,12 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::Path;
 use tch::{Device, Kind as DType, Tensor};
-use tracing::{info, instrument};
+use tracing::{debug, info, instrument};
 
 use super::architectures::{gemma::GemmaModel, llama::LlamaModel, ModelOperations};
 use super::kv_quant::KVQuantType;
 use super::model_config::{ModelArchitecture, ModelConfig};
 use super::torch_utils::{safe_to_device, estimate_tensor_size_mb};
-#[cfg(feature = "xet")]
-use crate::storage::{LfsXetBridge, XetConfig};
 
 /// Factory for creating models with proper configuration management
 pub struct ModelFactory;
@@ -276,12 +274,15 @@ impl ModelFactory {
         // Check for LFS pointer header
         if data.len() < 1024 {
             if let Ok(text) = String::from_utf8(data.clone()) {
-                if text.starts_with("version https://git-lfs") {
+                if text.starts_with("version https://git-lfs") || text.starts_with("version https://hawser") {
                     #[cfg(feature = "xet")]
                     {
-                        debug!("Un-smudged LFS pointer, using XET fallback: {}", path.display());
-                        let bridge = LfsXetBridge::new(XetConfig::default()).await?;
-                        return bridge.load_file(path).await;
+                        debug!("Un-smudged LFS pointer, using git2db::lfs fallback: {}", path.display());
+                        let config = git2db::XetConfig::default();
+                        let storage = git2db::LfsStorage::new(&config).await
+                            .map_err(|e| anyhow!("Failed to create LfsStorage: {}", e))?;
+                        return storage.load_file(path).await
+                            .map_err(|e| anyhow!("Failed to load LFS file: {}", e));
                     }
 
                     #[cfg(not(feature = "xet"))]
