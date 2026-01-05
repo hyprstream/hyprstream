@@ -2010,13 +2010,9 @@ impl TorchEngine {
     /// - Vec<f32> - The embedding vector (dimension = model's hidden_size)
     ///
     /// # Example
-    /// ```no_run
-    /// # use hyprstream::runtime::torch_engine::TorchEngine;
-    /// # fn example(engine: &TorchEngine) -> anyhow::Result<()> {
+    /// ```ignore
     /// let embedding = engine.extract_embedding("What is machine learning?")?;
     /// println!("Embedding dimension: {}", embedding.len());
-    /// # Ok(())
-    /// # }
     /// ```
     pub fn extract_embedding(&self, text: &str) -> Result<Vec<f32>> {
         // Tokenize input

@@ -224,17 +224,25 @@ impl XetConfig {
     }
 }
 
-// NOTE: Tests that modify environment variables must run serially to avoid race conditions.
-// Run with: cargo test -p git-xet-filter -- --test-threads=1
+// NOTE: Tests that modify environment variables use ENV_MUTEX to avoid race conditions.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Mutex to serialize tests that modify environment variables
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Helper to clear XET-related env vars
+    fn clear_xet_env_vars() {
+        std::env::remove_var("GIT2DB_XET_ENDPOINT");
+        std::env::remove_var("XETHUB_ENDPOINT");
+    }
 
     #[test]
     fn test_default_config_disabled_without_env() {
-        // Clear env vars for this test
-        std::env::remove_var("GIT2DB_XET_ENDPOINT");
-        std::env::remove_var("XETHUB_ENDPOINT");
+        let _guard = ENV_MUTEX.lock().unwrap();
+        clear_xet_env_vars();
 
         let config = XetConfig::default();
         // XET is disabled by default when no env vars set
@@ -243,6 +251,7 @@ mod tests {
 
     #[test]
     fn test_config_builder() {
+        // No env var access, no lock needed
         let config = XetConfig::new("https://custom.endpoint.dev")
             .with_token("test_token");
 
@@ -253,6 +262,7 @@ mod tests {
 
     #[test]
     fn test_huggingface_config() {
+        // No env var access, no lock needed
         let config = XetConfig::huggingface();
 
         assert_eq!(config.endpoint, HUGGINGFACE_XET_ENDPOINT);
@@ -262,9 +272,8 @@ mod tests {
 
     #[test]
     fn test_for_url_huggingface() {
-        // Clear env vars to test URL pattern matching
-        std::env::remove_var("GIT2DB_XET_ENDPOINT");
-        std::env::remove_var("XETHUB_ENDPOINT");
+        let _guard = ENV_MUTEX.lock().unwrap();
+        clear_xet_env_vars();
 
         // HuggingFace URLs should return huggingface config
         let config = XetConfig::for_url("https://huggingface.co/Qwen/Qwen3-0.6B");
@@ -279,9 +288,8 @@ mod tests {
 
     #[test]
     fn test_for_url_unknown() {
-        // Clear env vars
-        std::env::remove_var("GIT2DB_XET_ENDPOINT");
-        std::env::remove_var("XETHUB_ENDPOINT");
+        let _guard = ENV_MUTEX.lock().unwrap();
+        clear_xet_env_vars();
 
         // Unknown URLs should return None
         let config = XetConfig::for_url("https://github.com/some/repo");
@@ -290,6 +298,9 @@ mod tests {
 
     #[test]
     fn test_for_url_env_override() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        clear_xet_env_vars();
+
         // Set env var - should take priority over URL pattern
         std::env::set_var("XETHUB_ENDPOINT", "https://custom.xet.server");
 
@@ -303,9 +314,8 @@ mod tests {
 
     #[test]
     fn test_for_url_with_trailing_slash() {
-        // Clear env vars
-        std::env::remove_var("GIT2DB_XET_ENDPOINT");
-        std::env::remove_var("XETHUB_ENDPOINT");
+        let _guard = ENV_MUTEX.lock().unwrap();
+        clear_xet_env_vars();
 
         // URLs with trailing slash should still match
         let config = XetConfig::for_url("https://huggingface.co/Qwen/Model/");
@@ -315,6 +325,7 @@ mod tests {
 
     #[test]
     fn test_debug_redacts_token() {
+        // No env var access, no lock needed
         let config = XetConfig::new("https://example.com")
             .with_token("secret_token_12345");
 
@@ -329,6 +340,7 @@ mod tests {
 
     #[test]
     fn test_debug_without_token() {
+        // No env var access, no lock needed
         let config = XetConfig::new("https://example.com");
 
         let debug_str = format!("{:?}", config);

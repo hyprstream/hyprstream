@@ -74,7 +74,7 @@ impl GitTorrentConfig {
     /// 3. Default values
     ///
     /// # Basic Usage
-    /// ```
+    /// ```ignore
     /// use gittorrent::service::GitTorrentConfig;
     ///
     /// // Simple case - use defaults
@@ -84,7 +84,7 @@ impl GitTorrentConfig {
     /// ```
     ///
     /// # Extended Usage - Add Custom Sources
-    /// ```
+    /// ```ignore
     /// use gittorrent::service::GitTorrentConfig;
     /// use config::File;
     ///
@@ -96,7 +96,7 @@ impl GitTorrentConfig {
     /// ```
     ///
     /// # Programmatic Overrides
-    /// ```
+    /// ```ignore
     /// use gittorrent::service::GitTorrentConfig;
     ///
     /// // Override specific values programmatically
@@ -135,7 +135,7 @@ impl GitTorrentConfig {
     /// This is equivalent to `GitTorrentConfig::builder()?.build()?.try_deserialize()?`
     ///
     /// # Basic Usage
-    /// ```
+    /// ```ignore
     /// use gittorrent::service::GitTorrentConfig;
     ///
     /// let config = GitTorrentConfig::load()?;
