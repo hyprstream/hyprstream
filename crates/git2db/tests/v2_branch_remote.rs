@@ -34,10 +34,11 @@ fn init_git_manager_no_shallow() {
 async fn create_test_repo_with_branches(
     path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use git2::Repository;
+    use git2::{Repository, Signature};
 
     let repo = Repository::init(path)?;
-    let sig = repo.signature()?;
+    // Use explicit signature for CI environments without git config
+    let sig = Signature::now("Test User", "test@example.com")?;
 
     // Create initial commit on main
     let tree_id = {
