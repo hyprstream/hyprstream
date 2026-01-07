@@ -69,11 +69,13 @@ pub mod prelude {
         ed25519_to_x25519_pubkey, ed25519_to_x25519_secret, generate_ephemeral_keypair,
     };
     pub use crate::error::{EnvelopeError, EnvelopeResult};
-    pub use crate::service::RpcService;
+    pub use crate::service::{
+        EnvelopeContext, RpcService, ServiceHandle, ServiceRunner, ZmqClient, ZmqService,
+    };
     pub use crate::transport::{AsyncTransport, Transport, TransportConfig};
 
     // Re-export derive macros
-    pub use hyprstream_rpc_derive::{FromCapnp, ToCapnp};
+    pub use hyprstream_rpc_derive::{rpc_method, FromCapnp, ToCapnp};
 }
 
 // Re-export key types at crate root
@@ -90,4 +92,5 @@ pub use envelope::{
     SignedEnvelope, MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
 };
 pub use error::{EnvelopeError, EnvelopeResult};
-pub use hyprstream_rpc_derive::{FromCapnp, ToCapnp};
+pub use hyprstream_rpc_derive::{rpc_method, FromCapnp, ToCapnp};
+pub use service::{EnvelopeContext, ServiceHandle, ServiceRunner, ZmqClient, ZmqService};

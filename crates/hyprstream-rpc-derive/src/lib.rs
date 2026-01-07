@@ -436,3 +436,276 @@ fn is_vec_string_type(ty: &syn::Type) -> bool {
     }
     false
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RPC Method Macro - Generates client method implementations
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Attribute macro that generates RPC client method implementations.
+///
+/// This macro reduces boilerplate by auto-generating the serialize→call→parse pattern
+/// used in ZMQ RPC clients.
+///
+/// # Attributes
+///
+/// - `request` - Path to the Cap'n Proto request schema (e.g., `workers_capnp::runtime_request`)
+/// - `response` - Path to the Cap'n Proto response schema (e.g., `workers_capnp::runtime_response`)
+/// - `variant` - Name of the request union variant to set (e.g., `"version"`)
+/// - `returns` - Name of the response union variant to match (e.g., `"Version"`)
+///
+/// # Simple Variants (no nested builder)
+///
+/// For variants that take a simple value (Text, Void, primitive):
+/// ```ignore
+/// #[rpc_method(
+///     request = workers_capnp::runtime_request,
+///     response = workers_capnp::runtime_response,
+///     variant = "version",         // Maps to set_version(arg)
+///     returns = "Version"          // Maps to Which::Version(v)
+/// )]
+/// async fn worker_version(&self, version: &str) -> Result<VersionResponse>;
+/// ```
+///
+/// For Void variants (no arguments beyond &self):
+/// ```ignore
+/// #[rpc_method(
+///     request = workers_capnp::image_request,
+///     response = workers_capnp::image_response,
+///     variant = "image_fs_info",   // Maps to set_image_fs_info(())
+///     returns = "FsInfo"
+/// )]
+/// async fn image_fs_info(&self) -> Result<Vec<FilesystemUsage>>;
+/// ```
+///
+/// # Complex Variants (nested builder with ToCapnp)
+///
+/// For variants that take a struct (uses `init_*` and ToCapnp::write_to):
+/// ```ignore
+/// #[rpc_method(
+///     request = workers_capnp::runtime_request,
+///     response = workers_capnp::runtime_response,
+///     variant = "run_pod_sandbox", // Maps to init_run_pod_sandbox()
+///     returns = "SandboxId",
+///     complex = true               // Uses init_* instead of set_*
+/// )]
+/// async fn run_pod_sandbox(&self, config: &PodSandboxConfig) -> Result<String>;
+/// ```
+#[proc_macro_attribute]
+pub fn rpc_method(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(attr as RpcMethodArgs);
+    let input = parse_macro_input!(item as syn::TraitItemFn);
+
+    let method_name = &input.sig.ident;
+    let return_type = &input.sig.output;
+    let inputs = &input.sig.inputs;
+
+    // Extract request/response schema paths
+    let request_schema = &args.request;
+    let response_schema = &args.response;
+    let variant_name = &args.variant;
+    let returns_variant = &args.returns;
+    let is_complex = args.complex;
+
+    // Generate setter name (snake_case)
+    let setter_name = if is_complex {
+        format_ident!("init_{}", variant_name)
+    } else {
+        format_ident!("set_{}", variant_name)
+    };
+
+    // Generate response variant (PascalCase)
+    let response_variant = format_ident!("{}", returns_variant);
+
+    // Collect non-self arguments
+    let args_list: Vec<_> = inputs.iter().filter_map(|arg| {
+        if let syn::FnArg::Typed(pat_type) = arg {
+            Some(pat_type)
+        } else {
+            None
+        }
+    }).collect();
+
+    // Generate request building code based on argument count and complexity
+    let request_builder = if args_list.is_empty() {
+        // Void variant - no arguments
+        quote! {
+            req.#setter_name(());
+        }
+    } else if is_complex && args_list.len() == 1 {
+        // Complex variant with single struct argument - use ToCapnp
+        let arg_name = &args_list[0].pat;
+        quote! {
+            {
+                let mut builder = req.#setter_name();
+                hyprstream_rpc::capnp::ToCapnp::write_to(#arg_name, &mut builder);
+            }
+        }
+    } else if args_list.len() == 1 {
+        // Simple variant with single argument
+        let arg_name = &args_list[0].pat;
+        let arg_type = &args_list[0].ty;
+
+        // Check if it's a reference type (&str, &T)
+        if is_reference_type(arg_type) {
+            quote! {
+                req.#setter_name(#arg_name);
+            }
+        } else {
+            quote! {
+                req.#setter_name(#arg_name);
+            }
+        }
+    } else {
+        // Multiple arguments - need custom handling or init_* with multiple setters
+        // For now, generate a compile error asking for manual implementation
+        return syn::Error::new_spanned(
+            &input.sig,
+            "rpc_method with multiple arguments requires manual implementation or complex=true with a single struct"
+        ).to_compile_error().into();
+    };
+
+    // Generate response parsing
+    let response_parser = generate_response_parser(&response_schema, &response_variant, return_type);
+
+    // Generate the full method implementation
+    let expanded = quote! {
+        async fn #method_name(#inputs) #return_type {
+            let id = self.next_id();
+            let payload = hyprstream_rpc::serialize_message(|msg| {
+                let mut req = msg.init_root::<#request_schema::Builder>();
+                req.set_id(id);
+                #request_builder
+            })?;
+            let response = self.call(payload).await?;
+            #response_parser
+        }
+    };
+
+    expanded.into()
+}
+
+/// Arguments for the rpc_method attribute
+struct RpcMethodArgs {
+    request: syn::Path,
+    response: syn::Path,
+    variant: String,
+    returns: String,
+    complex: bool,
+}
+
+impl syn::parse::Parse for RpcMethodArgs {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let mut request = None;
+        let mut response = None;
+        let mut variant = None;
+        let mut returns = None;
+        let mut complex = false;
+
+        while !input.is_empty() {
+            let ident: syn::Ident = input.parse()?;
+            input.parse::<syn::Token![=]>()?;
+
+            match ident.to_string().as_str() {
+                "request" => {
+                    request = Some(input.parse::<syn::Path>()?);
+                }
+                "response" => {
+                    response = Some(input.parse::<syn::Path>()?);
+                }
+                "variant" => {
+                    let lit: syn::LitStr = input.parse()?;
+                    variant = Some(lit.value());
+                }
+                "returns" => {
+                    let lit: syn::LitStr = input.parse()?;
+                    returns = Some(lit.value());
+                }
+                "complex" => {
+                    let lit: syn::LitBool = input.parse()?;
+                    complex = lit.value();
+                }
+                other => {
+                    return Err(syn::Error::new(ident.span(), format!("unknown attribute: {}", other)));
+                }
+            }
+
+            // Consume optional comma
+            if input.peek(syn::Token![,]) {
+                input.parse::<syn::Token![,]>()?;
+            }
+        }
+
+        Ok(RpcMethodArgs {
+            request: request.ok_or_else(|| syn::Error::new(input.span(), "missing 'request' attribute"))?,
+            response: response.ok_or_else(|| syn::Error::new(input.span(), "missing 'response' attribute"))?,
+            variant: variant.ok_or_else(|| syn::Error::new(input.span(), "missing 'variant' attribute"))?,
+            returns: returns.ok_or_else(|| syn::Error::new(input.span(), "missing 'returns' attribute"))?,
+            complex,
+        })
+    }
+}
+
+/// Check if type is a reference (&T, &str, etc.)
+fn is_reference_type(ty: &syn::Type) -> bool {
+    matches!(ty, syn::Type::Reference(_))
+}
+
+/// Generate response parsing code based on return type
+fn generate_response_parser(
+    response_schema: &syn::Path,
+    variant: &syn::Ident,
+    return_type: &syn::ReturnType,
+) -> proc_macro2::TokenStream {
+    // Extract the inner type from Result<T> (reserved for future use with typed responses)
+    let _inner_type = match return_type {
+        syn::ReturnType::Type(_, ty) => {
+            if let syn::Type::Path(type_path) = ty.as_ref() {
+                if let Some(segment) = type_path.path.segments.last() {
+                    if segment.ident == "Result" {
+                        if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                            if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
+                                Some(inner.clone())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
+    // Generate parsing code
+    quote! {
+        {
+            let reader = capnp::serialize::read_message(
+                &mut std::io::Cursor::new(&response),
+                capnp::message::ReaderOptions::new()
+            )?;
+            let resp = reader.get_root::<#response_schema::Reader>()?;
+
+            // Check for error first
+            match resp.which()? {
+                #response_schema::Which::Error(err) => {
+                    let err = err?;
+                    let msg = err.get_message()?.to_str()?;
+                    return Err(anyhow::anyhow!("{}", msg));
+                }
+                #response_schema::Which::#variant(v) => {
+                    let v = v?;
+                    hyprstream_rpc::capnp::FromCapnp::read_from(v)
+                }
+                _ => Err(anyhow::anyhow!(concat!("Expected ", stringify!(#variant), " response"))),
+            }
+        }
+    }
+}

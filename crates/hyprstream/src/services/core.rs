@@ -9,140 +9,39 @@
 //! - `ServiceRunner` unwraps and verifies signatures before dispatching
 //! - Handlers receive `EnvelopeContext` with verified identity
 //! - Services use `ctx.casbin_subject()` for policy checks
+//!
+//! # Note
+//!
+//! The core types (`EnvelopeContext`, `ZmqService`, `ServiceRunner`, `ServiceHandle`, `ZmqClient`)
+//! are now defined in `hyprstream-rpc` and re-exported here for backward compatibility.
+//!
+//! This module provides convenience constructors that use the global ZMQ context.
 
 use crate::zmq::global_context;
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use hyprstream_rpc::prelude::*;
 use std::sync::Arc;
-use tmq::{reply, Multipart, RequestReceiver};
-use tokio::sync::Notify;
-use tracing::{debug, error, info, trace, warn};
 
-/// Context extracted from a verified SignedEnvelope.
-///
-/// This struct is passed to service handlers after the `ServiceRunner`
-/// has verified the envelope signature. Handlers use this for:
-/// - Authorization checks via `casbin_subject()`
-/// - Correlation via `request_id`
-/// - Stream HMAC key derivation via `ephemeral_pubkey`
-///
-/// # Example
-///
-/// ```ignore
-/// fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<Vec<u8>> {
-///     // Check authorization
-///     if !policy_manager.check(&ctx.casbin_subject(), "Model", "infer") {
-///         return Err(anyhow!("unauthorized: {}", ctx.casbin_subject()));
-///     }
-///     // Process request...
-/// }
-/// ```
-#[derive(Debug, Clone)]
-pub struct EnvelopeContext {
-    /// Unique request ID for correlation and logging
-    pub request_id: u64,
+// Re-export core types from hyprstream-rpc
+pub use hyprstream_rpc::service::{
+    EnvelopeContext, ServiceHandle, ServiceRunner as ServiceRunnerBase, ZmqClient as ZmqClientBase,
+    ZmqService,
+};
 
-    /// Verified identity of the requester (after signature verification)
-    pub identity: RequestIdentity,
-
-    /// Ephemeral public key for stream HMAC derivation (if streaming)
-    pub ephemeral_pubkey: Option<[u8; 32]>,
-}
-
-impl EnvelopeContext {
-    /// Create context from a verified SignedEnvelope.
-    ///
-    /// This should only be called after signature verification succeeds.
-    pub fn from_verified(envelope: &SignedEnvelope) -> Self {
-        Self {
-            request_id: envelope.request_id(),
-            identity: envelope.identity().clone(),
-            ephemeral_pubkey: envelope.ephemeral_pubkey().copied(),
-        }
-    }
-
-    /// Get the namespaced Casbin subject for policy checks.
-    ///
-    /// Returns prefixed identities like `"local:alice"`, `"token:bob"`, etc.
-    pub fn casbin_subject(&self) -> String {
-        self.identity.casbin_subject()
-    }
-
-    /// Get the raw user string (without namespace prefix).
-    pub fn user(&self) -> &str {
-        self.identity.user()
-    }
-
-    /// Check if the identity is authenticated (not anonymous).
-    pub fn is_authenticated(&self) -> bool {
-        self.identity.is_authenticated()
-    }
-}
-
-/// Trait for ZMQ-based services
+/// REQ/REP service runner with global ZMQ context.
 ///
-/// Implement this trait to create a service that handles REQ/REP requests.
-/// Services run as async tasks with TMQ for I/O, handlers execute in spawn_blocking.
+/// This is a convenience wrapper around `hyprstream_rpc::ServiceRunner` that
+/// automatically uses the global ZMQ context for `inproc://` connectivity.
 ///
-/// Requires `Sync` because the service is shared via `Arc` for concurrent handler execution.
-///
-/// # Security Model
-///
-/// The `ServiceRunner` unwraps and verifies `SignedEnvelope` before calling handlers.
-/// Handlers receive `EnvelopeContext` with verified identity - no need to re-verify.
-///
-/// # Example
-///
-/// ```ignore
-/// impl ZmqService for MyService {
-///     fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<Vec<u8>> {
-///         // ctx.identity is already verified
-///         info!("Request from {} (id={})", ctx.casbin_subject(), ctx.request_id);
-///         // ...
-///     }
-/// }
-/// ```
-pub trait ZmqService: Send + Sync + 'static {
-    /// Process a request and return a response
-    ///
-    /// # Arguments
-    ///
-    /// * `ctx` - Verified envelope context with identity
-    /// * `payload` - Raw inner request bytes (Cap'n Proto encoded)
-    ///
-    /// Returns raw bytes for the response (Cap'n Proto encoded).
-    ///
-    /// This runs in a blocking task to avoid blocking the async runtime.
-    fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<Vec<u8>>;
-
-    /// Get the name of this service (for logging)
-    fn name(&self) -> &str;
-}
-
-/// REQ/REP service runner
-///
-/// Runs a ZmqService as an async task with TMQ for I/O.
-/// Uses proper async/await with epoll integration instead of blocking threads.
-///
-/// # Envelope Verification
-///
-/// The runner unwraps and verifies `SignedEnvelope` for every request:
-/// 1. Deserialize `SignedEnvelope` from wire bytes
-/// 2. Verify Ed25519 signature against server's public key
-/// 3. Check nonce not replayed (replay protection)
-/// 4. Extract `EnvelopeContext` and dispatch to handler
-///
-/// Invalid/unsigned requests are rejected with an error response.
+/// For direct context control, use `ServiceRunnerBase` from hyprstream-rpc.
 pub struct ServiceRunner {
-    endpoint: String,
-    /// Server's Ed25519 verifying key for signature verification
-    server_pubkey: VerifyingKey,
-    /// Nonce cache for replay protection
-    nonce_cache: Arc<InMemoryNonceCache>,
+    inner: ServiceRunnerBase,
 }
 
 impl ServiceRunner {
     /// Create a new service runner bound to the given endpoint.
+    ///
+    /// Uses the global ZMQ context for `inproc://` connectivity.
     ///
     /// # Arguments
     ///
@@ -150,9 +49,7 @@ impl ServiceRunner {
     /// * `server_pubkey` - Server's Ed25519 public key for verifying request signatures
     pub fn new(endpoint: &str, server_pubkey: VerifyingKey) -> Self {
         Self {
-            endpoint: endpoint.to_string(),
-            server_pubkey,
-            nonce_cache: Arc::new(InMemoryNonceCache::new()),
+            inner: ServiceRunnerBase::new(endpoint, global_context(), server_pubkey),
         }
     }
 
@@ -165,9 +62,12 @@ impl ServiceRunner {
         nonce_cache: Arc<InMemoryNonceCache>,
     ) -> Self {
         Self {
-            endpoint: endpoint.to_string(),
-            server_pubkey,
-            nonce_cache,
+            inner: ServiceRunnerBase::with_nonce_cache(
+                endpoint,
+                global_context(),
+                server_pubkey,
+                nonce_cache,
+            ),
         }
     }
 
@@ -183,232 +83,16 @@ impl ServiceRunner {
     /// Waits for socket binding to complete before returning.
     /// Returns a handle that can be used to stop the service.
     pub async fn run<S: ZmqService>(self, service: S) -> Result<ServiceHandle> {
-        let endpoint = self.endpoint.clone();
-        let server_pubkey = self.server_pubkey;
-        let nonce_cache = self.nonce_cache.clone();
-        let shutdown = Arc::new(Notify::new());
-        let shutdown_clone = shutdown.clone();
-
-        // Create oneshot channel for ready signal
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-
-        // Wrap service in Arc for sharing with spawn_blocking handlers
-        let service = Arc::new(service);
-
-        // Spawn async task (not spawn_blocking - TMQ provides async I/O)
-        let handle = tokio::spawn(async move {
-            if let Err(e) =
-                Self::service_loop_async(endpoint, service, server_pubkey, nonce_cache, shutdown_clone, Some(ready_tx)).await
-            {
-                error!("Service loop error: {}", e);
-            }
-        });
-
-        // Wait for the socket to bind (or get bind error)
-        ready_rx
-            .await
-            .map_err(|_| anyhow!("Service task exited before signaling ready"))??;
-
-        Ok(ServiceHandle {
-            task: Some(handle),
-            shutdown: Some(shutdown),
-        })
-    }
-
-    /// Async service loop using TMQ
-    ///
-    /// The `ready_tx` channel signals when the socket is bound and ready.
-    async fn service_loop_async<S: ZmqService>(
-        endpoint: String,
-        service: Arc<S>,
-        server_pubkey: VerifyingKey,
-        nonce_cache: Arc<InMemoryNonceCache>,
-        shutdown: Arc<Notify>,
-        ready_tx: Option<tokio::sync::oneshot::Sender<Result<()>>>,
-    ) -> Result<()> {
-        // Use the global context for inproc:// connectivity
-        // All ZMQ sockets must use the same context for inproc to work
-        let context = global_context();
-
-        // Create REP socket with TMQ
-        let mut receiver: RequestReceiver = match reply(&*context)
-            .set_linger(0)
-            .bind(&endpoint)
-        {
-            Ok(r) => r,
-            Err(e) => {
-                let err = anyhow!("failed to bind to {}: {}", endpoint, e);
-                if let Some(tx) = ready_tx {
-                    let _ = tx.send(Err(anyhow!("{}", err)));
-                }
-                return Err(err);
-            }
-        };
-
-        info!("{} service bound to {}", service.name(), endpoint);
-
-        // Signal ready AFTER socket is bound
-        if let Some(tx) = ready_tx {
-            if tx.send(Ok(())).is_err() {
-                warn!("{} service ready signal dropped - receiver gone", service.name());
-            }
-        }
-
-        loop {
-            // Use select! for clean shutdown without polling timeouts
-            tokio::select! {
-                biased;
-
-                // Check for shutdown signal
-                _ = shutdown.notified() => {
-                    debug!("{} service received shutdown signal", service.name());
-                    break;
-                }
-
-                // Receive request via TMQ async I/O
-                result = receiver.recv() => {
-                    let (request_msg, sender) = result
-                        .map_err(|e| anyhow!("recv error: {}", e))?;
-
-                    // Extract bytes from multipart message
-                    let request: Vec<u8> = request_msg
-                        .into_iter()
-                        .flat_map(|frame| frame.to_vec())
-                        .collect();
-
-                    trace!(
-                        "{} received request ({} bytes)",
-                        service.name(),
-                        request.len()
-                    );
-
-                    // Unwrap and verify SignedEnvelope
-                    let (ctx, payload) = match Self::unwrap_envelope(&request, &server_pubkey, &*nonce_cache) {
-                        Ok((ctx, payload)) => (ctx, payload),
-                        Err(e) => {
-                            warn!(
-                                "{} envelope verification failed: {}",
-                                service.name(),
-                                e
-                            );
-                            // Send error response
-                            let msg: Multipart = vec![vec![]].into();
-                            receiver = sender
-                                .send(msg)
-                                .await
-                                .map_err(|e| anyhow!("send error: {}", e))?;
-                            continue;
-                        }
-                    };
-
-                    debug!(
-                        "{} verified request from {} (id={})",
-                        service.name(),
-                        ctx.casbin_subject(),
-                        ctx.request_id
-                    );
-
-                    // Process request in spawn_blocking (handler may do blocking work)
-                    let service_clone = service.clone();
-                    let response = tokio::task::spawn_blocking(move || {
-                        service_clone.handle_request(&ctx, &payload)
-                    })
-                    .await
-                    .map_err(|e| anyhow!("spawn_blocking join error: {}", e))?;
-
-                    let response = match response {
-                        Ok(resp) => resp,
-                        Err(e) => {
-                            error!("{} request handling error: {}", service.name(), e);
-                            vec![] // Error response
-                        }
-                    };
-
-                    // Send response via TMQ async I/O
-                    let msg: Multipart = vec![response].into();
-                    receiver = sender
-                        .send(msg)
-                        .await
-                        .map_err(|e| anyhow!("send error: {}", e))?;
-                }
-            }
-        }
-
-        info!("{} service stopped", service.name());
-        Ok(())
-    }
-
-    /// Unwrap and verify a SignedEnvelope from wire bytes.
-    ///
-    /// Returns the verified context and inner payload on success.
-    fn unwrap_envelope(
-        request: &[u8],
-        server_pubkey: &VerifyingKey,
-        nonce_cache: &dyn NonceCache,
-    ) -> Result<(EnvelopeContext, Vec<u8>)> {
-        use capnp::serialize;
-
-        // Deserialize SignedEnvelope from Cap'n Proto
-        let reader = serialize::read_message(
-            &mut std::io::Cursor::new(request),
-            capnp::message::ReaderOptions::default(),
-        )?;
-        let signed_reader = reader.get_root::<hyprstream_rpc::common_capnp::signed_envelope::Reader>()?;
-        let signed = SignedEnvelope::read_from(signed_reader)?;
-
-        // Verify signature and replay protection
-        signed.verify(server_pubkey, nonce_cache)?;
-
-        // Extract context and payload
-        let ctx = EnvelopeContext::from_verified(&signed);
-        let payload = signed.payload().to_vec();
-
-        Ok((ctx, payload))
+        self.inner.run(service).await
     }
 }
-
-/// Handle for a running service
-pub struct ServiceHandle {
-    task: Option<tokio::task::JoinHandle<()>>,
-    /// Shutdown signal using Notify (clean async shutdown)
-    shutdown: Option<Arc<Notify>>,
-}
-
-impl ServiceHandle {
-    /// Create a dummy handle for services that manage their own lifecycle
-    pub fn dummy() -> Self {
-        Self {
-            task: None,
-            shutdown: None,
-        }
-    }
-
-    /// Stop the service gracefully
-    pub async fn stop(self) {
-        // Signal shutdown via Notify
-        if let Some(shutdown) = &self.shutdown {
-            shutdown.notify_one();
-        }
-        // Wait for task to complete
-        if let Some(task) = self.task {
-            let _ = task.await;
-        }
-    }
-
-    /// Check if the service is still running
-    pub fn is_running(&self) -> bool {
-        self.task.as_ref().map(|t| !t.is_finished()).unwrap_or(true)
-    }
-}
-
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Authenticated ZMQ client with automatic request signing.
 ///
-/// This is the unified client for all ZMQ-based services. All requests are
-/// automatically wrapped in `SignedEnvelope` for authentication.
+/// This is a convenience wrapper around `hyprstream_rpc::ZmqClient` that
+/// automatically uses the global ZMQ context for `inproc://` connectivity.
 ///
-/// Uses the global ZMQ context for `inproc://` compatibility with services.
+/// For direct context control, use `ZmqClientBase` from hyprstream-rpc.
 ///
 /// # Usage
 ///
@@ -422,18 +106,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// let repos = client.list().await?;  // RegistryOps method
 /// ```
 pub struct ZmqClient {
-    /// ZMQ endpoint
-    endpoint: String,
-    /// Ed25519 signing key for request authentication
-    signing_key: SigningKey,
-    /// Identity included in requests for authorization
-    identity: RequestIdentity,
-    /// Monotonic request ID counter
-    request_id: AtomicU64,
+    inner: ZmqClientBase,
 }
 
 impl ZmqClient {
     /// Create a new client with signing credentials.
+    ///
+    /// Uses the global ZMQ context for `inproc://` connectivity.
     ///
     /// # Arguments
     /// * `endpoint` - ZMQ endpoint (e.g., `inproc://hyprstream/registry`)
@@ -441,31 +120,28 @@ impl ZmqClient {
     /// * `identity` - Identity to include in requests (for authorization)
     pub fn new(endpoint: &str, signing_key: SigningKey, identity: RequestIdentity) -> Self {
         Self {
-            endpoint: endpoint.to_string(),
-            signing_key,
-            identity,
-            request_id: AtomicU64::new(1),
+            inner: ZmqClientBase::new(endpoint, global_context(), signing_key, identity),
         }
     }
 
     /// Get the next request ID (monotonically increasing).
     pub fn next_id(&self) -> u64 {
-        self.request_id.fetch_add(1, Ordering::Relaxed)
+        self.inner.next_id()
     }
 
     /// Get the endpoint this client is connected to.
     pub fn endpoint(&self) -> &str {
-        &self.endpoint
+        self.inner.endpoint()
     }
 
     /// Get the identity used for requests.
     pub fn identity(&self) -> &RequestIdentity {
-        &self.identity
+        self.inner.identity()
     }
 
     /// Get the signing key.
     pub fn signing_key(&self) -> &SigningKey {
-        &self.signing_key
+        self.inner.signing_key()
     }
 
     /// Sign and send a request.
@@ -475,59 +151,7 @@ impl ZmqClient {
     ///
     /// Uses TMQ with the global context for proper `inproc://` support.
     pub async fn call(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
-        let signed = self.sign_request(payload)?;
-
-        // Use global context for inproc:// connectivity
-        let context = global_context();
-
-        // Create REQ socket using TMQ for proper async I/O
-        let socket = tmq::request(&*context)
-            .connect(&self.endpoint)
-            .map_err(|e| anyhow!("Failed to connect to {}: {}", self.endpoint, e))?;
-
-        trace!("ZmqClient sending {} bytes to {}", signed.len(), self.endpoint);
-
-        // TMQ REQ pattern: send returns RequestReceiver
-        let receiver = socket
-            .send(tmq::Multipart::from(vec![signed]))
-            .await
-            .map_err(|e| anyhow!("Failed to send request: {}", e))?;
-
-        // Receive response
-        let (response, _sender) = receiver
-            .recv()
-            .await
-            .map_err(|e| anyhow!("Failed to receive response: {}", e))?;
-
-        // Extract bytes from multipart message
-        let bytes: Vec<u8> = response
-            .into_iter()
-            .flat_map(|frame| frame.to_vec())
-            .collect();
-
-        trace!("ZmqClient received {} bytes", bytes.len());
-
-        Ok(bytes)
-    }
-
-    /// Wrap a payload in a SignedEnvelope and serialize to bytes.
-    fn sign_request(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
-        use capnp::message::Builder;
-        use capnp::serialize;
-
-        let envelope = RequestEnvelope::new(self.identity.clone(), payload);
-        let signed = SignedEnvelope::new_signed(envelope, &self.signing_key);
-
-        let mut message = Builder::new_default();
-        {
-            let mut builder =
-                message.init_root::<hyprstream_rpc::common_capnp::signed_envelope::Builder>();
-            signed.write_to(&mut builder);
-        }
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-        Ok(bytes)
+        self.inner.call(payload).await
     }
 }
 

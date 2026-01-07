@@ -50,6 +50,13 @@ pub struct HyprConfig {
     /// Git storage and P2P transport configuration
     #[serde(default)]
     pub git2db: git2db::config::Git2DBConfig,
+
+    /// Worker service configuration (optional)
+    ///
+    /// When present, the WorkerService will be started for container/sandbox management.
+    /// This enables Kata-based isolated workload execution.
+    #[serde(default)]
+    pub worker: Option<hyprstream_workers::config::WorkerConfig>,
 }
 
 /// Storage paths and directories configuration
@@ -269,6 +276,7 @@ pub struct HyprConfigBuilder {
     lora: LoRAConfig,
     storage: StorageConfig,
     git2db: git2db::config::Git2DBConfig,
+    worker: Option<hyprstream_workers::config::WorkerConfig>,
 }
 
 impl HyprConfigBuilder {
@@ -282,6 +290,7 @@ impl HyprConfigBuilder {
             lora: LoRAConfig::default(),
             storage: StorageConfig::default(),
             git2db: git2db::config::Git2DBConfig::default(),
+            worker: None,
         }
     }
 
@@ -295,6 +304,7 @@ impl HyprConfigBuilder {
             lora: config.lora,
             storage: config.storage,
             git2db: config.git2db,
+            worker: config.worker,
         }
     }
 
@@ -320,7 +330,14 @@ impl HyprConfigBuilder {
             lora: self.lora,
             storage: self.storage,
             git2db: self.git2db,
+            worker: self.worker,
         }
+    }
+
+    /// Set the worker service configuration
+    pub fn worker(mut self, config: hyprstream_workers::config::WorkerConfig) -> Self {
+        self.worker = Some(config);
+        self
     }
 }
 

@@ -6,12 +6,14 @@ pub mod model;
 pub mod policy;
 pub mod server;
 pub mod training;
+pub mod worker;
 
 pub use flight::FlightArgs;
 pub use git::{GitAction, GitCommand};
 pub use policy::{PolicyCommand, TokenCommand};
 pub use server::{ServerCliArgs, ServerCommand};
 pub use training::{TrainingAction, TrainingCommand};
+pub use worker::{ImageCommand, WorkerAction, WorkerCommand};
 
 use clap::{Subcommand, ValueEnum};
 
@@ -396,6 +398,16 @@ pub enum Commands {
         #[command(subcommand)]
         command: RemoteCommand,
     },
+
+    /// Worker (sandbox/container) management commands
+    ///
+    /// Commands for managing Kata VMs (sandboxes) and OCI containers:
+    /// - `worker list` - List sandboxes and containers
+    /// - `worker run` - Run a container in a sandbox
+    /// - `worker stop` - Stop sandbox or container
+    /// - `worker rm` - Remove sandbox or container
+    /// - `worker images` - Image management
+    Worker(WorkerCommand),
 }
 
 /// Worktree subcommands

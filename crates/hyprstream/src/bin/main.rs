@@ -21,6 +21,11 @@ use hyprstream_core::cli::{
     handle_training_batch, handle_training_checkpoint, handle_training_infer, handle_training_init,
     handle_worktree_add, handle_worktree_info, handle_worktree_list,
     handle_worktree_remove, load_or_generate_signing_key, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
+    // Worker handlers
+    handle_images_df, handle_images_list, handle_images_pull, handle_images_rm,
+    handle_worker_exec, handle_worker_list, handle_worker_restart, handle_worker_rm,
+    handle_worker_run, handle_worker_start, handle_worker_stats, handle_worker_status,
+    handle_worker_stop,
 };
 use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
@@ -29,6 +34,11 @@ use hyprstream_core::storage::{GitRef, ModelRef};
 use hyprstream_core::services::{
     PolicyService, PolicyZmqClient, RegistryClient, RegistryService, RegistryZmqClient, ServiceHandle,
 };
+// Worker service for Kata-based workload execution
+use hyprstream_workers::runtime::WorkerService;
+use hyprstream_workers::{ImageConfig, PoolConfig};
+// ZMQ context for service startup
+use hyprstream_core::zmq::global_context;
 use std::sync::Arc;
 // Tracing imports (feature-gated)
 #[cfg(feature = "otel")]
@@ -257,11 +267,15 @@ fn main() -> Result<()> {
         .build()
         .context("Failed to create registry runtime")?;
 
-    // Start ZMQ-based services: PolicyService first, then RegistryService
+    // Start ZMQ-based services: PolicyService first, then RegistryService, then optional WorkerService
     // Return both client AND service handle so we can stop it on exit
     // Also return keypair for other services (like InferenceService) to use
     use hyprstream_rpc::{SigningKey, VerifyingKey, RequestIdentity};
-    let (registry_client, _service_handle, signing_key, verifying_key): (Arc<dyn RegistryClient>, ServiceHandle, SigningKey, VerifyingKey) = _registry_runtime
+
+    // Clone worker config before moving config into the async block
+    let worker_config = config.worker.clone();
+
+    let (registry_client, _service_handle, _worker_handle, signing_key, verifying_key): (Arc<dyn RegistryClient>, ServiceHandle, Option<ServiceHandle>, SigningKey, VerifyingKey) = _registry_runtime
         .block_on(async {
             let models_dir = config.models_dir();
 
@@ -294,15 +308,32 @@ fn main() -> Result<()> {
             let service_handle = RegistryService::start(&models_dir, verifying_key, policy_client)
                 .await
                 .context("Failed to start registry service")?;
+
+            // Start WorkerService if configured (optional, for Kata-based workload execution)
+            let worker_handle = if let Some(ref wc) = worker_config {
+                info!("Starting WorkerService for container/sandbox management");
+                let handle = WorkerService::start(
+                    wc.pool.clone(),
+                    wc.images.clone(),
+                    global_context(),
+                    verifying_key,
+                )
+                .await
+                .context("Failed to start worker service")?;
+                Some(handle)
+            } else {
+                None
+            };
+
             // Create client with signing credentials for service communication
             // Uses local identity (current OS user) for authorization
             let client = Arc::new(RegistryZmqClient::new(
                 signing_key.clone(),
                 RequestIdentity::local(),
             )) as Arc<dyn RegistryClient>;
-            Ok::<_, anyhow::Error>((client, service_handle, signing_key, verifying_key))
+            Ok::<_, anyhow::Error>((client, service_handle, worker_handle, signing_key, verifying_key))
         })
-        .context("Failed to initialize registry")?;
+        .context("Failed to initialize services")?;
 
     // Create application context with shared registry client
     let ctx = AppContext::with_client(config, registry_client.clone());
@@ -1104,6 +1135,118 @@ fn main() -> Result<()> {
                         }
                         RemoteCommand::Rename { model, old_name, new_name } => {
                             handle_remote_rename(storage, &model, &old_name, &new_name).await
+                        }
+                    }
+                },
+            )?;
+        }
+
+        Commands::Worker(cmd) => {
+            use hyprstream_core::cli::commands::{WorkerAction, ImageCommand};
+            use hyprstream_core::services::WorkerClient;
+
+            let signing_key = signing_key.clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    // Start WorkerService for CLI commands
+                    // Use minimal config without warm pool (no VMs started immediately)
+                    info!("Starting WorkerService for CLI worker commands");
+
+                    // Use user-accessible paths for CLI (not /var/lib which requires root)
+                    let data_dir = dirs::data_local_dir()
+                        .unwrap_or_else(|| std::path::PathBuf::from("."))
+                        .join("hyprstream");
+                    let runtime_dir = dirs::runtime_dir()
+                        .unwrap_or_else(|| std::env::temp_dir())
+                        .join("hyprstream");
+
+                    // Kata VM files location from KATA_BOOT_PATH env var
+                    let kata_boot_path = std::env::var("KATA_BOOT_PATH")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|_| std::path::PathBuf::from("/opt/kata/share/kata-containers"));
+
+                    let pool_config = PoolConfig {
+                        warm_pool_size: 0, // Don't pre-warm VMs for CLI
+                        runtime_dir: runtime_dir.join("sandboxes"),
+                        kernel_path: kata_boot_path.join("vmlinux.container"),
+                        vm_image: kata_boot_path.join("kata-containers.img"),
+                        cloud_init_dir: data_dir.join("cloud-init"),
+                        ..PoolConfig::default()
+                    };
+                    let image_config = ImageConfig {
+                        blobs_dir: data_dir.join("images/blobs"),
+                        bootstrap_dir: data_dir.join("images/bootstrap"),
+                        refs_dir: data_dir.join("images/refs"),
+                        cache_dir: data_dir.join("images/cache"),
+                        runtime_dir: runtime_dir.join("nydus"),
+                        ..ImageConfig::default()
+                    };
+
+                    tracing::debug!(
+                        data_dir = %data_dir.display(),
+                        runtime_dir = %runtime_dir.display(),
+                        "Using CLI-friendly paths for worker service"
+                    );
+
+                    let _worker_handle = WorkerService::start(
+                        pool_config,
+                        image_config,
+                        global_context(),
+                        verifying_key,
+                    )
+                    .await
+                    .context("Failed to start worker service")?;
+
+                    // Create WorkerClient for ZMQ communication with WorkerService
+                    let worker_client = WorkerClient::new(signing_key, RequestIdentity::local());
+
+                    match cmd.action {
+                        WorkerAction::List { sandbox, containers, sandboxes, state, verbose } => {
+                            handle_worker_list(&worker_client, sandbox, containers, sandboxes, state, verbose).await
+                        }
+                        WorkerAction::Run { image, command, sandbox, name, env, workdir, detach, rm } => {
+                            handle_worker_run(&worker_client, &image, command, sandbox, name, env, workdir, detach, rm).await
+                        }
+                        WorkerAction::Stop { id, timeout, force } => {
+                            handle_worker_stop(&worker_client, &id, timeout, force).await
+                        }
+                        WorkerAction::Start { container_id } => {
+                            handle_worker_start(&worker_client, &container_id).await
+                        }
+                        WorkerAction::Restart { id, timeout } => {
+                            handle_worker_restart(&worker_client, &id, timeout).await
+                        }
+                        WorkerAction::Rm { ids, force, volumes: _ } => {
+                            handle_worker_rm(&worker_client, ids, force).await
+                        }
+                        WorkerAction::Status { id, verbose } => {
+                            handle_worker_status(&worker_client, &id, verbose).await
+                        }
+                        WorkerAction::Stats { ids, stream: _, no_header } => {
+                            handle_worker_stats(&worker_client, ids, no_header).await
+                        }
+                        WorkerAction::Exec { container_id, command, timeout } => {
+                            handle_worker_exec(&worker_client, &container_id, command, timeout).await
+                        }
+                        WorkerAction::Images(img_cmd) => {
+                            match img_cmd {
+                                ImageCommand::List { verbose, filter: _ } => {
+                                    handle_images_list(&worker_client, verbose).await
+                                }
+                                ImageCommand::Pull { image, username, password } => {
+                                    handle_images_pull(&worker_client, &image, username, password).await
+                                }
+                                ImageCommand::Rm { images, force } => {
+                                    handle_images_rm(&worker_client, images, force).await
+                                }
+                                ImageCommand::Df => {
+                                    handle_images_df(&worker_client).await
+                                }
+                            }
                         }
                     }
                 },

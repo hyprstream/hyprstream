@@ -58,6 +58,7 @@ git2db = { path = "../git2db", features = ["overlayfs"] }  # High-level git libr
 hyprstream-rpc = { path = "../hyprstream-rpc" }  # RPC infrastructure (Cap'n Proto + ZMQ)
 hyprstream-flight = { path = "../hyprstream-flight" }  # Flight SQL server and client
 hyprstream-metrics = { path = "../hyprstream-metrics" }  # Metrics storage (for RegistryClient trait)
+hyprstream-workers = { path = "../hyprstream-workers" }  # Worker runtime (Kata containers)
 gittorrent = { workspace = true, optional = true }  # P2P transport
 clap.workspace = true
 tracing.workspace = true
@@ -70,6 +71,7 @@ opentelemetry-stdout = { workspace = true, optional = true }
 parking_lot.workspace = true
 num_cpus.workspace = true
 once_cell.workspace = true  # For global GitService singleton
+dirs = "5"  # User directory paths for CLI
 
 # Build dependencies
 cxx.workspace = true

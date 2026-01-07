@@ -62,6 +62,7 @@ pub mod model;
 pub mod policy;
 pub mod registry;
 pub mod rpc_types;
+pub mod worker;
 
 pub use core::{
     EnvelopeContext, ServiceHandle, ServiceRunner, ZmqClient, ZmqService,
@@ -81,3 +82,4 @@ pub use model::{
     LoadedModelInfo, ModelHealthInfo, ModelService, ModelServiceConfig, ModelStatusInfo,
     ModelZmqClient, MODEL_ENDPOINT,
 };
+pub use worker::WorkerClient;
