@@ -60,7 +60,7 @@ pub use error::WorkerError;
 pub use runtime::{WorkerService, RuntimeService, RuntimeZmq};
 pub use image::{ImageService, ImageZmq, RafsStore};
 pub use workflow::{WorkflowService, WorkflowOps, WorkflowZmq};
-pub use events::EventBroker;
+pub use events::{start_event_service, EventServiceHandle, EventPublisher, EventSubscriber, endpoints};
 
 /// Generated Cap'n Proto code
 #[allow(dead_code)]

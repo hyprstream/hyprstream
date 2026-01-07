@@ -36,7 +36,7 @@ use hyprstream_core::services::{
 };
 // Worker service for Kata-based workload execution
 use hyprstream_workers::runtime::WorkerService;
-use hyprstream_workers::{ImageConfig, PoolConfig};
+use hyprstream_workers::{ImageConfig, PoolConfig, start_event_service, EventServiceHandle};
 // ZMQ context for service startup
 use hyprstream_core::zmq::global_context;
 use std::sync::Arc;
@@ -275,7 +275,7 @@ fn main() -> Result<()> {
     // Clone worker config before moving config into the async block
     let worker_config = config.worker.clone();
 
-    let (registry_client, _service_handle, _worker_handle, signing_key, verifying_key): (Arc<dyn RegistryClient>, ServiceHandle, Option<ServiceHandle>, SigningKey, VerifyingKey) = _registry_runtime
+    let (registry_client, _service_handle, _worker_handle, _event_handle, signing_key, verifying_key): (Arc<dyn RegistryClient>, ServiceHandle, Option<ServiceHandle>, EventServiceHandle, SigningKey, VerifyingKey) = _registry_runtime
         .block_on(async {
             let models_dir = config.models_dir();
 
@@ -283,6 +283,11 @@ fn main() -> Result<()> {
             let keys_dir = models_dir.join(".registry").join("keys");
             let signing_key = load_or_generate_signing_key(&keys_dir).await?;
             let verifying_key = signing_key.verifying_key();
+
+            // Start EventService FIRST (event bus must be running before services that publish events)
+            // Uses XPUB/XSUB proxy pattern for efficient message distribution
+            let event_handle = start_event_service(global_context())
+                .context("Failed to start event service")?;
 
             // Initialize policy manager for authorization
             // Note: Policy templates should be applied explicitly using CLI commands:
@@ -295,7 +300,7 @@ fn main() -> Result<()> {
                     .context("Failed to initialize policy manager")?
             );
 
-            // Start PolicyService FIRST (runs on multi-threaded runtime where block_in_place works)
+            // Start PolicyService (runs on multi-threaded runtime where block_in_place works)
             // This service wraps PolicyManager and exposes it over ZMQ
             let _policy_handle = PolicyService::start(policy_manager, verifying_key)
                 .await
@@ -331,7 +336,7 @@ fn main() -> Result<()> {
                 signing_key.clone(),
                 RequestIdentity::local(),
             )) as Arc<dyn RegistryClient>;
-            Ok::<_, anyhow::Error>((client, service_handle, worker_handle, signing_key, verifying_key))
+            Ok::<_, anyhow::Error>((client, service_handle, worker_handle, event_handle, signing_key, verifying_key))
         })
         .context("Failed to initialize services")?;
 
@@ -1255,10 +1260,15 @@ fn main() -> Result<()> {
 
     };
 
-    // Gracefully stop registry service before exiting
+    // Gracefully stop services before exiting (reverse order of startup)
     _registry_runtime.block_on(async {
         _service_handle.stop().await;
     });
+
+    // Stop EventService (uses blocking stop, not async)
+    if let Err(e) = _event_handle.stop() {
+        tracing::warn!("Failed to stop event service: {}", e);
+    }
 
     Ok(())
 }
