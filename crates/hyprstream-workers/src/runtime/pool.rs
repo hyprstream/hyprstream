@@ -14,7 +14,7 @@ use kata_hypervisor::ch::CloudHypervisor;
 #[cfg(feature = "dragonball")]
 use kata_hypervisor::dragonball::Dragonball;
 use kata_hypervisor::Hypervisor;
-use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
+use kata_types::config::hypervisor::{Hypervisor as HypervisorConfig, RootlessUser};
 use kata_types::rootless;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -285,15 +285,6 @@ impl SandboxPool {
         // 6. Prepare the VM (creates configuration)
         // Note: Annotations are passed to prepare_vm, config was set via set_hypervisor_config()
         let annotations = sandbox.annotations.clone();
-        tracing::debug!(
-            sandbox_id = %sandbox.id,
-            kernel = %self.config.kernel_path.display(),
-            image = %self.config.vm_image.display(),
-            hypervisor_path = %self.config.hypervisor_path.display(),
-            vcpus = self.config.vm_cpus,
-            memory_mb = self.config.vm_memory_mb,
-            "Preparing VM with configuration"
-        );
         hypervisor
             .prepare_vm(&sandbox.id, None, &annotations, None)
             .await
@@ -369,10 +360,20 @@ impl SandboxPool {
         let mut config = HypervisorConfig::default();
 
         // VM configuration - use configured path or default based on hypervisor type
+        // Note: Kata's canonicalize() requires an absolute path, so we must resolve from PATH
         config.path = if self.config.hypervisor_path.as_os_str().is_empty() {
-            // Default path based on hypervisor type
+            // Default path based on hypervisor type - resolve from PATH
             match self.config.hypervisor {
-                HypervisorType::CloudHypervisor => "cloud-hypervisor".to_string(),
+                HypervisorType::CloudHypervisor => {
+                    match which::which("cloud-hypervisor") {
+                        Ok(path) => path.to_string_lossy().to_string(),
+                        Err(e) => {
+                            tracing::warn!("Failed to find cloud-hypervisor in PATH: {}", e);
+                            // Fallback to name, will fail at Kata's canonicalize() if not found
+                            "cloud-hypervisor".to_string()
+                        }
+                    }
+                }
                 #[cfg(feature = "dragonball")]
                 HypervisorType::Dragonball => String::new(), // Built-in, no path needed
             }
@@ -386,7 +387,35 @@ impl SandboxPool {
 
         // Resource limits
         config.cpu_info.default_vcpus = self.config.vm_cpus as f32;
+        config.cpu_info.default_maxvcpus = self.config.vm_cpus;
         config.memory_info.default_memory = self.config.vm_memory_mb as u32;
+
+        // Configure rootless user if running in rootless mode
+        if rootless::is_rootless() {
+            // Get current user info
+            let uid = nix::unistd::getuid().as_raw();
+            let gid = nix::unistd::getgid().as_raw();
+            let username = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
+
+            // Get supplementary groups
+            let groups = nix::unistd::getgroups()
+                .map(|gs| gs.into_iter().map(|g| g.as_raw()).collect())
+                .unwrap_or_else(|_| vec![gid]);
+
+            config.security_info.rootless = true;
+            config.security_info.rootless_user = Some(RootlessUser {
+                uid,
+                gid,
+                groups,
+                user_name: username,
+            });
+
+            tracing::debug!(
+                uid = uid,
+                gid = gid,
+                "Configured rootless user for hypervisor"
+            );
+        }
 
         config
     }

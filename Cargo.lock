@@ -3787,6 +3787,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "env_home"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7f84e12ccf0a7ddc17a6c41c93326024c42920d7ee630d04950e6926645c0fe"
+
+[[package]]
 name = "env_logger"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3872,7 +3878,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "377fa591135fbe23396a18e2655a6d5481bf7c5823cdfa3cc81b01a229cbe640"
 dependencies = [
  "libc",
- "vmm-sys-util 0.12.1",
+ "vmm-sys-util 0.15.0",
 ]
 
 [[package]]
@@ -5416,6 +5422,7 @@ dependencies = [
  "tracing",
  "uuid 1.18.1",
  "walkdir",
+ "which 7.0.3",
  "zmq",
 ]
 
@@ -9254,7 +9261,7 @@ dependencies = [
  "prost 0.8.0",
  "prost-types 0.8.0",
  "tempfile",
- "which",
+ "which 4.4.2",
 ]
 
 [[package]]
@@ -9341,7 +9348,7 @@ dependencies = [
  "protobuf-support",
  "tempfile",
  "thiserror 1.0.69",
- "which",
+ "which 4.4.2",
 ]
 
 [[package]]
@@ -12846,10 +12853,10 @@ dependencies = [
  "kvm-ioctls 0.24.0",
  "libc",
  "log",
- "thiserror 1.0.69",
+ "thiserror 2.0.17",
  "vfio-bindings 0.6.1",
  "vm-memory 0.14.1",
- "vmm-sys-util 0.10.0",
+ "vmm-sys-util 0.15.0",
 ]
 
 [[package]]
@@ -13231,6 +13238,18 @@ dependencies = [
  "home",
  "once_cell",
  "rustix 0.38.44",
+]
+
+[[package]]
+name = "which"
+version = "7.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24d643ce3fd3e5b54854602a080f34fb10ab75e0b813ee32d00ca2b44fa74762"
+dependencies = [
+ "either",
+ "env_home",
+ "rustix 1.1.2",
+ "winsafe",
 ]
 
 [[package]]
@@ -13823,6 +13842,12 @@ dependencies = [
  "cfg-if 1.0.3",
  "windows-sys 0.48.0",
 ]
+
+[[package]]
+name = "winsafe"
+version = "0.0.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d135d17ab770252ad95e9a872d365cf3090e3be864a34ab46f48555993efc904"
 
 [[package]]
 name = "wit-bindgen"

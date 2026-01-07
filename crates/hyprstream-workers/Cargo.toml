@@ -43,6 +43,7 @@ glob = { workspace = true }
 
 # System (override workspace to add required features)
 nix = { version = "0.27", features = ["process", "signal", "user"] }
+which = "7"
 
 # Nydus libraries (Dragonfly-native blob fetching)
 nydus-api = { path = "../../../nydus/api" }
