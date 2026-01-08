@@ -32,13 +32,14 @@ fn init_git_manager_no_shallow() {
 
 /// Helper to create a simple test repository
 async fn create_test_repo(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    use git2::Repository;
+    use git2::{Repository, Signature};
 
     // Initialize git repo
     let repo = Repository::init(path)?;
 
     // Create initial commit
-    let sig = repo.signature()?;
+    // Use explicit signature for CI environments without git config
+    let sig = Signature::now("Test User", "test@example.com")?;
     let tree_id = {
         let mut index = repo.index()?;
 
@@ -472,9 +473,10 @@ async fn test_worktree_status_ahead_behind() {
     let test_repo_dir = temp_dir.path().join("test-repo");
     fs::create_dir(&test_repo_dir).unwrap();
 
-    use git2::Repository;
+    use git2::{Repository, Signature};
     let repo = Repository::init(&test_repo_dir).unwrap();
-    let sig = repo.signature().unwrap();
+    // Use explicit signature for CI environments without git config
+    let sig = Signature::now("Test User", "test@example.com").unwrap();
 
     // Create initial commit
     let mut index = repo.index().unwrap();

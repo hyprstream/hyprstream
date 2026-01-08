@@ -34,10 +34,11 @@ fn init_git_manager_no_shallow() {
 async fn create_test_repo_with_branches(
     path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use git2::Repository;
+    use git2::{Repository, Signature};
 
     let repo = Repository::init(path)?;
-    let sig = repo.signature()?;
+    // Use explicit signature for CI environments without git config
+    let sig = Signature::now("Test User", "test@example.com")?;
 
     // Create initial commit on main
     let tree_id = {
@@ -137,8 +138,8 @@ async fn test_branch_create_and_checkout() {
     let repo = registry.repo(&repo_id).unwrap();
     let mgr = repo.branch();
 
-    // Create new branch from main
-    mgr.create("new-feature", Some("main")).await.unwrap();
+    // Create new branch from current HEAD (None = HEAD)
+    mgr.create::<&str>("new-feature", None).await.unwrap();
 
     // List branches - should include new branch
     let branches = mgr.list().await.unwrap();
@@ -175,11 +176,14 @@ async fn test_branch_delete() {
     let repo = registry.repo(&repo_id).unwrap();
     let mgr = repo.branch();
 
-    // Create and checkout a temporary branch
-    mgr.create("temp-branch", Some("main")).await.unwrap();
+    // Get the current branch name (could be main or master)
+    let default_branch = mgr.current().await.unwrap().unwrap().name.clone();
 
-    // Switch back to main
-    mgr.checkout("main").await.unwrap();
+    // Create and checkout a temporary branch from HEAD
+    mgr.create::<&str>("temp-branch", None).await.unwrap();
+
+    // Switch back to default branch
+    mgr.checkout(&default_branch).await.unwrap();
 
     // Remove the temporary branch (force=true since no divergent commits)
     mgr.remove("temp-branch", true).await.unwrap();
@@ -237,8 +241,8 @@ async fn test_branch_rename() {
     let repo = registry.repo(&repo_id).unwrap();
     let mgr = repo.branch();
 
-    // Create a test branch
-    mgr.create("old-name", Some("main")).await.unwrap();
+    // Create a test branch from HEAD
+    mgr.create::<&str>("old-name", None).await.unwrap();
 
     // Rename it
     mgr.rename(Some("old-name"), "new-name").await.unwrap();
