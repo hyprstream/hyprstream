@@ -68,7 +68,9 @@ impl PolicyService {
     ) -> Result<crate::services::ServiceHandle> {
         let service = Self::new(policy_manager);
         let runner = ServiceRunner::new(endpoint, server_pubkey);
-        runner.run(service).await
+        let handle = runner.run(service).await?;
+        tracing::info!("PolicyService started at {}", endpoint);
+        Ok(handle)
     }
 
     /// Parse operation from string

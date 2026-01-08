@@ -1,6 +1,7 @@
 //! Event triggers and handlers for workflow execution
 //!
 //! Provides the EventHandler trait for testable, composable event handling.
+//! Uses ReceivedEvent from the events module for EventService integration.
 
 #![allow(dead_code)] // Handlers will be used when event bus is implemented
 
@@ -9,11 +10,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::error::Result;
+use crate::events::{ReceivedEvent, WorkerEvent};
 
-use super::WorkflowId;
 use super::parser::InputDef;
+use super::WorkflowId;
 
-/// Event trigger types
+// ═══════════════════════════════════════════════════════════════════════════════
+// Trigger Configuration Types
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Event trigger types for workflow configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EventTrigger {
     /// Repository events - triggers rescan + registered workflows
@@ -46,6 +52,14 @@ pub enum EventTrigger {
         inputs: HashMap<String, InputDef>,
     },
 
+    /// Worker lifecycle events (sandbox/container)
+    WorkerLifecycle {
+        /// Event filter: "started", "stopped", or None for all
+        event_filter: Option<String>,
+        /// Entity type: "sandbox", "container", or None for all
+        entity_type: Option<String>,
+    },
+
     /// Custom topic subscription
     Custom {
         /// Topic pattern
@@ -72,71 +86,9 @@ pub enum RepoEventType {
     Tag,
 }
 
-/// Event envelope for routing
-#[derive(Debug, Clone)]
-pub struct EventEnvelope {
-    /// Event topic (e.g., "git2db.abc123.push")
-    pub topic: String,
-
-    /// Event payload
-    pub payload: EventPayload,
-
-    /// Event timestamp
-    pub timestamp: chrono::DateTime<chrono::Utc>,
-}
-
-/// Event payload types
-#[derive(Debug, Clone)]
-pub enum EventPayload {
-    /// Repository cloned
-    RepositoryCloned {
-        repo_id: String,
-        name: String,
-        url: String,
-    },
-
-    /// Repository push
-    RepositoryPush {
-        repo_id: String,
-        branch: String,
-        commit_hash: String,
-    },
-
-    /// Repository commit
-    RepositoryCommit {
-        repo_id: String,
-        hash: String,
-        message: String,
-    },
-
-    /// Repository merge
-    RepositoryMerge {
-        repo_id: String,
-        source_branch: String,
-        target_branch: String,
-    },
-
-    /// Repository tag
-    RepositoryTag {
-        repo_id: String,
-        tag_name: String,
-        commit_hash: String,
-    },
-
-    /// Training progress
-    TrainingProgress {
-        model_id: String,
-        step: u32,
-        loss: f64,
-    },
-
-    /// Metrics breach
-    MetricsBreach {
-        metric_name: String,
-        value: f64,
-        threshold: f64,
-    },
-}
+// ═══════════════════════════════════════════════════════════════════════════════
+// Handler Result
+// ═══════════════════════════════════════════════════════════════════════════════
 
 /// Handler result actions
 #[derive(Debug)]
@@ -148,61 +100,118 @@ pub enum HandlerResult {
     },
 
     /// Rescan repository for workflows
-    Rescan {
-        repo_id: String,
-    },
+    Rescan { repo_id: String },
 
     /// No action needed
     Ignored,
 }
 
-/// Event handler trait for testable, composable handlers
+// ═══════════════════════════════════════════════════════════════════════════════
+// Event Handler Trait (uses ReceivedEvent from EventService)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Event handler trait for testable, composable handlers.
+///
+/// Handlers receive ReceivedEvent from the EventService subscriber
+/// and decide whether to dispatch workflows based on the event.
 #[async_trait]
 pub trait EventHandler: Send + Sync {
-    /// Event types this handler processes
-    fn handles(&self) -> &[&str];
+    /// Check if this handler should process the event.
+    ///
+    /// Called for every event; should be fast (topic/type checking only).
+    fn matches(&self, event: &ReceivedEvent) -> bool;
 
-    /// Fine-grained matching (branch patterns, thresholds, etc.)
-    fn matches(&self, event: &EventEnvelope) -> bool;
-
-    /// Process the event
-    async fn handle(&self, event: &EventEnvelope) -> Result<HandlerResult>;
+    /// Process the event and return an action.
+    ///
+    /// Only called if `matches()` returned true.
+    async fn handle(&self, event: &ReceivedEvent) -> Result<HandlerResult>;
 }
 
-/// Push event handler
-pub struct PushHandler {
+// ═══════════════════════════════════════════════════════════════════════════════
+// Worker Lifecycle Handler
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Handler for worker lifecycle events (sandbox/container started/stopped).
+///
+/// Triggers workflows when sandboxes or containers reach specific states.
+pub struct WorkerLifecycleHandler {
     workflow_id: WorkflowId,
-    branch_pattern: Option<String>,
+    /// Filter by event type: "started", "stopped", or None for all
+    event_filter: Option<String>,
+    /// Filter by entity type: "sandbox", "container", or None for all
+    entity_type: Option<String>,
 }
 
-impl PushHandler {
-    /// Create a new push handler
-    pub fn new(workflow_id: WorkflowId, branch_pattern: Option<String>) -> Self {
+impl WorkerLifecycleHandler {
+    /// Create a new worker lifecycle handler
+    pub fn new(
+        workflow_id: WorkflowId,
+        event_filter: Option<String>,
+        entity_type: Option<String>,
+    ) -> Self {
         Self {
             workflow_id,
-            branch_pattern,
+            event_filter,
+            entity_type,
         }
+    }
+
+    /// Create a handler for all sandbox events
+    pub fn sandboxes(workflow_id: WorkflowId) -> Self {
+        Self::new(workflow_id, None, Some("sandbox".to_string()))
+    }
+
+    /// Create a handler for all container events
+    pub fn containers(workflow_id: WorkflowId) -> Self {
+        Self::new(workflow_id, None, Some("container".to_string()))
+    }
+
+    /// Create a handler for started events only
+    pub fn on_started(workflow_id: WorkflowId) -> Self {
+        Self::new(workflow_id, Some("started".to_string()), None)
+    }
+
+    /// Create a handler for stopped events only
+    pub fn on_stopped(workflow_id: WorkflowId) -> Self {
+        Self::new(workflow_id, Some("stopped".to_string()), None)
     }
 }
 
 #[async_trait]
-impl EventHandler for PushHandler {
-    fn handles(&self) -> &[&str] {
-        &["push"]
-    }
-
-    fn matches(&self, event: &EventEnvelope) -> bool {
-        if let EventPayload::RepositoryPush { branch, .. } = &event.payload {
-            self.branch_pattern.as_ref().map_or(true, |pattern| {
-                glob_match(pattern, branch)
-            })
-        } else {
-            false
+impl EventHandler for WorkerLifecycleHandler {
+    fn matches(&self, event: &ReceivedEvent) -> bool {
+        // Only handle worker events
+        if event.source != "worker" {
+            return false;
         }
+
+        // Check event type filter
+        if let Some(ref filter) = self.event_filter {
+            if &event.event_type != filter {
+                return false;
+            }
+        }
+
+        // Check entity type filter
+        if let Some(ref entity_type) = self.entity_type {
+            if let Some(ref worker_event) = event.worker_event {
+                match (entity_type.as_str(), worker_event) {
+                    ("sandbox", WorkerEvent::SandboxStarted(_))
+                    | ("sandbox", WorkerEvent::SandboxStopped(_)) => {}
+                    ("container", WorkerEvent::ContainerStarted(_))
+                    | ("container", WorkerEvent::ContainerStopped(_)) => {}
+                    _ => return false,
+                }
+            } else {
+                return false;
+            }
+        }
+
+        true
     }
 
-    async fn handle(&self, event: &EventEnvelope) -> Result<HandlerResult> {
-        let inputs = extract_inputs(event);
+    async fn handle(&self, event: &ReceivedEvent) -> Result<HandlerResult> {
+        let inputs = event.extract_inputs();
         Ok(HandlerResult::Dispatch {
             workflow_id: self.workflow_id.clone(),
             inputs,
@@ -210,40 +219,37 @@ impl EventHandler for PushHandler {
     }
 }
 
-/// Metrics breach handler
-pub struct MetricsBreachHandler {
+// ═══════════════════════════════════════════════════════════════════════════════
+// Topic Pattern Handler
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Handler that matches events by topic pattern.
+///
+/// Useful for custom event routing or debugging.
+pub struct TopicPatternHandler {
     workflow_id: WorkflowId,
-    metric_name: String,
-    threshold: f64,
+    /// Topic prefix or exact match
+    topic_pattern: String,
 }
 
-impl MetricsBreachHandler {
-    /// Create a new metrics breach handler
-    pub fn new(workflow_id: WorkflowId, metric_name: String, threshold: f64) -> Self {
+impl TopicPatternHandler {
+    /// Create a new topic pattern handler
+    pub fn new(workflow_id: WorkflowId, topic_pattern: String) -> Self {
         Self {
             workflow_id,
-            metric_name,
-            threshold,
+            topic_pattern,
         }
     }
 }
 
 #[async_trait]
-impl EventHandler for MetricsBreachHandler {
-    fn handles(&self) -> &[&str] {
-        &["metrics_breach"]
+impl EventHandler for TopicPatternHandler {
+    fn matches(&self, event: &ReceivedEvent) -> bool {
+        event.matches_pattern(&self.topic_pattern)
     }
 
-    fn matches(&self, event: &EventEnvelope) -> bool {
-        if let EventPayload::MetricsBreach { metric_name, value, threshold } = &event.payload {
-            metric_name == &self.metric_name && *value >= *threshold
-        } else {
-            false
-        }
-    }
-
-    async fn handle(&self, event: &EventEnvelope) -> Result<HandlerResult> {
-        let inputs = extract_inputs(event);
+    async fn handle(&self, event: &ReceivedEvent) -> Result<HandlerResult> {
+        let inputs = event.extract_inputs();
         Ok(HandlerResult::Dispatch {
             workflow_id: self.workflow_id.clone(),
             inputs,
@@ -251,12 +257,12 @@ impl EventHandler for MetricsBreachHandler {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
 // Helpers
-// ─────────────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
 
 /// Simple glob pattern matching
-fn glob_match(pattern: &str, text: &str) -> bool {
+pub fn glob_match(pattern: &str, text: &str) -> bool {
     // Simple implementation: * matches any sequence
     if pattern == "*" {
         return true;
@@ -275,37 +281,6 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     pattern == text
 }
 
-/// Extract inputs from event for workflow dispatch
-fn extract_inputs(event: &EventEnvelope) -> HashMap<String, String> {
-    let mut inputs = HashMap::new();
-
-    match &event.payload {
-        EventPayload::RepositoryPush { repo_id, branch, commit_hash } => {
-            inputs.insert("repo_id".to_string(), repo_id.clone());
-            inputs.insert("branch".to_string(), branch.clone());
-            inputs.insert("commit".to_string(), commit_hash.clone());
-        }
-        EventPayload::RepositoryCommit { repo_id, hash, message } => {
-            inputs.insert("repo_id".to_string(), repo_id.clone());
-            inputs.insert("commit".to_string(), hash.clone());
-            inputs.insert("message".to_string(), message.clone());
-        }
-        EventPayload::TrainingProgress { model_id, step, loss } => {
-            inputs.insert("model_id".to_string(), model_id.clone());
-            inputs.insert("step".to_string(), step.to_string());
-            inputs.insert("loss".to_string(), loss.to_string());
-        }
-        EventPayload::MetricsBreach { metric_name, value, threshold } => {
-            inputs.insert("metric".to_string(), metric_name.clone());
-            inputs.insert("value".to_string(), value.to_string());
-            inputs.insert("threshold".to_string(), threshold.to_string());
-        }
-        _ => {}
-    }
-
-    inputs
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,5 +291,32 @@ mod tests {
         assert!(glob_match("*", "anything"));
         assert!(glob_match("feature/*", "feature/foo"));
         assert!(!glob_match("main", "develop"));
+    }
+
+    #[test]
+    fn test_worker_lifecycle_handler_matches() {
+        // Create a handler for sandbox started events
+        let handler =
+            WorkerLifecycleHandler::new("test:wf".to_string(), Some("started".to_string()), None);
+
+        // Create test events
+        let started_event = ReceivedEvent::from_message("worker.sandbox123.started", &[]);
+        let stopped_event = ReceivedEvent::from_message("worker.sandbox123.stopped", &[]);
+        let other_event = ReceivedEvent::from_message("registry.repo456.push", &[]);
+
+        assert!(handler.matches(&started_event));
+        assert!(!handler.matches(&stopped_event));
+        assert!(!handler.matches(&other_event));
+    }
+
+    #[test]
+    fn test_topic_pattern_handler_matches() {
+        let handler = TopicPatternHandler::new("test:wf".to_string(), "worker.".to_string());
+
+        let worker_event = ReceivedEvent::from_message("worker.sandbox123.started", &[]);
+        let registry_event = ReceivedEvent::from_message("registry.repo456.push", &[]);
+
+        assert!(handler.matches(&worker_event));
+        assert!(!handler.matches(&registry_event));
     }
 }

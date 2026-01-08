@@ -17,6 +17,13 @@ use hyprstream_rpc::service::{EnvelopeContext, ServiceHandle, ServiceRunner, Zmq
 
 use crate::config::{ImageConfig, PoolConfig};
 use crate::error::{Result, WorkerError};
+use crate::events::{
+    EventPublisher,
+    // Event types and serialization helpers
+    ContainerStarted, ContainerStopped, SandboxStarted, SandboxStopped,
+    serialize_container_started, serialize_container_stopped,
+    serialize_sandbox_started, serialize_sandbox_stopped,
+};
 use crate::image::RafsStore;
 use crate::workers_capnp;
 
@@ -51,6 +58,9 @@ pub struct WorkerService {
 
     /// Captured runtime handle for async operations in sync handlers
     runtime_handle: tokio::runtime::Handle,
+
+    /// Event publisher for lifecycle events (sandbox/container started/stopped)
+    event_publisher: tokio::sync::Mutex<EventPublisher>,
 }
 
 impl WorkerService {
@@ -61,20 +71,25 @@ impl WorkerService {
         pool_config: PoolConfig,
         image_config: ImageConfig,
         rafs_store: Arc<RafsStore>,
-    ) -> Self {
+        context: Arc<zmq::Context>,
+    ) -> AnyhowResult<Self> {
         let sandbox_pool = Arc::new(SandboxPool::new(
             pool_config,
             image_config,
             rafs_store.clone(),
         ));
 
-        Self {
+        // Create event publisher for worker lifecycle events
+        let event_publisher = EventPublisher::new(&context, "worker")?;
+
+        Ok(Self {
             sandbox_pool,
             rafs_store,
             containers: RwLock::new(HashMap::new()),
             container_sandbox_map: RwLock::new(HashMap::new()),
             runtime_handle: tokio::runtime::Handle::current(),
-        }
+            event_publisher: tokio::sync::Mutex::new(event_publisher),
+        })
     }
 
     /// Create a new WorkerService with an explicit runtime handle
@@ -85,20 +100,25 @@ impl WorkerService {
         image_config: ImageConfig,
         rafs_store: Arc<RafsStore>,
         runtime_handle: tokio::runtime::Handle,
-    ) -> Self {
+        context: Arc<zmq::Context>,
+    ) -> AnyhowResult<Self> {
         let sandbox_pool = Arc::new(SandboxPool::new(
             pool_config,
             image_config,
             rafs_store.clone(),
         ));
 
-        Self {
+        // Create event publisher for worker lifecycle events
+        let event_publisher = EventPublisher::new(&context, "worker")?;
+
+        Ok(Self {
             sandbox_pool,
             rafs_store,
             containers: RwLock::new(HashMap::new()),
             container_sandbox_map: RwLock::new(HashMap::new()),
             runtime_handle,
-        }
+            event_publisher: tokio::sync::Mutex::new(event_publisher),
+        })
     }
 
     /// Initialize the service (start warm pool)
@@ -149,8 +169,8 @@ impl WorkerService {
         // Create RAFS store for image management
         let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
 
-        // Create the WorkerService
-        let service = Self::new(pool_config, image_config, rafs_store);
+        // Create the WorkerService (with event publisher using same context)
+        let service = Self::new(pool_config, image_config, rafs_store, context.clone())?;
 
         // Initialize the service (start warm pool)
         service
@@ -218,7 +238,32 @@ impl WorkerService {
     pub async fn run_pod_sandbox(&self, config: &PodSandboxConfig) -> Result<String> {
         let sandbox_id = self.sandbox_pool.acquire(config).await?;
         tracing::info!(sandbox_id = %sandbox_id, "Created pod sandbox");
+
+        // Publish sandbox started event with structured payload
+        let event = SandboxStarted {
+            sandbox_id: sandbox_id.clone(),
+            metadata: serde_json::to_string(&config.metadata).unwrap_or_default(),
+            vm_pid: 0, // VM PID not easily accessible here; could be enhanced later
+        };
+        let payload = serialize_sandbox_started(&event).unwrap_or_default();
+        self.publish_event(&sandbox_id, "started", &payload).await;
+
         Ok(sandbox_id)
+    }
+
+    /// Publish a worker lifecycle event (fire-and-forget)
+    ///
+    /// Topic format: worker.{entity_id}.{event_name}
+    async fn publish_event(&self, entity_id: &str, event: &str, payload: &[u8]) {
+        let mut publisher = self.event_publisher.lock().await;
+        if let Err(e) = publisher.publish(entity_id, event, payload).await {
+            tracing::warn!(
+                entity_id = %entity_id,
+                event = %event,
+                error = %e,
+                "Failed to publish worker event"
+            );
+        }
     }
 
     /// Stop a running pod sandbox
@@ -245,6 +290,16 @@ impl WorkerService {
         // Mark sandbox as not ready (but don't release yet)
         // The actual VM stop happens in remove_pod_sandbox
         tracing::info!(sandbox_id = %pod_sandbox_id, "Stopped pod sandbox");
+
+        // Publish sandbox stopped event with structured payload
+        let event = SandboxStopped {
+            sandbox_id: pod_sandbox_id.to_string(),
+            reason: "stopped".to_string(),
+            exit_code: 0,
+        };
+        let payload = serialize_sandbox_stopped(&event).unwrap_or_default();
+        self.publish_event(pod_sandbox_id, "stopped", &payload).await;
+
         Ok(())
     }
 
@@ -458,11 +513,24 @@ impl WorkerService {
         }
 
         container.state = ContainerState::ContainerRunning;
+        let image = container.image.image.clone();
         tracing::info!(
             container_id = %container_id,
             sandbox_id = %sandbox_id,
             "Started container (host-level, VM is running)"
         );
+
+        // Release the lock before publishing to avoid deadlock
+        drop(containers);
+
+        // Publish container started event with structured payload
+        let event = ContainerStarted {
+            container_id: container_id.to_string(),
+            sandbox_id: sandbox_id.clone(),
+            image,
+        };
+        let payload = serialize_container_started(&event).unwrap_or_default();
+        self.publish_event(container_id, "started", &payload).await;
 
         Ok(())
     }
@@ -497,10 +565,25 @@ impl WorkerService {
 
         container.state = ContainerState::ContainerExited;
         container.exit_code = Some(0);
+        let sandbox_id = container.pod_sandbox_id.clone();
+        let exit_code = container.exit_code.unwrap_or(0);
         tracing::info!(
             container_id = %container_id,
             "Stopped container (host-level, container marked as exited)"
         );
+
+        // Release the lock before publishing to avoid deadlock
+        drop(containers);
+
+        // Publish container stopped event with structured payload
+        let event = ContainerStopped {
+            container_id: container_id.to_string(),
+            sandbox_id,
+            exit_code,
+            reason: "stopped".to_string(),
+        };
+        let payload = serialize_container_stopped(&event).unwrap_or_default();
+        self.publish_event(container_id, "stopped", &payload).await;
 
         Ok(())
     }
@@ -1498,7 +1581,11 @@ mod tests {
             ..PoolConfig::default()
         };
 
-        let service = WorkerService::new(pool_config, image_config, rafs_store);
+        // Create a zmq context for event publishing
+        let context = Arc::new(zmq::Context::new());
+
+        let service = WorkerService::new(pool_config, image_config, rafs_store, context)
+            .expect("Failed to create WorkerService");
         (service, temp_dir)
     }
 

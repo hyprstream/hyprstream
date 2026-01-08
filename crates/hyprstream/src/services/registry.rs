@@ -524,7 +524,9 @@ impl RegistryService {
     ) -> Result<crate::services::ServiceHandle> {
         let service = Self::new(base_dir, policy_client).await?;
         let runner = ServiceRunner::new(endpoint, server_pubkey);
-        runner.run(service).await
+        let handle = runner.run(service).await?;
+        tracing::info!("RegistryService started at {}", endpoint);
+        Ok(handle)
     }
 
     /// Check authorization for an operation.

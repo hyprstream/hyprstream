@@ -44,6 +44,12 @@ pub mod common_capnp {
     include!(concat!(env!("OUT_DIR"), "/common_capnp.rs"));
 }
 
+#[allow(dead_code)]
+#[allow(unused_imports)]
+pub mod events_capnp {
+    include!(concat!(env!("OUT_DIR"), "/events_capnp.rs"));
+}
+
 pub mod capnp;
 pub mod crypto;
 pub mod envelope;

@@ -739,3 +739,44 @@ struct StepRun {
   status @1 :RunStatus;
   exitCode @2 :Int32;
 }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Worker Events (for EventService pub/sub)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# These events are serialized into EventEnvelope.payload (from hyprstream-rpc).
+# Topics use format: worker.{entity_id}.{event_name}
+
+struct WorkerEvent {
+  union {
+    sandboxStarted @0 :SandboxStarted;
+    sandboxStopped @1 :SandboxStopped;
+    containerStarted @2 :ContainerStarted;
+    containerStopped @3 :ContainerStopped;
+  }
+}
+
+struct SandboxStarted {
+  sandboxId @0 :Text;
+  metadata @1 :Text;    # JSON metadata
+  vmPid @2 :UInt32;     # VM process ID
+}
+
+struct SandboxStopped {
+  sandboxId @0 :Text;
+  reason @1 :Text;
+  exitCode @2 :Int32;
+}
+
+struct ContainerStarted {
+  containerId @0 :Text;
+  sandboxId @1 :Text;
+  image @2 :Text;
+}
+
+struct ContainerStopped {
+  containerId @0 :Text;
+  sandboxId @1 :Text;
+  exitCode @2 :Int32;
+  reason @3 :Text;
+}

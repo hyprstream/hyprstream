@@ -41,10 +41,24 @@
 mod publisher;
 mod service;
 mod subscriber;
+mod types;
 
 pub use publisher::EventPublisher;
 pub use service::{start_event_service, EventServiceHandle};
 pub use subscriber::EventSubscriber;
+
+// Re-export event types
+pub use types::{
+    // Individual event structs (with ToCapnp/FromCapnp)
+    ContainerStarted, ContainerStopped, SandboxStarted, SandboxStopped,
+    // Union enum for type-safe handling
+    WorkerEvent,
+    // EventSubscriber integration
+    ReceivedEvent,
+    // Serialization helpers
+    serialize_container_started, serialize_container_stopped,
+    serialize_sandbox_started, serialize_sandbox_stopped,
+};
 
 /// Event bus endpoints
 pub mod endpoints {

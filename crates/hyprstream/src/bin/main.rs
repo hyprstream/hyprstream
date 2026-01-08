@@ -36,6 +36,7 @@ use hyprstream_core::services::{
 };
 // Worker service for Kata-based workload execution
 use hyprstream_workers::runtime::WorkerService;
+use hyprstream_workers::workflow::WorkflowService;
 use hyprstream_workers::{ImageConfig, PoolConfig, start_event_service, EventServiceHandle};
 // ZMQ context for service startup
 use hyprstream_core::zmq::global_context;
@@ -260,89 +261,7 @@ fn main() -> Result<()> {
         .validate()
         .context("Configuration validation failed")?;
 
-    // Start registry service ONCE at CLI level
-    // This runtime must stay alive to keep ZMQ services running
-    let _registry_runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("Failed to create registry runtime")?;
-
-    // Start ZMQ-based services: PolicyService first, then RegistryService, then optional WorkerService
-    // Return both client AND service handle so we can stop it on exit
-    // Also return keypair for other services (like InferenceService) to use
-    use hyprstream_rpc::{SigningKey, VerifyingKey, RequestIdentity};
-
-    // Clone worker config before moving config into the async block
-    let worker_config = config.worker.clone();
-
-    let (registry_client, _service_handle, _worker_handle, _event_handle, signing_key, verifying_key): (Arc<dyn RegistryClient>, ServiceHandle, Option<ServiceHandle>, EventServiceHandle, SigningKey, VerifyingKey) = _registry_runtime
-        .block_on(async {
-            let models_dir = config.models_dir();
-
-            // Load or generate signing key (persisted to .registry/keys/signing.key)
-            let keys_dir = models_dir.join(".registry").join("keys");
-            let signing_key = load_or_generate_signing_key(&keys_dir).await?;
-            let verifying_key = signing_key.verifying_key();
-
-            // Start EventService FIRST (event bus must be running before services that publish events)
-            // Uses XPUB/XSUB proxy pattern for efficient message distribution
-            let event_handle = start_event_service(global_context())
-                .context("Failed to start event service")?;
-
-            // Initialize policy manager for authorization
-            // Note: Policy templates should be applied explicitly using CLI commands:
-            //   hyprstream policy apply-template local    # For local full access
-            //   hyprstream policy apply-template public-inference  # For public inference
-            let policies_dir = models_dir.join(".registry").join("policies");
-            let policy_manager = Arc::new(
-                PolicyManager::new(&policies_dir)
-                    .await
-                    .context("Failed to initialize policy manager")?
-            );
-
-            // Start PolicyService (runs on multi-threaded runtime where block_in_place works)
-            // This service wraps PolicyManager and exposes it over ZMQ
-            let _policy_handle = PolicyService::start(policy_manager, verifying_key)
-                .await
-                .context("Failed to start policy service")?;
-
-            // Create policy client for other services to use
-            let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
-
-            // Start the registry service with policy client (waits for socket binding)
-            let service_handle = RegistryService::start(&models_dir, verifying_key, policy_client)
-                .await
-                .context("Failed to start registry service")?;
-
-            // Start WorkerService if configured (optional, for Kata-based workload execution)
-            let worker_handle = if let Some(ref wc) = worker_config {
-                info!("Starting WorkerService for container/sandbox management");
-                let handle = WorkerService::start(
-                    wc.pool.clone(),
-                    wc.images.clone(),
-                    global_context(),
-                    verifying_key,
-                )
-                .await
-                .context("Failed to start worker service")?;
-                Some(handle)
-            } else {
-                None
-            };
-
-            // Create client with signing credentials for service communication
-            // Uses local identity (current OS user) for authorization
-            let client = Arc::new(RegistryZmqClient::new(
-                signing_key.clone(),
-                RequestIdentity::local(),
-            )) as Arc<dyn RegistryClient>;
-            Ok::<_, anyhow::Error>((client, service_handle, worker_handle, event_handle, signing_key, verifying_key))
-        })
-        .context("Failed to initialize services")?;
-
-    // Create application context with shared registry client
-    let ctx = AppContext::with_client(config, registry_client.clone());
-
+    // ========== TRACING INITIALIZATION (before service startup) ==========
     // Keep the guard alive for the entire program lifetime
     // Dropping the guard stops the background logging thread
     let _log_guard: Option<tracing_appender::non_blocking::WorkerGuard>;
@@ -452,6 +371,100 @@ fn main() -> Result<()> {
     }
 
     info!("Hyprstream v{} starting up", env!("CARGO_PKG_VERSION"));
+    // ========== END TRACING INITIALIZATION ==========
+
+    // Start registry service ONCE at CLI level
+    // This runtime must stay alive to keep ZMQ services running
+    let _registry_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("Failed to create registry runtime")?;
+
+    // Start ZMQ-based services: PolicyService first, then RegistryService, then optional WorkerService
+    // Return both client AND service handle so we can stop it on exit
+    // Also return keypair for other services (like InferenceService) to use
+    use hyprstream_rpc::{SigningKey, VerifyingKey, RequestIdentity};
+
+    // Clone worker config before moving config into the async block
+    let worker_config = config.worker.clone();
+
+    let (registry_client, _service_handle, _worker_handle, _event_handle, _workflow_service, signing_key, verifying_key): (Arc<dyn RegistryClient>, ServiceHandle, Option<ServiceHandle>, EventServiceHandle, Arc<WorkflowService>, SigningKey, VerifyingKey) = _registry_runtime
+        .block_on(async {
+            let models_dir = config.models_dir();
+
+            // Load or generate signing key (persisted to .registry/keys/signing.key)
+            let keys_dir = models_dir.join(".registry").join("keys");
+            let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+            let verifying_key = signing_key.verifying_key();
+
+            // Start EventService FIRST (event bus must be running before services that publish events)
+            // Uses XPUB/XSUB proxy pattern for efficient message distribution
+            let event_handle = start_event_service(global_context())
+                .context("Failed to start event service")?;
+
+            // Initialize policy manager for authorization
+            // Note: Policy templates should be applied explicitly using CLI commands:
+            //   hyprstream policy apply-template local    # For local full access
+            //   hyprstream policy apply-template public-inference  # For public inference
+            let policies_dir = models_dir.join(".registry").join("policies");
+            let policy_manager = Arc::new(
+                PolicyManager::new(&policies_dir)
+                    .await
+                    .context("Failed to initialize policy manager")?
+            );
+
+            // Start PolicyService (runs on multi-threaded runtime where block_in_place works)
+            // This service wraps PolicyManager and exposes it over ZMQ
+            let _policy_handle = PolicyService::start(policy_manager, verifying_key)
+                .await
+                .context("Failed to start policy service")?;
+
+            // Create policy client for other services to use
+            let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
+
+            // Start the registry service with policy client (waits for socket binding)
+            let service_handle = RegistryService::start(&models_dir, verifying_key, policy_client)
+                .await
+                .context("Failed to start registry service")?;
+
+            // Start WorkerService if configured (optional, for Kata-based workload execution)
+            let worker_handle = if let Some(ref wc) = worker_config {
+                info!("Starting WorkerService for container/sandbox management");
+                let handle = WorkerService::start(
+                    wc.pool.clone(),
+                    wc.images.clone(),
+                    global_context(),
+                    verifying_key,
+                )
+                .await
+                .context("Failed to start worker service")?;
+                Some(handle)
+            } else {
+                None
+            };
+
+            // Start WorkflowService for event-driven workflow orchestration
+            // Subscribes to worker events via EventService
+            let workflow_service = Arc::new(WorkflowService::new(global_context()));
+            workflow_service
+                .clone()
+                .start()
+                .await
+                .context("Failed to start workflow service")?;
+            info!("WorkflowService started, subscribed to worker.* events");
+
+            // Create client with signing credentials for service communication
+            // Uses local identity (current OS user) for authorization
+            let client = Arc::new(RegistryZmqClient::new(
+                signing_key.clone(),
+                RequestIdentity::local(),
+            )) as Arc<dyn RegistryClient>;
+            Ok::<_, anyhow::Error>((client, service_handle, worker_handle, event_handle, workflow_service, signing_key, verifying_key))
+        })
+        .context("Failed to initialize services")?;
+
+    // Create application context with shared registry client
+    let ctx = AppContext::with_client(config, registry_client.clone());
 
     // Handle commands with appropriate runtime configuration
     match cli.command {
