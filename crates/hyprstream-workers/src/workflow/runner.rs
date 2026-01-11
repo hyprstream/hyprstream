@@ -1,4 +1,4 @@
-//! Workflow runner - executes workflows via RuntimeService
+//! Workflow runner - executes workflows via WorkerService
 //!
 //! Creates PodSandboxes and runs steps as containers.
 
@@ -13,7 +13,7 @@ use super::client::{JobRun, RunStatus, StepRun, WorkflowRun};
 use super::parser::{Job, Step, Workflow};
 use super::WorkflowId;
 
-/// Workflow runner that executes workflows using RuntimeService
+/// Workflow runner that executes workflows using WorkerService
 pub struct WorkflowRunner {
     /// Reference to WorkerService for container operations
     worker_service: std::sync::Arc<WorkerService>,

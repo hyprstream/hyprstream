@@ -10,6 +10,7 @@ use std::time::Duration;
 use tmq::subscribe;
 
 use super::endpoints;
+use hyprstream_rpc::registry::{self, SocketKind};
 
 /// Async event subscriber using TMQ SUB socket
 ///
@@ -38,7 +39,7 @@ pub struct EventSubscriber {
 }
 
 impl EventSubscriber {
-    /// Create a new subscriber
+    /// Create a new subscriber connecting to the default endpoint
     ///
     /// # Arguments
     ///
@@ -47,10 +48,38 @@ impl EventSubscriber {
     /// # Note
     ///
     /// The subscriber won't receive any messages until `subscribe()` is called.
+    ///
+    /// # Endpoint Resolution
+    ///
+    /// Uses EndpointRegistry if initialized, otherwise falls back to default inproc endpoint.
     pub fn new(context: &Arc<zmq::Context>) -> Result<Self> {
+        let endpoint = match registry::try_global() {
+            Some(reg) => reg.endpoint("events", SocketKind::Sub).to_zmq_string(),
+            None => endpoints::SUB.to_string(),
+        };
+        Self::with_endpoint(context, &endpoint)
+    }
+
+    /// Create a new subscriber connecting to a specific endpoint
+    ///
+    /// Use this for IPC sockets in distributed mode.
+    ///
+    /// # Arguments
+    ///
+    /// * `context` - ZMQ context
+    /// * `endpoint` - Endpoint to connect to (e.g., "ipc:///run/user/1000/hyprstream/events/sub.sock")
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let endpoint = format!("ipc://{}", paths::events_sub_socket().display());
+    /// let mut subscriber = EventSubscriber::with_endpoint(&ctx, &endpoint)?;
+    /// subscriber.subscribe("system.")?;
+    /// ```
+    pub fn with_endpoint(context: &Arc<zmq::Context>, endpoint: &str) -> Result<Self> {
         let socket = subscribe(context)
-            .connect(endpoints::SUB)
-            .map_err(|e| anyhow!("Failed to connect subscriber to {}: {}", endpoints::SUB, e))?;
+            .connect(endpoint)
+            .map_err(|e| anyhow!("Failed to connect subscriber to {}: {}", endpoint, e))?;
 
         Ok(Self {
             unsubscribed: Some(socket),

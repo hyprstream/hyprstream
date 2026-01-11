@@ -11,10 +11,11 @@
 //! - Services use `ctx.casbin_subject()` for policy checks
 
 use crate::prelude::*;
+use crate::transport::TransportConfig;
 use anyhow::{anyhow, Result};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tmq::{reply, Multipart, RequestReceiver};
+use tmq::{FromZmqSocket, Multipart, RequestReceiver};
 use tokio::sync::Notify;
 use tracing::{debug, error, info, trace, warn};
 
@@ -134,7 +135,8 @@ pub trait ZmqService: Send + Sync + 'static {
 ///
 /// Invalid/unsigned requests are rejected with an error response.
 pub struct ServiceRunner {
-    endpoint: String,
+    /// Transport configuration (supports SystemdFd for socket activation)
+    transport: TransportConfig,
     /// ZMQ context for socket creation (required for inproc:// connectivity)
     context: Arc<zmq::Context>,
     /// Server's Ed25519 verifying key for signature verification
@@ -144,16 +146,16 @@ pub struct ServiceRunner {
 }
 
 impl ServiceRunner {
-    /// Create a new service runner bound to the given endpoint.
+    /// Create a new service runner bound to the given transport.
     ///
     /// # Arguments
     ///
-    /// * `endpoint` - ZMQ endpoint (e.g., `inproc://hyprstream/registry`)
+    /// * `transport` - Transport configuration (supports SystemdFd for socket activation)
     /// * `context` - ZMQ context (must be shared for inproc:// to work)
     /// * `server_pubkey` - Server's Ed25519 public key for verifying request signatures
-    pub fn new(endpoint: &str, context: Arc<zmq::Context>, server_pubkey: VerifyingKey) -> Self {
+    pub fn new(transport: TransportConfig, context: Arc<zmq::Context>, server_pubkey: VerifyingKey) -> Self {
         Self {
-            endpoint: endpoint.to_string(),
+            transport,
             context,
             server_pubkey,
             nonce_cache: Arc::new(InMemoryNonceCache::new()),
@@ -164,13 +166,13 @@ impl ServiceRunner {
     ///
     /// Use this when multiple services should share replay protection state.
     pub fn with_nonce_cache(
-        endpoint: &str,
+        transport: TransportConfig,
         context: Arc<zmq::Context>,
         server_pubkey: VerifyingKey,
         nonce_cache: Arc<InMemoryNonceCache>,
     ) -> Self {
         Self {
-            endpoint: endpoint.to_string(),
+            transport,
             context,
             server_pubkey,
             nonce_cache,
@@ -180,8 +182,8 @@ impl ServiceRunner {
     /// Run the service as an async task
     ///
     /// This spawns an async task that:
-    /// 1. Creates a REP socket with TMQ (async I/O via epoll)
-    /// 2. Binds to the endpoint
+    /// 1. Creates a REP socket and binds using TransportConfig (supports SystemdFd)
+    /// 2. Converts to TMQ for async I/O via epoll
     /// 3. Loops receiving and verifying `SignedEnvelope` requests
     /// 4. Dispatches to handler with verified `EnvelopeContext`
     ///
@@ -189,7 +191,7 @@ impl ServiceRunner {
     /// Waits for socket binding to complete before returning.
     /// Returns a handle that can be used to stop the service.
     pub async fn run<S: ZmqService>(self, service: S) -> Result<ServiceHandle> {
-        let endpoint = self.endpoint.clone();
+        let transport = self.transport.clone();
         let context = self.context.clone();
         let server_pubkey = self.server_pubkey;
         let nonce_cache = self.nonce_cache.clone();
@@ -205,7 +207,7 @@ impl ServiceRunner {
         // Spawn async task (not spawn_blocking - TMQ provides async I/O)
         let handle = tokio::spawn(async move {
             if let Err(e) = Self::service_loop_async(
-                endpoint,
+                transport,
                 context,
                 service,
                 server_pubkey,
@@ -233,8 +235,10 @@ impl ServiceRunner {
     /// Async service loop using TMQ
     ///
     /// The `ready_tx` channel signals when the socket is bound and ready.
+    /// Uses raw ZMQ socket creation + TransportConfig::bind() for SystemdFd support,
+    /// then converts to TMQ via from_zmq_socket for async I/O.
     async fn service_loop_async<S: ZmqService>(
-        endpoint: String,
+        transport: TransportConfig,
         context: Arc<zmq::Context>,
         service: Arc<S>,
         server_pubkey: VerifyingKey,
@@ -242,11 +246,35 @@ impl ServiceRunner {
         shutdown: Arc<Notify>,
         ready_tx: Option<tokio::sync::oneshot::Sender<Result<()>>>,
     ) -> Result<()> {
-        // Create REP socket with TMQ
-        let mut receiver: RequestReceiver = match reply(&*context).set_linger(0).bind(&endpoint) {
+        let endpoint = transport.zmq_endpoint();
+
+        // Create raw ZMQ REP socket
+        let mut socket = match context.socket(zmq::REP) {
+            Ok(s) => s,
+            Err(e) => {
+                let err = anyhow!("failed to create REP socket: {}", e);
+                if let Some(tx) = ready_tx {
+                    let _ = tx.send(Err(anyhow!("{}", err)));
+                }
+                return Err(err);
+            }
+        };
+        socket.set_linger(0).ok();
+
+        // Bind using TransportConfig - handles SystemdFd via set_use_fd()
+        if let Err(e) = transport.bind(&mut socket) {
+            let err = anyhow!("failed to bind to {}: {}", endpoint, e);
+            if let Some(tx) = ready_tx {
+                let _ = tx.send(Err(anyhow!("{}", err)));
+            }
+            return Err(err);
+        }
+
+        // Convert to TMQ for async I/O (from_zmq_socket makes no assumptions about state)
+        let mut receiver: RequestReceiver = match RequestReceiver::from_zmq_socket(socket) {
             Ok(r) => r,
             Err(e) => {
-                let err = anyhow!("failed to bind to {}: {}", endpoint, e);
+                let err = anyhow!("failed to wrap socket in TMQ: {}", e);
                 if let Some(tx) = ready_tx {
                     let _ = tx.send(Err(anyhow!("{}", err)));
                 }
@@ -295,7 +323,7 @@ impl ServiceRunner {
                     );
 
                     // Unwrap and verify SignedEnvelope
-                    let (ctx, payload) = match Self::unwrap_envelope(&request, &server_pubkey, &*nonce_cache) {
+                    let (ctx, payload) = match crate::envelope::unwrap_envelope(&request, &server_pubkey, &*nonce_cache) {
                         Ok((ctx, payload)) => (ctx, payload),
                         Err(e) => {
                             warn!(
@@ -349,35 +377,6 @@ impl ServiceRunner {
         info!("{} service stopped", service.name());
         Ok(())
     }
-
-    /// Unwrap and verify a SignedEnvelope from wire bytes.
-    ///
-    /// Returns the verified context and inner payload on success.
-    fn unwrap_envelope(
-        request: &[u8],
-        server_pubkey: &VerifyingKey,
-        nonce_cache: &dyn NonceCache,
-    ) -> Result<(EnvelopeContext, Vec<u8>)> {
-        use capnp::serialize;
-
-        // Deserialize SignedEnvelope from Cap'n Proto
-        let reader = serialize::read_message(
-            &mut std::io::Cursor::new(request),
-            capnp::message::ReaderOptions::default(),
-        )?;
-        let signed_reader =
-            reader.get_root::<crate::common_capnp::signed_envelope::Reader>()?;
-        let signed = SignedEnvelope::read_from(signed_reader)?;
-
-        // Verify signature and replay protection
-        signed.verify(server_pubkey, nonce_cache)?;
-
-        // Extract context and payload
-        let ctx = EnvelopeContext::from_verified(&signed);
-        let payload = signed.payload().to_vec();
-
-        Ok((ctx, payload))
-    }
 }
 
 /// Handle for a running service
@@ -396,14 +395,26 @@ impl ServiceHandle {
         }
     }
 
+    /// Create a handle from an existing task and shutdown signal.
+    ///
+    /// Used by ServiceSpawner when spawning Spawnable services.
+    pub fn from_task(task: tokio::task::JoinHandle<()>, shutdown: Arc<Notify>) -> Self {
+        Self {
+            task: Some(task),
+            shutdown: Some(shutdown),
+        }
+    }
+
     /// Stop the service gracefully
-    pub async fn stop(self) {
+    ///
+    /// Idempotent: subsequent calls are no-ops if already stopped.
+    pub async fn stop(&mut self) {
         // Signal shutdown via Notify
         if let Some(shutdown) = &self.shutdown {
             shutdown.notify_one();
         }
         // Wait for task to complete
-        if let Some(task) = self.task {
+        if let Some(task) = self.task.take() {
             let _ = task.await;
         }
     }
@@ -578,18 +589,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_service_runner() {
-        let endpoint = "inproc://test-echo-service-rpc";
+        let transport = TransportConfig::inproc("test-echo-service-rpc");
+        let endpoint = transport.zmq_endpoint();
         let context = Arc::new(zmq::Context::new());
 
         // Generate keypair for this test
         let (signing_key, verifying_key) = generate_signing_keypair();
 
         // Start the service (waits for socket binding)
-        let runner = ServiceRunner::new(endpoint, context.clone(), verifying_key);
-        let handle = runner.run(EchoService).await.expect("test: start service");
+        let runner = ServiceRunner::new(transport, context.clone(), verifying_key);
+        let mut handle = runner.run(EchoService).await.expect("test: start service");
 
         // Use ZmqClient directly (handles signing internally)
-        let client = ZmqClient::new(endpoint, context, signing_key, RequestIdentity::local());
+        let client = ZmqClient::new(&endpoint, context, signing_key, RequestIdentity::local());
         let response = client.call(b"hello".to_vec()).await.expect("test: call");
 
         // Response should start with "from <user>:"
@@ -606,7 +618,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_signature_rejected() {
-        let endpoint = "inproc://test-invalid-sig-rpc";
+        let transport = TransportConfig::inproc("test-invalid-sig-rpc");
+        let endpoint = transport.zmq_endpoint();
         let context = Arc::new(zmq::Context::new());
 
         // Generate two keypairs - use one to sign, verify with other
@@ -614,11 +627,11 @@ mod tests {
         let (_, wrong_verifying_key) = generate_signing_keypair();
 
         // Start the service with wrong key (waits for socket binding)
-        let runner = ServiceRunner::new(endpoint, context.clone(), wrong_verifying_key);
-        let handle = runner.run(EchoService).await.expect("test: start service");
+        let runner = ServiceRunner::new(transport, context.clone(), wrong_verifying_key);
+        let mut handle = runner.run(EchoService).await.expect("test: start service");
 
         // Sign with different key than service expects
-        let client = ZmqClient::new(endpoint, context, signing_key, RequestIdentity::local());
+        let client = ZmqClient::new(&endpoint, context, signing_key, RequestIdentity::local());
         let response = client
             .call(b"should fail".to_vec())
             .await

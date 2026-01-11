@@ -3,9 +3,13 @@
 //! This module provides:
 //! - `Transport` / `AsyncTransport` traits for generic transport abstraction
 //! - `TransportConfig` for unified endpoint configuration
+//! - Systemd socket activation support via `SystemdFd` variant
+//! - Raw socket options via `sockopt` submodule
 
 mod traits;
+pub mod sockopt;
 
+use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 
 pub use traits::{AsyncTransport, Transport};
@@ -53,6 +57,18 @@ pub enum TransportConfig {
     ///
     /// Format: `ipc:///path/to/socket`
     Ipc { path: PathBuf },
+
+    /// Systemd socket activation endpoint.
+    ///
+    /// Used when systemd passes a pre-bound file descriptor to the service.
+    /// The `fd` is used for server-side binding (via `ZMQ_USE_FD`),
+    /// while `client_path` provides the IPC path for clients to connect.
+    SystemdFd {
+        /// Pre-bound file descriptor from systemd
+        fd: RawFd,
+        /// IPC path for client connections
+        client_path: PathBuf,
+    },
 }
 
 impl TransportConfig {
@@ -76,14 +92,93 @@ impl TransportConfig {
         Self::Ipc { path: path.into() }
     }
 
+    /// Create a systemd socket activation endpoint.
+    ///
+    /// # Arguments
+    ///
+    /// * `fd` - Pre-bound file descriptor from systemd
+    /// * `client_path` - IPC path for client connections
+    pub fn systemd_fd(fd: RawFd, client_path: impl Into<PathBuf>) -> Self {
+        Self::SystemdFd {
+            fd,
+            client_path: client_path.into(),
+        }
+    }
+
+    /// Parse a ZMQ endpoint string into a TransportConfig.
+    ///
+    /// Supports:
+    /// - `inproc://name` → `TransportConfig::Inproc`
+    /// - `tcp://host:port` → `TransportConfig::Tcp` (no CURVE)
+    /// - `ipc:///path/to/socket` → `TransportConfig::Ipc`
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hyprstream_rpc::transport::TransportConfig;
+    ///
+    /// let config = TransportConfig::from_endpoint("inproc://hyprstream/registry");
+    /// assert_eq!(config.zmq_endpoint(), "inproc://hyprstream/registry");
+    /// ```
+    pub fn from_endpoint(endpoint: &str) -> Self {
+        if let Some(name) = endpoint.strip_prefix("inproc://") {
+            Self::Inproc {
+                endpoint: name.to_string(),
+            }
+        } else if let Some(addr) = endpoint.strip_prefix("tcp://") {
+            Self::Tcp {
+                endpoint: addr.to_string(),
+                curve_pubkey: None,
+            }
+        } else if let Some(path) = endpoint.strip_prefix("ipc://") {
+            Self::Ipc {
+                path: PathBuf::from(path),
+            }
+        } else {
+            // Default to inproc if no scheme
+            Self::Inproc {
+                endpoint: endpoint.to_string(),
+            }
+        }
+    }
+
     /// Get the ZMQ endpoint string for this configuration.
     ///
     /// Returns the full ZMQ endpoint URI (e.g., `tcp://127.0.0.1:5560`).
+    /// For `SystemdFd`, returns the client IPC path.
     pub fn zmq_endpoint(&self) -> String {
         match self {
             Self::Inproc { endpoint } => format!("inproc://{}", endpoint),
             Self::Tcp { endpoint, .. } => format!("tcp://{}", endpoint),
             Self::Ipc { path } => format!("ipc://{}", path.display()),
+            Self::SystemdFd { client_path, .. } => format!("ipc://{}", client_path.display()),
+        }
+    }
+
+    /// Alias for `zmq_endpoint()` for consistency.
+    #[inline]
+    pub fn to_zmq_string(&self) -> String {
+        self.zmq_endpoint()
+    }
+
+    /// Bind a ZMQ socket to this endpoint.
+    ///
+    /// For `SystemdFd`, uses the pre-bound file descriptor via `ZMQ_USE_FD`.
+    /// For other variants, binds to the endpoint string.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if binding fails.
+    pub fn bind(&self, socket: &mut zmq::Socket) -> anyhow::Result<()> {
+        match self {
+            Self::SystemdFd { fd, .. } => {
+                sockopt::set_use_fd(socket, *fd)?;
+                Ok(())
+            }
+            _ => {
+                socket.bind(&self.zmq_endpoint())?;
+                Ok(())
+            }
         }
     }
 
@@ -99,6 +194,11 @@ impl TransportConfig {
             _ => None,
         }
     }
+
+    /// Check if this is a systemd-activated endpoint.
+    pub fn is_systemd_activated(&self) -> bool {
+        matches!(self, Self::SystemdFd { .. })
+    }
 }
 
 #[cfg(test)]
@@ -109,7 +209,9 @@ mod tests {
     fn test_inproc_endpoint() {
         let config = TransportConfig::inproc("hyprstream/registry");
         assert_eq!(config.zmq_endpoint(), "inproc://hyprstream/registry");
+        assert_eq!(config.to_zmq_string(), "inproc://hyprstream/registry");
         assert!(!config.uses_curve());
+        assert!(!config.is_systemd_activated());
     }
 
     #[test]
@@ -117,6 +219,7 @@ mod tests {
         let config = TransportConfig::tcp("127.0.0.1:5560", None);
         assert_eq!(config.zmq_endpoint(), "tcp://127.0.0.1:5560");
         assert!(!config.uses_curve());
+        assert!(!config.is_systemd_activated());
     }
 
     #[test]
@@ -126,6 +229,7 @@ mod tests {
         assert_eq!(config.zmq_endpoint(), "tcp://192.168.1.100:5560");
         assert!(config.uses_curve());
         assert_eq!(config.curve_pubkey(), Some(&key));
+        assert!(!config.is_systemd_activated());
     }
 
     #[test]
@@ -133,5 +237,17 @@ mod tests {
         let config = TransportConfig::ipc("/tmp/hyprstream.sock");
         assert_eq!(config.zmq_endpoint(), "ipc:///tmp/hyprstream.sock");
         assert!(!config.uses_curve());
+        assert!(!config.is_systemd_activated());
+    }
+
+    #[test]
+    fn test_systemd_fd_endpoint() {
+        let config = TransportConfig::systemd_fd(5, "/run/hyprstream/policy.sock");
+        assert_eq!(
+            config.zmq_endpoint(),
+            "ipc:///run/hyprstream/policy.sock"
+        );
+        assert!(!config.uses_curve());
+        assert!(config.is_systemd_activated());
     }
 }

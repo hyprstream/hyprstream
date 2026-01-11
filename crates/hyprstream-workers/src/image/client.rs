@@ -1,16 +1,16 @@
-//! ImageService trait and ZMQ client
+//! ImageClient trait and ZMQ client
 //!
-//! Mirrors Kubernetes CRI ImageService (`runtime.v1`) for future kubelet compatibility.
+//! Client-side trait for CRI ImageService (`runtime.v1`) for future kubelet compatibility.
 
 use crate::error::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
 
-/// CRI-aligned ImageService trait
+/// CRI-aligned ImageClient trait
 ///
-/// Mirrors Kubernetes CRI ImageService (`runtime.v1`) for future kubelet/crictl compatibility.
+/// Client-side interface for CRI ImageService (`runtime.v1`) for future kubelet/crictl compatibility.
 #[async_trait]
-pub trait ImageService: Send + Sync {
+pub trait ImageClient: Send + Sync {
     /// List images matching filter
     async fn list_images(&self, filter: Option<&ImageFilter>) -> Result<Vec<Image>>;
 
@@ -128,7 +128,7 @@ pub struct FilesystemIdentifier {
 // ZMQ Client Implementation
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// ZMQ client for ImageService
+/// ZMQ client for ImageClient
 pub struct ImageZmq {
     _endpoint: String,
 }
@@ -143,7 +143,7 @@ impl ImageZmq {
 }
 
 #[async_trait]
-impl ImageService for ImageZmq {
+impl ImageClient for ImageZmq {
     async fn list_images(&self, _filter: Option<&ImageFilter>) -> Result<Vec<Image>> {
         todo!("Implement ZMQ call")
     }

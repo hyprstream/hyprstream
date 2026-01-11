@@ -408,6 +408,35 @@ pub enum Commands {
     /// - `worker rm` - Remove sandbox or container
     /// - `worker images` - Image management
     Worker(WorkerCommand),
+
+    /// Run a single service (for systemd socket activation or callback mode)
+    ///
+    /// This command is used internally by systemd to run individual services.
+    /// Systemd socket activation spawns these when a connection arrives.
+    ///
+    /// Examples:
+    ///   hyprstream service event --ipc    # Run event service with IPC sockets
+    ///   hyprstream service worker --ipc   # Run worker service with IPC sockets
+    ///   hyprstream service registry --ipc # Run registry service with IPC sockets
+    ///   hyprstream service inference@abc123 --callback ipc:///run/hyprstream/callback.sock
+    Service {
+        /// Service name: event, worker, registry, policy, or inference@{id} for callback mode
+        name: String,
+
+        /// Use IPC sockets for distributed mode (required for systemd socket activation)
+        #[arg(long, default_value = "false")]
+        ipc: bool,
+
+        /// Callback endpoint for callback mode (inference service only)
+        ///
+        /// When specified, the inference service runs in callback mode:
+        /// 1. Connects DEALER to this ROUTER endpoint
+        /// 2. Sends Register message with its stream endpoint
+        /// 3. Waits for LoadModel command
+        /// 4. Handles Infer/Shutdown commands
+        #[arg(long)]
+        callback: Option<String>,
+    },
 }
 
 /// Worktree subcommands

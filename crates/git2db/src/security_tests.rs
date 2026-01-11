@@ -195,11 +195,7 @@ mod integration_tests {
         let path_error = Git2DBError::invalid_path("/test/path", "Security violation");
         let auth_error = Git2DBError::authentication("https://example.com", "Invalid credentials");
 
-        // Security-related errors should not be retryable
-        assert!(!path_error.retry_suggested());
-        assert!(!auth_error.retry_suggested());
-
-        // They should be properly classified
+        // Security-related errors should be properly classified as non-recoverable
         assert!(!path_error.is_recoverable());
         assert!(!auth_error.is_recoverable());
     }

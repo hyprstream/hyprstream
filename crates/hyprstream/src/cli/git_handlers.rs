@@ -1162,7 +1162,7 @@ pub async fn handle_infer(
     // Note: Training mode is already forced to Disabled in the config file above
 
     // Start InferenceService (loads model, adapters, trainer automatically)
-    let service_handle = InferenceService::start_at(
+    let mut service_handle = InferenceService::start_at(
         &model_path,
         runtime_config,
         verifying_key,

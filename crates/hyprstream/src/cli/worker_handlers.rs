@@ -6,11 +6,11 @@ use anyhow::{bail, Result};
 use std::io::{self, Write};
 use tracing::info;
 
-use hyprstream_workers::image::{AuthConfig, ImageService, ImageSpec};
+use hyprstream_workers::image::{AuthConfig, ImageClient, ImageSpec};
 use hyprstream_workers::runtime::{
     ContainerConfig, ContainerFilter, ContainerImageSpec, ContainerState, ContainerStats,
     PodSandboxConfig, PodSandboxFilter, PodSandboxState, PodSandboxStats,
-    RuntimeService,
+    RuntimeClient,
 };
 
 use crate::services::WorkerClient;

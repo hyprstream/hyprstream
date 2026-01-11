@@ -104,18 +104,30 @@ For reliable status checking (e.g., CLI waiting for container):
 
 ### EventService
 
-Runs the XPUB/XSUB proxy in a dedicated thread using `zmq::proxy_steerable()`.
+Runs the XPUB/XSUB proxy using `ProxyService` from `hyprstream-rpc`.
 
 **Location:** `crates/hyprstream-workers/src/events/service.rs`
 
 ```rust
-// Start the event service
-let ctx = global_context();
-let handle = start_event_service(ctx.clone())?;
+use hyprstream_workers::events::{endpoints, ProxyService, ServiceSpawner, SpawnedService};
+
+// Create proxy with transport configuration
+let ctx = Arc::new(zmq::Context::new());
+let (pub_transport, sub_transport) = endpoints::inproc_transports();
+let proxy = ProxyService::new("events", ctx.clone(), pub_transport, sub_transport);
+
+// Spawn in dedicated thread
+let spawner = ServiceSpawner::threaded();
+let service: SpawnedService = spawner.spawn(proxy).await?;
 
 // Later, graceful shutdown
-handle.stop()?;
+service.stop().await?;
 ```
+
+**Endpoint Modes:**
+- `Inproc` - In-process communication (default)
+- `Ipc` - Unix domain sockets for distributed mode
+- `SystemdFd` - Systemd socket activation
 
 ### EventPublisher
 
@@ -140,6 +152,36 @@ subscriber.subscribe("worker.")?;  // All worker events
 
 while let Ok((topic, payload)) = subscriber.recv().await {
     println!("Received: {} ({} bytes)", topic, payload.len());
+}
+```
+
+**Additional Methods:**
+- `new_at(ctx, endpoint)` - Connect to explicit endpoint (for distributed mode)
+- `subscribe_all()` - Subscribe to all topics
+- `recv_timeout(duration)` - Receive with timeout
+- `try_recv()` - Non-blocking receive
+
+### Event Types
+
+**Location:** `crates/hyprstream-workers/src/events/types.rs`
+
+Worker events with Cap'n Proto serialization:
+
+```rust
+pub enum WorkerEvent {
+    SandboxStarted(SandboxStarted),
+    SandboxStopped(SandboxStopped),
+    ContainerStarted(ContainerStarted),
+    ContainerStopped(ContainerStopped),
+}
+
+pub struct ReceivedEvent {
+    pub topic: String,
+    pub source: String,
+    pub entity_id: String,
+    pub event_type: String,
+    pub worker_event: Option<WorkerEvent>,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 ```
 
@@ -186,6 +228,14 @@ EventService and MetricsService are **separate concerns**:
 | MetricsService | REQ/REP | Data queries/inserts (RPC) |
 
 MetricsService queries are NOT broadcast to EventService. Future work may add optional CDC for threshold breach events.
+
+## Implemented Features
+
+The following features are now implemented:
+
+- **IPC mode** - Unix domain sockets for distributed deployments
+- **Systemd socket activation** - Pre-bound file descriptors via `LISTEN_FDS`
+- **Endpoint detection** - Automatic transport mode selection
 
 ## Future Work
 

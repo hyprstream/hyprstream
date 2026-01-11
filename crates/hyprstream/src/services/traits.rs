@@ -47,15 +47,6 @@ pub enum RegistryServiceError {
 }
 
 impl RegistryServiceError {
-    /// Check if this error suggests retrying the operation.
-    pub fn is_retryable(&self) -> bool {
-        match self {
-            Self::Registry(e) => e.should_retry(),
-            Self::Transport(_) => true,
-            Self::Unavailable => true,
-        }
-    }
-
     /// Create a transport error.
     pub fn transport<S: Into<String>>(msg: S) -> Self {
         Self::Transport(msg.into())
@@ -269,18 +260,3 @@ pub trait RepositoryClient: Send + Sync {
     ) -> Result<(), RegistryServiceError>;
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_registry_service_error_is_retryable() {
-        // Transport errors should be retryable
-        let err = RegistryServiceError::transport("test");
-        assert!(err.is_retryable());
-
-        // Unavailable should be retryable
-        let err = RegistryServiceError::Unavailable;
-        assert!(err.is_retryable());
-    }
-}

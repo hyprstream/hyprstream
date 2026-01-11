@@ -1,4 +1,4 @@
-//! WorkflowOps extension trait and ZMQ client
+//! WorkflowClient trait and ZMQ client
 
 use crate::error::Result;
 use async_trait::async_trait;
@@ -7,9 +7,9 @@ use std::collections::HashMap;
 use super::{RunId, SubscriptionId, Workflow, WorkflowId};
 use super::triggers::EventTrigger;
 
-/// WorkflowOps extension trait for workflow operations
+/// WorkflowClient trait for workflow operations
 #[async_trait]
-pub trait WorkflowOps: Send + Sync {
+pub trait WorkflowClient: Send + Sync {
     /// Scan a repository for workflows
     async fn scan_repo(&self, repo_id: &str) -> Result<Vec<WorkflowDef>>;
 
@@ -141,7 +141,7 @@ pub struct StepRun {
     pub exit_code: Option<i32>,
 }
 
-/// ZMQ client for WorkflowOps
+/// ZMQ client for WorkflowClient
 pub struct WorkflowZmq {
     _endpoint: String,
 }
@@ -156,7 +156,7 @@ impl WorkflowZmq {
 }
 
 #[async_trait]
-impl WorkflowOps for WorkflowZmq {
+impl WorkflowClient for WorkflowZmq {
     async fn scan_repo(&self, _repo_id: &str) -> Result<Vec<WorkflowDef>> {
         todo!("Implement ZMQ call")
     }

@@ -1,4 +1,4 @@
-//! CRI RuntimeService implementation
+//! CRI RuntimeClient implementation
 //!
 //! Provides Kubernetes CRI-aligned APIs for managing pod sandboxes (Kata VMs)
 //! and containers. PodSandbox maps to a Kata VM, Container to an OCI container
@@ -9,7 +9,7 @@
 //! ```text
 //! WorkerService (ZmqService)
 //!     │
-//!     ├── RuntimeService trait
+//!     ├── RuntimeClient trait (client-side interface)
 //!     │     ├── run_pod_sandbox()    → Creates Kata VM
 //!     │     ├── create_container()   → Creates container in VM
 //!     │     ├── start_container()    → Starts container
@@ -25,6 +25,7 @@ mod container;
 mod pool;
 mod sandbox;
 mod service;
+pub mod spawner;
 mod virtiofs;
 
 pub use client::{
@@ -33,7 +34,7 @@ pub use client::{
     FilesystemIdentifier, FilesystemUsage, LinuxPodSandboxStats, MemoryUsage,
     NetworkInterfaceUsage, NetworkUsage, PodSandboxAttributes, PodSandboxFilter,
     PodSandboxMetadata, PodSandboxStats, PodSandboxStatsFilter, PodSandboxStatusResponse,
-    ProcessUsage, RuntimeCondition, RuntimeService, RuntimeStatus, RuntimeZmq,
+    ProcessUsage, RuntimeCondition, RuntimeClient, RuntimeStatus, RuntimeZmq,
     StatusResponse, VersionResponse,
 };
 pub use container::{
@@ -45,7 +46,7 @@ pub use sandbox::{
     PodIP, PodSandbox, PodSandboxConfig, PodSandboxNetworkStatus, PodSandboxState,
     PodSandboxStatus,
 };
-pub use service::{WorkerService, WORKER_ENDPOINT};
+pub use service::WorkerService;
 // Re-export service infrastructure from hyprstream-rpc for convenience
 pub use hyprstream_rpc::service::{EnvelopeContext, ServiceHandle, ZmqService};
 pub use virtiofs::{SandboxVirtiofs, SandboxVirtiofsBuilder};

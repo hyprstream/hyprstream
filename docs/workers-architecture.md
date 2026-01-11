@@ -9,16 +9,16 @@ Isolated workload execution using Kata Containers with OCI image support and Git
 │                       hyprstream-workers                             │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
-│  WorkflowService (ZmqService)                                       │
+│  WorkflowService (ZmqService) ⚠️ Partially Implemented              │
 │    └── Endpoint: inproc://hyprstream/workflows                      │
 │    └── Discovers .github/workflows/*.yml from RegistryService repos │
 │    └── Subscribes to event bus for workflow triggers                │
-│    └── Spawns pods/containers via WorkerService (RuntimeService)    │
+│    └── Spawns pods/containers via WorkerService (RuntimeClient)     │
 │                                                                     │
 │  WorkerService (ZmqService) ─ Kubernetes CRI aligned                │
 │    └── Endpoint: inproc://hyprstream/workers                        │
-│    └── RuntimeService: PodSandbox + Container lifecycle             │
-│    └── ImageService: Pull, List, Remove images                      │
+│    └── RuntimeClient: PodSandbox + Container lifecycle              │
+│    └── ImageClient: Pull, List, Remove images                       │
 │    └── PodSandbox = Kata VM (maps to CRI sandbox concept)           │
 │    └── Container = OCI container within VM                          │
 │                                                                     │
@@ -55,32 +55,45 @@ crates/hyprstream-workers/
 │   ├── config.rs                 # WorkerConfig, PoolConfig, WorkflowConfig
 │   ├── error.rs                  # WorkerError enum
 │   │
-│   ├── runtime/                  # CRI RuntimeService (PodSandbox + Container)
+│   ├── runtime/                  # CRI RuntimeClient (PodSandbox + Container)
 │   │   ├── mod.rs
 │   │   ├── service.rs            # WorkerService (ZmqService impl)
-│   │   ├── client.rs             # RuntimeService trait + RuntimeZmq client
+│   │   ├── client.rs             # RuntimeClient trait + RuntimeZmq client
 │   │   ├── sandbox.rs            # PodSandbox (Kata VM lifecycle)
 │   │   ├── container.rs          # Container lifecycle within sandbox
-│   │   └── pool.rs               # SandboxPool (warm VM management)
+│   │   ├── pool.rs               # SandboxPool (warm VM management)
+│   │   ├── virtiofs.rs           # VM file sharing via virtio-fs
+│   │   └── spawner/              # Re-exports from hyprstream-rpc
 │   │
-│   ├── image/                    # RAFS-backed ImageService
+│   ├── image/                    # RAFS-backed ImageClient
 │   │   ├── mod.rs
-│   │   ├── client.rs             # ImageService trait + ImageZmq client
+│   │   ├── client.rs             # ImageClient trait + ImageZmq client
 │   │   ├── store.rs              # RafsStore - chunk CAS + bootstrap metadata
-│   │   └── registry.rs           # OCI registry client (oci-distribution)
+│   │   └── manifest.rs           # OCI manifest fetching and parsing
 │   │
 │   ├── workflow/                 # WorkflowService (orchestration)
 │   │   ├── mod.rs
 │   │   ├── service.rs            # WorkflowService (ZmqService impl)
-│   │   ├── client.rs             # WorkflowOps extension trait
+│   │   ├── client.rs             # WorkflowClient trait + WorkflowZmq client
 │   │   ├── parser.rs             # GitHub Actions YAML parsing
 │   │   ├── triggers.rs           # EventHandler trait + concrete handlers
 │   │   ├── subscription.rs       # WorkflowSubscription, indexed routing
-│   │   └── runner.rs             # Job/step execution via RuntimeService
+│   │   └── runner.rs             # Job/step execution via RuntimeClient
 │   │
-│   └── events/                   # Event bus infrastructure
-│       ├── mod.rs
-│       └── broker.rs             # XPUB/XSUB proxy
+│   ├── events/                   # Event bus infrastructure
+│   │   ├── mod.rs                # Main entry, re-exports from hyprstream-rpc
+│   │   ├── service.rs            # ProxyService usage (from hyprstream-rpc)
+│   │   ├── publisher.rs          # EventPublisher
+│   │   ├── subscriber.rs         # EventSubscriber
+│   │   ├── types.rs              # WorkerEvent, SandboxStarted, etc.
+│   │   ├── endpoints.rs          # Endpoint detection (inproc/IPC/systemd)
+│   │   └── sockopt.rs            # ZMQ socket options
+│   │
+│   └── dbus/                     # D-Bus bridge for container access
+│       ├── mod.rs                # Main module
+│       ├── bridge.rs             # ZMQ bridge with policy integration
+│       ├── policy.rs             # Resource access control
+│       └── protocol.rs           # D-Bus request/response protocol
 │
 └── cloud-init/                   # VM bootstrap templates
     ├── user-data.template
@@ -102,11 +115,11 @@ pub struct WorkerService {
 }
 ```
 
-#### RuntimeService Trait (CRI-aligned)
+#### RuntimeClient Trait (CRI-aligned)
 
 ```rust
 #[async_trait]
-pub trait RuntimeService {
+pub trait RuntimeClient {
     // Runtime
     async fn version(&self, version: &str) -> Result<VersionResponse>;
     async fn status(&self, verbose: bool) -> Result<StatusResponse>;
@@ -137,11 +150,11 @@ pub trait RuntimeService {
 }
 ```
 
-#### ImageService Trait (CRI-aligned)
+#### ImageClient Trait (CRI-aligned)
 
 ```rust
 #[async_trait]
-pub trait ImageService {
+pub trait ImageClient {
     async fn list_images(&self, filter: Option<&ImageFilter>) -> Result<Vec<Image>>;
     async fn image_status(&self, image: &ImageSpec, verbose: bool) -> Result<ImageStatusResponse>;
     async fn pull_image(&self, image: &ImageSpec, auth: Option<&AuthConfig>) -> Result<String>;
@@ -171,11 +184,11 @@ pub struct WorkflowService {
 }
 ```
 
-#### WorkflowOps Trait
+#### WorkflowClient Trait ⚠️ Partially Implemented
 
 ```rust
 #[async_trait]
-pub trait WorkflowOps {
+pub trait WorkflowClient {
     // Discovery and registration
     async fn scan_repo(&self, repo_id: &str) -> Result<Vec<WorkflowDef>>;
     async fn register_workflow(&self, workflow: WorkflowDef) -> Result<WorkflowId>;
@@ -257,14 +270,17 @@ Endpoints:
 Events use repo-scoped topics for efficient ZMQ prefix filtering:
 
 ```
-# Repository events (repo-scoped)
+# Worker events (✅ Implemented)
+worker.{entity_id}.{event}     # Sandbox/container lifecycle events
+
+# Repository events (⚠️ Future Work - not yet implemented)
 git2db.{repo_id}.clone         # Repository cloned
 git2db.{repo_id}.push          # Branch pushed
 git2db.{repo_id}.commit        # Commit created
 git2db.{repo_id}.merge         # Branch merged
 git2db.{repo_id}.tag           # Tag created
 
-# Non-repo events (model-scoped)
+# Non-repo events (⚠️ Future Work - not yet implemented)
 training.{model_id}.started    # Training started
 training.{model_id}.completed  # Training completed
 metrics.{model_id}.breach      # Threshold breach
@@ -292,7 +308,10 @@ pub enum HandlerResult {
 }
 ```
 
-### Event Routing (Indexed Dispatch)
+### Event Routing (Indexed Dispatch) ⚠️ Future Work
+
+> **Note**: The routing code below is the design target. Currently only `worker.*` events
+> are implemented. git2db/training/metrics event routing is not yet wired up.
 
 ```rust
 impl WorkflowService {

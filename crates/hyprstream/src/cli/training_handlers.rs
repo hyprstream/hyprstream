@@ -329,7 +329,7 @@ pub async fn handle_training_infer(
     runtime_config.kv_quant_type = kv_quant.into();
 
     // Start InferenceService with TTT enabled
-    let service_handle = InferenceService::start_at(
+    let mut service_handle = InferenceService::start_at(
         &model_path,
         runtime_config,
         verifying_key,
@@ -544,7 +544,7 @@ pub async fn handle_training_batch(
     runtime_config.kv_quant_type = kv_quant.into();
 
     let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
-    let service_handle = InferenceService::start_at(
+    let mut service_handle = InferenceService::start_at(
         &model_path,
         runtime_config,
         verifying_key,

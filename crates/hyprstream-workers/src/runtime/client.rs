@@ -1,6 +1,6 @@
-//! RuntimeService trait and ZMQ client
+//! RuntimeClient trait and ZMQ client
 //!
-//! Mirrors Kubernetes CRI RuntimeService (`runtime.v1`) for future kubelet compatibility.
+//! Client-side trait for CRI RuntimeService (`runtime.v1`) for future kubelet compatibility.
 
 use crate::error::Result;
 use crate::workers_capnp;
@@ -13,12 +13,12 @@ use super::{
     Container, ContainerConfig, ContainerStatus,
 };
 
-/// CRI-aligned RuntimeService trait
+/// CRI-aligned RuntimeClient trait
 ///
-/// Mirrors Kubernetes CRI RuntimeService (`runtime.v1`) for future kubelet/crictl compatibility.
+/// Client-side interface for CRI RuntimeService (`runtime.v1`) for future kubelet/crictl compatibility.
 /// PodSandbox = Kata VM, Container = OCI container within VM.
 #[async_trait]
-pub trait RuntimeService: Send + Sync {
+pub trait RuntimeClient: Send + Sync {
     // ─────────────────────────────────────────────────────────────────────
     // Runtime Information
     // ─────────────────────────────────────────────────────────────────────
@@ -431,9 +431,9 @@ pub struct FilesystemIdentifier {
 // ZMQ Client Implementation
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// ZMQ client for RuntimeService
+/// ZMQ client for RuntimeClient
 ///
-/// Implements RuntimeService trait via ZMQ REQ/REP to WorkerService.
+/// Implements RuntimeClient trait via ZMQ REQ/REP to WorkerService.
 pub struct RuntimeZmq {
     // TODO: Add ZmqClient from hyprstream core
     _endpoint: String,
@@ -449,7 +449,7 @@ impl RuntimeZmq {
 }
 
 #[async_trait]
-impl RuntimeService for RuntimeZmq {
+impl RuntimeClient for RuntimeZmq {
     async fn version(&self, _version: &str) -> Result<VersionResponse> {
         todo!("Implement ZMQ call")
     }

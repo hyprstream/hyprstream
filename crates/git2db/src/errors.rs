@@ -41,7 +41,6 @@ pub enum Git2DBError {
         code: ErrorCode,
         message: String,
         recoverable: bool,
-        retry_suggested: bool,
     },
 
     /// Repository access errors
@@ -62,10 +61,7 @@ pub enum Git2DBError {
 
     /// Network operation errors
     #[error("Network operation failed: {message}")]
-    Network {
-        message: String,
-        retry_after: Option<std::time::Duration>,
-    },
+    Network { message: String },
 
     /// Configuration errors
     #[error("Configuration error: {message}")]
@@ -154,17 +150,6 @@ impl Git2DBError {
         }
     }
 
-    /// Check if this error suggests retrying
-    pub fn retry_suggested(&self) -> bool {
-        match self {
-            Self::GitOperation {
-                retry_suggested, ..
-            } => *retry_suggested,
-            Self::Network { .. } => true,
-            _ => false,
-        }
-    }
-
     /// Create a git operation error from git2::Error
     pub fn from_git_error(err: git2::Error) -> Self {
         let class = err.class();
@@ -173,15 +158,11 @@ impl Git2DBError {
 
         let recoverable = matches!(class, ErrorClass::Net | ErrorClass::Http | ErrorClass::Ssh);
 
-        let retry_suggested = matches!(code, ErrorCode::GenericError)
-            || matches!(class, ErrorClass::Net | ErrorClass::Http);
-
         Self::GitOperation {
             class,
             code,
             message,
             recoverable,
-            retry_suggested,
         }
     }
 
@@ -221,18 +202,6 @@ impl Git2DBError {
     pub fn network<S: Into<String>>(message: S) -> Self {
         Self::Network {
             message: message.into(),
-            retry_after: None,
-        }
-    }
-
-    /// Create a network error with retry suggestion
-    pub fn network_with_retry<S: Into<String>>(
-        message: S,
-        retry_after: std::time::Duration,
-    ) -> Self {
-        Self::Network {
-            message: message.into(),
-            retry_after: Some(retry_after),
         }
     }
 
@@ -313,7 +282,6 @@ impl Git2DBError {
             code: ErrorCode::Conflict,
             message: message.into(),
             recoverable: true,
-            retry_suggested: false,
         }
     }
 
@@ -333,28 +301,6 @@ impl Git2DBError {
         }
     }
 
-    /// Check if retry is suggested
-    pub fn should_retry(&self) -> bool {
-        match self {
-            Self::GitOperation {
-                retry_suggested, ..
-            } => *retry_suggested,
-            Self::Network { .. } => true,
-            _ => false,
-        }
-    }
-
-    /// Get suggested retry delay
-    pub fn retry_delay(&self) -> Option<std::time::Duration> {
-        match self {
-            Self::Network { retry_after, .. } => *retry_after,
-            Self::GitOperation {
-                retry_suggested: true,
-                ..
-            } => Some(std::time::Duration::from_secs(1)),
-            _ => None,
-        }
-    }
 }
 
 impl From<git2::Error> for Git2DBError {
@@ -399,7 +345,6 @@ macro_rules! ref_error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
     fn test_git_operation_error_classification() {
@@ -412,14 +357,12 @@ mod tests {
             class,
             code,
             recoverable,
-            retry_suggested,
             ..
         } = err
         {
             assert_eq!(class, ErrorClass::Net);
             assert_eq!(code, ErrorCode::GenericError);
             assert!(recoverable);
-            assert!(retry_suggested);
         } else {
             panic!("Expected GitOperation error");
         }
@@ -439,14 +382,12 @@ mod tests {
             class,
             code,
             recoverable,
-            retry_suggested,
             ..
         } = err
         {
             assert_eq!(class, ErrorClass::Repository);
             assert_eq!(code, ErrorCode::NotFound);
             assert!(!recoverable);
-            assert!(!retry_suggested);
         } else {
             panic!("Expected GitOperation error");
         }
@@ -469,7 +410,6 @@ mod tests {
         }
 
         assert!(!err.is_recoverable());
-        assert!(!err.should_retry());
     }
 
     #[test]
@@ -488,7 +428,6 @@ mod tests {
         }
 
         assert!(!err.is_recoverable());
-        assert!(!err.should_retry());
     }
 
     #[test]
@@ -520,48 +459,19 @@ mod tests {
         }
 
         assert!(err.is_recoverable());
-        assert!(!err.should_retry());
     }
 
     #[test]
     fn test_network_error_creation() {
         let err = Git2DBError::network("Connection timeout");
 
-        if let Git2DBError::Network {
-            ref message,
-            retry_after,
-        } = err
-        {
+        if let Git2DBError::Network { ref message } = err {
             assert_eq!(message, "Connection timeout");
-            assert!(retry_after.is_none());
         } else {
             panic!("Expected Network error");
         }
 
         assert!(err.is_recoverable());
-        assert!(err.should_retry());
-        assert!(err.retry_delay().is_none());
-    }
-
-    #[test]
-    fn test_network_error_with_retry() {
-        let retry_duration = Duration::from_secs(30);
-        let err = Git2DBError::network_with_retry("Rate limited", retry_duration);
-
-        if let Git2DBError::Network {
-            ref message,
-            retry_after,
-        } = err
-        {
-            assert_eq!(message, "Rate limited");
-            assert_eq!(retry_after, Some(retry_duration));
-        } else {
-            panic!("Expected Network error");
-        }
-
-        assert!(err.is_recoverable());
-        assert!(err.should_retry());
-        assert_eq!(err.retry_delay(), Some(retry_duration));
     }
 
     #[test]
@@ -575,7 +485,6 @@ mod tests {
         }
 
         assert!(!err.is_recoverable());
-        assert!(!err.should_retry());
     }
 
     #[test]
@@ -595,7 +504,6 @@ mod tests {
         }
 
         assert!(!err.is_recoverable());
-        assert!(!err.should_retry());
     }
 
     #[test]
@@ -614,7 +522,6 @@ mod tests {
         }
 
         assert!(!err.is_recoverable());
-        assert!(!err.should_retry());
     }
 
     #[test]
@@ -628,7 +535,6 @@ mod tests {
         }
 
         assert!(!err.is_recoverable());
-        assert!(!err.should_retry());
     }
 
     #[test]
@@ -642,7 +548,6 @@ mod tests {
         }
 
         assert!(!err.is_recoverable());
-        assert!(!err.should_retry());
     }
 
     #[test]
@@ -674,7 +579,6 @@ mod tests {
         }
 
         assert!(!err.is_recoverable());
-        assert!(!err.should_retry());
     }
 
     #[test]
@@ -699,27 +603,6 @@ mod tests {
         } else {
             panic!("Expected External error");
         }
-    }
-
-    #[test]
-    fn test_retry_delay_suggestions() {
-        // Test git operation retry delay
-        let git_err = Git2DBError::GitOperation {
-            class: ErrorClass::Net,
-            code: ErrorCode::GenericError,
-            message: "Network error".to_string(),
-            recoverable: true,
-            retry_suggested: true,
-        };
-        assert_eq!(git_err.retry_delay(), Some(Duration::from_secs(1)));
-
-        // Test network retry delay
-        let net_err = Git2DBError::network_with_retry("Rate limited", Duration::from_secs(60));
-        assert_eq!(net_err.retry_delay(), Some(Duration::from_secs(60)));
-
-        // Test no retry delay
-        let repo_err = Git2DBError::repository("/test", "Error");
-        assert_eq!(repo_err.retry_delay(), None);
     }
 
     #[test]
@@ -791,22 +674,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_comprehensive_retry_classification() {
-        let test_cases = vec![
-            (Git2DBError::network("test"), true),
-            (Git2DBError::authentication("url", "test"), false),
-            (Git2DBError::repository("/test", "test"), false),
-            (Git2DBError::configuration("test"), false),
-        ];
-
-        for (error, expected_retry) in test_cases {
-            assert_eq!(
-                error.should_retry(),
-                expected_retry,
-                "Retry classification failed for: {:?}",
-                error
-            );
-        }
-    }
 }

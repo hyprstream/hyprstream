@@ -86,7 +86,9 @@ anyhow.workspace = true
 sha2.workspace = true  # SHA256 validation for LFS files
 daemonize.workspace = true
 prost.workspace = true
-# Arrow JSON removed - focused on ML inference only
+
+# HTTP socket activation (systemd)
+listenfd = { version = "1.0", optional = true }
 
 # ML dependencies
 thiserror.workspace = true
@@ -152,7 +154,7 @@ half.workspace = true
 shellexpand.workspace = true
 
 [features]
-default = ["gittorrent", "xet"]
+default = ["gittorrent", "xet", "systemd", "otel"]
 cuda = []
 bnb = ["dep:bitsandbytes-sys"]  # Enable bitsandbytes KV cache quantization (requires compatible ROCm/CUDA)
 xet = ["git2db/xet-storage"]  # Enable XET large file storage
@@ -160,6 +162,7 @@ otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk
 gittorrent = ["dep:gittorrent", "git2db/gittorrent-transport"]  # Enable P2P model sharing via gittorrent transport
 download-libtorch = ["tch/download-libtorch"]
 overlayfs = ["git2db/overlayfs"]  # Enable overlayfs-backed worktrees (delegated to git2db)
+systemd = ["hyprstream-rpc/systemd", "hyprstream-workers/systemd", "dep:listenfd"]  # Systemd integration (socket activation, service units)
 
 [build-dependencies]
 cc.workspace = true

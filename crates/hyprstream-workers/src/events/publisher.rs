@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tmq::{publish, Multipart};
 
 use super::endpoints;
+use hyprstream_rpc::registry::{self, SocketKind};
 
 /// Async event publisher using TMQ PUB socket
 ///
@@ -28,16 +29,45 @@ pub struct EventPublisher {
 }
 
 impl EventPublisher {
-    /// Create a new publisher for a service
+    /// Create a new publisher for a service connecting to the default endpoint
     ///
     /// # Arguments
     ///
     /// * `context` - ZMQ context (must be same as EventService for inproc://)
     /// * `source` - Service name (e.g., "worker", "registry", "model", "inference")
+    ///
+    /// # Endpoint Resolution
+    ///
+    /// Uses EndpointRegistry if initialized, otherwise falls back to default inproc endpoint.
     pub fn new(context: &Arc<zmq::Context>, source: &str) -> Result<Self> {
+        let endpoint = match registry::try_global() {
+            Some(reg) => reg.endpoint("events", SocketKind::Pub).to_zmq_string(),
+            None => endpoints::PUB.to_string(),
+        };
+        Self::with_endpoint(context, source, &endpoint)
+    }
+
+    /// Create a new publisher for a service connecting to a specific endpoint
+    ///
+    /// Use this for IPC sockets in distributed mode.
+    ///
+    /// # Arguments
+    ///
+    /// * `context` - ZMQ context
+    /// * `source` - Service name (e.g., "worker", "registry", "cli")
+    /// * `endpoint` - Endpoint to connect to (e.g., "ipc:///run/user/1000/hyprstream/events/pub.sock")
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let endpoint = format!("ipc://{}", paths::events_pub_socket().display());
+    /// let mut publisher = EventPublisher::with_endpoint(&ctx, "cli", &endpoint)?;
+    /// publisher.publish_raw("system.registry.request", b"").await?;
+    /// ```
+    pub fn with_endpoint(context: &Arc<zmq::Context>, source: &str, endpoint: &str) -> Result<Self> {
         let socket = publish(context)
-            .connect(endpoints::PUB)
-            .map_err(|e| anyhow!("Failed to connect publisher to {}: {}", endpoints::PUB, e))?;
+            .connect(endpoint)
+            .map_err(|e| anyhow!("Failed to connect publisher to {}: {}", endpoint, e))?;
 
         Ok(Self {
             socket,

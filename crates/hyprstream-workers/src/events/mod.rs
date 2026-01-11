@@ -14,16 +14,33 @@
 //! └─────────────┘
 //! ```
 //!
+//! # Endpoint Modes
+//!
+//! The EventService supports three endpoint configurations:
+//!
+//! - **Inproc** (default): In-process transport for monolithic mode
+//! - **IPC**: Unix domain sockets for distributed processes
+//! - **Systemd FD**: Pre-bound file descriptors from socket activation
+//!
 //! # Usage
 //!
 //! ```ignore
-//! use hyprstream_workers::events::{start_event_service, EventPublisher, EventSubscriber, endpoints};
+//! use hyprstream_workers::events::{
+//!     endpoints, ProxyService, ServiceSpawner, SpawnedService,
+//!     EventPublisher, EventSubscriber,
+//! };
+//! use hyprstream_workers::events::endpoints::EndpointMode;
 //!
-//! // Start the event service (typically in main)
-//! let ctx = global_context();
-//! let handle = start_event_service(ctx.clone())?;
+//! // Detect transport configuration
+//! let (pub_transport, sub_transport) = endpoints::detect_transports(EndpointMode::Auto);
 //!
-//! // Create a publisher in your service
+//! // Create and spawn proxy service
+//! let ctx = Arc::new(zmq::Context::new());
+//! let proxy = ProxyService::new("events", ctx.clone(), pub_transport, sub_transport);
+//! let spawner = ServiceSpawner::threaded();
+//! let service = spawner.spawn(proxy).await?;
+//!
+//! // Create a publisher
 //! let mut publisher = EventPublisher::new(&ctx, "worker")?;
 //! publisher.publish("sandbox123", "started", &payload).await?;
 //!
@@ -35,17 +52,26 @@
 //! }
 //!
 //! // Graceful shutdown
-//! handle.stop()?;
+//! service.stop().await?;
 //! ```
 
+pub mod endpoints;
 mod publisher;
 mod service;
+pub mod sockopt;
 mod subscriber;
 mod types;
 
 pub use publisher::EventPublisher;
-pub use service::{start_event_service, EventServiceHandle};
 pub use subscriber::EventSubscriber;
+
+// Re-export spawner types for the recommended API:
+// let proxy = ProxyService::new("events", ctx, pub_transport, sub_transport);
+// let service = ServiceSpawner::threaded().spawn(proxy).await?;
+pub use hyprstream_rpc::service::spawner::{ProxyService, ServiceSpawner, SpawnedService};
+
+// Re-export endpoint types for convenience
+pub use endpoints::EndpointMode;
 
 // Re-export event types
 pub use types::{
@@ -60,21 +86,5 @@ pub use types::{
     serialize_sandbox_started, serialize_sandbox_stopped,
 };
 
-/// Event bus endpoints
-pub mod endpoints {
-    /// Publishers connect here (XSUB binds)
-    pub const PUB: &str = "inproc://hyprstream/events/pub";
-
-    /// Subscribers connect here (XPUB binds)
-    pub const SUB: &str = "inproc://hyprstream/events/sub";
-
-    /// Control socket for graceful shutdown (PAIR)
-    pub const CTRL: &str = "inproc://hyprstream/events/ctrl";
-}
-
-// Legacy aliases for backward compatibility
-#[deprecated(note = "Use endpoints::PUB instead")]
-pub const EVENTS_PUB: &str = endpoints::PUB;
-
-#[deprecated(note = "Use endpoints::SUB instead")]
-pub const EVENTS_SUB: &str = endpoints::SUB;
+// Inproc endpoint constants (for backward compatibility)
+pub use endpoints::{PUB as EVENTS_PUB, SUB as EVENTS_SUB};

@@ -1,18 +1,19 @@
 //! WorkerClient - ZMQ client for WorkerService
 //!
 //! Provides high-level async API for sandbox/container/image operations.
-//! Implements both RuntimeService and ImageService via ZMQ REQ/REP.
+//! Implements both RuntimeClient and ImageClient via ZMQ REQ/REP.
 //!
 //! # Architecture
 //!
 //! Uses extension traits on `ZmqClient` following the `RegistryOps` pattern:
-//! - `RuntimeOps` - CRI RuntimeService operations
-//! - `ImageOps` - CRI ImageService operations
+//! - `RuntimeOps` - CRI RuntimeClient operations
+//! - `ImageOps` - CRI ImageClient operations
 //!
 //! All requests are Cap'n Proto serialized and signed via `ZmqClient::call()`.
 
 use async_trait::async_trait;
 use hyprstream_rpc::prelude::*;
+use hyprstream_rpc::registry::{global as registry, SocketKind};
 use hyprstream_rpc::serialize_message;
 use anyhow::{anyhow, Result};
 use capnp::message::ReaderOptions;
@@ -24,7 +25,7 @@ use hyprstream_workers::workers_capnp;
 
 // Re-export types from hyprstream-workers for convenience
 pub use hyprstream_workers::image::{
-    AuthConfig, Image, ImageFilter, ImageService, ImageSpec,
+    AuthConfig, Image, ImageFilter, ImageClient, ImageSpec,
 };
 pub use hyprstream_workers::runtime::{
     Container, ContainerAttributes, ContainerConfig, ContainerFilter, ContainerMetadata,
@@ -33,9 +34,12 @@ pub use hyprstream_workers::runtime::{
     KeyValue, LinuxPodSandboxStats, MemoryUsage, NetworkInterfaceUsage, NetworkUsage, PodIP,
     PodSandbox, PodSandboxAttributes, PodSandboxConfig, PodSandboxFilter, PodSandboxMetadata,
     PodSandboxNetworkStatus, PodSandboxState, PodSandboxStats, PodSandboxStatsFilter,
-    PodSandboxStatus, PodSandboxStatusResponse, ProcessUsage, RuntimeCondition, RuntimeService,
-    RuntimeStatus, StatusResponse, VersionResponse, ContainerImageSpec, WORKER_ENDPOINT,
+    PodSandboxStatus, PodSandboxStatusResponse, ProcessUsage, RuntimeCondition, RuntimeClient,
+    RuntimeStatus, StatusResponse, VersionResponse, ContainerImageSpec,
 };
+
+/// Service name for endpoint registry
+const SERVICE_NAME: &str = "workers";
 
 // ============================================================================
 // RuntimeOps Extension Trait
@@ -43,7 +47,7 @@ pub use hyprstream_workers::runtime::{
 
 /// Runtime operations extension trait for `ZmqClient`.
 ///
-/// Provides CRI RuntimeService methods when `ZmqClient` is connected to WorkerService.
+/// Provides CRI RuntimeClient methods when `ZmqClient` is connected to WorkerService.
 /// All requests are automatically signed via `ZmqClient::call()`.
 #[async_trait]
 pub trait RuntimeOps {
@@ -132,7 +136,7 @@ pub trait RuntimeOps {
 
 /// Image operations extension trait for `ZmqClient`.
 ///
-/// Provides CRI ImageService methods when `ZmqClient` is connected to WorkerService.
+/// Provides CRI ImageClient methods when `ZmqClient` is connected to WorkerService.
 #[async_trait]
 pub trait ImageOps {
     /// List images.
@@ -1354,8 +1358,8 @@ fn build_auth_config(mut builder: workers_capnp::auth_config::Builder, auth: &Au
 
 /// WorkerClient wraps ZMQ communication with WorkerService
 ///
-/// Implements both RuntimeService (sandbox/container lifecycle) and
-/// ImageService (image management) via ZMQ REQ/REP.
+/// Implements both RuntimeClient (sandbox/container lifecycle) and
+/// ImageClient (image management) via ZMQ REQ/REP.
 pub struct WorkerClient {
     client: Arc<ZmqClient>,
 }
@@ -1363,8 +1367,16 @@ pub struct WorkerClient {
 impl WorkerClient {
     /// Create a new WorkerClient with the given signing key and identity
     pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
+        let endpoint = registry().endpoint(SERVICE_NAME, SocketKind::Rep).to_zmq_string();
         Self {
-            client: Arc::new(ZmqClient::new(WORKER_ENDPOINT, signing_key, identity)),
+            client: Arc::new(ZmqClient::new(&endpoint, signing_key, identity)),
+        }
+    }
+
+    /// Create a WorkerClient connected to a specific endpoint
+    pub fn with_endpoint(endpoint: &str, signing_key: SigningKey, identity: RequestIdentity) -> Self {
+        Self {
+            client: Arc::new(ZmqClient::new(endpoint, signing_key, identity)),
         }
     }
 
@@ -1380,11 +1392,11 @@ impl WorkerClient {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// RuntimeService Implementation (delegates to RuntimeOps)
+// RuntimeClient Implementation (delegates to RuntimeOps)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[async_trait]
-impl RuntimeService for WorkerClient {
+impl RuntimeClient for WorkerClient {
     async fn version(&self, version: &str) -> hyprstream_workers::error::Result<VersionResponse> {
         self.client
             .runtime_version(version)
@@ -1568,11 +1580,11 @@ impl RuntimeService for WorkerClient {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ImageService Implementation (delegates to ImageOps)
+// ImageClient Implementation (delegates to ImageOps)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[async_trait]
-impl ImageService for WorkerClient {
+impl ImageClient for WorkerClient {
     async fn list_images(
         &self,
         filter: Option<&ImageFilter>,

@@ -26,7 +26,7 @@ mod subscription;
 mod runner;
 
 pub use service::WorkflowService;
-pub use client::{WorkflowOps, WorkflowZmq};
+pub use client::{WorkflowClient, WorkflowZmq};
 pub use parser::{Workflow, Job, Step};
 pub use triggers::{EventTrigger, EventHandler, HandlerResult};
 pub use subscription::WorkflowSubscription;

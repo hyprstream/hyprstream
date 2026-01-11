@@ -16,6 +16,7 @@ capnp = { workspace = true }
 # ZMQ transport
 tmq = { workspace = true }
 zmq = { workspace = true }
+zmq-sys = { workspace = true }  # Raw FFI for ZMQ_USE_FD socket option
 
 # Async runtime
 tokio = { workspace = true }
@@ -31,6 +32,17 @@ tracing = { workspace = true }
 whoami = { workspace = true }
 hex = { workspace = true }
 parking_lot = { workspace = true }
+
+# Process spawning (moved from hyprstream-workers)
+nix = { workspace = true }
+dashmap = { workspace = true }
+which = { workspace = true }
+uuid = { workspace = true }
+
+# Service management (merged from hyprstream-utils)
+dirs = "5"
+systemd = { version = "0.10", optional = true }
+zbus_systemd = { version = "0.0.11", features = ["login1", "systemd1"], optional = true }
 
 # Cryptography (for signed envelopes, DH key exchange, stream HMAC)
 ed25519-dalek = { workspace = true }
@@ -48,6 +60,7 @@ p256 = { workspace = true, optional = true }
 [features]
 default = []
 fips = ["p256"]
+systemd = ["dep:systemd", "dep:zbus_systemd"]
 
 [build-dependencies]
 capnpc = { workspace = true }

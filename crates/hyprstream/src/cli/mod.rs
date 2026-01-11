@@ -8,10 +8,12 @@
 
 pub mod commands;
 pub mod context;
+pub mod daemon;
 pub mod git_handlers;
 pub mod handlers;
 pub mod policy_handlers;
 pub mod remote_handlers;
+pub mod systemd_setup;
 pub mod training_handlers;
 pub mod worker_handlers;
 pub mod worktree_handlers;

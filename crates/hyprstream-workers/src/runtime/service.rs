@@ -1,4 +1,4 @@
-//! WorkerService - CRI RuntimeService + ImageService via ZMQ
+//! WorkerService - CRI RuntimeClient + ImageClient via ZMQ
 //!
 //! Implements ZmqService trait for handling CRI-aligned requests.
 
@@ -13,7 +13,9 @@ use tracing::debug;
 
 // Import ZMQ service infrastructure from hyprstream-rpc
 use hyprstream_rpc::prelude::VerifyingKey;
+use hyprstream_rpc::registry::{global as registry, SocketKind};
 use hyprstream_rpc::service::{EnvelopeContext, ServiceHandle, ServiceRunner, ZmqService};
+use hyprstream_rpc::transport::TransportConfig;
 
 use crate::config::{ImageConfig, PoolConfig};
 use crate::error::{Result, WorkerError};
@@ -37,10 +39,10 @@ use super::pool::SandboxPool;
 use super::sandbox::{PodSandbox, PodSandboxConfig};
 use super::{RUNTIME_NAME, RUNTIME_VERSION};
 
-/// Default endpoint for the worker service
-pub const WORKER_ENDPOINT: &str = "inproc://hyprstream/workers";
+/// Service name for endpoint registry
+const SERVICE_NAME: &str = "workers";
 
-/// WorkerService handles CRI RuntimeService and ImageService requests
+/// WorkerService handles CRI RuntimeClient and ImageClient requests
 ///
 /// Implements the ZmqService trait for integration with hyprstream's ZMQ infrastructure.
 pub struct WorkerService {
@@ -135,10 +137,10 @@ impl WorkerService {
         Ok(())
     }
 
-    /// Start the WorkerService as a ZMQ service
+    /// Start the WorkerService as a ZMQ service on the default endpoint
     ///
-    /// This creates the service, initializes it, and starts it on the
-    /// `WORKER_ENDPOINT` using the provided ZMQ context and verifying key.
+    /// This creates the service, initializes it, and starts it using the
+    /// endpoint from the registry with the provided ZMQ context and verifying key.
     ///
     /// # Arguments
     ///
@@ -166,6 +168,41 @@ impl WorkerService {
         context: Arc<zmq::Context>,
         verifying_key: VerifyingKey,
     ) -> AnyhowResult<ServiceHandle> {
+        let endpoint = registry().endpoint(SERVICE_NAME, SocketKind::Rep).to_zmq_string();
+        Self::start_at(pool_config, image_config, context, verifying_key, &endpoint).await
+    }
+
+    /// Start the WorkerService as a ZMQ service on a specific endpoint
+    ///
+    /// Use this for IPC sockets in distributed mode.
+    ///
+    /// # Arguments
+    ///
+    /// * `pool_config` - Configuration for the sandbox pool
+    /// * `image_config` - Configuration for image management
+    /// * `context` - ZMQ context for socket creation
+    /// * `verifying_key` - Server's public key for signature verification
+    /// * `endpoint` - Endpoint to bind to (e.g., "ipc:///run/user/1000/hyprstream/worker.sock")
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let endpoint = format!("ipc://{}", paths::worker_socket().display());
+    /// let handle = WorkerService::start_at(
+    ///     pool_config,
+    ///     image_config,
+    ///     global_context(),
+    ///     verifying_key,
+    ///     &endpoint,
+    /// ).await?;
+    /// ```
+    pub async fn start_at(
+        pool_config: PoolConfig,
+        image_config: ImageConfig,
+        context: Arc<zmq::Context>,
+        verifying_key: VerifyingKey,
+        endpoint: &str,
+    ) -> AnyhowResult<ServiceHandle> {
         // Create RAFS store for image management
         let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
 
@@ -178,10 +215,11 @@ impl WorkerService {
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize WorkerService: {}", e))?;
 
-        tracing::info!("WorkerService initialized, binding to {}", WORKER_ENDPOINT);
+        tracing::info!("WorkerService initialized, binding to {}", endpoint);
 
         // Start the ZMQ service using ServiceRunner
-        let runner = ServiceRunner::new(WORKER_ENDPOINT, context, verifying_key);
+        let transport = TransportConfig::from_endpoint(endpoint);
+        let runner = ServiceRunner::new(transport, context, verifying_key);
         runner.run(service).await
     }
 

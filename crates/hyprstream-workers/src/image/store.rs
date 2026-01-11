@@ -555,15 +555,15 @@ impl RafsStore {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // CRI ImageService methods
+    // CRI ImageClient methods
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// List all images (CRI ImageService aligned)
+    /// List all images (CRI ImageClient aligned)
     pub async fn list_images(&self) -> Result<Vec<Image>> {
         self.list().await
     }
 
-    /// Get image status (CRI ImageService aligned)
+    /// Get image status (CRI ImageClient aligned)
     pub async fn image_status(&self, image_ref: &str, _verbose: bool) -> Result<super::client::ImageStatusResponse> {
         if self.exists(image_ref) {
             let metadata = self.get_metadata(image_ref)?;
@@ -591,14 +591,14 @@ impl RafsStore {
         }
     }
 
-    /// Remove image by reference (CRI ImageService aligned)
+    /// Remove image by reference (CRI ImageClient aligned)
     pub async fn remove_image(&self, image_ref: &str) -> Result<()> {
         // Get image ID from reference, then remove
         let image_id = self.get_image_id(image_ref)?;
         self.remove(&image_id).await
     }
 
-    /// Get filesystem info (CRI ImageService aligned)
+    /// Get filesystem info (CRI ImageClient aligned)
     pub async fn fs_info(&self) -> Result<Vec<super::client::FilesystemUsage>> {
         let mut used_bytes = 0u64;
         let mut inodes_used = 0u64;

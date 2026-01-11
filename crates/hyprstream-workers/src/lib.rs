@@ -8,10 +8,10 @@
 //!
 //! Two main services:
 //!
-//! - **WorkerService**: CRI-aligned RuntimeService + ImageService
+//! - **WorkerService**: CRI-aligned RuntimeClient + ImageClient
 //!   - PodSandbox = Kata VM (maps to CRI sandbox concept)
 //!   - Container = OCI container within VM
-//!   - ImageService backed by Nydus RAFS for chunk-level deduplication
+//!   - ImageClient backed by Nydus RAFS for chunk-level deduplication
 //!
 //! - **WorkflowService**: High-level workflow orchestration
 //!   - Discovers `.github/workflows/*.yml` from RegistryService repos
@@ -28,7 +28,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use hyprstream_workers::{WorkerService, RuntimeService, ImageService};
+//! use hyprstream_workers::{WorkerService, RuntimeClient, ImageClient};
 //!
 //! // Create worker service
 //! let worker = WorkerService::new(config).await?;
@@ -47,26 +47,39 @@
 pub mod config;
 pub mod error;
 
+// Re-export paths from hyprstream-rpc
+pub use hyprstream_rpc::paths;
+
 pub mod runtime;
 pub mod image;
 pub mod workflow;
 pub mod events;
+
+#[cfg(feature = "dbus")]
+pub mod dbus;
 
 // Re-export main types
 pub use config::{HypervisorType, ImageConfig, PoolConfig, WorkerConfig, WorkflowConfig};
 pub use error::WorkerError;
 
 // Re-export service types
-pub use runtime::{WorkerService, RuntimeService, RuntimeZmq};
-pub use image::{ImageService, ImageZmq, RafsStore};
-pub use workflow::{WorkflowService, WorkflowOps, WorkflowZmq};
+pub use runtime::{WorkerService, RuntimeClient, RuntimeZmq};
+pub use image::{ImageClient, ImageZmq, RafsStore};
+pub use workflow::{WorkflowService, WorkflowClient, WorkflowZmq};
 pub use events::{
-    start_event_service, EventServiceHandle, EventPublisher, EventSubscriber, endpoints,
+    // Spawner types (new API)
+    ProxyService, ServiceSpawner, SpawnedService,
+    // Publisher/Subscriber
+    EventPublisher, EventSubscriber, endpoints,
+    // Endpoint configuration
+    EndpointMode,
     // Event types
     WorkerEvent, ReceivedEvent,
     SandboxStarted, SandboxStopped, ContainerStarted, ContainerStopped,
     serialize_sandbox_started, serialize_sandbox_stopped,
     serialize_container_started, serialize_container_stopped,
+    // Inproc endpoint constants
+    EVENTS_PUB, EVENTS_SUB,
 };
 
 /// Generated Cap'n Proto code

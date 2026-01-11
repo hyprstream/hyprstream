@@ -20,6 +20,7 @@
 use crate::zmq::global_context;
 use anyhow::Result;
 use hyprstream_rpc::prelude::*;
+use hyprstream_rpc::transport::TransportConfig;
 use std::sync::Arc;
 
 // Re-export core types from hyprstream-rpc
@@ -49,7 +50,26 @@ impl ServiceRunner {
     /// * `server_pubkey` - Server's Ed25519 public key for verifying request signatures
     pub fn new(endpoint: &str, server_pubkey: VerifyingKey) -> Self {
         Self {
-            inner: ServiceRunnerBase::new(endpoint, global_context(), server_pubkey),
+            inner: ServiceRunnerBase::new(
+                TransportConfig::from_endpoint(endpoint),
+                global_context(),
+                server_pubkey,
+            ),
+        }
+    }
+
+    /// Create a new service runner bound to the given transport configuration.
+    ///
+    /// Uses the global ZMQ context for `inproc://` connectivity.
+    /// Supports SystemdFd for socket activation.
+    ///
+    /// # Arguments
+    ///
+    /// * `transport` - Transport configuration (supports SystemdFd)
+    /// * `server_pubkey` - Server's Ed25519 public key for verifying request signatures
+    pub fn with_transport(transport: TransportConfig, server_pubkey: VerifyingKey) -> Self {
+        Self {
+            inner: ServiceRunnerBase::new(transport, global_context(), server_pubkey),
         }
     }
 
@@ -63,7 +83,7 @@ impl ServiceRunner {
     ) -> Self {
         Self {
             inner: ServiceRunnerBase::with_nonce_cache(
-                endpoint,
+                TransportConfig::from_endpoint(endpoint),
                 global_context(),
                 server_pubkey,
                 nonce_cache,
@@ -185,7 +205,7 @@ mod tests {
 
         // Start the service (waits for socket binding)
         let runner = ServiceRunner::new(endpoint, verifying_key);
-        let handle = runner.run(EchoService).await.expect("test: start service");
+        let mut handle = runner.run(EchoService).await.expect("test: start service");
 
         // Use ZmqClient directly (handles signing internally)
         let client = ZmqClient::new(endpoint, signing_key, RequestIdentity::local());
@@ -209,7 +229,7 @@ mod tests {
 
         // Start the service with wrong key (waits for socket binding)
         let runner = ServiceRunner::new(endpoint, wrong_verifying_key);
-        let handle = runner.run(EchoService).await.expect("test: start service");
+        let mut handle = runner.run(EchoService).await.expect("test: start service");
 
         // Sign with different key than service expects
         let client = ZmqClient::new(endpoint, signing_key, RequestIdentity::local());

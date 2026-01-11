@@ -9,6 +9,7 @@ use crate::registry_capnp;
 use crate::services::rpc_types::{HealthStatus, RemoteInfo, RegistryResponse, WorktreeData};
 use crate::services::{EnvelopeContext, ServiceRunner, ZmqClient, ZmqService};
 use hyprstream_rpc::prelude::*;
+use hyprstream_rpc::registry::{global as registry, SocketKind};
 use hyprstream_rpc::{serialize_message, FromCapnp};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -21,8 +22,8 @@ use std::sync::{Arc, RwLock};
 use tracing::debug;
 use uuid::Uuid;
 
-/// Default endpoint for the registry service
-pub const REGISTRY_ENDPOINT: &str = "inproc://hyprstream/registry";
+/// Service name for endpoint registry
+const SERVICE_NAME: &str = "registry";
 
 // ============================================================================
 // Extension Trait for Registry Operations on ZmqClient
@@ -336,7 +337,8 @@ pub struct RegistryZmq {
 impl RegistryZmq {
     /// Create a new registry client with signing credentials.
     pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
-        Self::with_endpoint(REGISTRY_ENDPOINT, signing_key, identity)
+        let endpoint = registry().endpoint(SERVICE_NAME, SocketKind::Rep).to_zmq_string();
+        Self::with_endpoint(&endpoint, signing_key, identity)
     }
 
     /// Create a registry client connected to a specific endpoint.
@@ -504,13 +506,14 @@ impl RegistryService {
         })
     }
 
-    /// Start the registry service on the default endpoint
+    /// Start the registry service on the default endpoint (from registry)
     pub async fn start(
         base_dir: impl AsRef<Path>,
         server_pubkey: hyprstream_rpc::VerifyingKey,
         policy_client: PolicyZmqClient,
     ) -> Result<crate::services::ServiceHandle> {
-        Self::start_at(base_dir, server_pubkey, policy_client, REGISTRY_ENDPOINT).await
+        let endpoint = registry().endpoint(SERVICE_NAME, SocketKind::Rep).to_zmq_string();
+        Self::start_at(base_dir, server_pubkey, policy_client, &endpoint).await
     }
 
     /// Start the registry service at a specific endpoint
@@ -2395,14 +2398,14 @@ mod tests {
         .expect("test: start policy service");
 
         // Create policy client for RegistryService
-        let policy_client = PolicyZmqClient::new_at(
+        let policy_client = PolicyZmqClient::with_endpoint(
             "inproc://test-policy",
             signing_key.clone(),
             RequestIdentity::local(),
         );
 
         // Start the registry service with policy client
-        let handle = RegistryService::start_at(
+        let mut handle = RegistryService::start_at(
             temp_dir.path(),
             verifying_key,
             policy_client,

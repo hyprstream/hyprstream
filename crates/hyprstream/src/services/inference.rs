@@ -46,23 +46,11 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::mpsc;
+use tmq::{reply, Multipart};
 use tokio::runtime::Handle;
 use tokenizers::Tokenizer;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
-
-// ============================================================================
-// PolicyChecker - Thread-safe wrapper for policy checks from single-threaded runtime
-// ============================================================================
-
-/// Request sent to the policy checker thread
-struct PolicyCheckRequest {
-    subject: String,
-    resource: String,
-    operation: Operation,
-    response_tx: mpsc::Sender<bool>,
-}
 
 /// Pending stream to be executed after REP response is sent.
 ///
@@ -73,80 +61,6 @@ struct PendingStream {
     request: GenerationRequest,
     stream_id: String,
     prompt: String, // For training collection (stored as String for simplicity)
-}
-
-/// Thread-safe policy checker that runs on a dedicated thread with its own runtime.
-///
-/// This allows InferenceService (single-threaded runtime) to call async PolicyZmqClient
-/// without nesting runtimes. The PolicyChecker thread runs a multi-threaded runtime
-/// where TMQ async I/O works properly.
-#[derive(Clone)]
-pub struct PolicyChecker {
-    request_tx: mpsc::Sender<PolicyCheckRequest>,
-}
-
-impl PolicyChecker {
-    /// Create a new PolicyChecker and start its background thread.
-    ///
-    /// The background thread runs a multi-threaded tokio runtime and processes
-    /// policy check requests via synchronous channels.
-    pub fn start(policy_client: PolicyZmqClient) -> Self {
-        let (request_tx, request_rx) = mpsc::channel::<PolicyCheckRequest>();
-
-        std::thread::spawn(move || {
-            // Create a multi-threaded runtime for this thread
-            let rt = match tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)  // Single worker is enough for policy checks
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    tracing::error!("Failed to create policy checker runtime: {}", e);
-                    return;
-                }
-            };
-
-            rt.block_on(async move {
-                // Process requests until the channel is closed
-                while let Ok(req) = request_rx.recv() {
-                    let allowed = policy_client
-                        .check(&req.subject, &req.resource, req.operation)
-                        .await
-                        .unwrap_or(false);
-
-                    // Send response (ignore errors if receiver dropped)
-                    let _ = req.response_tx.send(allowed);
-                }
-            });
-        });
-
-        Self { request_tx }
-    }
-
-    /// Check if subject is allowed to perform operation on resource.
-    ///
-    /// This is synchronous and safe to call from any context (including
-    /// inside `block_on`). Internally sends request to background thread.
-    pub fn check(&self, subject: &str, resource: &str, operation: Operation) -> bool {
-        let (response_tx, response_rx) = mpsc::channel();
-
-        let request = PolicyCheckRequest {
-            subject: subject.to_string(),
-            resource: resource.to_string(),
-            operation,
-            response_tx,
-        };
-
-        // Send request to background thread
-        if self.request_tx.send(request).is_err() {
-            warn!("Policy checker thread died, denying request");
-            return false;
-        }
-
-        // Wait for response (blocking, but background thread does async I/O)
-        response_rx.recv().unwrap_or(false)
-    }
 }
 
 /// Default endpoint for the inference service
@@ -193,8 +107,8 @@ pub struct InferenceService {
     server_pubkey: VerifyingKey,
     /// Nonce cache for replay protection
     nonce_cache: Arc<InMemoryNonceCache>,
-    /// Policy checker for authorization (runs on separate thread with its own runtime)
-    policy_checker: PolicyChecker,
+    /// Policy client for authorization checks (async via TMQ)
+    policy_client: PolicyZmqClient,
     /// Optional TTT trainer (initialized from config.json)
     ttt_trainer: Option<Arc<TestTimeTrainer>>,
     /// Tokenizer for TTT adaptation
@@ -250,7 +164,7 @@ impl InferenceService {
                 match Self::initialize(model_path, config, model_id, server_pubkey, nonce_cache, policy_client).await {
                     Ok(service) => {
                         // Pass init_tx to run_service_loop - it signals AFTER socket binding
-                        Self::run_service_loop(service, &endpoint_owned, Some(init_tx));
+                        Self::run_service_loop(service, &endpoint_owned, Some(init_tx)).await;
                     }
                     Err(e) => {
                         if init_tx.send(Err(e)).is_err() {
@@ -272,6 +186,234 @@ impl InferenceService {
         Ok(crate::services::ServiceHandle::dummy())
     }
 
+    /// Start inference service in callback mode
+    ///
+    /// This mode is used when InferenceService is spawned as a separate process.
+    /// The service:
+    /// 1. Connects DEALER to ModelService's ROUTER (callback endpoint)
+    /// 2. Sends Register message with its stream endpoint
+    /// 3. Waits for LoadModel command
+    /// 4. Loads the model
+    /// 5. Enters command loop handling Infer/Shutdown
+    ///
+    /// # Arguments
+    /// * `instance_id` - Unique ID for this instance (e.g., "inference-a1b2c3d4")
+    /// * `callback_endpoint` - ModelService's ROUTER endpoint for callbacks
+    /// * `config` - Runtime configuration
+    /// * `policy_client` - Policy client for authorization
+    pub async fn start_with_callback(
+        instance_id: String,
+        callback_endpoint: String,
+        config: RuntimeConfig,
+        policy_client: PolicyZmqClient,
+    ) -> Result<()> {
+        info!(
+            "Starting InferenceService {} in callback mode (callback={})",
+            instance_id, callback_endpoint
+        );
+
+        // Run in current thread (we're likely spawned as a separate process)
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        rt.block_on(async move {
+            Self::run_callback_mode(instance_id, callback_endpoint, config, policy_client).await
+        })
+    }
+
+    /// Run the callback mode loop
+    async fn run_callback_mode(
+        instance_id: String,
+        callback_endpoint: String,
+        config: RuntimeConfig,
+        policy_client: PolicyZmqClient,
+    ) -> Result<()> {
+        let ctx = global_context();
+
+        // Create DEALER socket and connect to callback endpoint
+        let dealer = ctx.socket(zmq::DEALER)?;
+        dealer.set_identity(instance_id.as_bytes())?;
+        dealer.set_rcvtimeo(100)?; // 100ms timeout for polling
+        dealer.connect(&callback_endpoint)?;
+        info!("Connected DEALER to {}", callback_endpoint);
+
+        // Create XPUB socket for streaming
+        let xpub = ctx.socket(zmq::XPUB)?;
+        let stream_endpoint = format!(
+            "ipc:///run/hyprstream/inference-{}-stream.sock",
+            &instance_id[..8.min(instance_id.len())]
+        );
+        xpub.bind(&stream_endpoint)?;
+        info!("XPUB bound to {}", stream_endpoint);
+
+        // Send Register message (this IS the ready signal)
+        let register_msg = Self::build_register(&instance_id, &stream_endpoint)?;
+        dealer.send(&register_msg, 0)?;
+        info!("Sent Register to callback");
+
+        // Wait for LoadModel command
+        let (model_path, model_ref) = Self::wait_for_load_model(&dealer)?;
+
+        // Initialize the engine and load the model
+        let server_pubkey = VerifyingKey::default(); // Callback mode doesn't need signature verification
+        let nonce_cache = Arc::new(InMemoryNonceCache::new());
+        let mut service = Self::initialize(
+            model_path.clone(),
+            config,
+            model_ref.clone(),
+            server_pubkey,
+            nonce_cache,
+            policy_client,
+        )
+        .await?;
+
+        // Set the XPUB socket
+        *service.xpub_socket.borrow_mut() = Some(xpub);
+        service.stream_endpoint = stream_endpoint.clone();
+
+        // Send LoadModelResponse
+        let response = Self::build_load_model_response(true, "")?;
+        dealer.send(&response, 0)?;
+        info!("Model {} loaded, sent response", model_ref);
+
+        // Enter command loop
+        Self::callback_command_loop(service, &dealer).await
+    }
+
+    /// Wait for LoadModel command from DEALER
+    fn wait_for_load_model(dealer: &zmq::Socket) -> Result<(PathBuf, String)> {
+        loop {
+            match dealer.recv_bytes(0) {
+                Ok(data) => {
+                    let reader = serialize::read_message(
+                        &mut std::io::Cursor::new(&data),
+                        ReaderOptions::new(),
+                    )?;
+                    let cmd = reader.get_root::<crate::model_capnp::inference_command::Reader>()?;
+
+                    use crate::model_capnp::inference_command::Which;
+                    match cmd.which()? {
+                        Which::LoadModel(load) => {
+                            let load = load?;
+                            let model_ref = load.get_model_ref()?.to_str()?.to_string();
+                            let model_path = PathBuf::from(load.get_model_path()?.to_str()?);
+                            return Ok((model_path, model_ref));
+                        }
+                        Which::Shutdown(()) => {
+                            info!("Received Shutdown before LoadModel, exiting");
+                            std::process::exit(0);
+                        }
+                        Which::Infer(_) => {
+                            warn!("Received Infer before LoadModel, ignoring");
+                        }
+                    }
+                }
+                Err(zmq::Error::EAGAIN) => {
+                    // Timeout, continue waiting
+                    continue;
+                }
+                Err(e) => {
+                    return Err(anyhow!("DEALER recv error: {}", e));
+                }
+            }
+        }
+    }
+
+    /// Callback mode command loop
+    async fn callback_command_loop(mut service: Self, dealer: &zmq::Socket) -> Result<()> {
+        loop {
+            match dealer.recv_bytes(0) {
+                Ok(data) => {
+                    let response = service.handle_callback_command(&data).await?;
+                    dealer.send(&response, 0)?;
+                }
+                Err(zmq::Error::EAGAIN) => {
+                    // Timeout, continue
+                    continue;
+                }
+                Err(e) => {
+                    error!("DEALER recv error: {}", e);
+                    return Err(anyhow!("DEALER recv error: {}", e));
+                }
+            }
+        }
+    }
+
+    /// Handle a command from the callback channel
+    async fn handle_callback_command(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+        let reader = serialize::read_message(
+            &mut std::io::Cursor::new(data),
+            ReaderOptions::new(),
+        )?;
+        let cmd = reader.get_root::<crate::model_capnp::inference_command::Reader>()?;
+
+        use crate::model_capnp::inference_command::Which;
+        match cmd.which()? {
+            Which::LoadModel(_) => {
+                // Already loaded, return success
+                Self::build_load_model_response(true, "")
+            }
+            Which::Shutdown(()) => {
+                info!("Received Shutdown command, exiting");
+                std::process::exit(0);
+            }
+            Which::Infer(infer_data) => {
+                let infer_data = infer_data?;
+                // infer_data contains serialized InferenceRequest
+                self.handle_callback_infer(infer_data).await
+            }
+        }
+    }
+
+    /// Handle inference request from callback channel
+    async fn handle_callback_infer(&mut self, request_data: &[u8]) -> Result<Vec<u8>> {
+        // Parse InferenceRequest
+        let reader = serialize::read_message(
+            &mut std::io::Cursor::new(request_data),
+            ReaderOptions::new(),
+        )?;
+        let req = reader.get_root::<inference_capnp::inference_request::Reader>()?;
+        let request_id = req.get_id();
+
+        // Create a context for the handler (callback mode uses local identity)
+        let ctx = EnvelopeContext {
+            identity: RequestIdentity::local(),
+            request_id,
+            ephemeral_pubkey: None,
+        };
+
+        // Reuse existing request handling
+        let (response, _pending_stream) = self.handle_request(&ctx, request_data).await?;
+        Ok(response)
+    }
+
+    /// Build Register message
+    fn build_register(id: &str, stream_endpoint: &str) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut reg = message.init_root::<crate::model_capnp::register::Builder>();
+            reg.set_id(id);
+            reg.set_stream_endpoint(stream_endpoint);
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    /// Build LoadModelCommandResponse
+    fn build_load_model_response(success: bool, error: &str) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut resp = message.init_root::<crate::model_capnp::load_model_command_response::Builder>();
+            resp.set_success(success);
+            resp.set_error(error);
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
     /// Initialize the service
     async fn initialize(
         model_path: PathBuf,
@@ -283,10 +425,6 @@ impl InferenceService {
     ) -> Result<Self> {
         // Capture runtime handle for reuse in handlers
         let runtime_handle = Handle::current();
-
-        // Start PolicyChecker on a dedicated thread with its own runtime.
-        // This allows synchronous policy checks from within our single-threaded runtime.
-        let policy_checker = PolicyChecker::start(policy_client);
 
         let mut engine = TorchEngine::new(config.clone())?;
         RuntimeEngine::load_model(&mut engine, &model_path).await?;
@@ -351,56 +489,43 @@ impl InferenceService {
             xpub_socket: RefCell::new(None), // Initialized in run_service_loop
             server_pubkey,
             nonce_cache,
-            policy_checker,
+            policy_client,
             ttt_trainer,
             tokenizer,
             stream_endpoint,
         })
     }
 
-    /// Run the service loop (blocking)
+    /// Run the service loop (async with TMQ)
     ///
     /// The `ready_tx` channel signals when sockets are bound and the service is ready.
     /// This ensures callers wait for actual readiness, not just initialization.
-    fn run_service_loop(
+    async fn run_service_loop(
         service: Self,
         endpoint: &str,
         ready_tx: Option<tokio::sync::oneshot::Sender<Result<()>>>,
     ) {
         let ctx = global_context();
 
-        // Helper to signal error and return
+        // Helper to signal error
         let signal_error = |tx: Option<tokio::sync::oneshot::Sender<Result<()>>>, err: anyhow::Error| {
             if let Some(tx) = tx {
                 let _ = tx.send(Err(err));
             }
         };
 
-        // Create REP socket for RPC
-        let socket = match ctx.socket(zmq::REP) {
-            Ok(s) => s,
+        // Create REP socket with TMQ for async I/O
+        let mut receiver = match reply(&*ctx).set_linger(0).bind(endpoint) {
+            Ok(r) => r,
             Err(e) => {
-                let err = anyhow!("failed to create REP socket: {}", e);
+                let err = anyhow!("failed to bind REP to {}: {}", endpoint, e);
                 error!("{}", err);
                 signal_error(ready_tx, err);
                 return;
             }
         };
 
-        // Set socket options
-        if let Err(e) = socket.set_rcvtimeo(100) {
-            warn!("failed to set receive timeout: {}", e);
-        }
-
-        // Bind to endpoint
-        if let Err(e) = socket.bind(endpoint) {
-            let err = anyhow!("failed to bind to {}: {}", endpoint, e);
-            error!("{}", err);
-            signal_error(ready_tx, err);
-            return;
-        }
-
-        // Create single XPUB socket for all streaming
+        // Create single XPUB socket for all streaming (raw ZMQ - sync I/O)
         // Topic-based multiplexing: clients subscribe to "stream-{id}"
         let xpub_socket = match ctx.socket(zmq::XPUB) {
             Ok(s) => s,
@@ -413,7 +538,6 @@ impl InferenceService {
         };
 
         // Enable XPUB_VERBOSE to receive all subscription events
-        // (not just unique ones) - useful for debugging
         if let Err(e) = xpub_socket.set_xpub_verbose(true) {
             warn!("failed to set XPUB_VERBOSE: {}", e);
         }
@@ -436,94 +560,84 @@ impl InferenceService {
 
         info!("inference service bound to {} (RPC) and {} (streaming)", endpoint, service.stream_endpoint);
 
-        // Signal ready AFTER sockets are bound - this is the correct semantics
+        // Signal ready AFTER sockets are bound
         if let Some(tx) = ready_tx {
             if tx.send(Ok(())).is_err() {
                 warn!("Failed to signal service ready - receiver dropped");
             }
         }
 
-        // Main service loop
+        // Main service loop (async with TMQ)
         loop {
-            match socket.recv_bytes(0) {
-                Ok(request) => {
-                    trace!("inference received request ({} bytes)", request.len());
-
-                    // Unwrap and verify SignedEnvelope
-                    let (ctx, payload) = match Self::unwrap_envelope(&request, &service.server_pubkey, &*service.nonce_cache) {
-                        Ok((ctx, payload)) => (ctx, payload),
-                        Err(e) => {
-                            warn!("inference envelope verification failed: {}", e);
-                            // Send error response
-                            let response = InferenceResponse::error(0, "envelope verification failed");
-                            if let Err(e) = socket.send(&response, 0) {
-                                error!("failed to send error response: {}", e);
-                            }
-                            continue;
-                        }
-                    };
-
-                    debug!(
-                        "Inference request from {} (envelope_id={})",
-                        ctx.casbin_subject(),
-                        ctx.request_id
-                    );
-
-                    // Handle request - may return pending stream work
-                    let (response, pending_stream) = match service.handle_request(&ctx, &payload) {
-                        Ok((resp, pending)) => (resp, pending),
-                        Err(e) => {
-                            error!("inference request handling error: {}", e);
-                            (InferenceResponse::error(0, &e.to_string()), None)
-                        }
-                    };
-
-                    // Send response FIRST (before any streaming)
-                    if let Err(e) = socket.send(&response, 0) {
-                        error!("failed to send response: {}", e);
-                    }
-
-                    // THEN execute any pending stream (after response is sent)
-                    // This solves the streaming deadlock - client can subscribe after
-                    // receiving the stream_id in the response
-                    if let Some(pending) = pending_stream {
-                        service.execute_stream(pending);
-                    }
+            let result = receiver.recv().await;
+            let (request_msg, sender) = match result {
+                Ok((msg, sender)) => (msg, sender),
+                Err(e) => {
+                    // recv() consumes the receiver, so on error we must exit
+                    // A recv error typically means socket/context problem
+                    error!("inference recv error (fatal): {}", e);
+                    return;
                 }
-                Err(zmq::Error::EAGAIN) => {
-                    // Timeout, continue
+            };
+
+            // Extract bytes from multipart message
+            let request: Vec<u8> = request_msg
+                .into_iter()
+                .flat_map(|frame| frame.to_vec())
+                .collect();
+
+            trace!("inference received request ({} bytes)", request.len());
+
+            // Unwrap and verify SignedEnvelope
+            let (envelope_ctx, payload) = match hyprstream_rpc::unwrap_envelope(&request, &service.server_pubkey, &*service.nonce_cache) {
+                Ok((ctx, payload)) => (ctx, payload),
+                Err(e) => {
+                    warn!("inference envelope verification failed: {}", e);
+                    let response = InferenceResponse::error(0, "envelope verification failed");
+                    let msg: Multipart = vec![response].into();
+                    receiver = match sender.send(msg).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            error!("failed to send error response: {}", e);
+                            return;
+                        }
+                    };
                     continue;
                 }
+            };
+
+            debug!(
+                "Inference request from {} (envelope_id={})",
+                envelope_ctx.casbin_subject(),
+                envelope_ctx.request_id
+            );
+
+            // Handle request - may return pending stream work (now async for policy checks)
+            let (response, pending_stream) = match service.handle_request(&envelope_ctx, &payload).await {
+                Ok((resp, pending)) => (resp, pending),
                 Err(e) => {
-                    warn!("inference recv error: {}", e);
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    error!("inference request handling error: {}", e);
+                    (InferenceResponse::error(0, &e.to_string()), None)
                 }
+            };
+
+            // Send response via TMQ
+            let msg: Multipart = vec![response].into();
+            receiver = match sender.send(msg).await {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("failed to send response: {}", e);
+                    return;
+                }
+            };
+
+            // THEN execute any pending stream (after response is sent)
+            // This solves the streaming deadlock - client can subscribe after
+            // receiving the stream_id in the response
+            if let Some(pending) = pending_stream {
+                service.execute_stream(pending);
             }
         }
-    }
-
-    /// Unwrap and verify a SignedEnvelope from wire bytes.
-    fn unwrap_envelope(
-        request: &[u8],
-        server_pubkey: &VerifyingKey,
-        nonce_cache: &dyn NonceCache,
-    ) -> Result<(EnvelopeContext, Vec<u8>)> {
-        // Deserialize SignedEnvelope from Cap'n Proto
-        let reader = serialize::read_message(
-            &mut std::io::Cursor::new(request),
-            ReaderOptions::default(),
-        )?;
-        let signed_reader = reader.get_root::<hyprstream_rpc::common_capnp::signed_envelope::Reader>()?;
-        let signed = SignedEnvelope::read_from(signed_reader)?;
-
-        // Verify signature and replay protection
-        signed.verify(server_pubkey, nonce_cache)?;
-
-        // Extract context and payload
-        let ctx = EnvelopeContext::from_verified(&signed);
-        let payload = signed.payload().to_vec();
-
-        Ok((ctx, payload))
     }
 
     /// Generate next stream ID
@@ -646,42 +760,10 @@ impl InferenceService {
             }
         };
 
-        // Wait for subscription event from client
-        // XPUB receives: 0x01 + topic (subscribe) or 0x00 + topic (unsubscribe)
-        // Timeout after 5 seconds if no subscriber
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(5);
-        let mut subscribed = false;
-
-        while start.elapsed() < timeout {
-            match xpub.recv_bytes(zmq::DONTWAIT) {
-                Ok(sub_msg) if !sub_msg.is_empty() => {
-                    let is_subscribe = sub_msg[0] == 0x01;
-                    let sub_topic = &sub_msg[1..];
-
-                    if is_subscribe && sub_topic == topic.as_slice() {
-                        trace!("client subscribed to stream {}", stream_id);
-                        subscribed = true;
-                        break;
-                    }
-                    // Other subscription event, continue waiting
-                }
-                Ok(_) => {} // Empty message, continue
-                Err(zmq::Error::EAGAIN) => {
-                    // No subscription yet, yield briefly
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                Err(e) => {
-                    warn!("XPUB recv error: {}", e);
-                    break;
-                }
-            }
-        }
-
-        if !subscribed {
-            warn!("no subscriber for stream {} after timeout", stream_id);
-            // Continue anyway - client may have subscribed before we started checking
-        }
+        // With callback pattern, subscriber (ModelService) subscribes to stream_endpoint
+        // BEFORE sending the Infer command. ZMQ HWM buffers initial messages if needed.
+        // No polling loop required - proceed directly to streaming.
+        trace!("starting stream {} on topic {:?}", stream_id, String::from_utf8_lossy(&topic));
 
         // Helper to send topic-prefixed message
         let send_with_topic = |data: &[u8]| -> Result<(), zmq::Error> {
@@ -874,9 +956,8 @@ impl InferenceService {
     /// Check authorization for an operation.
     ///
     /// Returns the unauthorized response if the check fails, or None if authorized.
-    /// Uses PolicyChecker which runs on a separate thread with its own runtime.
-    /// This is safe to call from any context (including inside block_on).
-    fn check_auth(
+    /// Uses PolicyZmqClient for async policy checks via TMQ.
+    async fn check_auth(
         &self,
         ctx: &EnvelopeContext,
         request_id: u64,
@@ -884,10 +965,12 @@ impl InferenceService {
         operation: Operation,
     ) -> Option<Vec<u8>> {
         let subject = ctx.casbin_subject();
-        // PolicyChecker runs on a separate thread with its own runtime,
-        // so this synchronous call is safe even from within our single-threaded runtime.
-        // TMQ async I/O happens on the PolicyChecker thread.
-        let allowed = self.policy_checker.check(&subject, resource, operation);
+
+        // Async policy check via TMQ
+        let allowed = self.policy_client
+            .check(&subject, resource, operation)
+            .await
+            .unwrap_or(false);
 
         if allowed {
             None // Authorized
@@ -912,7 +995,7 @@ impl InferenceService {
     /// Returns (response_bytes, pending_stream) where pending_stream is Some
     /// for streaming requests. The caller should send the response FIRST,
     /// then execute the pending stream.
-    fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<PendingStream>)> {
+    async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<PendingStream>)> {
         // Log identity for audit trail
         trace!(
             "Inference request from {} (envelope_id={}, authenticated={})",
@@ -935,7 +1018,7 @@ impl InferenceService {
         match req.which()? {
             Which::Generate(gen_req) => {
                 // Authorization: Infer on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Infer) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Infer).await {
                     return Ok((resp, None));
                 }
                 let gen_req = gen_req?;
@@ -949,7 +1032,7 @@ impl InferenceService {
 
             Which::GenerateStream(gen_req) => {
                 // Authorization: Infer on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Infer) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Infer).await {
                     return Ok((resp, None));
                 }
                 let gen_req = gen_req?;
@@ -965,7 +1048,7 @@ impl InferenceService {
 
             Which::ModelInfo(()) => {
                 // Authorization: Query on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query).await {
                     return Ok((resp, None));
                 }
                 let info = self.handle_model_info();
@@ -975,7 +1058,7 @@ impl InferenceService {
 
             Which::IsReady(()) => {
                 // Authorization: Query on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query).await {
                     return Ok((resp, None));
                 }
                 let ready = self.handle_is_ready();
@@ -984,7 +1067,7 @@ impl InferenceService {
 
             Which::ApplyChatTemplate(template_req) => {
                 // Authorization: Query on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query).await {
                     return Ok((resp, None));
                 }
                 let template_req = template_req?;
@@ -1009,7 +1092,7 @@ impl InferenceService {
 
             Which::CreateLora(lora_config) => {
                 // Authorization: Write on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
                     return Ok((resp, None));
                 }
                 let lora_config = lora_config?;
@@ -1033,7 +1116,7 @@ impl InferenceService {
 
             Which::LoadLora(path) => {
                 // Authorization: Write on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
                     return Ok((resp, None));
                 }
                 let path = path?.to_str()?;
@@ -1045,7 +1128,7 @@ impl InferenceService {
 
             Which::SaveLora(path) => {
                 // Authorization: Write on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
                     return Ok((resp, None));
                 }
                 let path = path?.to_str()?;
@@ -1057,7 +1140,7 @@ impl InferenceService {
 
             Which::UnloadLora(()) => {
                 // Authorization: Write on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
                     return Ok((resp, None));
                 }
                 match self.handle_unload_lora() {
@@ -1068,7 +1151,7 @@ impl InferenceService {
 
             Which::HasLora(()) => {
                 // Authorization: Query on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query).await {
                     return Ok((resp, None));
                 }
                 let has_lora = self.handle_has_lora();
@@ -1077,7 +1160,7 @@ impl InferenceService {
 
             Which::SetSession(session_id) => {
                 // Authorization: Write on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
                     return Ok((resp, None));
                 }
                 let session_id = session_id?.to_str()?.to_string();
@@ -1089,7 +1172,7 @@ impl InferenceService {
 
             Which::ClearSession(()) => {
                 // Authorization: Write on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
                     return Ok((resp, None));
                 }
                 self.handle_clear_session();
@@ -1098,7 +1181,7 @@ impl InferenceService {
 
             Which::ReleaseSession(session_id) => {
                 // Authorization: Write on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
                     return Ok((resp, None));
                 }
                 let session_id = session_id?.to_str()?;
@@ -1116,7 +1199,7 @@ impl InferenceService {
 
             Which::Shutdown(()) => {
                 // Authorization: Manage on inference (shutdown requires admin)
-                if let Some(resp) = self.check_auth(ctx, request_id, "inference", Operation::Manage) {
+                if let Some(resp) = self.check_auth(ctx, request_id, "inference", Operation::Manage).await {
                     return Ok((resp, None));
                 }
                 info!("Inference service shutdown requested");

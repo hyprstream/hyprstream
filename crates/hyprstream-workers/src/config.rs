@@ -116,7 +116,7 @@ impl Default for PoolConfig {
             vm_image: PathBuf::from("/var/lib/hyprstream/vm/rootfs.img"),
             kernel_path: PathBuf::from("/var/lib/hyprstream/vm/vmlinux"),
             cloud_init_dir: PathBuf::from("/var/lib/hyprstream/cloud-init"),
-            runtime_dir: PathBuf::from("/run/hyprstream/sandboxes"),
+            runtime_dir: crate::paths::sandboxes_dir(),
             vm_memory_mb: 2048,
             vm_cpus: 2,
             create_timeout_secs: 60,
@@ -169,7 +169,7 @@ impl Default for ImageConfig {
             bootstrap_dir: PathBuf::from("/var/lib/hyprstream/images/bootstrap"),
             refs_dir: PathBuf::from("/var/lib/hyprstream/images/refs"),
             cache_dir: PathBuf::from("/var/lib/hyprstream/images/cache"),
-            runtime_dir: PathBuf::from("/run/hyprstream/nydus"),
+            runtime_dir: crate::paths::nydus_dir(),
             dragonfly_peer: None,
             fuse_threads: 4,
             chunk_size: 1024 * 1024, // 1MB
