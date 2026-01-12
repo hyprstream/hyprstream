@@ -8,28 +8,33 @@
 //! ```ignore
 //! use hyprstream::cli::systemd_setup::ensure_units;
 //!
-//! if ensure_units() {
+//! let services = &["registry".to_string(), "policy".to_string()];
+//! if ensure_units(services) {
 //!     // Systemd units are installed and ready
 //! }
 //! ```
 
 use tracing::info;
 
-/// Services to install units for
-const SERVICES: &[&str] = &["registry", "policy", "worker", "event"];
-
 /// Check if systemd is available
 pub fn is_systemd_available() -> bool {
-    hyprstream_rpc::is_systemd_booted()
+    hyprstream_rpc::has_systemd()
 }
 
 /// Ensure systemd socket units are installed and enabled (idempotent)
 ///
+/// # Arguments
+///
+/// * `services` - List of services to ensure.
+///
 /// Returns `true` if sockets are ready for use.
-pub fn ensure_units() -> bool {
+pub fn ensure_units(services: &[String]) -> bool {
     if !is_systemd_available() {
         return false;
     }
+
+    // Convert String slices to &str for ServiceManager
+    let services_list: Vec<&str> = services.iter().map(|s| s.as_str()).collect();
 
     // Create a runtime for async ServiceManager operations
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -53,7 +58,7 @@ pub fn ensure_units() -> bool {
         };
 
         // Install and start all services
-        for service in SERVICES {
+        for service in services_list {
             if let Err(e) = manager.ensure(service).await {
                 tracing::warn!("Failed to ensure {} service: {}", service, e);
                 // Continue with other services

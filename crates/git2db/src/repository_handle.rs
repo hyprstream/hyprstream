@@ -318,6 +318,208 @@ impl<'a> RepositoryHandle<'a> {
         .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
     }
 
+    /// Get repository status (branch, dirty files, etc.)
+    ///
+    /// Similar to `git status` but returns structured data instead of printing.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # async fn example(repo: &git2db::RepositoryHandle<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    /// let status = repo.status().await?;
+    /// println!("Branch: {:?}", status.branch);
+    /// println!("Clean: {}", status.is_clean);
+    /// if !status.is_clean {
+    ///     for file in &status.modified_files {
+    ///         println!("Modified: {}", file.display());
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// This method will return an error if:
+    /// - The repository cannot be opened
+    /// - The status cannot be retrieved
+    pub async fn status(&self) -> Git2DBResult<RepositoryStatus> {
+        let repo_path = self.worktree()?.to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            let repo = crate::manager::GitManager::global()
+                .get_repository(&repo_path)
+                .map_err(|e| Git2DBError::repository(&repo_path, format!("Failed to get repository: {}", e)))?
+                .open()
+                .map_err(|e| Git2DBError::repository(&repo_path, format!("Failed to open repository: {}", e)))?;
+
+            // Get HEAD
+            let head = repo.head().ok();
+            let branch = head.as_ref().and_then(|h| h.shorthand().map(String::from));
+            let head_oid = head.as_ref().and_then(|h| h.target());
+
+            // Get statuses
+            let statuses = repo
+                .statuses(None)
+                .map_err(|e| Git2DBError::internal(format!("Failed to get statuses: {}", e)))?;
+
+            let is_clean = statuses.is_empty();
+
+            // Collect modified file paths
+            let modified_files: Vec<PathBuf> = statuses
+                .iter()
+                .filter_map(|entry| entry.path().map(|p| PathBuf::from(p)))
+                .collect();
+
+            Ok(RepositoryStatus {
+                branch,
+                head: head_oid,
+                ahead: 0,  // TODO: Implement ahead/behind detection
+                behind: 0, // TODO: Implement ahead/behind detection
+                is_clean,
+                modified_files,
+            })
+        })
+        .await
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
+    }
+
+    /// Merge a branch or reference into the current HEAD
+    ///
+    /// Similar to `git merge <source>`
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - The branch or ref to merge (e.g., "feature-branch", "refs/tags/v1.0")
+    /// * `message` - Optional commit message (defaults to "Merge branch 'source'")
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # async fn example(repo: &git2db::RepositoryHandle<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    /// // Merge a branch
+    /// let merge_oid = repo.merge("feature-branch", None).await?;
+    ///
+    /// // Merge with custom message
+    /// let merge_oid = repo.merge("feature-branch", Some("Merge feature-branch")).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// This method will return an error if:
+    /// - The repository cannot be opened
+    /// - The source ref cannot be found
+    /// - Merge conflicts are detected
+    /// - The merge commit cannot be created
+    pub async fn merge(&self, source: &str, message: Option<&str>) -> Git2DBResult<Oid> {
+        let repo_path = self.worktree()?.to_path_buf();
+        let source = source.to_string();
+        let message = message.map(|m| m.to_string());
+
+        tokio::task::spawn_blocking(move || {
+            let repo = crate::manager::GitManager::global()
+                .get_repository(&repo_path)
+                .map_err(|e| Git2DBError::repository(&repo_path, format!("Failed to get repository: {}", e)))?
+                .open()
+                .map_err(|e| Git2DBError::repository(&repo_path, format!("Failed to open repository: {}", e)))?;
+
+            // Get default signature from the global GitManager
+            let git_manager = crate::manager::GitManager::global();
+            let sig = git_manager.create_signature(None, None)?;
+
+            // Find the source ref to merge
+            let (obj, _src_ref) = repo
+                .revparse_ext(&source)
+                .map_err(|e| Git2DBError::reference(&source, format!("Failed to find ref: {}", e)))?;
+
+            let source_commit = obj
+                .peel_to_commit()
+                .map_err(|e| Git2DBError::reference(&source, format!("Failed to peel to commit: {}", e)))?;
+
+            // Get annotated commit for merge
+            let source_annotated = repo
+                .find_annotated_commit(source_commit.id())
+                .map_err(|e| Git2DBError::internal(format!("Failed to find annotated commit: {}", e)))?;
+
+            // Perform the merge analysis
+            let (analysis, _preference) = repo.merge_analysis(&[&source_annotated])
+                .map_err(|e| Git2DBError::internal(format!("Failed to analyze merge: {}", e)))?;
+
+            // Check if up-to-date
+            if analysis.contains(git2::MergeAnalysis::ANALYSIS_UP_TO_DATE) {
+                return Err(Git2DBError::invalid_operation("Already up to date"));
+            }
+
+            // Check if fast-forward
+            if analysis.contains(git2::MergeAnalysis::ANALYSIS_FASTFORWARD) {
+                // Do fast-forward merge
+                let source_obj = source_commit.as_object();
+                repo.checkout_tree(&source_obj, None)
+                    .map_err(|e| Git2DBError::internal(format!("Failed to checkout tree: {}", e)))?;
+
+                repo.set_head(&format!("refs/heads/{}", source))
+                    .map_err(|e| Git2DBError::internal(format!("Failed to set HEAD: {}", e)))?;
+
+                return Ok(source_commit.id());
+            }
+
+            // Normal merge required - commit merge
+            repo.merge(&[&source_annotated], None, None)
+                .map_err(|e| Git2DBError::internal(format!("Failed to perform merge: {}", e)))?;
+
+            // Check for conflicts again after merge
+            let mut index = repo
+                .index()
+                .map_err(|e| Git2DBError::internal(format!("Failed to get index: {}", e)))?;
+
+            if index.has_conflicts() {
+                repo.cleanup_state()
+                    .map_err(|e| Git2DBError::internal(format!("Failed to cleanup merge state: {}", e)))?;
+                return Err(Git2DBError::invalid_operation("Merge conflicts detected"));
+            }
+
+            // Write tree and create merge commit
+            let tree_id = index
+                .write_tree()
+                .map_err(|e| Git2DBError::internal(format!("Failed to write tree: {}", e)))?;
+
+            let tree = repo
+                .find_tree(tree_id)
+                .map_err(|e| Git2DBError::internal(format!("Failed to find tree: {}", e)))?;
+
+            // Get parent commits
+            let head = repo
+                .head()
+                .map_err(|e| Git2DBError::internal(format!("Failed to get HEAD: {}", e)))?
+                .peel_to_commit()
+                .map_err(|e| Git2DBError::internal(format!("Failed to resolve HEAD commit: {}", e)))?;
+
+            let merge_msg = message.unwrap_or_else(|| format!("Merge branch '{}'", source));
+
+            // Create merge commit
+            let merge_oid = repo
+                .commit(
+                    Some("HEAD"),
+                    &sig,
+                    &sig,
+                    &merge_msg,
+                    &tree,
+                    &[&head, &source_commit],
+                )
+                .map_err(|e| Git2DBError::internal(format!("Failed to create merge commit: {}", e)))?;
+
+            // Cleanup merge state
+            repo.cleanup_state()
+                .map_err(|e| Git2DBError::internal(format!("Failed to cleanup merge state: {}", e)))?;
+
+            Ok(merge_oid)
+        })
+        .await
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
+    }
+
     /// List all references (branches and tags) with their OIDs
     ///
     /// Similar to `git show-ref`

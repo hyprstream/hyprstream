@@ -33,8 +33,12 @@ export PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH:-gfx90a}
 export LIBTORCH_STATIC=0
 export LIBTORCH_BYPASS_VERSION_CHECK=1
 
-# Library paths - libtorch first (includes bundled ROCm), then bitsandbytes
-export LD_LIBRARY_PATH=$LIBTORCH/lib:$BITSANDBYTES_LIB_DIR:$LD_LIBRARY_PATH
+# Library paths - libtorch first (includes bundled ROCm), then bitsandbytes if it exists
+LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
+if [ -d "$BITSANDBYTES_LIB_DIR" ]; then
+  LD_LIBRARY_PATH=$BITSANDBYTES_LIB_DIR:$LD_LIBRARY_PATH
+fi
+export LD_LIBRARY_PATH
 
 # Run hyprstream with all passed arguments
 exec "$SCRIPT_DIR/target/release/hyprstream" "$@"

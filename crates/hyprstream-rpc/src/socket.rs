@@ -11,12 +11,12 @@ use std::os::unix::io::RawFd;
 /// 1. System was booted with systemd
 /// 2. `LISTEN_FDS` environment variable is set
 #[cfg(feature = "systemd")]
-pub fn is_socket_activated() -> bool {
+pub fn has_socket() -> bool {
     systemd::daemon::booted().unwrap_or(false) && std::env::var("LISTEN_FDS").is_ok()
 }
 
 #[cfg(not(feature = "systemd"))]
-pub fn is_socket_activated() -> bool {
+pub fn has_socket() -> bool {
     false
 }
 

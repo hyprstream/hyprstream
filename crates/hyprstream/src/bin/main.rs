@@ -9,7 +9,7 @@ use tracing::info;
 
 // Core application imports
 use hyprstream_core::auth::PolicyManager;
-use hyprstream_core::cli::commands::{Commands, TrainingAction};
+use hyprstream_core::cli::commands::{Commands, ExecutionMode, TrainingAction};
 use hyprstream_core::cli::handlers::handle_server;
 use hyprstream_core::cli::{
     handle_branch, handle_checkout, handle_clone, handle_commit, handle_infer, handle_info,
@@ -373,32 +373,33 @@ fn main() -> Result<()> {
     info!("Hyprstream v{} starting up", env!("CARGO_PKG_VERSION"));
     // ========== END TRACING INITIALIZATION ==========
 
+    // ========== EXECUTION MODE DETECTION ==========
+    // Auto-detect execution mode based on system capabilities
+    let execution_mode = hyprstream_core::cli::commands::ExecutionMode::detect();
+
+    info!("Execution mode: {}", execution_mode);
+
     // ========== SYSTEMD SOCKET UNITS ==========
-    // Ensure socket units are installed (idempotent)
+    // Ensure socket units are installed (idempotent) when using systemd mode
     #[cfg(feature = "systemd")]
-    let use_ipc = {
-        use hyprstream_core::cli::systemd_setup::ensure_units;
-        std::env::var("HYPRSTREAM_NO_SYSTEMD").is_err() && ensure_units()
+    let _ = {
+        use hyprstream_core::cli::commands::ExecutionMode;
+        if execution_mode == ExecutionMode::IpcSystemd {
+            use hyprstream_core::cli::systemd_setup::ensure_units;
+            if std::env::var("HYPRSTREAM_NO_SYSTEMD").is_err() {
+                // Install systemd unit files for configured services
+                ensure_units(&config.services.startup);
+            }
+        }
     };
 
-    #[cfg(not(feature = "systemd"))]
-    let use_ipc = false;
-
     // ========== ENDPOINT REGISTRY INITIALIZATION ==========
-    // Initialize the endpoint registry based on systemd mode
+    // Initialize the endpoint registry based on execution mode
     {
         use hyprstream_rpc::registry::{init as init_registry, EndpointMode};
 
-        let mode = if use_ipc {
-            info!("Systemd socket activation enabled - using IPC endpoints");
-            EndpointMode::Ipc
-        } else {
-            info!("Daemon mode - using in-process endpoints");
-            EndpointMode::Inproc
-        };
-
-        // Get runtime directory for IPC mode
-        let runtime_dir = if use_ipc {
+        let mode = execution_mode.endpoint_mode();
+        let runtime_dir = if execution_mode.uses_ipc() {
             Some(hyprstream_rpc::paths::runtime_dir())
         } else {
             None
@@ -423,7 +424,8 @@ fn main() -> Result<()> {
     // Clone worker config before moving config into the async block
     let worker_config = config.worker.clone();
 
-    let (registry_client, mut _service_handle, _worker_handle, mut _event_handle, _workflow_service, signing_key, verifying_key): (Arc<dyn RegistryClient>, ServiceHandle, Option<ServiceHandle>, SpawnedService, Arc<WorkflowService>, SigningKey, VerifyingKey) = _registry_runtime
+    let (registry_client, mut _service_handle, _worker_handle, mut _event_handle, _workflow_service, signing_key, verifying_key): (Arc<dyn RegistryClient>, Option<ServiceHandle>, Option<ServiceHandle>, Option<SpawnedService>, Option<Arc<WorkflowService>>, SigningKey, VerifyingKey) = if execution_mode == ExecutionMode::Inproc {
+        _registry_runtime
         .block_on(async {
             let models_dir = config.models_dir();
 
@@ -498,13 +500,42 @@ fn main() -> Result<()> {
                 signing_key.clone(),
                 RequestIdentity::local(),
             )) as Arc<dyn RegistryClient>;
-            Ok::<_, anyhow::Error>((client, service_handle, worker_handle, event_handle, workflow_service, signing_key, verifying_key))
+            Ok::<_, anyhow::Error>((client, Some(service_handle), worker_handle, Some(event_handle), Some(workflow_service), signing_key, verifying_key))
         })
-        .context("Failed to initialize services")?;
+        .context("Failed to initialize services")?
+    } else {
+        // For systemd/standalone modes, ensure services are running then connect via IPC
+        _registry_runtime
+        .block_on(async {
+            use hyprstream_rpc::service::manager::detect as detect_manager;
+
+            // Ensure services are running (idempotent)
+            // Use configured startup services from config
+            let manager = detect_manager().await?;
+            for service in &config.services.startup {
+                manager.ensure(service).await?;
+            }
+
+            let models_dir = config.models_dir();
+            let keys_dir = models_dir.join(".registry").join("keys");
+            let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+            let verifying_key = signing_key.verifying_key();
+
+            let client = Arc::new(RegistryZmqClient::new(
+                signing_key.clone(),
+                RequestIdentity::local(),
+            )) as Arc<dyn RegistryClient>;
+
+            Ok::<_, anyhow::Error>((client, None, None, None, None, signing_key, verifying_key))
+        })
+        .context("Failed to connect to services")?
+    };
 
     // Create application context with shared registry client
     // Clone config for Service command to use later
     let config_for_service = config.clone();
+    // Extract services startup list before config is moved
+    let services_startup = config.services.startup.clone();
     let ctx = AppContext::with_client(config, registry_client.clone());
 
     // Handle commands with appropriate runtime configuration
@@ -1219,9 +1250,16 @@ fn main() -> Result<()> {
                     multi_threaded: true,
                 },
                 || async move {
-                    // Start WorkerService for CLI commands
-                    // Use minimal config without warm pool (no VMs started immediately)
-                    info!("Starting WorkerService for CLI worker commands");
+                    // Check if worker is in the startup services list
+                    let worker_already_running = services_startup.contains(&"worker".to_string());
+
+                    if worker_already_running {
+                        info!("WorkerService is managed by systemd, connecting to existing service");
+                    } else {
+                        // Start WorkerService for CLI commands (only if not in systemd mode)
+                        // Use minimal config without warm pool (no VMs started immediately)
+                        info!("Starting WorkerService for CLI worker commands");
+                    }
 
                     // Use user-accessible paths for CLI (not /var/lib which requires root)
                     let data_dir = dirs::data_local_dir()
@@ -1259,14 +1297,19 @@ fn main() -> Result<()> {
                         "Using CLI-friendly paths for worker service"
                     );
 
-                    let _worker_handle = WorkerService::start(
-                        pool_config,
-                        image_config,
-                        global_context(),
-                        verifying_key,
-                    )
-                    .await
-                    .context("Failed to start worker service")?;
+                    // Only start WorkerService if it's not already running via systemd
+                    let _worker_handle = if !worker_already_running {
+                        Some(WorkerService::start(
+                            pool_config,
+                            image_config,
+                            global_context(),
+                            verifying_key,
+                        )
+                        .await
+                        .context("Failed to start worker service")?)
+                    } else {
+                        None
+                    };
 
                     // Create WorkerClient for ZMQ communication with WorkerService
                     let worker_client = WorkerClient::new(signing_key, RequestIdentity::local());
@@ -1371,10 +1414,15 @@ fn main() -> Result<()> {
             }
 
             // Services must run with IPC sockets for distributed mode
-            let mode = if ipc {
-                EndpointMode::Ipc
+            let rpc_mode = if ipc {
+                hyprstream_rpc::registry::EndpointMode::Ipc
             } else {
-                EndpointMode::Inproc
+                hyprstream_rpc::registry::EndpointMode::Inproc
+            };
+            let mode = if ipc {
+                hyprstream_workers::endpoints::EndpointMode::Ipc
+            } else {
+                hyprstream_workers::endpoints::EndpointMode::Inproc
             };
 
             // Capture config for use in async block
@@ -1395,6 +1443,17 @@ fn main() -> Result<()> {
                         info!("Received shutdown signal");
                         let _ = shutdown_tx.send(());
                     });
+
+                    // Initialize endpoint registry for service process
+                    {
+                        use hyprstream_rpc::registry::init as init_registry;
+                        let runtime_dir = if ipc {
+                            Some(hyprstream_rpc::paths::runtime_dir())
+                        } else {
+                            None
+                        };
+                        init_registry(rpc_mode, runtime_dir);
+                    }
 
                     match name.as_str() {
                         "event" => {
@@ -1575,13 +1634,16 @@ fn main() -> Result<()> {
 
     };
 
-    // Gracefully stop services before exiting (reverse order of startup)
+    // Gracefully stop services before exiting (only for Inproc mode)
+    // For systemd/standalone modes, services are managed externally
     _registry_runtime.block_on(async {
-        _service_handle.stop().await;
-
-        // Stop EventService
-        if let Err(e) = _event_handle.stop().await {
-            tracing::warn!("Failed to stop event service: {}", e);
+        if let Some(mut handle) = _service_handle {
+            handle.stop().await;
+        }
+        if let Some(mut event) = _event_handle {
+            if let Err(e) = event.stop().await {
+                tracing::warn!("Failed to stop event service: {}", e);
+            }
         }
     });
 

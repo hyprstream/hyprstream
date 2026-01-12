@@ -57,6 +57,12 @@ pub struct HyprConfig {
     /// This enables Kata-based isolated workload execution.
     #[serde(default)]
     pub worker: Option<hyprstream_workers::config::WorkerConfig>,
+
+    /// Service management configuration
+    ///
+    /// Controls which services are started at startup in ipc-systemd mode.
+    #[serde(default)]
+    pub services: ServicesConfig,
 }
 
 /// Storage paths and directories configuration
@@ -100,6 +106,36 @@ impl Default for StorageConfig {
             config_dir,
         }
     }
+}
+
+/// Service management configuration
+///
+/// Controls which services are started at startup in ipc-systemd mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServicesConfig {
+    /// Services to start automatically at startup (ipc-systemd mode)
+    ///
+    /// Default: ["registry", "policy", "worker", "event"]
+    #[serde(default = "default_startup_services")]
+    pub startup: Vec<String>,
+}
+
+impl Default for ServicesConfig {
+    fn default() -> Self {
+        Self {
+            startup: default_startup_services(),
+        }
+    }
+}
+
+/// Default list of services to start at startup
+fn default_startup_services() -> Vec<String> {
+    vec![
+        "registry".to_string(),
+        "policy".to_string(),
+        "worker".to_string(),
+        "event".to_string(),
+    ]
 }
 
 /// Model loading and identification
@@ -277,6 +313,7 @@ pub struct HyprConfigBuilder {
     storage: StorageConfig,
     git2db: git2db::config::Git2DBConfig,
     worker: Option<hyprstream_workers::config::WorkerConfig>,
+    services: ServicesConfig,
 }
 
 impl HyprConfigBuilder {
@@ -291,6 +328,7 @@ impl HyprConfigBuilder {
             storage: StorageConfig::default(),
             git2db: git2db::config::Git2DBConfig::default(),
             worker: None,
+            services: ServicesConfig::default(),
         }
     }
 
@@ -305,6 +343,7 @@ impl HyprConfigBuilder {
             storage: config.storage,
             git2db: config.git2db,
             worker: config.worker,
+            services: config.services,
         }
     }
 
@@ -331,6 +370,7 @@ impl HyprConfigBuilder {
             storage: self.storage,
             git2db: self.git2db,
             worker: self.worker,
+            services: self.services,
         }
     }
 

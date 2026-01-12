@@ -68,35 +68,14 @@ impl ServiceManager for SystemdManager {
         let units_dir = Self::units_dir()?;
         std::fs::create_dir_all(&units_dir)?;
 
-        let socket_content = units::socket_unit(service);
         let service_content = units::service_unit(service)?;
-
-        let socket_path = units_dir.join(Self::socket_unit(service));
         let service_path = units_dir.join(Self::service_unit(service));
-
-        let mut changed = false;
-
-        // Write socket unit if changed (idempotent)
-        if std::fs::read_to_string(&socket_path).ok().as_deref() != Some(&socket_content) {
-            std::fs::write(&socket_path, &socket_content)?;
-            info!("Installed socket unit: {}", socket_path.display());
-            changed = true;
-        }
 
         // Write service unit if changed (idempotent)
         if std::fs::read_to_string(&service_path).ok().as_deref() != Some(&service_content) {
             std::fs::write(&service_path, &service_content)?;
             info!("Installed service unit: {}", service_path.display());
-            changed = true;
-        }
-
-        if changed {
-            // Reload and enable
             self.reload().await?;
-            self.systemd
-                .enable_unit_files(vec![Self::socket_unit(service)], false, true)
-                .await?;
-            info!("Enabled socket unit: {}", Self::socket_unit(service));
         }
 
         Ok(())
@@ -104,23 +83,23 @@ impl ServiceManager for SystemdManager {
 
     async fn start(&self, service: &str) -> Result<()> {
         self.systemd
-            .start_unit(Self::socket_unit(service), "replace".into())
+            .start_unit(Self::service_unit(service), "replace".into())
             .await?;
-        info!("Started socket unit: {}", Self::socket_unit(service));
+        info!("Started service unit: {}", Self::service_unit(service));
         Ok(())
     }
 
     async fn stop(&self, service: &str) -> Result<()> {
         self.systemd
-            .stop_unit(Self::socket_unit(service), "replace".into())
+            .stop_unit(Self::service_unit(service), "replace".into())
             .await?;
-        info!("Stopped socket unit: {}", Self::socket_unit(service));
+        info!("Stopped service unit: {}", Self::service_unit(service));
         Ok(())
     }
 
     async fn is_active(&self, service: &str) -> Result<bool> {
-        // Get the unit and check its active state
-        match self.systemd.get_unit(Self::socket_unit(service)).await {
+        // Check if the SERVICE unit is active, not the socket unit
+        match self.systemd.get_unit(Self::service_unit(service)).await {
             Ok(unit_path) => {
                 // Query the unit's ActiveState property via D-Bus
                 let unit = zbus_systemd::systemd1::UnitProxy::builder(&self.systemd.inner().connection())
@@ -144,21 +123,9 @@ impl ServiceManager for SystemdManager {
         // Stop the service first
         let _ = self.stop(service).await;
 
-        // Disable the unit
-        let _ = self
-            .systemd
-            .disable_unit_files(vec![Self::socket_unit(service)], false)
-            .await;
-
-        // Remove unit files
+        // Remove service unit file
         let units_dir = Self::units_dir()?;
-        let socket_path = units_dir.join(Self::socket_unit(service));
         let service_path = units_dir.join(Self::service_unit(service));
-
-        if socket_path.exists() {
-            std::fs::remove_file(&socket_path)?;
-            info!("Removed: {}", socket_path.display());
-        }
 
         if service_path.exists() {
             std::fs::remove_file(&service_path)?;

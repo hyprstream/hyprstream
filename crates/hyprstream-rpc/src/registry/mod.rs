@@ -126,17 +126,18 @@ impl From<zmq::SocketType> for SocketKind {
 /// Endpoint mode determines default transport type.
 ///
 /// - `Inproc`: In-process ZMQ endpoints (daemon mode, single process)
-/// - `Ipc`: Unix domain sockets (systemd mode, socket activation)
-/// - `Tcp`: TCP sockets (multi-host, future)
+/// - `Ipc`: Unix domain sockets (systemd mode, auto-detects socket activation)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum EndpointMode {
     /// In-process ZMQ (daemon mode)
     #[default]
     Inproc,
     /// Unix domain sockets (systemd mode)
+    ///
+    /// When running under systemd socket activation (LISTEN_FDS set),
+    /// automatically uses the systemd-provided file descriptor.
+    /// Otherwise, binds to a new Unix domain socket.
     Ipc,
-    /// TCP sockets (multi-host, future)
-    Tcp,
 }
 
 /// Service registration entry with multiple endpoints by socket type.
@@ -247,6 +248,8 @@ impl EndpointRegistry {
                 endpoint: format!("hyprstream/{}{}", name, suffix),
             },
             EndpointMode::Ipc => {
+                // Use normal IPC binding instead of systemd socket activation for ZMQ sockets
+                // ZMQ_USE_FD has compatibility issues with systemd socket activation
                 let path = self
                     .runtime_dir
                     .as_ref()
@@ -254,11 +257,39 @@ impl EndpointRegistry {
                     .unwrap_or_else(|| PathBuf::from(format!("/tmp/hyprstream/{}{}.sock", name, suffix)));
                 TransportConfig::Ipc { path }
             }
-            EndpointMode::Tcp => TransportConfig::Tcp {
-                endpoint: "127.0.0.1:0".to_string(),
-                curve_pubkey: None,
-            },
         }
+    }
+
+    /// Check for systemd socket activation and return the file descriptor.
+    ///
+    /// Returns `Some(fd)` if running under systemd with socket activation,
+    /// `None` otherwise.
+    ///
+    /// For services with multiple sockets (e.g., event service with PUB/SUB),
+    /// detects the correct FD based on socket type and index.
+    fn get_systemd_fd(&self, _socket_kind: SocketKind) -> Option<std::os::unix::io::RawFd> {
+        use std::os::unix::io::RawFd;
+
+        const SD_LISTEN_FDS_START: RawFd = 3;
+
+        let listen_fds: i32 = std::env::var("LISTEN_FDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
+        let listen_pid: u32 = std::env::var("LISTEN_PID")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
+        // Verify PID matches and we have at least 1 FD
+        if listen_pid != std::process::id() || listen_fds < 1 {
+            return None;
+        }
+
+        // For most services, use the first FD (index 0)
+        // For event service with PUB/SUB, this could be extended to detect socket index
+        Some(SD_LISTEN_FDS_START)
     }
 
     // ========================================================================

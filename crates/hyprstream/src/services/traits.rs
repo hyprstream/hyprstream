@@ -4,7 +4,7 @@
 //! Implementations can use ZMQ/Cap'n Proto (RegistryZmqClient) or other transports.
 
 use async_trait::async_trait;
-use git2db::{Git2DBError, RepoId, TrackedRepository};
+use git2db::{Git2DBError, RepoId, RepositoryStatus, TrackedRepository};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -208,6 +208,15 @@ pub trait RepositoryClient: Send + Sync {
     /// List all branches.
     async fn list_branches(&self) -> Result<Vec<String>, RegistryServiceError>;
 
+    /// Merge a branch or reference into the current HEAD.
+    ///
+    /// # Arguments
+    /// * `source` - The branch or ref to merge (e.g., "feature-branch", "refs/tags/v1.0")
+    /// * `message` - Optional commit message (defaults to "Merge branch 'source'")
+    ///
+    /// Returns the merge commit OID as a string.
+    async fn merge(&self, source: &str, message: Option<&str>) -> Result<String, RegistryServiceError>;
+
     /// Remove a worktree.
     async fn remove_worktree(&self, path: &Path) -> Result<(), RegistryServiceError>;
 
@@ -223,6 +232,9 @@ pub trait RepositoryClient: Send + Sync {
     ///
     /// Returns the commit OID as a string.
     async fn commit(&self, message: &str) -> Result<String, RegistryServiceError>;
+
+    /// Get repository status (branch, dirty files, etc.)
+    async fn status(&self) -> Result<RepositoryStatus, RegistryServiceError>;
 
     // === Reference Operations ===
 

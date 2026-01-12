@@ -139,11 +139,11 @@ pub use service::SystemdManager;
 
 /// Check if system booted with systemd
 #[cfg(feature = "systemd")]
-pub fn is_systemd_booted() -> bool {
+pub fn has_systemd() -> bool {
     systemd::daemon::booted().unwrap_or(false)
 }
 
 #[cfg(not(feature = "systemd"))]
-pub fn is_systemd_booted() -> bool {
+pub fn has_systemd() -> bool {
     false
 }

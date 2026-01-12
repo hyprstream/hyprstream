@@ -2,7 +2,6 @@ pub mod chat;
 pub mod config;
 pub mod flight;
 pub mod git;
-pub mod model;
 pub mod policy;
 pub mod server;
 pub mod training;
@@ -47,6 +46,71 @@ impl From<KVQuantArg> for KVQuantType {
             KVQuantArg::Int8 => KVQuantType::Int8,
             KVQuantArg::Nf4 => KVQuantType::Nf4,
             KVQuantArg::Fp4 => KVQuantType::Fp4,
+        }
+    }
+}
+
+/// Overall execution mode for the hyprstream CLI and services
+///
+/// This determines how services are spawned and managed:
+/// - **Inproc**: Single process, all services in-process, inproc:// ZMQ transport
+/// - **IpcStandalone**: Multiple processes spawned directly, ipc:// ZMQ transport
+/// - **IpcSystemd**: Multiple systemd services with socket activation, ipc:// ZMQ transport
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExecutionMode {
+    /// Standalone mode with in-process services (default for development)
+    #[default]
+    Inproc,
+
+    /// Standalone mode with forked processes (no systemd)
+    /// Services spawned via ProcessSpawner with StandaloneBackend
+    IpcStandalone,
+
+    /// Systemd mode with socket-activated services
+    /// Services managed by systemd, started on-demand via socket activation
+    IpcSystemd,
+}
+
+impl ExecutionMode {
+    /// Detect best execution mode based on system capabilities
+    pub fn detect() -> Self {
+        #[cfg(feature = "systemd")]
+        {
+            if hyprstream_rpc::has_systemd() {
+                return ExecutionMode::IpcSystemd;
+            }
+        }
+        ExecutionMode::Inproc
+    }
+
+    /// Get the EndpointMode for this execution mode
+    pub fn endpoint_mode(&self) -> hyprstream_rpc::registry::EndpointMode {
+        match self {
+            ExecutionMode::Inproc => hyprstream_rpc::registry::EndpointMode::Inproc,
+            ExecutionMode::IpcStandalone | ExecutionMode::IpcSystemd => {
+                hyprstream_rpc::registry::EndpointMode::Ipc
+            }
+        }
+    }
+
+    /// Whether this mode uses IPC sockets
+    pub fn uses_ipc(&self) -> bool {
+        matches!(self, ExecutionMode::IpcStandalone | ExecutionMode::IpcSystemd)
+    }
+
+    /// Whether this mode uses systemd
+    pub fn uses_systemd(&self) -> bool {
+        matches!(self, ExecutionMode::IpcSystemd)
+    }
+}
+
+impl std::fmt::Display for ExecutionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExecutionMode::Inproc => write!(f, "inproc"),
+            ExecutionMode::IpcStandalone => write!(f, "ipc-standalone"),
+            ExecutionMode::IpcSystemd => write!(f, "ipc-systemd"),
         }
     }
 }

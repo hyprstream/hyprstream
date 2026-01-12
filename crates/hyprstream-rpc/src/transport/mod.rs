@@ -28,12 +28,8 @@ pub use traits::{AsyncTransport, Transport};
 /// // In-process endpoint
 /// let inproc = TransportConfig::inproc("hyprstream/registry");
 ///
-/// // TCP endpoint (no CURVE)
-/// let tcp = TransportConfig::tcp("127.0.0.1:5560", None);
-///
-/// // TCP endpoint with CURVE authentication
-/// let curve_key = [0u8; 32]; // Server's public key
-/// let tcp_curve = TransportConfig::tcp("192.168.1.100:5560", Some(curve_key));
+/// // IPC endpoint (auto-detects systemd socket activation)
+/// let ipc = TransportConfig::ipc("/run/user/1000/hyprstream/service.sock");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportConfig {
@@ -41,17 +37,6 @@ pub enum TransportConfig {
     ///
     /// Format: `inproc://hyprstream/service`
     Inproc { endpoint: String },
-
-    /// TCP socket endpoint, optionally with CURVE encryption.
-    ///
-    /// Format: `tcp://host:port`
-    ///
-    /// If `curve_pubkey` is provided, CURVE encryption is used.
-    /// The key is the server's 32-byte CURVE public key.
-    Tcp {
-        endpoint: String,
-        curve_pubkey: Option<[u8; 32]>,
-    },
 
     /// Unix domain socket (IPC) endpoint.
     ///
@@ -79,14 +64,6 @@ impl TransportConfig {
         }
     }
 
-    /// Create a TCP endpoint configuration.
-    pub fn tcp(endpoint: impl Into<String>, curve_pubkey: Option<[u8; 32]>) -> Self {
-        Self::Tcp {
-            endpoint: endpoint.into(),
-            curve_pubkey,
-        }
-    }
-
     /// Create an IPC (Unix domain socket) endpoint configuration.
     pub fn ipc(path: impl Into<PathBuf>) -> Self {
         Self::Ipc { path: path.into() }
@@ -109,7 +86,6 @@ impl TransportConfig {
     ///
     /// Supports:
     /// - `inproc://name` → `TransportConfig::Inproc`
-    /// - `tcp://host:port` → `TransportConfig::Tcp` (no CURVE)
     /// - `ipc:///path/to/socket` → `TransportConfig::Ipc`
     ///
     /// # Example
@@ -125,15 +101,8 @@ impl TransportConfig {
             Self::Inproc {
                 endpoint: name.to_string(),
             }
-        } else if let Some(addr) = endpoint.strip_prefix("tcp://") {
-            Self::Tcp {
-                endpoint: addr.to_string(),
-                curve_pubkey: None,
-            }
         } else if let Some(path) = endpoint.strip_prefix("ipc://") {
-            Self::Ipc {
-                path: PathBuf::from(path),
-            }
+            Self::Ipc { path: PathBuf::from(path) }
         } else {
             // Default to inproc if no scheme
             Self::Inproc {
@@ -144,12 +113,10 @@ impl TransportConfig {
 
     /// Get the ZMQ endpoint string for this configuration.
     ///
-    /// Returns the full ZMQ endpoint URI (e.g., `tcp://127.0.0.1:5560`).
     /// For `SystemdFd`, returns the client IPC path.
     pub fn zmq_endpoint(&self) -> String {
         match self {
             Self::Inproc { endpoint } => format!("inproc://{}", endpoint),
-            Self::Tcp { endpoint, .. } => format!("tcp://{}", endpoint),
             Self::Ipc { path } => format!("ipc://{}", path.display()),
             Self::SystemdFd { client_path, .. } => format!("ipc://{}", client_path.display()),
         }
@@ -182,22 +149,34 @@ impl TransportConfig {
         }
     }
 
-    /// Check if this endpoint uses CURVE encryption.
-    pub fn uses_curve(&self) -> bool {
-        matches!(self, Self::Tcp { curve_pubkey: Some(_), .. })
-    }
-
-    /// Get the CURVE public key if configured.
-    pub fn curve_pubkey(&self) -> Option<&[u8; 32]> {
-        match self {
-            Self::Tcp { curve_pubkey: Some(key), .. } => Some(key),
-            _ => None,
-        }
-    }
-
     /// Check if this is a systemd-activated endpoint.
     pub fn is_systemd_activated(&self) -> bool {
         matches!(self, Self::SystemdFd { .. })
+    }
+
+    /// Check for systemd socket activation and return the file descriptor.
+    ///
+    /// Returns `Some(fd)` if running under systemd with socket activation,
+    /// `None` otherwise.
+    fn get_systemd_fd() -> Option<RawFd> {
+        const SD_LISTEN_FDS_START: RawFd = 3;
+
+        let listen_fds: i32 = std::env::var("LISTEN_FDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
+        let listen_pid: u32 = std::env::var("LISTEN_PID")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
+        // Verify PID matches and we have at least 1 FD
+        if listen_pid == std::process::id() && listen_fds >= 1 {
+            Some(SD_LISTEN_FDS_START)
+        } else {
+            None
+        }
     }
 }
 
@@ -210,25 +189,6 @@ mod tests {
         let config = TransportConfig::inproc("hyprstream/registry");
         assert_eq!(config.zmq_endpoint(), "inproc://hyprstream/registry");
         assert_eq!(config.to_zmq_string(), "inproc://hyprstream/registry");
-        assert!(!config.uses_curve());
-        assert!(!config.is_systemd_activated());
-    }
-
-    #[test]
-    fn test_tcp_endpoint() {
-        let config = TransportConfig::tcp("127.0.0.1:5560", None);
-        assert_eq!(config.zmq_endpoint(), "tcp://127.0.0.1:5560");
-        assert!(!config.uses_curve());
-        assert!(!config.is_systemd_activated());
-    }
-
-    #[test]
-    fn test_tcp_with_curve() {
-        let key = [42u8; 32];
-        let config = TransportConfig::tcp("192.168.1.100:5560", Some(key));
-        assert_eq!(config.zmq_endpoint(), "tcp://192.168.1.100:5560");
-        assert!(config.uses_curve());
-        assert_eq!(config.curve_pubkey(), Some(&key));
         assert!(!config.is_systemd_activated());
     }
 
@@ -236,7 +196,6 @@ mod tests {
     fn test_ipc_endpoint() {
         let config = TransportConfig::ipc("/tmp/hyprstream.sock");
         assert_eq!(config.zmq_endpoint(), "ipc:///tmp/hyprstream.sock");
-        assert!(!config.uses_curve());
         assert!(!config.is_systemd_activated());
     }
 
@@ -247,7 +206,6 @@ mod tests {
             config.zmq_endpoint(),
             "ipc:///run/hyprstream/policy.sock"
         );
-        assert!(!config.uses_curve());
         assert!(config.is_systemd_activated());
     }
 }

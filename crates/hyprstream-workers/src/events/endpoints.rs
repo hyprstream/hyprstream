@@ -103,7 +103,7 @@ pub fn detect_transports(mode: EndpointMode) -> (TransportConfig, TransportConfi
         EndpointMode::Ipc => ipc_transports(),
         EndpointMode::Auto => {
             // Check for systemd socket activation
-            if let Some((pub_fd, sub_fd)) = detect_systemd_fds() {
+            if let Some((pub_fd, sub_fd)) = get_fds() {
                 return systemd_transports(pub_fd, sub_fd);
             }
             // Fall back to inproc for monolithic mode
@@ -116,7 +116,7 @@ pub fn detect_transports(mode: EndpointMode) -> (TransportConfig, TransportConfi
 ///
 /// Returns `Some((pub_fd, sub_fd))` if systemd socket activation is detected,
 /// `None` otherwise.
-pub fn detect_systemd_fds() -> Option<(RawFd, RawFd)> {
+pub fn get_fds() -> Option<(RawFd, RawFd)> {
     let listen_fds: i32 = std::env::var("LISTEN_FDS")
         .ok()
         .and_then(|v| v.parse().ok())

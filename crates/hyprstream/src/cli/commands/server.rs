@@ -4,7 +4,7 @@
 //! Configuration logic is in crate::config module.
 
 use super::config::LoggingConfig;
-use super::KVQuantArg;
+use super::{ExecutionMode, KVQuantArg};
 use crate::config::ServerConfigBuilder;
 use clap::Args;
 use serde::Deserialize;

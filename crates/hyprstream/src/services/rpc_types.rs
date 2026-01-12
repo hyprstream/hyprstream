@@ -316,6 +316,40 @@ impl RegistryResponse {
         serialize::write_message(&mut bytes, &msg).unwrap_or_default();
         bytes
     }
+
+    /// Build a repository status response.
+    pub fn repository_status(request_id: u64, status: &git2db::RepositoryStatus) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut status_builder = response.init_repository_status();
+
+        // Set branch (optional)
+        if let Some(ref branch) = status.branch {
+            status_builder.set_branch(branch);
+        }
+
+        // Set head OID (optional)
+        if let Some(ref oid) = status.head {
+            status_builder.set_head_oid(&oid.to_string());
+        }
+
+        // Set other fields
+        status_builder.set_ahead(status.ahead as u32);
+        status_builder.set_behind(status.behind as u32);
+        status_builder.set_is_clean(status.is_clean);
+
+        // Set modified files
+        let mut files_builder = status_builder.init_modified_files(status.modified_files.len() as u32);
+        for (i, file) in status.modified_files.iter().enumerate() {
+            files_builder.set(i as u32, &file.to_string_lossy());
+        }
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
 }
 
 // ============================================================================

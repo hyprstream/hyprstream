@@ -68,7 +68,7 @@ use tracing::{debug, info};
 /// ```
 pub async fn get_listener(addr: &str) -> Result<TcpListener> {
     // Try socket activation first
-    if let Some(listener) = try_systemd_listener()? {
+    if let Some(listener) = try_systemd()? {
         let local_addr = listener
             .local_addr()
             .context("Failed to get local address from systemd socket")?;
@@ -103,9 +103,9 @@ pub async fn get_listener_addr(addr: SocketAddr) -> Result<TcpListener> {
 /// Returns `Ok(Some(listener))` if socket activation is available,
 /// `Ok(None)` if not running under systemd or no sockets passed,
 /// `Err` if socket activation is configured but failed.
-fn try_systemd_listener() -> Result<Option<TcpListener>> {
+fn try_systemd() -> Result<Option<TcpListener>> {
     // Check if we're running under systemd with socket activation
-    if !is_socket_activated() {
+    if !has_socket() {
         debug!("Not running with systemd socket activation");
         return Ok(None);
     }
@@ -143,7 +143,7 @@ fn try_systemd_listener() -> Result<Option<TcpListener>> {
 /// Check if running with systemd socket activation
 ///
 /// Returns `true` if `LISTEN_FDS` is set and `LISTEN_PID` matches current process.
-pub fn is_socket_activated() -> bool {
+pub fn has_socket() -> bool {
     let listen_fds: i32 = std::env::var("LISTEN_FDS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -172,7 +172,7 @@ pub fn is_socket_activated() -> bool {
 ///
 /// Returns 0 if not running under systemd socket activation.
 pub fn listen_fd_count() -> usize {
-    if !is_socket_activated() {
+    if !has_socket() {
         return 0;
     }
 
@@ -196,7 +196,7 @@ pub fn listen_fd_count() -> usize {
 /// }
 /// ```
 pub fn get_all_tcp_listeners() -> Result<Vec<TcpListener>> {
-    if !is_socket_activated() {
+    if !has_socket() {
         return Ok(Vec::new());
     }
 
@@ -236,19 +236,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_socket_activated_false() {
+    fn test_has_socket_false() {
         // Should return false when env vars not set
         std::env::remove_var("LISTEN_FDS");
         std::env::remove_var("LISTEN_PID");
-        assert!(!is_socket_activated());
+        assert!(!has_socket());
     }
 
     #[test]
-    fn test_is_socket_activated_wrong_pid() {
+    fn test_has_socket_wrong_pid() {
         // Should return false when PID doesn't match
         std::env::set_var("LISTEN_FDS", "1");
         std::env::set_var("LISTEN_PID", "99999999"); // Wrong PID
-        assert!(!is_socket_activated());
+        assert!(!has_socket());
 
         // Cleanup
         std::env::remove_var("LISTEN_FDS");

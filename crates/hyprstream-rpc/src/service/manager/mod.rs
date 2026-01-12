@@ -62,7 +62,7 @@ pub trait ServiceManager: Send + Sync {
 pub async fn detect() -> Result<Box<dyn ServiceManager>> {
     #[cfg(feature = "systemd")]
     {
-        if crate::is_systemd_booted() {
+        if crate::has_systemd() {
             return Ok(Box::new(systemd::SystemdManager::new().await?));
         }
     }
