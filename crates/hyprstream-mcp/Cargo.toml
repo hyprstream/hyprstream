@@ -1,0 +1,80 @@
+[package]
+name = "tcl-mcp-server"
+version = "0.1.2"
+description = "A Model Context Protocol (MCP) server that provides TCL (Tool Command Language) execution capabilities with namespace-based tool management and versioning."
+license = "BSD-3-Clause"
+edition = "2021"
+build = "build.rs"
+readme = "README.md"
+repository = "https://crates.io/crates/tcl-mcp-server"
+
+[features]
+default = ["molt"]
+molt = ["dep:molt"]
+tcl = ["dep:tcl"]
+# rust-tcl = ["dep:rust-tcl"]  # Alternative TCL crate that works
+
+[dependencies]
+# TCL interpreters (optional based on feature)
+molt = { version = "0.3", optional = true }
+tcl = { version = "0.1", optional = true }
+
+# MCP Protocol schema
+rust-mcp-schema = "0.1"
+
+# JSON-RPC implementation (since rmcp requires unstable features)
+jsonrpc-core = "18.0"
+
+# Schema generation for tool parameters
+schemars = "0.8"
+
+# Async runtime (still needed by rmcp)
+tokio = { version = "1.0", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# For dynamic tool management
+dashmap = "5.5"
+
+# CLI argument parsing
+clap = { version = "4.0", features = ["derive"] }
+
+# Cross-platform directories
+dirs = "5.0"
+
+# Date/time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID generation
+uuid = { version = "1.0", features = ["serde", "v4"] }
+
+# MCP client support
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures = "0.3"
+
+# Filesystem notification for tool auto-reload
+notify = "6.0"
+
+[dev-dependencies]
+# For testing with temporary directories
+tempfile = "3.0"
+# For examples
+env_logger = "0.10"
+
+[lib]
+name = "tcl_mcp_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tcl-mcp-server"
+path = "src/main.rs"
