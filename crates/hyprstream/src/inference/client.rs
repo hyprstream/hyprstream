@@ -117,11 +117,6 @@ pub enum InferenceError {
 }
 
 impl InferenceError {
-    /// Check if this error suggests retrying the operation.
-    pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Channel(_) | Self::Unavailable)
-    }
-
     /// Create a channel error.
     pub fn channel<S: Into<String>>(msg: S) -> Self {
         Self::Channel(msg.into())
@@ -139,22 +134,3 @@ impl From<anyhow::Error> for InferenceError {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_inference_error_is_retryable() {
-        // Channel errors should be retryable
-        let err = InferenceError::channel("test");
-        assert!(err.is_retryable());
-
-        // Unavailable should be retryable
-        let err = InferenceError::Unavailable;
-        assert!(err.is_retryable());
-
-        // Generation errors should not be retryable
-        let err = InferenceError::Generation("failed".into());
-        assert!(!err.is_retryable());
-    }
-}

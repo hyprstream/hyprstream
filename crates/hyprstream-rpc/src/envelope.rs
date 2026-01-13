@@ -798,6 +798,54 @@ impl FromCapnp for ResponseEnvelope {
     }
 }
 
+/// Unwrap and verify a SignedEnvelope from wire bytes.
+///
+/// Deserializes, verifies signature and replay protection, then extracts
+/// the context and payload.
+///
+/// # Arguments
+///
+/// * `request` - Raw bytes containing a serialized SignedEnvelope
+/// * `server_pubkey` - Expected Ed25519 public key of the signer
+/// * `nonce_cache` - Cache for replay protection
+///
+/// # Returns
+///
+/// On success, returns `(EnvelopeContext, payload)` where:
+/// - `EnvelopeContext` contains verified request metadata
+/// - `payload` is the inner request bytes
+///
+/// # Errors
+///
+/// Returns error if:
+/// - Deserialization fails
+/// - Signature verification fails
+/// - Replay attack detected (nonce reused or timestamp expired)
+pub fn unwrap_envelope(
+    request: &[u8],
+    server_pubkey: &VerifyingKey,
+    nonce_cache: &dyn NonceCache,
+) -> Result<(crate::service::EnvelopeContext, Vec<u8>)> {
+    use capnp::serialize;
+
+    // Deserialize SignedEnvelope from Cap'n Proto
+    let reader = serialize::read_message(
+        &mut std::io::Cursor::new(request),
+        capnp::message::ReaderOptions::default(),
+    )?;
+    let signed_reader = reader.get_root::<crate::common_capnp::signed_envelope::Reader>()?;
+    let signed = SignedEnvelope::read_from(signed_reader)?;
+
+    // Verify signature and replay protection
+    signed.verify(server_pubkey, nonce_cache)?;
+
+    // Extract context and payload
+    let ctx = crate::service::EnvelopeContext::from_verified(&signed);
+    let payload = signed.payload().to_vec();
+
+    Ok((ctx, payload))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

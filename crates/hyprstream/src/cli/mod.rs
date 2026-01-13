@@ -8,11 +8,14 @@
 
 pub mod commands;
 pub mod context;
+pub mod daemon;
 pub mod git_handlers;
 pub mod handlers;
 pub mod policy_handlers;
 pub mod remote_handlers;
+pub mod systemd_setup;
 pub mod training_handlers;
+pub mod worker_handlers;
 pub mod worktree_handlers;
 
 pub use context::AppContext;
@@ -37,6 +40,12 @@ pub use policy_handlers::{
 pub use remote_handlers::{
     handle_remote_add, handle_remote_list, handle_remote_remove, handle_remote_rename,
     handle_remote_set_url,
+};
+pub use worker_handlers::{
+    handle_images_df, handle_images_list, handle_images_pull, handle_images_rm,
+    handle_worker_exec, handle_worker_list, handle_worker_restart, handle_worker_rm,
+    handle_worker_run, handle_worker_start, handle_worker_stats, handle_worker_status,
+    handle_worker_stop,
 };
 
 /// Device preference strategy

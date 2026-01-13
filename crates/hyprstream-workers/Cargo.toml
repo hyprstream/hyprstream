@@ -1,0 +1,96 @@
+[package]
+name = "hyprstream-workers"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Isolated workload execution using Kata Containers with CRI-aligned APIs"
+
+[dependencies]
+# Workspace crates
+hyprstream-rpc = { path = "../hyprstream-rpc" }
+hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }
+
+# Async runtime
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+capnp = { workspace = true }
+
+# Messaging
+tmq = { workspace = true }
+zmq = { workspace = true }
+zmq-sys = { workspace = true }  # Raw FFI for ZMQ_USE_FD socket option
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+chrono = { workspace = true }
+dashmap = { workspace = true }
+walkdir = { workspace = true }
+parking_lot = { workspace = true }
+glob = { workspace = true }
+
+# System utilities (also used by runtime/pool.rs, virtiofs.rs, events/endpoints.rs)
+nix = { workspace = true }
+which = { workspace = true }
+
+# Service management utilities (merged into hyprstream-rpc)
+
+# D-Bus integration (optional, for container D-Bus proxy)
+zbus = { version = "4", features = ["tokio"], optional = true }
+
+# Nydus libraries (Dragonfly-native blob fetching)
+nydus-api = { path = "../../../nydus/api" }
+nydus-builder = { path = "../../../nydus/builder" }
+nydus-rafs = { path = "../../../nydus/rafs" }
+nydus-storage = { path = "../../../nydus/storage", features = [
+    "backend-registry",
+    "backend-localfs",
+] }
+nydus-utils = { path = "../../../nydus/utils" }
+
+# Phase 2: VM Runtime (nydus-service for virtiofs)
+nydus-service = { path = "../../../nydus/service" }
+fuse-backend-rs = "0.12"
+
+# Minimal HTTP for manifest fetching only (blobs go through nydus-storage)
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+
+# Hashing & encoding
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.21"
+
+# Kata Containers runtime-rs (hypervisor abstraction)
+kata-hypervisor = { path = "../../../kata-containers/src/runtime-rs/crates/hypervisor", package = "hypervisor", features = ["cloud-hypervisor"] }
+kata-types = { path = "../../../kata-containers/src/libs/kata-types" }
+kata-sys-util = { path = "../../../kata-containers/src/libs/kata-sys-util" }
+ch-config = { path = "../../../kata-containers/src/runtime-rs/crates/hypervisor/ch-config" }
+
+[features]
+default = []
+# Enable Dragonball built-in VMM support (alternative to cloud-hypervisor)
+dragonball = ["kata-hypervisor/dragonball"]
+# Enable D-Bus bridge for container access to host D-Bus services
+dbus = ["dep:zbus"]
+# Systemd integration (socket activation, service units)
+systemd = ["dbus", "hyprstream-rpc/systemd"]
+
+[build-dependencies]
+capnpc = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tempfile = { workspace = true }

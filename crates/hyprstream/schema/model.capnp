@@ -136,3 +136,45 @@ struct ApplyChatTemplateRequest {
   messages @1 :List(ChatMessage);
   addGenerationPrompt @2 :Bool;  # Whether to add assistant prompt at end
 }
+
+# =============================================================================
+# Callback Protocol (InferenceService → ModelService)
+# =============================================================================
+#
+# InferenceService spawns, connects DEALER to ModelService's ROUTER callback
+# socket, and sends Register. ModelService then uses the same connection for
+# commands (LoadModel, Infer, Shutdown). This eliminates race conditions.
+
+# Sent by InferenceService when it connects back to ModelService
+struct Register {
+  id @0 :Text;              # Instance ID (e.g., "inference-a1b2c3d4")
+  streamEndpoint @1 :Text;  # XPUB endpoint for token streaming
+}
+
+# Response to Register (optional, for acknowledgment)
+struct RegisterResponse {
+  success @0 :Bool;
+  error @1 :Text;
+}
+
+# Command wrapper for ModelService → InferenceService
+struct InferenceCommand {
+  union {
+    loadModel @0 :LoadModelCommand;
+    shutdown @1 :Void;
+    # Infer uses existing InferenceRequest via request field
+    infer @2 :Data;  # Serialized InferenceRequest
+  }
+}
+
+# Load model command sent over callback connection
+struct LoadModelCommand {
+  modelRef @0 :Text;    # e.g., "qwen3-small:main"
+  modelPath @1 :Text;   # Resolved path to model directory
+}
+
+# Response to LoadModelCommand
+struct LoadModelCommandResponse {
+  success @0 :Bool;
+  error @1 :Text;
+}

@@ -2,16 +2,17 @@ pub mod chat;
 pub mod config;
 pub mod flight;
 pub mod git;
-pub mod model;
 pub mod policy;
 pub mod server;
 pub mod training;
+pub mod worker;
 
 pub use flight::FlightArgs;
 pub use git::{GitAction, GitCommand};
 pub use policy::{PolicyCommand, TokenCommand};
 pub use server::{ServerCliArgs, ServerCommand};
 pub use training::{TrainingAction, TrainingCommand};
+pub use worker::{ImageCommand, WorkerAction, WorkerCommand};
 
 use clap::{Subcommand, ValueEnum};
 
@@ -45,6 +46,71 @@ impl From<KVQuantArg> for KVQuantType {
             KVQuantArg::Int8 => KVQuantType::Int8,
             KVQuantArg::Nf4 => KVQuantType::Nf4,
             KVQuantArg::Fp4 => KVQuantType::Fp4,
+        }
+    }
+}
+
+/// Overall execution mode for the hyprstream CLI and services
+///
+/// This determines how services are spawned and managed:
+/// - **Inproc**: Single process, all services in-process, inproc:// ZMQ transport
+/// - **IpcStandalone**: Multiple processes spawned directly, ipc:// ZMQ transport
+/// - **IpcSystemd**: Multiple systemd services with socket activation, ipc:// ZMQ transport
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExecutionMode {
+    /// Standalone mode with in-process services (default for development)
+    #[default]
+    Inproc,
+
+    /// Standalone mode with forked processes (no systemd)
+    /// Services spawned via ProcessSpawner with StandaloneBackend
+    IpcStandalone,
+
+    /// Systemd mode with socket-activated services
+    /// Services managed by systemd, started on-demand via socket activation
+    IpcSystemd,
+}
+
+impl ExecutionMode {
+    /// Detect best execution mode based on system capabilities
+    pub fn detect() -> Self {
+        #[cfg(feature = "systemd")]
+        {
+            if hyprstream_rpc::has_systemd() {
+                return ExecutionMode::IpcSystemd;
+            }
+        }
+        ExecutionMode::Inproc
+    }
+
+    /// Get the EndpointMode for this execution mode
+    pub fn endpoint_mode(&self) -> hyprstream_rpc::registry::EndpointMode {
+        match self {
+            ExecutionMode::Inproc => hyprstream_rpc::registry::EndpointMode::Inproc,
+            ExecutionMode::IpcStandalone | ExecutionMode::IpcSystemd => {
+                hyprstream_rpc::registry::EndpointMode::Ipc
+            }
+        }
+    }
+
+    /// Whether this mode uses IPC sockets
+    pub fn uses_ipc(&self) -> bool {
+        matches!(self, ExecutionMode::IpcStandalone | ExecutionMode::IpcSystemd)
+    }
+
+    /// Whether this mode uses systemd
+    pub fn uses_systemd(&self) -> bool {
+        matches!(self, ExecutionMode::IpcSystemd)
+    }
+}
+
+impl std::fmt::Display for ExecutionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExecutionMode::Inproc => write!(f, "inproc"),
+            ExecutionMode::IpcStandalone => write!(f, "ipc-standalone"),
+            ExecutionMode::IpcSystemd => write!(f, "ipc-systemd"),
         }
     }
 }
@@ -395,6 +461,45 @@ pub enum Commands {
     Remote {
         #[command(subcommand)]
         command: RemoteCommand,
+    },
+
+    /// Worker (sandbox/container) management commands
+    ///
+    /// Commands for managing Kata VMs (sandboxes) and OCI containers:
+    /// - `worker list` - List sandboxes and containers
+    /// - `worker run` - Run a container in a sandbox
+    /// - `worker stop` - Stop sandbox or container
+    /// - `worker rm` - Remove sandbox or container
+    /// - `worker images` - Image management
+    Worker(WorkerCommand),
+
+    /// Run a single service (for systemd socket activation or callback mode)
+    ///
+    /// This command is used internally by systemd to run individual services.
+    /// Systemd socket activation spawns these when a connection arrives.
+    ///
+    /// Examples:
+    ///   hyprstream service event --ipc    # Run event service with IPC sockets
+    ///   hyprstream service worker --ipc   # Run worker service with IPC sockets
+    ///   hyprstream service registry --ipc # Run registry service with IPC sockets
+    ///   hyprstream service inference@abc123 --callback ipc:///run/hyprstream/callback.sock
+    Service {
+        /// Service name: event, worker, registry, policy, or inference@{id} for callback mode
+        name: String,
+
+        /// Use IPC sockets for distributed mode (required for systemd socket activation)
+        #[arg(long, default_value = "false")]
+        ipc: bool,
+
+        /// Callback endpoint for callback mode (inference service only)
+        ///
+        /// When specified, the inference service runs in callback mode:
+        /// 1. Connects DEALER to this ROUTER endpoint
+        /// 2. Sends Register message with its stream endpoint
+        /// 3. Waits for LoadModel command
+        /// 4. Handles Infer/Shutdown commands
+        #[arg(long)]
+        callback: Option<String>,
     },
 }
 

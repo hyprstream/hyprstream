@@ -24,7 +24,8 @@
 //!
 //! # Endpoint
 //!
-//! Default: `inproc://hyprstream/model`
+//! Uses `registry().endpoint("model", SocketKind::Rep)` for the REP endpoint.
+//! Default fallback: `inproc://hyprstream/model`
 
 use crate::api::openai_compat::ChatMessage;
 use crate::config::{GenerationRequest, GenerationResult, TemplatedPrompt};
@@ -40,7 +41,9 @@ use anyhow::{anyhow, Result};
 use capnp::message::{Builder, ReaderOptions};
 use capnp::serialize;
 use hyprstream_rpc::prelude::*;
+use hyprstream_rpc::registry::{global as registry, SocketKind};
 use lru::LruCache;
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
@@ -73,6 +76,16 @@ pub struct LoadedModel {
     pub last_used: Instant,
 }
 
+/// How InferenceService instances are spawned
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpawnMode {
+    /// Run InferenceService in-process (current behavior)
+    #[default]
+    InProcess,
+    /// Spawn InferenceService as separate process via callback pattern
+    Spawned,
+}
+
 /// Model service configuration
 pub struct ModelServiceConfig {
     /// Maximum number of models to keep loaded
@@ -81,6 +94,10 @@ pub struct ModelServiceConfig {
     pub max_context: Option<usize>,
     /// KV cache quantization type
     pub kv_quant: KVQuantType,
+    /// How to spawn InferenceService instances
+    pub spawn_mode: SpawnMode,
+    /// Callback endpoint for spawned mode
+    pub callback_endpoint: Option<String>,
 }
 
 impl Default for ModelServiceConfig {
@@ -89,6 +106,8 @@ impl Default for ModelServiceConfig {
             max_models: 5,
             max_context: None,
             kv_quant: KVQuantType::None,
+            spawn_mode: SpawnMode::InProcess,
+            callback_endpoint: None,
         }
     }
 }
@@ -97,6 +116,10 @@ impl Default for ModelServiceConfig {
 ///
 /// Runs on multi-threaded runtime. Manages an LRU cache of loaded models,
 /// spawning and stopping InferenceService instances as needed.
+///
+/// Supports two modes:
+/// - InProcess: Runs InferenceService in the same process (default)
+/// - Spawned: Spawns InferenceService as separate process via callback pattern
 pub struct ModelService {
     /// LRU cache of loaded models
     loaded_models: RwLock<LruCache<String, LoadedModel>>,
@@ -110,6 +133,10 @@ pub struct ModelService {
     policy_client: PolicyZmqClient,
     /// Model storage for resolving model paths
     model_storage: Arc<ModelStorage>,
+    /// Callback router for spawned mode (None for in-process)
+    callback_router: Option<crate::services::callback::CallbackRouter>,
+    /// Spawned instances by model ref (for spawned mode)
+    spawned_instances: RwLock<HashMap<String, crate::services::callback::Instance>>,
 }
 
 impl ModelService {
@@ -135,10 +162,39 @@ impl ModelService {
             verifying_key,
             policy_client,
             model_storage,
+            callback_router: None,
+            spawned_instances: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Start the model service at the default endpoint
+    /// Create a model service with callback router for spawned mode
+    pub fn with_callback_router(
+        config: ModelServiceConfig,
+        signing_key: SigningKey,
+        verifying_key: VerifyingKey,
+        policy_client: PolicyZmqClient,
+        model_storage: Arc<ModelStorage>,
+        callback_router: crate::services::callback::CallbackRouter,
+    ) -> Self {
+        const DEFAULT_CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(5) {
+            Some(n) => n,
+            None => unreachable!(),
+        };
+        let cache_size = NonZeroUsize::new(config.max_models).unwrap_or(DEFAULT_CACHE_SIZE);
+
+        Self {
+            loaded_models: RwLock::new(LruCache::new(cache_size)),
+            config,
+            signing_key,
+            verifying_key,
+            policy_client,
+            model_storage,
+            callback_router: Some(callback_router),
+            spawned_instances: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Start the model service at the default endpoint (from registry)
     pub async fn start(
         config: ModelServiceConfig,
         signing_key: SigningKey,
@@ -146,13 +202,14 @@ impl ModelService {
         policy_client: PolicyZmqClient,
         model_storage: Arc<ModelStorage>,
     ) -> Result<ServiceHandle> {
+        let endpoint = registry().endpoint("model", SocketKind::Rep).to_zmq_string();
         Self::start_at(
             config,
             signing_key,
             verifying_key,
             policy_client,
             model_storage,
-            MODEL_ENDPOINT,
+            &endpoint,
         )
         .await
     }
@@ -234,7 +291,7 @@ impl ModelService {
         {
             let mut cache = self.loaded_models.write().await;
             if cache.len() >= self.config.max_models {
-                if let Some((evicted_ref, evicted)) = cache.pop_lru() {
+                if let Some((evicted_ref, mut evicted)) = cache.pop_lru() {
                     info!("Evicting model {} to load {}", evicted_ref, model_ref_str);
                     // Stop the evicted service
                     tokio::spawn(async move {
@@ -264,7 +321,7 @@ impl ModelService {
     /// Unload a model
     async fn unload_model(&self, model_ref_str: &str) -> Result<()> {
         let mut cache = self.loaded_models.write().await;
-        if let Some((_, model)) = cache.pop_entry(model_ref_str) {
+        if let Some((_, mut model)) = cache.pop_entry(model_ref_str) {
             info!("Unloading model {}", model_ref_str);
             model.service_handle.stop().await;
             Ok(())
@@ -706,15 +763,16 @@ pub struct ModelZmqClient {
 }
 
 impl ModelZmqClient {
-    /// Create a new model client
+    /// Create a new model client (endpoint from registry)
     pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
+        let endpoint = registry().endpoint("model", SocketKind::Rep).to_zmq_string();
         Self {
-            client: Arc::new(ZmqClient::new(MODEL_ENDPOINT, signing_key, identity)),
+            client: Arc::new(ZmqClient::new(&endpoint, signing_key, identity)),
         }
     }
 
     /// Create a model client at a specific endpoint
-    pub fn new_at(endpoint: &str, signing_key: SigningKey, identity: RequestIdentity) -> Self {
+    pub fn with_endpoint(endpoint: &str, signing_key: SigningKey, identity: RequestIdentity) -> Self {
         Self {
             client: Arc::new(ZmqClient::new(endpoint, signing_key, identity)),
         }

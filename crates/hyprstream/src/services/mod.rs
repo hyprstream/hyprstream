@@ -57,11 +57,13 @@
 
 mod core;
 mod traits;
+pub mod callback;
 pub mod inference;
 pub mod model;
 pub mod policy;
 pub mod registry;
 pub mod rpc_types;
+pub mod worker;
 
 pub use core::{
     EnvelopeContext, ServiceHandle, ServiceRunner, ZmqClient, ZmqService,
@@ -74,10 +76,11 @@ pub use traits::{
 pub use inference::{InferenceService, InferenceZmqClient, INFERENCE_ENDPOINT};
 pub use registry::{
     RegistryOps, RegistryService, RegistryZmq, RegistryZmqClient, RepositoryZmqClient,
-    REGISTRY_ENDPOINT,
 };
-pub use policy::{PolicyService, PolicyZmqClient, POLICY_ENDPOINT};
+pub use policy::{PolicyService, PolicyZmqClient};
 pub use model::{
     LoadedModelInfo, ModelHealthInfo, ModelService, ModelServiceConfig, ModelStatusInfo,
     ModelZmqClient, MODEL_ENDPOINT,
 };
+pub use worker::WorkerClient;
+pub use callback::{CallbackRouter, Instance};

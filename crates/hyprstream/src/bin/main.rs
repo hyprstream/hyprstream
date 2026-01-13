@@ -9,7 +9,7 @@ use tracing::info;
 
 // Core application imports
 use hyprstream_core::auth::PolicyManager;
-use hyprstream_core::cli::commands::{Commands, TrainingAction};
+use hyprstream_core::cli::commands::{Commands, ExecutionMode, TrainingAction};
 use hyprstream_core::cli::handlers::handle_server;
 use hyprstream_core::cli::{
     handle_branch, handle_checkout, handle_clone, handle_commit, handle_infer, handle_info,
@@ -21,6 +21,11 @@ use hyprstream_core::cli::{
     handle_training_batch, handle_training_checkpoint, handle_training_infer, handle_training_init,
     handle_worktree_add, handle_worktree_info, handle_worktree_list,
     handle_worktree_remove, load_or_generate_signing_key, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
+    // Worker handlers
+    handle_images_df, handle_images_list, handle_images_pull, handle_images_rm,
+    handle_worker_exec, handle_worker_list, handle_worker_restart, handle_worker_rm,
+    handle_worker_run, handle_worker_start, handle_worker_stats, handle_worker_status,
+    handle_worker_stop,
 };
 use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
@@ -29,6 +34,12 @@ use hyprstream_core::storage::{GitRef, ModelRef};
 use hyprstream_core::services::{
     PolicyService, PolicyZmqClient, RegistryClient, RegistryService, RegistryZmqClient, ServiceHandle,
 };
+// Worker service for Kata-based workload execution
+use hyprstream_workers::runtime::WorkerService;
+use hyprstream_workers::workflow::WorkflowService;
+use hyprstream_workers::{ImageConfig, PoolConfig, ProxyService, ServiceSpawner, SpawnedService, endpoints, EndpointMode};
+// ZMQ context for service startup
+use hyprstream_core::zmq::global_context;
 use std::sync::Arc;
 // Tracing imports (feature-gated)
 #[cfg(feature = "otel")]
@@ -250,63 +261,7 @@ fn main() -> Result<()> {
         .validate()
         .context("Configuration validation failed")?;
 
-    // Start registry service ONCE at CLI level
-    // This runtime must stay alive to keep ZMQ services running
-    let _registry_runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("Failed to create registry runtime")?;
-
-    // Start ZMQ-based services: PolicyService first, then RegistryService
-    // Return both client AND service handle so we can stop it on exit
-    // Also return keypair for other services (like InferenceService) to use
-    use hyprstream_rpc::{SigningKey, VerifyingKey, RequestIdentity};
-    let (registry_client, _service_handle, signing_key, verifying_key): (Arc<dyn RegistryClient>, ServiceHandle, SigningKey, VerifyingKey) = _registry_runtime
-        .block_on(async {
-            let models_dir = config.models_dir();
-
-            // Load or generate signing key (persisted to .registry/keys/signing.key)
-            let keys_dir = models_dir.join(".registry").join("keys");
-            let signing_key = load_or_generate_signing_key(&keys_dir).await?;
-            let verifying_key = signing_key.verifying_key();
-
-            // Initialize policy manager for authorization
-            // Note: Policy templates should be applied explicitly using CLI commands:
-            //   hyprstream policy apply-template local    # For local full access
-            //   hyprstream policy apply-template public-inference  # For public inference
-            let policies_dir = models_dir.join(".registry").join("policies");
-            let policy_manager = Arc::new(
-                PolicyManager::new(&policies_dir)
-                    .await
-                    .context("Failed to initialize policy manager")?
-            );
-
-            // Start PolicyService FIRST (runs on multi-threaded runtime where block_in_place works)
-            // This service wraps PolicyManager and exposes it over ZMQ
-            let _policy_handle = PolicyService::start(policy_manager, verifying_key)
-                .await
-                .context("Failed to start policy service")?;
-
-            // Create policy client for other services to use
-            let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
-
-            // Start the registry service with policy client (waits for socket binding)
-            let service_handle = RegistryService::start(&models_dir, verifying_key, policy_client)
-                .await
-                .context("Failed to start registry service")?;
-            // Create client with signing credentials for service communication
-            // Uses local identity (current OS user) for authorization
-            let client = Arc::new(RegistryZmqClient::new(
-                signing_key.clone(),
-                RequestIdentity::local(),
-            )) as Arc<dyn RegistryClient>;
-            Ok::<_, anyhow::Error>((client, service_handle, signing_key, verifying_key))
-        })
-        .context("Failed to initialize registry")?;
-
-    // Create application context with shared registry client
-    let ctx = AppContext::with_client(config, registry_client.clone());
-
+    // ========== TRACING INITIALIZATION (before service startup) ==========
     // Keep the guard alive for the entire program lifetime
     // Dropping the guard stops the background logging thread
     let _log_guard: Option<tracing_appender::non_blocking::WorkerGuard>;
@@ -416,10 +371,184 @@ fn main() -> Result<()> {
     }
 
     info!("Hyprstream v{} starting up", env!("CARGO_PKG_VERSION"));
+    // ========== END TRACING INITIALIZATION ==========
+
+    // ========== EXECUTION MODE DETECTION ==========
+    // Auto-detect execution mode based on system capabilities
+    let execution_mode = hyprstream_core::cli::commands::ExecutionMode::detect();
+
+    info!("Execution mode: {}", execution_mode);
+
+    // ========== SYSTEMD SOCKET UNITS ==========
+    // Ensure socket units are installed (idempotent) when using systemd mode
+    #[cfg(feature = "systemd")]
+    let _ = {
+        use hyprstream_core::cli::commands::ExecutionMode;
+        if execution_mode == ExecutionMode::IpcSystemd {
+            use hyprstream_core::cli::systemd_setup::ensure_units;
+            if std::env::var("HYPRSTREAM_NO_SYSTEMD").is_err() {
+                // Install systemd unit files for configured services
+                ensure_units(&config.services.startup);
+            }
+        }
+    };
+
+    // ========== ENDPOINT REGISTRY INITIALIZATION ==========
+    // Initialize the endpoint registry based on execution mode
+    {
+        use hyprstream_rpc::registry::{init as init_registry, EndpointMode};
+
+        let mode = execution_mode.endpoint_mode();
+        let runtime_dir = if execution_mode.uses_ipc() {
+            Some(hyprstream_rpc::paths::runtime_dir())
+        } else {
+            None
+        };
+
+        init_registry(mode, runtime_dir);
+    }
+    // ========== END ENDPOINT REGISTRY INITIALIZATION ==========
+
+    // Start registry service ONCE at CLI level
+    // This runtime must stay alive to keep ZMQ services running
+    let _registry_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("Failed to create registry runtime")?;
+
+    // Start ZMQ-based services: PolicyService first, then RegistryService, then optional WorkerService
+    // Return both client AND service handle so we can stop it on exit
+    // Also return keypair for other services (like InferenceService) to use
+    use hyprstream_rpc::{SigningKey, VerifyingKey, RequestIdentity};
+
+    // Clone worker config before moving config into the async block
+    let worker_config = config.worker.clone();
+
+    let (registry_client, mut _service_handle, _worker_handle, mut _event_handle, _workflow_service, signing_key, verifying_key): (Arc<dyn RegistryClient>, Option<ServiceHandle>, Option<ServiceHandle>, Option<SpawnedService>, Option<Arc<WorkflowService>>, SigningKey, VerifyingKey) = if execution_mode == ExecutionMode::Inproc {
+        _registry_runtime
+        .block_on(async {
+            let models_dir = config.models_dir();
+
+            // Load or generate signing key (persisted to .registry/keys/signing.key)
+            let keys_dir = models_dir.join(".registry").join("keys");
+            let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+            let verifying_key = signing_key.verifying_key();
+
+            // Start EventService FIRST (event bus must be running before services that publish events)
+            // Uses XPUB/XSUB proxy pattern for efficient message distribution
+            let (pub_transport, sub_transport) = endpoints::inproc_transports();
+            let proxy = ProxyService::new("events", global_context(), pub_transport, sub_transport);
+            let event_handle = ServiceSpawner::threaded()
+                .spawn(proxy)
+                .await
+                .context("Failed to start event service")?;
+
+            // Initialize policy manager for authorization
+            // Note: Policy templates should be applied explicitly using CLI commands:
+            //   hyprstream policy apply-template local    # For local full access
+            //   hyprstream policy apply-template public-inference  # For public inference
+            let policies_dir = models_dir.join(".registry").join("policies");
+            let policy_manager = Arc::new(
+                PolicyManager::new(&policies_dir)
+                    .await
+                    .context("Failed to initialize policy manager")?
+            );
+
+            // Start PolicyService (runs on multi-threaded runtime where block_in_place works)
+            // This service wraps PolicyManager and exposes it over ZMQ
+            let _policy_handle = PolicyService::start(policy_manager, verifying_key)
+                .await
+                .context("Failed to start policy service")?;
+
+            // Create policy client for other services to use
+            let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
+
+            // Start the registry service with policy client (waits for socket binding)
+            let service_handle = RegistryService::start(&models_dir, verifying_key, policy_client)
+                .await
+                .context("Failed to start registry service")?;
+
+            // Start WorkerService if configured (optional, for Kata-based workload execution)
+            let worker_handle = if let Some(ref wc) = worker_config {
+                info!("Starting WorkerService for container/sandbox management");
+                let handle = WorkerService::start(
+                    wc.pool.clone(),
+                    wc.images.clone(),
+                    global_context(),
+                    verifying_key,
+                )
+                .await
+                .context("Failed to start worker service")?;
+                Some(handle)
+            } else {
+                None
+            };
+
+            // Start WorkflowService for event-driven workflow orchestration
+            // Subscribes to worker events via EventService
+            let workflow_service = Arc::new(WorkflowService::new(global_context()));
+            workflow_service
+                .clone()
+                .start()
+                .await
+                .context("Failed to start workflow service")?;
+            info!("WorkflowService started, subscribed to worker.* events");
+
+            // Create client with signing credentials for service communication
+            // Uses local identity (current OS user) for authorization
+            let client = Arc::new(RegistryZmqClient::new(
+                signing_key.clone(),
+                RequestIdentity::local(),
+            )) as Arc<dyn RegistryClient>;
+            Ok::<_, anyhow::Error>((client, Some(service_handle), worker_handle, Some(event_handle), Some(workflow_service), signing_key, verifying_key))
+        })
+        .context("Failed to initialize services")?
+    } else {
+        // For systemd/standalone modes, ensure services are running then connect via IPC
+        _registry_runtime
+        .block_on(async {
+            use hyprstream_rpc::service::manager::detect as detect_manager;
+
+            // Ensure services are running (idempotent)
+            // Use configured startup services from config
+            let manager = detect_manager().await?;
+            for service in &config.services.startup {
+                manager.ensure(service).await?;
+            }
+
+            let models_dir = config.models_dir();
+            let keys_dir = models_dir.join(".registry").join("keys");
+            let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+            let verifying_key = signing_key.verifying_key();
+
+            let client = Arc::new(RegistryZmqClient::new(
+                signing_key.clone(),
+                RequestIdentity::local(),
+            )) as Arc<dyn RegistryClient>;
+
+            Ok::<_, anyhow::Error>((client, None, None, None, None, signing_key, verifying_key))
+        })
+        .context("Failed to connect to services")?
+    };
+
+    // Create application context with shared registry client
+    // Clone config for Service command to use later
+    let config_for_service = config.clone();
+    // Extract services startup list before config is moved
+    let services_startup = config.services.startup.clone();
+    let ctx = AppContext::with_client(config, registry_client.clone());
 
     // Handle commands with appropriate runtime configuration
     match cli.command {
         Commands::Server(cmd) => {
+            // Daemonize BEFORE creating tokio runtime if --detach is specified
+            // This must happen before any async code runs
+            hyprstream_core::cli::daemon::maybe_daemonize(
+                cmd.detach,
+                cmd.server.working_dir.clone(),
+                cmd.server.pid_file.clone(),
+            )?;
+
             // Load base config from files
             let mut config = load_config(cli.config.as_deref())?;
 
@@ -1110,11 +1239,412 @@ fn main() -> Result<()> {
             )?;
         }
 
+        Commands::Worker(cmd) => {
+            use hyprstream_core::cli::commands::{WorkerAction, ImageCommand};
+            use hyprstream_core::services::WorkerClient;
+
+            let signing_key = signing_key.clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    // Check if worker is in the startup services list
+                    let worker_already_running = services_startup.contains(&"worker".to_string());
+
+                    if worker_already_running {
+                        info!("WorkerService is managed by systemd, connecting to existing service");
+                    } else {
+                        // Start WorkerService for CLI commands (only if not in systemd mode)
+                        // Use minimal config without warm pool (no VMs started immediately)
+                        info!("Starting WorkerService for CLI worker commands");
+                    }
+
+                    // Use user-accessible paths for CLI (not /var/lib which requires root)
+                    let data_dir = dirs::data_local_dir()
+                        .unwrap_or_else(|| std::path::PathBuf::from("."))
+                        .join("hyprstream");
+                    let runtime_dir = dirs::runtime_dir()
+                        .unwrap_or_else(|| std::env::temp_dir())
+                        .join("hyprstream");
+
+                    // Kata VM files location from KATA_BOOT_PATH env var
+                    let kata_boot_path = std::env::var("KATA_BOOT_PATH")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|_| std::path::PathBuf::from("/opt/kata/share/kata-containers"));
+
+                    let pool_config = PoolConfig {
+                        warm_pool_size: 0, // Don't pre-warm VMs for CLI
+                        runtime_dir: runtime_dir.join("sandboxes"),
+                        kernel_path: kata_boot_path.join("vmlinux.container"),
+                        vm_image: kata_boot_path.join("kata-containers.img"),
+                        cloud_init_dir: data_dir.join("cloud-init"),
+                        ..PoolConfig::default()
+                    };
+                    let image_config = ImageConfig {
+                        blobs_dir: data_dir.join("images/blobs"),
+                        bootstrap_dir: data_dir.join("images/bootstrap"),
+                        refs_dir: data_dir.join("images/refs"),
+                        cache_dir: data_dir.join("images/cache"),
+                        runtime_dir: runtime_dir.join("nydus"),
+                        ..ImageConfig::default()
+                    };
+
+                    tracing::debug!(
+                        data_dir = %data_dir.display(),
+                        runtime_dir = %runtime_dir.display(),
+                        "Using CLI-friendly paths for worker service"
+                    );
+
+                    // Only start WorkerService if it's not already running via systemd
+                    let _worker_handle = if !worker_already_running {
+                        Some(WorkerService::start(
+                            pool_config,
+                            image_config,
+                            global_context(),
+                            verifying_key,
+                        )
+                        .await
+                        .context("Failed to start worker service")?)
+                    } else {
+                        None
+                    };
+
+                    // Create WorkerClient for ZMQ communication with WorkerService
+                    let worker_client = WorkerClient::new(signing_key, RequestIdentity::local());
+
+                    match cmd.action {
+                        WorkerAction::List { sandbox, containers, sandboxes, state, verbose } => {
+                            handle_worker_list(&worker_client, sandbox, containers, sandboxes, state, verbose).await
+                        }
+                        WorkerAction::Run { image, command, sandbox, name, env, workdir, detach, rm } => {
+                            handle_worker_run(&worker_client, &image, command, sandbox, name, env, workdir, detach, rm).await
+                        }
+                        WorkerAction::Stop { id, timeout, force } => {
+                            handle_worker_stop(&worker_client, &id, timeout, force).await
+                        }
+                        WorkerAction::Start { container_id } => {
+                            handle_worker_start(&worker_client, &container_id).await
+                        }
+                        WorkerAction::Restart { id, timeout } => {
+                            handle_worker_restart(&worker_client, &id, timeout).await
+                        }
+                        WorkerAction::Rm { ids, force, volumes: _ } => {
+                            handle_worker_rm(&worker_client, ids, force).await
+                        }
+                        WorkerAction::Status { id, verbose } => {
+                            handle_worker_status(&worker_client, &id, verbose).await
+                        }
+                        WorkerAction::Stats { ids, stream: _, no_header } => {
+                            handle_worker_stats(&worker_client, ids, no_header).await
+                        }
+                        WorkerAction::Exec { container_id, command, timeout } => {
+                            handle_worker_exec(&worker_client, &container_id, command, timeout).await
+                        }
+                        WorkerAction::Images(img_cmd) => {
+                            match img_cmd {
+                                ImageCommand::List { verbose, filter: _ } => {
+                                    handle_images_list(&worker_client, verbose).await
+                                }
+                                ImageCommand::Pull { image, username, password } => {
+                                    handle_images_pull(&worker_client, &image, username, password).await
+                                }
+                                ImageCommand::Rm { images, force } => {
+                                    handle_images_rm(&worker_client, images, force).await
+                                }
+                                ImageCommand::Df => {
+                                    handle_images_df(&worker_client).await
+                                }
+                            }
+                        }
+                    }
+                },
+            )?;
+        }
+
+        // Service command: Run individual services for systemd socket activation
+        Commands::Service { name, ipc, callback } => {
+            use hyprstream_workers::endpoints::EndpointMode;
+
+            // Check if this is inference callback mode (inference@{id})
+            if let Some(callback_endpoint) = callback {
+                use anyhow::anyhow;
+                use hyprstream_core::services::InferenceService;
+
+                // Extract instance ID from name (e.g., "inference@abc123" -> "abc123")
+                let instance_id = if let Some(id) = name.strip_prefix("inference@") {
+                    id.to_string()
+                } else {
+                    return Err(anyhow!("--callback requires inference@{{id}} format (got: {})", name));
+                };
+
+                info!("Starting InferenceService in callback mode: {} -> {}", instance_id, callback_endpoint);
+
+                // Run in async context
+                return with_runtime(
+                    RuntimeConfig {
+                        device: DeviceConfig::request_cpu(),
+                        multi_threaded: false, // Single-threaded for inference
+                    },
+                    || async move {
+                        // Callback mode uses the PolicyService via ZMQ
+                        let data_dir = dirs::data_local_dir()
+                            .unwrap_or_else(|| std::path::PathBuf::from("."))
+                            .join("hyprstream");
+                        let keys_dir = data_dir.join("keys");
+                        let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+                        let policy_client = PolicyZmqClient::new(
+                            signing_key.clone(),
+                            hyprstream_rpc::RequestIdentity::local(),
+                        );
+
+                        // Use default RuntimeConfig (inference will use model-specific config)
+                        let runtime_config = hyprstream_core::runtime::RuntimeConfig::default();
+
+                        // Start in callback mode (this blocks until shutdown)
+                        InferenceService::start_with_callback(
+                            instance_id,
+                            callback_endpoint,
+                            runtime_config,
+                            policy_client,
+                        ).await
+                    },
+                );
+            }
+
+            // Services must run with IPC sockets for distributed mode
+            let rpc_mode = if ipc {
+                hyprstream_rpc::registry::EndpointMode::Ipc
+            } else {
+                hyprstream_rpc::registry::EndpointMode::Inproc
+            };
+            let mode = if ipc {
+                hyprstream_workers::endpoints::EndpointMode::Ipc
+            } else {
+                hyprstream_workers::endpoints::EndpointMode::Inproc
+            };
+
+            // Capture config for use in async block
+            let config = config_for_service;
+
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    // Set up signal handler for graceful shutdown
+                    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+                    // Spawn signal handler task
+                    tokio::spawn(async move {
+                        let _ = tokio::signal::ctrl_c().await;
+                        info!("Received shutdown signal");
+                        let _ = shutdown_tx.send(());
+                    });
+
+                    // Initialize endpoint registry for service process
+                    {
+                        use hyprstream_rpc::registry::init as init_registry;
+                        let runtime_dir = if ipc {
+                            Some(hyprstream_rpc::paths::runtime_dir())
+                        } else {
+                            None
+                        };
+                        init_registry(rpc_mode, runtime_dir);
+                    }
+
+                    match name.as_str() {
+                        "event" => {
+                            info!("Starting EventService in standalone mode (IPC: {})", ipc);
+
+                            // Start EventService using new API
+                            let (pub_transport, sub_transport) = endpoints::detect_transports(mode);
+                            let proxy = ProxyService::new("events", global_context(), pub_transport, sub_transport);
+                            let mut handle = ServiceSpawner::threaded()
+                                .spawn(proxy)
+                                .await
+                                .context("Failed to start event service")?;
+
+                            // Notify systemd that service is ready
+                            let _ = hyprstream_rpc::notify::ready();
+
+                            info!("EventService ready, waiting for shutdown signal");
+
+                            // Wait for shutdown
+                            let _ = shutdown_rx.await;
+
+                            // Stop service
+                            handle.stop().await.context("Failed to stop event service")?;
+
+                            info!("EventService stopped");
+                        }
+
+                        "worker" => {
+                            info!("Starting WorkerService in standalone mode (IPC: {})", ipc);
+
+                            // Use worker config from main config or defaults
+                            let data_dir = dirs::data_local_dir()
+                                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                                .join("hyprstream");
+                            let runtime_dir = dirs::runtime_dir()
+                                .unwrap_or_else(|| std::env::temp_dir())
+                                .join("hyprstream");
+
+                            let kata_boot_path = std::env::var("KATA_BOOT_PATH")
+                                .map(std::path::PathBuf::from)
+                                .unwrap_or_else(|_| std::path::PathBuf::from("/opt/kata/share/kata-containers"));
+
+                            let pool_config = PoolConfig {
+                                warm_pool_size: 0,
+                                runtime_dir: runtime_dir.join("sandboxes"),
+                                kernel_path: kata_boot_path.join("vmlinux.container"),
+                                vm_image: kata_boot_path.join("kata-containers.img"),
+                                cloud_init_dir: data_dir.join("cloud-init"),
+                                ..PoolConfig::default()
+                            };
+                            let image_config = ImageConfig {
+                                blobs_dir: data_dir.join("images/blobs"),
+                                bootstrap_dir: data_dir.join("images/bootstrap"),
+                                refs_dir: data_dir.join("images/refs"),
+                                cache_dir: data_dir.join("images/cache"),
+                                runtime_dir: runtime_dir.join("nydus"),
+                                ..ImageConfig::default()
+                            };
+
+                            let mut worker_handle = WorkerService::start(
+                                pool_config,
+                                image_config,
+                                global_context(),
+                                verifying_key,
+                            )
+                            .await
+                            .context("Failed to start worker service")?;
+
+                            // Publish ready event via event bus
+                            if let Ok(mut publisher) = hyprstream_workers::EventPublisher::new(&global_context(), "system") {
+                                let _ = publisher.publish_raw("system.worker.ready", b"").await;
+                            }
+
+                            // Notify systemd
+                            let _ = hyprstream_rpc::notify::ready();
+
+                            info!("WorkerService ready, waiting for shutdown signal");
+
+                            // Wait for shutdown
+                            let _ = shutdown_rx.await;
+
+                            // Publish stopping event
+                            if let Ok(mut publisher) = hyprstream_workers::EventPublisher::new(&global_context(), "system") {
+                                let _ = publisher.publish_raw("system.worker.stopping", b"").await;
+                            }
+
+                            worker_handle.stop().await;
+                            info!("WorkerService stopped");
+                        }
+
+                        "registry" => {
+                            info!("Starting RegistryService in standalone mode (IPC: {})", ipc);
+
+                            let models_dir = config.models_dir();
+
+                            // Load signing key
+                            let keys_dir = models_dir.join(".registry").join("keys");
+                            let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+                            let verifying_key = signing_key.verifying_key();
+
+                            // Create policy client
+                            let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
+
+                            let mut registry_handle = RegistryService::start(&models_dir, verifying_key, policy_client)
+                                .await
+                                .context("Failed to start registry service")?;
+
+                            // Publish ready event
+                            if let Ok(mut publisher) = hyprstream_workers::EventPublisher::new(&global_context(), "system") {
+                                let _ = publisher.publish_raw("system.registry.ready", b"").await;
+                            }
+
+                            // Notify systemd
+                            let _ = hyprstream_rpc::notify::ready();
+
+                            info!("RegistryService ready, waiting for shutdown signal");
+
+                            let _ = shutdown_rx.await;
+
+                            if let Ok(mut publisher) = hyprstream_workers::EventPublisher::new(&global_context(), "system") {
+                                let _ = publisher.publish_raw("system.registry.stopping", b"").await;
+                            }
+
+                            registry_handle.stop().await;
+                            info!("RegistryService stopped");
+                        }
+
+                        "policy" => {
+                            info!("Starting PolicyService in standalone mode (IPC: {})", ipc);
+
+                            let models_dir = config.models_dir();
+                            let policies_dir = models_dir.join(".registry").join("policies");
+
+                            // Load signing key for verification
+                            let keys_dir = models_dir.join(".registry").join("keys");
+                            let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+                            let verifying_key = signing_key.verifying_key();
+
+                            let policy_manager = Arc::new(
+                                PolicyManager::new(&policies_dir)
+                                    .await
+                                    .context("Failed to initialize policy manager")?
+                            );
+
+                            let mut policy_handle = PolicyService::start(policy_manager, verifying_key)
+                                .await
+                                .context("Failed to start policy service")?;
+
+                            // Publish ready event
+                            if let Ok(mut publisher) = hyprstream_workers::EventPublisher::new(&global_context(), "system") {
+                                let _ = publisher.publish_raw("system.policy.ready", b"").await;
+                            }
+
+                            // Notify systemd
+                            let _ = hyprstream_rpc::notify::ready();
+
+                            info!("PolicyService ready, waiting for shutdown signal");
+
+                            let _ = shutdown_rx.await;
+
+                            if let Ok(mut publisher) = hyprstream_workers::EventPublisher::new(&global_context(), "system") {
+                                let _ = publisher.publish_raw("system.policy.stopping", b"").await;
+                            }
+
+                            policy_handle.stop().await;
+                            info!("PolicyService stopped");
+                        }
+
+                        _ => {
+                            anyhow::bail!("Unknown service: {}. Valid services: event, worker, registry, policy", name);
+                        }
+                    }
+
+                    Ok(())
+                },
+            )?;
+        }
+
     };
 
-    // Gracefully stop registry service before exiting
+    // Gracefully stop services before exiting (only for Inproc mode)
+    // For systemd/standalone modes, services are managed externally
     _registry_runtime.block_on(async {
-        _service_handle.stop().await;
+        if let Some(mut handle) = _service_handle {
+            handle.stop().await;
+        }
+        if let Some(mut event) = _event_handle {
+            if let Err(e) = event.stop().await {
+                tracing::warn!("Failed to stop event service: {}", e);
+            }
+        }
     });
 
     Ok(())

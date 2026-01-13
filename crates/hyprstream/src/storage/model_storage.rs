@@ -66,7 +66,7 @@ pub struct CacheStats {
 /// Model storage using a shared registry service.
 ///
 /// Registry operations (list, clone, register) go through the service client.
-/// Repository operations (worktrees, branches) use local git access via GitManager.
+/// Repository operations (worktrees, branches) use the service layer.
 pub struct ModelStorage {
     base_dir: PathBuf,
     client: Arc<dyn RegistryClient>,
@@ -79,6 +79,11 @@ impl ModelStorage {
     /// from a parent component that manages the shared registry.
     pub fn new(client: Arc<dyn RegistryClient>, base_dir: PathBuf) -> Self {
         Self { client, base_dir }
+    }
+
+    /// Get the registry client (for accessing repository operations)
+    pub fn registry(&self) -> &Arc<dyn RegistryClient> {
+        &self.client
     }
 
     /// Create ModelStorage with default configuration.
@@ -321,11 +326,6 @@ impl ModelStorage {
         }
 
         Ok(())
-    }
-
-    /// Get the registry client for advanced operations
-    pub fn registry(&self) -> &Arc<dyn RegistryClient> {
-        &self.client
     }
 
     /// Open repository for direct git operations
@@ -584,12 +584,15 @@ impl ModelStorage {
 
     /// Remove a worktree for a model
     pub async fn remove_worktree(&self, model_ref: &ModelRef, branch: &str) -> Result<()> {
-        let bare_repo_path = self.get_bare_repo_path(model_ref).await?;
+        // Get the worktree path for this branch
+        let worktree_path = self.get_worktree_path(model_ref, branch).await?;
 
-        // Use GitManager's high-level worktree removal with automatic cleanup
-        // This method is already optimized and handles storage driver cleanup properly
-        git2db::GitManager::global()
-            .remove_worktree(&bare_repo_path, branch, Some(&self.base_dir))
+        // Use RepositoryClient to remove worktree via service layer
+        // This routes through the service which handles storage driver cleanup properly
+        let repo_client = self.client.repo(&model_ref.model).await
+            .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
+
+        repo_client.remove_worktree(&worktree_path).await
             .map_err(|e| anyhow::anyhow!("Failed to remove worktree: {}", e))?;
 
         Ok(())

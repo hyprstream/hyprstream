@@ -1,0 +1,76 @@
+{
+  "tools": [
+    {
+      "path": "/demo/utils/hello:1.0",
+      "description": "Simple greeting tool",
+      "script": "return \"Hello, $name!\"",
+      "parameters": [
+        {
+          "name": "name",
+          "description": "Name to greet",
+          "required": true,
+          "type_name": "string"
+        }
+      ]
+    },
+    {
+      "path": "/demo/math/calculate:1.0",
+      "description": "Basic calculator",
+      "script": "expr {$a $op $b}",
+      "parameters": [
+        {
+          "name": "a",
+          "description": "First operand",
+          "required": true,
+          "type_name": "number"
+        },
+        {
+          "name": "op",
+          "description": "Operation (+, -, *, /)",
+          "required": true,
+          "type_name": "string"
+        },
+        {
+          "name": "b",
+          "description": "Second operand",
+          "required": true,
+          "type_name": "number"
+        }
+      ]
+    },
+    {
+      "path": "/demo/text/format:1.0",
+      "description": "Text formatter",
+      "script": "
+        set result $text
+        if {[info exists uppercase] && $uppercase} {
+            set result [string toupper $result]
+        }
+        if {[info exists trim] && $trim} {
+            set result [string trim $result]
+        }
+        return $result
+      ",
+      "parameters": [
+        {
+          "name": "text",
+          "description": "Text to format",
+          "required": true,
+          "type_name": "string"
+        },
+        {
+          "name": "uppercase",
+          "description": "Convert to uppercase",
+          "required": false,
+          "type_name": "boolean"
+        },
+        {
+          "name": "trim",
+          "description": "Trim whitespace",
+          "required": false,
+          "type_name": "boolean"
+        }
+      ]
+    }
+  ]
+}

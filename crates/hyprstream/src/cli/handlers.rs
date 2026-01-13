@@ -3,6 +3,7 @@
 use crate::archetypes::capabilities::Query;
 use crate::services::RegistryClient;
 use crate::storage::ModelStorage;
+use hyprstream_rpc::registry::{global as registry, SocketKind};
 use crate::training::{CheckpointManager, WeightFormat, WeightSnapshot};
 use ::config::{Config, File};
 use async_trait::async_trait;
@@ -183,6 +184,7 @@ pub async fn handle_server(
         max_models: server_config.max_cached_models,
         max_context: server_config.max_context,
         kv_quant: server_config.kv_quant.into(),
+        ..Default::default()
     };
 
     let _model_service_handle = ModelService::start(
@@ -194,7 +196,7 @@ pub async fn handle_server(
     )
     .await?;
 
-    info!("ModelService started at {}", crate::services::MODEL_ENDPOINT);
+    info!("ModelService started at {}", registry().endpoint("model", SocketKind::Rep).to_zmq_string());
 
     // Create ModelZmqClient for ServerState
     let model_client = ModelZmqClient::new(signing_key.clone(), RequestIdentity::local());

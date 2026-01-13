@@ -28,11 +28,12 @@ use anyhow::{anyhow, Result};
 use capnp::message::{Builder, ReaderOptions};
 use capnp::serialize;
 use hyprstream_rpc::prelude::*;
+use hyprstream_rpc::registry::{global as registry, SocketKind};
 use std::sync::Arc;
 use tracing::{debug, trace};
 
-/// ZMQ endpoint for the policy service
-pub const POLICY_ENDPOINT: &str = "inproc://hyprstream/policy";
+/// Service name for endpoint registry
+const SERVICE_NAME: &str = "policy";
 
 // ============================================================================
 // PolicyService (server-side)
@@ -52,12 +53,13 @@ impl PolicyService {
         Self { policy_manager }
     }
 
-    /// Start the policy service at the default endpoint
+    /// Start the policy service at the default endpoint (from registry)
     pub async fn start(
         policy_manager: Arc<PolicyManager>,
         server_pubkey: VerifyingKey,
     ) -> Result<crate::services::ServiceHandle> {
-        Self::start_at(policy_manager, server_pubkey, POLICY_ENDPOINT).await
+        let endpoint = registry().endpoint(SERVICE_NAME, SocketKind::Rep).to_zmq_string();
+        Self::start_at(policy_manager, server_pubkey, &endpoint).await
     }
 
     /// Start the policy service at a specific endpoint
@@ -68,7 +70,9 @@ impl PolicyService {
     ) -> Result<crate::services::ServiceHandle> {
         let service = Self::new(policy_manager);
         let runner = ServiceRunner::new(endpoint, server_pubkey);
-        runner.run(service).await
+        let handle = runner.run(service).await?;
+        tracing::info!("PolicyService started at {}", endpoint);
+        Ok(handle)
     }
 
     /// Parse operation from string
@@ -186,19 +190,20 @@ pub struct PolicyZmqClient {
 }
 
 impl PolicyZmqClient {
-    /// Create a new policy client
+    /// Create a new policy client (endpoint from registry)
     ///
     /// # Arguments
     /// * `signing_key` - Ed25519 signing key for request authentication
     /// * `identity` - Identity to include in requests (for authorization)
     pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
+        let endpoint = registry().endpoint(SERVICE_NAME, SocketKind::Rep).to_zmq_string();
         Self {
-            client: Arc::new(ZmqClient::new(POLICY_ENDPOINT, signing_key, identity)),
+            client: Arc::new(ZmqClient::new(&endpoint, signing_key, identity)),
         }
     }
 
     /// Create a new policy client at a specific endpoint
-    pub fn new_at(endpoint: &str, signing_key: SigningKey, identity: RequestIdentity) -> Self {
+    pub fn with_endpoint(endpoint: &str, signing_key: SigningKey, identity: RequestIdentity) -> Self {
         Self {
             client: Arc::new(ZmqClient::new(endpoint, signing_key, identity)),
         }
