@@ -135,6 +135,7 @@ fn default_startup_services() -> Vec<String> {
         "policy".to_string(),
         "worker".to_string(),
         "event".to_string(),
+        "model".to_string(),
     ]
 }
 

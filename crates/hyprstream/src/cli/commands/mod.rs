@@ -162,6 +162,9 @@ pub enum Commands {
     },
 
     /// Record changes to the repository
+    ///
+    /// **EXPERIMENTAL**: Requires `experimental` feature
+    #[cfg(feature = "experimental")]
     Commit {
         /// Model reference (e.g., "model:branch")
         model: String,
@@ -323,6 +326,9 @@ pub enum Commands {
     },
 
     /// Push changes to remote
+    ///
+    /// **EXPERIMENTAL**: Requires `experimental` feature
+    #[cfg(feature = "experimental")]
     Push {
         /// Model name
         model: String,
@@ -352,6 +358,9 @@ pub enum Commands {
     },
 
     /// Merge branches
+    ///
+    /// **EXPERIMENTAL**: Requires `experimental` feature
+    #[cfg(feature = "experimental")]
     Merge {
         /// Target model and branch (e.g., "model:branch")
         target: String,

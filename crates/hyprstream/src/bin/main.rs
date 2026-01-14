@@ -12,11 +12,11 @@ use hyprstream_core::auth::PolicyManager;
 use hyprstream_core::cli::commands::{Commands, ExecutionMode, TrainingAction};
 use hyprstream_core::cli::handlers::handle_server;
 use hyprstream_core::cli::{
-    handle_branch, handle_checkout, handle_clone, handle_commit, handle_infer, handle_info,
-    handle_list, handle_merge, handle_policy_apply, handle_policy_apply_template,
+    handle_branch, handle_checkout, handle_clone, handle_infer, handle_info,
+    handle_list, handle_policy_apply, handle_policy_apply_template,
     handle_policy_check, handle_policy_diff, handle_policy_edit, handle_policy_history,
     handle_policy_list_templates, handle_policy_rollback, handle_policy_show, handle_pull,
-    handle_push, handle_remote_add, handle_remote_list, handle_remote_remove, handle_remote_rename,
+    handle_remote_add, handle_remote_list, handle_remote_remove, handle_remote_rename,
     handle_remote_set_url, handle_remove, handle_status, handle_token_create,
     handle_training_batch, handle_training_checkpoint, handle_training_infer, handle_training_init,
     handle_worktree_add, handle_worktree_info, handle_worktree_list,
@@ -27,6 +27,9 @@ use hyprstream_core::cli::{
     handle_worker_run, handle_worker_start, handle_worker_stats, handle_worker_status,
     handle_worker_stop,
 };
+
+#[cfg(feature = "experimental")]
+use hyprstream_core::cli::{handle_commit, handle_merge, handle_push};
 use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
 
@@ -639,6 +642,7 @@ fn main() -> Result<()> {
             )?;
         }
 
+        #[cfg(feature = "experimental")]
         Commands::Commit {
             model,
             message,
@@ -943,6 +947,7 @@ fn main() -> Result<()> {
             )?;
         }
 
+        #[cfg(feature = "experimental")]
         Commands::Push {
             model,
             remote,
@@ -982,6 +987,7 @@ fn main() -> Result<()> {
             )?;
         }
 
+        #[cfg(feature = "experimental")]
         Commands::Merge {
             target,
             source,
@@ -1034,6 +1040,7 @@ fn main() -> Result<()> {
                 },
             )?;
         }
+
         Commands::Remove {
             model,
             force,
@@ -1622,8 +1629,66 @@ fn main() -> Result<()> {
                             info!("PolicyService stopped");
                         }
 
+                        "model" => {
+                            info!("Starting ModelService in standalone mode (IPC: {})", ipc);
+
+                            let models_dir = config.models_dir();
+
+                            // Load signing key
+                            let keys_dir = models_dir.join(".registry").join("keys");
+                            let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+                            let verifying_key = signing_key.verifying_key();
+
+                            // Create policy client
+                            let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
+
+                            // Create registry client
+                            let registry_client = Arc::new(RegistryZmqClient::new(
+                                signing_key.clone(),
+                                RequestIdentity::local(),
+                            )) as Arc<dyn RegistryClient>;
+
+                            // Create model storage
+                            let model_storage = Arc::new(hyprstream_core::storage::ModelStorage::new(
+                                registry_client,
+                                models_dir.clone(),
+                            ));
+
+                            // Use default config for standalone mode
+                            let model_config = hyprstream_core::services::ModelServiceConfig::default();
+
+                            let mut model_handle = hyprstream_core::services::ModelService::start(
+                                model_config,
+                                signing_key,
+                                verifying_key,
+                                policy_client,
+                                model_storage,
+                            )
+                            .await
+                            .context("Failed to start model service")?;
+
+                            // Publish ready event
+                            if let Ok(mut publisher) = hyprstream_workers::EventPublisher::new(&global_context(), "system") {
+                                let _ = publisher.publish_raw("system.model.ready", b"").await;
+                            }
+
+                            // Notify systemd
+                            let _ = hyprstream_rpc::notify::ready();
+
+                            info!("ModelService ready, waiting for shutdown signal");
+
+                            let _ = shutdown_rx.await;
+
+                            if let Ok(mut publisher) = hyprstream_workers::EventPublisher::new(&global_context(), "system") {
+                                let _ = publisher.publish_raw("system.model.stopping", b"").await;
+                            }
+
+                            model_handle.stop().await;
+                            info!("ModelService stopped");
+                        }
+
                         _ => {
-                            anyhow::bail!("Unknown service: {}. Valid services: event, worker, registry, policy", name);
+                            anyhow::bail!("Unknown service: {}. Valid services: event, worker, registry, policy, model", name);
                         }
                     }
 
