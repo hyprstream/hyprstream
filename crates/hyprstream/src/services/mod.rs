@@ -25,8 +25,11 @@
 //! # Usage
 //!
 //! ```rust,ignore
-//! use crate::services::{EnvelopeContext, ServiceRunner, ZmqService};
+//! use crate::services::{EnvelopeContext, ZmqService};
 //! use hyprstream_rpc::prelude::*;
+//! use hyprstream_rpc::service::{as_spawnable, InprocManager, ServiceManager};
+//! use hyprstream_rpc::transport::TransportConfig;
+//! use std::sync::Arc;
 //!
 //! // Define a service
 //! struct MyService;
@@ -43,13 +46,17 @@
 //!     }
 //! }
 //!
-//! // Run the service with server's verifying key (waits for socket bind)
-//! let runner = ServiceRunner::new("inproc://my-service", server_pubkey);
-//! let handle = runner.run(MyService).await?;
+//! // Run the service using unified pattern
+//! let service = MyService;
+//! let transport = TransportConfig::inproc("my-service");
+//! let context = Arc::new(zmq::Context::new());
+//! let spawnable = as_spawnable(service, transport, context, verifying_key);
+//! let manager = InprocManager::new();
+//! let handle = manager.spawn(Box::new(spawnable)).await?;
 //!
 //! // Connect a client (signing is automatic)
 //! let client = ZmqClient::new("inproc://my-service", signing_key, identity);
-//! let response = client.call(payload).await?;
+//! let response = client.call(payload, None).await?;
 //!
 //! // Stop the service
 //! handle.stop().await;
@@ -63,10 +70,11 @@ pub mod model;
 pub mod policy;
 pub mod registry;
 pub mod rpc_types;
+pub mod stream;
 pub mod worker;
 
 pub use core::{
-    EnvelopeContext, ServiceHandle, ServiceRunner, ZmqClient, ZmqService,
+    EnvelopeContext, ServiceRunner, ZmqClient, ZmqService,
 };
 
 pub use traits::{
@@ -82,5 +90,6 @@ pub use model::{
     LoadedModelInfo, ModelHealthInfo, ModelService, ModelServiceConfig, ModelStatusInfo,
     ModelZmqClient, MODEL_ENDPOINT,
 };
+pub use stream::StreamService;
 pub use worker::WorkerClient;
 pub use callback::{CallbackRouter, Instance};

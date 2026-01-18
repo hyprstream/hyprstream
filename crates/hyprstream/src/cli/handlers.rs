@@ -4,6 +4,7 @@ use crate::archetypes::capabilities::Query;
 use crate::services::RegistryClient;
 use crate::storage::ModelStorage;
 use hyprstream_rpc::registry::{global as registry, SocketKind};
+use hyprstream_rpc::service::ServiceManager;
 use crate::training::{CheckpointManager, WeightFormat, WeightSnapshot};
 use ::config::{Config, File};
 use async_trait::async_trait;
@@ -187,14 +188,23 @@ pub async fn handle_server(
         ..Default::default()
     };
 
-    let _model_service_handle = ModelService::start(
+    // Start ModelService using unified pattern
+    let model_service = ModelService::new(
         model_service_config,
         signing_key.clone(),
         verifying_key,
         policy_client.clone(),
         model_storage.clone(),
-    )
-    .await?;
+    );
+    let model_transport = hyprstream_rpc::transport::TransportConfig::inproc("hyprstream/model");
+    let model_spawnable = hyprstream_rpc::service::as_spawnable(
+        model_service,
+        model_transport,
+        crate::zmq::global_context().clone(),
+        verifying_key,
+    );
+    let manager = hyprstream_rpc::service::InprocManager::new();
+    let _model_service_handle = manager.spawn(Box::new(model_spawnable)).await?;
 
     info!("ModelService started at {}", registry().endpoint("model", SocketKind::Rep).to_zmq_string());
 

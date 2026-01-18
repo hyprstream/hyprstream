@@ -50,6 +50,7 @@ pub mod events_capnp {
     include!(concat!(env!("OUT_DIR"), "/events_capnp.rs"));
 }
 
+pub mod auth;
 pub mod capnp;
 pub mod crypto;
 pub mod envelope;
@@ -123,7 +124,7 @@ pub use envelope::{
     ResponseEnvelope, SignedEnvelope, MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
 };
 pub use error::{EnvelopeError, EnvelopeResult, Result, RpcError};
-pub use hyprstream_rpc_derive::{rpc_method, FromCapnp, ToCapnp};
+pub use hyprstream_rpc_derive::{authorize, register_scopes, rpc_method, FromCapnp, ToCapnp};
 pub use service::{EnvelopeContext, ServiceHandle, ServiceRunner, ZmqClient, ZmqService};
 pub use service::spawner::{
     HandlerService, ProcessBackend, ProcessConfig, ProcessKind, ProcessSpawner,

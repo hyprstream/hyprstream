@@ -17,6 +17,9 @@ use crate::registry::{ServiceRegistration, SocketKind};
 use crate::service::{ServiceRunner, ZmqService};
 use crate::transport::TransportConfig;
 
+// Import anyhow! macro for error creation in ServiceManager impl
+use anyhow::anyhow;
+
 // ============================================================================
 // Spawnable Trait
 // ============================================================================
@@ -44,6 +47,24 @@ pub trait Spawnable: Send + 'static {
     /// Called by spawner after thread/process setup.
     /// Should block until shutdown is signaled.
     fn run_blocking(self: Box<Self>, shutdown: Arc<Notify>) -> Result<()>;
+
+    /// Run the service with ready signaling (blocking).
+    ///
+    /// Called by InprocManager to ensure service is ready before returning.
+    /// The ready_tx should be sent after the socket binds but before request loop starts.
+    fn run_blocking_with_ready(
+        self: Box<Self>,
+        shutdown: Arc<Notify>,
+        ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<()> {
+        // Default implementation just calls run_blocking (for backward compatibility)
+        // Services that need ready signaling should override this
+        if ready_tx.is_some() {
+            // Drop the sender without using it (for services that don't support ready signaling)
+            drop(ready_tx);
+        }
+        self.run_blocking(shutdown)
+    }
 }
 
 // ============================================================================
@@ -135,6 +156,71 @@ impl<S: ZmqService> Spawnable for HandlerService<S> {
             }
         })
     }
+
+    fn run_blocking_with_ready(
+        self: Box<Self>,
+        shutdown: Arc<Notify>,
+        ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<()> {
+        // Create a single-threaded runtime for blocking execution
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("runtime: {}", e)))?;
+
+        rt.block_on(async move {
+            // Pass TransportConfig directly for SystemdFd support
+            let runner = ServiceRunner::with_nonce_cache(
+                self.transport.clone(),
+                self.context.clone(),
+                self.verifying_key.clone(),
+                self.nonce_cache.clone(),
+            );
+
+            match runner.run(self.service).await {
+                Ok(mut handle) => {
+                    // Socket is now bound - signal ready
+                    if let Some(tx) = ready_tx {
+                        let _ = tx.send(());
+                    }
+
+                    // Notify systemd that service is ready (for Type=notify services)
+                    let _ = crate::notify::ready();
+
+                    // Wait for shutdown signal
+                    shutdown.notified().await;
+                    handle.stop().await;
+                    Ok(())
+                }
+                Err(e) => Err(crate::error::RpcError::SpawnFailed(e.to_string())),
+            }
+        })
+    }
+}
+
+/// Convert a ZmqService into a Spawnable for use with ServiceManager
+///
+/// This is a convenience function that hides the HandlerService wrapper.
+/// Use this when you need to spawn a ZmqService using ServiceManager::spawn().
+///
+/// # Example
+/// ```ignore
+/// let service = PolicyService::new(...);
+/// let spawnable = as_spawnable(
+///     service,
+///     TransportConfig::inproc("hyprstream/policy"),
+///     context,
+///     verifying_key,
+/// );
+/// manager.spawn(Box::new(spawnable)).await?;
+/// ```
+pub fn as_spawnable<S: ZmqService>(
+    service: S,
+    transport: TransportConfig,
+    context: Arc<zmq::Context>,
+    verifying_key: VerifyingKey,
+) -> impl Spawnable {
+    HandlerService::new(service, transport, context, verifying_key)
 }
 
 // ============================================================================
@@ -196,6 +282,14 @@ impl Spawnable for ProxyService {
     }
 
     fn run_blocking(self: Box<Self>, shutdown: Arc<Notify>) -> Result<()> {
+        self.run_blocking_with_ready(shutdown, None)
+    }
+
+    fn run_blocking_with_ready(
+        self: Box<Self>,
+        shutdown: Arc<Notify>,
+        ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<()> {
         // Create XSUB socket (receives from publishers)
         let mut xsub = self.context.socket(zmq::XSUB)
             .map_err(|e| crate::error::RpcError::SpawnFailed(format!("XSUB socket: {}", e)))?;
@@ -230,6 +324,11 @@ impl Spawnable for ProxyService {
             sub_endpoint
         );
 
+        // Send ready signal after sockets are bound
+        if let Some(tx) = ready_tx {
+            let _ = tx.send(());
+        }
+
         // Spawn shutdown listener
         let ctrl_sender = self.context.socket(zmq::PAIR)
             .map_err(|e| crate::error::RpcError::SpawnFailed(format!("CTRL sender: {}", e)))?;
@@ -250,7 +349,8 @@ impl Spawnable for ProxyService {
             let _ = ctrl_sender.send("TERMINATE", 0);
         });
 
-        // Run steerable proxy (blocks until TERMINATE received)
+        // TEST: Use original proxy_steerable to verify directory fix was the real solution
+        tracing::debug!("Proxy {} calling proxy_steerable", self.name);
         zmq::proxy_steerable(&mut xsub, &mut xpub, &mut ctrl)
             .map_err(|e| crate::error::RpcError::SpawnFailed(format!("proxy: {}", e)))?;
 
@@ -552,6 +652,45 @@ pub struct SpawnedService {
 }
 
 impl SpawnedService {
+    /// Create a dummy handle for services that manage their own lifecycle
+    /// (e.g., systemd-managed services)
+    pub fn dummy() -> Self {
+        Self {
+            id: "dummy".to_string(),
+            kind: ServiceKind::TokioTask { handle: None },
+            _registration: None,
+        }
+    }
+
+    /// Create a subprocess handle
+    pub fn subprocess(id: String, process: SpawnedProcess, pid_file: PathBuf) -> Self {
+        Self {
+            id,
+            kind: ServiceKind::Subprocess {
+                process,
+                pid_file,
+            },
+            _registration: None,
+        }
+    }
+
+    /// Create a thread handle
+    pub fn thread(
+        id: String,
+        handle: Option<JoinHandle<()>>,
+        shutdown: Arc<Notify>,
+        registration: Option<ServiceRegistration>,
+    ) -> Self {
+        Self {
+            id,
+            kind: ServiceKind::Thread {
+                handle,
+                shutdown,
+            },
+            _registration: registration,
+        }
+    }
+
     /// Get the service ID.
     pub fn id(&self) -> &str {
         &self.id
@@ -624,6 +763,119 @@ impl SpawnedService {
 
         tracing::info!("Service {} stopped", self.id);
         Ok(())
+    }
+}
+
+// ============================================================================
+// InprocManager - ServiceManager for in-process spawning
+// ============================================================================
+
+use crate::service::manager::ServiceManager;
+use async_trait::async_trait;
+
+/// In-process service manager
+///
+/// Spawns services in the current process using ServiceSpawner.
+pub struct InprocManager {
+    spawner: ServiceSpawner,
+}
+
+impl InprocManager {
+    /// Create a new InprocManager with threaded spawner
+    pub fn new() -> Self {
+        Self {
+            spawner: ServiceSpawner::threaded(),
+        }
+    }
+
+    /// Create with a custom spawner mode
+    pub fn with_spawner(spawner: ServiceSpawner) -> Self {
+        Self { spawner }
+    }
+}
+
+impl Default for InprocManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl ServiceManager for InprocManager {
+    async fn install(&self, _service: &str) -> anyhow::Result<()> {
+        // No-op for inproc
+        Ok(())
+    }
+
+    async fn uninstall(&self, _service: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn start(&self, _service: &str) -> anyhow::Result<()> {
+        // Services spawned via spawn(), not start()
+        Ok(())
+    }
+
+    async fn stop(&self, _service: &str) -> anyhow::Result<()> {
+        // Services managed via SpawnedService handles
+        Ok(())
+    }
+
+    async fn is_active(&self, _service: &str) -> anyhow::Result<bool> {
+        // Always true for inproc (services managed by handles)
+        Ok(true)
+    }
+
+    async fn reload(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn spawn(&self, service: Box<dyn Spawnable>) -> anyhow::Result<SpawnedService> {
+        // Can't call spawn(*service) because trait objects aren't Sized
+        // Need to spawn inline instead
+        let name = service.name().to_string();
+        let registrations = service.registrations();
+
+        // Register with EndpointRegistry
+        let _registration = if !registrations.is_empty() {
+            ServiceRegistration::multi(&name, registrations, None).ok()
+        } else {
+            None
+        };
+
+        // Spawn on dedicated thread
+        // The ready signal is sent by the service after the socket binds
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_clone = shutdown.clone();
+        let name_clone = name.clone(); // Clone for closure use
+
+        let thread_handle = thread::Builder::new()
+            .name(format!("{}-service", &name))
+            .spawn(move || {
+                if let Err(e) = service.run_blocking_with_ready(shutdown_clone, Some(ready_tx)) {
+                    tracing::error!("Service {} failed: {}", name_clone, e);
+                }
+            })
+            .map_err(|e| anyhow!("thread spawn: {}", e))?;
+
+        // Wait for service to be ready (socket bound)
+        match ready_rx.await {
+            Ok(()) => {
+                // Notify systemd that service is ready (for Type=notify services)
+                let _ = crate::notify::ready();
+            }
+            Err(_) => {
+                return Err(anyhow!("service thread exited before ready"));
+            }
+        }
+
+        Ok(SpawnedService::thread(
+            format!("{}-thread", name),
+            Some(thread_handle),
+            shutdown,
+            _registration,
+        ))
     }
 }
 

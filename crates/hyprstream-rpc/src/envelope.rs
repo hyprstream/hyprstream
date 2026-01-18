@@ -40,6 +40,7 @@
 //!
 //! The nested structure makes clear exactly what is being signed.
 
+use crate::auth::Claims;
 use crate::capnp::{FromCapnp, ToCapnp};
 use crate::common_capnp;
 use crate::crypto::{SigningKey, VerifyingKey};
@@ -278,6 +279,11 @@ pub struct RequestEnvelope {
 
     /// Unix timestamp in milliseconds for expiration check
     pub timestamp: i64,
+
+    /// User authorization claims (protected by envelope signature)
+    /// Contains the user's identity, scopes, and expiration.
+    /// No separate JWT signature needed - the envelope signature covers this.
+    pub claims: Option<Claims>,
 }
 
 impl RequestEnvelope {
@@ -299,12 +305,19 @@ impl RequestEnvelope {
             ephemeral_pubkey: None,
             nonce,
             timestamp,
+            claims: None,
         }
     }
 
     /// Set ephemeral public key for streaming requests (DH key exchange).
     pub fn with_ephemeral_pubkey(mut self, pubkey: [u8; 32]) -> Self {
         self.ephemeral_pubkey = Some(pubkey);
+        self
+    }
+
+    /// Set user authorization claims.
+    pub fn with_claims(mut self, claims: Claims) -> Self {
+        self.claims = Some(claims);
         self
     }
 
@@ -338,24 +351,68 @@ impl RequestEnvelope {
         self.identity.casbin_subject()
     }
 
-    /// Serialize this envelope to canonical Cap'n Proto bytes.
+    /// Serialize this envelope to canonical Cap'n Proto bytes for signing.
+    ///
+    /// SECURITY: This method MUST produce deterministic output for cryptographic
+    /// signatures to work correctly. We use Cap'n Proto's canonical form as
+    /// specified in the encoding spec:
+    /// https://capnproto.org/encoding.html#canonicalization
+    ///
+    /// Canonical form guarantees:
+    /// - Same logical data → identical bytes (always)
+    /// - Preorder encoding (deterministic pointer ordering)
+    /// - Single segment (no segment boundary ambiguity)
+    /// - Truncated trailing zeros (no padding differences)
+    /// - No packing (binary format is deterministic)
+    /// - No segment table framing (redundant for signing)
     ///
     /// These bytes are what gets signed in a SignedEnvelope.
     pub fn to_bytes(&self) -> Vec<u8> {
         use capnp::message::Builder;
         use capnp::serialize;
+        use capnp::Word;
 
+        // Step 1: Build the message
         let mut message = Builder::new_default();
         {
             let mut builder = message.init_root::<common_capnp::request_envelope::Builder>();
             self.write_to(&mut builder);
         }
 
-        let mut bytes = Vec::new();
-        if let Err(e) = serialize::write_message(&mut bytes, &message) {
-            tracing::error!("RequestEnvelope serialization failed: {}", e);
+        // Step 2: Serialize to bytes first (to create a reader)
+        let mut temp_bytes = Vec::new();
+        if let Err(e) = serialize::write_message(&mut temp_bytes, &message) {
+            tracing::error!("RequestEnvelope temporary serialization failed: {}", e);
+            return Vec::new();
         }
-        bytes
+
+        // Step 3: Read back to get a Reader
+        let reader = match serialize::read_message(
+            &mut std::io::Cursor::new(&temp_bytes),
+            capnp::message::ReaderOptions::default(),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("RequestEnvelope reader creation failed: {}", e);
+                return Vec::new();
+            }
+        };
+
+        // Step 4: CRITICAL - Canonicalize before signing
+        // This ensures deterministic serialization as required by Cap'n Proto spec.
+        // Non-canonical serialization can produce different bytes for identical data,
+        // breaking signature verification across platforms/versions.
+        let canonical_words = match reader.canonicalize() {
+            Ok(words) => words,
+            Err(e) => {
+                tracing::error!("Envelope canonicalization failed: {}", e);
+                // Fall back to temp_bytes if canonicalization fails
+                return temp_bytes;
+            }
+        };
+
+        // Step 5: Convert Words to bytes (raw segment data, NO stream framing)
+        Word::words_to_bytes(&canonical_words).to_vec()
     }
 }
 
@@ -662,6 +719,9 @@ impl ToCapnp for RequestEnvelope {
         }
         builder.set_nonce(&self.nonce);
         builder.set_timestamp(self.timestamp);
+        if let Some(ref claims) = self.claims {
+            claims.write_to(&mut builder.reborrow().init_claims());
+        }
     }
 }
 
@@ -698,6 +758,14 @@ impl FromCapnp for RequestEnvelope {
             arr
         };
 
+        let claims = {
+            if reader.has_claims() {
+                Some(Claims::read_from(reader.get_claims()?)?)
+            } else {
+                None
+            }
+        };
+
         Ok(Self {
             request_id: reader.get_request_id(),
             identity: RequestIdentity::read_from(reader.get_identity()?)?,
@@ -705,6 +773,7 @@ impl FromCapnp for RequestEnvelope {
             ephemeral_pubkey,
             nonce,
             timestamp: reader.get_timestamp(),
+            claims,
         })
     }
 }

@@ -117,11 +117,12 @@ struct StreamInfo {
 struct StreamChunk {
   streamId @0 :Text;
   sequenceNum @1 :UInt32;
+  hmac @2 :Data;  # HMAC-SHA256 for authentication (empty when disabled, 32 bytes when enabled)
 
   union {
-    text @2 :Text;
-    complete @3 :StreamStats;
-    error @4 :ErrorInfo;
+    text @3 :Text;
+    complete @4 :StreamStats;
+    error @5 :ErrorInfo;
   }
 }
 

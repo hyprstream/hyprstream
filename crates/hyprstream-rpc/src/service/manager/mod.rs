@@ -6,6 +6,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
+use crate::service::spawner::{Spawnable, SpawnedService};
+
 pub mod units;
 
 #[cfg(feature = "systemd")]
@@ -54,6 +56,12 @@ pub trait ServiceManager: Send + Sync {
         }
         Ok(())
     }
+
+    /// Spawn a service (unified API for inproc and systemd)
+    ///
+    /// For inproc mode, spawns in current process.
+    /// For systemd mode, ensures systemd unit is running.
+    async fn spawn(&self, service: Box<dyn Spawnable>) -> Result<SpawnedService>;
 }
 
 /// Detect best available service manager

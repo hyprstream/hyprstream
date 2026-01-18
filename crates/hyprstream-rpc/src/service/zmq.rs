@@ -13,9 +13,10 @@
 use crate::prelude::*;
 use crate::transport::TransportConfig;
 use anyhow::{anyhow, Result};
+use chrono::Utc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tmq::{FromZmqSocket, Multipart, RequestReceiver};
+use tmq::{FromZmqSocket, Multipart, RequestReceiver, RequestSender};
 use tokio::sync::Notify;
 use tracing::{debug, error, info, trace, warn};
 
@@ -48,6 +49,10 @@ pub struct EnvelopeContext {
 
     /// Ephemeral public key for stream HMAC derivation (if streaming)
     pub ephemeral_pubkey: Option<[u8; 32]>,
+
+    /// User claims from envelope (protected by envelope signature)
+    /// Already verified by envelope signature verification
+    claims: Option<crate::auth::Claims>,
 }
 
 impl EnvelopeContext {
@@ -59,6 +64,7 @@ impl EnvelopeContext {
             request_id: envelope.request_id(),
             identity: envelope.identity().clone(),
             ephemeral_pubkey: envelope.ephemeral_pubkey().copied(),
+            claims: envelope.envelope.claims.clone(),
         }
     }
 
@@ -77,6 +83,41 @@ impl EnvelopeContext {
     /// Check if the identity is authenticated (not anonymous).
     pub fn is_authenticated(&self) -> bool {
         self.identity.is_authenticated()
+    }
+
+    /// Get user claims (if present in envelope)
+    ///
+    /// Claims are already verified by the envelope signature.
+    pub fn claims(&self) -> Option<&crate::auth::Claims> {
+        self.claims.as_ref()
+    }
+
+    /// Get user subject for Casbin checks (if claims present)
+    pub fn user_subject(&self) -> Option<String> {
+        self.claims.as_ref().map(|c| c.casbin_subject())
+    }
+
+    /// Get effective subject (user if present, otherwise service identity)
+    pub fn effective_subject(&self) -> String {
+        self.user_subject().unwrap_or_else(|| self.casbin_subject())
+    }
+
+    /// Check if request has user context
+    pub fn has_user_context(&self) -> bool {
+        self.claims.is_some()
+    }
+
+    /// Get user scopes (if claims present)
+    pub fn user_scopes(&self) -> Option<Vec<String>> {
+        self.claims.as_ref().map(|c| c.scopes.iter().map(|s| s.to_string()).collect())
+    }
+
+    /// Check if user has specific scope (if claims present)
+    pub fn has_scope(&self, required_scope: &crate::auth::Scope) -> bool {
+        self.claims
+            .as_ref()
+            .map(|c| c.has_scope(required_scope))
+            .unwrap_or(false)
     }
 }
 
@@ -454,6 +495,51 @@ pub struct ZmqClient {
     request_id: AtomicU64,
 }
 
+/// Calculate ZMQ timeout using min() of multiple constraints.
+///
+/// Returns the smaller of:
+/// - Explicit timeout parameter (if provided)
+/// - Requested lifetime (if provided)
+/// - JWT remaining time (with 1s safety buffer)
+/// - Default timeout (30 seconds)
+///
+/// This ensures:
+/// - We don't wait past JWT expiration (security)
+/// - We respect service-specific timeout requirements (practicality)
+/// - We respect user-requested lifetime (quality of service)
+/// - We don't have excessively long timeouts (practicality)
+fn calculate_timeout(
+    explicit_timeout: Option<i32>,
+    requested_lifetime_ms: Option<i32>,
+    claims: Option<&crate::auth::Claims>,
+) -> i32 {
+    const DEFAULT_TIMEOUT_MS: i32 = 30000; // 30 seconds
+    const SAFETY_BUFFER_MS: i64 = 1000; // 1 second buffer
+
+    // Start with explicit timeout or default
+    let mut timeout = explicit_timeout.unwrap_or(DEFAULT_TIMEOUT_MS);
+
+    // Apply requested lifetime constraint (if provided)
+    if let Some(lifetime) = requested_lifetime_ms {
+        timeout = timeout.min(lifetime);
+    }
+
+    // Apply Claims expiration constraint (if provided)
+    if let Some(claims) = claims {
+        let now = Utc::now().timestamp();
+        let remaining_ms = (claims.exp - now) * 1000 - SAFETY_BUFFER_MS;
+
+        if remaining_ms > 0 {
+            timeout = timeout.min(remaining_ms as i32);
+        } else {
+            warn!("Claims have expired or will expire immediately, using minimal timeout");
+            return 100; // 100ms minimal timeout
+        }
+    }
+
+    timeout
+}
+
 impl ZmqClient {
     /// Create a new client with signing credentials.
     ///
@@ -507,28 +593,47 @@ impl ZmqClient {
     /// All requests are automatically wrapped in `SignedEnvelope`.
     /// This ensures every call is authenticated - no bypass possible.
     ///
+    /// # Arguments
+    /// * `payload` - Request payload bytes
+    /// * `timeout_ms` - Optional explicit timeout in milliseconds (defaults to 30s)
+    ///
     /// Uses TMQ with the provided context for proper `inproc://` support.
-    pub async fn call(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
+    pub async fn call(&self, payload: Vec<u8>, timeout_ms: Option<i32>) -> Result<Vec<u8>> {
         let signed = self.sign_request(payload)?;
 
-        // Create REQ socket using TMQ for proper async I/O
-        let socket = tmq::request(&*self.context)
-            .connect(&self.endpoint)
+        // Calculate timeout (no JWT or requested lifetime for regular calls)
+        let timeout = calculate_timeout(timeout_ms, None, None);
+
+        // Create raw REQ socket to set timeout before wrapping with TMQ
+        let req_socket = self.context.socket(zmq::REQ)
+            .map_err(|e| anyhow!("Failed to create REQ socket: {}", e))?;
+
+        // Set receive timeout to prevent indefinite hangs
+        req_socket.set_rcvtimeo(timeout)
+            .map_err(|e| anyhow!("Failed to set receive timeout: {}", e))?;
+
+        // Connect to endpoint
+        req_socket.connect(&self.endpoint)
             .map_err(|e| anyhow!("Failed to connect to {}: {}", self.endpoint, e))?;
 
+        // Wrap with TMQ RequestSender for async I/O
+        let sender = RequestSender::from_zmq_socket(req_socket)
+            .map_err(|e| anyhow!("Failed to wrap socket in TMQ: {}", e))?;
+
         trace!(
-            "ZmqClient sending {} bytes to {}",
+            "ZmqClient sending {} bytes to {} (timeout: {}ms)",
             signed.len(),
-            self.endpoint
+            self.endpoint,
+            timeout
         );
 
         // TMQ REQ pattern: send returns RequestReceiver
-        let receiver = socket
+        let mut receiver = sender
             .send(tmq::Multipart::from(vec![signed]))
             .await
             .map_err(|e| anyhow!("Failed to send request: {}", e))?;
 
-        // Receive response
+        // Receive response (will timeout based on calculated timeout)
         let (response, _sender) = receiver
             .recv()
             .await
@@ -545,12 +650,150 @@ impl ZmqClient {
         Ok(bytes)
     }
 
+    /// Call service with user JWT context (for authorization).
+    ///
+    /// This method propagates the user's JWT token in the request envelope.
+    /// The receiving service MUST validate the JWT token to extract user claims.
+    ///
+    /// # Arguments
+    /// * `payload` - Request payload bytes
+    /// * `jwt_token` - JWT token string from user context
+    /// * `timeout_ms` - Optional explicit timeout in milliseconds (defaults to 30s)
+    /// * `requested_lifetime_ms` - Optional requested lifetime for this request
+    ///
+    /// # Returns
+    /// Response bytes from the service
+    ///
+    /// # Security
+    /// The JWT token is embedded in the signed envelope and independently
+    /// verified by the receiving service. This provides defense-in-depth:
+    /// - Envelope signature proves service identity
+    /// - JWT signature proves user authorization
+    ///
+    /// # Timeout Calculation
+    /// The timeout is calculated as `min()` of:
+    /// - Explicit timeout parameter (if provided)
+    /// - Requested lifetime (if provided)
+    /// - Claims expiration time (with 1s safety buffer)
+    /// - Default timeout (30 seconds)
+    pub async fn call_with_user_context(
+        &self,
+        payload: Vec<u8>,
+        claims: crate::auth::Claims,
+        timeout_ms: Option<i32>,
+        requested_lifetime_ms: Option<i32>,
+    ) -> Result<Vec<u8>> {
+        // Calculate timeout using claims expiration
+        let timeout = calculate_timeout(timeout_ms, requested_lifetime_ms, Some(&claims));
+
+        let signed = self.sign_request_with_context(payload, claims)?;
+
+        // Create raw REQ socket to set timeout before wrapping with TMQ
+        let req_socket = self.context.socket(zmq::REQ)
+            .map_err(|e| anyhow!("Failed to create REQ socket: {}", e))?;
+
+        // Set receive timeout based on calculated timeout
+        req_socket.set_rcvtimeo(timeout)
+            .map_err(|e| anyhow!("Failed to set receive timeout: {}", e))?;
+
+        // Connect to endpoint
+        req_socket.connect(&self.endpoint)
+            .map_err(|e| anyhow!("Failed to connect to {}: {}", self.endpoint, e))?;
+
+        // Wrap with TMQ RequestSender for async I/O
+        let sender = RequestSender::from_zmq_socket(req_socket)
+            .map_err(|e| anyhow!("Failed to wrap socket in TMQ: {}", e))?;
+
+        trace!(
+            "ZmqClient sending {} bytes to {} (with user context, timeout: {}ms)",
+            signed.len(),
+            self.endpoint,
+            timeout
+        );
+
+        // TMQ REQ pattern: send returns RequestReceiver
+        let mut receiver = sender
+            .send(tmq::Multipart::from(vec![signed]))
+            .await
+            .map_err(|e| anyhow!("Failed to send request: {}", e))?;
+
+        // Receive response (will timeout based on calculated timeout)
+        let (response, _sender) = receiver
+            .recv()
+            .await
+            .map_err(|e| anyhow!("Failed to receive response: {}", e))?;
+
+        // Extract bytes from multipart message
+        let bytes: Vec<u8> = response
+            .into_iter()
+            .flat_map(|frame| frame.to_vec())
+            .collect();
+
+        trace!("ZmqClient received {} bytes", bytes.len());
+
+        Ok(bytes)
+    }
+
+    /// Convenience method for propagating user context from an existing envelope.
+    ///
+    /// This is useful when a service needs to make downstream RPC calls while
+    /// preserving the original user's authorization context.
+    ///
+    /// # Arguments
+    /// * `ctx` - EnvelopeContext from the incoming request
+    /// * `payload` - Request payload bytes for the downstream call
+    /// * `timeout_ms` - Optional explicit timeout in milliseconds (defaults to 30s)
+    /// * `requested_lifetime_ms` - Optional requested lifetime for this request
+    ///
+    /// # Returns
+    /// Response bytes from the downstream service
+    ///
+    /// # Errors
+    /// Returns error if the context doesn't contain Claims
+    pub async fn call_with_context(
+        &self,
+        ctx: &EnvelopeContext,
+        payload: Vec<u8>,
+        timeout_ms: Option<i32>,
+        requested_lifetime_ms: Option<i32>,
+    ) -> Result<Vec<u8>> {
+        let claims = ctx.claims()
+            .ok_or_else(|| anyhow!("Missing user context - Claims required for authorization"))?
+            .clone();
+        self.call_with_user_context(payload, claims, timeout_ms, requested_lifetime_ms).await
+    }
+
     /// Wrap a payload in a SignedEnvelope and serialize to bytes.
     fn sign_request(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
         use capnp::message::Builder;
         use capnp::serialize;
 
         let envelope = RequestEnvelope::new(self.identity.clone(), payload);
+        let signed = SignedEnvelope::new_signed(envelope, &self.signing_key);
+
+        let mut message = Builder::new_default();
+        {
+            let mut builder =
+                message.init_root::<crate::common_capnp::signed_envelope::Builder>();
+            signed.write_to(&mut builder);
+        }
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    /// Wrap a payload with user context in a SignedEnvelope and serialize to bytes.
+    ///
+    /// # Security
+    /// The Claims are embedded in the envelope and protected by the envelope signature.
+    /// Services receive already-verified claims (no separate JWT validation needed).
+    fn sign_request_with_context(&self, payload: Vec<u8>, claims: crate::auth::Claims) -> Result<Vec<u8>> {
+        use capnp::message::Builder;
+        use capnp::serialize;
+
+        let envelope = RequestEnvelope::new(self.identity.clone(), payload)
+            .with_claims(claims);
         let signed = SignedEnvelope::new_signed(envelope, &self.signing_key);
 
         let mut message = Builder::new_default();

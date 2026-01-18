@@ -162,66 +162,6 @@ impl WorkerService {
     /// // Later, to stop the service:
     /// handle.stop().await;
     /// ```
-    pub async fn start(
-        pool_config: PoolConfig,
-        image_config: ImageConfig,
-        context: Arc<zmq::Context>,
-        verifying_key: VerifyingKey,
-    ) -> AnyhowResult<ServiceHandle> {
-        let endpoint = registry().endpoint(SERVICE_NAME, SocketKind::Rep).to_zmq_string();
-        Self::start_at(pool_config, image_config, context, verifying_key, &endpoint).await
-    }
-
-    /// Start the WorkerService as a ZMQ service on a specific endpoint
-    ///
-    /// Use this for IPC sockets in distributed mode.
-    ///
-    /// # Arguments
-    ///
-    /// * `pool_config` - Configuration for the sandbox pool
-    /// * `image_config` - Configuration for image management
-    /// * `context` - ZMQ context for socket creation
-    /// * `verifying_key` - Server's public key for signature verification
-    /// * `endpoint` - Endpoint to bind to (e.g., "ipc:///run/user/1000/hyprstream/worker.sock")
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let endpoint = format!("ipc://{}", paths::worker_socket().display());
-    /// let handle = WorkerService::start_at(
-    ///     pool_config,
-    ///     image_config,
-    ///     global_context(),
-    ///     verifying_key,
-    ///     &endpoint,
-    /// ).await?;
-    /// ```
-    pub async fn start_at(
-        pool_config: PoolConfig,
-        image_config: ImageConfig,
-        context: Arc<zmq::Context>,
-        verifying_key: VerifyingKey,
-        endpoint: &str,
-    ) -> AnyhowResult<ServiceHandle> {
-        // Create RAFS store for image management
-        let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
-
-        // Create the WorkerService (with event publisher using same context)
-        let service = Self::new(pool_config, image_config, rafs_store, context.clone())?;
-
-        // Initialize the service (start warm pool)
-        service
-            .initialize()
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to initialize WorkerService: {}", e))?;
-
-        tracing::info!("WorkerService initialized, binding to {}", endpoint);
-
-        // Start the ZMQ service using ServiceRunner
-        let transport = TransportConfig::from_endpoint(endpoint);
-        let runner = ServiceRunner::new(transport, context, verifying_key);
-        runner.run(service).await
-    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Runtime Information

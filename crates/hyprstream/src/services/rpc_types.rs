@@ -584,6 +584,7 @@ impl InferenceResponse {
         let mut chunk = msg.init_root::<inference_capnp::stream_chunk::Builder>();
         chunk.set_stream_id(stream_id);
         chunk.set_sequence_num(seq_num);
+        chunk.set_hmac(&[]);  // Empty HMAC when feature is disabled
         chunk.set_text(text);
 
         let mut bytes = Vec::new();
@@ -597,6 +598,7 @@ impl InferenceResponse {
         let mut chunk = msg.init_root::<inference_capnp::stream_chunk::Builder>();
         chunk.set_stream_id(stream_id);
         chunk.set_sequence_num(seq_num);
+        chunk.set_hmac(&[]);  // Empty HMAC when feature is disabled
 
         let mut error_info = chunk.init_error();
         error_info.set_message(error);
@@ -614,6 +616,7 @@ impl InferenceResponse {
         let mut chunk = msg.init_root::<inference_capnp::stream_chunk::Builder>();
         chunk.set_stream_id(stream_id);
         chunk.set_sequence_num(seq_num);
+        chunk.set_hmac(&[]);  // Empty HMAC when feature is disabled
 
         let mut complete = chunk.init_complete();
         complete.set_tokens_generated(stats.tokens_generated as u32);
@@ -637,5 +640,94 @@ impl InferenceResponse {
             FinishReason::Error(_) => inference_capnp::FinishReason::Error,
             FinishReason::Stop => inference_capnp::FinishReason::Stop,
         }
+    }
+}
+
+// ============================================================================
+// Policy Service Types
+// ============================================================================
+
+use crate::policy_capnp;
+
+/// Token information response.
+#[derive(Debug, Clone, FromCapnp)]
+#[capnp(policy_capnp::token_info)]
+pub struct TokenInfo {
+    pub token: String,
+    pub expires_at: i64,
+}
+
+// ============================================================================
+// Policy Service Response Helper
+// ============================================================================
+
+/// Helper for building policy service responses.
+///
+/// Eliminates boilerplate by providing typed response builders.
+///
+/// # Example
+///
+/// ```ignore
+/// // Before (manual - 12 lines):
+/// let mut msg = Builder::new_default();
+/// let mut response = msg.init_root::<policy_response::Builder>();
+/// response.set_request_id(id);
+/// let mut token_info = response.init_success();
+/// token_info.set_token(&token);
+/// // ... 7 more lines
+///
+/// // After (1 line):
+/// PolicyResponse::token_success(id, &token, expires_at)
+/// ```
+pub struct PolicyResponse;
+
+impl PolicyResponse {
+    /// Build an error response.
+    pub fn error(request_id: u64, message: &str, code: &str) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<policy_capnp::issue_token_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut error_info = response.init_error();
+        error_info.set_message(message);
+        error_info.set_code(code);
+        error_info.set_details("");
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build an unauthorized error response.
+    pub fn unauthorized(request_id: u64, scope: &str) -> Vec<u8> {
+        Self::error(
+            request_id,
+            &format!("Access denied for scope: {}", scope),
+            "UNAUTHORIZED"
+        )
+    }
+
+    /// Build a TTL exceeded error response.
+    pub fn ttl_exceeded(request_id: u64, requested: u32, max: u32) -> Vec<u8> {
+        Self::error(
+            request_id,
+            &format!("TTL exceeds maximum: {} > {}", requested, max),
+            "TTL_EXCEEDED"
+        )
+    }
+
+    /// Build a token success response.
+    pub fn token_success(request_id: u64, token: &str, expires_at: i64) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<policy_capnp::issue_token_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut token_info = response.init_success();
+        token_info.set_token(token);
+        token_info.set_expires_at(expires_at);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
     }
 }

@@ -164,6 +164,7 @@ download-libtorch = ["tch/download-libtorch"]
 overlayfs = ["git2db/overlayfs"]  # Enable overlayfs-backed worktrees (delegated to git2db)
 systemd = ["hyprstream-rpc/systemd", "hyprstream-workers/systemd", "dep:listenfd"]  # Systemd integration (socket activation, service units)
 experimental = []  # EXPERIMENTAL: Enable git write operations (commit/push/merge - need service layer implementation)
+stream-hmac = []  # Enable HMAC signing for stream chunks (NOT YET IMPLEMENTED - feature flag only)
 
 [build-dependencies]
 cc.workspace = true

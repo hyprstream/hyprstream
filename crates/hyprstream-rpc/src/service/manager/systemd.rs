@@ -3,6 +3,7 @@
 //! Uses D-Bus to control systemd units via zbus_systemd.
 
 use super::{units, ServiceManager};
+use crate::service::spawner::{Spawnable, SpawnedService};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -133,5 +134,11 @@ impl ServiceManager for SystemdManager {
         }
 
         self.reload().await
+    }
+
+    async fn spawn(&self, service: Box<dyn Spawnable>) -> Result<SpawnedService> {
+        // Call existing ensure() to install and start systemd unit
+        self.ensure(service.name()).await?;
+        Ok(SpawnedService::dummy())
     }
 }

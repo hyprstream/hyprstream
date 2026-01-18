@@ -19,7 +19,7 @@ use git2db::{Git2DB, RepoId, RepositoryStatus, TrackedRepository, GitRef};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 /// Service name for endpoint registry
@@ -78,7 +78,7 @@ impl RegistryOps for ZmqClient {
             req.set_id(id);
             req.set_list(());
         })?;
-        let response = self.call(payload).await?;
+        let response = self.call(payload, None).await?;
         parse_repositories_response(&response)
     }
 
@@ -89,7 +89,7 @@ impl RegistryOps for ZmqClient {
             req.set_id(id);
             req.set_get(repo_id);
         })?;
-        let response = self.call(payload).await?;
+        let response = self.call(payload, None).await?;
         parse_optional_repository_response(&response)
     }
 
@@ -100,7 +100,7 @@ impl RegistryOps for ZmqClient {
             req.set_id(id);
             req.set_get_by_name(name);
         })?;
-        let response = self.call(payload).await?;
+        let response = self.call(payload, None).await?;
         parse_optional_repository_response(&response)
     }
 
@@ -111,7 +111,7 @@ impl RegistryOps for ZmqClient {
             req.set_id(id);
             req.set_list_branches(repo_id);
         })?;
-        let response = self.call(payload).await?;
+        let response = self.call(payload, None).await?;
         parse_branches_response(&response)
     }
 
@@ -122,7 +122,7 @@ impl RegistryOps for ZmqClient {
             req.set_id(id);
             req.set_health_check(());
         })?;
-        let response = self.call(payload).await?;
+        let response = self.call(payload, None).await?;
         parse_health_response(&response)
     }
 
@@ -139,7 +139,7 @@ impl RegistryOps for ZmqClient {
             clone_req.set_shallow(false);
             clone_req.set_depth(0);
         })?;
-        let response = self.call(payload).await?;
+        let response = self.call(payload, None).await?;
         parse_repo_id_response(&response)
     }
 
@@ -158,7 +158,7 @@ impl RegistryOps for ZmqClient {
                 reg_req.set_name(n);
             }
         })?;
-        let response = self.call(payload).await?;
+        let response = self.call(payload, None).await?;
         parse_success_response(&response)
     }
 
@@ -169,7 +169,7 @@ impl RegistryOps for ZmqClient {
             req.set_id(req_id);
             req.set_remove(&id.to_string());
         })?;
-        let response = self.call(payload).await?;
+        let response = self.call(payload, None).await?;
         parse_success_response(&response)
     }
 }
@@ -506,32 +506,6 @@ impl RegistryService {
         })
     }
 
-    /// Start the registry service on the default endpoint (from registry)
-    pub async fn start(
-        base_dir: impl AsRef<Path>,
-        server_pubkey: hyprstream_rpc::VerifyingKey,
-        policy_client: PolicyZmqClient,
-    ) -> Result<crate::services::ServiceHandle> {
-        let endpoint = registry().endpoint(SERVICE_NAME, SocketKind::Rep).to_zmq_string();
-        Self::start_at(base_dir, server_pubkey, policy_client, &endpoint).await
-    }
-
-    /// Start the registry service at a specific endpoint
-    ///
-    /// Waits for socket binding to complete before returning.
-    pub async fn start_at(
-        base_dir: impl AsRef<Path>,
-        server_pubkey: hyprstream_rpc::VerifyingKey,
-        policy_client: PolicyZmqClient,
-        endpoint: &str,
-    ) -> Result<crate::services::ServiceHandle> {
-        let service = Self::new(base_dir, policy_client).await?;
-        let runner = ServiceRunner::new(endpoint, server_pubkey);
-        let handle = runner.run(service).await?;
-        tracing::info!("RegistryService started at {}", endpoint);
-        Ok(handle)
-    }
-
     /// Check authorization for an operation.
     ///
     /// Returns the unauthorized response if the check fails, or None if authorized.
@@ -549,7 +523,14 @@ impl RegistryService {
             self.runtime_handle.block_on(
                 self.policy_client.check(&subject, resource, operation)
             )
-        }).unwrap_or(false);
+        }).unwrap_or_else(|e| {
+            // Log error before denying - prevents silent failures
+            warn!(
+                "Policy check failed for {} on {}: {} - denying access",
+                subject, resource, e
+            );
+            false
+        });
 
         if allowed {
             None // Authorized
@@ -1741,7 +1722,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, None).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -1787,7 +1768,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, None).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         self.parse_worktrees_response(&response)
@@ -1827,7 +1808,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, None).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -1871,7 +1852,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, None).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         let reader = serialize::read_message(&*response, ReaderOptions::new())
@@ -1925,7 +1906,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, None).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -1969,7 +1950,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, None).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2018,7 +1999,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, None).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2065,7 +2046,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, None).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2106,7 +2087,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, None).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2155,7 +2136,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, None).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2206,7 +2187,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, None).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2247,7 +2228,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, None).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         self.parse_remotes_response(&response)
@@ -2274,7 +2255,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, None).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2318,7 +2299,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, None).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2363,7 +2344,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, None).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2412,7 +2393,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, None).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2453,7 +2434,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, None).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2545,7 +2526,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, None).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response

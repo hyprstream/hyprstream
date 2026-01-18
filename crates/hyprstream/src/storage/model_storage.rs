@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
+use hyprstream_rpc::service::ServiceManager;
 
 use super::model_ref::{validate_model_name, ModelRef};
 
@@ -119,8 +120,18 @@ impl ModelStorage {
         // If PolicyService isn't running, policy checks will fail gracefully
         let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
 
-        // Start ZMQ-based registry service (waits for socket binding)
-        let _service_handle = RegistryService::start(&base_dir, verifying_key, policy_client)
+        // Start ZMQ-based registry service using unified pattern
+        let registry_service = RegistryService::new(&base_dir, policy_client.clone()).await
+            .map_err(|e| anyhow::anyhow!("Failed to create registry service: {}", e))?;
+        let registry_transport = hyprstream_rpc::transport::TransportConfig::inproc("hyprstream/registry");
+        let registry_spawnable = hyprstream_rpc::service::as_spawnable(
+            registry_service,
+            registry_transport,
+            crate::zmq::global_context().clone(),
+            verifying_key,
+        );
+        let manager = hyprstream_rpc::service::InprocManager::new();
+        let _service_handle = manager.spawn(Box::new(registry_spawnable))
             .await
             .map_err(|e| anyhow::anyhow!("Failed to start registry service: {}", e))?;
 

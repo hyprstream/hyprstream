@@ -48,8 +48,9 @@ mod systemd;
 pub use standalone::StandaloneBackend;
 pub use process::ProcessSpawner;
 pub use service::{
-    HandlerService, ProxyService, ServiceKind, ServiceMode,
+    as_spawnable, HandlerService, ProxyService, ServiceKind, ServiceMode,
     ServiceSpawner, Spawnable, SpawnedService,
+    InprocManager,
 };
 pub use systemd::SystemdBackend;
 

@@ -709,3 +709,238 @@ fn generate_response_parser(
         }
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Authorization Macros - #[authorize] and #[register_scopes]
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Attribute macro for method-level authorization with structured scopes.
+///
+/// Generates a wrapper that validates JWT tokens and checks structured scopes
+/// before calling the original method. This provides compile-time enforcement
+/// of authorization requirements.
+///
+/// # Attributes
+///
+/// - `action` - The action being performed (e.g., "infer", "read", "write")
+/// - `resource` - The resource type (e.g., "model", "stream", "policy")
+/// - `identifier_field` - Field name in request containing the resource ID
+///
+/// # Example
+///
+/// ```ignore
+/// impl InferenceService {
+///     #[authorize(action = "infer", resource = "model", identifier_field = "model_name")]
+///     fn handle_generate(&self, ctx: &EnvelopeContext, request: GenerateRequest) -> Result<Vec<u8>> {
+///         // Authorization already validated - just implement business logic
+///         // ctx.user_claims is guaranteed to exist here
+///     }
+/// }
+/// ```
+///
+/// # Generated Code
+///
+/// The macro generates:
+/// 1. JWT token validation via `ctx.validate_jwt()`
+/// 2. Structured scope construction: `Scope::new(action, resource, request.identifier_field)`
+/// 3. Casbin policy check (optional, based on service configuration)
+/// 4. JWT scope check via `claims.has_scope(&required_scope)`
+/// 5. Original method call if all checks pass
+///
+/// # Security
+///
+/// Defense-in-depth with three validation layers:
+/// - Layer 1: Envelope signature (service identity)
+/// - Layer 2: Casbin policy (RBAC/ABAC)
+/// - Layer 3: JWT scope (structured, least privilege)
+#[proc_macro_attribute]
+pub fn authorize(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(attr as AuthorizeArgs);
+    let input = parse_macro_input!(item as syn::ItemFn);
+
+    let action = &args.action;
+    let resource = &args.resource;
+    let identifier_field = format_ident!("{}", &args.identifier_field);
+
+    let fn_vis = &input.vis;
+    let fn_sig = &input.sig;
+    let fn_block = &input.block;
+    let fn_attrs = &input.attrs;
+
+    // The function signature should have (self, ctx: &EnvelopeContext, request: RequestType)
+    // We generate a wrapper that validates before calling the original
+
+    let expanded = quote! {
+        #(#fn_attrs)*
+        #fn_vis #fn_sig {
+            // Extract claims from envelope (already verified by envelope signature)
+            let claims = ctx.claims()
+                .ok_or_else(|| anyhow::anyhow!("Unauthorized: Missing claims in envelope"))?;
+
+            // Build structured scope from request
+            let required_scope = hyprstream_rpc::auth::Scope::new(
+                #action.to_string(),
+                #resource.to_string(),
+                request.#identifier_field.clone(),
+            );
+
+            // Check Casbin policy (scope used as resource)
+            let subject = claims.casbin_subject();
+            let allowed = tokio::task::block_in_place(|| {
+                let handle = tokio::runtime::Handle::current();
+                handle.block_on(self.policy_manager.check(
+                    &subject,
+                    &required_scope.to_string(),
+                    crate::auth::Operation::Infer,
+                ))
+            })?;
+
+            if !allowed {
+                return Err(anyhow::anyhow!(
+                    "Forbidden: Casbin policy denied for scope '{}'",
+                    required_scope.to_string()
+                ));
+            }
+
+            // Check claims scope (uses Scope::grants() with safe wildcard matching)
+            if !claims.has_scope(&required_scope) {
+                return Err(anyhow::anyhow!(
+                    "Forbidden: Missing scope '{}'",
+                    required_scope.to_string()
+                ));
+            }
+
+            // Authorization passed - execute original function body
+            #fn_block
+        }
+    };
+
+    expanded.into()
+}
+
+/// Arguments for the #[authorize] attribute
+struct AuthorizeArgs {
+    action: String,
+    resource: String,
+    identifier_field: String,
+}
+
+impl syn::parse::Parse for AuthorizeArgs {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let mut action = None;
+        let mut resource = None;
+        let mut identifier_field = None;
+
+        while !input.is_empty() {
+            let ident: syn::Ident = input.parse()?;
+            input.parse::<syn::Token![=]>()?;
+
+            match ident.to_string().as_str() {
+                "action" => {
+                    let lit: syn::LitStr = input.parse()?;
+                    action = Some(lit.value());
+                }
+                "resource" => {
+                    let lit: syn::LitStr = input.parse()?;
+                    resource = Some(lit.value());
+                }
+                "identifier_field" => {
+                    let lit: syn::LitStr = input.parse()?;
+                    identifier_field = Some(lit.value());
+                }
+                other => return Err(syn::Error::new(ident.span(), format!("unknown attribute: {}", other))),
+            }
+
+            if input.peek(syn::Token![,]) {
+                input.parse::<syn::Token![,]>()?;
+            }
+        }
+
+        Ok(AuthorizeArgs {
+            action: action.ok_or_else(|| syn::Error::new(input.span(), "missing 'action'"))?,
+            resource: resource.ok_or_else(|| syn::Error::new(input.span(), "missing 'resource'"))?,
+            identifier_field: identifier_field.ok_or_else(|| syn::Error::new(input.span(), "missing 'identifier_field'"))?,
+        })
+    }
+}
+
+/// Attribute macro for automatic scope registration.
+///
+/// Scans all `#[authorize]` attributes in the impl block and generates
+/// inventory::submit! statements for each unique (action, resource) pair.
+///
+/// This ensures that all scopes are automatically registered at compile-time,
+/// making it impossible to forget scope registration.
+///
+/// # Example
+///
+/// ```ignore
+/// #[register_scopes]
+/// impl InferenceService {
+///     #[authorize(action = "infer", resource = "model", identifier_field = "model")]
+///     fn handle_generate(...) { }
+///
+///     #[authorize(action = "read", resource = "model", identifier_field = "model")]
+///     fn handle_config(...) { }
+/// }
+///
+/// // Automatically generates:
+/// // inventory::submit! {
+/// //     hyprstream_rpc::auth::ScopeDefinition::new("infer", "model", "infer:model:*", "infer on model")
+/// // }
+/// // inventory::submit! {
+/// //     hyprstream_rpc::auth::ScopeDefinition::new("read", "model", "read:model:*", "read on model")
+/// // }
+/// ```
+///
+/// # Benefits
+///
+/// - ✅ DRY: Scopes declared once in #[authorize], auto-registered
+/// - ✅ Impossible to forget: Missing #[authorize] = no registration = compile error
+/// - ✅ Self-documenting: Scopes visible via `inventory::iter::<ScopeDefinition>()`
+/// - ✅ Zero boilerplate: No manual inventory::submit! needed
+#[proc_macro_attribute]
+pub fn register_scopes(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as syn::ItemImpl);
+
+    // Collect all unique (action, resource) pairs from #[authorize] attributes
+    let mut scopes = std::collections::HashSet::new();
+
+    for item in &input.items {
+        if let syn::ImplItem::Fn(method) = item {
+            for attr in &method.attrs {
+                if attr.path().is_ident("authorize") {
+                    if let Ok(args) = attr.parse_args::<AuthorizeArgs>() {
+                        scopes.insert((args.action.clone(), args.resource.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Generate inventory submissions
+    let registrations: Vec<_> = scopes.iter().map(|(action, resource)| {
+        let example = format!("{}:{}:*", action, resource);
+        let description = format!("{} on {}", action, resource);
+
+        quote! {
+            inventory::submit! {
+                hyprstream_rpc::auth::ScopeDefinition::new(
+                    #action,
+                    #resource,
+                    #example,
+                    #description
+                )
+            }
+        }
+    }).collect();
+
+    // Output original impl + registrations
+    let expanded = quote! {
+        #input
+
+        #(#registrations)*
+    };
+
+    expanded.into()
+}

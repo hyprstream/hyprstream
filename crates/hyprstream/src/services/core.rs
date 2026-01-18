@@ -6,13 +6,13 @@
 //! # Envelope-Based Security
 //!
 //! All requests are wrapped in `SignedEnvelope` for authentication:
-//! - `ServiceRunner` unwraps and verifies signatures before dispatching
+//! - Service infrastructure unwraps and verifies signatures before dispatching
 //! - Handlers receive `EnvelopeContext` with verified identity
 //! - Services use `ctx.casbin_subject()` for policy checks
 //!
 //! # Note
 //!
-//! The core types (`EnvelopeContext`, `ZmqService`, `ServiceRunner`, `ServiceHandle`, `ZmqClient`)
+//! The core types (`EnvelopeContext`, `ZmqService`, `ZmqClient`)
 //! are now defined in `hyprstream-rpc` and re-exported here for backward compatibility.
 //!
 //! This module provides convenience constructors that use the global ZMQ context.
@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 // Re-export core types from hyprstream-rpc
 pub use hyprstream_rpc::service::{
-    EnvelopeContext, ServiceHandle, ServiceRunner as ServiceRunnerBase, ZmqClient as ZmqClientBase,
+    EnvelopeContext, ServiceRunner as ServiceRunnerBase, ZmqClient as ZmqClientBase,
     ZmqService,
 };
 
@@ -169,9 +169,13 @@ impl ZmqClient {
     /// All requests are automatically wrapped in `SignedEnvelope`.
     /// This ensures every call is authenticated - no bypass possible.
     ///
+    /// # Arguments
+    /// * `payload` - Request payload bytes
+    /// * `timeout_ms` - Optional explicit timeout in milliseconds (defaults to 30s)
+    ///
     /// Uses TMQ with the global context for proper `inproc://` support.
-    pub async fn call(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
-        self.inner.call(payload).await
+    pub async fn call(&self, payload: Vec<u8>, timeout_ms: Option<i32>) -> Result<Vec<u8>> {
+        self.inner.call(payload, timeout_ms).await
     }
 }
 

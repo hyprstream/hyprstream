@@ -12,9 +12,12 @@ mod traits;
 mod zmq;
 pub mod spawner;
 pub mod manager;
+pub mod streaming;
 
 pub use traits::{RpcHandler, RpcRequest, RpcService};
 pub use zmq::{EnvelopeContext, ServiceHandle, ServiceRunner, ZmqClient, ZmqService};
+pub use streaming::StreamService;
+pub use spawner::{as_spawnable, InprocManager, SpawnedService};
 
 // Re-export service manager types
 pub use manager::{detect as detect_service_manager, ServiceManager, StandaloneManager};

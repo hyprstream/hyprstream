@@ -43,11 +43,12 @@ struct PeerIdentity {
 # is signed by SignedEnvelope.signature for clear signing scope.
 struct RequestEnvelope {
   requestId @0 :UInt64;            # Unique request ID for correlation
-  identity @1 :RequestIdentity;    # Who is making the request
+  identity @1 :RequestIdentity;    # Who is making the request (service identity)
   payload @2 :Data;                # Serialized inner request (RegistryRequest, etc.)
   ephemeralPubkey @3 :Data;        # X25519/P-256 public key for stream HMAC (optional, 32 bytes)
   nonce @4 :Data;                  # 16 random bytes for replay protection
   timestamp @5 :Int64;             # Unix millis, for expiration check
+  claims @6 :Claims;               # User authorization claims (protected by envelope signature)
 }
 
 # Signed wrapper - signature covers serialized RequestEnvelope bytes
@@ -82,4 +83,26 @@ struct StreamChunk {
   requestId @0 :UInt64;   # Which request this chunk belongs to
   data @1 :Data;          # Token or chunk data
   hmac @2 :Data;          # Chained HMAC-SHA256 (32 bytes)
+}
+
+# Structured scope for fine-grained authorization
+# Format: action:resource:identifier
+# Examples:
+#   infer:model:qwen-7b     - Specific model inference
+#   subscribe:stream:abc    - Specific stream subscription
+#   read:model:*            - Read any model (explicit wildcard)
+#   admin:*:*               - Admin wildcard
+struct Scope {
+  action @0 :Text;       # read, write, infer, subscribe, admin
+  resource @1 :Text;     # model, stream, policy
+  identifier @2 :Text;   # specific ID or "*" for wildcard
+}
+
+# JWT claims with structured scopes
+struct Claims {
+  sub @0 :Text;          # Subject (user/service)
+  exp @1 :Int64;         # Expiration timestamp
+  iat @2 :Int64;         # Issued at timestamp
+  scopes @3 :List(Scope); # Structured scopes
+  admin @4 :Bool;        # Admin override
 }

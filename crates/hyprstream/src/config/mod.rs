@@ -63,7 +63,33 @@ pub struct HyprConfig {
     /// Controls which services are started at startup in ipc-systemd mode.
     #[serde(default)]
     pub services: ServicesConfig,
+
+    /// JWT token configuration
+    #[serde(default)]
+    pub token: TokenConfig,
 }
+
+/// JWT token issuance configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenConfig {
+    #[serde(default = "default_token_ttl")]
+    pub default_ttl_seconds: u32,
+
+    #[serde(default = "default_max_token_ttl")]
+    pub max_ttl_seconds: u32,
+}
+
+impl Default for TokenConfig {
+    fn default() -> Self {
+        Self {
+            default_ttl_seconds: 300,   // 5 minutes
+            max_ttl_seconds: 3600,      // 1 hour
+        }
+    }
+}
+
+fn default_token_ttl() -> u32 { 300 }
+fn default_max_token_ttl() -> u32 { 3600 }
 
 /// Storage paths and directories configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,11 +157,12 @@ impl Default for ServicesConfig {
 /// Default list of services to start at startup
 fn default_startup_services() -> Vec<String> {
     vec![
-        "registry".to_string(),
-        "policy".to_string(),
-        "worker".to_string(),
-        "event".to_string(),
-        "model".to_string(),
+        "event".to_string(),     // Must start first (message bus)
+        "registry".to_string(),  // Model registry
+        "policy".to_string(),    // Authorization
+        "streams".to_string(),   // Streaming proxy with JWT validation
+        "worker".to_string(),    // Container workloads
+        "model".to_string(),     // Model management
     ]
 }
 
@@ -315,6 +342,7 @@ pub struct HyprConfigBuilder {
     git2db: git2db::config::Git2DBConfig,
     worker: Option<hyprstream_workers::config::WorkerConfig>,
     services: ServicesConfig,
+    token: TokenConfig,
 }
 
 impl HyprConfigBuilder {
@@ -330,6 +358,7 @@ impl HyprConfigBuilder {
             git2db: git2db::config::Git2DBConfig::default(),
             worker: None,
             services: ServicesConfig::default(),
+            token: TokenConfig::default(),
         }
     }
 
@@ -345,6 +374,7 @@ impl HyprConfigBuilder {
             git2db: config.git2db,
             worker: config.worker,
             services: config.services,
+            token: config.token,
         }
     }
 
@@ -372,6 +402,7 @@ impl HyprConfigBuilder {
             git2db: self.git2db,
             worker: self.worker,
             services: self.services,
+            token: self.token,
         }
     }
 

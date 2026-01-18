@@ -33,8 +33,7 @@ use crate::model_capnp;
 use crate::runtime::kv_quant::KVQuantType;
 use crate::runtime::RuntimeConfig;
 use crate::services::{
-    EnvelopeContext, InferenceService, InferenceZmqClient, PolicyZmqClient, ServiceHandle,
-    ServiceRunner, ZmqClient,
+    EnvelopeContext, InferenceService, InferenceZmqClient, PolicyZmqClient, ZmqClient,
 };
 use crate::storage::{ModelRef, ModelStorage};
 use anyhow::{anyhow, Result};
@@ -67,7 +66,7 @@ pub struct LoadedModel {
     /// ZMQ endpoint for this model's InferenceService
     pub endpoint: String,
     /// Handle to stop the InferenceService
-    pub service_handle: ServiceHandle,
+    pub service_handle: hyprstream_rpc::service::SpawnedService,
     /// Client for communicating with the InferenceService
     pub client: InferenceZmqClient,
     /// When the model was loaded
@@ -192,46 +191,6 @@ impl ModelService {
             callback_router: Some(callback_router),
             spawned_instances: RwLock::new(HashMap::new()),
         }
-    }
-
-    /// Start the model service at the default endpoint (from registry)
-    pub async fn start(
-        config: ModelServiceConfig,
-        signing_key: SigningKey,
-        verifying_key: VerifyingKey,
-        policy_client: PolicyZmqClient,
-        model_storage: Arc<ModelStorage>,
-    ) -> Result<ServiceHandle> {
-        let endpoint = registry().endpoint("model", SocketKind::Rep).to_zmq_string();
-        Self::start_at(
-            config,
-            signing_key,
-            verifying_key,
-            policy_client,
-            model_storage,
-            &endpoint,
-        )
-        .await
-    }
-
-    /// Start the model service at a specific endpoint
-    pub async fn start_at(
-        config: ModelServiceConfig,
-        signing_key: SigningKey,
-        verifying_key: VerifyingKey,
-        policy_client: PolicyZmqClient,
-        model_storage: Arc<ModelStorage>,
-        endpoint: &str,
-    ) -> Result<ServiceHandle> {
-        let service = Self::new(
-            config,
-            signing_key,
-            verifying_key,
-            policy_client,
-            model_storage,
-        );
-        let runner = ServiceRunner::new(endpoint, service.verifying_key);
-        runner.run(service).await
     }
 
     /// Load a model by reference, returns the inference endpoint
@@ -766,6 +725,7 @@ impl ModelZmqClient {
     /// Create a new model client (endpoint from registry)
     pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
         let endpoint = registry().endpoint("model", SocketKind::Rep).to_zmq_string();
+        tracing::debug!("ModelZmqClient connecting to endpoint: {}", endpoint);
         Self {
             client: Arc::new(ZmqClient::new(&endpoint, signing_key, identity)),
         }
@@ -793,7 +753,7 @@ impl ModelZmqClient {
         let mut request_bytes = Vec::new();
         serialize::write_message(&mut request_bytes, &message)?;
 
-        let response_bytes = self.client.call(request_bytes).await?;
+        let response_bytes = self.client.call(request_bytes, None).await?;
         self.parse_loaded_response(&response_bytes)
     }
 
@@ -812,7 +772,7 @@ impl ModelZmqClient {
         let mut request_bytes = Vec::new();
         serialize::write_message(&mut request_bytes, &message)?;
 
-        let response_bytes = self.client.call(request_bytes).await?;
+        let response_bytes = self.client.call(request_bytes, None).await?;
         self.parse_ok_response(&response_bytes)
     }
 
@@ -830,7 +790,7 @@ impl ModelZmqClient {
         let mut request_bytes = Vec::new();
         serialize::write_message(&mut request_bytes, &message)?;
 
-        let response_bytes = self.client.call(request_bytes).await?;
+        let response_bytes = self.client.call(request_bytes, None).await?;
         self.parse_list_response(&response_bytes)
     }
 
@@ -849,7 +809,7 @@ impl ModelZmqClient {
         let mut request_bytes = Vec::new();
         serialize::write_message(&mut request_bytes, &message)?;
 
-        let response_bytes = self.client.call(request_bytes).await?;
+        let response_bytes = self.client.call(request_bytes, None).await?;
         self.parse_status_response(&response_bytes)
     }
 
@@ -872,7 +832,7 @@ impl ModelZmqClient {
         let mut request_bytes = Vec::new();
         serialize::write_message(&mut request_bytes, &message)?;
 
-        let response_bytes = self.client.call(request_bytes).await?;
+        let response_bytes = self.client.call(request_bytes, None).await?;
         self.parse_infer_result_response(&response_bytes)
     }
 
@@ -895,7 +855,7 @@ impl ModelZmqClient {
         let mut request_bytes = Vec::new();
         serialize::write_message(&mut request_bytes, &message)?;
 
-        let response_bytes = self.client.call(request_bytes).await?;
+        let response_bytes = self.client.call(request_bytes, None).await?;
         self.parse_stream_started_response(&response_bytes)
     }
 
@@ -913,7 +873,7 @@ impl ModelZmqClient {
         let mut request_bytes = Vec::new();
         serialize::write_message(&mut request_bytes, &message)?;
 
-        let response_bytes = self.client.call(request_bytes).await?;
+        let response_bytes = self.client.call(request_bytes, None).await?;
         self.parse_health_response(&response_bytes)
     }
 
@@ -948,7 +908,7 @@ impl ModelZmqClient {
         let mut request_bytes = Vec::new();
         serialize::write_message(&mut request_bytes, &message)?;
 
-        let response_bytes = self.client.call(request_bytes).await?;
+        let response_bytes = self.client.call(request_bytes, None).await?;
         self.parse_template_result_response(&response_bytes)
     }
 

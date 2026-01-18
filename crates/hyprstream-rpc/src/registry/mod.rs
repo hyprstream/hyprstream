@@ -244,9 +244,9 @@ impl EndpointRegistry {
     fn default_endpoint(&self, name: &str, socket_kind: SocketKind) -> TransportConfig {
         let suffix = socket_kind.suffix();
         match self.mode {
-            EndpointMode::Inproc => TransportConfig::Inproc {
-                endpoint: format!("hyprstream/{}{}", name, suffix),
-            },
+            EndpointMode::Inproc => {
+                TransportConfig::inproc(format!("hyprstream/{}{}", name, suffix))
+            }
             EndpointMode::Ipc => {
                 // Use normal IPC binding instead of systemd socket activation for ZMQ sockets
                 // ZMQ_USE_FD has compatibility issues with systemd socket activation
@@ -255,7 +255,7 @@ impl EndpointRegistry {
                     .as_ref()
                     .map(|d| d.join(format!("{}{}.sock", name, suffix)))
                     .unwrap_or_else(|| PathBuf::from(format!("/tmp/hyprstream/{}{}.sock", name, suffix)));
-                TransportConfig::Ipc { path }
+                TransportConfig::ipc(path)
             }
         }
     }

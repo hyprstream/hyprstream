@@ -53,7 +53,7 @@ pub async fn auth_middleware(
                 let user = AuthenticatedUser {
                     user: claims.sub.clone(),
                     is_admin: claims.admin,
-                    scopes: claims.scope.clone(),
+                    scopes: claims.scopes.iter().map(|s| s.to_string()).collect(),
                 };
                 request.extensions_mut().insert(user);
                 return next.run(request).await;
