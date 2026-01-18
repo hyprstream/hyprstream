@@ -10,11 +10,9 @@ use std::thread::{self, JoinHandle};
 use tokio::sync::Notify;
 
 use super::{ProcessConfig, ProcessSpawner, SpawnedProcess};
-use crate::envelope::InMemoryNonceCache;
 use crate::error::Result;
-use crate::prelude::VerifyingKey;
 use crate::registry::{ServiceRegistration, SocketKind};
-use crate::service::{ServiceRunner, ZmqService};
+use crate::service::{RequestLoop, ZmqService};
 use crate::transport::TransportConfig;
 
 // Import anyhow! macro for error creation in ServiceManager impl
@@ -46,122 +44,66 @@ pub trait Spawnable: Send + 'static {
     ///
     /// Called by spawner after thread/process setup.
     /// Should block until shutdown is signaled.
-    fn run_blocking(self: Box<Self>, shutdown: Arc<Notify>) -> Result<()>;
-
-    /// Run the service with ready signaling (blocking).
     ///
-    /// Called by InprocManager to ensure service is ready before returning.
-    /// The ready_tx should be sent after the socket binds but before request loop starts.
-    fn run_blocking_with_ready(
+    /// # Arguments
+    /// * `shutdown` - Notification to signal service shutdown
+    /// * `on_ready` - Optional oneshot sender to signal when socket is bound and ready
+    fn run(
         self: Box<Self>,
         shutdown: Arc<Notify>,
-        ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    ) -> Result<()> {
-        // Default implementation just calls run_blocking (for backward compatibility)
-        // Services that need ready signaling should override this
-        if ready_tx.is_some() {
-            // Drop the sender without using it (for services that don't support ready signaling)
-            drop(ready_tx);
-        }
-        self.run_blocking(shutdown)
-    }
+        on_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<()>;
 }
 
 // ============================================================================
-// HandlerService - Wrapper for ZmqService
+// Blanket Spawnable impl for ZmqService
 // ============================================================================
 
-/// Wrapper to make ZmqService spawnable via the Spawnable trait.
+/// Every `ZmqService` is automatically `Spawnable`.
 ///
-/// This adapts the existing ZmqService pattern (REQ/REP) to work with
-/// the unified ServiceSpawner API.
-pub struct HandlerService<S: ZmqService> {
-    /// The underlying ZmqService implementation.
-    service: S,
-    /// Service name (for logging and registry).
-    service_name: String,
-    /// Transport configuration (endpoint).
-    transport: TransportConfig,
-    /// ZMQ context.
-    context: Arc<zmq::Context>,
-    /// Server's Ed25519 verifying key for signature verification.
-    verifying_key: VerifyingKey,
-    /// Nonce cache for replay protection.
-    nonce_cache: Arc<InMemoryNonceCache>,
-}
-
-impl<S: ZmqService> HandlerService<S> {
-    /// Create a new handler service wrapper.
-    pub fn new(
-        service: S,
-        transport: TransportConfig,
-        context: Arc<zmq::Context>,
-        verifying_key: VerifyingKey,
-    ) -> Self {
-        let service_name = service.name().to_string();
-        Self {
-            service,
-            service_name,
-            transport,
-            context,
-            verifying_key,
-            nonce_cache: Arc::new(InMemoryNonceCache::new()),
-        }
-    }
-
-    /// Use a shared nonce cache.
-    pub fn with_nonce_cache(mut self, cache: Arc<InMemoryNonceCache>) -> Self {
-        self.nonce_cache = cache;
-        self
-    }
-}
-
-impl<S: ZmqService> Spawnable for HandlerService<S> {
+/// This blanket implementation eliminates the need for wrapper types.
+/// Services that implement `ZmqService` include their infrastructure
+/// (context, transport, verifying_key) and can be spawned directly.
+///
+/// # Example
+///
+/// ```ignore
+/// // PolicyService implements ZmqService with infrastructure
+/// let service = PolicyService::new(
+///     policy_manager,
+///     signing_key,
+///     token_config,
+///     context,
+///     transport,
+///     verifying_key,
+/// );
+///
+/// // Spawn directly - no wrapping needed!
+/// manager.spawn(Box::new(service)).await?;
+/// ```
+impl<S: ZmqService> Spawnable for S {
     fn name(&self) -> &str {
-        &self.service_name
+        ZmqService::name(self)
     }
 
     fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
+        ZmqService::context(self)
     }
 
     fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {
-        vec![(SocketKind::Rep, self.transport.clone())]
+        vec![(SocketKind::Rep, ZmqService::transport(self).clone())]
     }
 
-    fn run_blocking(self: Box<Self>, shutdown: Arc<Notify>) -> Result<()> {
-        // Create a single-threaded runtime for blocking execution
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("runtime: {}", e)))?;
-
-        rt.block_on(async move {
-            // Pass TransportConfig directly for SystemdFd support
-            let runner = ServiceRunner::with_nonce_cache(
-                self.transport.clone(),
-                self.context.clone(),
-                self.verifying_key.clone(),
-                self.nonce_cache.clone(),
-            );
-
-            match runner.run(self.service).await {
-                Ok(mut handle) => {
-                    // Wait for shutdown signal
-                    shutdown.notified().await;
-                    handle.stop().await;
-                    Ok(())
-                }
-                Err(e) => Err(crate::error::RpcError::SpawnFailed(e.to_string())),
-            }
-        })
-    }
-
-    fn run_blocking_with_ready(
+    fn run(
         self: Box<Self>,
         shutdown: Arc<Notify>,
-        ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        on_ready: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<()> {
+        // Extract infrastructure before consuming self
+        let transport = ZmqService::transport(&*self).clone();
+        let context = ZmqService::context(&*self).clone();
+        let verifying_key = ZmqService::verifying_key(&*self);
+
         // Create a single-threaded runtime for blocking execution
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -169,18 +111,12 @@ impl<S: ZmqService> Spawnable for HandlerService<S> {
             .map_err(|e| crate::error::RpcError::SpawnFailed(format!("runtime: {}", e)))?;
 
         rt.block_on(async move {
-            // Pass TransportConfig directly for SystemdFd support
-            let runner = ServiceRunner::with_nonce_cache(
-                self.transport.clone(),
-                self.context.clone(),
-                self.verifying_key.clone(),
-                self.nonce_cache.clone(),
-            );
+            let runner = RequestLoop::new(transport, context, verifying_key);
 
-            match runner.run(self.service).await {
+            match runner.run(*self).await {
                 Ok(mut handle) => {
-                    // Socket is now bound - signal ready
-                    if let Some(tx) = ready_tx {
+                    // Socket is now bound - signal ready if callback provided
+                    if let Some(tx) = on_ready {
                         let _ = tx.send(());
                     }
 
@@ -196,31 +132,6 @@ impl<S: ZmqService> Spawnable for HandlerService<S> {
             }
         })
     }
-}
-
-/// Convert a ZmqService into a Spawnable for use with ServiceManager
-///
-/// This is a convenience function that hides the HandlerService wrapper.
-/// Use this when you need to spawn a ZmqService using ServiceManager::spawn().
-///
-/// # Example
-/// ```ignore
-/// let service = PolicyService::new(...);
-/// let spawnable = as_spawnable(
-///     service,
-///     TransportConfig::inproc("hyprstream/policy"),
-///     context,
-///     verifying_key,
-/// );
-/// manager.spawn(Box::new(spawnable)).await?;
-/// ```
-pub fn as_spawnable<S: ZmqService>(
-    service: S,
-    transport: TransportConfig,
-    context: Arc<zmq::Context>,
-    verifying_key: VerifyingKey,
-) -> impl Spawnable {
-    HandlerService::new(service, transport, context, verifying_key)
 }
 
 // ============================================================================
@@ -281,14 +192,10 @@ impl Spawnable for ProxyService {
         ]
     }
 
-    fn run_blocking(self: Box<Self>, shutdown: Arc<Notify>) -> Result<()> {
-        self.run_blocking_with_ready(shutdown, None)
-    }
-
-    fn run_blocking_with_ready(
+    fn run(
         self: Box<Self>,
         shutdown: Arc<Notify>,
-        ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        on_ready: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<()> {
         // Create XSUB socket (receives from publishers)
         let mut xsub = self.context.socket(zmq::XSUB)
@@ -325,7 +232,7 @@ impl Spawnable for ProxyService {
         );
 
         // Send ready signal after sockets are bound
-        if let Some(tx) = ready_tx {
+        if let Some(tx) = on_ready {
             let _ = tx.send(());
         }
 
@@ -384,22 +291,21 @@ pub enum ServiceMode {
 /// # Example
 ///
 /// ```ignore
-/// use hyprstream_rpc::service::spawner::{ServiceSpawner, HandlerService, ProxyService};
+/// use hyprstream_rpc::service::spawner::{ServiceSpawner, ProxyService};
 /// use hyprstream_rpc::transport::TransportConfig;
 ///
-/// // Spawn a REQ/REP handler
-/// let transport = TransportConfig::inproc("my-service");
-/// let handler = HandlerService::new(MyZmqService::new(), transport, ctx, verifying_key);
+/// // Spawn a REQ/REP service (ZmqService implementations are directly Spawnable)
+/// let service = MyZmqService::new(ctx, transport, verifying_key);
 /// let spawner = ServiceSpawner::tokio();
-/// let service = spawner.spawn(handler).await?;
+/// let spawned = spawner.spawn(service).await?;
 ///
 /// // Spawn an XSUB/XPUB proxy on dedicated thread
 /// let proxy = ProxyService::new("events", ctx, pub_transport, sub_transport);
 /// let spawner = ServiceSpawner::threaded();
-/// let service = spawner.spawn(proxy).await?;
+/// let spawned = spawner.spawn(proxy).await?;
 ///
 /// // Stop the service
-/// service.stop().await?;
+/// spawned.stop().await?;
 /// ```
 pub struct ServiceSpawner {
     mode: ServiceMode,
@@ -452,7 +358,7 @@ impl ServiceSpawner {
     /// Spawn any Spawnable service with registry integration.
     ///
     /// This is the unified spawning API that works with both:
-    /// - `HandlerService<S: ZmqService>` - REQ/REP handlers
+    /// - Any `S: ZmqService` - REQ/REP services (directly Spawnable via blanket impl)
     /// - `ProxyService` - XSUB/XPUB proxies
     ///
     /// The service is automatically registered with the EndpointRegistry and
@@ -461,13 +367,13 @@ impl ServiceSpawner {
     /// # Example
     ///
     /// ```ignore
-    /// // Spawn a handler
-    /// let handler = HandlerService::new(my_zmq_service, transport, ctx, verifying_key);
-    /// let service = spawner.spawn(handler).await?;
+    /// // Spawn a REQ/REP service (ZmqService implementations are directly Spawnable)
+    /// let service = MyZmqService::new(ctx, transport, verifying_key);
+    /// let spawned = spawner.spawn(service).await?;
     ///
     /// // Spawn a proxy
     /// let proxy = ProxyService::new("events", ctx, pub_transport, sub_transport);
-    /// let service = spawner.spawn(proxy).await?;
+    /// let spawned = spawner.spawn(proxy).await?;
     /// ```
     pub async fn spawn<S: Spawnable>(&self, service: S) -> Result<SpawnedService> {
         // 1. Register with EndpointRegistry (if initialized)
@@ -501,7 +407,7 @@ impl ServiceSpawner {
 
         // Spawn task that runs the service
         let join_handle = tokio::spawn(async move {
-            if let Err(e) = Box::new(service).run_blocking(shutdown_clone) {
+            if let Err(e) = Box::new(service).run(shutdown_clone, None) {
                 tracing::error!("Service {} failed: {}", name_for_spawn, e);
             }
         });
@@ -534,27 +440,18 @@ impl ServiceSpawner {
         let thread_handle = thread::Builder::new()
             .name(format!("{}-service", &name))
             .spawn(move || {
-                // Signal ready before blocking
-                let _ = ready_tx.send(Ok(()));
-
-                // Run the service (blocking)
-                if let Err(e) = Box::new(service).run_blocking(shutdown_clone) {
+                // Run the service - it will signal ready after socket binds
+                if let Err(e) = Box::new(service).run(shutdown_clone, Some(ready_tx)) {
                     tracing::error!("Service {} failed: {}", name_for_thread, e);
                 }
             })
             .map_err(|e| crate::error::RpcError::SpawnFailed(format!("thread spawn: {}", e)))?;
 
-        // Wait for ready signal
-        match ready_rx.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                return Err(crate::error::RpcError::SpawnFailed(e));
-            }
-            Err(_) => {
-                return Err(crate::error::RpcError::SpawnFailed(
-                    "service thread exited before ready".to_string(),
-                ));
-            }
+        // Wait for ready signal (sent by service after socket binds)
+        if ready_rx.await.is_err() {
+            return Err(crate::error::RpcError::SpawnFailed(
+                "service thread exited before ready".to_string(),
+            ));
         }
 
         Ok(SpawnedService {
@@ -853,21 +750,16 @@ impl ServiceManager for InprocManager {
         let thread_handle = thread::Builder::new()
             .name(format!("{}-service", &name))
             .spawn(move || {
-                if let Err(e) = service.run_blocking_with_ready(shutdown_clone, Some(ready_tx)) {
+                if let Err(e) = service.run(shutdown_clone, Some(ready_tx)) {
                     tracing::error!("Service {} failed: {}", name_clone, e);
                 }
             })
             .map_err(|e| anyhow!("thread spawn: {}", e))?;
 
         // Wait for service to be ready (socket bound)
-        match ready_rx.await {
-            Ok(()) => {
-                // Notify systemd that service is ready (for Type=notify services)
-                let _ = crate::notify::ready();
-            }
-            Err(_) => {
-                return Err(anyhow!("service thread exited before ready"));
-            }
+        // Note: systemd notification is handled inside run() after socket binds
+        if ready_rx.await.is_err() {
+            return Err(anyhow!("service thread exited before ready"));
         }
 
         Ok(SpawnedService::thread(
@@ -883,10 +775,22 @@ impl ServiceManager for InprocManager {
 mod tests {
     use super::*;
     use crate::crypto::generate_signing_keypair;
+    use crate::prelude::VerifyingKey;
     use crate::service::ZmqService;
     use anyhow::Result as AnyhowResult;
 
-    struct EchoService;
+    /// Test service that includes infrastructure (new pattern)
+    struct EchoService {
+        context: Arc<zmq::Context>,
+        transport: TransportConfig,
+        verifying_key: VerifyingKey,
+    }
+
+    impl EchoService {
+        fn new(context: Arc<zmq::Context>, transport: TransportConfig, verifying_key: VerifyingKey) -> Self {
+            Self { context, transport, verifying_key }
+        }
+    }
 
     impl ZmqService for EchoService {
         fn handle_request(
@@ -900,37 +804,51 @@ mod tests {
         fn name(&self) -> &str {
             "echo"
         }
+
+        fn context(&self) -> &Arc<zmq::Context> {
+            &self.context
+        }
+
+        fn transport(&self) -> &TransportConfig {
+            &self.transport
+        }
+
+        fn verifying_key(&self) -> VerifyingKey {
+            self.verifying_key
+        }
     }
 
     #[tokio::test]
     async fn test_tokio_spawner() {
         let context = Arc::new(zmq::Context::new());
         let (_, verifying_key) = generate_signing_keypair();
-
         let transport = TransportConfig::inproc("test-spawner-tokio");
-        let handler = HandlerService::new(EchoService, transport, context, verifying_key);
+
+        // Service is directly Spawnable - no wrapping needed
+        let service = EchoService::new(context, transport, verifying_key);
 
         let spawner = ServiceSpawner::tokio();
-        let mut service = spawner.spawn(handler).await.unwrap();
+        let mut spawned = spawner.spawn(service).await.unwrap();
 
-        assert!(service.is_running());
+        assert!(spawned.is_running());
 
-        service.stop().await.unwrap();
+        spawned.stop().await.unwrap();
     }
 
     #[tokio::test]
     async fn test_thread_spawner() {
         let context = Arc::new(zmq::Context::new());
         let (_, verifying_key) = generate_signing_keypair();
-
         let transport = TransportConfig::inproc("test-spawner-thread");
-        let handler = HandlerService::new(EchoService, transport, context, verifying_key);
+
+        // Service is directly Spawnable - no wrapping needed
+        let service = EchoService::new(context, transport, verifying_key);
 
         let spawner = ServiceSpawner::threaded();
-        let mut service = spawner.spawn(handler).await.unwrap();
+        let mut spawned = spawner.spawn(service).await.unwrap();
 
-        assert!(service.is_running());
+        assert!(spawned.is_running());
 
-        service.stop().await.unwrap();
+        spawned.stop().await.unwrap();
     }
 }

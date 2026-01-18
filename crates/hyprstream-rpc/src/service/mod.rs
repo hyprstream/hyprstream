@@ -1,7 +1,7 @@
 //! Service-side RPC infrastructure.
 //!
 //! This module provides:
-//! - `ZmqService`, `ServiceRunner`, `ZmqClient` - ZMQ REQ/REP service infrastructure
+//! - `ZmqService`, `RequestLoop`, `ZmqClient` - ZMQ REQ/REP service infrastructure
 //! - `EnvelopeContext` - Verified request context passed to handlers
 //! - `ServiceHandle` - Handle for managing running services
 //! - `RpcService`, `RpcHandler` - Lower-level RPC traits
@@ -13,11 +13,13 @@ mod zmq;
 pub mod spawner;
 pub mod manager;
 pub mod streaming;
+pub mod factory;
 
 pub use traits::{RpcHandler, RpcRequest, RpcService};
-pub use zmq::{EnvelopeContext, ServiceHandle, ServiceRunner, ZmqClient, ZmqService};
+pub use zmq::{EnvelopeContext, ServiceHandle, RequestLoop, ZmqClient, ZmqService};
 pub use streaming::StreamService;
-pub use spawner::{as_spawnable, InprocManager, SpawnedService};
+pub use spawner::{InprocManager, Spawnable, SpawnedService};
+pub use factory::{get_factory, list_factories, ServiceContext, ServiceFactory};
 
 // Re-export service manager types
 pub use manager::{detect as detect_service_manager, ServiceManager, StandaloneManager};

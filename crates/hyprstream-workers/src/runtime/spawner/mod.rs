@@ -48,7 +48,6 @@ pub use hyprstream_rpc::service::spawner::{
     SpawnerBackend,
     SystemdBackend,
     // ServiceSpawner types
-    HandlerService,
     ProxyService,
     ServiceKind,
     ServiceMode,

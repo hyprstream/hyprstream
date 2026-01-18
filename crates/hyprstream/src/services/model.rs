@@ -41,6 +41,7 @@ use capnp::message::{Builder, ReaderOptions};
 use capnp::serialize;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::{global as registry, SocketKind};
+use hyprstream_rpc::transport::TransportConfig;
 use lru::LruCache;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -120,14 +121,13 @@ impl Default for ModelServiceConfig {
 /// - InProcess: Runs InferenceService in the same process (default)
 /// - Spawned: Spawns InferenceService as separate process via callback pattern
 pub struct ModelService {
+    // Business logic
     /// LRU cache of loaded models
     loaded_models: RwLock<LruCache<String, LoadedModel>>,
     /// Service configuration
     config: ModelServiceConfig,
     /// Ed25519 signing key for creating InferenceZmqClients
     signing_key: SigningKey,
-    /// Ed25519 verifying key for InferenceService
-    verifying_key: VerifyingKey,
     /// Policy client for authorization checks in InferenceService
     policy_client: PolicyZmqClient,
     /// Model storage for resolving model paths
@@ -136,16 +136,23 @@ pub struct ModelService {
     callback_router: Option<crate::services::callback::CallbackRouter>,
     /// Spawned instances by model ref (for spawned mode)
     spawned_instances: RwLock<HashMap<String, crate::services::callback::Instance>>,
+    // Infrastructure (for Spawnable)
+    context: Arc<zmq::Context>,
+    transport: TransportConfig,
+    /// Ed25519 verifying key for envelope verification
+    verifying_key: VerifyingKey,
 }
 
 impl ModelService {
-    /// Create a new model service
+    /// Create a new model service with infrastructure
     pub fn new(
         config: ModelServiceConfig,
         signing_key: SigningKey,
-        verifying_key: VerifyingKey,
         policy_client: PolicyZmqClient,
         model_storage: Arc<ModelStorage>,
+        context: Arc<zmq::Context>,
+        transport: TransportConfig,
+        verifying_key: VerifyingKey,
     ) -> Self {
         // SAFETY: 5 is a valid non-zero value
         const DEFAULT_CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(5) {
@@ -158,11 +165,13 @@ impl ModelService {
             loaded_models: RwLock::new(LruCache::new(cache_size)),
             config,
             signing_key,
-            verifying_key,
             policy_client,
             model_storage,
             callback_router: None,
             spawned_instances: RwLock::new(HashMap::new()),
+            context,
+            transport,
+            verifying_key,
         }
     }
 
@@ -170,10 +179,12 @@ impl ModelService {
     pub fn with_callback_router(
         config: ModelServiceConfig,
         signing_key: SigningKey,
-        verifying_key: VerifyingKey,
         policy_client: PolicyZmqClient,
         model_storage: Arc<ModelStorage>,
         callback_router: crate::services::callback::CallbackRouter,
+        context: Arc<zmq::Context>,
+        transport: TransportConfig,
+        verifying_key: VerifyingKey,
     ) -> Self {
         const DEFAULT_CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(5) {
             Some(n) => n,
@@ -185,11 +196,13 @@ impl ModelService {
             loaded_models: RwLock::new(LruCache::new(cache_size)),
             config,
             signing_key,
-            verifying_key,
             policy_client,
             model_storage,
             callback_router: Some(callback_router),
             spawned_instances: RwLock::new(HashMap::new()),
+            context,
+            transport,
+            verifying_key,
         }
     }
 
@@ -686,6 +699,18 @@ impl crate::services::ZmqService for ModelService {
 
     fn name(&self) -> &str {
         "model"
+    }
+
+    fn context(&self) -> &Arc<zmq::Context> {
+        &self.context
+    }
+
+    fn transport(&self) -> &TransportConfig {
+        &self.transport
+    }
+
+    fn verifying_key(&self) -> VerifyingKey {
+        self.verifying_key
     }
 }
 

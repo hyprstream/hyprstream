@@ -42,7 +42,7 @@ mod tests {
 
         let proxy = ProxyService::new("events-test", ctx, pub_t, sub_t);
         let spawner = ServiceSpawner::threaded();
-        let service = spawner.spawn(proxy).await.expect("Failed to spawn proxy");
+        let mut service = spawner.spawn(proxy).await.expect("Failed to spawn proxy");
 
         assert!(service.is_running());
 

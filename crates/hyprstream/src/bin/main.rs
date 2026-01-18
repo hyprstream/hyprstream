@@ -45,8 +45,10 @@ use hyprstream_workers::{ImageConfig, PoolConfig, ProxyService, SpawnedService, 
 use hyprstream_core::zmq::global_context;
 use std::sync::Arc;
 // Unified service manager API
-use hyprstream_rpc::service::{as_spawnable, InprocManager, ServiceManager};
+use hyprstream_rpc::service::{get_factory, InprocManager, ServiceContext, ServiceManager};
 use hyprstream_rpc::transport::TransportConfig;
+// Import factories module to ensure inventory registrations are linked
+use hyprstream_core::services::factories as _service_factories;
 // Tracing imports (feature-gated)
 #[cfg(feature = "otel")]
 use opentelemetry::trace::TracerProvider;
@@ -427,10 +429,10 @@ fn main() -> Result<()> {
     // Also return keypair for other services (like InferenceService) to use
     use hyprstream_rpc::{SigningKey, VerifyingKey, RequestIdentity};
 
-    // Clone worker config before moving config into the async block
-    let worker_config = config.worker.clone();
+    // Worker config is now handled by factory - no need to clone separately
 
-    let (registry_client, mut _service_handle, _worker_handle, mut _event_handle, mut _stream_handle, _workflow_service, signing_key, verifying_key): (Arc<dyn RegistryClient>, Option<SpawnedService>, Option<SpawnedService>, Option<SpawnedService>, Option<SpawnedService>, Option<Arc<WorkflowService>>, SigningKey, VerifyingKey) = if execution_mode == ExecutionMode::Inproc {
+    // Service handles stored in a Vec for cleanup
+    let (registry_client, mut _service_handles, _workflow_service, signing_key, verifying_key): (Arc<dyn RegistryClient>, Vec<SpawnedService>, Option<Arc<WorkflowService>>, SigningKey, VerifyingKey) = if execution_mode == ExecutionMode::Inproc {
         _registry_runtime
         .block_on(async {
             let models_dir = config.models_dir();
@@ -440,107 +442,52 @@ fn main() -> Result<()> {
             let signing_key = load_or_generate_signing_key(&keys_dir).await?;
             let verifying_key = signing_key.verifying_key();
 
-            // Start EventService FIRST (event bus must be running before services that publish events)
-            // Uses XPUB/XSUB proxy pattern for efficient message distribution
-            let (pub_transport, sub_transport) = endpoints::inproc_transports();
-            let proxy = ProxyService::new("events", global_context(), pub_transport, sub_transport);
-            let manager = InprocManager::new();
-            let event_handle = manager.spawn(Box::new(proxy))
-                .await
-                .context("Failed to start event service")?;
-
-            // Initialize policy manager for authorization
-            // Note: Policy templates should be applied explicitly using CLI commands:
-            //   hyprstream policy apply-template local    # For local full access
-            //   hyprstream policy apply-template public-inference  # For public inference
-            let policies_dir = models_dir.join(".registry").join("policies");
-            let policy_manager = Arc::new(
-                PolicyManager::new(&policies_dir)
-                    .await
-                    .context("Failed to initialize policy manager")?
-            );
-
-            // Start PolicyService (runs on multi-threaded runtime where block_in_place works)
-            // This service wraps PolicyManager and exposes it over ZMQ
-            let policy_service = PolicyService::new(
-                policy_manager,
-                Arc::new(signing_key.clone()),
-                config.token.clone(),
-            );
-            let policy_transport = TransportConfig::inproc("hyprstream/policy");
-            let policy_spawnable = as_spawnable(
-                policy_service,
-                policy_transport,
-                global_context().clone(),
+            // ========== UNIFIED SERVICE STARTUP via Factory ==========
+            // Create ServiceContext for factory functions
+            let ctx = ServiceContext::new(
+                global_context(),
+                signing_key.clone(),
                 verifying_key,
+                false, // inproc mode, not IPC
+                models_dir.clone(),
             );
+
             let manager = InprocManager::new();
-            let _policy_handle = manager.spawn(Box::new(policy_spawnable))
-                .await
-                .context("Failed to start policy service")?;
+            let mut handles = Vec::new();
 
-            // Create policy client for other services to use
-            let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
+            // Start services from config.services.startup using factory
+            // ZMQ handles reconnection, so order doesn't matter for most services
+            for service_name in &config.services.startup {
+                // Skip workflow - it's not a standard Spawnable service
+                if service_name == "workflow" {
+                    continue;
+                }
 
-            // Start the registry service with policy client
-            let registry_service = RegistryService::new(&models_dir, policy_client).await?;
-            let registry_transport = TransportConfig::inproc("hyprstream/registry");
-            let registry_spawnable = as_spawnable(
-                registry_service,
-                registry_transport,
-                global_context().clone(),
-                verifying_key,
-            );
-            let service_handle = manager.spawn(Box::new(registry_spawnable))
-                .await
-                .context("Failed to start registry service")?;
+                let factory = get_factory(service_name)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown service in startup config: {}", service_name))?;
 
-            // Start StreamService for authorized streaming (PUB/SUB with JWT validation)
-            use hyprstream_core::services::StreamService;
-            use hyprstream_rpc::registry;
-            let pub_transport = registry::global().endpoint("streams", registry::SocketKind::Sub);
-            let sub_transport = registry::global().endpoint("streams", registry::SocketKind::Pub);
-            let stream_service = StreamService::new("streams", global_context().clone(), pub_transport, sub_transport, verifying_key);
-            let stream_handle = manager.spawn(Box::new(stream_service))
-                .await
-                .context("Failed to start stream service")?;
-            info!("StreamService started with JWT validation");
-
-            // Start WorkerService if configured (optional, for Kata-based workload execution)
-            let worker_handle = if let Some(ref wc) = worker_config {
-                info!("Starting WorkerService for container/sandbox management");
-                use hyprstream_workers::image::RafsStore;
-                let rafs_store = Arc::new(RafsStore::new(wc.images.clone())?);
-                let worker_service = WorkerService::new(
-                    wc.pool.clone(),
-                    wc.images.clone(),
-                    rafs_store,
-                    global_context().clone(),
-                )?;
-                let worker_transport = TransportConfig::inproc("hyprstream/workers");
-                let worker_spawnable = as_spawnable(
-                    worker_service,
-                    worker_transport,
-                    global_context().clone(),
-                    verifying_key,
-                );
-                let handle = manager.spawn(Box::new(worker_spawnable))
+                info!("Starting {} service via factory", service_name);
+                let spawnable = (factory.factory)(&ctx)
+                    .context(format!("Failed to create {} service", service_name))?;
+                let handle = manager.spawn(spawnable)
                     .await
-                    .context("Failed to start worker service")?;
-                Some(handle)
+                    .context(format!("Failed to start {} service", service_name))?;
+                handles.push(handle);
+            }
+
+            // Start WorkflowService for event-driven workflow orchestration
+            // Note: WorkflowService is special - not a standard Spawnable, uses .start()
+            let workflow_service = if config.services.startup.iter().any(|s| s == "workflow") {
+                let ws = Arc::new(WorkflowService::new(global_context()));
+                ws.clone()
+                    .start()
+                    .await
+                    .context("Failed to start workflow service")?;
+                info!("WorkflowService started, subscribed to worker.* events");
+                Some(ws)
             } else {
                 None
             };
-
-            // Start WorkflowService for event-driven workflow orchestration
-            // Subscribes to worker events via EventService
-            let workflow_service = Arc::new(WorkflowService::new(global_context()));
-            workflow_service
-                .clone()
-                .start()
-                .await
-                .context("Failed to start workflow service")?;
-            info!("WorkflowService started, subscribed to worker.* events");
 
             // Create client with signing credentials for service communication
             // Uses local identity (current OS user) for authorization
@@ -548,7 +495,8 @@ fn main() -> Result<()> {
                 signing_key.clone(),
                 RequestIdentity::local(),
             )) as Arc<dyn RegistryClient>;
-            Ok::<_, anyhow::Error>((client, Some(service_handle), worker_handle, Some(event_handle), Some(stream_handle), Some(workflow_service), signing_key, verifying_key))
+
+            Ok::<_, anyhow::Error>((client, handles, workflow_service, signing_key, verifying_key))
         })
         .context("Failed to initialize services")?
     } else {
@@ -574,7 +522,7 @@ fn main() -> Result<()> {
                 RequestIdentity::local(),
             )) as Arc<dyn RegistryClient>;
 
-            Ok::<_, anyhow::Error>((client, None, None, None, None, None, signing_key, verifying_key))
+            Ok::<_, anyhow::Error>((client, Vec::new(), None, signing_key, verifying_key))
         })
         .context("Failed to connect to services")?
     };
@@ -1353,21 +1301,17 @@ fn main() -> Result<()> {
                     let _worker_handle = if !worker_already_running {
                         use hyprstream_workers::image::RafsStore;
                         let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
+                        let worker_transport = TransportConfig::inproc("hyprstream/workers");
                         let worker_service = WorkerService::new(
                             pool_config,
                             image_config,
                             rafs_store,
                             global_context().clone(),
-                        )?;
-                        let worker_transport = TransportConfig::inproc("hyprstream/workers");
-                        let worker_spawnable = as_spawnable(
-                            worker_service,
                             worker_transport,
-                            global_context().clone(),
                             verifying_key,
-                        );
+                        )?;
                         let manager = InprocManager::new();
-                        Some(manager.spawn(Box::new(worker_spawnable))
+                        Some(manager.spawn(Box::new(worker_service))
                             .await
                             .context("Failed to start worker service")?)
                     } else {
@@ -1481,11 +1425,7 @@ fn main() -> Result<()> {
             } else {
                 hyprstream_rpc::registry::EndpointMode::Inproc
             };
-            let mode = if ipc {
-                hyprstream_workers::endpoints::EndpointMode::Ipc
-            } else {
-                hyprstream_workers::endpoints::EndpointMode::Inproc
-            };
+            // Note: worker endpoint mode now handled internally by factory
 
             // Capture config for use in async block
             let config = config_for_service;
@@ -1517,321 +1457,63 @@ fn main() -> Result<()> {
                         init_registry(rpc_mode, runtime_dir);
                     }
 
-                    match name.as_str() {
-                        "event" => {
-                            info!("Starting EventService in standalone mode (IPC: {})", ipc);
-
-                            // Start EventService using InprocManager
-                            let (pub_transport, sub_transport) = endpoints::detect_transports(mode);
-                            let proxy = ProxyService::new("events", global_context(), pub_transport, sub_transport);
-                            let manager = InprocManager::new();
-                            let mut handle = manager.spawn(Box::new(proxy))
-                                .await
-                                .context("Failed to start event service")?;
-
-                            // Note: notify::ready() is called by ProxyService after sockets bind
-
-                            info!("EventService ready, waiting for shutdown signal");
-
-                            // Wait for shutdown
-                            let _ = shutdown_rx.await;
-
-                            // Stop service
-                            handle.stop().await.context("Failed to stop event service")?;
-
-                            info!("EventService stopped");
-                        }
-
-                        "worker" => {
-                            info!("Starting WorkerService in standalone mode (IPC: {})", ipc);
-
-                            // Use worker config from main config or defaults
-                            let data_dir = dirs::data_local_dir()
-                                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                                .join("hyprstream");
-                            let runtime_dir = dirs::runtime_dir()
-                                .unwrap_or_else(|| std::env::temp_dir())
-                                .join("hyprstream");
-
-                            let kata_boot_path = std::env::var("KATA_BOOT_PATH")
-                                .map(std::path::PathBuf::from)
-                                .unwrap_or_else(|_| std::path::PathBuf::from("/opt/kata/share/kata-containers"));
-
-                            let pool_config = PoolConfig {
-                                warm_pool_size: 0,
-                                runtime_dir: runtime_dir.join("sandboxes"),
-                                kernel_path: kata_boot_path.join("vmlinux.container"),
-                                vm_image: kata_boot_path.join("kata-containers.img"),
-                                cloud_init_dir: data_dir.join("cloud-init"),
-                                ..PoolConfig::default()
-                            };
-                            let image_config = ImageConfig {
-                                blobs_dir: data_dir.join("images/blobs"),
-                                bootstrap_dir: data_dir.join("images/bootstrap"),
-                                refs_dir: data_dir.join("images/refs"),
-                                cache_dir: data_dir.join("images/cache"),
-                                runtime_dir: runtime_dir.join("nydus"),
-                                ..ImageConfig::default()
-                            };
-
-                            use hyprstream_workers::image::RafsStore;
-                            let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
-                            let worker_service = WorkerService::new(
-                                pool_config,
-                                image_config,
-                                rafs_store,
-                                global_context().clone(),
-                            )?;
-                            let worker_transport = TransportConfig::inproc("hyprstream/workers");
-                            let worker_spawnable = as_spawnable(
-                                worker_service,
-                                worker_transport,
-                                global_context().clone(),
-                                verifying_key,
-                            );
-                            let manager = InprocManager::new();
-                            let mut worker_handle = manager.spawn(Box::new(worker_spawnable))
-                                .await
-                                .context("Failed to start worker service")?;
-
-                            // Publish ready event via event bus
-                            if let Ok(mut publisher) = hyprstream_workers::EventPublisher::new(&global_context(), "system") {
-                                let _ = publisher.publish_raw("system.worker.ready", b"").await;
-                            }
-
-                            // Note: notify::ready() is called by HandlerService after socket binds
-
-                            info!("WorkerService ready, waiting for shutdown signal");
-
-                            // Wait for shutdown
-                            let _ = shutdown_rx.await;
-
-                            // Publish stopping event
-                            if let Ok(mut publisher) = hyprstream_workers::EventPublisher::new(&global_context(), "system") {
-                                let _ = publisher.publish_raw("system.worker.stopping", b"").await;
-                            }
-
-                            worker_handle.stop().await;
-                            info!("WorkerService stopped");
-                        }
-
-                        "registry" => {
-                            info!("Starting RegistryService in standalone mode (IPC: {})", ipc);
-
-                            let models_dir = config.models_dir();
-
-                            // Load signing key
-                            let keys_dir = models_dir.join(".registry").join("keys");
-                            let signing_key = load_or_generate_signing_key(&keys_dir).await?;
-                            let verifying_key = signing_key.verifying_key();
-
-                            // Create policy client
-                            let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
-
-                            let registry_service = RegistryService::new(&models_dir, policy_client).await?;
-                            let registry_transport = TransportConfig::inproc("hyprstream/registry");
-                            let registry_spawnable = as_spawnable(
-                                registry_service,
-                                registry_transport,
-                                global_context().clone(),
-                                verifying_key,
-                            );
-                            let manager = InprocManager::new();
-                            let mut registry_handle = manager.spawn(Box::new(registry_spawnable))
-                                .await
-                                .context("Failed to start registry service")?;
-
-                            // Publish ready event
-                            if let Ok(mut publisher) = hyprstream_workers::EventPublisher::new(&global_context(), "system") {
-                                let _ = publisher.publish_raw("system.registry.ready", b"").await;
-                            }
-
-                            // Note: notify::ready() is called by HandlerService after socket binds
-
-                            info!("RegistryService ready, waiting for shutdown signal");
-
-                            let _ = shutdown_rx.await;
-
-                            if let Ok(mut publisher) = hyprstream_workers::EventPublisher::new(&global_context(), "system") {
-                                let _ = publisher.publish_raw("system.registry.stopping", b"").await;
-                            }
-
-                            registry_handle.stop().await;
-                            info!("RegistryService stopped");
-                        }
-
-                        "policy" => {
-                            info!("Starting PolicyService in standalone mode (IPC: {})", ipc);
-
-                            let models_dir = config.models_dir();
-                            let policies_dir = models_dir.join(".registry").join("policies");
-
-                            // Load signing key for verification
-                            let keys_dir = models_dir.join(".registry").join("keys");
-                            let signing_key = load_or_generate_signing_key(&keys_dir).await?;
-                            let verifying_key = signing_key.verifying_key();
-
-                            let policy_manager = Arc::new(
-                                PolicyManager::new(&policies_dir)
-                                    .await
-                                    .context("Failed to initialize policy manager")?
-                            );
-
-                            let policy_service = PolicyService::new(
-                                policy_manager,
-                                Arc::new(signing_key),
-                                config.token.clone(),
-                            );
-                            let policy_transport = TransportConfig::inproc("hyprstream/policy");
-                            let policy_spawnable = as_spawnable(
-                                policy_service,
-                                policy_transport,
-                                global_context().clone(),
-                                verifying_key,
-                            );
-                            let manager = InprocManager::new();
-                            let mut policy_handle = manager.spawn(Box::new(policy_spawnable))
-                                .await
-                                .context("Failed to start policy service")?;
-
-                            // Publish ready event
-                            if let Ok(mut publisher) = hyprstream_workers::EventPublisher::new(&global_context(), "system") {
-                                let _ = publisher.publish_raw("system.policy.ready", b"").await;
-                            }
-
-                            // Note: notify::ready() is called by HandlerService after socket binds
-
-                            info!("PolicyService ready, waiting for shutdown signal");
-
-                            let _ = shutdown_rx.await;
-
-                            if let Ok(mut publisher) = hyprstream_workers::EventPublisher::new(&global_context(), "system") {
-                                let _ = publisher.publish_raw("system.policy.stopping", b"").await;
-                            }
-
-                            policy_handle.stop().await;
-                            info!("PolicyService stopped");
-                        }
-
-                        "model" => {
-                            info!("Starting ModelService in standalone mode (IPC: {})", ipc);
-
-                            let models_dir = config.models_dir();
-
-                            // Load signing key
-                            let keys_dir = models_dir.join(".registry").join("keys");
-                            let signing_key = load_or_generate_signing_key(&keys_dir).await?;
-                            let verifying_key = signing_key.verifying_key();
-
-                            // Create policy client
-                            let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
-
-                            // Create registry client
-                            let registry_client = Arc::new(RegistryZmqClient::new(
-                                signing_key.clone(),
-                                RequestIdentity::local(),
-                            )) as Arc<dyn RegistryClient>;
-
-                            // Create model storage
-                            let model_storage = Arc::new(hyprstream_core::storage::ModelStorage::new(
-                                registry_client,
-                                models_dir.clone(),
-                            ));
-
-                            // Use default config for standalone mode
-                            let model_config = hyprstream_core::services::ModelServiceConfig::default();
-
-                            let model_service = hyprstream_core::services::ModelService::new(
-                                model_config,
-                                signing_key.clone(),
-                                verifying_key,
-                                policy_client,
-                                model_storage,
-                            );
-
-                            // Use IPC transport when --ipc is passed, otherwise inproc
-                            // For IPC, use the runtime directory to build full socket path
-                            let model_transport = if ipc {
-                                let runtime_dir = hyprstream_rpc::paths::runtime_dir();
-                                TransportConfig::ipc(runtime_dir.join("model.sock"))
-                            } else {
-                                TransportConfig::inproc("hyprstream/model")
-                            };
-
-                            let model_spawnable = as_spawnable(
-                                model_service,
-                                model_transport,
-                                global_context().clone(),
-                                verifying_key,
-                            );
-                            let manager = InprocManager::new();
-                            let mut model_handle = manager.spawn(Box::new(model_spawnable))
-                                .await
-                                .context("Failed to start model service")?;
-
-                            // Publish ready event
-                            if let Ok(mut publisher) = hyprstream_workers::EventPublisher::new(&global_context(), "system") {
-                                let _ = publisher.publish_raw("system.model.ready", b"").await;
-                            }
-
-                            // Note: notify::ready() is now called by HandlerService after socket binds
-                            // This ensures systemd Type=notify services don't start dependencies too early
-
-                            info!("ModelService ready, waiting for shutdown signal");
-
-                            let _ = shutdown_rx.await;
-
-                            if let Ok(mut publisher) = hyprstream_workers::EventPublisher::new(&global_context(), "system") {
-                                let _ = publisher.publish_raw("system.model.stopping", b"").await;
-                            }
-
-                            model_handle.stop().await;
-                            info!("ModelService stopped");
-                        }
-
-                        "streams" => {
-                            info!("Starting StreamService in standalone mode (IPC: {})", ipc);
-
-                            // Load signing keys for JWT validation
-                            let models_dir = config.models_dir();
-                            let keys_dir = models_dir.join(".registry").join("keys");
-                            let signing_key = load_or_generate_signing_key(&keys_dir).await?;
-                            let verifying_key = signing_key.verifying_key();
-
-                            // Start StreamService with JWT validation
-                            use hyprstream_core::services::StreamService;
-                            use hyprstream_rpc::registry;
-                            let pub_transport = registry::global().endpoint("streams", registry::SocketKind::Sub);
-                            let sub_transport = registry::global().endpoint("streams", registry::SocketKind::Pub);
-                            let stream_service = StreamService::new("streams", global_context().clone(), pub_transport, sub_transport, verifying_key);
-                            let manager = InprocManager::new();
-                            let mut stream_handle = manager.spawn(Box::new(stream_service))
-                                .await
-                                .context("Failed to start stream service")?;
-
-                            // Publish ready event
-                            if let Ok(mut publisher) = hyprstream_workers::EventPublisher::new(&global_context(), "system") {
-                                let _ = publisher.publish_raw("system.streams.ready", b"").await;
-                            }
-
-                            // Note: notify::ready() is called by ProxyService after sockets bind
-
-                            info!("StreamService ready, waiting for shutdown signal");
-
-                            let _ = shutdown_rx.await;
-
-                            if let Ok(mut publisher) = hyprstream_workers::EventPublisher::new(&global_context(), "system") {
-                                let _ = publisher.publish_raw("system.streams.stopping", b"").await;
-                            }
-
-                            stream_handle.stop().await?;
-                            info!("StreamService stopped");
-                        }
-
-                        _ => {
-                            anyhow::bail!("Unknown service: {}. Valid services: event, worker, registry, policy, model, streams", name);
-                        }
+                    // ========== UNIFIED SERVICE STARTUP via Factory ==========
+                    // Load signing key for ServiceContext
+                    let models_dir = config.models_dir();
+                    let keys_dir = models_dir.join(".registry").join("keys");
+                    let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+                    let verifying_key = signing_key.verifying_key();
+
+                    // Create ServiceContext for factory
+                    let ctx = ServiceContext::new(
+                        global_context(),
+                        signing_key.clone(),
+                        verifying_key,
+                        ipc,
+                        models_dir.clone(),
+                    );
+
+                    // Look up service factory
+                    let factory = get_factory(&name)
+                        .ok_or_else(|| {
+                            let available: Vec<_> = hyprstream_rpc::service::list_factories()
+                                .map(|f| f.name)
+                                .collect();
+                            anyhow::anyhow!(
+                                "Unknown service: '{}'. Available services: {}",
+                                name,
+                                available.join(", ")
+                            )
+                        })?;
+
+                    info!("Starting {} service in standalone mode (IPC: {})", name, ipc);
+
+                    // Create and spawn the service
+                    let spawnable = (factory.factory)(&ctx)
+                        .context(format!("Failed to create {} service", name))?;
+                    let manager = InprocManager::new();
+                    let mut handle = manager.spawn(spawnable)
+                        .await
+                        .context(format!("Failed to start {} service", name))?;
+
+                    // Publish ready event
+                    if let Ok(mut publisher) = hyprstream_workers::EventPublisher::new(&global_context(), "system") {
+                        let _ = publisher.publish_raw(&format!("system.{}.ready", name), b"").await;
                     }
+
+                    info!("{} service ready, waiting for shutdown signal", name);
+
+                    // Wait for shutdown
+                    let _ = shutdown_rx.await;
+
+                    // Publish stopping event
+                    if let Ok(mut publisher) = hyprstream_workers::EventPublisher::new(&global_context(), "system") {
+                        let _ = publisher.publish_raw(&format!("system.{}.stopping", name), b"").await;
+                    }
+
+                    // Stop service
+                    let _ = handle.stop().await;
+                    info!("{} service stopped", name);
 
                     Ok(())
                 },
@@ -1843,17 +1525,9 @@ fn main() -> Result<()> {
     // Gracefully stop services before exiting (only for Inproc mode)
     // For systemd/standalone modes, services are managed externally
     _registry_runtime.block_on(async {
-        if let Some(mut handle) = _service_handle {
-            handle.stop().await;
-        }
-        if let Some(mut stream) = _stream_handle {
-            if let Err(e) = stream.stop().await {
-                tracing::warn!("Failed to stop stream service: {}", e);
-            }
-        }
-        if let Some(mut event) = _event_handle {
-            if let Err(e) = event.stop().await {
-                tracing::warn!("Failed to stop event service: {}", e);
+        for mut handle in _service_handles {
+            if let Err(e) = handle.stop().await {
+                tracing::warn!("Failed to stop service: {}", e);
             }
         }
     });

@@ -284,7 +284,7 @@ impl StreamService {
         Ok(xpub)
     }
 
-    /// Run the streaming proxy loop (blocking)
+    /// Run the streaming proxy loop with pre-bound sockets (blocking)
     ///
     /// This is the main event loop that:
     /// 1. Receives subscriptions from XPUB (client-facing)
@@ -293,21 +293,15 @@ impl StreamService {
     /// 4. Forwards messages bidirectionally
     ///
     /// # Arguments
+    /// * `xpub` - Pre-bound XPUB socket (client-facing)
+    /// * `xsub` - Pre-bound XSUB socket (backend)
     /// * `shutdown` - Notification signal to stop the service
-    fn run_loop(&self, shutdown: Arc<Notify>) -> Result<(), crate::error::RpcError> {
-        info!(
-            service = %self.name,
-            pub_endpoint = %self.pub_transport.to_zmq_string(),
-            sub_endpoint = %self.sub_transport.to_zmq_string(),
-            "Starting StreamService proxy"
-        );
-
-        // Setup sockets
-        let xpub = self.setup_xpub()
-            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("XPUB setup: {}", e)))?;
-        let xsub = self.setup_xsub()
-            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("XSUB setup: {}", e)))?;
-
+    fn run_loop_with_sockets(
+        &self,
+        xpub: zmq::Socket,
+        xsub: zmq::Socket,
+        shutdown: Arc<Notify>,
+    ) -> Result<(), crate::error::RpcError> {
         // Create CTRL socket for shutdown (PAIR pattern)
         let mut ctrl = self.context.socket(zmq::PAIR)
             .map_err(|e| crate::error::RpcError::SpawnFailed(format!("CTRL socket: {}", e)))?;
@@ -459,7 +453,33 @@ impl crate::service::spawner::Spawnable for StreamService {
         ]
     }
 
-    fn run_blocking(self: Box<Self>, shutdown: Arc<Notify>) -> Result<(), crate::error::RpcError> {
-        self.run_loop(shutdown)
+    fn run(
+        self: Box<Self>,
+        shutdown: Arc<Notify>,
+        on_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<(), crate::error::RpcError> {
+        info!(
+            service = %self.name,
+            pub_endpoint = %self.pub_transport.to_zmq_string(),
+            sub_endpoint = %self.sub_transport.to_zmq_string(),
+            "Starting StreamService proxy"
+        );
+
+        // Setup sockets BEFORE signaling ready
+        let xpub = self.setup_xpub()
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("XPUB setup: {}", e)))?;
+        let xsub = self.setup_xsub()
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("XSUB setup: {}", e)))?;
+
+        // Signal ready AFTER sockets are bound
+        if let Some(tx) = on_ready {
+            let _ = tx.send(());
+        }
+
+        // Notify systemd that service is ready (for Type=notify services)
+        let _ = crate::notify::ready();
+
+        // Run the proxy loop with pre-bound sockets
+        self.run_loop_with_sockets(xpub, xsub, shutdown)
     }
 }

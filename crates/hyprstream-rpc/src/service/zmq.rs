@@ -6,7 +6,7 @@
 //! # Envelope-Based Security
 //!
 //! All requests are wrapped in `SignedEnvelope` for authentication:
-//! - `ServiceRunner` unwraps and verifies signatures before dispatching
+//! - `RequestLoop` unwraps and verifies signatures before dispatching
 //! - Handlers receive `EnvelopeContext` with verified identity
 //! - Services use `ctx.casbin_subject()` for policy checks
 
@@ -22,7 +22,7 @@ use tracing::{debug, error, info, trace, warn};
 
 /// Context extracted from a verified SignedEnvelope.
 ///
-/// This struct is passed to service handlers after the `ServiceRunner`
+/// This struct is passed to service handlers after the `RequestLoop`
 /// has verified the envelope signature. Handlers use this for:
 /// - Authorization checks via `casbin_subject()`
 /// - Correlation via `request_id`
@@ -121,31 +121,50 @@ impl EnvelopeContext {
     }
 }
 
-/// Trait for ZMQ-based services
+/// Trait for ZMQ-based REQ/REP services.
 ///
-/// Implement this trait to create a service that handles REQ/REP requests.
-/// Services run as async tasks with TMQ for I/O, handlers execute in spawn_blocking.
+/// This is the unified trait for services that:
+/// 1. Handle requests via `handle_request()`
+/// 2. Are automatically spawnable (blanket `impl Spawnable for S: ZmqService`)
 ///
-/// Requires `Sync` because the service is shared via `Arc` for concurrent handler execution.
+/// Services include their infrastructure (context, transport, verifying key) so they
+/// can be spawned directly without wrapping.
 ///
 /// # Security Model
 ///
-/// The `ServiceRunner` unwraps and verifies `SignedEnvelope` before calling handlers.
+/// The `RequestLoop` unwraps and verifies `SignedEnvelope` before calling handlers.
 /// Handlers receive `EnvelopeContext` with verified identity - no need to re-verify.
 ///
 /// # Example
 ///
 /// ```ignore
+/// pub struct MyService {
+///     // Business logic
+///     data: MyData,
+///     // Infrastructure (required for spawning)
+///     context: Arc<zmq::Context>,
+///     transport: TransportConfig,
+///     verifying_key: VerifyingKey,
+/// }
+///
 /// impl ZmqService for MyService {
 ///     fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<Vec<u8>> {
 ///         // ctx.identity is already verified
 ///         info!("Request from {} (id={})", ctx.casbin_subject(), ctx.request_id);
-///         // ...
+///         Ok(vec![])
 ///     }
+///
+///     fn name(&self) -> &str { "my-service" }
+///     fn context(&self) -> &Arc<zmq::Context> { &self.context }
+///     fn transport(&self) -> &TransportConfig { &self.transport }
+///     fn verifying_key(&self) -> VerifyingKey { self.verifying_key }
 /// }
+///
+/// // MyService is now automatically Spawnable!
+/// manager.spawn(Box::new(my_service)).await?;
 /// ```
 pub trait ZmqService: Send + Sync + 'static {
-    /// Process a request and return a response
+    /// Process a request and return a response.
     ///
     /// # Arguments
     ///
@@ -157,25 +176,39 @@ pub trait ZmqService: Send + Sync + 'static {
     /// This runs in a blocking task to avoid blocking the async runtime.
     fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<Vec<u8>>;
 
-    /// Get the name of this service (for logging)
+    /// Service name (for logging and registry).
     fn name(&self) -> &str;
+
+    /// ZMQ context for socket creation.
+    fn context(&self) -> &Arc<zmq::Context>;
+
+    /// Transport configuration (endpoint binding).
+    fn transport(&self) -> &TransportConfig;
+
+    /// Ed25519 verifying key for envelope signature verification.
+    fn verifying_key(&self) -> VerifyingKey;
 }
 
-/// REQ/REP service runner
+/// REQ/REP message loop for ZmqService.
 ///
-/// Runs a ZmqService as an async task with TMQ for I/O.
+/// Runs the REQ/REP message loop as an async task with TMQ for I/O.
 /// Uses proper async/await with epoll integration instead of blocking threads.
 ///
 /// # Envelope Verification
 ///
-/// The runner unwraps and verifies `SignedEnvelope` for every request:
+/// The loop unwraps and verifies `SignedEnvelope` for every request:
 /// 1. Deserialize `SignedEnvelope` from wire bytes
 /// 2. Verify Ed25519 signature against server's public key
 /// 3. Check nonce not replayed (replay protection)
 /// 4. Extract `EnvelopeContext` and dispatch to handler
 ///
 /// Invalid/unsigned requests are rejected with an error response.
-pub struct ServiceRunner {
+///
+/// # Usage
+///
+/// Typically used internally by the blanket `Spawnable` impl for `ZmqService`.
+/// Direct usage is for advanced cases only.
+pub struct RequestLoop {
     /// Transport configuration (supports SystemdFd for socket activation)
     transport: TransportConfig,
     /// ZMQ context for socket creation (required for inproc:// connectivity)
@@ -186,8 +219,8 @@ pub struct ServiceRunner {
     nonce_cache: Arc<InMemoryNonceCache>,
 }
 
-impl ServiceRunner {
-    /// Create a new service runner bound to the given transport.
+impl RequestLoop {
+    /// Create a new request loop bound to the given transport.
     ///
     /// # Arguments
     ///
@@ -807,6 +840,58 @@ impl ZmqClient {
         serialize::write_message(&mut bytes, &message)?;
         Ok(bytes)
     }
+
+    /// High-level RPC call helper that handles serialization and parsing.
+    ///
+    /// This reduces boilerplate in RPC client methods by combining:
+    /// 1. Request ID allocation
+    /// 2. Cap'n Proto message serialization
+    /// 3. ZMQ call
+    /// 4. Response parsing
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// async fn list(&self) -> Result<Vec<TrackedRepository>> {
+    ///     self.client.rpc_call(
+    ///         |id, msg| {
+    ///             let mut req = msg.init_root::<registry_capnp::registry_request::Builder>();
+    ///             req.set_id(id);
+    ///             req.set_list(());
+    ///         },
+    ///         parse_repositories_response,
+    ///     ).await
+    /// }
+    /// ```
+    pub async fn rpc_call<T, F, P>(&self, build_request: F, parse_response: P) -> Result<T>
+    where
+        F: FnOnce(u64, &mut capnp::message::Builder<capnp::message::HeapAllocator>),
+        P: FnOnce(&[u8]) -> Result<T>,
+    {
+        let id = self.next_id();
+        let payload = crate::capnp::serialize_message(|msg| build_request(id, msg))?;
+        let response = self.call(payload, None).await?;
+        parse_response(&response)
+    }
+
+    /// High-level RPC call with user context (JWT propagation).
+    ///
+    /// Same as `rpc_call` but includes user claims for authorization.
+    pub async fn rpc_call_with_context<T, F, P>(
+        &self,
+        ctx: &EnvelopeContext,
+        build_request: F,
+        parse_response: P,
+    ) -> Result<T>
+    where
+        F: FnOnce(u64, &mut capnp::message::Builder<capnp::message::HeapAllocator>),
+        P: FnOnce(&[u8]) -> Result<T>,
+    {
+        let id = self.next_id();
+        let payload = crate::capnp::serialize_message(|msg| build_request(id, msg))?;
+        let response = self.call_with_context(ctx, payload, None, None).await?;
+        parse_response(&response)
+    }
 }
 
 #[cfg(test)]
@@ -814,7 +899,18 @@ mod tests {
     use super::*;
     use crate::crypto::generate_signing_keypair;
 
-    struct EchoService;
+    /// Test service with infrastructure (new pattern)
+    struct EchoService {
+        context: Arc<zmq::Context>,
+        transport: TransportConfig,
+        verifying_key: VerifyingKey,
+    }
+
+    impl EchoService {
+        fn new(context: Arc<zmq::Context>, transport: TransportConfig, verifying_key: VerifyingKey) -> Self {
+            Self { context, transport, verifying_key }
+        }
+    }
 
     impl ZmqService for EchoService {
         fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<Vec<u8>> {
@@ -828,24 +924,39 @@ mod tests {
         fn name(&self) -> &str {
             "echo"
         }
+
+        fn context(&self) -> &Arc<zmq::Context> {
+            &self.context
+        }
+
+        fn transport(&self) -> &TransportConfig {
+            &self.transport
+        }
+
+        fn verifying_key(&self) -> VerifyingKey {
+            self.verifying_key
+        }
     }
 
     #[tokio::test]
-    async fn test_service_runner() {
+    async fn test_request_loop() {
+        let context = Arc::new(zmq::Context::new());
         let transport = TransportConfig::inproc("test-echo-service-rpc");
         let endpoint = transport.zmq_endpoint();
-        let context = Arc::new(zmq::Context::new());
 
         // Generate keypair for this test
         let (signing_key, verifying_key) = generate_signing_keypair();
 
+        // Create service with infrastructure
+        let service = EchoService::new(context.clone(), transport.clone(), verifying_key);
+
         // Start the service (waits for socket binding)
-        let runner = ServiceRunner::new(transport, context.clone(), verifying_key);
-        let mut handle = runner.run(EchoService).await.expect("test: start service");
+        let runner = RequestLoop::new(transport, context.clone(), verifying_key);
+        let mut handle = runner.run(service).await.expect("test: start service");
 
         // Use ZmqClient directly (handles signing internally)
         let client = ZmqClient::new(&endpoint, context, signing_key, RequestIdentity::local());
-        let response = client.call(b"hello".to_vec()).await.expect("test: call");
+        let response = client.call(b"hello".to_vec(), None).await.expect("test: call");
 
         // Response should start with "from <user>:"
         let response_str = String::from_utf8_lossy(&response);
@@ -861,22 +972,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_signature_rejected() {
+        let context = Arc::new(zmq::Context::new());
         let transport = TransportConfig::inproc("test-invalid-sig-rpc");
         let endpoint = transport.zmq_endpoint();
-        let context = Arc::new(zmq::Context::new());
 
         // Generate two keypairs - use one to sign, verify with other
         let (signing_key, _) = generate_signing_keypair();
         let (_, wrong_verifying_key) = generate_signing_keypair();
 
+        // Create service (verifying_key here doesn't matter - RequestLoop uses its own)
+        let service = EchoService::new(context.clone(), transport.clone(), wrong_verifying_key);
+
         // Start the service with wrong key (waits for socket binding)
-        let runner = ServiceRunner::new(transport, context.clone(), wrong_verifying_key);
-        let mut handle = runner.run(EchoService).await.expect("test: start service");
+        let runner = RequestLoop::new(transport, context.clone(), wrong_verifying_key);
+        let mut handle = runner.run(service).await.expect("test: start service");
 
         // Sign with different key than service expects
         let client = ZmqClient::new(&endpoint, context, signing_key, RequestIdentity::local());
         let response = client
-            .call(b"should fail".to_vec())
+            .call(b"should fail".to_vec(), None)
             .await
             .expect("test: call");
 

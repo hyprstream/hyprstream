@@ -23,12 +23,13 @@
 
 use crate::auth::{Operation, PolicyManager};
 use crate::policy_capnp;
-use crate::services::{EnvelopeContext, ServiceRunner, ZmqClient, ZmqService};
+use crate::services::{EnvelopeContext, ZmqClient, ZmqService};
 use anyhow::{anyhow, Result};
 use capnp::message::{Builder, ReaderOptions};
 use capnp::serialize;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::{global as registry, SocketKind};
+use hyprstream_rpc::transport::TransportConfig;
 use std::sync::Arc;
 use tracing::{debug, error, trace};
 
@@ -44,22 +45,33 @@ const SERVICE_NAME: &str = "policy";
 /// Runs on multi-threaded runtime where block_in_place works safely.
 /// Receives policy check requests over ZMQ and delegates to PolicyManager.
 pub struct PolicyService {
+    // Business logic
     policy_manager: Arc<PolicyManager>,
     signing_key: Arc<SigningKey>,
     token_config: crate::config::TokenConfig,
+    // Infrastructure (for Spawnable)
+    context: Arc<zmq::Context>,
+    transport: TransportConfig,
+    verifying_key: VerifyingKey,
 }
 
 impl PolicyService {
-    /// Create a new policy service
+    /// Create a new policy service with infrastructure
     pub fn new(
         policy_manager: Arc<PolicyManager>,
         signing_key: Arc<SigningKey>,
         token_config: crate::config::TokenConfig,
+        context: Arc<zmq::Context>,
+        transport: TransportConfig,
+        verifying_key: VerifyingKey,
     ) -> Self {
         Self {
             policy_manager,
             signing_key,
             token_config,
+            context,
+            transport,
+            verifying_key,
         }
     }
 
@@ -264,6 +276,18 @@ impl ZmqService for PolicyService {
 
     fn name(&self) -> &str {
         "policy"
+    }
+
+    fn context(&self) -> &Arc<zmq::Context> {
+        &self.context
+    }
+
+    fn transport(&self) -> &TransportConfig {
+        &self.transport
+    }
+
+    fn verifying_key(&self) -> VerifyingKey {
+        self.verifying_key
     }
 }
 

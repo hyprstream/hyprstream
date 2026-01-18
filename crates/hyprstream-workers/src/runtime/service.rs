@@ -14,7 +14,7 @@ use tracing::debug;
 // Import ZMQ service infrastructure from hyprstream-rpc
 use hyprstream_rpc::prelude::VerifyingKey;
 use hyprstream_rpc::registry::{global as registry, SocketKind};
-use hyprstream_rpc::service::{EnvelopeContext, ServiceHandle, ServiceRunner, ZmqService};
+use hyprstream_rpc::service::{EnvelopeContext, ZmqService};
 use hyprstream_rpc::transport::TransportConfig;
 
 use crate::config::{ImageConfig, PoolConfig};
@@ -46,6 +46,7 @@ const SERVICE_NAME: &str = "workers";
 ///
 /// Implements the ZmqService trait for integration with hyprstream's ZMQ infrastructure.
 pub struct WorkerService {
+    // Business logic
     /// Sandbox pool for VM management
     sandbox_pool: Arc<SandboxPool>,
 
@@ -63,10 +64,15 @@ pub struct WorkerService {
 
     /// Event publisher for lifecycle events (sandbox/container started/stopped)
     event_publisher: tokio::sync::Mutex<EventPublisher>,
+
+    // Infrastructure (for Spawnable)
+    context: Arc<zmq::Context>,
+    transport: TransportConfig,
+    verifying_key: VerifyingKey,
 }
 
 impl WorkerService {
-    /// Create a new WorkerService with full configuration
+    /// Create a new WorkerService with full configuration and infrastructure
     ///
     /// Must be called from within a tokio runtime context.
     pub fn new(
@@ -74,6 +80,8 @@ impl WorkerService {
         image_config: ImageConfig,
         rafs_store: Arc<RafsStore>,
         context: Arc<zmq::Context>,
+        transport: TransportConfig,
+        verifying_key: VerifyingKey,
     ) -> AnyhowResult<Self> {
         let sandbox_pool = Arc::new(SandboxPool::new(
             pool_config,
@@ -91,6 +99,9 @@ impl WorkerService {
             container_sandbox_map: RwLock::new(HashMap::new()),
             runtime_handle: tokio::runtime::Handle::current(),
             event_publisher: tokio::sync::Mutex::new(event_publisher),
+            context,
+            transport,
+            verifying_key,
         })
     }
 
@@ -103,6 +114,8 @@ impl WorkerService {
         rafs_store: Arc<RafsStore>,
         runtime_handle: tokio::runtime::Handle,
         context: Arc<zmq::Context>,
+        transport: TransportConfig,
+        verifying_key: VerifyingKey,
     ) -> AnyhowResult<Self> {
         let sandbox_pool = Arc::new(SandboxPool::new(
             pool_config,
@@ -120,6 +133,9 @@ impl WorkerService {
             container_sandbox_map: RwLock::new(HashMap::new()),
             runtime_handle,
             event_publisher: tokio::sync::Mutex::new(event_publisher),
+            context,
+            transport,
+            verifying_key,
         })
     }
 
@@ -882,6 +898,18 @@ impl ZmqService for WorkerService {
     fn name(&self) -> &str {
         "workers"
     }
+
+    fn context(&self) -> &Arc<zmq::Context> {
+        &self.context
+    }
+
+    fn transport(&self) -> &TransportConfig {
+        &self.transport
+    }
+
+    fn verifying_key(&self) -> VerifyingKey {
+        self.verifying_key
+    }
 }
 
 impl WorkerService {
@@ -1529,6 +1557,8 @@ fn build_fs_info_response(request_id: u64, usage: &[crate::image::FilesystemUsag
 mod tests {
     use super::*;
     use crate::runtime::PodSandboxState;
+    use hyprstream_rpc::crypto::generate_signing_keypair;
+    use hyprstream_rpc::transport::TransportConfig;
     use tempfile::TempDir;
 
     /// Create a test WorkerService with temporary directories
@@ -1561,8 +1591,10 @@ mod tests {
 
         // Create a zmq context for event publishing
         let context = Arc::new(zmq::Context::new());
+        let transport = TransportConfig::inproc("test-worker-service");
+        let (_, verifying_key) = generate_signing_keypair();
 
-        let service = WorkerService::new(pool_config, image_config, rafs_store, context)
+        let service = WorkerService::new(pool_config, image_config, rafs_store, context, transport, verifying_key)
             .expect("Failed to create WorkerService");
         (service, temp_dir)
     }

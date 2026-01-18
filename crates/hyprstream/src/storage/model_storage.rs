@@ -120,18 +120,18 @@ impl ModelStorage {
         // If PolicyService isn't running, policy checks will fail gracefully
         let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
 
-        // Start ZMQ-based registry service using unified pattern
-        let registry_service = RegistryService::new(&base_dir, policy_client.clone()).await
-            .map_err(|e| anyhow::anyhow!("Failed to create registry service: {}", e))?;
+        // Start ZMQ-based registry service using unified pattern (service includes infrastructure)
         let registry_transport = hyprstream_rpc::transport::TransportConfig::inproc("hyprstream/registry");
-        let registry_spawnable = hyprstream_rpc::service::as_spawnable(
-            registry_service,
-            registry_transport,
+        let registry_service = RegistryService::new(
+            &base_dir,
+            policy_client.clone(),
             crate::zmq::global_context().clone(),
+            registry_transport,
             verifying_key,
-        );
+        ).await
+            .map_err(|e| anyhow::anyhow!("Failed to create registry service: {}", e))?;
         let manager = hyprstream_rpc::service::InprocManager::new();
-        let _service_handle = manager.spawn(Box::new(registry_spawnable))
+        let _service_handle = manager.spawn(Box::new(registry_service))
             .await
             .map_err(|e| anyhow::anyhow!("Failed to start registry service: {}", e))?;
 

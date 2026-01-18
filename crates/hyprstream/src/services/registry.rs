@@ -7,7 +7,8 @@ use crate::auth::Operation;
 use crate::services::PolicyZmqClient;
 use crate::registry_capnp;
 use crate::services::rpc_types::{HealthStatus, RemoteInfo, RegistryResponse, WorktreeData};
-use crate::services::{EnvelopeContext, ServiceRunner, ZmqClient, ZmqService};
+use crate::services::{EnvelopeContext, ZmqClient, ZmqService};
+use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::{global as registry, SocketKind};
 use hyprstream_rpc::{serialize_message, FromCapnp};
@@ -476,6 +477,7 @@ impl RegistryClient for RegistryZmq {
 /// The registry is wrapped in RwLock for interior mutability since some operations
 /// (like clone) require mutable access but ZmqService::handle_request takes &self.
 pub struct RegistryService {
+    // Business logic
     registry: RwLock<Git2DB>,
     #[allow(dead_code)] // Future: base directory for relative path operations
     base_dir: PathBuf,
@@ -483,15 +485,22 @@ pub struct RegistryService {
     runtime_handle: tokio::runtime::Handle,
     /// Policy client for authorization checks (uses ZMQ to PolicyService)
     policy_client: PolicyZmqClient,
+    // Infrastructure (for Spawnable)
+    context: Arc<zmq::Context>,
+    transport: TransportConfig,
+    verifying_key: VerifyingKey,
 }
 
 impl RegistryService {
-    /// Create a new registry service
+    /// Create a new registry service with infrastructure
     ///
     /// Must be called from within a tokio runtime context.
     pub async fn new(
         base_dir: impl AsRef<Path>,
         policy_client: PolicyZmqClient,
+        context: Arc<zmq::Context>,
+        transport: TransportConfig,
+        verifying_key: VerifyingKey,
     ) -> Result<Self> {
         let base_dir = base_dir.as_ref().to_path_buf();
         let registry = Git2DB::open(&base_dir).await?;
@@ -503,6 +512,9 @@ impl RegistryService {
             base_dir,
             runtime_handle,
             policy_client,
+            context,
+            transport,
+            verifying_key,
         })
     }
 
@@ -1513,6 +1525,18 @@ impl ZmqService for RegistryService {
 
     fn name(&self) -> &str {
         "registry"
+    }
+
+    fn context(&self) -> &Arc<zmq::Context> {
+        &self.context
+    }
+
+    fn transport(&self) -> &TransportConfig {
+        &self.transport
+    }
+
+    fn verifying_key(&self) -> VerifyingKey {
+        self.verifying_key
     }
 }
 
@@ -2566,41 +2590,50 @@ mod tests {
 
     #[tokio::test]
     async fn test_registry_service_health_check() {
+        use hyprstream_rpc::service::InprocManager;
+        use hyprstream_rpc::transport::TransportConfig;
+
         let temp_dir = TempDir::new().expect("test: create temp dir");
+        let context = crate::zmq::global_context();
 
         // Generate keypair for signing/verification
         let (signing_key, verifying_key) = generate_signing_keypair();
 
         // Create a permissive policy manager and start PolicyService first
         let policy_manager = Arc::new(PolicyManager::permissive().await.expect("test: create policy manager"));
-        let _policy_handle = PolicyService::start_at(
+        let policy_transport = TransportConfig::inproc("test-policy-health");
+        let policy_service = PolicyService::new(
             policy_manager,
+            Arc::new(signing_key.clone()),
+            crate::config::TokenConfig::default(),
+            context.clone(),
+            policy_transport,
             verifying_key,
-            "inproc://test-policy",
-        )
-        .await
-        .expect("test: start policy service");
+        );
+        let manager = InprocManager::new();
+        let _policy_handle = manager.spawn(Box::new(policy_service)).await.expect("test: start policy service");
 
         // Create policy client for RegistryService
         let policy_client = PolicyZmqClient::with_endpoint(
-            "inproc://test-policy",
+            "inproc://test-policy-health",
             signing_key.clone(),
             RequestIdentity::local(),
         );
 
         // Start the registry service with policy client
-        let mut handle = RegistryService::start_at(
+        let registry_transport = TransportConfig::inproc("test-registry-health");
+        let registry_service = RegistryService::new(
             temp_dir.path(),
-            verifying_key,
             policy_client,
-            "inproc://test-registry",
-        )
-        .await
-        .expect("test: start registry service");
+            context.clone(),
+            registry_transport,
+            verifying_key,
+        ).await.expect("test: create registry service");
+        let mut handle = manager.spawn(Box::new(registry_service)).await.expect("test: start registry service");
 
         // Create signed client with matching key and local identity
         let client = RegistryZmqClient::with_endpoint(
-            "inproc://test-registry",
+            "inproc://test-registry-health",
             signing_key,
             RequestIdentity::local(),
         );
@@ -2609,6 +2642,6 @@ mod tests {
         assert!(result.is_ok(), "health_check should succeed: {:?}", result.err());
 
         // Stop the service
-        handle.stop().await;
+        let _ = handle.stop().await;
     }
 }

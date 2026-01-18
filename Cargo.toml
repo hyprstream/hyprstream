@@ -42,6 +42,7 @@ dashmap = "6.0"
 parking_lot = "0.12"
 lru = "0.16.1"
 once_cell = "1.19"
+inventory = "0.3"  # Compile-time registration for services
 
 # Path handling and security
 safe-path = "0.1"

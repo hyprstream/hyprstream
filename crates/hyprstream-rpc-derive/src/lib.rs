@@ -944,3 +944,77 @@ pub fn register_scopes(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     expanded.into()
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Service Factory Macro - #[service_factory]
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Attribute macro for service factory registration.
+///
+/// Automatically registers a service factory function with the inventory system,
+/// following the same pattern as `#[register_scopes]` for authorization scopes
+/// and `DriverFactory` for storage drivers.
+///
+/// # Usage
+///
+/// ```ignore
+/// use hyprstream_rpc::service::factory::ServiceContext;
+/// use hyprstream_rpc::service::spawner::Spawnable;
+/// use hyprstream_rpc_derive::service_factory;
+///
+/// #[service_factory("policy")]
+/// fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+///     // Services include infrastructure and are directly Spawnable
+///     let policy = PolicyService::new(
+///         ...,
+///         ctx.zmq_context(),
+///         ctx.transport("policy", SocketKind::Rep),
+///         ctx.verifying_key(),
+///     );
+///     Ok(Box::new(policy))
+/// }
+/// ```
+///
+/// # Generated Code
+///
+/// The macro generates:
+/// ```ignore
+/// fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+///     // ... original function body ...
+/// }
+///
+/// inventory::submit! {
+///     hyprstream_rpc::service::factory::ServiceFactory::new(
+///         "policy",
+///         create_policy_service
+///     )
+/// }
+/// ```
+///
+/// # Benefits
+///
+/// - ✅ DRY: Service factory declared once, auto-registered
+/// - ✅ Decentralized: Services own their registration (not in main.rs)
+/// - ✅ Self-documenting: All services discoverable via `list_factories()`
+/// - ✅ Matches existing patterns: Same as `#[register_scopes]` and `DriverFactory`
+#[proc_macro_attribute]
+pub fn service_factory(attr: TokenStream, item: TokenStream) -> TokenStream {
+    use syn::LitStr;
+
+    let name = parse_macro_input!(attr as LitStr);
+    let func = parse_macro_input!(item as syn::ItemFn);
+    let func_name = &func.sig.ident;
+
+    let expanded = quote! {
+        #func
+
+        inventory::submit! {
+            hyprstream_rpc::service::factory::ServiceFactory::new(
+                #name,
+                #func_name
+            )
+        }
+    };
+
+    expanded.into()
+}

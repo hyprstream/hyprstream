@@ -77,9 +77,9 @@ pub mod prelude {
         // Error
         EnvelopeError, EnvelopeResult, Result, RpcError,
         // Service
-        EnvelopeContext, ServiceHandle, ServiceRunner, ZmqClient, ZmqService,
+        EnvelopeContext, RequestLoop, ServiceHandle, ZmqClient, ZmqService,
         // Spawner
-        HandlerService, ProcessBackend, ProcessConfig, ProcessKind, ProcessSpawner,
+        ProcessBackend, ProcessConfig, ProcessKind, ProcessSpawner,
         ProxyService, ServiceKind, ServiceMode, ServiceSpawner,
         Spawnable, SpawnedProcess, SpawnedService, SpawnerBackend, StandaloneBackend,
         SystemdBackend,
@@ -124,10 +124,10 @@ pub use envelope::{
     ResponseEnvelope, SignedEnvelope, MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
 };
 pub use error::{EnvelopeError, EnvelopeResult, Result, RpcError};
-pub use hyprstream_rpc_derive::{authorize, register_scopes, rpc_method, FromCapnp, ToCapnp};
-pub use service::{EnvelopeContext, ServiceHandle, ServiceRunner, ZmqClient, ZmqService};
+pub use hyprstream_rpc_derive::{authorize, register_scopes, rpc_method, service_factory, FromCapnp, ToCapnp};
+pub use service::{EnvelopeContext, RequestLoop, ServiceHandle, ZmqClient, ZmqService};
 pub use service::spawner::{
-    HandlerService, ProcessBackend, ProcessConfig, ProcessKind, ProcessSpawner,
+    ProcessBackend, ProcessConfig, ProcessKind, ProcessSpawner,
     ProxyService, ServiceKind, ServiceMode, ServiceSpawner,
     Spawnable, SpawnedProcess, SpawnedService, SpawnerBackend, StandaloneBackend,
     SystemdBackend,

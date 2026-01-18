@@ -188,23 +188,19 @@ pub async fn handle_server(
         ..Default::default()
     };
 
-    // Start ModelService using unified pattern
+    // Start ModelService using unified pattern (service includes infrastructure)
+    let model_transport = hyprstream_rpc::transport::TransportConfig::inproc("hyprstream/model");
     let model_service = ModelService::new(
         model_service_config,
         signing_key.clone(),
-        verifying_key,
         policy_client.clone(),
         model_storage.clone(),
-    );
-    let model_transport = hyprstream_rpc::transport::TransportConfig::inproc("hyprstream/model");
-    let model_spawnable = hyprstream_rpc::service::as_spawnable(
-        model_service,
-        model_transport,
         crate::zmq::global_context().clone(),
+        model_transport,
         verifying_key,
     );
     let manager = hyprstream_rpc::service::InprocManager::new();
-    let _model_service_handle = manager.spawn(Box::new(model_spawnable)).await?;
+    let _model_service_handle = manager.spawn(Box::new(model_service)).await?;
 
     info!("ModelService started at {}", registry().endpoint("model", SocketKind::Rep).to_zmq_string());
 

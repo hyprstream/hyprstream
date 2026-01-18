@@ -25,87 +25,9 @@ use std::sync::Arc;
 
 // Re-export core types from hyprstream-rpc
 pub use hyprstream_rpc::service::{
-    EnvelopeContext, ServiceRunner as ServiceRunnerBase, ZmqClient as ZmqClientBase,
+    EnvelopeContext, RequestLoop as RequestLoopBase, ZmqClient as ZmqClientBase,
     ZmqService,
 };
-
-/// REQ/REP service runner with global ZMQ context.
-///
-/// This is a convenience wrapper around `hyprstream_rpc::ServiceRunner` that
-/// automatically uses the global ZMQ context for `inproc://` connectivity.
-///
-/// For direct context control, use `ServiceRunnerBase` from hyprstream-rpc.
-pub struct ServiceRunner {
-    inner: ServiceRunnerBase,
-}
-
-impl ServiceRunner {
-    /// Create a new service runner bound to the given endpoint.
-    ///
-    /// Uses the global ZMQ context for `inproc://` connectivity.
-    ///
-    /// # Arguments
-    ///
-    /// * `endpoint` - ZMQ endpoint (e.g., `inproc://hyprstream/registry`)
-    /// * `server_pubkey` - Server's Ed25519 public key for verifying request signatures
-    pub fn new(endpoint: &str, server_pubkey: VerifyingKey) -> Self {
-        Self {
-            inner: ServiceRunnerBase::new(
-                TransportConfig::from_endpoint(endpoint),
-                global_context(),
-                server_pubkey,
-            ),
-        }
-    }
-
-    /// Create a new service runner bound to the given transport configuration.
-    ///
-    /// Uses the global ZMQ context for `inproc://` connectivity.
-    /// Supports SystemdFd for socket activation.
-    ///
-    /// # Arguments
-    ///
-    /// * `transport` - Transport configuration (supports SystemdFd)
-    /// * `server_pubkey` - Server's Ed25519 public key for verifying request signatures
-    pub fn with_transport(transport: TransportConfig, server_pubkey: VerifyingKey) -> Self {
-        Self {
-            inner: ServiceRunnerBase::new(transport, global_context(), server_pubkey),
-        }
-    }
-
-    /// Create a service runner with a shared nonce cache.
-    ///
-    /// Use this when multiple services should share replay protection state.
-    pub fn with_nonce_cache(
-        endpoint: &str,
-        server_pubkey: VerifyingKey,
-        nonce_cache: Arc<InMemoryNonceCache>,
-    ) -> Self {
-        Self {
-            inner: ServiceRunnerBase::with_nonce_cache(
-                TransportConfig::from_endpoint(endpoint),
-                global_context(),
-                server_pubkey,
-                nonce_cache,
-            ),
-        }
-    }
-
-    /// Run the service as an async task
-    ///
-    /// This spawns an async task that:
-    /// 1. Creates a REP socket with TMQ (async I/O via epoll)
-    /// 2. Binds to the endpoint
-    /// 3. Loops receiving and verifying `SignedEnvelope` requests
-    /// 4. Dispatches to handler with verified `EnvelopeContext`
-    ///
-    /// Handler execution runs in spawn_blocking to avoid blocking the runtime.
-    /// Waits for socket binding to complete before returning.
-    /// Returns a handle that can be used to stop the service.
-    pub async fn run<S: ZmqService>(self, service: S) -> Result<ServiceHandle> {
-        self.inner.run(service).await
-    }
-}
 
 /// Authenticated ZMQ client with automatic request signing.
 ///
@@ -184,7 +106,18 @@ mod tests {
     use super::*;
     use hyprstream_rpc::crypto::generate_signing_keypair;
 
-    struct EchoService;
+    /// Test service with infrastructure (new pattern)
+    struct EchoService {
+        context: Arc<zmq::Context>,
+        transport: TransportConfig,
+        verifying_key: VerifyingKey,
+    }
+
+    impl EchoService {
+        fn new(context: Arc<zmq::Context>, transport: TransportConfig, verifying_key: VerifyingKey) -> Self {
+            Self { context, transport, verifying_key }
+        }
+    }
 
     impl ZmqService for EchoService {
         fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<Vec<u8>> {
@@ -198,22 +131,38 @@ mod tests {
         fn name(&self) -> &str {
             "echo"
         }
+
+        fn context(&self) -> &Arc<zmq::Context> {
+            &self.context
+        }
+
+        fn transport(&self) -> &TransportConfig {
+            &self.transport
+        }
+
+        fn verifying_key(&self) -> VerifyingKey {
+            self.verifying_key
+        }
     }
 
     #[tokio::test]
-    async fn test_service_runner() {
-        let endpoint = "inproc://test-echo-service";
+    async fn test_request_loop() {
+        let transport = TransportConfig::inproc("test-echo-service-core");
+        let endpoint = transport.zmq_endpoint();
 
         // Generate keypair for this test
         let (signing_key, verifying_key) = generate_signing_keypair();
 
-        // Start the service (waits for socket binding)
-        let runner = ServiceRunner::new(endpoint, verifying_key);
-        let mut handle = runner.run(EchoService).await.expect("test: start service");
+        // Create service with infrastructure
+        let service = EchoService::new(global_context(), transport.clone(), verifying_key);
+
+        // Start the service using RequestLoop from hyprstream-rpc
+        let runner = RequestLoopBase::new(transport, global_context(), verifying_key);
+        let mut handle = runner.run(service).await.expect("test: start service");
 
         // Use ZmqClient directly (handles signing internally)
-        let client = ZmqClient::new(endpoint, signing_key, RequestIdentity::local());
-        let response = client.call(b"hello".to_vec()).await.expect("test: call");
+        let client = ZmqClient::new(&endpoint, signing_key, RequestIdentity::local());
+        let response = client.call(b"hello".to_vec(), None).await.expect("test: call");
 
         // Response should start with "from <user>:"
         let response_str = String::from_utf8_lossy(&response);
@@ -225,19 +174,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_signature_rejected() {
-        let endpoint = "inproc://test-invalid-sig";
+        let transport = TransportConfig::inproc("test-invalid-sig-core");
+        let endpoint = transport.zmq_endpoint();
 
         // Generate two keypairs - use one to sign, verify with other
         let (signing_key, _) = generate_signing_keypair();
         let (_, wrong_verifying_key) = generate_signing_keypair();
 
-        // Start the service with wrong key (waits for socket binding)
-        let runner = ServiceRunner::new(endpoint, wrong_verifying_key);
-        let mut handle = runner.run(EchoService).await.expect("test: start service");
+        // Create service (verifying_key here doesn't matter - RequestLoop uses its own)
+        let service = EchoService::new(global_context(), transport.clone(), wrong_verifying_key);
+
+        // Start the service with wrong key
+        let runner = RequestLoopBase::new(transport, global_context(), wrong_verifying_key);
+        let mut handle = runner.run(service).await.expect("test: start service");
 
         // Sign with different key than service expects
-        let client = ZmqClient::new(endpoint, signing_key, RequestIdentity::local());
-        let response = client.call(b"should fail".to_vec()).await.expect("test: call");
+        let client = ZmqClient::new(&endpoint, signing_key, RequestIdentity::local());
+        let response = client.call(b"should fail".to_vec(), None).await.expect("test: call");
 
         // Response should be empty (verification failure)
         assert!(response.is_empty(), "Invalid signature should return empty response");

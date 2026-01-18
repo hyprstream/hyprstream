@@ -572,9 +572,7 @@ mod tests {
         {
             let _reg = ServiceRegistration::new(
                 "test-service",
-                TransportConfig::Inproc {
-                    endpoint: "custom/endpoint".to_string(),
-                },
+                TransportConfig::inproc("custom/endpoint"),
                 Some("Test service"),
             )
             .unwrap();
@@ -598,12 +596,8 @@ mod tests {
             let _reg = ServiceRegistration::multi(
                 "model",
                 vec![
-                    (SocketKind::Rep, TransportConfig::Inproc {
-                        endpoint: "model/rep".to_string(),
-                    }),
-                    (SocketKind::Router, TransportConfig::Inproc {
-                        endpoint: "model/router".to_string(),
-                    }),
+                    (SocketKind::Rep, TransportConfig::inproc("model/rep")),
+                    (SocketKind::Router, TransportConfig::inproc("model/router")),
                 ],
                 Some("Model service"),
             )
@@ -635,9 +629,7 @@ mod tests {
         let registry = global();
         registry.register_rep(
             "compat-service",
-            TransportConfig::Inproc {
-                endpoint: "compat/endpoint".to_string(),
-            },
+            TransportConfig::inproc("compat/endpoint"),
             None,
         );
 
@@ -663,12 +655,8 @@ mod tests {
         reset_registry();
         init(EndpointMode::Inproc, None);
 
-        global().register("svc1", SocketKind::Rep, TransportConfig::Inproc {
-            endpoint: "a".to_string(),
-        }, None);
-        global().register("svc2", SocketKind::Router, TransportConfig::Inproc {
-            endpoint: "b".to_string(),
-        }, None);
+        global().register("svc1", SocketKind::Rep, TransportConfig::inproc("a"), None);
+        global().register("svc2", SocketKind::Router, TransportConfig::inproc("b"), None);
 
         let services = global().list_services();
         assert!(services.contains(&"svc1".to_string()));

@@ -6,7 +6,7 @@
 //! # Security
 //!
 //! All requests are wrapped in `SignedEnvelope` for authentication:
-//! - `ServiceRunner` verifies Ed25519 signatures before dispatching
+//! - `RequestLoop` verifies Ed25519 signatures before dispatching
 //! - Handlers receive `EnvelopeContext` with verified identity
 //! - Services use `ctx.casbin_subject()` for policy checks
 //!
@@ -24,15 +24,22 @@
 //!
 //! # Usage
 //!
+//! Services implement `ZmqService` with infrastructure methods and are automatically
+//! `Spawnable` via blanket impl:
+//!
 //! ```rust,ignore
 //! use crate::services::{EnvelopeContext, ZmqService};
 //! use hyprstream_rpc::prelude::*;
-//! use hyprstream_rpc::service::{as_spawnable, InprocManager, ServiceManager};
+//! use hyprstream_rpc::service::{InprocManager, ServiceManager, Spawnable};
 //! use hyprstream_rpc::transport::TransportConfig;
 //! use std::sync::Arc;
 //!
-//! // Define a service
-//! struct MyService;
+//! // Define a service with infrastructure
+//! struct MyService {
+//!     context: Arc<zmq::Context>,
+//!     transport: TransportConfig,
+//!     verifying_key: VerifyingKey,
+//! }
 //!
 //! impl ZmqService for MyService {
 //!     fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<Vec<u8>> {
@@ -41,21 +48,19 @@
 //!         Ok(vec![])
 //!     }
 //!
-//!     fn name(&self) -> &str {
-//!         "my-service"
-//!     }
+//!     fn name(&self) -> &str { "my-service" }
+//!     fn context(&self) -> &Arc<zmq::Context> { &self.context }
+//!     fn transport(&self) -> &TransportConfig { &self.transport }
+//!     fn verifying_key(&self) -> VerifyingKey { self.verifying_key }
 //! }
 //!
-//! // Run the service using unified pattern
-//! let service = MyService;
-//! let transport = TransportConfig::inproc("my-service");
-//! let context = Arc::new(zmq::Context::new());
-//! let spawnable = as_spawnable(service, transport, context, verifying_key);
+//! // Services are directly Spawnable - no wrapping needed!
+//! let service = MyService { context, transport, verifying_key };
 //! let manager = InprocManager::new();
-//! let handle = manager.spawn(Box::new(spawnable)).await?;
+//! let handle = manager.spawn(Box::new(service)).await?;
 //!
 //! // Connect a client (signing is automatic)
-//! let client = ZmqClient::new("inproc://my-service", signing_key, identity);
+//! let client = ZmqClient::new("inproc://my-service", context, signing_key, identity);
 //! let response = client.call(payload, None).await?;
 //!
 //! // Stop the service
@@ -65,6 +70,7 @@
 mod core;
 mod traits;
 pub mod callback;
+pub mod factories;
 pub mod inference;
 pub mod model;
 pub mod policy;
@@ -74,7 +80,7 @@ pub mod stream;
 pub mod worker;
 
 pub use core::{
-    EnvelopeContext, ServiceRunner, ZmqClient, ZmqService,
+    EnvelopeContext, ZmqClient, ZmqService,
 };
 
 pub use traits::{
