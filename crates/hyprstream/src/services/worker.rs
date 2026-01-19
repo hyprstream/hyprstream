@@ -39,7 +39,7 @@ pub use hyprstream_workers::runtime::{
 };
 
 /// Service name for endpoint registry
-const SERVICE_NAME: &str = "workers";
+const SERVICE_NAME: &str = "worker";
 
 // ============================================================================
 // RuntimeOps Extension Trait

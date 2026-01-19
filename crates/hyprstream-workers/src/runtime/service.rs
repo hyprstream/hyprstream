@@ -40,7 +40,7 @@ use super::sandbox::{PodSandbox, PodSandboxConfig};
 use super::{RUNTIME_NAME, RUNTIME_VERSION};
 
 /// Service name for endpoint registry
-const SERVICE_NAME: &str = "workers";
+const SERVICE_NAME: &str = "worker";
 
 /// WorkerService handles CRI RuntimeClient and ImageClient requests
 ///
@@ -896,7 +896,7 @@ impl ZmqService for WorkerService {
     }
 
     fn name(&self) -> &str {
-        "workers"
+        SERVICE_NAME
     }
 
     fn context(&self) -> &Arc<zmq::Context> {
