@@ -29,7 +29,7 @@ pub use git_handlers::{handle_commit, handle_merge, handle_push, MergeOptions};
 pub use training_handlers::{
     handle_training_batch, handle_training_checkpoint, handle_training_infer, handle_training_init,
 };
-pub use handlers::{handle_config, handle_server, FlightServerConfig};
+pub use handlers::handle_config;
 pub use worktree_handlers::{
     handle_worktree_add, handle_worktree_info, handle_worktree_list, handle_worktree_remove,
 };

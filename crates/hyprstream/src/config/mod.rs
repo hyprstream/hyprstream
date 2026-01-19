@@ -67,6 +67,14 @@ pub struct HyprConfig {
     /// JWT token configuration
     #[serde(default)]
     pub token: TokenConfig,
+
+    /// OpenAI-compatible HTTP API configuration
+    #[serde(default)]
+    pub oai: OAIConfig,
+
+    /// Arrow Flight SQL server configuration
+    #[serde(default)]
+    pub flight: FlightConfig,
 }
 
 /// JWT token issuance configuration
@@ -90,6 +98,90 @@ impl Default for TokenConfig {
 
 fn default_token_ttl() -> u32 { 300 }
 fn default_max_token_ttl() -> u32 { 3600 }
+
+/// OpenAI-compatible HTTP API configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAIConfig {
+    /// Host address for HTTP server
+    #[serde(default = "default_oai_host")]
+    pub host: String,
+
+    /// Port for HTTP server
+    #[serde(default = "default_oai_port")]
+    pub port: u16,
+
+    /// TLS certificate path (optional)
+    #[serde(default)]
+    pub tls_cert: Option<PathBuf>,
+
+    /// TLS private key path (optional)
+    #[serde(default)]
+    pub tls_key: Option<PathBuf>,
+
+    /// Request timeout in seconds
+    #[serde(default = "default_oai_timeout")]
+    pub request_timeout_secs: u64,
+
+    /// CORS configuration
+    #[serde(default)]
+    pub cors: server::CorsConfig,
+}
+
+impl Default for OAIConfig {
+    fn default() -> Self {
+        Self {
+            host: default_oai_host(),
+            port: default_oai_port(),
+            tls_cert: None,
+            tls_key: None,
+            request_timeout_secs: default_oai_timeout(),
+            cors: server::CorsConfig::default(),
+        }
+    }
+}
+
+fn default_oai_host() -> String { "0.0.0.0".to_string() }
+fn default_oai_port() -> u16 { 8080 }
+fn default_oai_timeout() -> u64 { 300 }
+
+/// Arrow Flight SQL server configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlightConfig {
+    /// Host address for Flight SQL server
+    #[serde(default = "default_flight_host")]
+    pub host: String,
+
+    /// Port for Flight SQL server
+    #[serde(default = "default_flight_port")]
+    pub port: u16,
+
+    /// Default dataset to serve (optional)
+    #[serde(default)]
+    pub default_dataset: Option<String>,
+
+    /// TLS certificate path (optional)
+    #[serde(default)]
+    pub tls_cert: Option<PathBuf>,
+
+    /// TLS private key path (optional)
+    #[serde(default)]
+    pub tls_key: Option<PathBuf>,
+}
+
+impl Default for FlightConfig {
+    fn default() -> Self {
+        Self {
+            host: default_flight_host(),
+            port: default_flight_port(),
+            default_dataset: None,
+            tls_cert: None,
+            tls_key: None,
+        }
+    }
+}
+
+fn default_flight_host() -> String { "0.0.0.0".to_string() }
+fn default_flight_port() -> u16 { 50051 }
 
 /// Storage paths and directories configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +255,8 @@ fn default_startup_services() -> Vec<String> {
         "streams".to_string(),   // Streaming proxy with JWT validation
         "worker".to_string(),    // Container workloads
         "model".to_string(),     // Model management
+        "oai".to_string(),       // OpenAI-compatible HTTP API
+        "flight".to_string(),    // Arrow Flight SQL server
     ]
 }
 
@@ -343,6 +437,8 @@ pub struct HyprConfigBuilder {
     worker: Option<hyprstream_workers::config::WorkerConfig>,
     services: ServicesConfig,
     token: TokenConfig,
+    oai: OAIConfig,
+    flight: FlightConfig,
 }
 
 impl HyprConfigBuilder {
@@ -359,6 +455,8 @@ impl HyprConfigBuilder {
             worker: None,
             services: ServicesConfig::default(),
             token: TokenConfig::default(),
+            oai: OAIConfig::default(),
+            flight: FlightConfig::default(),
         }
     }
 
@@ -375,6 +473,8 @@ impl HyprConfigBuilder {
             worker: config.worker,
             services: config.services,
             token: config.token,
+            oai: config.oai,
+            flight: config.flight,
         }
     }
 
@@ -403,6 +503,8 @@ impl HyprConfigBuilder {
             worker: self.worker,
             services: self.services,
             token: self.token,
+            oai: self.oai,
+            flight: self.flight,
         }
     }
 

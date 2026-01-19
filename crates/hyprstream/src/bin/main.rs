@@ -10,7 +10,6 @@ use tracing::info;
 // Core application imports
 use hyprstream_core::auth::PolicyManager;
 use hyprstream_core::cli::commands::{Commands, ExecutionMode, TrainingAction};
-use hyprstream_core::cli::handlers::handle_server;
 use hyprstream_core::cli::{
     handle_branch, handle_checkout, handle_clone, handle_infer, handle_info,
     handle_list, handle_policy_apply, handle_policy_apply_template,
@@ -152,16 +151,6 @@ where
     }
 }
 
-/// Server command handler - requires multi-threaded runtime for GPU
-async fn handle_server_cmd(
-    ctx: AppContext,
-    flight_config: Option<hyprstream_core::cli::FlightServerConfig>,
-) -> Result<()> {
-    handle_server(ctx, flight_config)
-        .await
-        .map_err(|e| anyhow::anyhow!("{}", e))
-}
-
 #[cfg(feature = "otel")]
 /// Telemetry provider type
 #[derive(Debug, Clone, Copy)]
@@ -278,8 +267,8 @@ fn main() -> Result<()> {
     {
         // Determine telemetry provider based on command
         let telemetry_provider = match &cli.command {
-            Commands::Server(_) => TelemetryProvider::Otlp, // Server uses OTLP
-            _ => TelemetryProvider::Stdout,                 // All CLI commands use stdout
+            Commands::Service { .. } => TelemetryProvider::Otlp, // Services use OTLP
+            _ => TelemetryProvider::Stdout,                      // CLI commands use stdout
         };
 
         // Initialize OpenTelemetry based on environment
@@ -338,7 +327,7 @@ fn main() -> Result<()> {
     {
         // Simple logging without OpenTelemetry support
         let default_log_level = match &cli.command {
-            Commands::Server(_) => "hyprstream=info",
+            Commands::Service { .. } => "hyprstream=info",
             _ => "hyprstream=warn",
         };
 
@@ -536,49 +525,6 @@ fn main() -> Result<()> {
 
     // Handle commands with appropriate runtime configuration
     match cli.command {
-        Commands::Server(cmd) => {
-            // Daemonize BEFORE creating tokio runtime if --detach is specified
-            // This must happen before any async code runs
-            hyprstream_core::cli::daemon::maybe_daemonize(
-                cmd.detach,
-                cmd.server.working_dir.clone(),
-                cmd.server.pid_file.clone(),
-            )?;
-
-            // Load base config from files
-            let mut config = load_config(cli.config.as_deref())?;
-
-            // Merge CLI server arguments into config using apply_to_builder
-            config.server = cmd.server.apply_to_builder(config.server.to_builder())
-                .build();
-
-            // Apply GPU device setting from CLI if specified
-            if let Some(gpu_device) = cli.gpu_device {
-                config.runtime.gpu_device_id = Some(gpu_device);
-                info!("Using GPU device {} from CLI", gpu_device);
-            }
-
-            // Create Flight SQL server config if dataset is specified
-            let flight_config = cmd.dataset.as_ref().map(|dataset| {
-                hyprstream_core::cli::FlightServerConfig {
-                    dataset: Some(dataset.clone()),
-                    port: cmd.flight_port,
-                    host: cmd.flight_host.clone(),
-                }
-            });
-
-            // Create context with merged config and shared registry client
-            let ctx = AppContext::with_client(config, registry_client.clone());
-
-            let ctx = ctx.clone();
-            with_runtime(
-                RuntimeConfig {
-                    device: DeviceConfig::request_gpu(),
-                    multi_threaded: true,
-                },
-                || handle_server_cmd(ctx, flight_config),
-            )?
-        }
         // Phase 1: Git-style commands
         Commands::Branch { model, name, from, policy } => {
             let ctx = ctx.clone();

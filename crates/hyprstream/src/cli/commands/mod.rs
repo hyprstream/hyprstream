@@ -3,14 +3,12 @@ pub mod config;
 pub mod flight;
 pub mod git;
 pub mod policy;
-pub mod server;
 pub mod training;
 pub mod worker;
 
 pub use flight::FlightArgs;
 pub use git::{GitAction, GitCommand};
 pub use policy::{PolicyCommand, TokenCommand};
-pub use server::{ServerCliArgs, ServerCommand};
 pub use training::{TrainingAction, TrainingCommand};
 pub use worker::{ImageCommand, WorkerAction, WorkerCommand};
 
@@ -117,9 +115,6 @@ impl std::fmt::Display for ExecutionMode {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Start the Hyprstream server
-    Server(ServerCommand),
-
     /// Flight SQL client to query datasets
     Flight(FlightArgs),
 

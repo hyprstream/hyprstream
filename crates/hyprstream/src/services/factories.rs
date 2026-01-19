@@ -243,3 +243,104 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 
     Ok(Box::new(worker_service))
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// OAI Service Factory
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Factory for OAIService (OpenAI-compatible HTTP API)
+///
+/// This service provides the HTTP API for inference requests.
+/// It communicates with ModelService and PolicyService via ZMQ.
+#[service_factory("oai")]
+fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+    info!("Creating OAIService");
+
+    use crate::config::HyprConfig;
+    use crate::server::state::ServerState;
+    use crate::services::{ModelZmqClient, OAIService};
+
+    // Load full config for OAI settings
+    let config = HyprConfig::load().unwrap_or_default();
+
+    // Create ZMQ clients for Model and Policy services
+    let model_client = ModelZmqClient::new(ctx.signing_key().clone(), RequestIdentity::local());
+    let policy_client = PolicyZmqClient::new(ctx.signing_key().clone(), RequestIdentity::local());
+
+    // Create registry client
+    let registry_client = Arc::new(RegistryZmqClient::new(
+        ctx.signing_key().clone(),
+        RequestIdentity::local(),
+    )) as Arc<dyn RegistryClient>;
+
+    // Create model storage
+    let model_storage = Arc::new(ModelStorage::new(
+        registry_client,
+        ctx.models_dir().to_path_buf(),
+    ));
+
+    // Create server state (blocking since we're in sync context)
+    let server_state = tokio::task::block_in_place(|| {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(ServerState::new(
+            config.server.clone(),
+            model_client,
+            policy_client,
+            model_storage,
+            ctx.signing_key().clone(),
+        ))
+    })
+    .context("Failed to create server state")?;
+
+    let oai_service = OAIService::new(
+        config.oai.clone(),
+        server_state,
+        global_context(),
+        ctx.transport("oai", SocketKind::Rep),
+        ctx.verifying_key(),
+    );
+
+    Ok(Box::new(oai_service))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Flight Service Factory
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Factory for FlightService (Arrow Flight SQL server)
+///
+/// This service provides Flight SQL protocol for dataset queries.
+/// It optionally uses RegistryClient for dataset lookup.
+#[service_factory("flight")]
+fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+    info!("Creating FlightService");
+
+    use crate::config::HyprConfig;
+    use crate::services::FlightService;
+
+    // Load full config for Flight settings
+    let config = HyprConfig::load().unwrap_or_default();
+
+    // Create registry client for dataset lookup (if default_dataset is configured)
+    // RegistryZmqClient already implements hyprstream_metrics::RegistryClient
+    let registry_client: Option<Arc<dyn hyprstream_metrics::RegistryClient>> =
+        if config.flight.default_dataset.is_some() {
+            let zmq_client = RegistryZmqClient::new(
+                ctx.signing_key().clone(),
+                RequestIdentity::local(),
+            );
+            Some(Arc::new(zmq_client))
+        } else {
+            None
+        };
+
+    let flight_service = FlightService::new(
+        config.flight.clone(),
+        registry_client,
+        global_context(),
+        ctx.transport("flight", SocketKind::Rep),
+        ctx.verifying_key(),
+    );
+
+    Ok(Box::new(flight_service))
+}

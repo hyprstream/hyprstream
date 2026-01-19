@@ -71,8 +71,10 @@ mod core;
 mod traits;
 pub mod callback;
 pub mod factories;
+pub mod flight;
 pub mod inference;
 pub mod model;
+pub mod oai;
 pub mod policy;
 pub mod registry;
 pub mod rpc_types;
@@ -98,4 +100,6 @@ pub use model::{
 };
 pub use stream::StreamService;
 pub use worker::WorkerClient;
+pub use oai::OAIService;
+pub use flight::FlightService;
 pub use callback::{CallbackRouter, Instance};
