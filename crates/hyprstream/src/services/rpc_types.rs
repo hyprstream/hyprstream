@@ -501,6 +501,23 @@ impl InferenceResponse {
         bytes
     }
 
+    /// Build a stream authorized response.
+    ///
+    /// Sent in response to StartStream to confirm stream subscription is authorized.
+    /// Future: will include server's ephemeral public key for DH key exchange.
+    pub fn stream_authorized(request_id: u64, stream_id: &str) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<inference_capnp::inference_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut auth_response = response.init_stream_authorized();
+        auth_response.set_stream_id(stream_id);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
     /// Build a model info response.
     pub fn model_info(request_id: u64, info: &ModelInfo, has_lora: bool) -> Vec<u8> {
         let mut msg = Builder::new_default();

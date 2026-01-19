@@ -504,6 +504,13 @@ impl ServiceHandle {
 /// This is the unified client for all ZMQ-based services. All requests are
 /// automatically wrapped in `SignedEnvelope` for authentication.
 ///
+/// # Resilience
+///
+/// Uses a persistent socket with ZMQ's built-in reliability features:
+/// - `ZMQ_REQ_RELAXED`: Allows sending new requests after timeout (no stuck state)
+/// - `ZMQ_REQ_CORRELATE`: Matches replies to requests automatically
+/// - `ZMQ_RECONNECT_IVL/MAX`: Automatic reconnection with exponential backoff
+///
 /// # Usage
 ///
 /// Use extension traits (`RegistryOps`, `InferenceOps`) to add service-specific
@@ -526,6 +533,9 @@ pub struct ZmqClient {
     identity: RequestIdentity,
     /// Monotonic request ID counter
     request_id: AtomicU64,
+    /// Persistent socket wrapped in TMQ RequestSender (protected by async mutex)
+    /// Using Option to allow re-initialization on connection errors
+    sender: tokio::sync::Mutex<Option<RequestSender>>,
 }
 
 /// Calculate ZMQ timeout using min() of multiple constraints.
@@ -576,24 +586,90 @@ fn calculate_timeout(
 impl ZmqClient {
     /// Create a new client with signing credentials.
     ///
+    /// Creates a persistent socket with ZMQ's reliability options enabled:
+    /// - `ZMQ_REQ_RELAXED`: Don't get stuck waiting for replies
+    /// - `ZMQ_REQ_CORRELATE`: Match replies to requests
+    /// - Auto-reconnect with exponential backoff (100ms to 5s)
+    ///
     /// # Arguments
     /// * `endpoint` - ZMQ endpoint (e.g., `inproc://hyprstream/registry`)
     /// * `context` - ZMQ context (must be shared for inproc:// to work)
     /// * `signing_key` - Ed25519 signing key for request authentication
     /// * `identity` - Identity to include in requests (for authorization)
+    ///
+    /// # Errors
+    /// Returns error if socket creation or connection fails.
     pub fn new(
         endpoint: &str,
         context: Arc<zmq::Context>,
         signing_key: SigningKey,
         identity: RequestIdentity,
     ) -> Self {
+        // Socket is lazily initialized on first call to allow construction without errors
         Self {
             endpoint: endpoint.to_string(),
             context,
             signing_key,
             identity,
             request_id: AtomicU64::new(1),
+            sender: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Create and configure a new REQ socket with resilience options.
+    fn create_socket(&self) -> Result<zmq::Socket> {
+        let socket = self.context.socket(zmq::REQ)
+            .map_err(|e| anyhow!("Failed to create REQ socket: {}", e))?;
+
+        // Enable relaxed REQ mode - allows sending new request after timeout
+        // without getting stuck in send/recv state machine
+        socket.set_req_relaxed(true)
+            .map_err(|e| anyhow!("Failed to set REQ_RELAXED: {}", e))?;
+
+        // Enable request correlation - ZMQ automatically matches replies to requests
+        // Required when using REQ_RELAXED to handle out-of-order/late replies
+        socket.set_req_correlate(true)
+            .map_err(|e| anyhow!("Failed to set REQ_CORRELATE: {}", e))?;
+
+        // Auto-reconnect settings for resilience
+        socket.set_reconnect_ivl(100)  // Start with 100ms
+            .map_err(|e| anyhow!("Failed to set reconnect interval: {}", e))?;
+        socket.set_reconnect_ivl_max(5000)  // Max 5s with exponential backoff
+            .map_err(|e| anyhow!("Failed to set max reconnect interval: {}", e))?;
+
+        // Don't block on close
+        socket.set_linger(0)
+            .map_err(|e| anyhow!("Failed to set linger: {}", e))?;
+
+        // Connect to endpoint
+        socket.connect(&self.endpoint)
+            .map_err(|e| anyhow!("Failed to connect to {}: {}", self.endpoint, e))?;
+
+        debug!("ZmqClient connected to {} with REQ_RELAXED+REQ_CORRELATE", self.endpoint);
+
+        Ok(socket)
+    }
+
+    /// Get or create the RequestSender, reconnecting if necessary.
+    async fn get_or_create_sender(&self) -> Result<RequestSender> {
+        let mut guard = self.sender.lock().await;
+
+        if let Some(sender) = guard.take() {
+            return Ok(sender);
+        }
+
+        // Create new socket and wrap with TMQ
+        let socket = self.create_socket()?;
+        let sender = RequestSender::from_zmq_socket(socket)
+            .map_err(|e| anyhow!("Failed to wrap socket in TMQ: {}", e))?;
+
+        Ok(sender)
+    }
+
+    /// Store the sender for reuse after a successful call.
+    async fn store_sender(&self, sender: RequestSender) {
+        let mut guard = self.sender.lock().await;
+        *guard = Some(sender);
     }
 
     /// Get the next request ID (monotonically increasing).
@@ -626,32 +702,21 @@ impl ZmqClient {
     /// All requests are automatically wrapped in `SignedEnvelope`.
     /// This ensures every call is authenticated - no bypass possible.
     ///
+    /// Uses a persistent socket with automatic reconnection. If the service
+    /// is temporarily unavailable, ZMQ will automatically reconnect when it
+    /// becomes available.
+    ///
     /// # Arguments
     /// * `payload` - Request payload bytes
     /// * `timeout_ms` - Optional explicit timeout in milliseconds (defaults to 30s)
     ///
-    /// Uses TMQ with the provided context for proper `inproc://` support.
+    /// # Resilience
+    /// - Socket auto-reconnects if connection is lost
+    /// - REQ_RELAXED prevents getting stuck if reply is lost
+    /// - On timeout, socket is reset and will be recreated on next call
     pub async fn call(&self, payload: Vec<u8>, timeout_ms: Option<i32>) -> Result<Vec<u8>> {
         let signed = self.sign_request(payload)?;
-
-        // Calculate timeout (no JWT or requested lifetime for regular calls)
         let timeout = calculate_timeout(timeout_ms, None, None);
-
-        // Create raw REQ socket to set timeout before wrapping with TMQ
-        let req_socket = self.context.socket(zmq::REQ)
-            .map_err(|e| anyhow!("Failed to create REQ socket: {}", e))?;
-
-        // Set receive timeout to prevent indefinite hangs
-        req_socket.set_rcvtimeo(timeout)
-            .map_err(|e| anyhow!("Failed to set receive timeout: {}", e))?;
-
-        // Connect to endpoint
-        req_socket.connect(&self.endpoint)
-            .map_err(|e| anyhow!("Failed to connect to {}: {}", self.endpoint, e))?;
-
-        // Wrap with TMQ RequestSender for async I/O
-        let sender = RequestSender::from_zmq_socket(req_socket)
-            .map_err(|e| anyhow!("Failed to wrap socket in TMQ: {}", e))?;
 
         trace!(
             "ZmqClient sending {} bytes to {} (timeout: {}ms)",
@@ -660,27 +725,48 @@ impl ZmqClient {
             timeout
         );
 
+        // Get or create the persistent sender
+        let sender = self.get_or_create_sender().await?;
+
         // TMQ REQ pattern: send returns RequestReceiver
-        let mut receiver = sender
+        let receiver = sender
             .send(tmq::Multipart::from(vec![signed]))
             .await
-            .map_err(|e| anyhow!("Failed to send request: {}", e))?;
+            .map_err(|e| anyhow!("Failed to send request to {}: {}", self.endpoint, e))?;
 
-        // Receive response (will timeout based on calculated timeout)
-        let (response, _sender) = receiver
-            .recv()
-            .await
-            .map_err(|e| anyhow!("Failed to receive response: {}", e))?;
+        // Receive response with timeout
+        // Use tokio::time::timeout since ZMQ socket timeout may not work with TMQ async
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(timeout as u64),
+            receiver.recv()
+        ).await;
 
-        // Extract bytes from multipart message
-        let bytes: Vec<u8> = response
-            .into_iter()
-            .flat_map(|frame| frame.to_vec())
-            .collect();
+        match result {
+            Ok(Ok((response, sender))) => {
+                // Success - store sender for reuse
+                self.store_sender(sender).await;
 
-        trace!("ZmqClient received {} bytes", bytes.len());
+                // Extract bytes from multipart message
+                let bytes: Vec<u8> = response
+                    .into_iter()
+                    .flat_map(|frame| frame.to_vec())
+                    .collect();
 
-        Ok(bytes)
+                trace!("ZmqClient received {} bytes from {}", bytes.len(), self.endpoint);
+                Ok(bytes)
+            }
+            Ok(Err(e)) => {
+                // Recv error - don't store sender, will recreate on next call
+                warn!("ZmqClient recv error from {}: {}", self.endpoint, e);
+                Err(anyhow!("Failed to receive response from {}: {}", self.endpoint, e))
+            }
+            Err(_) => {
+                // Timeout - don't store sender (it's stuck with the receiver)
+                // REQ_RELAXED allows the next call to work with a fresh socket
+                warn!("ZmqClient timeout after {}ms waiting for {}", timeout, self.endpoint);
+                Err(anyhow!("Request to {} timed out after {}ms", self.endpoint, timeout))
+            }
+        }
     }
 
     /// Call service with user JWT context (for authorization).
@@ -690,7 +776,7 @@ impl ZmqClient {
     ///
     /// # Arguments
     /// * `payload` - Request payload bytes
-    /// * `jwt_token` - JWT token string from user context
+    /// * `claims` - User claims to embed in the request
     /// * `timeout_ms` - Optional explicit timeout in milliseconds (defaults to 30s)
     /// * `requested_lifetime_ms` - Optional requested lifetime for this request
     ///
@@ -698,10 +784,8 @@ impl ZmqClient {
     /// Response bytes from the service
     ///
     /// # Security
-    /// The JWT token is embedded in the signed envelope and independently
-    /// verified by the receiving service. This provides defense-in-depth:
-    /// - Envelope signature proves service identity
-    /// - JWT signature proves user authorization
+    /// The Claims are embedded in the signed envelope and protected by the
+    /// envelope signature. Services receive already-verified claims.
     ///
     /// # Timeout Calculation
     /// The timeout is calculated as `min()` of:
@@ -716,26 +800,8 @@ impl ZmqClient {
         timeout_ms: Option<i32>,
         requested_lifetime_ms: Option<i32>,
     ) -> Result<Vec<u8>> {
-        // Calculate timeout using claims expiration
         let timeout = calculate_timeout(timeout_ms, requested_lifetime_ms, Some(&claims));
-
         let signed = self.sign_request_with_context(payload, claims)?;
-
-        // Create raw REQ socket to set timeout before wrapping with TMQ
-        let req_socket = self.context.socket(zmq::REQ)
-            .map_err(|e| anyhow!("Failed to create REQ socket: {}", e))?;
-
-        // Set receive timeout based on calculated timeout
-        req_socket.set_rcvtimeo(timeout)
-            .map_err(|e| anyhow!("Failed to set receive timeout: {}", e))?;
-
-        // Connect to endpoint
-        req_socket.connect(&self.endpoint)
-            .map_err(|e| anyhow!("Failed to connect to {}: {}", self.endpoint, e))?;
-
-        // Wrap with TMQ RequestSender for async I/O
-        let sender = RequestSender::from_zmq_socket(req_socket)
-            .map_err(|e| anyhow!("Failed to wrap socket in TMQ: {}", e))?;
 
         trace!(
             "ZmqClient sending {} bytes to {} (with user context, timeout: {}ms)",
@@ -744,27 +810,43 @@ impl ZmqClient {
             timeout
         );
 
+        // Get or create the persistent sender
+        let sender = self.get_or_create_sender().await?;
+
         // TMQ REQ pattern: send returns RequestReceiver
-        let mut receiver = sender
+        let receiver = sender
             .send(tmq::Multipart::from(vec![signed]))
             .await
-            .map_err(|e| anyhow!("Failed to send request: {}", e))?;
+            .map_err(|e| anyhow!("Failed to send request to {}: {}", self.endpoint, e))?;
 
-        // Receive response (will timeout based on calculated timeout)
-        let (response, _sender) = receiver
-            .recv()
-            .await
-            .map_err(|e| anyhow!("Failed to receive response: {}", e))?;
+        // Receive response with timeout
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(timeout as u64),
+            receiver.recv()
+        ).await;
 
-        // Extract bytes from multipart message
-        let bytes: Vec<u8> = response
-            .into_iter()
-            .flat_map(|frame| frame.to_vec())
-            .collect();
+        match result {
+            Ok(Ok((response, sender))) => {
+                // Success - store sender for reuse
+                self.store_sender(sender).await;
 
-        trace!("ZmqClient received {} bytes", bytes.len());
+                let bytes: Vec<u8> = response
+                    .into_iter()
+                    .flat_map(|frame| frame.to_vec())
+                    .collect();
 
-        Ok(bytes)
+                trace!("ZmqClient received {} bytes from {}", bytes.len(), self.endpoint);
+                Ok(bytes)
+            }
+            Ok(Err(e)) => {
+                warn!("ZmqClient recv error from {}: {}", self.endpoint, e);
+                Err(anyhow!("Failed to receive response from {}: {}", self.endpoint, e))
+            }
+            Err(_) => {
+                warn!("ZmqClient timeout after {}ms waiting for {}", timeout, self.endpoint);
+                Err(anyhow!("Request to {} timed out after {}ms", self.endpoint, timeout))
+            }
+        }
     }
 
     /// Convenience method for propagating user context from an existing envelope.

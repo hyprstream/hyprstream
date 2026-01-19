@@ -122,22 +122,23 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
 // Streams Service Factory
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Factory for StreamService (XPUB/XSUB proxy with JWT validation)
+/// Factory for StreamService (PULL/XPUB queuing proxy with JWT validation)
 #[service_factory("streams")]
 fn create_streams_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
-    info!("Creating StreamService with JWT validation");
+    info!("Creating StreamService with JWT validation and queuing");
 
     use crate::services::StreamService;
 
+    // XPUB frontend - clients subscribe via SUB
     let pub_transport = global_registry().endpoint("streams", SocketKind::Sub);
-    let sub_transport = global_registry().endpoint("streams", SocketKind::Pub);
+    // PULL backend - publishers connect via PUSH
+    let pull_transport = global_registry().endpoint("streams", SocketKind::Push);
 
     let stream_service = StreamService::new(
         "streams",
         global_context(),
         pub_transport,
-        sub_transport,
-        ctx.verifying_key(),
+        pull_transport,
     );
 
     Ok(Box::new(stream_service))

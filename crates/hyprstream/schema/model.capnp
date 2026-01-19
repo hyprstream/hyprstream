@@ -25,6 +25,10 @@ struct ModelRequest {
     infer @5 :InferRequest;
     inferStream @6 :InferRequest;
 
+    # Stream authorization handshake (routes to InferenceService)
+    # Client must call this after inferStream to authorize SUB subscription
+    startStream @9 :StartStreamRequest;
+
     # Health/Lifecycle
     healthCheck @7 :Void;
 
@@ -50,6 +54,8 @@ struct ModelResponse {
     health @8 :ModelHealthStatus;
     # Templated prompt string
     templateResult @9 :Text;
+    # Stream authorization confirmation
+    streamAuthorized @10 :StreamAuthInfo;
   }
 }
 
@@ -85,6 +91,20 @@ struct ModelStatusRequest {
 struct InferRequest {
   modelRef @0 :Text;
   request @1 :Data;  # Serialized GenerationRequest (Cap'n Proto bytes)
+}
+
+# Start stream request (authorizes SUB subscription)
+# Client must call this after inferStream to authorize subscription
+struct StartStreamRequest {
+  modelRef @0 :Text;  # Model that started the stream
+  streamId @1 :Text;  # Stream ID from inferStream response (e.g., "stream-uuid")
+  # Future: clientPublicKey @2 :Data; for DH key exchange
+}
+
+# Stream authorization response
+struct StreamAuthInfo {
+  streamId @0 :Text;
+  # Future: serverPublicKey @1 :Data; for DH key exchange
 }
 
 # Response when model is loaded

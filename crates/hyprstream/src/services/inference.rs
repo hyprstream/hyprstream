@@ -117,7 +117,8 @@ pub struct InferenceService {
     /// Runtime handle for async operations (reused instead of creating new runtimes)
     #[allow(dead_code)] // Reserved for future async operations
     runtime_handle: Handle,
-    /// Single PUB socket for streaming (connects to StreamService, initialized in run_service_loop)
+    /// Single PUSH socket for streaming (connects to StreamService's PULL, initialized in run_service_loop)
+    /// PUSH buffers at HWM instead of dropping - solves the subscriber race condition.
     /// Note: Field name retained as xpub_socket for compatibility with execute_stream
     xpub_socket: RwLock<Option<zmq::Socket>>,
     /// Server's Ed25519 verifying key for signature verification
@@ -243,25 +244,26 @@ impl InferenceService {
         dealer.connect(&callback_endpoint)?;
         info!("Connected DEALER to {}", callback_endpoint);
 
-        // Create PUB socket for streaming (connects to StreamService's XSUB)
-        let pub_socket = ctx.socket(zmq::PUB)?;
+        // Create PUSH socket for streaming (connects to StreamService's PULL)
+        // PUSH buffers at HWM instead of dropping, solving the race condition
+        // where messages are published before client subscribes
+        let push_socket = ctx.socket(zmq::PUSH)?;
 
         // Set socket options for reliability
-        if let Err(e) = pub_socket.set_immediate(false) {
-            warn!("Failed to set immediate mode on PUB socket: {}", e);
+        // HWM of 100K messages provides ~10 seconds buffer at 10K msg/s
+        if let Err(e) = push_socket.set_sndhwm(100_000) {
+            warn!("Failed to set send HWM on PUSH socket: {}", e);
         }
-        if let Err(e) = pub_socket.set_sndhwm(1000) {
-            warn!("Failed to set send HWM on PUB socket: {}", e);
-        }
-        if let Err(e) = pub_socket.set_sndtimeo(500) {
-            warn!("Failed to set send timeout on PUB socket: {}", e);
+        // 1 second timeout prevents infinite blocking if StreamService is down
+        if let Err(e) = push_socket.set_sndtimeo(1000) {
+            warn!("Failed to set send timeout on PUSH socket: {}", e);
         }
 
-        let stream_pub_endpoint = hyprstream_rpc::registry::global()
-            .endpoint("streams", hyprstream_rpc::registry::SocketKind::Pub)
+        let stream_push_endpoint = hyprstream_rpc::registry::global()
+            .endpoint("streams", hyprstream_rpc::registry::SocketKind::Push)
             .to_zmq_string();
-        pub_socket.connect(&stream_pub_endpoint)?;
-        info!("PUB connected to StreamService at {}", stream_pub_endpoint);
+        push_socket.connect(&stream_push_endpoint)?;
+        info!("PUSH connected to StreamService at {}", stream_push_endpoint);
 
         // Get StreamService's Sub endpoint for client subscriptions
         let stream_sub_endpoint = hyprstream_rpc::registry::global()
@@ -289,8 +291,8 @@ impl InferenceService {
         )
         .await?;
 
-        // Set the PUB socket (xpub_socket field name kept for compatibility)
-        *service.xpub_socket.write().unwrap() = Some(pub_socket);
+        // Set the PUSH socket (xpub_socket field name kept for compatibility)
+        *service.xpub_socket.write().unwrap() = Some(push_socket);
 
         // Send LoadModelResponse
         let response = Self::build_load_model_response(true, "")?;
@@ -552,12 +554,13 @@ impl InferenceService {
             }
         };
 
-        // Create PUB socket for streaming (connects to StreamService's XSUB)
-        // StreamService validates subscriptions with JWT, we just publish
-        let pub_socket = match ctx.socket(zmq::PUB) {
+        // Create PUSH socket for streaming (connects to StreamService's PULL)
+        // PUSH buffers at HWM instead of dropping, solving the race condition
+        // where messages are published before client subscribes
+        let push_socket = match ctx.socket(zmq::PUSH) {
             Ok(s) => s,
             Err(e) => {
-                let err = anyhow!("failed to create PUB socket: {}", e);
+                let err = anyhow!("failed to create PUSH socket: {}", e);
                 error!("{}", err);
                 signal_error(ready_tx, err);
                 return;
@@ -565,36 +568,32 @@ impl InferenceService {
         };
 
         // Set socket options for reliability
-        // - Disable immediate mode to queue messages until connection is ready
-        // - Set high send buffer to handle bursts
-        // - Set send timeout to prevent indefinite blocking
-        if let Err(e) = pub_socket.set_immediate(false) {
-            warn!("Failed to set immediate mode on PUB socket: {}", e);
+        // HWM of 100K messages provides ~10 seconds buffer at 10K msg/s
+        if let Err(e) = push_socket.set_sndhwm(100_000) {
+            warn!("Failed to set send HWM on PUSH socket: {}", e);
         }
-        if let Err(e) = pub_socket.set_sndhwm(1000) {
-            warn!("Failed to set send HWM on PUB socket: {}", e);
-        }
-        if let Err(e) = pub_socket.set_sndtimeo(500) {
-            warn!("Failed to set send timeout on PUB socket: {}", e);
+        // 1 second timeout prevents infinite blocking if StreamService is down
+        if let Err(e) = push_socket.set_sndtimeo(1000) {
+            warn!("Failed to set send timeout on PUSH socket: {}", e);
         }
 
-        // Connect to StreamService's Pub endpoint (XSUB backend)
-        let stream_pub_endpoint = hyprstream_rpc::registry::global()
-            .endpoint("streams", hyprstream_rpc::registry::SocketKind::Pub)
+        // Connect to StreamService's Push endpoint (PULL backend)
+        let stream_push_endpoint = hyprstream_rpc::registry::global()
+            .endpoint("streams", hyprstream_rpc::registry::SocketKind::Push)
             .to_zmq_string();
 
-        if let Err(e) = pub_socket.connect(&stream_pub_endpoint) {
-            let err = anyhow!("failed to connect PUB to {}: {}", stream_pub_endpoint, e);
+        if let Err(e) = push_socket.connect(&stream_push_endpoint) {
+            let err = anyhow!("failed to connect PUSH to {}: {}", stream_push_endpoint, e);
             error!("{}", err);
             signal_error(ready_tx, err);
             return;
         }
 
-        // Store PUB socket in service for use by execute_stream
-        // Note: Field name still xpub_socket for compatibility, but now holds PUB socket
-        *service.xpub_socket.write().unwrap() = Some(pub_socket);
+        // Store PUSH socket in service for use by execute_stream
+        // Note: Field name still xpub_socket for compatibility, but now holds PUSH socket
+        *service.xpub_socket.write().unwrap() = Some(push_socket);
 
-        info!("inference service bound to {} (RPC) and connected to {} (streaming)", endpoint, stream_pub_endpoint);
+        info!("inference service bound to {} (RPC) and connected to {} (streaming)", endpoint, stream_push_endpoint);
 
         // Signal ready - ZMQ connection will establish asynchronously
         // With immediate=false, messages queue until connection is ready
@@ -788,18 +787,18 @@ impl InferenceService {
         // Apply TTT adaptation BEFORE streaming generation (if enabled)
         self.apply_ttt_adaptation(&prompt);
 
-        // Get PUB socket (created in run_service_loop, connects to StreamService)
+        // Get PUSH socket (created in run_service_loop, connects to StreamService's PULL)
         let pub_guard = self.xpub_socket.read().unwrap();
-        let pub_socket = match pub_guard.as_ref() {
+        let push_socket = match pub_guard.as_ref() {
             Some(socket) => socket,
             None => {
-                error!("PUB socket not initialized for streaming");
+                error!("PUSH socket not initialized for streaming");
                 return;
             }
         };
 
         // StreamService handles subscription validation and forwarding
-        // We just publish chunks - StreamService validates JWT and strips it before forwarding
+        // We push chunks - StreamService queues until subscriber arrives, then delivers
         trace!("starting stream {} on topic {:?}", stream_id, String::from_utf8_lossy(&topic));
 
         // Helper to send topic-prefixed message
@@ -810,10 +809,9 @@ impl InferenceService {
             msg.extend_from_slice(&topic);
             msg.extend_from_slice(data);
 
-            // Blocking send - ZMQ will wait for connection to establish
-            // With immediate=false, messages queue until connected
-            // Timeout prevents indefinite blocking on connection issues
-            pub_socket.send(&msg, 0)
+            // Blocking send - PUSH buffers at HWM if receiver is slow
+            // Timeout (1s) prevents indefinite blocking if StreamService is down
+            push_socket.send(&msg, 0)
         };
 
         // Run the stream
@@ -1082,12 +1080,33 @@ impl InferenceService {
                 // Prepare stream but don't execute yet - return pending work
                 let (stream_id, pending) = self.prepare_stream(request);
 
+                // Pre-authorize the stream subscription BEFORE returning response
+                // This way client can subscribe immediately without calling start_stream
+                // Include expiry from claims so StreamService can GC expired entries
+                let exp = ctx.claims().map(|c| c.exp).unwrap_or_else(|| {
+                    // Default: 5 minutes from now if no claims
+                    chrono::Utc::now().timestamp() + 300
+                });
+
+                let push_guard = self.xpub_socket.read().unwrap();
+                if let Some(ref push_socket) = *push_guard {
+                    // Format: AUTHORIZE|stream-{uuid}|{exp_timestamp}
+                    let authorize_msg = format!("AUTHORIZE|{}|{}", stream_id, exp);
+                    if let Err(e) = push_socket.send(authorize_msg.as_bytes(), 0) {
+                        error!(stream_id = %stream_id, error = %e, "Failed to pre-authorize stream");
+                        // Continue anyway - client can retry with start_stream
+                    } else {
+                        info!(stream_id = %stream_id, exp = exp, "Stream pre-authorized for subscription");
+                    }
+                }
+                drop(push_guard);
+
                 // Get StreamService's Sub endpoint (where clients subscribe)
                 let stream_sub_endpoint = hyprstream_rpc::registry::global()
                     .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
                     .to_zmq_string();
 
-                // Return response with stream_id - client will subscribe to StreamService
+                // Return response with stream_id - client can subscribe immediately
                 let response = InferenceResponse::stream_started(request_id, &stream_id, &stream_sub_endpoint);
                 Ok((response, Some(pending)))
             }
@@ -1251,6 +1270,46 @@ impl InferenceService {
                 info!("Inference service shutdown requested");
                 Ok((InferenceResponse::success(request_id), None))
             }
+
+            Which::StartStream(start_req) => {
+                // Authorization: Infer on inference:{model} (same as generating)
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Infer).await {
+                    return Ok((resp, None));
+                }
+
+                let start_req = start_req?;
+                let stream_id = start_req.get_stream_id()?.to_str()?.to_string();
+
+                // Validate stream_id format
+                if !stream_id.starts_with("stream-") {
+                    return Ok((InferenceResponse::error(request_id, "Invalid stream_id format"), None));
+                }
+
+                // Send AUTHORIZE message to StreamService via PUSH socket
+                // This tells StreamService this stream is authorized for subscription
+                // Include expiry from claims so StreamService can GC expired entries
+                let exp = ctx.claims().map(|c| c.exp).unwrap_or_else(|| {
+                    // Default: 5 minutes from now if no claims
+                    chrono::Utc::now().timestamp() + 300
+                });
+
+                let push_guard = self.xpub_socket.read().unwrap();
+                if let Some(ref push_socket) = *push_guard {
+                    // Format: AUTHORIZE|stream-{uuid}|{exp_timestamp}
+                    let authorize_msg = format!("AUTHORIZE|{}|{}", stream_id, exp);
+                    if let Err(e) = push_socket.send(authorize_msg.as_bytes(), 0) {
+                        error!(stream_id = %stream_id, error = %e, "Failed to send authorize message to StreamService");
+                        return Ok((InferenceResponse::error(request_id, &format!("Stream authorization failed: {}", e)), None));
+                    }
+                    info!(stream_id = %stream_id, exp = exp, "Stream authorized for subscription");
+                } else {
+                    error!(stream_id = %stream_id, "No PUSH socket available for stream authorization");
+                    return Ok((InferenceResponse::error(request_id, "Stream service not available"), None));
+                }
+                drop(push_guard);
+
+                Ok((InferenceResponse::stream_authorized(request_id, &stream_id), None))
+            }
         }
     }
 }
@@ -1406,6 +1465,37 @@ impl InferenceZmqClient {
 
         let response = self.client.call(bytes, None).await?;
         self.parse_stream_started_response(&response)
+    }
+
+    /// Authorize a stream subscription
+    ///
+    /// After calling `generate_stream`, the client must call this method to authorize
+    /// subscription before subscribing to the stream. This sends an AUTHORIZE message
+    /// to StreamService which validates the stream_id and allows the subscription.
+    ///
+    /// # Arguments
+    /// * `stream_id` - The stream ID returned by `generate_stream`
+    ///
+    /// # Returns
+    /// The confirmed stream_id on success.
+    ///
+    /// # Future
+    /// Will support DH key exchange for encrypted streams.
+    pub async fn start_stream(&self, stream_id: &str) -> Result<String> {
+        let id = self.next_id();
+
+        let mut message = Builder::new_default();
+        let mut req = message.init_root::<inference_capnp::inference_request::Builder>();
+        req.set_id(id);
+
+        let mut start_req = req.init_start_stream();
+        start_req.set_stream_id(stream_id);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+
+        let response = self.client.call(bytes, None).await?;
+        self.parse_stream_authorized_response(&response)
     }
 
     /// Start streaming generation and return a handle for receiving chunks.
@@ -1722,6 +1812,26 @@ impl InferenceZmqClient {
                 let stream_id = info.get_stream_id()?.to_str()?.to_string();
                 let endpoint = info.get_endpoint()?.to_str()?.to_string();
                 Ok((stream_id, endpoint))
+            }
+            Which::Error(err) => {
+                let err = err?;
+                Err(anyhow!("{}", err.get_message()?.to_str()?))
+            }
+            _ => Err(anyhow!("Unexpected response type")),
+        }
+    }
+
+    /// Parse stream authorized response
+    fn parse_stream_authorized_response(&self, response: &[u8]) -> Result<String> {
+        let reader = serialize::read_message(response, ReaderOptions::new())?;
+        let resp = reader.get_root::<inference_capnp::inference_response::Reader>()?;
+
+        use inference_capnp::inference_response::Which;
+        match resp.which()? {
+            Which::StreamAuthorized(auth) => {
+                let auth = auth?;
+                let stream_id = auth.get_stream_id()?.to_str()?.to_string();
+                Ok(stream_id)
             }
             Which::Error(err) => {
                 let err = err?;

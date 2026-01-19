@@ -4,9 +4,7 @@ use crate::config::GenerationRequest;
 use crate::inference_capnp;
 use crate::api::openai_compat::ChatMessage;
 use crate::runtime::RuntimeConfig;
-use crate::services::{
-    ModelZmqClient, PolicyZmqClient,
-};
+use crate::services::ModelZmqClient;
 use crate::zmq::global_context;
 use crate::storage::{CheckoutOptions, GitRef, ModelRef, ModelStorage};
 use anyhow::{bail, Result};
@@ -1114,34 +1112,12 @@ pub async fn handle_infer(
 
     // Generate via ModelService (handles model loading, adapter loading, training collection, auth)
     if stream {
-        // Streaming via ZMQ pub/sub with JWT authorization
+        // Streaming via ZMQ pub/sub
+        // Authorization is automatic - AUTHORIZE message sent during infer_stream
         let (stream_id, _endpoint) = model_client.infer_stream(model_ref_str, &request).await?;
         info!("Streaming started: stream_id={}", stream_id);
 
-        // Extract clean stream UUID (remove "stream-" prefix if present)
-        let stream_id_clean = stream_id.strip_prefix("stream-").unwrap_or(&stream_id);
-
-        // Create PolicyZmqClient to request JWT token
-        let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
-
-        // Build structured scopes for JWT token
-        let scopes = vec![
-            // Subscribe to this specific stream
-            format!("subscribe:stream:{}", stream_id_clean),
-            // Infer on the model (for RPC calls)
-            format!("infer:model:{}", model_ref.model),
-        ];
-
-        // Request JWT token from PolicyService (300 second TTL)
-        let (token, _expires_at) = policy_client
-            .issue_token(scopes, Some(300))
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to issue JWT token: {}", e))?;
-
-        info!("JWT token issued for stream subscription");
-
-        // Get StreamService endpoint from registry (NOT from infer_stream response)
-        // StreamService validates JWT and forwards to backend
+        // Get StreamService endpoint from registry
         let stream_sub_endpoint = hyprstream_rpc::registry::global()
             .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
             .to_zmq_string();
@@ -1152,13 +1128,12 @@ pub async fn handle_infer(
         let subscriber = ctx.socket(zmq::SUB)?;
         subscriber.connect(&stream_sub_endpoint)?;
 
-        // Subscribe with JWT token in topic: "stream-{uuid}|{jwt}"
-        // StreamService validates JWT signature, checks scope, then strips JWT before XSUB forwarding
-        let subscription_topic = format!("stream-{}|{}", stream_id_clean, token);
-        subscriber.set_subscribe(subscription_topic.as_bytes())?;
+        // Subscribe with just the stream_id topic
+        // Stream was pre-authorized during infer_stream, so we can subscribe immediately
+        subscriber.set_subscribe(stream_id.as_bytes())?;
         subscriber.set_rcvtimeo(30000)?; // 30s timeout
 
-        info!("Subscribed to stream via StreamService with JWT validation");
+        info!("Subscribed to stream via StreamService");
 
         println!();
         loop {

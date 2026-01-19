@@ -32,6 +32,11 @@ struct InferenceRequest {
     # Health/Lifecycle
     healthCheck @14 :Void;
     shutdown @15 :Void;
+
+    # Stream authorization handshake
+    # Client calls this after generateStream to authorize subscription
+    # Future: will include client public key for DH key exchange
+    startStream @16 :StartStreamRequest;
   }
 }
 
@@ -57,6 +62,10 @@ struct InferenceResponse {
     sessionCleared @14 :Void;
     sessionReleased @15 :Void;
     health @16 :HealthStatus;
+
+    # Stream authorization response
+    # Future: will include server public key for DH key exchange
+    streamAuthorized @17 :StreamAuthResponse;
   }
 }
 
@@ -110,6 +119,23 @@ enum FinishReason {
 struct StreamInfo {
   streamId @0 :Text;
   endpoint @1 :Text;
+}
+
+# Stream authorization handshake
+# Step 1: Client calls startStream after generateStream returns stream_id
+# Step 2: Server authorizes client to subscribe, returns confirmation
+# Future: DH key exchange for encrypted streams
+
+struct StartStreamRequest {
+  streamId @0 :Text;
+  # Future fields for DH key exchange:
+  # clientPublicKey @1 :Data;  # Client's ephemeral X25519 public key
+}
+
+struct StreamAuthResponse {
+  streamId @0 :Text;
+  # Future fields for DH key exchange:
+  # serverPublicKey @1 :Data;  # Server's ephemeral X25519 public key
 }
 
 # Streaming messages (sent via PUB/SUB)

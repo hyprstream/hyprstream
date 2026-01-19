@@ -1,58 +1,83 @@
-//! StreamService - XPUB/XSUB proxy with stateless JWT validation
+//! StreamService - PULL/XPUB queuing proxy with claims-based expiry
 //!
 //! # Architecture
 //!
 //! ```text
-//! Publishers → XPUB (clients) → StreamService → XSUB (backend) → Subscribers
-//!                                      ↓
-//!                          JWT validation (~200µs)
-//!                          UUID validation (6 layers)
-//!                          Strip JWT before XSUB
+//! InferenceService                StreamService                     Client
+//!       │                              │                              │
+//!       │──AUTHORIZE|stream-uuid|exp──►│ (pre-authorize with expiry)  │
+//!       │                              │                              │
+//!       │──stream-uuid.chunk──────────►│ (queue if no subscriber)     │
+//!       │                              │                              │
+//!       │                              │◄───────\x01stream-uuid───────│
+//!       │                              │ (subscription, authorize OK)  │
+//!       │                              │                              │
+//!       │                              │────stream-uuid.chunk────────►│
+//!       │                              │ (flush queued + deliver)      │
 //! ```
 //!
-//! # Security (Defense-in-Depth)
+//! # Why PUSH/PULL instead of PUB/XSUB
 //!
-//! **Layer 1**: Application-level JWT validation (StreamService)
-//! **Layer 2**: CurveZMQ authentication (XSUB backend)
-//! **Layer 3**: Filesystem/network permissions (IPC sockets, localhost TCP)
+//! PUB/SUB drops messages when no subscriber exists. This causes a race condition:
+//! - Publisher starts immediately after returning stream_id
+//! - Client needs time to subscribe
+//! - Early messages are dropped before client subscribes
 //!
-//! # Key Features
+//! PUSH/PULL solves this:
+//! - PUSH buffers at HWM (never drops)
+//! - StreamService queues per-topic until subscriber arrives
+//! - On subscribe, queued messages are flushed to client
 //!
-//! - **Stateless JWT validation**: ~200µs signature verification (no server state)
-//! - **6-layer UUID validation**: Blocks wildcards, Unicode, injection attacks
-//! - **JWT stripping**: Backend never sees JWTs (prevents downstream leakage)
-//! - **Audit trail**: All subscriptions logged with user attribution (JWT never logged)
-//! - **Structured scopes**: Safe wildcard matching with action/resource isolation
+//! # Authorization Flow
 //!
-//! # Example Topic Flow
+//! 1. InferenceService validates JWT claims at request time
+//! 2. InferenceService sends AUTHORIZE message with stream_id and claims expiry
+//! 3. Client subscribes with just `stream-{uuid}` (no JWT needed)
+//! 4. StreamService checks stream was authorized, allows subscription
+//! 5. On unsubscribe (0x00), entry is removed entirely
+//! 6. Periodic compact() removes expired entries (claims.exp)
 //!
-//! ```text
-//! Client subscribes: \x01stream-{uuid}|{jwt}
-//!           ↓
-//! StreamService validates:
-//!   - UUID format (6 layers)
-//!   - JWT signature (~200µs)
-//!   - Scope: subscribe:stream:{uuid}
-//!           ↓
-//! Forwards to XSUB: \x01stream-{uuid}  (JWT stripped!)
-//!           ↓
-//! XSUB matches: stream-{uuid}.chunk ✓
-//! ```
+//! # Memory Management
+//!
+//! - **Unified StreamState**: Single HashMap tracks auth, subscription, and messages
+//! - **Claims-based expiry**: Entries removed when claims.exp timestamp passes
+//! - **Unsubscribe cleanup**: Entry removed entirely on 0x00 (prevents leaks)
+//! - **Message TTL**: Individual messages expire after 30s if not delivered
+//! - **Per-topic limit**: Max 1000 messages per topic (oldest dropped on overflow)
 
-use crate::auth::{jwt, Scope};
 use crate::transport::TransportConfig;
 use anyhow::{anyhow, Result};
-use ed25519_dalek::VerifyingKey;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tracing::{debug, error, info, trace, warn};
-use uuid::Uuid;
 
-/// StreamService - XPUB/XSUB proxy with stateless JWT validation
+/// A pending message waiting for a subscriber
+struct PendingMessage {
+    data: Vec<u8>,
+    received_at: Instant,
+}
+
+/// State for an authorized stream
 ///
-/// Validates JWT tokens at subscription time and strips them before
-/// forwarding to XSUB backend. This prevents JWT leakage and provides
-/// defense-in-depth with CurveZMQ authentication.
+/// Unified structure that tracks authorization, subscription status, and pending messages.
+/// Replaces separate `authorized_streams`, `subscribers`, and `pending` collections.
+struct StreamState {
+    /// Expiration timestamp (Unix seconds) from the authorizing request's claims
+    /// Stream is removed during compact() when `now > exp`
+    exp: i64,
+    /// Whether a client has subscribed to this stream
+    subscribed: bool,
+    /// Messages queued before subscriber arrived (flushed on subscribe)
+    messages: VecDeque<PendingMessage>,
+}
+
+/// StreamService - PULL/XPUB queuing proxy with claims-based expiry
+///
+/// Receives messages via PULL (from publishers using PUSH), queues them
+/// per-topic until a subscriber arrives, then delivers via XPUB.
+/// Authorization is handled via AUTHORIZE messages with expiry timestamps.
 pub struct StreamService {
     /// Service name (for logging and registry)
     name: String,
@@ -63,11 +88,17 @@ pub struct StreamService {
     /// XPUB frontend transport (client-facing)
     pub_transport: TransportConfig,
 
-    /// XSUB backend transport (internal)
-    sub_transport: TransportConfig,
+    /// PULL backend transport (receives from publishers)
+    pull_transport: TransportConfig,
 
-    /// JWT verifying key (for stateless validation)
-    verifying_key: VerifyingKey,
+    /// Message TTL - messages older than this are dropped (default: 30s)
+    message_ttl: Duration,
+
+    /// Maximum pending messages per topic (default: 1000)
+    max_pending_per_topic: usize,
+
+    /// Interval between compaction runs (default: 5s)
+    compact_interval: Duration,
 }
 
 impl StreamService {
@@ -77,29 +108,28 @@ impl StreamService {
     /// * `name` - Service name for logging (matches ProxyService pattern)
     /// * `context` - ZMQ context
     /// * `pub_transport` - XPUB frontend config (client-facing, with optional CurveZMQ)
-    /// * `sub_transport` - XSUB backend config (internal, with optional CurveZMQ)
-    /// * `verifying_key` - Ed25519 verifying key for JWT validation
+    /// * `pull_transport` - PULL backend config (receives from publishers)
     ///
     /// # Security
     ///
-    /// CurveZMQ can be enabled via `pub_transport.with_curve()` and `sub_transport.with_curve()`.
+    /// CurveZMQ can be enabled via `pub_transport.with_curve()` and `pull_transport.with_curve()`.
     /// The transport layer handles encryption automatically.
+    /// Authorization is handled via AUTHORIZE messages with claims-based expiry.
     pub fn new(
         name: impl Into<String>,
         context: Arc<zmq::Context>,
         pub_transport: TransportConfig,
-        sub_transport: TransportConfig,
-        verifying_key: VerifyingKey,
+        pull_transport: TransportConfig,
     ) -> Self {
         let name = name.into();
 
         // Log transport security configuration
-        let curve_enabled = pub_transport.curve.is_some() || sub_transport.curve.is_some();
+        let curve_enabled = pub_transport.curve.is_some() || pull_transport.curve.is_some();
         if curve_enabled {
             info!(
                 service=%name,
                 pub_encrypted=pub_transport.curve.is_some(),
-                sub_encrypted=sub_transport.curve.is_some(),
+                pull_encrypted=pull_transport.curve.is_some(),
                 "StreamService initialized with CurveZMQ encryption"
             );
         } else {
@@ -113,134 +143,53 @@ impl StreamService {
             name,
             context,
             pub_transport,
-            sub_transport,
-            verifying_key,
+            pull_transport,
+            message_ttl: Duration::from_secs(30),
+            max_pending_per_topic: 1000,
+            compact_interval: Duration::from_secs(5),
         }
     }
 
-    /// Validate subscription and strip JWT
+    /// Setup PULL socket with transport-layer security (CurveZMQ + permissions)
     ///
-    /// # Returns
-    /// Stripped subscription without JWT (ready for XSUB forwarding)
-    ///
-    /// # Security
-    /// - 6-layer UUID validation (blocks all known exploits)
-    /// - Stateless JWT signature verification (~200µs)
-    /// - Structured scope checking with safe wildcard matching
-    /// - JWT never logged (V4 mitigation)
-    fn validate_subscription(&self, subscription: &[u8]) -> Result<Vec<u8>> {
-        // Check subscribe control byte (0x01 = subscribe, 0x00 = unsubscribe)
-        if subscription.is_empty() {
-            return Err(anyhow!("Empty subscription"));
-        }
-
-        if subscription[0] != 0x01 {
-            return Err(anyhow!("Invalid subscription control byte: expected 0x01 (subscribe)"));
-        }
-
-        // Parse topic (everything after control byte)
-        let topic = &subscription[1..];
-        let topic_str = std::str::from_utf8(topic)
-            .map_err(|e| anyhow!("Invalid UTF-8 in topic: {}", e))?;
-
-        // Parse: "stream-{uuid}|{jwt}"
-        let parts: Vec<&str> = topic_str.split('|').collect();
-        if parts.len() != 2 {
-            return Err(anyhow!("Invalid topic format: expected 'stream-UUID|JWT'"));
-        }
-
-        let stream_topic = parts[0];
-        let jwt_token = parts[1];
-
-        // Extract UUID from "stream-{uuid}"
-        let stream_id = stream_topic.strip_prefix("stream-")
-            .ok_or_else(|| anyhow!("Invalid topic: must start with 'stream-'"))?;
-
-        // Validate UUID format
-        let stream_uuid = Uuid::parse_str(stream_id)
-            .map_err(|e| anyhow!("Invalid stream UUID: {}", e))?;
-
-        // Validate JWT signature STATELESSLY (~200µs)
-        let claims = jwt::decode(jwt_token, &self.verifying_key)
-            .map_err(|e| anyhow!("JWT validation failed: {}", e))?;
-
-        // Check expiration
-        if claims.is_expired() {
-            return Err(anyhow!("JWT token expired"));
-        }
-
-        // Build required scope: subscribe:stream:{uuid}
-        let required_scope = Scope::new(
-            "subscribe".to_string(),
-            "stream".to_string(),
-            stream_uuid.to_string(),
-        );
-
-        // Check scope (uses Scope::grants() with safe wildcard matching)
-        if !claims.has_scope(&required_scope) {
-            return Err(anyhow!(
-                "Missing required scope: {}",
-                required_scope.to_string()
-            ));
-        }
-
-        // Log authorization (audit trail - WITHOUT JWT!)
-        info!(
-            service = %self.name,
-            user = %claims.sub,
-            stream_id = %stream_uuid,
-            "Stream subscription authorized"
-        );
-
-        // CRITICAL: Strip JWT from subscription before forwarding
-        // Forward only: \x01stream-{uuid}
-        let stream_topic = format!("stream-{}", stream_uuid);
-        let mut stripped = vec![0x01];
-        stripped.extend_from_slice(stream_topic.as_bytes());
-
-        trace!(
-            service = %self.name,
-            stream_id = %stream_uuid,
-            original_len = subscription.len(),
-            stripped_len = stripped.len(),
-            "JWT stripped from subscription"
-        );
-
-        Ok(stripped)
-    }
-
-    /// Setup XSUB socket with transport-layer security (CurveZMQ + permissions)
+    /// PULL socket receives messages from publishers (using PUSH).
+    /// Unlike XSUB, PULL receives ALL messages - no subscription matching.
+    /// This prevents message drops before subscribers arrive.
     ///
     /// Uses the unified transport layer which handles:
     /// - CurveZMQ encryption (if configured)
     /// - Socket binding (inproc/IPC/systemd)
     /// - Filesystem permissions (IPC sockets)
-    fn setup_xsub(&self) -> Result<zmq::Socket> {
-        let mut xsub = self.context.socket(zmq::XSUB)
-            .map_err(|e| anyhow!("Failed to create XSUB socket: {}", e))?;
+    fn setup_pull(&self) -> Result<zmq::Socket> {
+        let mut pull = self.context.socket(zmq::PULL)
+            .map_err(|e| anyhow!("Failed to create PULL socket: {}", e))?;
+
+        // Set high water mark for buffering (100K messages ~ 10 seconds at 10K msg/s)
+        pull.set_rcvhwm(100_000)
+            .map_err(|e| anyhow!("Failed to set PULL HWM: {}", e))?;
 
         // Bind using transport layer (handles CurveZMQ automatically)
-        self.sub_transport.bind(&mut xsub)
-            .map_err(|e| anyhow!("Failed to bind XSUB: {}", e))?;
+        self.pull_transport.bind(&mut pull)
+            .map_err(|e| anyhow!("Failed to bind PULL: {}", e))?;
 
-        let endpoint = self.sub_transport.to_zmq_string();
-        if self.sub_transport.curve.is_some() {
+        let endpoint = self.pull_transport.to_zmq_string();
+        if self.pull_transport.curve.is_some() {
             info!(
                 service = %self.name,
                 endpoint = %endpoint,
-                "XSUB backend bound with CurveZMQ encryption"
+                "PULL backend bound with CurveZMQ encryption"
             );
         } else {
             info!(
                 service = %self.name,
                 endpoint = %endpoint,
-                "XSUB backend bound (plaintext)"
+                "PULL backend bound (plaintext)"
             );
         }
 
         // Set restrictive filesystem permissions for IPC sockets (Layer 3 defense)
         #[cfg(unix)]
-        if let crate::transport::EndpointType::Ipc { ref path } = self.sub_transport.endpoint {
+        if let crate::transport::EndpointType::Ipc { ref path } = self.pull_transport.endpoint {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
                 .map_err(|e| anyhow!("Failed to set IPC socket permissions: {}", e))?;
@@ -252,7 +201,7 @@ impl StreamService {
             );
         }
 
-        Ok(xsub)
+        Ok(pull)
     }
 
     /// Setup XPUB socket (client-facing frontend) with transport-layer security
@@ -261,6 +210,14 @@ impl StreamService {
     fn setup_xpub(&self) -> Result<zmq::Socket> {
         let mut xpub = self.context.socket(zmq::XPUB)
             .map_err(|e| anyhow!("Failed to create XPUB socket: {}", e))?;
+
+        // Set high water mark for buffering
+        xpub.set_sndhwm(100_000)
+            .map_err(|e| anyhow!("Failed to set XPUB HWM: {}", e))?;
+
+        // Enable verbose mode to receive all subscribe/unsubscribe notifications
+        xpub.set_xpub_verbose(true)
+            .map_err(|e| anyhow!("Failed to set XPUB verbose: {}", e))?;
 
         // Bind using transport layer (handles CurveZMQ automatically)
         self.pub_transport.bind(&mut xpub)
@@ -287,23 +244,23 @@ impl StreamService {
     /// Run the streaming proxy loop with pre-bound sockets (blocking)
     ///
     /// This is the main event loop that:
-    /// 1. Receives subscriptions from XPUB (client-facing)
-    /// 2. Validates JWT and strips it
-    /// 3. Forwards to XSUB (backend)
-    /// 4. Forwards messages bidirectionally
+    /// 1. Receives messages from PULL (publishers)
+    /// 2. Queues messages per-topic until subscriber arrives
+    /// 3. Receives subscriptions from XPUB (clients)
+    /// 4. Validates JWT, adds subscriber, flushes queued messages
     ///
     /// # Arguments
     /// * `xpub` - Pre-bound XPUB socket (client-facing)
-    /// * `xsub` - Pre-bound XSUB socket (backend)
+    /// * `pull` - Pre-bound PULL socket (receives from publishers)
     /// * `shutdown` - Notification signal to stop the service
     fn run_loop_with_sockets(
         &self,
         xpub: zmq::Socket,
-        xsub: zmq::Socket,
+        pull: zmq::Socket,
         shutdown: Arc<Notify>,
     ) -> Result<(), crate::error::RpcError> {
         // Create CTRL socket for shutdown (PAIR pattern)
-        let mut ctrl = self.context.socket(zmq::PAIR)
+        let ctrl = self.context.socket(zmq::PAIR)
             .map_err(|e| crate::error::RpcError::SpawnFailed(format!("CTRL socket: {}", e)))?;
         let ctrl_endpoint = format!("inproc://stream-ctrl-{}", self.name);
         ctrl.bind(&ctrl_endpoint)
@@ -329,17 +286,61 @@ impl StreamService {
             let _ = ctrl_sender.send("TERMINATE", 0);
         });
 
-        // Create poll items (XPUB, XSUB, CTRL)
+        // Unified stream state (local to this loop)
+        // Replaces separate pending, subscribers, and authorized_streams collections
+        let mut streams: HashMap<String, StreamState> = HashMap::new();
+        let mut last_compact = Instant::now();
+
+        // Create poll items (PULL, XPUB, CTRL)
         let mut items = [
+            pull.as_poll_item(zmq::POLLIN),
             xpub.as_poll_item(zmq::POLLIN),
-            xsub.as_poll_item(zmq::POLLIN),
             ctrl.as_poll_item(zmq::POLLIN),
         ];
 
-        info!(service = %self.name, "StreamService proxy loop started");
+        info!(service = %self.name, "StreamService queuing proxy loop started");
 
         loop {
-            // Poll with 1 second timeout
+            // Periodic compaction (every compact_interval)
+            // Removes expired streams and expired messages within active streams
+            if last_compact.elapsed() >= self.compact_interval {
+                last_compact = Instant::now();
+                let now_unix = chrono::Utc::now().timestamp();
+                let now_instant = Instant::now();
+
+                streams.retain(|topic, state| {
+                    // Remove if claims expired
+                    if state.exp <= now_unix {
+                        debug!(
+                            service = %self.name,
+                            topic = %topic,
+                            "Removing expired stream (claims expired)"
+                        );
+                        return false;
+                    }
+
+                    // For non-subscribed streams, also expire old messages
+                    if !state.subscribed {
+                        while let Some(msg) = state.messages.front() {
+                            if now_instant.duration_since(msg.received_at) > self.message_ttl {
+                                trace!(
+                                    service = %self.name,
+                                    topic = %topic,
+                                    "Expired pending message"
+                                );
+                                state.messages.pop_front();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+
+                    // Keep if: subscribed OR has pending messages
+                    state.subscribed || !state.messages.is_empty()
+                });
+            }
+
+            // Poll with 1 second timeout (allows periodic compaction)
             zmq::poll(&mut items, 1000)
                 .map_err(|e| crate::error::RpcError::SpawnFailed(format!("Poll failed: {}", e)))?;
 
@@ -353,35 +354,208 @@ impl StreamService {
                 }
             }
 
-            // XPUB → XSUB (subscriptions from clients)
+            // PULL → Handle authorize messages OR queue/deliver chunks
             if items[0].is_readable() {
+                match pull.recv_bytes(0) {
+                    Ok(message) => {
+                        // Check for AUTHORIZE message from InferenceService
+                        // Format: "AUTHORIZE|stream-{uuid}|{exp_timestamp}"
+                        if message.starts_with(b"AUTHORIZE|") {
+                            let auth_msg = String::from_utf8_lossy(&message);
+                            let parts: Vec<&str> = auth_msg.splitn(3, '|').collect();
+                            if parts.len() >= 3 {
+                                let stream_id = parts[1].to_string();
+                                let exp = parts[2].parse::<i64>().unwrap_or_else(|_| {
+                                    // Default: 5 minutes from now if parsing fails
+                                    chrono::Utc::now().timestamp() + 300
+                                });
+
+                                // Create stream state with expiry
+                                streams.insert(stream_id.clone(), StreamState {
+                                    exp,
+                                    subscribed: false,
+                                    messages: VecDeque::new(),
+                                });
+                                info!(
+                                    service = %self.name,
+                                    stream_id = %stream_id,
+                                    exp = %exp,
+                                    "Stream authorized with expiry"
+                                );
+                            } else if parts.len() == 2 {
+                                // Legacy format without expiry (shouldn't happen in production)
+                                let stream_id = parts[1].to_string();
+                                let exp = chrono::Utc::now().timestamp() + 300; // 5 min default
+                                streams.insert(stream_id.clone(), StreamState {
+                                    exp,
+                                    subscribed: false,
+                                    messages: VecDeque::new(),
+                                });
+                                warn!(
+                                    service = %self.name,
+                                    stream_id = %stream_id,
+                                    "Stream authorized with legacy format (no expiry provided)"
+                                );
+                            } else {
+                                warn!(
+                                    service = %self.name,
+                                    "Invalid AUTHORIZE message format"
+                                );
+                            }
+                            continue;
+                        }
+
+                        // Regular chunk message - extract topic (format: "stream-{uuid}...")
+                        if let Some(topic) = extract_topic(&message) {
+                            if let Some(state) = streams.get_mut(&topic) {
+                                if state.subscribed {
+                                    // Subscriber exists → deliver immediately
+                                    trace!(
+                                        service = %self.name,
+                                        topic = %topic,
+                                        len = message.len(),
+                                        "Delivering message to subscriber"
+                                    );
+                                    if let Err(e) = xpub.send(&message, 0) {
+                                        error!(
+                                            service = %self.name,
+                                            topic = %topic,
+                                            error = %e,
+                                            "Failed to deliver message to XPUB"
+                                        );
+                                    }
+                                } else {
+                                    // Authorized but no subscriber yet → queue for later
+                                    // Enforce per-topic limit (drop oldest)
+                                    while state.messages.len() >= self.max_pending_per_topic {
+                                        state.messages.pop_front();
+                                        trace!(
+                                            service = %self.name,
+                                            topic = %topic,
+                                            "Dropped oldest pending message (queue full)"
+                                        );
+                                    }
+
+                                    state.messages.push_back(PendingMessage {
+                                        data: message,
+                                        received_at: Instant::now(),
+                                    });
+                                    trace!(
+                                        service = %self.name,
+                                        topic = %topic,
+                                        queue_len = state.messages.len(),
+                                        "Queued message for later delivery"
+                                    );
+                                }
+                            } else {
+                                // Not authorized - drop message
+                                trace!(
+                                    service = %self.name,
+                                    topic = %topic,
+                                    "Dropping message for unauthorized stream"
+                                );
+                            }
+                        } else {
+                            warn!(
+                                service = %self.name,
+                                len = message.len(),
+                                "Received message with invalid topic format"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            service = %self.name,
+                            error = %e,
+                            "Failed to receive from PULL"
+                        );
+                    }
+                }
+            }
+
+            // XPUB subscriptions from clients
+            if items[1].is_readable() {
                 match xpub.recv_bytes(0) {
                     Ok(subscription) => {
-                        trace!(
-                            service = %self.name,
-                            len = subscription.len(),
-                            "Received subscription from XPUB"
-                        );
+                        match subscription.first() {
+                            Some(0x01) => {
+                                // Subscribe request
+                                trace!(
+                                    service = %self.name,
+                                    len = subscription.len(),
+                                    "Received subscription from XPUB"
+                                );
 
-                        // Validate and strip JWT
-                        match self.validate_subscription(&subscription) {
-                            Ok(stripped) => {
-                                // Forward stripped subscription to XSUB
-                                if let Err(e) = xsub.send(&stripped, 0) {
-                                    error!(
+                                // Extract topic from subscription (skip 0x01 control byte)
+                                // Client subscribes with just "stream-{uuid}" after pre-authorization
+                                let topic = String::from_utf8_lossy(&subscription[1..]).to_string();
+
+                                // Check if stream was authorized
+                                if let Some(state) = streams.get_mut(&topic) {
+                                    // Mark as subscribed
+                                    state.subscribed = true;
+                                    info!(
                                         service = %self.name,
-                                        error = %e,
-                                        "Failed to forward subscription to XSUB"
+                                        topic = %topic,
+                                        "Stream subscription accepted"
+                                    );
+
+                                    // Flush any pending messages
+                                    let now = Instant::now();
+                                    let mut delivered = 0;
+                                    let mut expired = 0;
+
+                                    while let Some(msg) = state.messages.pop_front() {
+                                        if now.duration_since(msg.received_at) <= self.message_ttl {
+                                            if let Err(e) = xpub.send(&msg.data, 0) {
+                                                error!(
+                                                    service = %self.name,
+                                                    topic = %topic,
+                                                    error = %e,
+                                                    "Failed to flush pending message"
+                                                );
+                                            } else {
+                                                delivered += 1;
+                                            }
+                                        } else {
+                                            expired += 1;
+                                        }
+                                    }
+
+                                    if delivered > 0 || expired > 0 {
+                                        info!(
+                                            service = %self.name,
+                                            topic = %topic,
+                                            delivered = delivered,
+                                            expired = expired,
+                                            "Flushed pending messages on subscribe"
+                                        );
+                                    }
+                                } else {
+                                    warn!(
+                                        service = %self.name,
+                                        topic = %topic,
+                                        "Subscription rejected - stream not authorized"
                                     );
                                 }
                             }
-                            Err(e) => {
-                                warn!(
+                            Some(0x00) => {
+                                // Unsubscribe request - extract topic (skip control byte)
+                                // Remove entry ENTIRELY to prevent memory leak
+                                let topic = String::from_utf8_lossy(&subscription[1..]).to_string();
+                                if streams.remove(&topic).is_some() {
+                                    debug!(
+                                        service = %self.name,
+                                        topic = %topic,
+                                        "Removed stream on unsubscribe"
+                                    );
+                                }
+                            }
+                            _ => {
+                                trace!(
                                     service = %self.name,
-                                    error = %e,
-                                    "Subscription rejected"
+                                    "Received unknown XPUB control message"
                                 );
-                                // Don't forward - subscription denied
                             }
                         }
                     }
@@ -394,39 +568,26 @@ impl StreamService {
                     }
                 }
             }
-
-            // XSUB → XPUB (messages from publishers)
-            if items[1].is_readable() {
-                match xsub.recv_bytes(0) {
-                    Ok(message) => {
-                        trace!(
-                            service = %self.name,
-                            len = message.len(),
-                            "Received message from XSUB"
-                        );
-
-                        // Forward message to XPUB (no validation needed)
-                        if let Err(e) = xpub.send(&message, 0) {
-                            error!(
-                                service = %self.name,
-                                error = %e,
-                                "Failed to forward message to XPUB"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        error!(
-                            service = %self.name,
-                            error = %e,
-                            "Failed to receive from XSUB"
-                        );
-                    }
-                }
-            }
         }
 
-        info!(service = %self.name, "StreamService proxy stopped");
+        info!(
+            service = %self.name,
+            streams = streams.len(),
+            "StreamService proxy stopped"
+        );
         Ok(())
+    }
+}
+
+/// Extract topic from a message
+///
+/// Topic format: "stream-{uuid}" = 43 bytes (7 + 36)
+fn extract_topic(msg: &[u8]) -> Option<String> {
+    // Topic format: "stream-{uuid}" = 43 bytes (7 + 36)
+    if msg.len() >= 43 && msg.starts_with(b"stream-") {
+        String::from_utf8(msg[..43].to_vec()).ok()
+    } else {
+        None
     }
 }
 
@@ -446,10 +607,10 @@ impl crate::service::spawner::Spawnable for StreamService {
     fn registrations(&self) -> Vec<(crate::registry::SocketKind, TransportConfig)> {
         vec![
             // Note: Registrations show the client-side view
-            // XPUB frontend is registered as "Sub" (clients subscribe)
-            // XSUB backend is registered as "Pub" (publishers connect)
+            // XPUB frontend is registered as "Sub" (clients subscribe via SUB)
+            // PULL backend is registered as "Push" (publishers connect via PUSH)
             (crate::registry::SocketKind::Sub, self.pub_transport.clone()),
-            (crate::registry::SocketKind::Pub, self.sub_transport.clone()),
+            (crate::registry::SocketKind::Push, self.pull_transport.clone()),
         ]
     }
 
@@ -461,15 +622,15 @@ impl crate::service::spawner::Spawnable for StreamService {
         info!(
             service = %self.name,
             pub_endpoint = %self.pub_transport.to_zmq_string(),
-            sub_endpoint = %self.sub_transport.to_zmq_string(),
-            "Starting StreamService proxy"
+            pull_endpoint = %self.pull_transport.to_zmq_string(),
+            "Starting StreamService queuing proxy"
         );
 
         // Setup sockets BEFORE signaling ready
         let xpub = self.setup_xpub()
             .map_err(|e| crate::error::RpcError::SpawnFailed(format!("XPUB setup: {}", e)))?;
-        let xsub = self.setup_xsub()
-            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("XSUB setup: {}", e)))?;
+        let pull = self.setup_pull()
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("PULL setup: {}", e)))?;
 
         // Signal ready AFTER sockets are bound
         if let Some(tx) = on_ready {
@@ -479,7 +640,7 @@ impl crate::service::spawner::Spawnable for StreamService {
         // Notify systemd that service is ready (for Type=notify services)
         let _ = crate::notify::ready();
 
-        // Run the proxy loop with pre-bound sockets
-        self.run_loop_with_sockets(xpub, xsub, shutdown)
+        // Run the queuing proxy loop with pre-bound sockets
+        self.run_loop_with_sockets(xpub, pull, shutdown)
     }
 }

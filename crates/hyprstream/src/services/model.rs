@@ -393,6 +393,28 @@ impl ModelService {
         client.generate_stream(&request).await
     }
 
+    /// Authorize stream subscription via StartStream handshake
+    ///
+    /// Client must call this after infer_stream() to authorize the SUB subscription.
+    /// This sends an AUTHORIZE message to StreamService via InferenceService.
+    async fn start_stream(&self, model_ref_str: &str, stream_id: &str) -> Result<()> {
+        // Ensure model is loaded
+        let _endpoint = self.load_model(model_ref_str).await?;
+
+        // Get client
+        let client = {
+            let mut cache = self.loaded_models.write().await;
+            let model = cache
+                .get_mut(model_ref_str)
+                .ok_or_else(|| anyhow!("Model {} not found after loading", model_ref_str))?;
+            model.last_used = Instant::now();
+            model.client.clone()
+        };
+
+        // Authorize stream via InferenceService
+        client.start_stream(stream_id).await.map(|_| ())
+    }
+
     /// Apply chat template via the model's InferenceService
     async fn apply_chat_template(
         &self,
@@ -530,6 +552,20 @@ impl ModelService {
         Ok(bytes)
     }
 
+    /// Build a stream authorized response
+    fn build_stream_authorized_response(request_id: u64, stream_id: &str) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut response = message.init_root::<model_capnp::model_response::Builder>();
+            response.set_request_id(request_id);
+            let mut auth_info = response.init_stream_authorized();
+            auth_info.set_stream_id(stream_id);
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
     /// Build a health response
     fn build_health_response(request_id: u64, loaded_count: u32, max_models: u32) -> Result<Vec<u8>> {
         let mut message = Builder::new_default();
@@ -655,6 +691,19 @@ impl crate::services::ZmqService for ModelService {
                                 request_id,
                                 &format!("Stream start failed: {}", e),
                                 "STREAM_FAILED",
+                            ),
+                        }
+                    }
+                    Which::StartStream(start_req) => {
+                        let start = start_req?;
+                        let model_ref = start.get_model_ref()?.to_str()?;
+                        let stream_id = start.get_stream_id()?.to_str()?;
+                        match self.start_stream(model_ref, stream_id).await {
+                            Ok(()) => Self::build_stream_authorized_response(request_id, stream_id),
+                            Err(e) => Self::build_error_response(
+                                request_id,
+                                &format!("Stream authorization failed: {}", e),
+                                "STREAM_AUTH_FAILED",
                             ),
                         }
                     }
@@ -884,6 +933,37 @@ impl ModelZmqClient {
         self.parse_stream_started_response(&response_bytes)
     }
 
+    /// Authorize a stream subscription
+    ///
+    /// After calling `infer_stream`, the client must call this method to authorize
+    /// subscription before subscribing to the stream. This routes to InferenceService
+    /// which sends an AUTHORIZE message to StreamService.
+    ///
+    /// # Arguments
+    /// * `model_ref` - The model reference (e.g., "qwen3-small:main")
+    /// * `stream_id` - The stream ID returned by `infer_stream`
+    ///
+    /// # Returns
+    /// The confirmed stream_id on success.
+    pub async fn start_stream(&self, model_ref: &str, stream_id: &str) -> Result<String> {
+        let request_id = self.client.next_id();
+
+        let mut message = Builder::new_default();
+        {
+            let mut req = message.init_root::<model_capnp::model_request::Builder>();
+            req.set_id(request_id);
+            let mut start_req = req.init_start_stream();
+            start_req.set_model_ref(model_ref);
+            start_req.set_stream_id(stream_id);
+        }
+
+        let mut request_bytes = Vec::new();
+        serialize::write_message(&mut request_bytes, &message)?;
+
+        let response_bytes = self.client.call(request_bytes, None).await?;
+        self.parse_stream_authorized_response(&response_bytes)
+    }
+
     /// Health check
     pub async fn health_check(&self) -> Result<ModelHealthInfo> {
         let request_id = self.client.next_id();
@@ -1077,6 +1157,28 @@ impl ModelZmqClient {
                     stream.get_stream_id()?.to_str()?.to_string(),
                     stream.get_endpoint()?.to_str()?.to_string(),
                 ))
+            }
+            Which::Error(error_reader) => {
+                let error = error_reader?;
+                Err(anyhow!(
+                    "{}: {}",
+                    error.get_code()?.to_str()?,
+                    error.get_message()?.to_str()?
+                ))
+            }
+            _ => Err(anyhow!("Unexpected response type")),
+        }
+    }
+
+    fn parse_stream_authorized_response(&self, bytes: &[u8]) -> Result<String> {
+        let reader = serialize::read_message(&mut std::io::Cursor::new(bytes), ReaderOptions::new())?;
+        let response = reader.get_root::<model_capnp::model_response::Reader>()?;
+
+        use model_capnp::model_response::Which;
+        match response.which()? {
+            Which::StreamAuthorized(auth_reader) => {
+                let auth = auth_reader?;
+                Ok(auth.get_stream_id()?.to_str()?.to_string())
             }
             Which::Error(error_reader) => {
                 let error = error_reader?;
