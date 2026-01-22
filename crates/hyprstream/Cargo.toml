@@ -24,22 +24,12 @@ path = "src/bin/main.rs"
 [dependencies]
 # Arrow and DataFusion dependencies removed - focused on ML inference only
 bytes.workspace = true
-safe-path.workspace = true  # Safe path traversal prevention
 futures.workspace = true
-futures-util.workspace = true
-pin-project-lite.workspace = true
-polars.workspace = true
 tokio.workspace = true
-tokio-rustls.workspace = true
 tonic.workspace = true
-rustls.workspace = true
-rustls-pemfile.workspace = true
 async-trait.workspace = true
 tokio-util.workspace = true
-sqlparser.workspace = true
 serde.workspace = true
-serde_derive.workspace = true
-lazy_static.workspace = true
 serde_json.workspace = true
 json-threat-protection.workspace = true
 nix.workspace = true
@@ -74,8 +64,6 @@ num_cpus.workspace = true
 once_cell.workspace = true  # For global GitService singleton
 dirs = "5"  # User directory paths for CLI
 
-# Build dependencies
-cxx.workspace = true
 tracing-log.workspace = true
 tracing-appender.workspace = true
 bincode.workspace = true
@@ -117,14 +105,6 @@ minijinja.workspace = true
 # mistralrs = { path = "../mistral.rs/mistralrs" }
 # mistralrs-core = { path = "../mistral.rs/mistralrs-core" }
 # hf-hub removed - using Git for all model downloads
-
-# Xet integration for LFS replacement (using git repository since crates not published)
-data.workspace = true
-cas_client.workspace = true
-cas_object.workspace = true
-cas_types.workspace = true
-chunk_cache.workspace = true
-merklehash.workspace = true
 
 uuid.workspace = true
 tmq.workspace = true  # Tokio ZeroMQ bindings for event bus
@@ -172,10 +152,6 @@ experimental = []  # EXPERIMENTAL: Enable git write operations (commit/push/merg
 stream-hmac = []  # Enable HMAC signing for stream chunks (NOT YET IMPLEMENTED - feature flag only)
 
 [build-dependencies]
-cc.workspace = true
-bindgen.workspace = true
-cxx-build.workspace = true
-pkg-config.workspace = true
 capnpc.workspace = true  # Cap'n Proto schema compiler
 
 [dev-dependencies]
