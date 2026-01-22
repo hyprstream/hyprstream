@@ -1680,6 +1680,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 [[package]]
 name = "ch-config"
 version = "0.1.0"
+source = "git+https://github.com/kata-containers/kata-containers?tag=3.25.0#17472f3f10c83a8626ea2bde8c4d4868f6ee95b4"
 dependencies = [
  "anyhow",
  "api_client",
@@ -3235,6 +3236,7 @@ dependencies = [
 [[package]]
 name = "dbs-address-space"
 version = "0.3.0"
+source = "git+https://github.com/kata-containers/kata-containers?tag=3.25.0#17472f3f10c83a8626ea2bde8c4d4868f6ee95b4"
 dependencies = [
  "arc-swap",
  "lazy_static",
@@ -3248,6 +3250,7 @@ dependencies = [
 [[package]]
 name = "dbs-allocator"
 version = "0.1.1"
+source = "git+https://github.com/kata-containers/kata-containers?tag=3.25.0#17472f3f10c83a8626ea2bde8c4d4868f6ee95b4"
 dependencies = [
  "thiserror 1.0.69",
 ]
@@ -3255,6 +3258,7 @@ dependencies = [
 [[package]]
 name = "dbs-arch"
 version = "0.2.3"
+source = "git+https://github.com/kata-containers/kata-containers?tag=3.25.0#17472f3f10c83a8626ea2bde8c4d4868f6ee95b4"
 dependencies = [
  "kvm-bindings 0.6.0",
  "kvm-ioctls 0.12.1",
@@ -3268,6 +3272,7 @@ dependencies = [
 [[package]]
 name = "dbs-boot"
 version = "0.4.0"
+source = "git+https://github.com/kata-containers/kata-containers?tag=3.25.0#17472f3f10c83a8626ea2bde8c4d4868f6ee95b4"
 dependencies = [
  "dbs-arch",
  "kvm-bindings 0.6.0",
@@ -3282,6 +3287,7 @@ dependencies = [
 [[package]]
 name = "dbs-device"
 version = "0.2.0"
+source = "git+https://github.com/kata-containers/kata-containers?tag=3.25.0#17472f3f10c83a8626ea2bde8c4d4868f6ee95b4"
 dependencies = [
  "thiserror 1.0.69",
 ]
@@ -3289,6 +3295,7 @@ dependencies = [
 [[package]]
 name = "dbs-interrupt"
 version = "0.2.2"
+source = "git+https://github.com/kata-containers/kata-containers?tag=3.25.0#17472f3f10c83a8626ea2bde8c4d4868f6ee95b4"
 dependencies = [
  "dbs-arch",
  "dbs-device",
@@ -3301,6 +3308,7 @@ dependencies = [
 [[package]]
 name = "dbs-legacy-devices"
 version = "0.1.1"
+source = "git+https://github.com/kata-containers/kata-containers?tag=3.25.0#17472f3f10c83a8626ea2bde8c4d4868f6ee95b4"
 dependencies = [
  "dbs-device",
  "dbs-utils",
@@ -3314,6 +3322,7 @@ dependencies = [
 [[package]]
 name = "dbs-pci"
 version = "0.1.0"
+source = "git+https://github.com/kata-containers/kata-containers?tag=3.25.0#17472f3f10c83a8626ea2bde8c4d4868f6ee95b4"
 dependencies = [
  "byteorder",
  "dbs-address-space",
@@ -3353,6 +3362,7 @@ dependencies = [
 [[package]]
 name = "dbs-upcall"
 version = "0.3.0"
+source = "git+https://github.com/kata-containers/kata-containers?tag=3.25.0#17472f3f10c83a8626ea2bde8c4d4868f6ee95b4"
 dependencies = [
  "anyhow",
  "dbs-utils",
@@ -3365,6 +3375,7 @@ dependencies = [
 [[package]]
 name = "dbs-utils"
 version = "0.2.1"
+source = "git+https://github.com/kata-containers/kata-containers?tag=3.25.0#17472f3f10c83a8626ea2bde8c4d4868f6ee95b4"
 dependencies = [
  "anyhow",
  "event-manager",
@@ -3379,6 +3390,7 @@ dependencies = [
 [[package]]
 name = "dbs-virtio-devices"
 version = "0.3.1"
+source = "git+https://github.com/kata-containers/kata-containers?tag=3.25.0#17472f3f10c83a8626ea2bde8c4d4868f6ee95b4"
 dependencies = [
  "byteorder",
  "caps",
@@ -3669,6 +3681,7 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 [[package]]
 name = "dragonball"
 version = "0.1.0"
+source = "git+https://github.com/kata-containers/kata-containers?tag=3.25.0#17472f3f10c83a8626ea2bde8c4d4868f6ee95b4"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -5261,6 +5274,7 @@ dependencies = [
 [[package]]
 name = "hypervisor"
 version = "0.1.0"
+source = "git+https://github.com/kata-containers/kata-containers?tag=3.25.0#17472f3f10c83a8626ea2bde8c4d4868f6ee95b4"
 dependencies = [
  "actix-rt",
  "anyhow",
@@ -6003,6 +6017,7 @@ dependencies = [
 [[package]]
 name = "kata-sys-util"
 version = "0.1.0"
+source = "git+https://github.com/kata-containers/kata-containers?tag=3.25.0#17472f3f10c83a8626ea2bde8c4d4868f6ee95b4"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -6020,7 +6035,7 @@ dependencies = [
  "pci-ids",
  "rand 0.8.5",
  "runtime-spec",
- "safe-path 0.1.0",
+ "safe-path 0.1.0 (git+https://github.com/kata-containers/kata-containers?tag=3.25.0)",
  "serde",
  "serde_json",
  "slog",
@@ -6032,6 +6047,7 @@ dependencies = [
 [[package]]
 name = "kata-types"
 version = "0.1.0"
+source = "git+https://github.com/kata-containers/kata-containers?tag=3.25.0#17472f3f10c83a8626ea2bde8c4d4868f6ee95b4"
 dependencies = [
  "anyhow",
  "base64 0.13.1",
@@ -6044,7 +6060,7 @@ dependencies = [
  "num_cpus",
  "oci-spec",
  "regex",
- "safe-path 0.1.0",
+ "safe-path 0.1.0 (git+https://github.com/kata-containers/kata-containers?tag=3.25.0)",
  "serde",
  "serde-enum-str",
  "serde_json",
@@ -6763,6 +6779,7 @@ checksum = "34080505efa8e45a4b816c349525ebe327ceaa8559756f0356cba97ef3bf7432"
 [[package]]
 name = "logging"
 version = "0.1.0"
+source = "git+https://github.com/kata-containers/kata-containers?tag=3.25.0#17472f3f10c83a8626ea2bde8c4d4868f6ee95b4"
 dependencies = [
  "arc-swap",
  "lazy_static",
@@ -8382,13 +8399,14 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "persist"
 version = "0.1.0"
+source = "git+https://github.com/kata-containers/kata-containers?tag=3.25.0#17472f3f10c83a8626ea2bde8c4d4868f6ee95b4"
 dependencies = [
  "anyhow",
  "async-trait",
  "kata-sys-util",
  "kata-types",
  "libc",
- "safe-path 0.1.0",
+ "safe-path 0.1.0 (git+https://github.com/kata-containers/kata-containers?tag=3.25.0)",
  "serde",
  "serde_json",
  "shim-interface",
@@ -9579,6 +9597,7 @@ dependencies = [
 [[package]]
 name = "protocols"
 version = "0.1.0"
+source = "git+https://github.com/kata-containers/kata-containers?tag=3.25.0#17472f3f10c83a8626ea2bde8c4d4868f6ee95b4"
 dependencies = [
  "async-trait",
  "oci-spec",
@@ -9629,9 +9648,9 @@ dependencies = [
 
 [[package]]
 name = "qapi"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6412bdd014ebee03ddbbe79ac03a0b622cce4d80ba45254f6357c847f06fa38"
+checksum = "7b047adab56acc4948d4b9b58693c1f33fd13efef2d6bb5f0f66a47436ceada8"
 dependencies = [
  "bytes",
  "futures",
@@ -9666,9 +9685,9 @@ dependencies = [
 
 [[package]]
 name = "qapi-qmp"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8b944db7e544d2fa97595e9a000a6ba5c62c426fa185e7e00aabe4b5640b538"
+checksum = "45303cac879d89361cad0287ae15f9ae1e7799b904b474152414aeece39b9875"
 dependencies = [
  "qapi-codegen",
  "qapi-spec",
@@ -10403,6 +10422,7 @@ dependencies = [
 [[package]]
 name = "runtime-spec"
 version = "0.1.0"
+source = "git+https://github.com/kata-containers/kata-containers?tag=3.25.0#17472f3f10c83a8626ea2bde8c4d4868f6ee95b4"
 dependencies = [
  "libc",
  "serde",
@@ -10802,6 +10822,8 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 [[package]]
 name = "safe-path"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "980abdd3220aa19b67ca3ea07b173ca36383f18ae48cde696d90c8af39447ffb"
 dependencies = [
  "libc",
 ]
@@ -10809,8 +10831,7 @@ dependencies = [
 [[package]]
 name = "safe-path"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "980abdd3220aa19b67ca3ea07b173ca36383f18ae48cde696d90c8af39447ffb"
+source = "git+https://github.com/kata-containers/kata-containers?tag=3.25.0#17472f3f10c83a8626ea2bde8c4d4868f6ee95b4"
 dependencies = [
  "libc",
 ]
@@ -11230,6 +11251,7 @@ dependencies = [
 [[package]]
 name = "shim-interface"
 version = "0.1.0"
+source = "git+https://github.com/kata-containers/kata-containers?tag=3.25.0#17472f3f10c83a8626ea2bde8c4d4868f6ee95b4"
 dependencies = [
  "anyhow",
  "hyper 0.14.32",
@@ -11944,6 +11966,7 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 [[package]]
 name = "tests_utils"
 version = "0.1.0"
+source = "git+https://github.com/kata-containers/kata-containers?tag=3.25.0#17472f3f10c83a8626ea2bde8c4d4868f6ee95b4"
 dependencies = [
  "anyhow",
  "kata-types",

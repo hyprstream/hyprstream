@@ -73,10 +73,10 @@ hex = "0.4"
 base64 = "0.21"
 
 # Kata Containers runtime-rs (hypervisor abstraction)
-kata-hypervisor = { path = "../../../kata-containers/src/runtime-rs/crates/hypervisor", package = "hypervisor", features = ["cloud-hypervisor"] }
-kata-types = { path = "../../../kata-containers/src/libs/kata-types" }
-kata-sys-util = { path = "../../../kata-containers/src/libs/kata-sys-util" }
-ch-config = { path = "../../../kata-containers/src/runtime-rs/crates/hypervisor/ch-config" }
+kata-hypervisor = { git = "https://github.com/kata-containers/kata-containers", tag = "3.25.0", package = "hypervisor", features = ["cloud-hypervisor"] }
+kata-types = { git = "https://github.com/kata-containers/kata-containers", tag = "3.25.0" }
+kata-sys-util = { git = "https://github.com/kata-containers/kata-containers", tag = "3.25.0" }
+ch-config = { git = "https://github.com/kata-containers/kata-containers", tag = "3.25.0" }
 
 [features]
 default = []
