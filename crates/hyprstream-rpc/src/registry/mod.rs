@@ -260,38 +260,6 @@ impl EndpointRegistry {
         }
     }
 
-    /// Check for systemd socket activation and return the file descriptor.
-    ///
-    /// Returns `Some(fd)` if running under systemd with socket activation,
-    /// `None` otherwise.
-    ///
-    /// For services with multiple sockets (e.g., event service with PUB/SUB),
-    /// detects the correct FD based on socket type and index.
-    fn get_systemd_fd(&self, _socket_kind: SocketKind) -> Option<std::os::unix::io::RawFd> {
-        use std::os::unix::io::RawFd;
-
-        const SD_LISTEN_FDS_START: RawFd = 3;
-
-        let listen_fds: i32 = std::env::var("LISTEN_FDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-
-        let listen_pid: u32 = std::env::var("LISTEN_PID")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-
-        // Verify PID matches and we have at least 1 FD
-        if listen_pid != std::process::id() || listen_fds < 1 {
-            return None;
-        }
-
-        // For most services, use the first FD (index 0)
-        // For event service with PUB/SUB, this could be extended to detect socket index
-        Some(SD_LISTEN_FDS_START)
-    }
-
     // ========================================================================
     // Backward-compatible convenience methods (default to REP socket)
     // ========================================================================

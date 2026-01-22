@@ -75,6 +75,10 @@ pub struct HyprConfig {
     /// Arrow Flight SQL server configuration
     #[serde(default)]
     pub flight: FlightConfig,
+
+    /// StreamService configuration (buffer sizes, TTL, etc.)
+    #[serde(default)]
+    pub streaming: StreamingConfig,
 }
 
 /// JWT token issuance configuration
@@ -182,6 +186,42 @@ impl Default for FlightConfig {
 
 fn default_flight_host() -> String { "0.0.0.0".to_string() }
 fn default_flight_port() -> u16 { 50051 }
+
+/// StreamService configuration
+///
+/// Controls the PULL/XPUB streaming proxy behavior including buffer sizes,
+/// message TTL, and retransmission settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamingConfig {
+    /// Maximum pending messages per topic (for pre-subscribe queue and retransmit buffer)
+    /// Default: 1000
+    #[serde(default = "default_max_pending_per_topic")]
+    pub max_pending_per_topic: usize,
+
+    /// Message TTL in seconds - messages older than this are dropped
+    /// Default: 30
+    #[serde(default = "default_message_ttl_secs")]
+    pub message_ttl_secs: u64,
+
+    /// Interval between compaction runs in seconds
+    /// Default: 5
+    #[serde(default = "default_compact_interval_secs")]
+    pub compact_interval_secs: u64,
+}
+
+impl Default for StreamingConfig {
+    fn default() -> Self {
+        Self {
+            max_pending_per_topic: default_max_pending_per_topic(),
+            message_ttl_secs: default_message_ttl_secs(),
+            compact_interval_secs: default_compact_interval_secs(),
+        }
+    }
+}
+
+fn default_max_pending_per_topic() -> usize { 1000 }
+fn default_message_ttl_secs() -> u64 { 30 }
+fn default_compact_interval_secs() -> u64 { 5 }
 
 /// Storage paths and directories configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -439,6 +479,7 @@ pub struct HyprConfigBuilder {
     token: TokenConfig,
     oai: OAIConfig,
     flight: FlightConfig,
+    streaming: StreamingConfig,
 }
 
 impl HyprConfigBuilder {
@@ -457,6 +498,7 @@ impl HyprConfigBuilder {
             token: TokenConfig::default(),
             oai: OAIConfig::default(),
             flight: FlightConfig::default(),
+            streaming: StreamingConfig::default(),
         }
     }
 
@@ -475,6 +517,7 @@ impl HyprConfigBuilder {
             token: config.token,
             oai: config.oai,
             flight: config.flight,
+            streaming: config.streaming,
         }
     }
 
@@ -505,6 +548,7 @@ impl HyprConfigBuilder {
             token: self.token,
             oai: self.oai,
             flight: self.flight,
+            streaming: self.streaming,
         }
     }
 

@@ -2,7 +2,7 @@
 //!
 //! This module provides:
 //! - Ed25519 digital signatures for request envelope authentication
-//! - Diffie-Hellman key exchange (X25519 or ECDH P-256 in FIPS mode)
+//! - Diffie-Hellman key exchange (Ristretto255 or ECDH P-256 in FIPS mode)
 //! - Chained HMAC-SHA256 for streaming response authentication
 //!
 //! # Chained HMAC
@@ -18,7 +18,7 @@
 //!
 //! # Feature Flags
 //!
-//! - Default: Uses X25519 for key exchange
+//! - Default: Uses Ristretto255 for key exchange (prime-order group, no cofactor issues)
 //! - `fips`: Uses ECDH P-256 for FIPS 140-2 compliance
 
 pub mod hmac;
@@ -26,7 +26,7 @@ pub mod key_exchange;
 pub mod signing;
 
 pub use hmac::{ChainedStreamHmac, HmacKey, StreamHmac};
-pub use key_exchange::{DefaultKeyExchange, KeyExchange, SharedSecret};
+pub use key_exchange::{derive_stream_keys, DefaultKeyExchange, KeyExchange, SharedSecret, StreamKeys};
 pub use signing::{
     generate_signing_keypair, sign_message, signing_key_from_bytes, verify_message,
     verifying_key_from_bytes, SigningKey, VerifyingKey,
@@ -34,8 +34,8 @@ pub use signing::{
 
 #[cfg(not(feature = "fips"))]
 pub use key_exchange::{
-    ed25519_to_x25519_pubkey, ed25519_to_x25519_secret, generate_ephemeral_keypair,
-    X25519KeyExchange,
+    generate_ephemeral_keypair, ristretto_dh, RistrettoKeyExchange, RistrettoPublic,
+    RistrettoSecret,
 };
 
 #[cfg(feature = "fips")]

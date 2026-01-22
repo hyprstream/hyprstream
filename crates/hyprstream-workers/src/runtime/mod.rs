@@ -46,7 +46,7 @@ pub use sandbox::{
     PodIP, PodSandbox, PodSandboxConfig, PodSandboxNetworkStatus, PodSandboxState,
     PodSandboxStatus,
 };
-pub use service::WorkerService;
+pub use service::{AttachResponse, WorkerService};
 // Re-export service infrastructure from hyprstream-rpc for convenience
 pub use hyprstream_rpc::service::{EnvelopeContext, ServiceHandle, ZmqService};
 pub use virtiofs::{SandboxVirtiofs, SandboxVirtiofsBuilder};

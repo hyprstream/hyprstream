@@ -137,6 +137,15 @@ pub enum WorkerAction {
         timeout: i64,
     },
 
+    /// Attach to container terminal (tmux-like streaming I/O)
+    Terminal {
+        /// Container ID
+        container_id: String,
+        /// Detach key sequence (default: ctrl-])
+        #[arg(long, default_value = "ctrl-]")]
+        detach_keys: String,
+    },
+
     /// Image management commands
     #[command(subcommand)]
     Images(ImageCommand),

@@ -40,6 +40,10 @@ struct RuntimeRequest {
     listPodSandboxStats @16 :PodSandboxStatsFilter;
     containerStats @17 :Text;       # container_id
     listContainerStats @18 :ContainerStatsFilter;
+
+    # Terminal attach/detach (tmux-like I/O streaming)
+    attach @19 :AttachRequest;
+    detach @20 :Text;               # container_id
   }
 }
 
@@ -62,6 +66,9 @@ struct RuntimeResponse {
     sandboxStatsList @13 :List(PodSandboxStats);
     containerStatsResult @14 :ContainerStats;
     containerStatsList @15 :List(ContainerStats);
+
+    # Terminal attach response
+    attachResponse @16 :AttachResponse;
   }
 }
 
@@ -468,6 +475,26 @@ struct ExecSyncResult {
   stdout @0 :Data;
   stderr @1 :Data;
   exitCode @2 :Int32;
+}
+
+# Terminal Attach (tmux-like I/O streaming)
+
+struct AttachRequest {
+  containerId @0 :Text;
+  # Optional: attach to specific FDs (default: stdin/stdout/stderr)
+  # 0 = stdin, 1 = stdout, 2 = stderr
+  fds @1 :List(UInt8);
+}
+
+struct AttachResponse {
+  containerId @0 :Text;
+  # Stream topics for each FD
+  # Client subscribes to these topics via StreamService
+  stdinTopic @1 :Text;    # worker-{container_id}-0
+  stdoutTopic @2 :Text;   # worker-{container_id}-1
+  stderrTopic @3 :Text;   # worker-{container_id}-2
+  # StreamService endpoint for subscribing
+  streamEndpoint @4 :Text;
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════

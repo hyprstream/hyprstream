@@ -332,30 +332,6 @@ impl TransportConfig {
         matches!(&self.endpoint, EndpointType::SystemdFd { .. })
     }
 
-    /// Check for systemd socket activation and return the file descriptor.
-    ///
-    /// Returns `Some(fd)` if running under systemd with socket activation,
-    /// `None` otherwise.
-    fn get_systemd_fd() -> Option<RawFd> {
-        const SD_LISTEN_FDS_START: RawFd = 3;
-
-        let listen_fds: i32 = std::env::var("LISTEN_FDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-
-        let listen_pid: u32 = std::env::var("LISTEN_PID")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-
-        // Verify PID matches and we have at least 1 FD
-        if listen_pid == std::process::id() && listen_fds >= 1 {
-            Some(SD_LISTEN_FDS_START)
-        } else {
-            None
-        }
-    }
 }
 
 #[cfg(test)]

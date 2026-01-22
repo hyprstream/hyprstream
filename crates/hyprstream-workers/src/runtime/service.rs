@@ -13,7 +13,6 @@ use tracing::debug;
 
 // Import ZMQ service infrastructure from hyprstream-rpc
 use hyprstream_rpc::prelude::VerifyingKey;
-use hyprstream_rpc::registry::{global as registry, SocketKind};
 use hyprstream_rpc::service::{EnvelopeContext, ZmqService};
 use hyprstream_rpc::transport::TransportConfig;
 
@@ -849,6 +848,70 @@ impl WorkerService {
 
         Ok(results)
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // Terminal Attach/Detach
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    /// Attach to a container's terminal I/O streams (tmux-like)
+    ///
+    /// Returns stream topics for stdin/stdout/stderr that the client can subscribe to.
+    /// The actual I/O bridge (vsock/serial → StreamService) is handled separately.
+    ///
+    /// # Topic Format
+    /// - stdin:  `worker-{container_id}-0`
+    /// - stdout: `worker-{container_id}-1`
+    /// - stderr: `worker-{container_id}-2`
+    pub async fn attach(&self, container_id: &str) -> Result<AttachResponse> {
+        // Verify container exists
+        let containers = self.containers.read().await;
+        if !containers.contains_key(container_id) {
+            return Err(anyhow::anyhow!("Container not found: {}", container_id).into());
+        }
+        drop(containers);
+
+        // Generate topics for each FD
+        let stdin_topic = format!("worker-{}-0", container_id);
+        let stdout_topic = format!("worker-{}-1", container_id);
+        let stderr_topic = format!("worker-{}-2", container_id);
+
+        // TODO: Send StreamRegister for each topic to StreamService
+        // This requires a PUSH socket connection to StreamService's PULL endpoint
+        // For now, we just return the topics - the caller must ensure topics are registered
+
+        // Get stream endpoint from transport config or use default
+        // The client will connect to this to subscribe
+        let stream_endpoint = std::env::var("HYPRSTREAM_STREAM_ENDPOINT")
+            .unwrap_or_else(|_| "tcp://127.0.0.1:5560".to_string());
+
+        Ok(AttachResponse {
+            container_id: container_id.to_string(),
+            stdin_topic,
+            stdout_topic,
+            stderr_topic,
+            stream_endpoint,
+        })
+    }
+
+    /// Detach from a container's terminal I/O streams
+    ///
+    /// This is a no-op for now - topics expire via claims.exp in StreamService.
+    /// In the future, we could send an explicit unregister message.
+    pub async fn detach(&self, _container_id: &str) -> Result<()> {
+        // TODO: Send unregister message to StreamService if needed
+        // For now, rely on claims-based expiry
+        Ok(())
+    }
+}
+
+/// Response from attach() with stream topics
+#[derive(Debug, Clone)]
+pub struct AttachResponse {
+    pub container_id: String,
+    pub stdin_topic: String,
+    pub stdout_topic: String,
+    pub stderr_topic: String,
+    pub stream_endpoint: String,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1121,6 +1184,23 @@ impl WorkerService {
                     Err(e) => Ok(build_error_response(request_id, &e.to_string())),
                 }
             }
+
+            Which::Attach(attach_req) => {
+                let attach_req = attach_req.ok()?;
+                let container_id = attach_req.get_container_id().ok()?.to_str().ok()?.to_string();
+                match self.runtime_handle.block_on(self.attach(&container_id)) {
+                    Ok(response) => Ok(build_attach_response(request_id, &response)),
+                    Err(e) => Ok(build_error_response(request_id, &e.to_string())),
+                }
+            }
+
+            Which::Detach(container_id) => {
+                let container_id = container_id.ok()?.to_str().ok()?.to_string();
+                match self.runtime_handle.block_on(self.detach(&container_id)) {
+                    Ok(()) => Ok(build_success_response(request_id)),
+                    Err(e) => Ok(build_error_response(request_id, &e.to_string())),
+                }
+            }
         })
     }
 
@@ -1311,6 +1391,19 @@ fn build_version_response(request_id: u64, version: &VersionResponse) -> Vec<u8>
         ver.set_runtime_name(&version.runtime_name);
         ver.set_runtime_version(&version.runtime_version);
         ver.set_runtime_api_version(&version.runtime_api_version);
+    }).unwrap_or_default()
+}
+
+fn build_attach_response(request_id: u64, attach: &AttachResponse) -> Vec<u8> {
+    serialize_message(|msg| {
+        let mut resp = msg.init_root::<workers_capnp::runtime_response::Builder>();
+        resp.set_request_id(request_id);
+        let mut attach_resp = resp.init_attach_response();
+        attach_resp.set_container_id(&attach.container_id);
+        attach_resp.set_stdin_topic(&attach.stdin_topic);
+        attach_resp.set_stdout_topic(&attach.stdout_topic);
+        attach_resp.set_stderr_topic(&attach.stderr_topic);
+        attach_resp.set_stream_endpoint(&attach.stream_endpoint);
     }).unwrap_or_default()
 }
 
@@ -1524,7 +1617,7 @@ fn build_image_status_response(request_id: u64, status: &crate::image::ImageStat
     serialize_message(|msg| {
         let mut resp = msg.init_root::<workers_capnp::image_response::Builder>();
         resp.set_request_id(request_id);
-        let mut image_status = resp.init_image_status();
+        let image_status = resp.init_image_status();
         if let Some(ref img) = status.image {
             let mut image = image_status.init_image();
             image.set_id(&img.id);

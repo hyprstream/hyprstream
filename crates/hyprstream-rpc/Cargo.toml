@@ -51,7 +51,7 @@ zbus_systemd = { version = "0.0.11", features = ["login1", "systemd1"], optional
 
 # Cryptography (for signed envelopes, DH key exchange, stream HMAC)
 ed25519-dalek = { workspace = true }
-x25519-dalek = { workspace = true }
+curve25519-dalek = { workspace = true }  # Ristretto255 DH for stream authentication
 sha2 = { workspace = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }

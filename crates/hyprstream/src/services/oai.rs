@@ -29,10 +29,8 @@
 //! port = 8080
 //! ```
 
-use crate::config::{HyprConfig, OAIConfig};
+use crate::config::OAIConfig;
 use crate::server::{create_app, state::ServerState};
-use crate::services::{ModelZmqClient, PolicyZmqClient};
-use crate::storage::ModelStorage;
 use anyhow::Result;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::SocketKind;
@@ -69,6 +67,7 @@ pub struct OAIService {
     control_transport: TransportConfig,
 
     /// Verifying key for envelope verification
+    #[allow(dead_code)]
     verifying_key: VerifyingKey,
 }
 

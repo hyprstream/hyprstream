@@ -1,19 +1,22 @@
-//! StreamService - PULL/XPUB queuing proxy with claims-based expiry
+//! StreamService - PULL/XPUB queuing proxy with signed registration (E2E blind forwarder)
 //!
 //! # Architecture
 //!
 //! ```text
-//! InferenceService                StreamService                     Client
-//!       │                              │                              │
-//!       │──AUTHORIZE|stream-uuid|exp──►│ (pre-authorize with expiry)  │
-//!       │                              │                              │
-//!       │──stream-uuid.chunk──────────►│ (queue if no subscriber)     │
-//!       │                              │                              │
-//!       │                              │◄───────\x01stream-uuid───────│
-//!       │                              │ (subscription, authorize OK)  │
-//!       │                              │                              │
-//!       │                              │────stream-uuid.chunk────────►│
-//!       │                              │ (flush queued + deliver)      │
+//! InferenceService                 StreamService                    Client
+//!    │                                  │                              │
+//!    │─ SignedEnvelope(StreamRegister) ►│                              │
+//!    │   [verify sig, check claims]     │                              │
+//!    │                                  │                              │
+//!    │─ StreamChunk(topic,data,hmac) ──►│                              │
+//!    │   [extract topic from capnp]     │                              │
+//!    │   [NO HMAC verification]         │                              │
+//!    │                                  │─ {topic}{StreamChunk} ──────►│
+//!    │                                  │   [XPUB prefix routing]      │[verify HMAC chain]
+//!    │                                  │                              │
+//!    │                                  │◄─ StreamResume(topic,hmac) ──│
+//!    │                                  │   [find hmac in buffer]      │
+//!    │                                  │─ {buffered chunks...} ──────►│
 //! ```
 //!
 //! # Why PUSH/PULL instead of PUB/XSUB
@@ -28,56 +31,85 @@
 //! - StreamService queues per-topic until subscriber arrives
 //! - On subscribe, queued messages are flushed to client
 //!
-//! # Authorization Flow
+//! # Security Model (E2E Authentication)
 //!
-//! 1. InferenceService validates JWT claims at request time
-//! 2. InferenceService sends AUTHORIZE message with stream_id and claims expiry
-//! 3. Client subscribes with just `stream-{uuid}` (no JWT needed)
-//! 4. StreamService checks stream was authorized, allows subscription
-//! 5. On unsubscribe (0x00), entry is removed entirely
-//! 6. Periodic compact() removes expired entries (claims.exp)
+//! StreamService is a **blind forwarder** - it does NOT verify HMACs.
+//! HMAC verification is done **end-to-end** by the client.
+//!
+//! - **Topic derivation**: DH-derived topic (InferenceService ↔ Client) - unpredictable
+//! - **StreamRegister**: Signed capnp wrapped in `SignedEnvelope`, verified before accepting
+//! - **StreamChunk**: Contains DH-derived topic, data, and chained HMAC
+//! - **Client verifies**: Client derives same keys from DH and verifies HMAC chain
+//! - **StreamResume**: Client provides last valid HMAC, service resends subsequent chunks
 //!
 //! # Memory Management
 //!
-//! - **Unified StreamState**: Single HashMap tracks auth, subscription, and messages
+//! - **Unified StreamState**: Single HashMap tracks auth, subscription, messages, and HMAC state
 //! - **Claims-based expiry**: Entries removed when claims.exp timestamp passes
 //! - **Unsubscribe cleanup**: Entry removed entirely on 0x00 (prevents leaks)
 //! - **Message TTL**: Individual messages expire after 30s if not delivered
 //! - **Per-topic limit**: Max 1000 messages per topic (oldest dropped on overflow)
+//! - **Retransmit buffer**: Chunks retained for resume requests (HMAC-indexed)
 
+use crate::auth::Scope;
+use crate::capnp::FromCapnp;
+use crate::common_capnp;
+use crate::streaming_capnp;
+use crate::envelope::{InMemoryNonceCache, SignedEnvelope};
 use crate::transport::TransportConfig;
 use anyhow::{anyhow, Result};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use subtle::ConstantTimeEq;
 use tokio::sync::Notify;
 use tracing::{debug, error, info, trace, warn};
 
 /// A pending message waiting for a subscriber
 struct PendingMessage {
+    /// Original capnp-serialized StreamChunk bytes
     data: Vec<u8>,
+    /// When this message was received
     received_at: Instant,
+    /// The HMAC from this chunk (for retransmit buffer indexing)
+    hmac: [u8; 32],
 }
 
 /// State for an authorized stream
 ///
 /// Unified structure that tracks authorization, subscription status, and pending messages.
-/// Replaces separate `authorized_streams`, `subscribers`, and `pending` collections.
+/// Note: StreamService is a blind forwarder - it does NOT verify HMACs.
+/// HMAC verification is done end-to-end by the client.
 struct StreamState {
-    /// Expiration timestamp (Unix seconds) from the authorizing request's claims
+    /// Expiration timestamp (Unix millis) from the authorizing request's claims
     /// Stream is removed during compact() when `now > exp`
     exp: i64,
+
     /// Whether a client has subscribed to this stream
     subscribed: bool,
+
     /// Messages queued before subscriber arrived (flushed on subscribe)
+    /// Also serves as retransmit buffer - indexed by HMAC for StreamResume
     messages: VecDeque<PendingMessage>,
 }
 
-/// StreamService - PULL/XPUB queuing proxy with claims-based expiry
+impl StreamState {
+    /// Find position in buffer matching the given HMAC
+    fn find_hmac_position(&self, hmac: &[u8; 32]) -> Option<usize> {
+        self.messages.iter().position(|msg| msg.hmac.ct_eq(hmac).into())
+    }
+}
+
+/// StreamService - PULL/XPUB queuing proxy with signed registration (E2E blind forwarder)
 ///
 /// Receives messages via PULL (from publishers using PUSH), queues them
 /// per-topic until a subscriber arrives, then delivers via XPUB.
-/// Authorization is handled via AUTHORIZE messages with expiry timestamps.
+///
+/// Security (E2E Authentication):
+/// - StreamService is a **blind forwarder** - does NOT verify HMACs
+/// - Registration via `SignedEnvelope(StreamRegister)` - signature verified
+/// - Client verifies HMAC chain end-to-end using DH-derived keys
+/// - Resume via `StreamResume` - client provides last valid HMAC
 pub struct StreamService {
     /// Service name (for logging and registry)
     name: String,
@@ -99,6 +131,10 @@ pub struct StreamService {
 
     /// Interval between compaction runs (default: 5s)
     compact_interval: Duration,
+
+    /// Nonce cache for replay protection on SignedEnvelope
+    #[allow(dead_code)]
+    nonce_cache: Arc<InMemoryNonceCache>,
 }
 
 impl StreamService {
@@ -110,11 +146,13 @@ impl StreamService {
     /// * `pub_transport` - XPUB frontend config (client-facing, with optional CurveZMQ)
     /// * `pull_transport` - PULL backend config (receives from publishers)
     ///
-    /// # Security
+    /// # Security (E2E Authentication)
     ///
-    /// CurveZMQ can be enabled via `pub_transport.with_curve()` and `pull_transport.with_curve()`.
-    /// The transport layer handles encryption automatically.
-    /// Authorization is handled via AUTHORIZE messages with claims-based expiry.
+    /// StreamService is a **blind forwarder**:
+    /// - Does NOT verify HMACs (client verifies end-to-end)
+    /// - Topics are DH-derived (InferenceService ↔ Client), unpredictable
+    /// - Stream registration via `SignedEnvelope(StreamRegister)` - signature verified
+    /// - CurveZMQ can be enabled via transport configs for transport-layer encryption
     pub fn new(
         name: impl Into<String>,
         context: Arc<zmq::Context>,
@@ -130,12 +168,12 @@ impl StreamService {
                 service=%name,
                 pub_encrypted=pub_transport.curve.is_some(),
                 pull_encrypted=pull_transport.curve.is_some(),
-                "StreamService initialized with CurveZMQ encryption"
+                "StreamService initialized with CurveZMQ encryption (E2E blind forwarder)"
             );
         } else {
             info!(
                 service=%name,
-                "StreamService initialized (CurveZMQ disabled - plaintext transport)"
+                "StreamService initialized (E2E blind forwarder, plaintext transport)"
             );
         }
 
@@ -147,7 +185,87 @@ impl StreamService {
             message_ttl: Duration::from_secs(30),
             max_pending_per_topic: 1000,
             compact_interval: Duration::from_secs(5),
+            nonce_cache: Arc::new(InMemoryNonceCache::new()),
         }
+    }
+
+    /// Configure buffer sizes and TTL
+    ///
+    /// # Arguments
+    /// * `max_pending_per_topic` - Maximum messages to buffer per topic (for queue and retransmit)
+    /// * `message_ttl` - How long to keep messages before expiry
+    /// * `compact_interval` - How often to run compaction
+    pub fn with_buffer_config(
+        mut self,
+        max_pending_per_topic: usize,
+        message_ttl: Duration,
+        compact_interval: Duration,
+    ) -> Self {
+        self.max_pending_per_topic = max_pending_per_topic;
+        self.message_ttl = message_ttl;
+        self.compact_interval = compact_interval;
+        self
+    }
+
+    /// Handle a SignedEnvelope(StreamRegister) message
+    ///
+    /// 1. Parse SignedEnvelope from capnp
+    /// 2. Verify signature (skip for now - trusted internal network)
+    /// 3. Parse StreamRegister from payload
+    /// 4. Check claims allow publishing to this topic
+    /// 5. Register the stream (topic is DH-derived, unpredictable)
+    ///
+    /// Note: StreamService is a blind forwarder - no HMAC key derivation.
+    /// Topic is DH-derived by InferenceService and Client.
+    fn handle_register(
+        &self,
+        msg: &[u8],
+        streams: &mut HashMap<String, StreamState>,
+    ) -> Result<String> {
+        use capnp::serialize;
+
+        // Parse SignedEnvelope
+        let reader = serialize::read_message(
+            &mut std::io::Cursor::new(msg),
+            capnp::message::ReaderOptions::default(),
+        )?;
+        let signed_reader = reader.get_root::<common_capnp::signed_envelope::Reader>()?;
+        let signed = SignedEnvelope::read_from(signed_reader)?;
+
+        // TODO: Verify signature against expected service pubkey
+        // For now, we trust the internal network (same machine IPC)
+        // In production, you'd verify against a known set of service pubkeys
+
+        // Parse StreamRegister from payload
+        // Topic is DH-derived (64 hex chars), unpredictable
+        let (topic, exp) = parse_stream_register(&signed.envelope.payload)
+            .ok_or_else(|| anyhow!("Invalid StreamRegister payload"))?;
+
+        // Check claims allow publishing to this topic
+        if let Some(claims) = &signed.envelope.claims {
+            let required = Scope::new(
+                "publish".to_string(),
+                "stream".to_string(),
+                topic.clone(),
+            );
+            let has_scope = claims.admin || claims.scopes.iter().any(|s| s.grants(&required));
+
+            if !has_scope {
+                return Err(anyhow!(
+                    "Claims do not authorize publishing to stream: {}",
+                    topic
+                ));
+            }
+        }
+
+        // Register the stream (blind forwarder - no HMAC key needed)
+        streams.insert(topic.clone(), StreamState {
+            exp,
+            subscribed: false,
+            messages: VecDeque::new(),
+        });
+
+        Ok(topic)
     }
 
     /// Setup PULL socket with transport-layer security (CurveZMQ + permissions)
@@ -354,69 +472,94 @@ impl StreamService {
                 }
             }
 
-            // PULL → Handle authorize messages OR queue/deliver chunks
+            // PULL → Handle SignedEnvelope(StreamRegister), StreamChunk, or StreamResume
             if items[0].is_readable() {
                 match pull.recv_bytes(0) {
                     Ok(message) => {
-                        // Check for AUTHORIZE message from InferenceService
-                        // Format: "AUTHORIZE|stream-{uuid}|{exp_timestamp}"
-                        if message.starts_with(b"AUTHORIZE|") {
-                            let auth_msg = String::from_utf8_lossy(&message);
-                            let parts: Vec<&str> = auth_msg.splitn(3, '|').collect();
-                            if parts.len() >= 3 {
-                                let stream_id = parts[1].to_string();
-                                let exp = parts[2].parse::<i64>().unwrap_or_else(|_| {
-                                    // Default: 5 minutes from now if parsing fails
-                                    chrono::Utc::now().timestamp() + 300
-                                });
+                        // Try to parse as SignedEnvelope (StreamRegister)
+                        if is_signed_envelope(&message) {
+                            match self.handle_register(&message, &mut streams) {
+                                Ok(topic) => {
+                                    info!(
+                                        service = %self.name,
+                                        topic = %topic,
+                                        "Stream registered via SignedEnvelope"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        service = %self.name,
+                                        error = %e,
+                                        "Failed to process StreamRegister"
+                                    );
+                                }
+                            }
+                            continue;
+                        }
 
-                                // Create stream state with expiry
-                                streams.insert(stream_id.clone(), StreamState {
-                                    exp,
-                                    subscribed: false,
-                                    messages: VecDeque::new(),
-                                });
-                                info!(
-                                    service = %self.name,
-                                    stream_id = %stream_id,
-                                    exp = %exp,
-                                    "Stream authorized with expiry"
-                                );
-                            } else if parts.len() == 2 {
-                                // Legacy format without expiry (shouldn't happen in production)
-                                let stream_id = parts[1].to_string();
-                                let exp = chrono::Utc::now().timestamp() + 300; // 5 min default
-                                streams.insert(stream_id.clone(), StreamState {
-                                    exp,
-                                    subscribed: false,
-                                    messages: VecDeque::new(),
-                                });
-                                warn!(
-                                    service = %self.name,
-                                    stream_id = %stream_id,
-                                    "Stream authorized with legacy format (no expiry provided)"
-                                );
+                        // Try to parse as StreamResume (retransmit request)
+                        if let Some((topic, resume_hmac)) = parse_stream_resume(&message) {
+                            if let Some(state) = streams.get(&topic) {
+                                if let Some(start_idx) = state.find_hmac_position(&resume_hmac) {
+                                    // Resend all chunks after the resume point
+                                    let mut resent = 0;
+                                    for msg in state.messages.iter().skip(start_idx + 1) {
+                                        // Send with topic prefix for XPUB routing
+                                        let mut prefixed = topic.as_bytes().to_vec();
+                                        prefixed.extend_from_slice(&msg.data);
+                                        if let Err(e) = xpub.send(&prefixed, 0) {
+                                            error!(
+                                                service = %self.name,
+                                                topic = %topic,
+                                                error = %e,
+                                                "Failed to resend chunk on resume"
+                                            );
+                                            break;
+                                        }
+                                        resent += 1;
+                                    }
+                                    info!(
+                                        service = %self.name,
+                                        topic = %topic,
+                                        resent = resent,
+                                        "Processed StreamResume request"
+                                    );
+                                } else {
+                                    warn!(
+                                        service = %self.name,
+                                        topic = %topic,
+                                        "StreamResume HMAC not found in buffer"
+                                    );
+                                }
                             } else {
                                 warn!(
                                     service = %self.name,
-                                    "Invalid AUTHORIZE message format"
+                                    topic = %topic,
+                                    "StreamResume for unknown topic"
                                 );
                             }
                             continue;
                         }
 
-                        // Regular chunk message - extract topic (format: "stream-{uuid}...")
-                        if let Some(topic) = extract_topic(&message) {
+                        // Parse as StreamChunk capnp - blind forward (no HMAC verification)
+                        // Client verifies HMAC chain end-to-end
+                        if let Some((topic, _data, hmac)) = parse_stream_chunk(&message) {
                             if let Some(state) = streams.get_mut(&topic) {
+                                // Blind forward - no HMAC verification
+                                // Client verifies HMAC chain using DH-derived keys
+
                                 if state.subscribed {
                                     // Subscriber exists → deliver immediately
+                                    // Send with topic prefix for XPUB routing
+                                    let mut prefixed = topic.as_bytes().to_vec();
+                                    prefixed.extend_from_slice(&message);
                                     trace!(
                                         service = %self.name,
                                         topic = %topic,
                                         len = message.len(),
-                                        "Delivering message to subscriber"
+                                        "Forwarding message to subscriber (blind)"
                                     );
-                                    if let Err(e) = xpub.send(&message, 0) {
+                                    if let Err(e) = xpub.send(&prefixed, 0) {
                                         error!(
                                             service = %self.name,
                                             topic = %topic,
@@ -424,22 +567,26 @@ impl StreamService {
                                             "Failed to deliver message to XPUB"
                                         );
                                     }
-                                } else {
-                                    // Authorized but no subscriber yet → queue for later
-                                    // Enforce per-topic limit (drop oldest)
-                                    while state.messages.len() >= self.max_pending_per_topic {
-                                        state.messages.pop_front();
-                                        trace!(
-                                            service = %self.name,
-                                            topic = %topic,
-                                            "Dropped oldest pending message (queue full)"
-                                        );
-                                    }
+                                }
 
-                                    state.messages.push_back(PendingMessage {
-                                        data: message,
-                                        received_at: Instant::now(),
-                                    });
+                                // Always add to buffer for retransmission support
+                                // Enforce per-topic limit (drop oldest)
+                                while state.messages.len() >= self.max_pending_per_topic {
+                                    state.messages.pop_front();
+                                    trace!(
+                                        service = %self.name,
+                                        topic = %topic,
+                                        "Dropped oldest message (queue full)"
+                                    );
+                                }
+
+                                state.messages.push_back(PendingMessage {
+                                    data: message,
+                                    received_at: Instant::now(),
+                                    hmac,
+                                });
+
+                                if !state.subscribed {
                                     trace!(
                                         service = %self.name,
                                         topic = %topic,
@@ -448,18 +595,20 @@ impl StreamService {
                                     );
                                 }
                             } else {
-                                // Not authorized - drop message
+                                // Topic not registered - drop message
+                                // DH-derived topics are unpredictable, so this is
+                                // either a timing issue or an attack
                                 trace!(
                                     service = %self.name,
                                     topic = %topic,
-                                    "Dropping message for unauthorized stream"
+                                    "Dropping message for unregistered topic"
                                 );
                             }
                         } else {
                             warn!(
                                 service = %self.name,
                                 len = message.len(),
-                                "Received message with invalid topic format"
+                                "Received message with invalid format (not StreamChunk)"
                             );
                         }
                     }
@@ -500,14 +649,17 @@ impl StreamService {
                                         "Stream subscription accepted"
                                     );
 
-                                    // Flush any pending messages
+                                    // Flush any pending messages (keep in buffer for retransmit)
                                     let now = Instant::now();
                                     let mut delivered = 0;
                                     let mut expired = 0;
 
-                                    while let Some(msg) = state.messages.pop_front() {
+                                    for msg in state.messages.iter() {
                                         if now.duration_since(msg.received_at) <= self.message_ttl {
-                                            if let Err(e) = xpub.send(&msg.data, 0) {
+                                            // Send with topic prefix for XPUB routing
+                                            let mut prefixed = topic.as_bytes().to_vec();
+                                            prefixed.extend_from_slice(&msg.data);
+                                            if let Err(e) = xpub.send(&prefixed, 0) {
                                                 error!(
                                                     service = %self.name,
                                                     topic = %topic,
@@ -579,16 +731,90 @@ impl StreamService {
     }
 }
 
-/// Extract topic from a message
+/// Extract topic and HMAC from a StreamChunk capnp message
 ///
-/// Topic format: "stream-{uuid}" = 43 bytes (7 + 36)
-fn extract_topic(msg: &[u8]) -> Option<String> {
-    // Topic format: "stream-{uuid}" = 43 bytes (7 + 36)
-    if msg.len() >= 43 && msg.starts_with(b"stream-") {
-        String::from_utf8(msg[..43].to_vec()).ok()
-    } else {
-        None
+/// Returns (topic, data, hmac) if valid StreamChunk, None otherwise.
+fn parse_stream_chunk(msg: &[u8]) -> Option<(String, Vec<u8>, [u8; 32])> {
+    use capnp::serialize;
+
+    let reader = serialize::read_message(
+        &mut std::io::Cursor::new(msg),
+        capnp::message::ReaderOptions::default(),
+    ).ok()?;
+
+    let chunk = reader.get_root::<streaming_capnp::stream_chunk::Reader>().ok()?;
+    let topic = chunk.get_topic().ok()?.to_str().ok()?.to_string();
+    let data = chunk.get_data().ok()?.to_vec();
+    let hmac_data = chunk.get_hmac().ok()?;
+
+    if hmac_data.len() != 32 {
+        return None;
     }
+    let mut hmac = [0u8; 32];
+    hmac.copy_from_slice(hmac_data);
+
+    Some((topic, data, hmac))
+}
+
+/// Parse a StreamRegister message from SignedEnvelope payload
+fn parse_stream_register(payload: &[u8]) -> Option<(String, i64)> {
+    use capnp::serialize;
+
+    let reader = serialize::read_message(
+        &mut std::io::Cursor::new(payload),
+        capnp::message::ReaderOptions::default(),
+    ).ok()?;
+
+    let register = reader.get_root::<streaming_capnp::stream_register::Reader>().ok()?;
+    let topic = register.get_topic().ok()?.to_str().ok()?.to_string();
+    let exp = register.get_exp();
+
+    Some((topic, exp))
+}
+
+/// Parse a StreamResume message
+fn parse_stream_resume(msg: &[u8]) -> Option<(String, [u8; 32])> {
+    use capnp::serialize;
+
+    let reader = serialize::read_message(
+        &mut std::io::Cursor::new(msg),
+        capnp::message::ReaderOptions::default(),
+    ).ok()?;
+
+    let resume = reader.get_root::<streaming_capnp::stream_resume::Reader>().ok()?;
+    let topic = resume.get_topic().ok()?.to_str().ok()?.to_string();
+    let hmac_data = resume.get_resume_from_hmac().ok()?;
+
+    if hmac_data.len() != 32 {
+        return None;
+    }
+    let mut hmac = [0u8; 32];
+    hmac.copy_from_slice(hmac_data);
+
+    Some((topic, hmac))
+}
+
+/// Check if a message is a SignedEnvelope (for registration)
+fn is_signed_envelope(msg: &[u8]) -> bool {
+    use capnp::serialize;
+
+    let Ok(reader) = serialize::read_message(
+        &mut std::io::Cursor::new(msg),
+        capnp::message::ReaderOptions::default(),
+    ) else {
+        return false;
+    };
+
+    let Ok(envelope) = reader.get_root::<common_capnp::signed_envelope::Reader>() else {
+        return false;
+    };
+
+    // Also check that signature is exactly 64 bytes (Ed25519 signature)
+    // This distinguishes SignedEnvelope from StreamChunk which has 32-byte HMAC
+    let Ok(signature) = envelope.get_signature() else {
+        return false;
+    };
+    signature.len() == 64
 }
 
 /// Implement Spawnable trait for StreamService

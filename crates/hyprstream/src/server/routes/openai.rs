@@ -25,6 +25,11 @@ use crate::{
     server::{state::ServerState, AuthenticatedUser},
 };
 
+// E2E authenticated streaming via Ristretto255 DH key exchange
+use hyprstream_rpc::crypto::{
+    derive_stream_keys, generate_ephemeral_keypair, ristretto_dh, RistrettoPublic,
+};
+
 /// RAII guard for metrics cleanup
 struct MetricsGuard<'a> {
     metrics: &'a crate::server::state::Metrics,
@@ -476,11 +481,15 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
             gen_request.max_tokens, gen_request.temperature, gen_request.top_p, gen_request.top_k, gen_request.repeat_penalty
         );
 
-        // Start ZMQ stream - returns (zmq_stream_id, endpoint)
-        let (zmq_stream_id, endpoint) = match state.model_client.infer_stream(&model_name, &gen_request).await {
-            Ok((id, ep)) => {
-                info!("ZMQ stream started: id={}, endpoint={}", id, ep);
-                (id, ep)
+        // Generate client ephemeral Ristretto255 keypair for DH key exchange
+        let (client_secret, client_pubkey) = generate_ephemeral_keypair();
+        let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
+
+        // Start ZMQ stream - returns StreamStartedInfo with stream_id, endpoint, server_pubkey
+        let stream_info = match state.model_client.infer_stream(&model_name, &gen_request, client_pubkey_bytes).await {
+            Ok(info) => {
+                info!("ZMQ stream started: id={}, endpoint={}", info.stream_id, info.endpoint);
+                info
             }
             Err(e) => {
                 error!("Failed to start ZMQ stream: {}", e);
@@ -488,8 +497,33 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                 return;
             }
         };
+        let _zmq_stream_id = stream_info.stream_id; // Keep for logging, but topic is DH-derived
+        let endpoint = stream_info.endpoint;
 
-        // Create ZMQ SUB socket and subscribe to stream topic
+        // Derive stream keys using Ristretto255 DH key exchange
+        let server_pubkey = match RistrettoPublic::from_bytes(&stream_info.server_pubkey) {
+            Some(pk) => pk,
+            None => {
+                error!("Invalid server Ristretto public key encoding");
+                let _ = tx.send(Err(anyhow::anyhow!("Invalid server public key"))).await;
+                return;
+            }
+        };
+        let shared_secret = ristretto_dh(&client_secret, &server_pubkey);
+        let stream_keys = match derive_stream_keys(
+            &shared_secret,
+            &client_pubkey_bytes,
+            &stream_info.server_pubkey,
+        ) {
+            Ok(keys) => keys,
+            Err(e) => {
+                error!("Failed to derive stream keys: {}", e);
+                let _ = tx.send(Err(anyhow::anyhow!("Failed to derive stream keys: {}", e))).await;
+                return;
+            }
+        };
+
+        // Create ZMQ SUB socket and subscribe to DH-derived topic
         let ctx = crate::zmq::global_context();
         let sub_socket = match ctx.socket(zmq::SUB) {
             Ok(s) => s,
@@ -506,7 +540,8 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
             return;
         }
 
-        if let Err(e) = sub_socket.set_subscribe(zmq_stream_id.as_bytes()) {
+        // Subscribe to DH-derived topic (64 hex chars)
+        if let Err(e) = sub_socket.set_subscribe(stream_keys.topic.as_bytes()) {
             error!("Failed to subscribe to stream: {}", e);
             let _ = tx.send(Err(anyhow::anyhow!("Failed to subscribe to stream: {}", e))).await;
             return;
@@ -540,7 +575,7 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
 
         // ZMQ receive loop - forward tokens to SSE
         info!("Starting ZMQ streaming receive loop...");
-        let topic_len = zmq_stream_id.len();
+        let topic_len = stream_keys.topic.len(); // 64 bytes (hex-encoded DH topic)
 
         loop {
             // Check if client disconnected (channel closed)
@@ -557,12 +592,13 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                     }
                     let data = &msg[topic_len..];
 
-                    // Parse Cap'n Proto StreamChunk
+                    // Parse outer streaming_capnp::StreamChunk (wire format with HMAC)
                     use capnp::message::ReaderOptions;
                     use capnp::serialize;
                     use crate::inference_capnp;
+                    use hyprstream_rpc::streaming_capnp;
 
-                    let reader = match serialize::read_message(
+                    let outer_reader = match serialize::read_message(
                         &mut std::io::Cursor::new(data),
                         ReaderOptions::default(),
                     ) {
@@ -573,7 +609,7 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                         }
                     };
 
-                    let chunk = match reader.get_root::<inference_capnp::stream_chunk::Reader>() {
+                    let outer_chunk = match outer_reader.get_root::<streaming_capnp::stream_chunk::Reader>() {
                         Ok(c) => c,
                         Err(e) => {
                             error!("Failed to get stream chunk root: {}", e);
@@ -581,9 +617,38 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                         }
                     };
 
-                    // Extract chunk data into owned values BEFORE any await
+                    // Extract inner payload data from StreamChunk.data
+                    let inner_data = match outer_chunk.get_data() {
+                        Ok(d) => d,
+                        Err(e) => {
+                            error!("Failed to get stream chunk data: {}", e);
+                            continue;
+                        }
+                    };
+
+                    // Parse inner inference_capnp::InferencePayload
+                    let inner_reader = match serialize::read_message(
+                        &mut std::io::Cursor::new(inner_data),
+                        ReaderOptions::default(),
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            error!("Failed to parse inference payload: {}", e);
+                            continue;
+                        }
+                    };
+
+                    let payload = match inner_reader.get_root::<inference_capnp::inference_payload::Reader>() {
+                        Ok(p) => p,
+                        Err(e) => {
+                            error!("Failed to get inference payload root: {}", e);
+                            continue;
+                        }
+                    };
+
+                    // Extract payload data into owned values BEFORE any await
                     // (capnp readers contain raw pointers and cannot be held across await points)
-                    use inference_capnp::stream_chunk::Which;
+                    use inference_capnp::inference_payload::Which;
                     enum ChunkAction {
                         SendText(String),
                         Complete { finish_reason: String, gen_time_ms: u64, toks_per_sec: f32, toks_gen: u32 },
@@ -591,9 +656,9 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                         Continue,
                     }
 
-                    let action = match chunk.which() {
-                        Ok(Which::Text(text_result)) => {
-                            match text_result {
+                    let action = match payload.which() {
+                        Ok(Which::Token(token_result)) => {
+                            match token_result {
                                 Ok(t) => ChunkAction::SendText(t.to_string().unwrap_or_default()),
                                 Err(_) => ChunkAction::Continue,
                             }

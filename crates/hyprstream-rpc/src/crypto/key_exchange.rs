@@ -3,24 +3,146 @@
 //! Streaming responses use HMAC authentication instead of per-token Ed25519
 //! signatures for performance. The HMAC key is derived from a DH shared secret.
 //!
+//! # Ristretto255
+//!
+//! This module uses Ristretto255, a prime-order group built on Curve25519.
+//! Unlike X25519, Ristretto255 has no cofactor issues:
+//! - No small subgroups or low-order points
+//! - Invalid encodings are rejected at decode time
+//! - If a point decodes successfully, it's safe to use
+//!
+//! See: https://ristretto.group/why_ristretto.html
+//!
 //! # Flow
 //!
-//! 1. Client generates ephemeral DH keypair
+//! 1. Client generates ephemeral Ristretto keypair
 //! 2. Client includes ephemeral public key in signed RequestEnvelope
 //! 3. Server computes shared secret: `DH(server_secret, client_ephemeral_pubkey)`
-//! 4. Both derive HMAC key: `HKDF(shared_secret, salt=request_id, info="stream-hmac")`
+//! 4. Both derive HMAC key: `HKDF(shared_secret, salt=pubkeys_xor, info="mac")`
 //! 5. Server HMACs each stream chunk, client verifies
 //!
 //! # Feature Flags
 //!
-//! - Default: X25519 (Curve25519)
+//! - Default: Ristretto255 (prime-order group on Curve25519)
 //! - `fips`: ECDH P-256 (NIST curve, SP 800-56A approved)
 
 use hkdf::Hkdf;
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{EnvelopeError, EnvelopeResult};
+
+// ============================================================================
+// Stream Key Derivation (E2E Authenticated Streaming)
+// ============================================================================
+
+/// Derived keys for E2E authenticated streaming.
+///
+/// Contains:
+/// - `topic`: 64-char hex string derived from DH, used as ZMQ subscription prefix
+/// - `mac_key`: 32-byte HMAC key for MAC chain verification
+///
+/// Both client and server derive identical keys from their DH shared secret.
+#[derive(Clone)]
+pub struct StreamKeys {
+    /// Topic for ZMQ PUB/SUB routing (64 hex chars = 32 bytes encoded).
+    pub topic: String,
+    /// HMAC key for MAC chain (zeroized on drop).
+    pub mac_key: Zeroizing<[u8; 32]>,
+}
+
+impl StreamKeys {
+    /// Create from raw topic and mac_key bytes.
+    pub fn new(topic: String, mac_key: [u8; 32]) -> Self {
+        Self {
+            topic,
+            mac_key: Zeroizing::new(mac_key),
+        }
+    }
+
+    /// Get the first 16 bytes of topic as bytes (for first block's prevMac).
+    ///
+    /// In the MAC chain, block 0 uses topic[..16] as prevMac.
+    pub fn topic_prefix_bytes(&self) -> [u8; 16] {
+        // Decode first 32 hex chars (= 16 bytes)
+        let mut prefix = [0u8; 16];
+        hex::decode_to_slice(&self.topic[..32], &mut prefix)
+            .expect("topic is valid hex");
+        prefix
+    }
+}
+
+/// Check if two public keys are identical (self-connection attack).
+fn is_self_connection(client_pub: &[u8; 32], server_pub: &[u8; 32]) -> bool {
+    client_pub.ct_eq(server_pub).into()
+}
+
+/// Derive stream keys (topic and mac_key) from DH shared secret.
+///
+/// Uses HKDF-SHA256 with:
+/// - Salt: XOR of client_pub and server_pub (binds both parties)
+/// - IKM: DH shared secret
+/// - Info: "topic" or "mac" for domain separation
+///
+/// # Arguments
+///
+/// * `shared_secret` - 32-byte DH shared secret
+/// * `client_pub` - Client's ephemeral Ristretto public key (32 bytes)
+/// * `server_pub` - Server's ephemeral Ristretto public key (32 bytes)
+///
+/// # Returns
+///
+/// `StreamKeys` containing the derived topic (64 hex chars) and mac_key (32 bytes).
+///
+/// # Errors
+///
+/// Returns `EnvelopeError::KeyExchange` if client and server keys are identical.
+///
+/// # Security
+///
+/// - Ristretto255 eliminates low-order point attacks by construction
+/// - XOR salt ensures both parties' keys are bound to the derivation
+/// - Self-connection check prevents replay attacks
+pub fn derive_stream_keys(
+    shared_secret: &[u8; 32],
+    client_pub: &[u8; 32],
+    server_pub: &[u8; 32],
+) -> EnvelopeResult<StreamKeys> {
+    // Ristretto255: No low-order point checks needed!
+    // Invalid encodings are rejected at decode time, and all valid
+    // Ristretto points are in the prime-order subgroup.
+
+    // Security check: reject self-connection
+    if is_self_connection(client_pub, server_pub) {
+        return Err(EnvelopeError::KeyExchange(
+            "client and server keys are identical".into(),
+        ));
+    }
+
+    // XOR public keys for salt
+    // This binds both parties' keys to the derivation
+    let mut salt = [0u8; 32];
+    for i in 0..32 {
+        salt[i] = client_pub[i] ^ server_pub[i];
+    }
+
+    // HKDF-Extract: PRK = HKDF-Extract(salt, IKM)
+    let hk = Hkdf::<Sha256>::new(Some(&salt), shared_secret);
+
+    // HKDF-Expand for topic (32 bytes -> 64 hex chars)
+    let mut topic_bytes = [0u8; 32];
+    hk.expand(b"topic", &mut topic_bytes)
+        .expect("32 bytes is valid HKDF-SHA256 output length");
+    let topic = hex::encode(topic_bytes);
+
+    // HKDF-Expand for mac_key (32 bytes)
+    let mut mac_key = [0u8; 32];
+    hk.expand(b"mac", &mut mac_key)
+        .expect("32 bytes is valid HKDF-SHA256 output length");
+
+    Ok(StreamKeys::new(topic, mac_key))
+}
 
 /// Shared secret from DH key exchange.
 ///
@@ -65,7 +187,7 @@ impl Zeroize for SharedSecret {
 
 /// Trait for Diffie-Hellman key exchange implementations.
 ///
-/// This trait abstracts over X25519 (default) and ECDH P-256 (FIPS mode).
+/// This trait abstracts over Ristretto255 (default) and ECDH P-256 (FIPS mode).
 pub trait KeyExchange: Send + Sync {
     /// Secret key type (zeroized on drop).
     type SecretKey: Zeroize + Clone;
@@ -90,54 +212,114 @@ pub trait KeyExchange: Send + Sync {
 }
 
 // ============================================================================
-// X25519 Implementation (default)
+// Ristretto255 Implementation (default)
 // ============================================================================
 
 #[cfg(not(feature = "fips"))]
-mod x25519_impl {
+mod ristretto_impl {
     use super::*;
-    use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
+    use curve25519_dalek::{
+        constants::RISTRETTO_BASEPOINT_POINT,
+        ristretto::{CompressedRistretto, RistrettoPoint},
+        scalar::Scalar,
+    };
 
-    /// X25519 secret key wrapper with Zeroize.
+    /// Ristretto255 secret key (scalar).
+    ///
+    /// Zeroized on drop to prevent key material from lingering in memory.
     #[derive(Clone)]
-    pub struct X25519SecretKey(StaticSecret);
+    pub struct RistrettoSecret(Scalar);
 
-    impl Zeroize for X25519SecretKey {
+    impl RistrettoSecret {
+        /// Get the underlying scalar for DH computation.
+        pub fn scalar(&self) -> &Scalar {
+            &self.0
+        }
+    }
+
+    impl Zeroize for RistrettoSecret {
         fn zeroize(&mut self) {
-            // StaticSecret doesn't implement Zeroize, so we can't do much here.
-            // The underlying memory will be zeroed by StaticSecret's Drop impl.
+            // Overwrite scalar with zero
+            self.0 = Scalar::ZERO;
         }
     }
 
-    /// X25519 public key wrapper.
-    #[derive(Clone)]
-    pub struct X25519PublicKey(PublicKey);
+    impl Drop for RistrettoSecret {
+        fn drop(&mut self) {
+            self.zeroize();
+        }
+    }
 
-    impl AsRef<[u8]> for X25519PublicKey {
+    /// Ristretto255 public key (compressed point).
+    ///
+    /// Stores the compressed form for efficient serialization.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub struct RistrettoPublic {
+        point: RistrettoPoint,
+        compressed: [u8; 32],
+    }
+
+    impl RistrettoPublic {
+        /// Create from a RistrettoPoint.
+        pub fn from_point(point: RistrettoPoint) -> Self {
+            let compressed = point.compress().to_bytes();
+            Self { point, compressed }
+        }
+
+        /// Get the underlying point for DH computation.
+        pub fn point(&self) -> &RistrettoPoint {
+            &self.point
+        }
+
+        /// Serialize to 32 bytes.
+        pub fn to_bytes(&self) -> [u8; 32] {
+            self.compressed
+        }
+
+        /// Deserialize from 32 bytes.
+        ///
+        /// Returns `None` if the encoding is invalid.
+        /// This is the primary defense against invalid points -
+        /// Ristretto255 rejects all non-canonical encodings.
+        pub fn from_bytes(bytes: &[u8; 32]) -> Option<Self> {
+            let compressed = CompressedRistretto::from_slice(bytes).ok()?;
+            let point = compressed.decompress()?;
+            Some(Self {
+                point,
+                compressed: *bytes,
+            })
+        }
+    }
+
+    impl AsRef<[u8]> for RistrettoPublic {
         fn as_ref(&self) -> &[u8] {
-            self.0.as_bytes()
+            &self.compressed
         }
     }
 
-    /// X25519 key exchange implementation.
-    pub struct X25519KeyExchange;
+    /// Ristretto255 key exchange implementation.
+    pub struct RistrettoKeyExchange;
 
-    impl KeyExchange for X25519KeyExchange {
-        type SecretKey = X25519SecretKey;
-        type PublicKey = X25519PublicKey;
+    impl KeyExchange for RistrettoKeyExchange {
+        type SecretKey = RistrettoSecret;
+        type PublicKey = RistrettoPublic;
 
         fn generate_keypair() -> (Self::SecretKey, Self::PublicKey) {
-            let secret = StaticSecret::random_from_rng(rand::thread_rng());
-            let public = PublicKey::from(&secret);
-            (X25519SecretKey(secret), X25519PublicKey(public))
+            let secret = Scalar::random(&mut rand::thread_rng());
+            let public_point = &RISTRETTO_BASEPOINT_POINT * &secret;
+            (
+                RistrettoSecret(secret),
+                RistrettoPublic::from_point(public_point),
+            )
         }
 
         fn derive_shared(
             secret: &Self::SecretKey,
             their_pubkey: &Self::PublicKey,
         ) -> EnvelopeResult<SharedSecret> {
-            let shared = secret.0.diffie_hellman(&their_pubkey.0);
-            Ok(SharedSecret::new(shared.to_bytes()))
+            let shared_point = their_pubkey.point() * secret.scalar();
+            let shared_bytes = shared_point.compress().to_bytes();
+            Ok(SharedSecret::new(shared_bytes))
         }
 
         fn pubkey_from_bytes(bytes: &[u8]) -> EnvelopeResult<Self::PublicKey> {
@@ -149,72 +331,32 @@ mod x25519_impl {
             }
             let mut arr = [0u8; 32];
             arr.copy_from_slice(bytes);
-            Ok(X25519PublicKey(PublicKey::from(arr)))
+            RistrettoPublic::from_bytes(&arr).ok_or_else(|| {
+                EnvelopeError::KeyExchange("invalid ristretto255 point encoding".into())
+            })
         }
 
         fn pubkey_to_bytes(pubkey: &Self::PublicKey) -> Vec<u8> {
-            pubkey.0.as_bytes().to_vec()
+            pubkey.to_bytes().to_vec()
         }
     }
 
-    /// Generate an ephemeral X25519 keypair (for one-time use in requests).
-    pub fn generate_ephemeral_keypair() -> (EphemeralSecret, PublicKey) {
-        let secret = EphemeralSecret::random_from_rng(rand::thread_rng());
-        let public = PublicKey::from(&secret);
-        (secret, public)
+    /// Generate an ephemeral Ristretto255 keypair (for one-time use in requests).
+    pub fn generate_ephemeral_keypair() -> (RistrettoSecret, RistrettoPublic) {
+        RistrettoKeyExchange::generate_keypair()
     }
 
-    /// Derive X25519 public key from Ed25519 verifying key.
-    ///
-    /// This allows using a single Ed25519 keypair for both signing and DH.
-    /// Ed25519 (Edwards curve) and X25519 (Montgomery curve) are mathematically related:
-    /// the same secret scalar works for both, just with different curve representations.
-    ///
-    /// # Security Note
-    ///
-    /// This is safe to use because:
-    /// - The conversion is one-way (X25519 pubkey → Ed25519 pubkey is hard)
-    /// - No new secret material is exposed
-    /// - Client generates ephemeral keypair, so forward secrecy is maintained
-    pub fn ed25519_to_x25519_pubkey(ed_pubkey: &ed25519_dalek::VerifyingKey) -> PublicKey {
-        // Ed25519 uses the Edwards curve, X25519 uses Montgomery curve
-        // The `to_montgomery()` method converts the point representation
-        let montgomery = ed_pubkey.to_montgomery();
-        PublicKey::from(montgomery.to_bytes())
-    }
-
-    /// Derive X25519 secret key from Ed25519 signing key.
-    ///
-    /// This allows the server to use its Ed25519 signing key for DH.
-    /// The secret scalar is the same for both curves.
-    ///
-    /// # Security Note
-    ///
-    /// This function extracts the scalar from the Ed25519 key and uses it for X25519.
-    /// This is mathematically sound but means the same secret is used for two purposes.
-    /// For maximum security, consider using separate keys.
-    pub fn ed25519_to_x25519_secret(ed_secret: &ed25519_dalek::SigningKey) -> StaticSecret {
-        // The Ed25519 signing key contains a 32-byte seed that is hashed to get the scalar
-        // For X25519, we need to use the same derivation that Ed25519 uses internally
-        use sha2::{Digest, Sha512};
-
-        let hash = Sha512::digest(ed_secret.to_bytes());
-        let mut scalar_bytes = [0u8; 32];
-        scalar_bytes.copy_from_slice(&hash[..32]);
-
-        // Apply clamping (same as X25519/Ed25519 do internally)
-        scalar_bytes[0] &= 248;
-        scalar_bytes[31] &= 127;
-        scalar_bytes[31] |= 64;
-
-        StaticSecret::from(scalar_bytes)
+    /// Perform Ristretto255 Diffie-Hellman and return shared secret bytes.
+    pub fn ristretto_dh(secret: &RistrettoSecret, their_public: &RistrettoPublic) -> [u8; 32] {
+        let shared_point = their_public.point() * secret.scalar();
+        shared_point.compress().to_bytes()
     }
 }
 
 #[cfg(not(feature = "fips"))]
-pub use x25519_impl::{
-    ed25519_to_x25519_pubkey, ed25519_to_x25519_secret, generate_ephemeral_keypair,
-    X25519KeyExchange, X25519PublicKey, X25519SecretKey,
+pub use ristretto_impl::{
+    generate_ephemeral_keypair, ristretto_dh, RistrettoKeyExchange, RistrettoPublic,
+    RistrettoSecret,
 };
 
 // ============================================================================
@@ -279,10 +421,11 @@ mod p256_impl {
         }
 
         fn pubkey_from_bytes(bytes: &[u8]) -> EnvelopeResult<Self::PublicKey> {
-            let point = EncodedPoint::from_bytes(bytes).map_err(|_| EnvelopeError::InvalidPublicKey {
-                expected: 33, // compressed
-                actual: bytes.len(),
-            })?;
+            let point =
+                EncodedPoint::from_bytes(bytes).map_err(|_| EnvelopeError::InvalidPublicKey {
+                    expected: 33, // compressed
+                    actual: bytes.len(),
+                })?;
             let pubkey: Option<PublicKey> = PublicKey::from_encoded_point(&point).into();
             pubkey
                 .map(P256PublicKey)
@@ -296,10 +439,15 @@ mod p256_impl {
             pubkey.0.to_encoded_point(true).as_bytes().to_vec()
         }
     }
+
+    /// Generate an ephemeral P-256 keypair (FIPS mode).
+    pub fn generate_ephemeral_keypair() -> (P256SecretKey, P256PublicKey) {
+        EcdhP256KeyExchange::generate_keypair()
+    }
 }
 
 #[cfg(feature = "fips")]
-pub use p256_impl::{EcdhP256KeyExchange, P256PublicKey, P256SecretKey};
+pub use p256_impl::{generate_ephemeral_keypair, EcdhP256KeyExchange, P256PublicKey, P256SecretKey};
 
 // ============================================================================
 // Default Key Exchange Type
@@ -307,7 +455,7 @@ pub use p256_impl::{EcdhP256KeyExchange, P256PublicKey, P256SecretKey};
 
 /// Default key exchange algorithm based on feature flags.
 #[cfg(not(feature = "fips"))]
-pub type DefaultKeyExchange = X25519KeyExchange;
+pub type DefaultKeyExchange = RistrettoKeyExchange;
 
 #[cfg(feature = "fips")]
 pub type DefaultKeyExchange = EcdhP256KeyExchange;
@@ -372,69 +520,204 @@ mod tests {
 
     #[cfg(not(feature = "fips"))]
     #[test]
-    fn test_ed25519_to_x25519_conversion() {
-        use crate::crypto::signing::generate_signing_keypair;
+    fn test_invalid_ristretto_encoding_rejected() {
+        // Note: All-zeros is the identity point in Ristretto255 (valid encoding)
+        // We need to use truly invalid encodings
 
-        // Generate Ed25519 keypair
-        let (signing_key, verifying_key) = generate_signing_keypair();
+        // All 0xFF is not a valid Ristretto encoding (with high probability)
+        let garbage = [0xffu8; 32];
+        let result = RistrettoPublic::from_bytes(&garbage);
+        assert!(result.is_none(), "0xFF bytes should be rejected");
 
-        // Derive X25519 keys from Ed25519 keys
-        let x25519_secret = ed25519_to_x25519_secret(&signing_key);
-        let x25519_pubkey = ed25519_to_x25519_pubkey(&verifying_key);
-
-        // Verify the derived keys work together
-        // Generate ephemeral client keypair
-        let (client_secret, client_pubkey) = generate_ephemeral_keypair();
-
-        // Server derives shared secret using derived X25519 key
-        let server_shared = x25519_secret.diffie_hellman(&client_pubkey);
-
-        // Client derives shared secret using server's derived X25519 pubkey
-        let client_shared = client_secret.diffie_hellman(&x25519_pubkey);
-
-        // Both should derive the same shared secret
-        assert_eq!(server_shared.as_bytes(), client_shared.as_bytes());
+        // A point with the high bit set incorrectly (non-canonical)
+        let mut invalid = [0u8; 32];
+        invalid[31] = 0x80; // Set high bit - invalid for Ristretto
+        let result = RistrettoPublic::from_bytes(&invalid);
+        assert!(result.is_none(), "Non-canonical encoding should be rejected");
     }
 
     #[cfg(not(feature = "fips"))]
     #[test]
-    fn test_ed25519_to_x25519_stream_hmac() {
-        use crate::crypto::hmac::ChainedStreamHmac;
-        use crate::crypto::signing::generate_signing_keypair;
+    fn test_ristretto_dh_function() {
+        let (client_secret, client_public) = generate_ephemeral_keypair();
+        let (server_secret, server_public) = generate_ephemeral_keypair();
 
-        // Simulate server setup: generate Ed25519 keypair
-        let (signing_key, verifying_key) = generate_signing_keypair();
+        // Both compute shared secret
+        let client_shared = ristretto_dh(&client_secret, &server_public);
+        let server_shared = ristretto_dh(&server_secret, &client_public);
 
-        // Client knows server's Ed25519 pubkey (from config)
-        // Client derives server's X25519 pubkey
-        let server_x25519_pubkey = ed25519_to_x25519_pubkey(&verifying_key);
+        assert_eq!(client_shared, server_shared);
+    }
 
-        // Client generates ephemeral keypair
+    // =========================================================================
+    // Stream key derivation tests
+    // =========================================================================
+
+    #[test]
+    fn test_derive_stream_keys_deterministic() {
+        // Same inputs should produce same outputs
+        let shared_secret = [0x42u8; 32];
+        let client_pub = [0x01u8; 32];
+        let server_pub = [0x02u8; 32];
+
+        let keys1 = derive_stream_keys(&shared_secret, &client_pub, &server_pub).unwrap();
+        let keys2 = derive_stream_keys(&shared_secret, &client_pub, &server_pub).unwrap();
+
+        assert_eq!(keys1.topic, keys2.topic);
+        assert_eq!(*keys1.mac_key, *keys2.mac_key);
+    }
+
+    #[test]
+    fn test_derive_stream_keys_symmetric() {
+        // Order of pubkeys shouldn't matter (XOR is commutative)
+        let shared_secret = [0x42u8; 32];
+        let client_pub = [0x01u8; 32];
+        let server_pub = [0x02u8; 32];
+
+        let keys1 = derive_stream_keys(&shared_secret, &client_pub, &server_pub).unwrap();
+        let keys2 = derive_stream_keys(&shared_secret, &server_pub, &client_pub).unwrap();
+
+        // Both should produce identical keys (XOR is commutative)
+        assert_eq!(keys1.topic, keys2.topic);
+        assert_eq!(*keys1.mac_key, *keys2.mac_key);
+    }
+
+    #[test]
+    fn test_derive_stream_keys_different_secrets() {
+        let client_pub = [0x01u8; 32];
+        let server_pub = [0x02u8; 32];
+
+        let keys1 = derive_stream_keys(&[0x11u8; 32], &client_pub, &server_pub).unwrap();
+        let keys2 = derive_stream_keys(&[0x22u8; 32], &client_pub, &server_pub).unwrap();
+
+        assert_ne!(keys1.topic, keys2.topic);
+        assert_ne!(*keys1.mac_key, *keys2.mac_key);
+    }
+
+    #[test]
+    fn test_derive_stream_keys_different_pubkeys() {
+        let shared_secret = [0x42u8; 32];
+
+        let keys1 = derive_stream_keys(&shared_secret, &[0x01u8; 32], &[0x02u8; 32]).unwrap();
+        let keys2 = derive_stream_keys(&shared_secret, &[0x03u8; 32], &[0x04u8; 32]).unwrap();
+
+        assert_ne!(keys1.topic, keys2.topic);
+        assert_ne!(*keys1.mac_key, *keys2.mac_key);
+    }
+
+    #[test]
+    fn test_derive_stream_keys_topic_is_hex() {
+        let shared_secret = [0x42u8; 32];
+        let client_pub = [0x01u8; 32];
+        let server_pub = [0x02u8; 32];
+
+        let keys = derive_stream_keys(&shared_secret, &client_pub, &server_pub).unwrap();
+
+        // Topic should be 64 hex chars
+        assert_eq!(keys.topic.len(), 64);
+        assert!(keys.topic.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_derive_stream_keys_topic_prefix() {
+        let shared_secret = [0x42u8; 32];
+        let client_pub = [0x01u8; 32];
+        let server_pub = [0x02u8; 32];
+
+        let keys = derive_stream_keys(&shared_secret, &client_pub, &server_pub).unwrap();
+        let prefix = keys.topic_prefix_bytes();
+
+        // Prefix should be first 16 bytes of topic
+        assert_eq!(prefix.len(), 16);
+
+        // Verify it matches the topic
+        let expected_prefix = hex::decode(&keys.topic[..32]).unwrap();
+        assert_eq!(&prefix[..], &expected_prefix[..]);
+    }
+
+    #[test]
+    fn test_derive_stream_keys_rejects_self_connection() {
+        let shared_secret = [0x42u8; 32];
+        let same_key = [0x01u8; 32];
+
+        let result = derive_stream_keys(&shared_secret, &same_key, &same_key);
+        assert!(
+            matches!(result, Err(EnvelopeError::KeyExchange(ref msg)) if msg.contains("identical")),
+            "Should reject self-connection"
+        );
+    }
+
+    #[cfg(not(feature = "fips"))]
+    #[test]
+    fn test_derive_stream_keys_with_real_dh() {
+        // Full integration test with actual DH key exchange
         let (client_secret, client_pubkey) = generate_ephemeral_keypair();
+        let (server_secret, server_pubkey) = generate_ephemeral_keypair();
 
-        // Client includes ephemeral pubkey in request envelope
-        // Server receives request and derives shared secret
-        let server_x25519_secret = ed25519_to_x25519_secret(&signing_key);
-        let server_shared = server_x25519_secret.diffie_hellman(&client_pubkey);
+        // Both sides compute shared secret
+        let client_shared = ristretto_dh(&client_secret, &server_pubkey);
+        let server_shared = ristretto_dh(&server_secret, &client_pubkey);
 
-        // Client derives same shared secret
-        let client_shared = client_secret.diffie_hellman(&server_x25519_pubkey);
+        // Both sides derive stream keys
+        let client_keys = derive_stream_keys(
+            &client_shared,
+            &client_pubkey.to_bytes(),
+            &server_pubkey.to_bytes(),
+        )
+        .unwrap();
 
-        // Derive HMAC keys from shared secrets
-        let shared_secret = SharedSecret::new(*server_shared.as_bytes());
-        let request_id = 12345u64;
-        let hmac_key = shared_secret.derive_hmac_key(request_id, b"stream-hmac");
+        let server_keys = derive_stream_keys(
+            &server_shared,
+            &client_pubkey.to_bytes(),
+            &server_pubkey.to_bytes(),
+        )
+        .unwrap();
 
-        let client_secret = SharedSecret::new(*client_shared.as_bytes());
-        let client_hmac_key = client_secret.derive_hmac_key(request_id, b"stream-hmac");
+        // Keys should be identical
+        assert_eq!(client_keys.topic, server_keys.topic);
+        assert_eq!(*client_keys.mac_key, *server_keys.mac_key);
+    }
 
-        assert_eq!(hmac_key, client_hmac_key);
+    #[cfg(not(feature = "fips"))]
+    #[test]
+    fn test_stream_keys_e2e_mac_verification() {
+        use crate::crypto::hmac::ChainedStreamHmac;
 
-        // Verify chained HMAC works with derived keys
-        let mut producer = ChainedStreamHmac::from_bytes(hmac_key, request_id);
-        let mac = producer.compute_next(b"hello world");
+        // Full E2E test: DH → stream keys → MAC chain
+        let (client_secret, client_pubkey) = generate_ephemeral_keypair();
+        let (server_secret, server_pubkey) = generate_ephemeral_keypair();
 
-        let mut verifier = ChainedStreamHmac::from_bytes(client_hmac_key, request_id);
-        verifier.verify_next(b"hello world", &mac).unwrap();
+        let client_shared = ristretto_dh(&client_secret, &server_pubkey);
+        let server_shared = ristretto_dh(&server_secret, &client_pubkey);
+
+        let client_keys = derive_stream_keys(
+            &client_shared,
+            &client_pubkey.to_bytes(),
+            &server_pubkey.to_bytes(),
+        )
+        .unwrap();
+
+        let server_keys = derive_stream_keys(
+            &server_shared,
+            &client_pubkey.to_bytes(),
+            &server_pubkey.to_bytes(),
+        )
+        .unwrap();
+
+        // Server produces MAC chain
+        // Use topic prefix as initial prev_mac (converted to u64 for request_id)
+        let prefix = server_keys.topic_prefix_bytes();
+        let request_id = u64::from_le_bytes(prefix[..8].try_into().unwrap());
+
+        let mut producer = ChainedStreamHmac::from_bytes(*server_keys.mac_key, request_id);
+        let mac1 = producer.compute_next(b"token 1");
+        let mac2 = producer.compute_next(b"token 2");
+        let mac3 = producer.compute_next(b"[DONE]");
+
+        // Client verifies MAC chain
+        let mut verifier = ChainedStreamHmac::from_bytes(*client_keys.mac_key, request_id);
+        verifier.verify_next(b"token 1", &mac1).unwrap();
+        verifier.verify_next(b"token 2", &mac2).unwrap();
+        verifier.verify_next(b"[DONE]", &mac3).unwrap();
     }
 }

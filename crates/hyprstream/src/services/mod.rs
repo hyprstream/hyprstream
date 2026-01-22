@@ -82,7 +82,7 @@ pub mod stream;
 pub mod worker;
 
 pub use core::{
-    EnvelopeContext, ZmqClient, ZmqService,
+    CallOptions, EnvelopeContext, ZmqClient, ZmqService,
 };
 
 pub use traits::{

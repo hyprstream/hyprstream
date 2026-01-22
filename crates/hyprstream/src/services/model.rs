@@ -33,7 +33,8 @@ use crate::model_capnp;
 use crate::runtime::kv_quant::KVQuantType;
 use crate::runtime::RuntimeConfig;
 use crate::services::{
-    EnvelopeContext, InferenceService, InferenceZmqClient, PolicyZmqClient, ZmqClient,
+    rpc_types::StreamStartedInfo, CallOptions, EnvelopeContext, InferenceService, InferenceZmqClient,
+    PolicyZmqClient, ZmqClient,
 };
 use crate::storage::{ModelRef, ModelStorage};
 use anyhow::{anyhow, Result};
@@ -133,8 +134,10 @@ pub struct ModelService {
     /// Model storage for resolving model paths
     model_storage: Arc<ModelStorage>,
     /// Callback router for spawned mode (None for in-process)
+    #[allow(dead_code)]
     callback_router: Option<crate::services::callback::CallbackRouter>,
     /// Spawned instances by model ref (for spawned mode)
+    #[allow(dead_code)]
     spawned_instances: RwLock<HashMap<String, crate::services::callback::Instance>>,
     // Infrastructure (for Spawnable)
     context: Arc<zmq::Context>,
@@ -266,8 +269,8 @@ impl ModelService {
                 if let Some((evicted_ref, mut evicted)) = cache.pop_lru() {
                     info!("Evicting model {} to load {}", evicted_ref, model_ref_str);
                     // Stop the evicted service
-                    tokio::spawn(async move {
-                        evicted.service_handle.stop().await;
+                    let _ = tokio::spawn(async move {
+                        let _ = evicted.service_handle.stop().await;
                     });
                 }
             }
@@ -295,7 +298,7 @@ impl ModelService {
         let mut cache = self.loaded_models.write().await;
         if let Some((_, mut model)) = cache.pop_entry(model_ref_str) {
             info!("Unloading model {}", model_ref_str);
-            model.service_handle.stop().await;
+            let _ = model.service_handle.stop().await;
             Ok(())
         } else {
             Err(anyhow!("Model {} is not loaded", model_ref_str))
@@ -364,8 +367,15 @@ impl ModelService {
         serialize_generation_result(&result)
     }
 
-    /// Route streaming inference request
-    async fn infer_stream(&self, model_ref_str: &str, request_bytes: &[u8]) -> Result<(String, String)> {
+    /// Route streaming inference request with E2E authentication.
+    ///
+    /// The ephemeral pubkey from the client's envelope is passed through to InferenceService.
+    async fn infer_stream(
+        &self,
+        model_ref_str: &str,
+        request_bytes: &[u8],
+        client_ephemeral_pubkey: Option<[u8; 32]>,
+    ) -> Result<StreamStartedInfo> {
         // Ensure model is loaded
         let _endpoint = self.load_model(model_ref_str).await?;
 
@@ -389,8 +399,8 @@ impl ModelService {
 
         let request = parse_generation_request(gen_req_reader)?;
 
-        // Start streaming
-        client.generate_stream(&request).await
+        // Pass through ephemeral pubkey for E2E authentication
+        client.generate_stream(&request, client_ephemeral_pubkey).await
     }
 
     /// Authorize stream subscription via StartStream handshake
@@ -533,11 +543,12 @@ impl ModelService {
         Ok(bytes)
     }
 
-    /// Build a stream started response
+    /// Build a stream started response (with server pubkey for E2E auth)
     fn build_stream_started_response(
         request_id: u64,
         stream_id: &str,
         endpoint: &str,
+        server_pubkey: &[u8; 32],
     ) -> Result<Vec<u8>> {
         let mut message = Builder::new_default();
         {
@@ -546,6 +557,7 @@ impl ModelService {
             let mut stream_info = response.init_stream_started();
             stream_info.set_stream_id(stream_id);
             stream_info.set_endpoint(endpoint);
+            stream_info.set_server_pubkey(server_pubkey);
         }
         let mut bytes = Vec::new();
         serialize::write_message(&mut bytes, &message)?;
@@ -626,6 +638,10 @@ impl crate::services::ZmqService for ModelService {
         let req = reader.get_root::<model_capnp::model_request::Reader>()?;
         let request_id = req.get_id();
 
+        // Extract ephemeral pubkey for E2E streaming (needed inside async block)
+        let client_ephemeral_pubkey = ctx.ephemeral_pubkey
+            .map(|pk| pk);
+
         // Handle request in blocking context (we need async operations)
         let result = tokio::task::block_in_place(|| {
             let handle = tokio::runtime::Handle::current();
@@ -683,10 +699,13 @@ impl crate::services::ZmqService for ModelService {
                         let infer = infer_req?;
                         let model_ref = infer.get_model_ref()?.to_str()?;
                         let request_data = infer.get_request()?;
-                        match self.infer_stream(model_ref, request_data).await {
-                            Ok((stream_id, endpoint)) => {
-                                Self::build_stream_started_response(request_id, &stream_id, &endpoint)
-                            }
+                        match self.infer_stream(model_ref, request_data, client_ephemeral_pubkey).await {
+                            Ok(info) => Self::build_stream_started_response(
+                                request_id,
+                                &info.stream_id,
+                                &info.endpoint,
+                                &info.server_pubkey,
+                            ),
                             Err(e) => Self::build_error_response(
                                 request_id,
                                 &format!("Stream start failed: {}", e),
@@ -827,7 +846,7 @@ impl ModelZmqClient {
         let mut request_bytes = Vec::new();
         serialize::write_message(&mut request_bytes, &message)?;
 
-        let response_bytes = self.client.call(request_bytes, None).await?;
+        let response_bytes = self.client.call(request_bytes, CallOptions::default()).await?;
         self.parse_loaded_response(&response_bytes)
     }
 
@@ -846,7 +865,7 @@ impl ModelZmqClient {
         let mut request_bytes = Vec::new();
         serialize::write_message(&mut request_bytes, &message)?;
 
-        let response_bytes = self.client.call(request_bytes, None).await?;
+        let response_bytes = self.client.call(request_bytes, CallOptions::default()).await?;
         self.parse_ok_response(&response_bytes)
     }
 
@@ -864,7 +883,7 @@ impl ModelZmqClient {
         let mut request_bytes = Vec::new();
         serialize::write_message(&mut request_bytes, &message)?;
 
-        let response_bytes = self.client.call(request_bytes, None).await?;
+        let response_bytes = self.client.call(request_bytes, CallOptions::default()).await?;
         self.parse_list_response(&response_bytes)
     }
 
@@ -883,7 +902,7 @@ impl ModelZmqClient {
         let mut request_bytes = Vec::new();
         serialize::write_message(&mut request_bytes, &message)?;
 
-        let response_bytes = self.client.call(request_bytes, None).await?;
+        let response_bytes = self.client.call(request_bytes, CallOptions::default()).await?;
         self.parse_status_response(&response_bytes)
     }
 
@@ -906,12 +925,34 @@ impl ModelZmqClient {
         let mut request_bytes = Vec::new();
         serialize::write_message(&mut request_bytes, &message)?;
 
-        let response_bytes = self.client.call(request_bytes, None).await?;
+        let response_bytes = self.client.call(request_bytes, CallOptions::default()).await?;
         self.parse_infer_result_response(&response_bytes)
     }
 
-    /// Start streaming inference on a model
-    pub async fn infer_stream(&self, model_ref: &str, request: &GenerationRequest) -> Result<(String, String)> {
+    /// Start streaming inference on a model with E2E authentication.
+    ///
+    /// # Arguments
+    /// * `model_ref` - The model reference (e.g., "qwen3-small:main")
+    /// * `request` - Generation parameters
+    /// * `client_ephemeral_pubkey` - Client's Ristretto255 ephemeral public key (32 bytes)
+    ///
+    /// # E2E Authentication
+    ///
+    /// The client must provide an ephemeral Ristretto255 public key. After receiving
+    /// the response, derive stream keys using:
+    /// ```ignore
+    /// let server_pubkey = RistrettoPublic::from_bytes(&server_pub)?;
+    /// let shared = ristretto_dh(&client_secret, &server_pubkey);
+    /// let keys = derive_stream_keys(&shared, &client_pub, &server_pub)?;
+    /// // keys.topic = DH-derived topic (64 hex chars) to subscribe to
+    /// // keys.mac_key = HMAC key for verifying stream chunks
+    /// ```
+    pub async fn infer_stream(
+        &self,
+        model_ref: &str,
+        request: &GenerationRequest,
+        client_ephemeral_pubkey: [u8; 32],
+    ) -> Result<StreamStartedInfo> {
         let request_id = self.client.next_id();
 
         // Serialize the GenerationRequest
@@ -929,7 +970,9 @@ impl ModelZmqClient {
         let mut request_bytes = Vec::new();
         serialize::write_message(&mut request_bytes, &message)?;
 
-        let response_bytes = self.client.call(request_bytes, None).await?;
+        // Pass ephemeral pubkey for E2E authenticated streaming
+        let opts = CallOptions::default().ephemeral_pubkey(client_ephemeral_pubkey);
+        let response_bytes = self.client.call(request_bytes, opts).await?;
         self.parse_stream_started_response(&response_bytes)
     }
 
@@ -960,7 +1003,7 @@ impl ModelZmqClient {
         let mut request_bytes = Vec::new();
         serialize::write_message(&mut request_bytes, &message)?;
 
-        let response_bytes = self.client.call(request_bytes, None).await?;
+        let response_bytes = self.client.call(request_bytes, CallOptions::default()).await?;
         self.parse_stream_authorized_response(&response_bytes)
     }
 
@@ -978,7 +1021,7 @@ impl ModelZmqClient {
         let mut request_bytes = Vec::new();
         serialize::write_message(&mut request_bytes, &message)?;
 
-        let response_bytes = self.client.call(request_bytes, None).await?;
+        let response_bytes = self.client.call(request_bytes, CallOptions::default()).await?;
         self.parse_health_response(&response_bytes)
     }
 
@@ -1013,7 +1056,7 @@ impl ModelZmqClient {
         let mut request_bytes = Vec::new();
         serialize::write_message(&mut request_bytes, &message)?;
 
-        let response_bytes = self.client.call(request_bytes, None).await?;
+        let response_bytes = self.client.call(request_bytes, CallOptions::default()).await?;
         self.parse_template_result_response(&response_bytes)
     }
 
@@ -1145,7 +1188,7 @@ impl ModelZmqClient {
         }
     }
 
-    fn parse_stream_started_response(&self, bytes: &[u8]) -> Result<(String, String)> {
+    fn parse_stream_started_response(&self, bytes: &[u8]) -> Result<StreamStartedInfo> {
         let reader = serialize::read_message(&mut std::io::Cursor::new(bytes), ReaderOptions::new())?;
         let response = reader.get_root::<model_capnp::model_response::Reader>()?;
 
@@ -1153,10 +1196,16 @@ impl ModelZmqClient {
         match response.which()? {
             Which::StreamStarted(stream_reader) => {
                 let stream = stream_reader?;
-                Ok((
-                    stream.get_stream_id()?.to_str()?.to_string(),
-                    stream.get_endpoint()?.to_str()?.to_string(),
-                ))
+                let server_pubkey_data = stream.get_server_pubkey()?;
+                let mut server_pubkey = [0u8; 32];
+                if server_pubkey_data.len() == 32 {
+                    server_pubkey.copy_from_slice(server_pubkey_data);
+                }
+                Ok(StreamStartedInfo {
+                    stream_id: stream.get_stream_id()?.to_str()?.to_string(),
+                    endpoint: stream.get_endpoint()?.to_str()?.to_string(),
+                    server_pubkey,
+                })
             }
             Which::Error(error_reader) => {
                 let error = error_reader?;

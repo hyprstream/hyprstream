@@ -674,6 +674,7 @@ use async_trait::async_trait;
 ///
 /// Spawns services in the current process using ServiceSpawner.
 pub struct InprocManager {
+    #[allow(dead_code)]
     spawner: ServiceSpawner,
 }
 

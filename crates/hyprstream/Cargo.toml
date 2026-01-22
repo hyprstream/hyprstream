@@ -85,6 +85,7 @@ chrono.workspace = true
 async-stream.workspace = true
 anyhow.workspace = true
 sha2.workspace = true  # SHA256 validation for LFS files
+hmac.workspace = true  # HMAC for authenticated stream chunks
 daemonize.workspace = true
 prost.workspace = true
 
@@ -145,6 +146,9 @@ blake3.workspace = true                  # Fast cryptographic hashing for checks
 tempfile.workspace = true                # Temporary files for model conversion
 base64.workspace = true                  # JWT token encoding
 ed25519-dalek.workspace = true           # JWT Ed25519 signatures
+curve25519-dalek.workspace = true        # Ristretto255 DH for stream authentication
+hkdf.workspace = true                    # HKDF key derivation
+subtle.workspace = true                  # Constant-time operations
 
 # HTTP API dependencies
 axum.workspace = true

@@ -26,7 +26,7 @@ pub async fn handle_worker_list(
     containers_only: bool,
     sandboxes_only: bool,
     state_filter: Option<String>,
-    verbose: bool,
+    _verbose: bool,
 ) -> Result<()> {
     if !containers_only {
         // List sandboxes
@@ -474,6 +474,186 @@ pub async fn handle_worker_exec(
     }
 
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Terminal Command
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Handle `worker terminal` command - attach to container I/O streams
+///
+/// This provides tmux-like terminal streaming:
+/// - Subscribes to stdout/stderr topics via ZMQ SUB
+/// - Pushes stdin to the container via ZMQ PUSH
+/// - Handles detach sequence (default: Ctrl-])
+pub async fn handle_worker_terminal(
+    client: &WorkerClient,
+    container_id: &str,
+    detach_keys: &str,
+) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tokio::signal;
+
+    info!(container_id = %container_id, "Attaching to container terminal");
+
+    // 1. Call Attach RPC to get topics
+    let attach_response = client.attach(container_id).await?;
+
+    println!(
+        "Attached to container {}\n\
+         Stream endpoint: {}\n\
+         stdout topic: {}\n\
+         stderr topic: {}\n\
+         stdin topic: {}\n\
+         Detach with: {}",
+        truncate_id(&attach_response.container_id, 12),
+        attach_response.stream_endpoint,
+        attach_response.stdout_topic,
+        attach_response.stderr_topic,
+        attach_response.stdin_topic,
+        detach_keys,
+    );
+
+    // 2. Set up ZMQ sockets
+    let context = zmq::Context::new();
+
+    // SUB socket for stdout/stderr
+    let sub_socket = context.socket(zmq::SUB)?;
+    sub_socket.connect(&attach_response.stream_endpoint)?;
+    sub_socket.set_subscribe(attach_response.stdout_topic.as_bytes())?;
+    sub_socket.set_subscribe(attach_response.stderr_topic.as_bytes())?;
+
+    // PUSH socket for stdin (to StreamService PULL)
+    // The push endpoint is typically the same host but different port
+    let push_endpoint = attach_response
+        .stream_endpoint
+        .replace(":5560", ":5559"); // XPUB is 5560, PULL is 5559
+    let push_socket = context.socket(zmq::PUSH)?;
+    push_socket.connect(&push_endpoint)?;
+
+    // 3. Set up terminal control
+    let running = Arc::new(AtomicBool::new(true));
+    let running_signal = running.clone();
+
+    // Spawn task to handle Ctrl-C
+    tokio::spawn(async move {
+        let _ = signal::ctrl_c().await;
+        running_signal.store(false, Ordering::SeqCst);
+    });
+
+    // Parse detach key sequence
+    let detach_byte = parse_detach_keys(detach_keys);
+
+    println!("\n--- Terminal attached. Press {} to detach ---\n", detach_keys);
+
+    // 4. Main I/O loop
+    // For a proper implementation, we'd use crossterm for raw mode
+    // and tokio for async I/O. This is a simplified version.
+
+    // Spawn receiver thread for stdout/stderr
+    let stdout_topic = attach_response.stdout_topic.clone();
+    let stderr_topic = attach_response.stderr_topic.clone();
+    let running_recv = running.clone();
+
+    let recv_handle = std::thread::spawn(move || {
+        while running_recv.load(Ordering::SeqCst) {
+            // Poll with 100ms timeout
+            if sub_socket.poll(zmq::POLLIN, 100).unwrap_or(0) > 0 {
+                if let Ok(msg) = sub_socket.recv_bytes(0) {
+                    // Message format: {topic}{streaming_capnp::StreamChunk}
+                    // For now, just print the raw data after topic
+                    let topic_len = if msg.starts_with(stdout_topic.as_bytes()) {
+                        stdout_topic.len()
+                    } else if msg.starts_with(stderr_topic.as_bytes()) {
+                        stderr_topic.len()
+                    } else {
+                        continue;
+                    };
+
+                    // Extract payload (skip topic prefix and capnp overhead)
+                    // In a full implementation, we'd parse the wire format StreamChunk
+                    if msg.len() > topic_len {
+                        let payload = &msg[topic_len..];
+                        // Try to extract data from wire format
+                        if let Some(text) = extract_stream_chunk_data(payload) {
+                            print!("{}", String::from_utf8_lossy(&text));
+                            let _ = io::stdout().flush();
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Read stdin and send to container
+    // In a full implementation, we'd use raw mode for character-by-character input
+    use std::io::BufRead;
+    let stdin = io::stdin();
+    for line in stdin.lock().lines() {
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
+
+        if let Ok(line) = line {
+            // Check for detach sequence
+            if line.as_bytes().first() == Some(&detach_byte) {
+                println!("\n--- Detached ---");
+                break;
+            }
+
+            // Send line + newline as stdin chunk
+            let mut data = line.into_bytes();
+            data.push(b'\n');
+
+            // Build wire format message and send
+            // For now, send raw data (full implementation would build capnp)
+            let mut msg = attach_response.stdin_topic.as_bytes().to_vec();
+            msg.extend_from_slice(&data);
+
+            if let Err(e) = push_socket.send(&msg, 0) {
+                eprintln!("Failed to send stdin: {}", e);
+                break;
+            }
+        }
+    }
+
+    running.store(false, Ordering::SeqCst);
+    let _ = recv_handle.join();
+
+    println!("Terminal session ended.");
+    Ok(())
+}
+
+/// Parse detach key sequence string to byte
+fn parse_detach_keys(keys: &str) -> u8 {
+    match keys.to_lowercase().as_str() {
+        "ctrl-]" | "ctrl+]" => 0x1D, // ASCII GS (Group Separator)
+        "ctrl-a" | "ctrl+a" => 0x01,
+        "ctrl-b" | "ctrl+b" => 0x02,
+        "ctrl-c" | "ctrl+c" => 0x03,
+        "ctrl-d" | "ctrl+d" => 0x04,
+        "ctrl-q" | "ctrl+q" => 0x11,
+        _ => 0x1D, // Default to Ctrl-]
+    }
+}
+
+/// Extract data from streaming_capnp::StreamChunk wire format message
+fn extract_stream_chunk_data(payload: &[u8]) -> Option<Vec<u8>> {
+    use capnp::serialize;
+
+    let _reader = serialize::read_message(
+        &mut std::io::Cursor::new(payload),
+        capnp::message::ReaderOptions::default(),
+    ).ok()?;
+
+    // Try to read as streaming_capnp::StreamChunk
+    // Note: This requires the capnp module to be accessible
+    // For now, return the raw payload and let the caller handle it
+    // In a full implementation, we'd properly deserialize the StreamChunk
+
+    // Fallback: return raw payload if capnp parsing fails
+    Some(payload.to_vec())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

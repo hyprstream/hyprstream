@@ -400,7 +400,7 @@ pub async fn handle_training_infer(
     println!("Run 'hyprstream training checkpoint {}' to commit changes", model_ref);
 
     // Stop service to properly release resources
-    service_handle.stop().await;
+    let _ = service_handle.stop().await;
 
     Ok(())
 }
@@ -638,7 +638,7 @@ pub async fn handle_training_batch(
 
     // Stop service - this saves final adapter weights
     println!("\nStopping InferenceService and saving weights...");
-    service_handle.stop().await;
+    let _ = service_handle.stop().await;
 
     let elapsed = start_time.elapsed();
     let total_tokens = total_input_tokens + total_output_tokens;

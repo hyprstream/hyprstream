@@ -7,7 +7,7 @@ use crate::auth::Operation;
 use crate::services::PolicyZmqClient;
 use crate::registry_capnp;
 use crate::services::rpc_types::{HealthStatus, RemoteInfo, RegistryResponse, WorktreeData};
-use crate::services::{EnvelopeContext, ZmqClient, ZmqService};
+use crate::services::{CallOptions, EnvelopeContext, ZmqClient, ZmqService};
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::{global as registry, SocketKind};
@@ -79,7 +79,7 @@ impl RegistryOps for ZmqClient {
             req.set_id(id);
             req.set_list(());
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_repositories_response(&response)
     }
 
@@ -90,7 +90,7 @@ impl RegistryOps for ZmqClient {
             req.set_id(id);
             req.set_get(repo_id);
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_optional_repository_response(&response)
     }
 
@@ -101,7 +101,7 @@ impl RegistryOps for ZmqClient {
             req.set_id(id);
             req.set_get_by_name(name);
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_optional_repository_response(&response)
     }
 
@@ -112,7 +112,7 @@ impl RegistryOps for ZmqClient {
             req.set_id(id);
             req.set_list_branches(repo_id);
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_branches_response(&response)
     }
 
@@ -123,7 +123,7 @@ impl RegistryOps for ZmqClient {
             req.set_id(id);
             req.set_health_check(());
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_health_response(&response)
     }
 
@@ -140,7 +140,7 @@ impl RegistryOps for ZmqClient {
             clone_req.set_shallow(false);
             clone_req.set_depth(0);
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_repo_id_response(&response)
     }
 
@@ -159,7 +159,7 @@ impl RegistryOps for ZmqClient {
                 reg_req.set_name(n);
             }
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_success_response(&response)
     }
 
@@ -170,7 +170,7 @@ impl RegistryOps for ZmqClient {
             req.set_id(req_id);
             req.set_remove(&id.to_string());
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_success_response(&response)
     }
 }
@@ -1746,7 +1746,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes, None).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -1792,7 +1792,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes, None).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         self.parse_worktrees_response(&response)
@@ -1832,7 +1832,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes, None).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -1876,7 +1876,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes, None).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         let reader = serialize::read_message(&*response, ReaderOptions::new())
@@ -1930,7 +1930,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes, None).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -1974,7 +1974,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes, None).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2023,7 +2023,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes, None).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2070,7 +2070,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes, None).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2111,7 +2111,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes, None).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2160,7 +2160,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes, None).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2211,7 +2211,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes, None).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2252,7 +2252,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes, None).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         self.parse_remotes_response(&response)
@@ -2279,7 +2279,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes, None).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2323,7 +2323,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes, None).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2368,7 +2368,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes, None).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2417,7 +2417,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes, None).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2458,7 +2458,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes, None).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2550,7 +2550,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes, None).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response

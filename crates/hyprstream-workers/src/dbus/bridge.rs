@@ -46,6 +46,7 @@ impl Default for DbusBridgeConfig {
 
 /// Signal subscription tracking
 #[derive(Debug)]
+#[allow(dead_code)]
 struct SignalSubscription {
     /// Subscription ID
     id: String,

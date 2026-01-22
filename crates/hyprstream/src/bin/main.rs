@@ -24,6 +24,7 @@ use hyprstream_core::cli::{
     handle_images_df, handle_images_list, handle_images_pull, handle_images_rm,
     handle_worker_exec, handle_worker_list, handle_worker_restart, handle_worker_rm,
     handle_worker_run, handle_worker_start, handle_worker_stats, handle_worker_status,
+    handle_worker_terminal,
     handle_worker_stop,
 };
 
@@ -33,21 +34,17 @@ use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
 
 // Registry and policy services - uses ZMQ-based services from hyprstream_core
-use hyprstream_core::services::{
-    PolicyService, PolicyZmqClient, RegistryClient, RegistryService, RegistryZmqClient,
-};
+use hyprstream_core::services::{PolicyZmqClient, RegistryClient, RegistryZmqClient};
 // Worker service for Kata-based workload execution
 use hyprstream_workers::runtime::WorkerService;
 use hyprstream_workers::workflow::WorkflowService;
-use hyprstream_workers::{ImageConfig, PoolConfig, ProxyService, SpawnedService, endpoints};
+use hyprstream_workers::{ImageConfig, PoolConfig, SpawnedService};
 // ZMQ context for service startup
 use hyprstream_core::zmq::global_context;
 use std::sync::Arc;
 // Unified service manager API
 use hyprstream_rpc::service::{get_factory, InprocManager, ServiceContext, ServiceManager};
 use hyprstream_rpc::transport::TransportConfig;
-// Import factories module to ensure inventory registrations are linked
-use hyprstream_core::services::factories as _service_factories;
 // Tracing imports (feature-gated)
 #[cfg(feature = "otel")]
 use opentelemetry::trace::TracerProvider;
@@ -1294,6 +1291,9 @@ fn main() -> Result<()> {
                         }
                         WorkerAction::Exec { container_id, command, timeout } => {
                             handle_worker_exec(&worker_client, &container_id, command, timeout).await
+                        }
+                        WorkerAction::Terminal { container_id, detach_keys } => {
+                            handle_worker_terminal(&worker_client, &container_id, &detach_keys).await
                         }
                         WorkerAction::Images(img_cmd) => {
                             match img_cmd {

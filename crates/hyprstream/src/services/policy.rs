@@ -23,7 +23,7 @@
 
 use crate::auth::{Operation, PolicyManager};
 use crate::policy_capnp;
-use crate::services::{EnvelopeContext, ZmqClient, ZmqService};
+use crate::services::{CallOptions, EnvelopeContext, ZmqClient, ZmqService};
 use anyhow::{anyhow, Result};
 use capnp::message::{Builder, ReaderOptions};
 use capnp::serialize;
@@ -31,7 +31,7 @@ use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::{global as registry, SocketKind};
 use hyprstream_rpc::transport::TransportConfig;
 use std::sync::Arc;
-use tracing::{debug, error, trace};
+use tracing::{debug, trace};
 
 /// Service name for endpoint registry
 const SERVICE_NAME: &str = "policy";
@@ -366,7 +366,7 @@ impl PolicyZmqClient {
         serialize::write_message(&mut request_bytes, &message)?;
 
         // Send request via ZMQ (async I/O - doesn't block runtime)
-        let response_bytes = self.client.call(request_bytes, None).await?;
+        let response_bytes = self.client.call(request_bytes, CallOptions::default()).await?;
 
         // Parse response
         let reader = serialize::read_message(
@@ -435,7 +435,7 @@ impl PolicyZmqClient {
         serialize::write_message(&mut request_bytes, &message)?;
 
         // Send request via ZMQ (async I/O)
-        let response_bytes = self.client.call(request_bytes, None).await?;
+        let response_bytes = self.client.call(request_bytes, CallOptions::default()).await?;
 
         // Parse response
         let reader = serialize::read_message(

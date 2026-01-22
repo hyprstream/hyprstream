@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 /// OCI media types for manifest negotiation.
+#[allow(dead_code)]
 pub mod media_types {
     pub const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
     pub const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";

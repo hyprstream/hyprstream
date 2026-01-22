@@ -20,7 +20,7 @@ use capnp::message::ReaderOptions;
 use capnp::serialize;
 use std::sync::Arc;
 
-use super::ZmqClient;
+use super::{CallOptions, ZmqClient};
 use hyprstream_workers::workers_capnp;
 
 // Re-export types from hyprstream-workers for convenience
@@ -28,8 +28,8 @@ pub use hyprstream_workers::image::{
     AuthConfig, Image, ImageFilter, ImageClient, ImageSpec,
 };
 pub use hyprstream_workers::runtime::{
-    Container, ContainerAttributes, ContainerConfig, ContainerFilter, ContainerMetadata,
-    ContainerState, ContainerStats, ContainerStatsFilter, ContainerStatus,
+    AttachResponse, Container, ContainerAttributes, ContainerConfig, ContainerFilter,
+    ContainerMetadata, ContainerState, ContainerStats, ContainerStatsFilter, ContainerStatus,
     ContainerStatusResponse, CpuUsage, ExecSyncResponse, FilesystemIdentifier, FilesystemUsage,
     KeyValue, LinuxPodSandboxStats, MemoryUsage, NetworkInterfaceUsage, NetworkUsage, PodIP,
     PodSandbox, PodSandboxAttributes, PodSandboxConfig, PodSandboxFilter, PodSandboxMetadata,
@@ -128,6 +128,12 @@ pub trait RuntimeOps {
         &self,
         filter: Option<&ContainerStatsFilter>,
     ) -> Result<Vec<ContainerStats>>;
+
+    /// Attach to container I/O streams.
+    async fn attach(&self, container_id: &str) -> Result<AttachResponse>;
+
+    /// Detach from container I/O streams.
+    async fn detach(&self, container_id: &str) -> Result<()>;
 }
 
 // ============================================================================
@@ -172,7 +178,7 @@ impl RuntimeOps for ZmqClient {
             req.set_id(id);
             req.set_version(version);
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_version_response(&response)
     }
 
@@ -184,7 +190,7 @@ impl RuntimeOps for ZmqClient {
             let mut status = req.init_status();
             status.set_verbose(verbose);
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_status_response(&response)
     }
 
@@ -196,7 +202,7 @@ impl RuntimeOps for ZmqClient {
             let sandbox_config = req.init_run_pod_sandbox();
             build_pod_sandbox_config(sandbox_config, config);
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_sandbox_id_response(&response)
     }
 
@@ -207,7 +213,7 @@ impl RuntimeOps for ZmqClient {
             req.set_id(id);
             req.set_stop_pod_sandbox(pod_sandbox_id);
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_success_response(&response)
     }
 
@@ -218,7 +224,7 @@ impl RuntimeOps for ZmqClient {
             req.set_id(id);
             req.set_remove_pod_sandbox(pod_sandbox_id);
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_success_response(&response)
     }
 
@@ -235,7 +241,7 @@ impl RuntimeOps for ZmqClient {
             status_req.set_pod_sandbox_id(pod_sandbox_id);
             status_req.set_verbose(verbose);
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_sandbox_status_response(&response)
     }
 
@@ -249,7 +255,7 @@ impl RuntimeOps for ZmqClient {
                 build_pod_sandbox_filter(filter_builder, f);
             }
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_sandboxes_response(&response)
     }
 
@@ -268,7 +274,7 @@ impl RuntimeOps for ZmqClient {
             build_container_config(create_req.reborrow().init_config(), config);
             build_pod_sandbox_config(create_req.init_sandbox_config(), sandbox_config);
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_container_id_response(&response)
     }
 
@@ -279,7 +285,7 @@ impl RuntimeOps for ZmqClient {
             req.set_id(id);
             req.set_start_container(container_id);
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_success_response(&response)
     }
 
@@ -292,7 +298,7 @@ impl RuntimeOps for ZmqClient {
             stop_req.set_container_id(container_id);
             stop_req.set_timeout(timeout);
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_success_response(&response)
     }
 
@@ -303,7 +309,7 @@ impl RuntimeOps for ZmqClient {
             req.set_id(id);
             req.set_remove_container(container_id);
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_success_response(&response)
     }
 
@@ -320,7 +326,7 @@ impl RuntimeOps for ZmqClient {
             status_req.set_container_id(container_id);
             status_req.set_verbose(verbose);
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_container_status_response(&response)
     }
 
@@ -334,7 +340,7 @@ impl RuntimeOps for ZmqClient {
                 build_container_filter(filter_builder, f);
             }
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_containers_response(&response)
     }
 
@@ -356,7 +362,7 @@ impl RuntimeOps for ZmqClient {
             }
             exec_req.set_timeout(timeout);
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_exec_response(&response)
     }
 
@@ -367,7 +373,7 @@ impl RuntimeOps for ZmqClient {
             req.set_id(id);
             req.set_pod_sandbox_stats(pod_sandbox_id);
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_sandbox_stats_response(&response)
     }
 
@@ -384,7 +390,7 @@ impl RuntimeOps for ZmqClient {
                 build_pod_sandbox_stats_filter(filter_builder, f);
             }
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_sandbox_stats_list_response(&response)
     }
 
@@ -395,7 +401,7 @@ impl RuntimeOps for ZmqClient {
             req.set_id(id);
             req.set_container_stats(container_id);
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_container_stats_response(&response)
     }
 
@@ -412,8 +418,31 @@ impl RuntimeOps for ZmqClient {
                 build_container_stats_filter(filter_builder, f);
             }
         })?;
-        let response = self.call(payload, None).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_container_stats_list_response(&response)
+    }
+
+    async fn attach(&self, container_id: &str) -> Result<AttachResponse> {
+        let id = self.next_id();
+        let payload = serialize_message(|msg| {
+            let mut req = msg.init_root::<workers_capnp::runtime_request::Builder>();
+            req.set_id(id);
+            let mut attach_req = req.init_attach();
+            attach_req.set_container_id(container_id);
+        })?;
+        let response = self.call(payload, CallOptions::default()).await?;
+        parse_attach_response(&response)
+    }
+
+    async fn detach(&self, container_id: &str) -> Result<()> {
+        let id = self.next_id();
+        let payload = serialize_message(|msg| {
+            let mut req = msg.init_root::<workers_capnp::runtime_request::Builder>();
+            req.set_id(id);
+            req.set_detach(container_id);
+        })?;
+        let response = self.call(payload, CallOptions::default()).await?;
+        parse_success_response(&response)
     }
 }
 
@@ -444,7 +473,7 @@ impl ImageOps for ZmqClient {
                 build_image_filter(filter_builder, f);
             }
         })?;
-        let response = self.call(prefix_image_request(payload), None).await?;
+        let response = self.call(prefix_image_request(payload), CallOptions::default()).await?;
         parse_images_response(&response)
     }
 
@@ -461,7 +490,7 @@ impl ImageOps for ZmqClient {
             build_image_spec(status_req.reborrow().init_image(), image);
             status_req.set_verbose(verbose);
         })?;
-        let response = self.call(prefix_image_request(payload), None).await?;
+        let response = self.call(prefix_image_request(payload), CallOptions::default()).await?;
         parse_image_status_response(&response)
     }
 
@@ -476,7 +505,7 @@ impl ImageOps for ZmqClient {
                 build_auth_config(pull_req.init_auth(), a);
             }
         })?;
-        let response = self.call(prefix_image_request(payload), None).await?;
+        let response = self.call(prefix_image_request(payload), CallOptions::default()).await?;
         parse_image_ref_response(&response)
     }
 
@@ -488,7 +517,7 @@ impl ImageOps for ZmqClient {
             let image_spec = req.init_remove_image();
             build_image_spec(image_spec, image);
         })?;
-        let response = self.call(prefix_image_request(payload), None).await?;
+        let response = self.call(prefix_image_request(payload), CallOptions::default()).await?;
         parse_image_success_response(&response)
     }
 
@@ -499,7 +528,7 @@ impl ImageOps for ZmqClient {
             req.set_id(id);
             req.set_image_fs_info(());
         })?;
-        let response = self.call(prefix_image_request(payload), None).await?;
+        let response = self.call(prefix_image_request(payload), CallOptions::default()).await?;
         parse_fs_info_response(&response)
     }
 }
@@ -577,6 +606,25 @@ fn parse_success_response(response: &[u8]) -> Result<()> {
         match resp.which()? {
             Which::Success(()) => Ok(()),
             _ => Err(anyhow!("Expected success response")),
+        }
+    })
+}
+
+fn parse_attach_response(response: &[u8]) -> Result<AttachResponse> {
+    parse_runtime_response(response, |resp| {
+        use workers_capnp::runtime_response::Which;
+        match resp.which()? {
+            Which::AttachResponse(attach) => {
+                let attach = attach?;
+                Ok(AttachResponse {
+                    container_id: attach.get_container_id()?.to_str()?.to_string(),
+                    stdin_topic: attach.get_stdin_topic()?.to_str()?.to_string(),
+                    stdout_topic: attach.get_stdout_topic()?.to_str()?.to_string(),
+                    stderr_topic: attach.get_stderr_topic()?.to_str()?.to_string(),
+                    stream_endpoint: attach.get_stream_endpoint()?.to_str()?.to_string(),
+                })
+            }
+            _ => Err(anyhow!("Expected attach_response")),
         }
     })
 }
@@ -1337,7 +1385,7 @@ fn build_container_image_spec(mut builder: workers_capnp::image_spec::Builder, s
     builder.set_runtime_handler(&spec.runtime_handler);
 }
 
-fn build_image_filter(mut builder: workers_capnp::image_filter::Builder, filter: &ImageFilter) {
+fn build_image_filter(builder: workers_capnp::image_filter::Builder, filter: &ImageFilter) {
     if let Some(spec) = &filter.image {
         build_image_spec(builder.init_image(), spec);
     }
@@ -1388,6 +1436,16 @@ impl WorkerClient {
     /// Get the underlying ZMQ client
     pub fn zmq_client(&self) -> &Arc<ZmqClient> {
         &self.client
+    }
+
+    /// Attach to container I/O streams
+    pub async fn attach(&self, container_id: &str) -> anyhow::Result<AttachResponse> {
+        self.client.attach(container_id).await
+    }
+
+    /// Detach from container I/O streams
+    pub async fn detach(&self, container_id: &str) -> anyhow::Result<()> {
+        self.client.detach(container_id).await
     }
 }
 

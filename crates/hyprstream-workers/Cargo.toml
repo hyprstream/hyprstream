@@ -52,17 +52,16 @@ which = { workspace = true }
 zbus = { version = "4", features = ["tokio"], optional = true }
 
 # Nydus libraries (Dragonfly-native blob fetching)
-nydus-api = { path = "../../../nydus/api" }
-nydus-builder = { path = "../../../nydus/builder" }
-nydus-rafs = { path = "../../../nydus/rafs" }
-nydus-storage = { path = "../../../nydus/storage", features = [
+# NOTE: Using git deps because published crates.io versions have API mismatch
+# (nydus-storage 0.7.1 references field missing from nydus-api 0.4.0)
+nydus-api = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0" }
+nydus-storage = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0", features = [
     "backend-registry",
     "backend-localfs",
 ] }
-nydus-utils = { path = "../../../nydus/utils" }
 
 # Phase 2: VM Runtime (nydus-service for virtiofs)
-nydus-service = { path = "../../../nydus/service" }
+nydus-service = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0" }
 fuse-backend-rs = "0.12"
 
 # Minimal HTTP for manifest fetching only (blobs go through nydus-storage)

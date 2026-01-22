@@ -4,6 +4,11 @@
 #
 # The inference service uses REQ/REP pattern for request handling.
 # Streaming uses PUB/SUB with stream IDs for chunk delivery.
+#
+# Streaming Architecture:
+#   - Wire format types are in hyprstream-rpc/schema/streaming.capnp
+#   - This file defines inference-specific payload types
+#   - InferencePayload gets serialized into streaming.capnp::StreamChunk.data
 
 struct InferenceRequest {
   # Request ID for tracking
@@ -116,48 +121,54 @@ enum FinishReason {
   stop @4;
 }
 
+# =============================================================================
+# Stream Setup (aligns with streaming.capnp::StreamInfo)
+# =============================================================================
+
+# Response when starting a stream - contains info needed to subscribe
+# Note: Matches streaming.capnp::StreamInfo for consistency
 struct StreamInfo {
   streamId @0 :Text;
   endpoint @1 :Text;
+  serverPubkey @2 :Data;  # Server's ephemeral Ristretto255 public key (32 bytes) for DH
 }
 
 # Stream authorization handshake
-# Step 1: Client calls startStream after generateStream returns stream_id
-# Step 2: Server authorizes client to subscribe, returns confirmation
-# Future: DH key exchange for encrypted streams
+# Note: Matches streaming.capnp::StreamStartRequest/StreamAuthResponse
 
 struct StartStreamRequest {
   streamId @0 :Text;
-  # Future fields for DH key exchange:
-  # clientPublicKey @1 :Data;  # Client's ephemeral X25519 public key
+  clientPubkey @1 :Data;  # Client's ephemeral Ristretto255 public key (32 bytes)
 }
 
 struct StreamAuthResponse {
   streamId @0 :Text;
-  # Future fields for DH key exchange:
-  # serverPublicKey @1 :Data;  # Server's ephemeral X25519 public key
+  serverPubkey @1 :Data;  # Server's ephemeral Ristretto255 public key (if not in StreamInfo)
 }
 
-# Streaming messages (sent via PUB/SUB)
+# =============================================================================
+# Inference Payload (serialized into streaming.capnp::StreamChunk.data)
+# =============================================================================
 
-struct StreamChunk {
+# The actual inference payload - gets serialized into wire format StreamChunk.data
+# This is the application-layer content, not the wire format.
+struct InferencePayload {
   streamId @0 :Text;
-  sequenceNum @1 :UInt32;
-  hmac @2 :Data;  # HMAC-SHA256 for authentication (empty when disabled, 32 bytes when enabled)
 
   union {
-    text @3 :Text;
-    complete @4 :StreamStats;
-    error @5 :ErrorInfo;
+    token @1 :Text;                   # Generated token text
+    complete @2 :InferenceStats;      # Generation complete with stats
+    error @3 :ErrorInfo;              # Error during generation
   }
 }
 
-struct StreamStats {
+# Inference-specific completion statistics (extends streaming.capnp::StreamStats)
+struct InferenceStats {
   tokensGenerated @0 :UInt32;
   finishReason @1 :FinishReason;
   generationTimeMs @2 :UInt64;
   tokensPerSecond @3 :Float32;
-  qualityMetrics @4 :QualityMetrics;
+  qualityMetrics @4 :QualityMetrics;  # Inference-specific quality metrics
 }
 
 # Chat Template

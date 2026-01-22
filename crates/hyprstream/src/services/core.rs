@@ -20,14 +20,9 @@
 use crate::zmq::global_context;
 use anyhow::Result;
 use hyprstream_rpc::prelude::*;
-use hyprstream_rpc::transport::TransportConfig;
-use std::sync::Arc;
 
 // Re-export core types from hyprstream-rpc
-pub use hyprstream_rpc::service::{
-    EnvelopeContext, RequestLoop as RequestLoopBase, ZmqClient as ZmqClientBase,
-    ZmqService,
-};
+pub use hyprstream_rpc::service::{CallOptions, EnvelopeContext, ZmqClient as ZmqClientBase, ZmqService};
 
 /// Authenticated ZMQ client with automatic request signing.
 ///
@@ -93,11 +88,11 @@ impl ZmqClient {
     ///
     /// # Arguments
     /// * `payload` - Request payload bytes
-    /// * `timeout_ms` - Optional explicit timeout in milliseconds (defaults to 30s)
+    /// * `opts` - Call options (timeout, claims, ephemeral_pubkey)
     ///
     /// Uses TMQ with the global context for proper `inproc://` support.
-    pub async fn call(&self, payload: Vec<u8>, timeout_ms: Option<i32>) -> Result<Vec<u8>> {
-        self.inner.call(payload, timeout_ms).await
+    pub async fn call(&self, payload: Vec<u8>, opts: hyprstream_rpc::service::CallOptions) -> Result<Vec<u8>> {
+        self.inner.call(payload, opts).await
     }
 }
 

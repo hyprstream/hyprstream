@@ -62,6 +62,7 @@ pub struct Instance {
 /// Thread-safe: socket operations are protected by a Mutex.
 pub struct CallbackRouter {
     /// ZMQ context
+    #[allow(dead_code)]
     ctx: Arc<zmq::Context>,
     /// ROUTER socket for callbacks (Mutex for thread safety)
     router: Mutex<zmq::Socket>,
@@ -303,7 +304,7 @@ impl CallbackRouter {
     fn build_load_model(&self, model_ref: &str, model_path: &str) -> Result<Vec<u8>> {
         let mut message = Builder::new_default();
         {
-            let mut cmd = message.init_root::<model_capnp::inference_command::Builder>();
+            let cmd = message.init_root::<model_capnp::inference_command::Builder>();
             let mut load = cmd.init_load_model();
             load.set_model_ref(model_ref);
             load.set_model_path(model_path);

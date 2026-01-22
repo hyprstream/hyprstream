@@ -17,7 +17,7 @@
 //!
 //! # Feature Flags
 //!
-//! - Default: X25519 for DH key exchange
+//! - Default: Ristretto255 for DH key exchange (prime-order group, no cofactor issues)
 //! - `fips`: ECDH P-256 for FIPS 140-2 compliance
 //!
 //! # Example
@@ -48,6 +48,12 @@ pub mod common_capnp {
 #[allow(unused_imports)]
 pub mod events_capnp {
     include!(concat!(env!("OUT_DIR"), "/events_capnp.rs"));
+}
+
+#[allow(dead_code)]
+#[allow(unused_imports)]
+pub mod streaming_capnp {
+    include!(concat!(env!("OUT_DIR"), "/streaming_capnp.rs"));
 }
 
 pub mod auth;
@@ -90,7 +96,7 @@ pub mod prelude {
     };
 
     #[cfg(not(feature = "fips"))]
-    pub use crate::{ed25519_to_x25519_pubkey, ed25519_to_x25519_secret, generate_ephemeral_keypair};
+    pub use crate::{generate_ephemeral_keypair, ristretto_dh, RistrettoPublic, RistrettoSecret};
 
     #[cfg(feature = "systemd")]
     pub use crate::SystemdManager;
@@ -118,7 +124,7 @@ pub use crypto::{
 };
 
 #[cfg(not(feature = "fips"))]
-pub use crypto::{ed25519_to_x25519_pubkey, ed25519_to_x25519_secret, generate_ephemeral_keypair};
+pub use crypto::{generate_ephemeral_keypair, ristretto_dh, RistrettoPublic, RistrettoSecret};
 pub use envelope::{
     unwrap_envelope, InMemoryNonceCache, NonceCache, RequestEnvelope, RequestIdentity,
     ResponseEnvelope, SignedEnvelope, MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,

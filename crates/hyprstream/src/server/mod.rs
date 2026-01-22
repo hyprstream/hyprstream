@@ -11,6 +11,7 @@ use axum::{middleware as axum_middleware, response::IntoResponse, routing::get, 
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpListener;
+use axum::http::StatusCode;
 use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 use tracing::info;
 
@@ -58,7 +59,7 @@ pub fn create_app(state: ServerState) -> Router {
     let mut app = public_routes
         .merge(protected_routes)
         // Add middleware (order matters: timeout should be before state)
-        .layer(TimeoutLayer::new(timeout_duration))
+        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, timeout_duration))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 

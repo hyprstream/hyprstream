@@ -417,7 +417,7 @@ impl RafsStore {
             for entry in std::fs::read_dir(&self.refs_dir)? {
                 let entry = entry?;
                 if entry.file_type()?.is_symlink() {
-                    let tag = entry.file_name().to_string_lossy().to_string();
+                    let _tag = entry.file_name().to_string_lossy().to_string();
                     let metadata_path = std::fs::read_link(entry.path())?;
 
                     if let Ok(metadata_str) = std::fs::read_to_string(&metadata_path) {

@@ -124,7 +124,7 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
 
 /// Factory for StreamService (PULL/XPUB queuing proxy with JWT validation)
 #[service_factory("streams")]
-fn create_streams_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+fn create_streams_service(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating StreamService with JWT validation and queuing");
 
     use crate::services::StreamService;

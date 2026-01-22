@@ -65,10 +65,16 @@ struct ErrorInfo {
   code @1 :Text;
 }
 
-# Stream info for streaming responses
+# =============================================================================
+# Stream Setup (aligns with streaming.capnp::StreamInfo)
+# =============================================================================
+
+# Stream info for streaming responses (includes server pubkey for E2E auth)
+# Note: Matches streaming.capnp::StreamInfo for consistency
 struct StreamInfo {
   streamId @0 :Text;
   endpoint @1 :Text;
+  serverPubkey @2 :Data;  # Server's ephemeral Ristretto255 public key (32 bytes) for DH
 }
 
 # Load model request
@@ -95,16 +101,18 @@ struct InferRequest {
 
 # Start stream request (authorizes SUB subscription)
 # Client must call this after inferStream to authorize subscription
+# Note: Aligns with streaming.capnp::StreamStartRequest
 struct StartStreamRequest {
-  modelRef @0 :Text;  # Model that started the stream
-  streamId @1 :Text;  # Stream ID from inferStream response (e.g., "stream-uuid")
-  # Future: clientPublicKey @2 :Data; for DH key exchange
+  modelRef @0 :Text;      # Model that started the stream
+  streamId @1 :Text;      # Stream ID from inferStream response (e.g., "stream-uuid")
+  clientPubkey @2 :Data;  # Client's ephemeral Ristretto255 public key (32 bytes) for DH
 }
 
 # Stream authorization response
+# Note: Aligns with streaming.capnp::StreamAuthResponse
 struct StreamAuthInfo {
   streamId @0 :Text;
-  # Future: serverPublicKey @1 :Data; for DH key exchange
+  serverPubkey @1 :Data;  # Server's ephemeral Ristretto255 public key (if not in StreamInfo)
 }
 
 # Response when model is loaded

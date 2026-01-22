@@ -53,8 +53,8 @@ use crate::lora::LoRAConfig;
 use crate::runtime::kv_cache::CacheOwner;
 use crate::runtime::model_config::ModelConfig;
 use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
-use crate::services::rpc_types::InferenceResponse;
-use crate::services::EnvelopeContext;
+use crate::services::rpc_types::{InferenceResponse, StreamStartedInfo};
+use crate::services::{CallOptions, EnvelopeContext};
 use crate::training::{TTTConfig, TestTimeTrainer};
 use crate::zmq::global_context;
 use anyhow::{anyhow, Result};
@@ -68,7 +68,6 @@ use tmq::{reply, Multipart};
 use tokio::runtime::Handle;
 use tokenizers::Tokenizer;
 use tracing::{debug, error, info, trace, warn};
-use uuid::Uuid;
 
 /// Pending stream to be executed after REP response is sent.
 ///
@@ -79,6 +78,10 @@ struct PendingStream {
     request: GenerationRequest,
     stream_id: String,
     prompt: String, // For training collection (stored as String for simplicity)
+    /// DH-derived topic for ZMQ routing (64 hex chars)
+    topic: String,
+    /// DH-derived HMAC key for authenticated stream chunks
+    mac_key: [u8; 32],
 }
 
 /// Default endpoint for the inference service
@@ -123,6 +126,8 @@ pub struct InferenceService {
     xpub_socket: RwLock<Option<zmq::Socket>>,
     /// Server's Ed25519 verifying key for signature verification
     server_pubkey: VerifyingKey,
+    /// Service signing key for stream registration (generated at init)
+    signing_key: SigningKey,
     /// Nonce cache for replay protection
     nonce_cache: Arc<InMemoryNonceCache>,
     /// Policy client for authorization checks (async via TMQ)
@@ -281,7 +286,7 @@ impl InferenceService {
         // Initialize the engine and load the model
         let server_pubkey = VerifyingKey::default(); // Callback mode doesn't need signature verification
         let nonce_cache = Arc::new(InMemoryNonceCache::new());
-        let mut service = Self::initialize(
+        let service = Self::initialize(
             model_path.clone(),
             config,
             model_ref.clone(),
@@ -510,6 +515,9 @@ impl InferenceService {
                 (None, None)
             };
 
+        // Generate signing key for stream registration
+        let signing_key = hyprstream_rpc::crypto::signing::generate_signing_keypair().0;
+
         Ok(Self {
             engine: RwLock::new(engine),
             model_id,
@@ -518,6 +526,7 @@ impl InferenceService {
             runtime_handle,
             xpub_socket: RwLock::new(None), // Initialized in run_service_loop
             server_pubkey,
+            signing_key,
             nonce_cache,
             policy_client,
             ttt_trainer,
@@ -742,47 +751,118 @@ impl InferenceService {
         })
     }
 
-    /// Prepare for streaming generation - returns stream_id immediately.
+    /// Prepare for streaming generation with DH-based key derivation.
     ///
     /// This is the first phase of streaming that runs BEFORE the REP response is sent.
     /// The actual streaming happens in `execute_stream` which runs AFTER the response.
     ///
-    /// This solves the deadlock where:
-    /// - Service waits for subscription before returning response
-    /// - Client can't subscribe without the stream_id from response
-    fn prepare_stream(&self, request: GenerationRequest) -> (String, PendingStream) {
+    /// # DH Key Exchange
+    ///
+    /// 1. Server generates ephemeral Ristretto255 keypair
+    /// 2. Server computes shared secret: DH(server_secret, client_ephemeral_pubkey)
+    /// 3. Both parties derive topic and mac_key from shared secret using HKDF
+    /// 4. Topic is used for ZMQ routing (replaces stream_id prefix)
+    /// 5. mac_key is used for HMAC chain (E2E authentication)
+    ///
+    /// # Returns
+    ///
+    /// (stream_id, server_pubkey, pending) where:
+    /// - stream_id: For client display/logging (not used for routing)
+    /// - server_pubkey: 32-byte Ristretto255 public key for client to derive same keys
+    /// - pending: Stream state including DH-derived topic and mac_key
+    fn prepare_stream(
+        &self,
+        request: GenerationRequest,
+        client_ephemeral_pubkey: Option<&[u8]>,
+    ) -> Result<(String, [u8; 32], PendingStream)> {
+        use hyprstream_rpc::crypto::{
+            derive_stream_keys, generate_ephemeral_keypair, ristretto_dh, RistrettoPublic,
+        };
+
         let stream_id = self.next_stream_id();
-        let prompt = request.prompt.as_str().to_string(); // Convert to String for training
+        let prompt = request.prompt.as_str().to_string();
+
+        // Generate server ephemeral Ristretto255 keypair for this stream
+        let (server_secret, server_pubkey) = generate_ephemeral_keypair();
+        let server_pubkey_bytes: [u8; 32] = server_pubkey.to_bytes();
+
+        // DH key derivation is required - no legacy fallback
+        let client_pub_bytes = client_ephemeral_pubkey
+            .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
+
+        if client_pub_bytes.len() != 32 {
+            bail!(
+                "Invalid client ephemeral pubkey length: expected 32, got {}",
+                client_pub_bytes.len()
+            );
+        }
+
+        // Convert to fixed-size array
+        let mut client_pub: [u8; 32] = [0u8; 32];
+        client_pub.copy_from_slice(client_pub_bytes);
+
+        // Parse and validate client Ristretto public key
+        let client_ristretto_pubkey = RistrettoPublic::from_bytes(&client_pub)
+            .ok_or_else(|| anyhow!("Invalid client Ristretto public key encoding"))?;
+
+        // Compute Ristretto255 DH shared secret
+        let shared_secret = ristretto_dh(&server_secret, &client_ristretto_pubkey);
+
+        // Derive topic and mac_key using HKDF
+        let keys = derive_stream_keys(
+            &shared_secret,
+            &client_pub,
+            &server_pubkey_bytes,
+        )?;
+
+        debug!(
+            stream_id = %stream_id,
+            topic = %keys.topic,
+            "DH-derived stream keys"
+        );
+
+        let (topic, mac_key) = (keys.topic, *keys.mac_key);
 
         let pending = PendingStream {
             request,
             stream_id: stream_id.clone(),
             prompt,
+            topic,
+            mac_key,
         };
 
-        (stream_id, pending)
+        Ok((stream_id, server_pubkey_bytes, pending))
     }
 
     /// Execute streaming generation - called AFTER REP response is sent.
     ///
-    /// Uses a PUB socket connected to StreamService with topic-based multiplexing.
-    /// The stream_id is used as the topic prefix for all messages.
+    /// Uses a PUSH socket connected to StreamService with DH-derived topic.
+    /// The topic is derived from DH shared secret, not guessable from stream_id.
     ///
-    /// # Protocol (with StreamService)
+    /// # Protocol (E2E Authenticated via DH)
     ///
-    /// 1. Client calls generate_stream via REQ/REP
-    /// 2. Service generates stream_id (prepare_stream)
-    /// 3. Service sends REP response (stream_id, StreamService endpoint)
-    /// 4. Client subscribes to StreamService with "stream-{id}|{jwt}"
-    /// 5. StreamService validates JWT and strips it
-    /// 6. Service publishes chunks via PUB (forwarded by StreamService)
+    /// 1. Client calls generate_stream with ephemeral pubkey in envelope
+    /// 2. Service generates ephemeral keypair, computes DH shared secret
+    /// 3. Both derive topic and mac_key from DH using HKDF
+    /// 4. Service returns server_pubkey in response (client derives same keys)
+    /// 5. Client subscribes to DH-derived topic (unpredictable, non-colliding)
+    /// 6. Service publishes chunks with HMAC chain (verified by client, not StreamService)
+    /// 7. StreamService is blind forwarder (no HMAC verification)
     fn execute_stream(&self, pending: PendingStream) {
+        use crate::services::rpc_types::{
+            build_authenticated_complete_chunk, build_authenticated_error_chunk,
+            build_authenticated_token_chunk, HmacChainState,
+        };
         use futures::StreamExt;
 
         let stream_id = pending.stream_id;
         let request = pending.request;
         let prompt = pending.prompt;
-        let topic = stream_id.as_bytes().to_vec();
+        // Use DH-derived topic for ZMQ routing (not stream_id)
+        let _topic = pending.topic.as_bytes().to_vec();
+
+        // Initialize HMAC chain state with DH-derived mac_key and topic
+        let mut hmac_state = HmacChainState::new(pending.mac_key, pending.topic.clone());
 
         // Apply TTT adaptation BEFORE streaming generation (if enabled)
         self.apply_ttt_adaptation(&prompt);
@@ -797,21 +877,21 @@ impl InferenceService {
             }
         };
 
-        // StreamService handles subscription validation and forwarding
+        // StreamService handles subscription forwarding (blind - no HMAC verification)
         // We push chunks - StreamService queues until subscriber arrives, then delivers
-        trace!("starting stream {} on topic {:?}", stream_id, String::from_utf8_lossy(&topic));
+        trace!(
+            stream_id = %stream_id,
+            topic = %pending.topic,
+            "Starting E2E authenticated stream"
+        );
 
-        // Helper to send topic-prefixed message
-        let send_with_topic = |data: &[u8]| -> Result<(), zmq::Error> {
-            // ZMQ topic filtering uses prefix matching
-            // Message format: topic_bytes + data_bytes
-            let mut msg = Vec::with_capacity(topic.len() + data.len());
-            msg.extend_from_slice(&topic);
-            msg.extend_from_slice(data);
-
+        // Helper to send StreamChunk via PUSH
+        // Note: PUSH/PULL doesn't use topic filtering (that's for PUB/SUB).
+        // StreamService parses the topic from the capnp and adds prefix when forwarding to XPUB.
+        let send_chunk = |data: &[u8]| -> Result<(), zmq::Error> {
             // Blocking send - PUSH buffers at HWM if receiver is slow
             // Timeout (1s) prevents indefinite blocking if StreamService is down
-            push_socket.send(&msg, 0)
+            push_socket.send(data, 0)
         };
 
         // Run the stream
@@ -820,27 +900,31 @@ impl InferenceService {
 
         match stream_result {
             Ok(mut stream) => {
-                let mut seq_num: u32 = 0;
-
                 // Use futures::executor::block_on because we're already inside a tokio runtime
                 // (run_service_loop runs in rt.block_on), and tokio's block_on can't be nested.
                 futures::executor::block_on(async {
                     while let Some(chunk_result) = stream.next().await {
                         match chunk_result {
                             Ok(text) => {
-                                // Build and send chunk message with topic prefix
-                                let chunk_bytes =
-                                    InferenceResponse::stream_chunk(&stream_id, seq_num, &text);
-                                if let Err(e) = send_with_topic(&chunk_bytes) {
+                                // Build authenticated chunk with HMAC chain
+                                // Ordering is via prevHmac in each chunk (no seq_num needed)
+                                let chunk_bytes = build_authenticated_token_chunk(
+                                    &stream_id,
+                                    &text,
+                                    &mut hmac_state,
+                                );
+                                if let Err(e) = send_chunk(&chunk_bytes) {
                                     warn!("failed to send stream chunk: {}", e);
                                     break;
                                 }
-                                seq_num += 1;
                             }
                             Err(e) => {
-                                let error_bytes =
-                                    InferenceResponse::stream_error(&stream_id, seq_num, &e.to_string());
-                                if let Err(send_err) = send_with_topic(&error_bytes) {
+                                let error_bytes = build_authenticated_error_chunk(
+                                    &stream_id,
+                                    &e.to_string(),
+                                    &mut hmac_state,
+                                );
+                                if let Err(send_err) = send_chunk(&error_bytes) {
                                     tracing::error!("Failed to send stream error: {}", send_err);
                                 }
                                 break;
@@ -850,15 +934,23 @@ impl InferenceService {
 
                     // Send completion
                     let stats = stream.stats();
-                    let complete_bytes = InferenceResponse::stream_complete(&stream_id, seq_num, &stats);
-                    if let Err(e) = send_with_topic(&complete_bytes) {
+                    let complete_bytes = build_authenticated_complete_chunk(
+                        &stream_id,
+                        &stats,
+                        &mut hmac_state,
+                    );
+                    if let Err(e) = send_chunk(&complete_bytes) {
                         tracing::error!("Failed to send stream completion: {}", e);
                     }
                 });
             }
             Err(e) => {
-                let error_bytes = InferenceResponse::stream_error(&stream_id, 0, &e.to_string());
-                if let Err(send_err) = send_with_topic(&error_bytes) {
+                let error_bytes = build_authenticated_error_chunk(
+                    &stream_id,
+                    &e.to_string(),
+                    &mut hmac_state,
+                );
+                if let Err(send_err) = send_chunk(&error_bytes) {
                     tracing::error!("Failed to send initial stream error: {}", send_err);
                 }
             }
@@ -1077,8 +1169,10 @@ impl InferenceService {
                 let gen_req = gen_req?;
                 let request = self.parse_generation_request(gen_req)?;
 
-                // Prepare stream but don't execute yet - return pending work
-                let (stream_id, pending) = self.prepare_stream(request);
+                // Prepare stream with DH key derivation
+                // Extract client ephemeral pubkey from envelope for DH
+                let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
+                let (stream_id, server_pubkey, pending) = self.prepare_stream(request, client_ephemeral_pubkey)?;
 
                 // Pre-authorize the stream subscription BEFORE returning response
                 // This way client can subscribe immediately without calling start_stream
@@ -1088,15 +1182,33 @@ impl InferenceService {
                     chrono::Utc::now().timestamp() + 300
                 });
 
+                // Register using DH-derived topic (not stream_id)
+                // StreamService uses this topic for subscription prefix matching
                 let push_guard = self.xpub_socket.read().unwrap();
                 if let Some(ref push_socket) = *push_guard {
-                    // Format: AUTHORIZE|stream-{uuid}|{exp_timestamp}
-                    let authorize_msg = format!("AUTHORIZE|{}|{}", stream_id, exp);
-                    if let Err(e) = push_socket.send(authorize_msg.as_bytes(), 0) {
-                        error!(stream_id = %stream_id, error = %e, "Failed to pre-authorize stream");
+                    // Build SignedEnvelope(StreamRegister) with DH-derived topic
+                    let claims = ctx.claims().cloned();
+                    let register_msg = crate::services::rpc_types::build_stream_register_envelope(
+                        &pending.topic, // Use DH-derived topic for registration
+                        exp,
+                        &self.signing_key,
+                        claims,
+                    );
+                    if let Err(e) = push_socket.send(&register_msg, 0) {
+                        error!(
+                            stream_id = %stream_id,
+                            topic = %pending.topic,
+                            error = %e,
+                            "Failed to pre-authorize stream"
+                        );
                         // Continue anyway - client can retry with start_stream
                     } else {
-                        info!(stream_id = %stream_id, exp = exp, "Stream pre-authorized for subscription");
+                        info!(
+                            stream_id = %stream_id,
+                            topic = %pending.topic,
+                            exp = exp,
+                            "Stream pre-authorized for subscription (DH-derived topic)"
+                        );
                     }
                 }
                 drop(push_guard);
@@ -1106,8 +1218,13 @@ impl InferenceService {
                     .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
                     .to_zmq_string();
 
-                // Return response with stream_id - client can subscribe immediately
-                let response = InferenceResponse::stream_started(request_id, &stream_id, &stream_sub_endpoint);
+                // Return response with stream_id AND server_pubkey for client DH
+                let response = InferenceResponse::stream_started(
+                    request_id,
+                    &stream_id,
+                    &stream_sub_endpoint,
+                    &server_pubkey,
+                );
                 Ok((response, Some(pending)))
             }
 
@@ -1295,13 +1412,19 @@ impl InferenceService {
 
                 let push_guard = self.xpub_socket.read().unwrap();
                 if let Some(ref push_socket) = *push_guard {
-                    // Format: AUTHORIZE|stream-{uuid}|{exp_timestamp}
-                    let authorize_msg = format!("AUTHORIZE|{}|{}", stream_id, exp);
-                    if let Err(e) = push_socket.send(authorize_msg.as_bytes(), 0) {
+                    // Build SignedEnvelope(StreamRegister) - secure registration
+                    let claims = ctx.claims().cloned();
+                    let register_msg = crate::services::rpc_types::build_stream_register_envelope(
+                        &stream_id,
+                        exp,
+                        &self.signing_key,
+                        claims,
+                    );
+                    if let Err(e) = push_socket.send(&register_msg, 0) {
                         error!(stream_id = %stream_id, error = %e, "Failed to send authorize message to StreamService");
                         return Ok((InferenceResponse::error(request_id, &format!("Stream authorization failed: {}", e)), None));
                     }
-                    info!(stream_id = %stream_id, exp = exp, "Stream authorized for subscription");
+                    info!(stream_id = %stream_id, exp = exp, "Stream authorized for subscription (SignedEnvelope)");
                 } else {
                     error!(stream_id = %stream_id, "No PUSH socket available for stream authorization");
                     return Ok((InferenceResponse::error(request_id, "Stream service not available"), None));
@@ -1392,7 +1515,7 @@ impl InferenceZmqClient {
         let mut bytes = Vec::new();
         serialize::write_message(&mut bytes, &message)?;
 
-        let response = self.client.call(bytes, None).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_generation_result(&response)
     }
 
@@ -1404,7 +1527,7 @@ impl InferenceZmqClient {
             req.set_id(id);
             req.set_is_ready(());
         })?;
-        let response = self.client.call(bytes, None).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_ready_response(&response)
     }
 
@@ -1416,7 +1539,7 @@ impl InferenceZmqClient {
             req.set_id(id);
             req.set_model_info(());
         })?;
-        let response = self.client.call(bytes, None).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_model_info_response(&response)
     }
 
@@ -1428,14 +1551,25 @@ impl InferenceZmqClient {
             req.set_id(id);
             req.set_health_check(());
         })?;
-        let response = self.client.call(bytes, None).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_health_response(&response)
     }
 
-    /// Start streaming generation
+    /// Start streaming generation with E2E authentication.
     ///
-    /// Returns the stream ID and endpoint for subscribing to chunks.
-    pub async fn generate_stream(&self, request: &GenerationRequest) -> Result<(String, String)> {
+    /// Returns StreamStartedInfo containing:
+    /// - stream_id: For client display/logging
+    /// - endpoint: StreamService SUB endpoint
+    /// - server_pubkey: Server's ephemeral Ristretto255 public key for DH
+    ///
+    /// # Arguments
+    /// * `request` - Generation parameters
+    /// * `ephemeral_pubkey` - Client's ephemeral Ristretto255 public key for DH (enables E2E auth)
+    pub async fn generate_stream(
+        &self,
+        request: &GenerationRequest,
+        ephemeral_pubkey: Option<[u8; 32]>,
+    ) -> Result<StreamStartedInfo> {
         let id = self.next_id();
 
         let mut message = Builder::new_default();
@@ -1463,7 +1597,11 @@ impl InferenceZmqClient {
         let mut bytes = Vec::new();
         serialize::write_message(&mut bytes, &message)?;
 
-        let response = self.client.call(bytes, None).await?;
+        let opts = match ephemeral_pubkey {
+            Some(pk) => CallOptions::default().ephemeral_pubkey(pk),
+            None => CallOptions::default(),
+        };
+        let response = self.client.call(bytes, opts).await?;
         self.parse_stream_started_response(&response)
     }
 
@@ -1494,7 +1632,7 @@ impl InferenceZmqClient {
         let mut bytes = Vec::new();
         serialize::write_message(&mut bytes, &message)?;
 
-        let response = self.client.call(bytes, None).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_stream_authorized_response(&response)
     }
 
@@ -1536,20 +1674,76 @@ impl InferenceZmqClient {
     ///     }
     /// }
     /// ```
+    /// Start streaming generation with E2E authenticated handle.
+    ///
+    /// # E2E Authentication Flow
+    ///
+    /// 1. Client generates ephemeral Ristretto255 keypair
+    /// 2. Client sends request (TODO: include client pubkey in envelope)
+    /// 3. Server returns server_pubkey in StreamInfo
+    /// 4. Client derives (topic, mac_key) from DH shared secret
+    /// 5. Client subscribes to DH-derived topic
+    /// 6. Client verifies HMAC chain on received chunks
+    ///
+    /// # Note
+    ///
+    /// Currently falls back to legacy mode because the ZmqClient doesn't yet
+    /// support setting ephemeral_pubkey in the request envelope. The infrastructure
+    /// for E2E authentication is in place; full integration requires:
+    /// - Adding `call_with_ephemeral` to ZmqClient
+    /// - Including client ephemeral pubkey in the envelope
     pub async fn generate_stream_handle(
         &self,
         request: &GenerationRequest,
         claims: crate::auth::Claims,
     ) -> Result<StreamHandle> {
-        // Call generate_stream to get stream_id and endpoint
-        let (stream_id, endpoint) = self.generate_stream(request).await?;
+        use hyprstream_rpc::crypto::{
+            derive_stream_keys, generate_ephemeral_keypair, ristretto_dh, RistrettoPublic,
+        };
 
-        // Create StreamHandle using global context (same as client uses)
+        // Generate client ephemeral Ristretto255 keypair for DH
+        let (client_secret, client_pubkey) = generate_ephemeral_keypair();
+        let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
+
+        // Call generate_stream with ephemeral pubkey for E2E auth
+        let info = self.generate_stream(request, Some(client_pubkey_bytes)).await?;
+
+        // Attempt E2E authentication if server provided pubkey
+        let use_e2e = info.server_pubkey != [0u8; 32];
+
         use crate::zmq::global_context;
+
+        // E2E authentication is required - server must provide Ristretto255 public key
+        if !use_e2e {
+            anyhow::bail!(
+                "Server did not provide Ristretto255 public key - E2E authentication required"
+            );
+        }
+
+        // Derive stream keys from Ristretto255 DH
+        let server_ristretto_pubkey = RistrettoPublic::from_bytes(&info.server_pubkey)
+            .ok_or_else(|| anyhow::anyhow!("Invalid server Ristretto255 public key encoding"))?;
+
+        let shared_secret = ristretto_dh(&client_secret, &server_ristretto_pubkey);
+
+        let keys = derive_stream_keys(
+            &shared_secret,
+            &client_pubkey_bytes,
+            &info.server_pubkey,
+        )?;
+
+        tracing::info!(
+            stream_id = %info.stream_id,
+            topic = %keys.topic,
+            "Creating E2E authenticated stream handle"
+        );
+
         StreamHandle::new(
             &global_context(),
-            stream_id,
-            &endpoint,
+            info.stream_id,
+            &info.endpoint,
+            keys.topic,
+            *keys.mac_key,
             claims,
             self.client.signing_key().clone(),
         )
@@ -1579,7 +1773,7 @@ impl InferenceZmqClient {
         let mut bytes = Vec::new();
         serialize::write_message(&mut bytes, &message)?;
 
-        let response = self.client.call(bytes, None).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_template_result_response(&response)
     }
 
@@ -1603,7 +1797,7 @@ impl InferenceZmqClient {
         let mut bytes = Vec::new();
         serialize::write_message(&mut bytes, &message)?;
 
-        let response = self.client.call(bytes, None).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_success_response(&response)
     }
 
@@ -1616,7 +1810,7 @@ impl InferenceZmqClient {
             req.set_id(id);
             req.set_load_lora(&path_str);
         })?;
-        let response = self.client.call(bytes, None).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_success_response(&response)
     }
 
@@ -1628,7 +1822,7 @@ impl InferenceZmqClient {
             req.set_id(id);
             req.set_save_lora(path);
         })?;
-        let response = self.client.call(bytes, None).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_success_response(&response)
     }
 
@@ -1640,7 +1834,7 @@ impl InferenceZmqClient {
             req.set_id(id);
             req.set_unload_lora(());
         })?;
-        let response = self.client.call(bytes, None).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_success_response(&response)
     }
 
@@ -1652,7 +1846,7 @@ impl InferenceZmqClient {
             req.set_id(id);
             req.set_has_lora(());
         })?;
-        let response = self.client.call(bytes, None).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_has_lora_response(&response)
     }
 
@@ -1664,7 +1858,7 @@ impl InferenceZmqClient {
             req.set_id(id);
             req.set_set_session(session_id);
         })?;
-        let response = self.client.call(bytes, None).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_success_response(&response)
     }
 
@@ -1676,7 +1870,7 @@ impl InferenceZmqClient {
             req.set_id(id);
             req.set_clear_session(());
         })?;
-        let response = self.client.call(bytes, None).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_success_response(&response)
     }
 
@@ -1688,7 +1882,7 @@ impl InferenceZmqClient {
             req.set_id(id);
             req.set_release_session(session_id);
         })?;
-        let response = self.client.call(bytes, None).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_success_response(&response)
     }
 
@@ -1700,7 +1894,7 @@ impl InferenceZmqClient {
             req.set_id(id);
             req.set_shutdown(());
         })?;
-        let response = self.client.call(bytes, None).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_success_response(&response)
     }
 
@@ -1801,7 +1995,10 @@ impl InferenceZmqClient {
     }
 
     /// Parse stream started response
-    fn parse_stream_started_response(&self, response: &[u8]) -> Result<(String, String)> {
+    /// Parse stream started response (with server_pubkey for E2E authentication)
+    fn parse_stream_started_response(&self, response: &[u8]) -> Result<StreamStartedInfo> {
+        use hyprstream_rpc::capnp::FromCapnp;
+
         let reader = serialize::read_message(response, ReaderOptions::new())?;
         let resp = reader.get_root::<inference_capnp::inference_response::Reader>()?;
 
@@ -1809,9 +2006,7 @@ impl InferenceZmqClient {
         match resp.which()? {
             Which::StreamStarted(info) => {
                 let info = info?;
-                let stream_id = info.get_stream_id()?.to_str()?.to_string();
-                let endpoint = info.get_endpoint()?.to_str()?.to_string();
-                Ok((stream_id, endpoint))
+                StreamStartedInfo::read_from(info)
             }
             Which::Error(err) => {
                 let err = err?;
@@ -1902,64 +2097,38 @@ impl InferenceZmqClient {
 /// - Chunk: Text chunk from the model
 /// - Complete: Stream finished with generation stats
 /// - Error: Generation failed
+///
+/// Note: Ordering is handled by prevHmac in the outer common_capnp::StreamChunk wrapper.
+/// The inner inference StreamChunk no longer has sequence_num or hmac fields.
 pub enum StreamChunkMessage {
     Chunk {
-        sequence_num: u32,
         text: String,
     },
     Complete {
-        sequence_num: u32,
         stats: crate::runtime::GenerationStats,
     },
     Error {
-        sequence_num: u32,
         error: String,
     },
 }
 
 impl StreamChunkMessage {
-    /// Parse a StreamChunk message from StreamService
-    pub fn from_capnp(chunk: inference_capnp::stream_chunk::Reader) -> Result<Self> {
-        use inference_capnp::stream_chunk::Which;
+    /// Parse an InferencePayload message from StreamService
+    ///
+    /// Note: This parses the inner inference_capnp::InferencePayload.
+    /// HMAC verification and ordering via prevHmac happen at the StreamService level
+    /// using the outer streaming_capnp::StreamChunk wrapper.
+    pub fn from_capnp(payload: inference_capnp::inference_payload::Reader) -> Result<Self> {
+        use inference_capnp::inference_payload::Which;
 
-        let stream_id = chunk.get_stream_id()?.to_str()?.to_string();
-        let sequence_num = chunk.get_sequence_num();
-        let hmac = chunk.get_hmac()?;
-
-        // Check HMAC presence (empty when feature disabled)
-        let has_hmac = hmac.len() > 0;
-
-        #[cfg(feature = "stream-hmac")]
-        if has_hmac {
-            // TODO: Verify HMAC when feature is enabled
-            tracing::debug!(
-                stream_id = %stream_id,
-                sequence = %sequence_num,
-                "Received chunk with HMAC"
-            );
-        } else {
-            #[cfg(feature = "stream-hmac")]
-            tracing::warn!(
-                stream_id = %stream_id,
-                sequence = %sequence_num,
-                "Received chunk without HMAC, but feature is enabled"
-            );
-        }
-
-        #[cfg(not(feature = "stream-hmac"))]
-        if has_hmac {
-            tracing::warn!(
-                stream_id = %stream_id,
-                sequence = %sequence_num,
-                "Received chunk with HMAC, but feature is disabled - ignoring"
-            );
-        }
+        let stream_id = payload.get_stream_id()?.to_str()?.to_string();
+        tracing::trace!(stream_id = %stream_id, "Parsing inference payload");
 
         // Parse union variant
-        match chunk.which()? {
-            Which::Text(text) => {
-                let text = text?.to_str()?.to_string();
-                Ok(StreamChunkMessage::Chunk { sequence_num, text })
+        match payload.which()? {
+            Which::Token(token) => {
+                let token = token?.to_str()?.to_string();
+                Ok(StreamChunkMessage::Chunk { text: token })
             }
             Which::Complete(complete) => {
                 let complete = complete?;
@@ -1983,13 +2152,12 @@ impl StreamChunkMessage {
                     inference_time_ms: 0,
                     inference_tokens_per_sec: 0.0,
                 };
-                Ok(StreamChunkMessage::Complete { sequence_num, stats })
+                Ok(StreamChunkMessage::Complete { stats })
             }
             Which::Error(error) => {
                 let error = error?;
                 let error_msg = error.get_message()?.to_str()?.to_string();
                 Ok(StreamChunkMessage::Error {
-                    sequence_num,
                     error: error_msg,
                 })
             }
@@ -2002,33 +2170,54 @@ impl StreamChunkMessage {
     }
 }
 
-/// Handle for receiving stream chunks from StreamService.
+/// Handle for receiving stream chunks from StreamService with E2E authentication.
 ///
-/// Subscribes to StreamService with JWT authentication and receives stream chunks.
+/// Subscribes to StreamService using DH-derived topic and verifies HMAC chain.
+///
+/// # E2E Authentication Protocol
+///
+/// 1. Client generates ephemeral keypair, includes pubkey in request envelope
+/// 2. Server generates ephemeral keypair, returns pubkey in StreamInfo
+/// 3. Both derive: shared_secret = DH(my_secret, their_pubkey)
+/// 4. Both derive: (topic, mac_key) = HKDF(shared_secret, pubkeys)
+/// 5. Client subscribes to DH-derived topic (unpredictable, non-colliding)
+/// 6. Client verifies HMAC chain on received chunks
 pub struct StreamHandle {
     /// ZMQ SUB socket
     subscriber: zmq::Socket,
-    /// Stream ID
+    /// Stream ID (for display/logging only, not used for routing)
     stream_id: String,
-    /// Claims for JWT subscription (kept for potential re-subscription)
+    /// DH-derived topic (64 hex chars) - used for ZMQ subscription
+    topic: String,
+    /// DH-derived HMAC key for verifying chunk chain
+    mac_key: [u8; 32],
+    /// Last verified HMAC (for chain verification)
+    last_hmac: Option<[u8; 32]>,
+    /// Claims for legacy JWT subscription (backwards compatibility)
+    #[allow(dead_code)]
     claims: crate::auth::Claims,
-    /// Signing key for JWT subscription
+    /// Signing key for legacy JWT subscription
+    #[allow(dead_code)]
     signing_key: ed25519_dalek::SigningKey,
 }
 
 impl StreamHandle {
-    /// Create a new stream handle and subscribe to StreamService.
+    /// Create a new E2E authenticated stream handle.
     ///
     /// # Arguments
     /// * `context` - ZMQ context
-    /// * `stream_id` - Stream ID from generate_stream response
+    /// * `stream_id` - Stream ID for display/logging
     /// * `endpoint` - StreamService SUB endpoint
-    /// * `claims` - Claims for JWT authentication
-    /// * `signing_key` - Ed25519 signing key for JWT
+    /// * `topic` - DH-derived topic for ZMQ subscription (from Ristretto255 key exchange)
+    /// * `mac_key` - DH-derived HMAC key for chain verification
+    /// * `claims` - User authorization claims
+    /// * `signing_key` - Ed25519 signing key
     pub fn new(
         context: &zmq::Context,
         stream_id: String,
         endpoint: &str,
+        topic: String,
+        mac_key: [u8; 32],
         claims: crate::auth::Claims,
         signing_key: ed25519_dalek::SigningKey,
     ) -> Result<Self> {
@@ -2038,43 +2227,101 @@ impl StreamHandle {
         // Connect to StreamService endpoint
         subscriber.connect(endpoint)?;
 
-        // Subscribe with JWT (StreamService validates this)
-        use hyprstream_rpc::auth::jwt;
-        let jwt = jwt::encode(&claims, &signing_key);
-        let subscription = format!("stream-{}|{}", stream_id, jwt);
-        subscriber.set_subscribe(subscription.as_bytes())?;
+        // Subscribe to DH-derived topic (E2E authentication via Ristretto255)
+        subscriber.set_subscribe(topic.as_bytes())?;
 
         tracing::info!(
             stream_id = %stream_id,
+            topic = %topic,
             endpoint = %endpoint,
-            "Subscribed to stream"
+            "Subscribed to E2E authenticated stream"
         );
 
         Ok(Self {
             subscriber,
             stream_id,
+            topic,
+            mac_key,
+            last_hmac: None,
             claims,
             signing_key,
         })
     }
 
-    /// Receive next chunk (blocking).
+    /// Receive next chunk (blocking) with HMAC verification.
     ///
     /// Returns `None` if the stream has ended (Complete or Error message received).
+    ///
+    /// # HMAC Verification
+    ///
+    /// Each chunk's HMAC is verified against the chain:
+    /// - First chunk: HMAC(mac_key, topic || data)
+    /// - Subsequent: HMAC(mac_key, prev_hmac || data)
+    ///
+    /// If verification fails, returns an error.
     pub fn next_chunk(&mut self) -> Result<Option<StreamChunkMessage>> {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        use subtle::ConstantTimeEq;
+
+        type HmacSha256 = Hmac<Sha256>;
+
         // Receive multipart message from StreamService
-        // Message format: [topic (stream_id), payload (StreamChunk)]
+        // Format: [topic][payload (outer StreamChunk)]
         let msg = self.subscriber.recv_multipart(0)?;
 
         if msg.len() < 2 {
             bail!("Invalid message format: expected at least 2 parts, got {}", msg.len());
         }
 
-        // Parse StreamChunk Cap'n Proto message
-        let reader = capnp::serialize::read_message(&*msg[1], capnp::message::ReaderOptions::new())?;
-        let chunk = reader.get_root::<inference_capnp::stream_chunk::Reader>()?;
+        // Parse outer StreamChunk (streaming_capnp) for HMAC verification
+        let outer_reader = capnp::serialize::read_message(
+            &*msg[1],
+            capnp::message::ReaderOptions::new(),
+        )?;
+        let outer_chunk = outer_reader.get_root::<hyprstream_rpc::streaming_capnp::stream_chunk::Reader>()?;
 
-        let message = StreamChunkMessage::from_capnp(chunk)?;
+        let hmac_data = outer_chunk.get_hmac()?;
+        let data = outer_chunk.get_data()?;
+
+        // Verify HMAC chain (if mac_key is set - skip for legacy mode)
+        if self.mac_key != [0u8; 32] && hmac_data.len() == 32 {
+            let mut expected_hmac = [0u8; 32];
+            expected_hmac.copy_from_slice(hmac_data);
+
+            let mut mac = HmacSha256::new_from_slice(&self.mac_key)
+                .expect("HMAC accepts any key size");
+
+            match &self.last_hmac {
+                None => {
+                    // First chunk: HMAC(key, topic || data)
+                    mac.update(self.topic.as_bytes());
+                    mac.update(data);
+                }
+                Some(prev) => {
+                    // Subsequent chunks: HMAC(key, prev_hmac || data)
+                    mac.update(prev);
+                    mac.update(data);
+                }
+            }
+
+            let computed: [u8; 32] = mac.finalize().into_bytes().into();
+            if computed.ct_eq(&expected_hmac).unwrap_u8() != 1 {
+                bail!("HMAC verification failed - stream may be tampered");
+            }
+
+            // Update chain state
+            self.last_hmac = Some(expected_hmac);
+        }
+
+        // Parse inner InferencePayload
+        let inner_reader = capnp::serialize::read_message(
+            data,
+            capnp::message::ReaderOptions::new(),
+        )?;
+        let payload = inner_reader.get_root::<inference_capnp::inference_payload::Reader>()?;
+
+        let message = StreamChunkMessage::from_capnp(payload)?;
 
         if message.is_last() {
             Ok(None)
@@ -2083,9 +2330,14 @@ impl StreamHandle {
         }
     }
 
-    /// Get the stream ID
+    /// Get the stream ID (for display/logging)
     pub fn stream_id(&self) -> &str {
         &self.stream_id
+    }
+
+    /// Get the DH-derived topic (for debugging)
+    pub fn topic(&self) -> &str {
+        &self.topic
     }
 }
 

@@ -2,11 +2,11 @@
 
 use crate::config::GenerationRequest;
 use crate::inference_capnp;
+use hyprstream_rpc::streaming_capnp;
 use crate::api::openai_compat::ChatMessage;
-use crate::runtime::RuntimeConfig;
 use crate::services::ModelZmqClient;
 use crate::zmq::global_context;
-use crate::storage::{CheckoutOptions, GitRef, ModelRef, ModelStorage};
+use crate::storage::{CheckoutOptions, ModelRef, ModelStorage};
 use anyhow::{bail, Result};
 use capnp::message::ReaderOptions;
 use capnp::serialize;
@@ -1112,10 +1112,30 @@ pub async fn handle_infer(
 
     // Generate via ModelService (handles model loading, adapter loading, training collection, auth)
     if stream {
-        // Streaming via ZMQ pub/sub
-        // Authorization is automatic - AUTHORIZE message sent during infer_stream
-        let (stream_id, _endpoint) = model_client.infer_stream(model_ref_str, &request).await?;
-        info!("Streaming started: stream_id={}", stream_id);
+        // E2E authenticated streaming via Ristretto255 DH key exchange
+        use hyprstream_rpc::crypto::{
+            derive_stream_keys, generate_ephemeral_keypair, ristretto_dh, RistrettoPublic,
+        };
+
+        // Generate client ephemeral Ristretto255 keypair for DH
+        let (client_secret, client_pubkey) = generate_ephemeral_keypair();
+        let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
+
+        // Start stream with client ephemeral pubkey
+        let stream_info = model_client.infer_stream(model_ref_str, &request, client_pubkey_bytes).await?;
+        let stream_id = stream_info.stream_id;
+        let server_pubkey = RistrettoPublic::from_bytes(&stream_info.server_pubkey)
+            .ok_or_else(|| anyhow::anyhow!("Invalid server Ristretto public key encoding"))?;
+
+        // Derive stream keys using Ristretto255 DH
+        let shared_secret = ristretto_dh(&client_secret, &server_pubkey);
+        let keys = derive_stream_keys(
+            &shared_secret,
+            &client_pubkey_bytes,
+            &stream_info.server_pubkey,
+        )?;
+
+        info!("Streaming started: stream_id={}, topic={}", stream_id, &keys.topic[..16]);
 
         // Get StreamService endpoint from registry
         let stream_sub_endpoint = hyprstream_rpc::registry::global()
@@ -1128,9 +1148,9 @@ pub async fn handle_infer(
         let subscriber = ctx.socket(zmq::SUB)?;
         subscriber.connect(&stream_sub_endpoint)?;
 
-        // Subscribe with just the stream_id topic
+        // Subscribe to DH-derived topic (64 hex chars)
         // Stream was pre-authorized during infer_stream, so we can subscribe immediately
-        subscriber.set_subscribe(stream_id.as_bytes())?;
+        subscriber.set_subscribe(keys.topic.as_bytes())?;
         subscriber.set_rcvtimeo(30000)?; // 30s timeout
 
         info!("Subscribed to stream via StreamService");
@@ -1140,15 +1160,16 @@ pub async fn handle_infer(
             match subscriber.recv_bytes(0) {
                 Ok(msg) => {
                     // Message format: topic_bytes + capnp_bytes
-                    // Topic is the stream_id, followed by Cap'n Proto StreamChunk
-                    let topic_len = stream_id.as_bytes().len();
+                    // Topic is DH-derived (64 hex chars), followed by Cap'n Proto StreamChunk
+                    // StreamChunk.data contains serialized InferencePayload
+                    let topic_len = keys.topic.len();  // 64 bytes
                     if msg.len() <= topic_len {
                         continue; // Too short, skip
                     }
 
-                    // Parse Cap'n Proto StreamChunk after the topic prefix
+                    // Parse outer streaming_capnp::StreamChunk (wire format with HMAC)
                     let chunk_bytes = &msg[topic_len..];
-                    let reader = match serialize::read_message(
+                    let outer_reader = match serialize::read_message(
                         &mut std::io::Cursor::new(chunk_bytes),
                         ReaderOptions::default(),
                     ) {
@@ -1159,7 +1180,7 @@ pub async fn handle_infer(
                         }
                     };
 
-                    let chunk = match reader.get_root::<inference_capnp::stream_chunk::Reader>() {
+                    let outer_chunk = match outer_reader.get_root::<streaming_capnp::stream_chunk::Reader>() {
                         Ok(c) => c,
                         Err(e) => {
                             warn!("Failed to get stream chunk root: {}", e);
@@ -1167,11 +1188,40 @@ pub async fn handle_infer(
                         }
                     };
 
+                    // Extract inner payload data from StreamChunk.data
+                    let inner_data = match outer_chunk.get_data() {
+                        Ok(d) => d,
+                        Err(e) => {
+                            warn!("Failed to get stream chunk data: {}", e);
+                            continue;
+                        }
+                    };
+
+                    // Parse inner inference_capnp::InferencePayload
+                    let inner_reader = match serialize::read_message(
+                        &mut std::io::Cursor::new(inner_data),
+                        ReaderOptions::default(),
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!("Failed to parse inference payload: {}", e);
+                            continue;
+                        }
+                    };
+
+                    let payload = match inner_reader.get_root::<inference_capnp::inference_payload::Reader>() {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!("Failed to get inference payload root: {}", e);
+                            continue;
+                        }
+                    };
+
                     // Handle the union variant
-                    use inference_capnp::stream_chunk::Which;
-                    match chunk.which() {
-                        Ok(Which::Text(text)) => {
-                            if let Ok(t) = text {
+                    use inference_capnp::inference_payload::Which;
+                    match payload.which() {
+                        Ok(Which::Token(token)) => {
+                            if let Ok(t) = token {
                                 print!("{}", t.to_str().unwrap_or(""));
                                 let _ = io::stdout().flush();
                             }
@@ -1189,7 +1239,7 @@ pub async fn handle_infer(
                             break;
                         }
                         Err(e) => {
-                            warn!("Failed to parse chunk variant: {:?}", e);
+                            warn!("Failed to parse payload variant: {:?}", e);
                             continue;
                         }
                     }

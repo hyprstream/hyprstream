@@ -47,7 +47,7 @@ pub use worker_handlers::{
     handle_images_df, handle_images_list, handle_images_pull, handle_images_rm,
     handle_worker_exec, handle_worker_list, handle_worker_restart, handle_worker_rm,
     handle_worker_run, handle_worker_start, handle_worker_stats, handle_worker_status,
-    handle_worker_stop,
+    handle_worker_stop, handle_worker_terminal,
 };
 
 /// Device preference strategy

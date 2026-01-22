@@ -1340,17 +1340,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bstr"
-version = "1.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63044e1ae8e69f3b5a92c736ca6269b8d12fa7efe39bf34ddb06d102cf0e2cab"
-dependencies = [
- "memchr",
- "regex-automata",
- "serde",
-]
-
-[[package]]
 name = "build-env"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1555,7 +1544,7 @@ dependencies = [
  "more-asserts",
  "progress_tracking",
  "rand 0.9.2",
- "reqwest 0.12.23",
+ "reqwest 0.12.28",
  "reqwest-middleware",
  "reqwest-retry",
  "serde",
@@ -1915,7 +1904,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "117725a109d387c937a1533ce01b450cbde6b88abceea8473c4d7a85853cda3c"
 dependencies = [
  "lazy_static",
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -2450,6 +2439,7 @@ dependencies = [
  "curve25519-dalek-derive",
  "digest 0.10.7",
  "fiat-crypto",
+ "rand_core 0.6.4",
  "rustc_version",
  "subtle",
  "zeroize",
@@ -2690,7 +2680,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d162beedaa69905488a8da94f5ac3edb4dd4788b732fadb7bd120b2625c1976"
 dependencies = [
  "data-encoding",
- "syn 2.0.111",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -4794,94 +4784,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gix-attributes"
-version = "0.25.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4e25825e0430aa11096f8b65ced6780d4a96a133f81904edceebb5344c8dd7f"
-dependencies = [
- "bstr",
- "gix-glob",
- "gix-path",
- "gix-quote",
- "gix-trace",
- "kstring",
- "smallvec",
- "thiserror 2.0.17",
- "unicode-bom",
-]
-
-[[package]]
-name = "gix-features"
-version = "0.41.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "016d6050219458d14520fe22bdfdeb9cb71631dec9bc2724767c983f60109634"
-dependencies = [
- "gix-trace",
- "libc",
-]
-
-[[package]]
-name = "gix-glob"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20972499c03473e773a2099e5fd0c695b9b72465837797a51a43391a1635a030"
-dependencies = [
- "bitflags 2.9.4",
- "bstr",
- "gix-features",
- "gix-path",
-]
-
-[[package]]
-name = "gix-path"
-version = "0.10.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cb06c3e4f8eed6e24fd915fa93145e28a511f4ea0e768bae16673e05ed3f366"
-dependencies = [
- "bstr",
- "gix-trace",
- "gix-validate",
- "thiserror 2.0.17",
-]
-
-[[package]]
-name = "gix-quote"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b005c550bf84de3b24aa5e540a23e6146a1c01c7d30470e35d75a12f827f969"
-dependencies = [
- "bstr",
- "gix-utils",
- "thiserror 2.0.17",
-]
-
-[[package]]
-name = "gix-trace"
-version = "0.1.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e42a4c2583357721ba2d887916e78df504980f22f1182df06997ce197b89504"
-
-[[package]]
-name = "gix-utils"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "189f8724cf903e7fd57cfe0b7bc209db255cacdcb22c781a022f52c3a774f8d0"
-dependencies = [
- "fastrand 2.3.0",
- "unicode-normalization",
-]
-
-[[package]]
-name = "gix-validate"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b1e63a5b516e970a594f870ed4571a8fdcb8a344e7bd407a20db8bd61dbfde4"
-dependencies = [
- "bstr",
- "thiserror 2.0.17",
-]
-
-[[package]]
 name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5283,7 +5185,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "cas_client",
- "reqwest 0.12.23",
+ "reqwest 0.12.28",
  "reqwest-middleware",
  "serde",
  "thiserror 2.0.17",
@@ -5402,6 +5304,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-tls"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70206fc6890eaca9fde8a0bf71caa2ddfc9fe045ac9e5c70df101a7dbde866e0"
+dependencies = [
+ "bytes",
+ "http-body-util",
+ "hyper 1.7.0",
+ "hyper-util",
+ "native-tls",
+ "tokio",
+ "tokio-native-tls",
+ "tower-service",
+]
+
+[[package]]
 name = "hyper-util"
 version = "0.1.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5419,7 +5337,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.0",
+ "socket2 0.5.10",
  "system-configuration 0.6.1",
  "tokio",
  "tower-service",
@@ -5515,6 +5433,7 @@ dependencies = [
  "clap",
  "config 0.13.4",
  "criterion",
+ "curve25519-dalek",
  "cxx",
  "cxx-build",
  "daemonize",
@@ -5531,6 +5450,8 @@ dependencies = [
  "glob",
  "half",
  "hex",
+ "hkdf",
+ "hmac 0.12.1",
  "hyprstream-flight",
  "hyprstream-metrics",
  "hyprstream-rpc",
@@ -5575,6 +5496,7 @@ dependencies = [
  "sha2 0.10.9",
  "shellexpand",
  "sqlparser 0.39.0",
+ "subtle",
  "tch",
  "tempfile",
  "thiserror 1.0.69",
@@ -5688,6 +5610,7 @@ dependencies = [
  "capnp",
  "capnpc",
  "chrono",
+ "curve25519-dalek",
  "dashmap",
  "dirs 5.0.1",
  "ed25519-dalek",
@@ -5714,7 +5637,6 @@ dependencies = [
  "uuid 1.18.1",
  "which 7.0.3",
  "whoami",
- "x25519-dalek",
  "zbus_systemd",
  "zeroize",
  "zmq",
@@ -5753,11 +5675,8 @@ dependencies = [
  "kata-types",
  "nix 0.27.1",
  "nydus-api 0.4.0",
- "nydus-builder",
- "nydus-rafs 0.4.0",
  "nydus-service",
  "nydus-storage 0.7.1",
- "nydus-utils 0.5.0",
  "parking_lot 0.12.4",
  "reqwest 0.11.27",
  "serde",
@@ -6286,15 +6205,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00af7901ba50898c9e545c24d5c580c96a982298134e8037d8978b6594782c07"
 
 [[package]]
-name = "kstring"
-version = "2.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "558bf9508a558512042d3095138b1f7b8fe90c5467d94f9f1da28b3731c5dbd1"
-dependencies = [
- "static_assertions",
-]
-
-[[package]]
 name = "kvm-bindings"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6422,7 +6332,7 @@ dependencies = [
  "cc",
  "flate2",
  "pkg-config",
- "reqwest 0.12.23",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tar",
@@ -6451,7 +6361,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07033963ba89ebaf1584d767badaa2e8fcec21aedea6b8c0346d487d49c28667"
 dependencies = [
  "cfg-if 1.0.3",
- "windows-targets 0.53.3",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -7852,6 +7762,7 @@ dependencies = [
 [[package]]
 name = "nydus-api"
 version = "0.4.0"
+source = "git+https://github.com/dragonflyoss/nydus?tag=v2.4.0#5a9d42d8b5cae5052b678ce324d79098f8ae19c1"
 dependencies = [
  "libc",
  "log",
@@ -7859,31 +7770,6 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "toml 0.5.11",
-]
-
-[[package]]
-name = "nydus-builder"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "base64 0.21.7",
- "gix-attributes",
- "hex",
- "indexmap 2.12.1",
- "libc",
- "log",
- "nix 0.24.3",
- "nydus-api 0.4.0",
- "nydus-rafs 0.4.0",
- "nydus-storage 0.7.1",
- "nydus-utils 0.5.0",
- "parse-size",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tar",
- "vmm-sys-util 0.12.1",
- "xattr",
 ]
 
 [[package]]
@@ -7911,6 +7797,7 @@ dependencies = [
 [[package]]
 name = "nydus-rafs"
 version = "0.4.0"
+source = "git+https://github.com/dragonflyoss/nydus?tag=v2.4.0#5a9d42d8b5cae5052b678ce324d79098f8ae19c1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -7932,6 +7819,7 @@ dependencies = [
 [[package]]
 name = "nydus-service"
 version = "0.4.0"
+source = "git+https://github.com/dragonflyoss/nydus?tag=v2.4.0#5a9d42d8b5cae5052b678ce324d79098f8ae19c1"
 dependencies = [
  "fuse-backend-rs 0.13.1",
  "libc",
@@ -7986,6 +7874,7 @@ dependencies = [
 [[package]]
 name = "nydus-storage"
 version = "0.7.1"
+source = "git+https://github.com/dragonflyoss/nydus?tag=v2.4.0#5a9d42d8b5cae5052b678ce324d79098f8ae19c1"
 dependencies = [
  "arc-swap",
  "base64 0.21.7",
@@ -7998,7 +7887,7 @@ dependencies = [
  "nix 0.24.3",
  "nydus-api 0.4.0",
  "nydus-utils 0.5.0",
- "reqwest 0.11.27",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tar",
@@ -8010,6 +7899,7 @@ dependencies = [
 [[package]]
 name = "nydus-upgrade"
 version = "0.2.0"
+source = "git+https://github.com/dragonflyoss/nydus?tag=v2.4.0#5a9d42d8b5cae5052b678ce324d79098f8ae19c1"
 dependencies = [
  "dbs-snapshot",
  "sendfd",
@@ -8046,6 +7936,7 @@ dependencies = [
 [[package]]
 name = "nydus-utils"
 version = "0.5.0"
+source = "git+https://github.com/dragonflyoss/nydus?tag=v2.4.0#5a9d42d8b5cae5052b678ce324d79098f8ae19c1"
 dependencies = [
  "blake3",
  "crc",
@@ -8261,7 +8152,7 @@ dependencies = [
  "bytes",
  "http 1.3.1",
  "opentelemetry",
- "reqwest 0.12.23",
+ "reqwest 0.12.28",
 ]
 
 [[package]]
@@ -8276,7 +8167,7 @@ dependencies = [
  "opentelemetry-proto",
  "opentelemetry_sdk",
  "prost 0.13.5",
- "reqwest 0.12.23",
+ "reqwest 0.12.28",
  "thiserror 2.0.17",
  "tokio",
  "tonic 0.13.1",
@@ -8528,12 +8419,6 @@ dependencies = [
  "twox-hash",
  "zstd 0.13.3",
 ]
-
-[[package]]
-name = "parse-size"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "487f2ccd1e17ce8c1bfab3a65c89525af41cfad4c8659021a1e9a2aacd73b89b"
 
 [[package]]
 name = "password-hash"
@@ -9995,7 +9880,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls 0.23.31",
- "socket2 0.6.0",
+ "socket2 0.5.10",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -10032,7 +9917,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.0",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -10351,7 +10236,7 @@ dependencies = [
  "http-body 0.4.6",
  "hyper 0.14.32",
  "hyper-rustls 0.24.2",
- "hyper-tls",
+ "hyper-tls 0.5.0",
  "ipnet",
  "js-sys",
  "log",
@@ -10383,23 +10268,28 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.12.23"
+version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d429f34c8092b2d42c7c93cec323bb4adeb7c67698f70839adec842ec10c7ceb"
+checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "encoding_rs",
  "futures-channel",
  "futures-core",
  "futures-util",
+ "h2 0.4.12",
  "http 1.3.1",
  "http-body 1.0.1",
  "http-body-util",
  "hyper 1.7.0",
  "hyper-rustls 0.27.7",
+ "hyper-tls 0.6.0",
  "hyper-util",
  "js-sys",
  "log",
+ "mime",
+ "native-tls",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -10411,6 +10301,7 @@ dependencies = [
  "serde_urlencoded",
  "sync_wrapper 1.0.2",
  "tokio",
+ "tokio-native-tls",
  "tokio-rustls 0.26.2",
  "tokio-util",
  "tower 0.5.2",
@@ -10433,7 +10324,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "http 1.3.1",
- "reqwest 0.12.23",
+ "reqwest 0.12.28",
  "serde",
  "thiserror 1.0.69",
  "tower-service",
@@ -10452,7 +10343,7 @@ dependencies = [
  "http 1.3.1",
  "hyper 1.7.0",
  "parking_lot 0.11.2",
- "reqwest 0.12.23",
+ "reqwest 0.12.28",
  "reqwest-middleware",
  "retry-policies",
  "thiserror 1.0.69",
@@ -12786,9 +12677,9 @@ dependencies = [
 
 [[package]]
 name = "tower-http"
-version = "0.6.6"
+version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adc82fd73de2a9722ac5da747f12383d2bfdb93591ee6c58486e0097890f05f2"
+checksum = "d4e6559d53cc268e5031cd8429d05415bc4cb4aefc4aa5d6cc35fbf5b924a1f8"
 dependencies = [
  "bitflags 2.9.4",
  "bytes",
@@ -13081,25 +12972,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75b844d17643ee918803943289730bec8aac480150456169e647ed0b576ba539"
 
 [[package]]
-name = "unicode-bom"
-version = "2.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7eec5d1121208364f6793f7d2e222bf75a915c19557537745b195b253dd64217"
-
-[[package]]
 name = "unicode-ident"
 version = "1.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adb9e6ca4f869e1180728b7950e35922a7fc6397f7b641499e8f3ef06e50dc83"
-
-[[package]]
-name = "unicode-normalization"
-version = "0.1.25"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
-dependencies = [
- "tinyvec",
-]
 
 [[package]]
 name = "unicode-normalization-alignments"
@@ -13372,7 +13248,7 @@ dependencies = [
  "kvm-ioctls 0.24.0",
  "libc",
  "log",
- "thiserror 2.0.17",
+ "thiserror 1.0.69",
  "vfio-bindings 0.6.1",
  "vm-memory 0.14.1",
  "vmm-sys-util 0.15.0",
@@ -13826,7 +13702,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -14478,7 +14354,7 @@ dependencies = [
  "error_printer",
  "libc",
  "oneshot",
- "reqwest 0.12.23",
+ "reqwest 0.12.28",
  "thiserror 2.0.17",
  "tokio",
  "tracing",

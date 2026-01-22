@@ -271,7 +271,7 @@ pub struct RequestEnvelope {
     /// Serialized inner request (e.g., RegistryRequest, InferenceRequest)
     pub payload: Vec<u8>,
 
-    /// X25519/P-256 ephemeral public key for stream HMAC key derivation (optional)
+    /// Ristretto255/P-256 ephemeral public key for stream HMAC key derivation (optional)
     pub ephemeral_pubkey: Option<[u8; 32]>,
 
     /// Random nonce for replay protection (16 bytes)

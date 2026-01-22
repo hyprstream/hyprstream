@@ -163,12 +163,12 @@ whoami = "1.5"  # OS username detection
 # Cryptography (for signed envelopes, DH key exchange, stream HMAC)
 base64 = "0.22"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+curve25519-dalek = { version = "4", features = ["rand_core"] }  # Ristretto255 DH for stream authentication
 hkdf = "0.12"
 hmac = "0.12"
 zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
-p256 = "0.13"  # FIPS mode alternative to X25519
+p256 = "0.13"  # FIPS mode alternative
 
 # Dev dependencies
 proptest = "1.0"

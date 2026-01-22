@@ -37,7 +37,7 @@ use hyprstream_rpc::service::spawner::Spawnable;
 use hyprstream_rpc::transport::TransportConfig;
 use std::sync::Arc;
 use tokio::sync::Notify;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// Service name for registry and logging
 pub const SERVICE_NAME: &str = "flight";
@@ -64,6 +64,7 @@ pub struct FlightService {
     control_transport: TransportConfig,
 
     /// Verifying key for envelope verification
+    #[allow(dead_code)]
     verifying_key: VerifyingKey,
 }
 

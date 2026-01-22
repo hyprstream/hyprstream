@@ -48,6 +48,7 @@ impl SystemdManager {
         })
     }
 
+    #[allow(dead_code)]
     fn socket_unit(service: &str) -> String {
         format!("hyprstream-{}.socket", service)
     }
