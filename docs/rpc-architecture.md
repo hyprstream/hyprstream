@@ -297,14 +297,13 @@ InferenceService                StreamService                     Client
 - StreamService removes entry on unsubscribe (0x00) to prevent memory leaks
 - Periodic compact() removes entries when `claims.exp` passes
 
-#### Complete Documentation
+#### Related Documentation
 
-For full implementation details, security analysis, and architectural decisions:
+For implementation details and security analysis:
 
-- **Main Plan:** `/home/birdetta/.claude/plans/pure-moseying-wand.md` (2,305 lines)
 - **Security Hardening:** `docs/security-hardening-scopes-validation.md` (structured scopes)
-- **Canonical Serialization Fix:** `docs/canonical-serialization-security-fix.md` (CRITICAL)
-- **Documentation Index:** `docs/JWT-AUTHORIZATION-INDEX.md` (navigation hub)
+- **Canonical Serialization:** `docs/canonical-serialization-security-fix.md` (deterministic signatures)
+- **JWT Authorization Index:** `docs/JWT-AUTHORIZATION-INDEX.md` (navigation hub)
 
 ## Service Spawning Architecture
 

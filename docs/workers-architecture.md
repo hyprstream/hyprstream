@@ -95,9 +95,8 @@ crates/hyprstream-workers/
 │       ├── policy.rs             # Resource access control
 │       └── protocol.rs           # D-Bus request/response protocol
 │
-└── cloud-init/                   # VM bootstrap templates
-    ├── user-data.template
-    └── meta-data.template
+└── schema/
+    └── workers.capnp             # CRI-aligned service definitions
 ```
 
 ## Services
@@ -504,14 +503,17 @@ Guest agent communication (vsock + CURVE) is deferred to a future phase.
 ## Dependencies
 
 ```toml
-# OCI registry client
-oci-distribution = "0.11"
+# Nydus libraries (Dragonfly-native blob fetching)
+# Using git deps because published crates.io versions have API mismatch
+nydus-api = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0" }
+nydus-storage = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0", features = ["backend-registry", "backend-localfs"] }
+nydus-service = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0" }
 
-# Nydus (library mode)
-nydus-storage = { git = "https://github.com/dragonflyoss/nydus" }
-nydus-rafs = { git = "https://github.com/dragonflyoss/nydus" }
-nydus-service = { git = "https://github.com/dragonflyoss/nydus" }
-nydus-api = { git = "https://github.com/dragonflyoss/nydus" }
+# Kata Containers runtime-rs (hypervisor abstraction)
+kata-hypervisor = { git = "https://github.com/kata-containers/kata-containers", tag = "3.25.0", package = "hypervisor", features = ["cloud-hypervisor"] }
+kata-types = { git = "https://github.com/kata-containers/kata-containers", tag = "3.25.0" }
+kata-sys-util = { git = "https://github.com/kata-containers/kata-containers", tag = "3.25.0" }
+ch-config = { git = "https://github.com/kata-containers/kata-containers", tag = "3.25.0" }
 ```
 
 ## Implementation Phases
