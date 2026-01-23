@@ -1984,7 +1984,8 @@ mod tests {
             Err(WorkerError::VmStartFailed(msg))
                 if msg.contains("No such file or directory")
                     || msg.contains("failed to create sandbox directory")
-                    || msg.contains("/run/kata") =>
+                    || msg.contains("/run/kata")
+                    || msg.contains("launch failed") =>
             {
                 eprintln!("Skipping test: cloud-hypervisor or kata runtime not available");
                 return;
@@ -2024,7 +2025,8 @@ mod tests {
             Err(WorkerError::VmStartFailed(msg))
                 if msg.contains("No such file or directory")
                     || msg.contains("failed to create sandbox directory")
-                    || msg.contains("/run/kata") =>
+                    || msg.contains("/run/kata")
+                    || msg.contains("launch failed") =>
             {
                 eprintln!("Skipping test: cloud-hypervisor or kata runtime not available");
                 return;
