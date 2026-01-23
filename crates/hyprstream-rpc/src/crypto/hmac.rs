@@ -1,35 +1,37 @@
-//! Chained HMAC-SHA256 for streaming response authentication.
+//! Chained MAC for streaming response authentication.
 //!
-//! Streaming responses (XPUB/XSUB) use HMAC instead of per-token Ed25519
+//! Streaming responses (XPUB/XSUB) use chained MACs instead of per-token Ed25519
 //! signatures for performance reasons:
 //! - Ed25519: ~10k signatures/sec
-//! - HMAC-SHA256: millions of MACs/sec
+//! - Blake3/HMAC-SHA256: millions of MACs/sec
 //!
-//! # Chained HMAC Design
+//! # Chained MAC Design
 //!
-//! Instead of explicit sequence numbers, we use chained HMACs where each
-//! chunk's HMAC depends on the previous chunk's HMAC:
+//! Instead of explicit sequence numbers, we use chained MACs where each
+//! chunk's MAC depends on the previous chunk's MAC:
 //!
 //! ```text
-//! mac_0 = HMAC(key, request_id_bytes || data_0)  // First chunk: prev = request_id
-//! mac_n = HMAC(key, mac_{n-1} || data_n)         // Subsequent chunks
+//! mac_0 = MAC(key, request_id_bytes || data_0)  // First chunk: prev = request_id
+//! mac_n = MAC(key, mac_{n-1} || data_n)         // Subsequent chunks
 //! ```
 //!
 //! # Security Properties
 //!
 //! - Authenticates server as holder of the DH shared secret
-//! - Chained HMAC provides cryptographic ordering (no separate sequence field)
+//! - Chained MAC provides cryptographic ordering (no separate sequence field)
 //! - Reordering is impossible - can't verify chunk N without mac_{N-1}
 //! - Request ID binds chunks to their request
 //! - TCP/ZMQ provides transport-level ordering (defense in depth)
+//!
+//! # Backend
+//!
+//! - Default: Blake3 `keyed_hash()` (~10+ GB/s with SIMD)
+//! - FIPS mode: HMAC-SHA256 (FIPS 198-1)
 
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
+use super::backend::keyed_mac;
 use crate::error::{EnvelopeError, EnvelopeResult};
-
-type HmacSha256 = Hmac<Sha256>;
 
 /// HMAC key derived from DH shared secret.
 #[derive(Clone)]
@@ -98,7 +100,7 @@ impl ChainedStreamHmac {
         Self::new(HmacKey::new(key_bytes), request_id)
     }
 
-    /// Compute HMAC for the next chunk in the stream.
+    /// Compute MAC for the next chunk in the stream.
     ///
     /// The MAC covers: `prev_mac || data`
     ///
@@ -110,20 +112,15 @@ impl ChainedStreamHmac {
     ///
     /// # Returns
     ///
-    /// 32-byte HMAC-SHA256 tag
+    /// 32-byte MAC tag (Blake3 keyed_hash or HMAC-SHA256 depending on feature flags)
     pub fn compute_next(&mut self, data: &[u8]) -> [u8; 32] {
-        // SAFETY: Per RFC 2104, HMAC accepts keys of any size (keys > block size are hashed first)
-        // HmacSha256::new_from_slice only fails for InvalidLength, which can't happen with any &[u8]
-        let mut mac = HmacSha256::new_from_slice(self.key.as_bytes())
-            .unwrap_or_else(|_| HmacSha256::new_from_slice(&[0u8; 32]).unwrap());
+        // Build input: prev_mac || data
+        let mut input = Vec::with_capacity(32 + data.len());
+        input.extend_from_slice(&self.prev_mac);
+        input.extend_from_slice(data);
 
-        // Chain: HMAC(key, prev_mac || data)
-        mac.update(&self.prev_mac);
-        mac.update(data);
-
-        let result = mac.finalize();
-        let mut output = [0u8; 32];
-        output.copy_from_slice(&result.into_bytes());
+        // Compute MAC using backend (Blake3 or HMAC-SHA256)
+        let output = keyed_mac(self.key.as_bytes(), &input);
 
         // Update chain state
         self.prev_mac = output;
@@ -161,17 +158,13 @@ impl ChainedStreamHmac {
     ///
     /// Useful for verification where we don't want to update state on failure.
     fn compute_next_peek(&self, data: &[u8]) -> [u8; 32] {
-        // SAFETY: Per RFC 2104, HMAC accepts keys of any size
-        let mut mac = HmacSha256::new_from_slice(self.key.as_bytes())
-            .unwrap_or_else(|_| HmacSha256::new_from_slice(&[0u8; 32]).unwrap());
+        // Build input: prev_mac || data
+        let mut input = Vec::with_capacity(32 + data.len());
+        input.extend_from_slice(&self.prev_mac);
+        input.extend_from_slice(data);
 
-        mac.update(&self.prev_mac);
-        mac.update(data);
-
-        let result = mac.finalize();
-        let mut output = [0u8; 32];
-        output.copy_from_slice(&result.into_bytes());
-        output
+        // Compute MAC using backend (Blake3 or HMAC-SHA256)
+        keyed_mac(self.key.as_bytes(), &input)
     }
 
     /// Get the current chain state (previous MAC).
@@ -200,20 +193,16 @@ impl StreamHmac {
         Self::new(HmacKey::new(bytes))
     }
 
-    /// Compute HMAC for a stream chunk (sequence-based, legacy).
+    /// Compute MAC for a stream chunk (sequence-based, legacy).
     pub fn compute(&self, request_id: u64, sequence: u64, data: &[u8]) -> [u8; 32] {
-        // SAFETY: Per RFC 2104, HMAC accepts keys of any size
-        let mut mac = HmacSha256::new_from_slice(self.key.as_bytes())
-            .unwrap_or_else(|_| HmacSha256::new_from_slice(&[0u8; 32]).unwrap());
+        // Build input: request_id || sequence || data
+        let mut input = Vec::with_capacity(16 + data.len());
+        input.extend_from_slice(&request_id.to_le_bytes());
+        input.extend_from_slice(&sequence.to_le_bytes());
+        input.extend_from_slice(data);
 
-        mac.update(&request_id.to_le_bytes());
-        mac.update(&sequence.to_le_bytes());
-        mac.update(data);
-
-        let result = mac.finalize();
-        let mut output = [0u8; 32];
-        output.copy_from_slice(&result.into_bytes());
-        output
+        // Compute MAC using backend (Blake3 or HMAC-SHA256)
+        keyed_mac(self.key.as_bytes(), &input)
     }
 
     /// Verify HMAC for a stream chunk (sequence-based, legacy).

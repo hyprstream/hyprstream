@@ -168,7 +168,7 @@ hkdf = "0.12"
 hmac = "0.12"
 zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
-p256 = "0.13"  # FIPS mode alternative
+p256 = { version = "0.13", features = ["ecdh"] }  # FIPS mode alternative (P-256 ECDH)
 
 # Dev dependencies
 proptest = "1.0"

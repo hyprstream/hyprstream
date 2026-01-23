@@ -49,12 +49,13 @@ dirs = "5"
 systemd = { version = "0.10", optional = true }
 zbus_systemd = { version = "0.0.11", features = ["login1", "systemd1"], optional = true }
 
-# Cryptography (for signed envelopes, DH key exchange, stream HMAC)
+# Cryptography (for signed envelopes, DH key exchange, stream MAC)
 ed25519-dalek = { workspace = true }
 curve25519-dalek = { workspace = true }  # Ristretto255 DH for stream authentication
-sha2 = { workspace = true }
-hkdf = { workspace = true }
-hmac = { workspace = true }
+sha2 = { workspace = true }              # Always needed for Ed25519 (Sha512)
+blake3 = { workspace = true }            # Default: fast KDF and MAC
+hkdf = { workspace = true, optional = true }   # FIPS mode only
+hmac = { workspace = true, optional = true }   # FIPS mode only
 zeroize = { workspace = true }
 subtle = { workspace = true }
 rand = { workspace = true }
@@ -64,7 +65,7 @@ p256 = { workspace = true, optional = true }
 
 [features]
 default = []
-fips = ["p256"]
+fips = ["p256", "hkdf", "hmac"]  # FIPS mode uses P-256 + HKDF-SHA256 + HMAC-SHA256
 systemd = ["dep:systemd", "dep:zbus_systemd"]
 
 [build-dependencies]

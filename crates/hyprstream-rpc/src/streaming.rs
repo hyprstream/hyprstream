@@ -1,6 +1,6 @@
 //! Generic streaming infrastructure for authenticated PUB/SUB communication.
 //!
-//! This module provides rate-controlled, HMAC-authenticated streaming that works
+//! This module provides rate-controlled, MAC-authenticated streaming that works
 //! for both inference (UTF-8 tokens) and worker I/O (arbitrary binary data).
 //!
 //! # Architecture
@@ -21,28 +21,36 @@
 //! ZMQ Multipart:
 //!   Frame 0: topic (64 hex chars, DH-derived)
 //!   Frame 1: capnp StreamBlock
-//!   Frame 2: mac (16 bytes truncated HMAC-SHA256)
+//!   Frame 2: mac (16 bytes truncated MAC)
 //! ```
 //!
 //! # Security
 //!
 //! - DH key exchange: Ristretto255 ECDH derives topic + mac_key
-//! - HMAC chain: Each block's MAC depends on previous, enforces ordering
+//! - MAC chain: Each block's MAC depends on previous, enforces ordering
 //! - E2E authentication: StreamService is blind forwarder
+//!
+//! # Backend
+//!
+//! - Default: Blake3 `keyed_hash()` (~10+ GB/s with SIMD)
+//! - FIPS mode: HMAC-SHA256 (FIPS 198-1)
 
 use std::collections::VecDeque;
 
 use anyhow::Result;
 use capnp::message::Builder;
 use capnp::serialize;
-use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 
-use crate::crypto::{derive_stream_keys, RistrettoSecret, ristretto_dh};
+use crate::crypto::{derive_stream_keys, keyed_mac_truncated};
+
+// DH key types - Ristretto255 (default) or P-256 (FIPS)
+#[cfg(not(feature = "fips"))]
+use crate::crypto::{ristretto_dh as dh_compute, RistrettoPublic as DhPublic, RistrettoSecret as DhSecret};
+
+#[cfg(feature = "fips")]
+use crate::crypto::{p256_dh as dh_compute, P256PublicKey as DhPublic, P256SecretKey as DhSecret};
 use crate::streaming_capnp;
-
-type HmacSha256 = Hmac<Sha256>;
 
 // ============================================================================
 // Configuration
@@ -150,25 +158,18 @@ impl StreamHmacState {
         }
     }
 
-    /// Compute 16-byte truncated HMAC for next block.
+    /// Compute 16-byte truncated MAC for next block.
     pub fn compute_next(&mut self, capnp_data: &[u8]) -> [u8; 16] {
-        let mut mac = HmacSha256::new_from_slice(&self.key)
-            .expect("HMAC accepts any key size");
-
+        // Build input: (prev_mac or topic) || capnp_data
+        let mut input = Vec::with_capacity(64 + capnp_data.len());
         match &self.prev_mac {
-            None => {
-                mac.update(self.topic.as_bytes());
-                mac.update(capnp_data);
-            }
-            Some(prev) => {
-                mac.update(prev);
-                mac.update(capnp_data);
-            }
+            None => input.extend_from_slice(self.topic.as_bytes()),
+            Some(prev) => input.extend_from_slice(prev),
         }
+        input.extend_from_slice(capnp_data);
 
-        let full_hmac: [u8; 32] = mac.finalize().into_bytes().into();
-        let mut truncated = [0u8; 16];
-        truncated.copy_from_slice(&full_hmac[..16]);
+        // Compute 16-byte truncated MAC using backend
+        let truncated = keyed_mac_truncated(&self.key, &input);
         self.prev_mac = Some(truncated);
         truncated
     }
@@ -265,20 +266,28 @@ impl StreamBuilder {
 
     /// Create with DH key derivation (encapsulated).
     ///
-    /// Performs Ristretto255 DH and derives topic + mac_key internally.
+    /// Performs DH (Ristretto255 or P-256 in FIPS mode) and derives topic + mac_key internally.
+    ///
+    /// # Note
+    ///
+    /// FIPS mode uses P-256 which requires 33-byte compressed public keys.
+    /// Default mode uses Ristretto255 with 32-byte keys.
     pub fn with_dh(
         config: BatchingConfig,
-        server_secret: &RistrettoSecret,
-        client_pubkey: &[u8; 32],
-        server_pubkey: &[u8; 32],
+        server_secret: &DhSecret,
+        client_pubkey: &[u8],
+        server_pubkey: &[u8],
     ) -> Result<Self> {
         // Perform DH
-        let client_pub = crate::crypto::RistrettoPublic::from_bytes(client_pubkey)
+        let client_pub = DhPublic::from_slice(client_pubkey)
             .ok_or_else(|| anyhow::anyhow!("Invalid client public key"))?;
-        let shared_secret = ristretto_dh(server_secret, &client_pub);
+        let shared_secret = dh_compute(server_secret, &client_pub);
 
-        // Derive stream keys
-        let keys = derive_stream_keys(&shared_secret, client_pubkey, server_pubkey)?;
+        // Derive stream keys (needs 32-byte arrays for salt computation)
+        // For non-32-byte keys, hash them to 32 bytes
+        let client_pub_32 = pubkey_to_32(client_pubkey);
+        let server_pub_32 = pubkey_to_32(server_pubkey);
+        let keys = derive_stream_keys(&shared_secret, &client_pub_32, &server_pub_32)?;
 
         Ok(Self::new(config, *keys.mac_key, keys.topic))
     }
@@ -424,21 +433,16 @@ impl StreamVerifier {
         }
 
         // Compute expected MAC
-        let mut mac = HmacSha256::new_from_slice(&self.key)?;
+        let mut input = Vec::with_capacity(64 + capnp_data.len());
         match &self.prev_mac {
-            None => {
-                mac.update(self.topic.as_bytes());
-                mac.update(capnp_data);
-            }
-            Some(prev) => {
-                mac.update(prev);
-                mac.update(capnp_data);
-            }
+            None => input.extend_from_slice(self.topic.as_bytes()),
+            Some(prev) => input.extend_from_slice(prev),
         }
-        let full_hmac: [u8; 32] = mac.finalize().into_bytes().into();
-        let expected_mac = &full_hmac[..16];
+        input.extend_from_slice(capnp_data);
 
-        if !constant_time_eq(received_mac, expected_mac) {
+        let expected_mac = keyed_mac_truncated(&self.key, &input);
+
+        if !constant_time_eq(received_mac, &expected_mac) {
             anyhow::bail!("MAC verification failed");
         }
 
@@ -526,21 +530,28 @@ pub struct StreamHandle {
 
 impl StreamHandle {
     /// Create with DH key derivation (encapsulated).
+    ///
+    /// # Note
+    ///
+    /// FIPS mode uses P-256 which requires 33-byte compressed public keys.
+    /// Default mode uses Ristretto255 with 32-byte keys.
     pub fn new(
         context: &zmq::Context,
         stream_id: String,
         endpoint: &str,
-        server_pubkey: &[u8; 32],
-        client_secret: &RistrettoSecret,
-        client_pubkey: &[u8; 32],
+        server_pubkey: &[u8],
+        client_secret: &DhSecret,
+        client_pubkey: &[u8],
     ) -> Result<Self> {
         // Perform DH
-        let server_pub = crate::crypto::RistrettoPublic::from_bytes(server_pubkey)
+        let server_pub = DhPublic::from_slice(server_pubkey)
             .ok_or_else(|| anyhow::anyhow!("Invalid server public key"))?;
-        let shared_secret = ristretto_dh(client_secret, &server_pub);
+        let shared_secret = dh_compute(client_secret, &server_pub);
 
-        // Derive stream keys
-        let keys = derive_stream_keys(&shared_secret, client_pubkey, server_pubkey)?;
+        // Derive stream keys (needs 32-byte arrays for salt computation)
+        let client_pub_32 = pubkey_to_32(client_pubkey);
+        let server_pub_32 = pubkey_to_32(server_pubkey);
+        let keys = derive_stream_keys(&shared_secret, &client_pub_32, &server_pub_32)?;
 
         // Create subscriber
         let subscriber = context.socket(zmq::SUB)?;
@@ -656,6 +667,21 @@ impl StreamHandle {
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Convert a public key to 32 bytes for derive_stream_keys.
+///
+/// - If 32 bytes: use as-is (Ristretto255)
+/// - If different length: hash with Blake3/SHA-256 to get 32 bytes (P-256)
+fn pubkey_to_32(pubkey: &[u8]) -> [u8; 32] {
+    if pubkey.len() == 32 {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(pubkey);
+        arr
+    } else {
+        // Hash to 32 bytes for non-32-byte keys (P-256 is 33 bytes compressed)
+        crate::crypto::keyed_mac(&[0u8; 32], pubkey)
+    }
+}
 
 /// Constant-time byte slice comparison.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {

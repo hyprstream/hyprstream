@@ -1,7 +1,7 @@
-//! Diffie-Hellman key exchange for stream HMAC key derivation.
+//! Diffie-Hellman key exchange for stream MAC key derivation.
 //!
-//! Streaming responses use HMAC authentication instead of per-token Ed25519
-//! signatures for performance. The HMAC key is derived from a DH shared secret.
+//! Streaming responses use MAC authentication instead of per-token Ed25519
+//! signatures for performance. The MAC key is derived from a DH shared secret.
 //!
 //! # Ristretto255
 //!
@@ -18,19 +18,18 @@
 //! 1. Client generates ephemeral Ristretto keypair
 //! 2. Client includes ephemeral public key in signed RequestEnvelope
 //! 3. Server computes shared secret: `DH(server_secret, client_ephemeral_pubkey)`
-//! 4. Both derive HMAC key: `HKDF(shared_secret, salt=pubkeys_xor, info="mac")`
-//! 5. Server HMACs each stream chunk, client verifies
+//! 4. Both derive MAC key: `KDF(shared_secret || salt, context="mac")`
+//! 5. Server MACs each stream chunk, client verifies
 //!
 //! # Feature Flags
 //!
-//! - Default: Ristretto255 (prime-order group on Curve25519)
-//! - `fips`: ECDH P-256 (NIST curve, SP 800-56A approved)
+//! - Default: Blake3 derive_key + Ristretto255 DH
+//! - `fips`: HKDF-SHA256 + ECDH P-256 (NIST approved)
 
-use hkdf::Hkdf;
-use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
+use super::backend::derive_key;
 use crate::error::{EnvelopeError, EnvelopeResult};
 
 // ============================================================================
@@ -80,10 +79,9 @@ fn is_self_connection(client_pub: &[u8; 32], server_pub: &[u8; 32]) -> bool {
 
 /// Derive stream keys (topic and mac_key) from DH shared secret.
 ///
-/// Uses HKDF-SHA256 with:
-/// - Salt: XOR of client_pub and server_pub (binds both parties)
-/// - IKM: DH shared secret
-/// - Info: "topic" or "mac" for domain separation
+/// Uses the crypto backend (Blake3 or HKDF-SHA256) with:
+/// - IKM: shared_secret || salt (where salt = XOR of client_pub and server_pub)
+/// - Context: "hyprstream stream-keys v1 topic" or "hyprstream stream-keys v1 mac"
 ///
 /// # Arguments
 ///
@@ -104,6 +102,11 @@ fn is_self_connection(client_pub: &[u8; 32], server_pub: &[u8; 32]) -> bool {
 /// - Ristretto255 eliminates low-order point attacks by construction
 /// - XOR salt ensures both parties' keys are bound to the derivation
 /// - Self-connection check prevents replay attacks
+///
+/// # Backend
+///
+/// - Default: Blake3 `derive_key()` (~10+ GB/s with SIMD)
+/// - FIPS mode: HKDF-SHA256 (NIST SP 800-56C)
 pub fn derive_stream_keys(
     shared_secret: &[u8; 32],
     client_pub: &[u8; 32],
@@ -120,26 +123,23 @@ pub fn derive_stream_keys(
         ));
     }
 
-    // XOR public keys for salt
-    // This binds both parties' keys to the derivation
+    // XOR public keys for salt (binds both parties' keys to the derivation)
     let mut salt = [0u8; 32];
     for i in 0..32 {
         salt[i] = client_pub[i] ^ server_pub[i];
     }
 
-    // HKDF-Extract: PRK = HKDF-Extract(salt, IKM)
-    let hk = Hkdf::<Sha256>::new(Some(&salt), shared_secret);
+    // Build IKM: shared_secret || salt
+    let mut ikm = [0u8; 64];
+    ikm[..32].copy_from_slice(shared_secret);
+    ikm[32..64].copy_from_slice(&salt);
 
-    // HKDF-Expand for topic (32 bytes -> 64 hex chars)
-    let mut topic_bytes = [0u8; 32];
-    hk.expand(b"topic", &mut topic_bytes)
-        .expect("32 bytes is valid HKDF-SHA256 output length");
+    // Derive topic (32 bytes -> 64 hex chars)
+    let topic_bytes = derive_key("hyprstream stream-keys v1 topic", &ikm);
     let topic = hex::encode(topic_bytes);
 
-    // HKDF-Expand for mac_key (32 bytes)
-    let mut mac_key = [0u8; 32];
-    hk.expand(b"mac", &mut mac_key)
-        .expect("32 bytes is valid HKDF-SHA256 output length");
+    // Derive mac_key (32 bytes)
+    let mac_key = derive_key("hyprstream stream-keys v1 mac", &ikm);
 
     Ok(StreamKeys::new(topic, mac_key))
 }
@@ -161,21 +161,28 @@ impl SharedSecret {
         &self.0
     }
 
-    /// Derive an HMAC key from this shared secret using HKDF.
+    /// Derive a MAC key from this shared secret using the crypto backend.
     ///
     /// # Arguments
     ///
-    /// * `request_id` - Used as salt for domain separation
+    /// * `request_id` - Used in IKM for domain separation
     /// * `info` - Context info (e.g., "stream-hmac")
+    ///
+    /// # Backend
+    ///
+    /// - Default: Blake3 `derive_key()` with fixed context
+    /// - FIPS mode: HKDF-SHA256
     pub fn derive_hmac_key(&self, request_id: u64, info: &[u8]) -> [u8; 32] {
-        let hk = Hkdf::<Sha256>::new(Some(&request_id.to_le_bytes()), self.as_bytes());
-        let mut okm = [0u8; 32];
-        // SAFETY: HKDF-SHA256 can output up to 255*32=8160 bytes, so 32 is always valid
-        if hk.expand(info, &mut okm).is_err() {
-            // Fallback to zeroed key (should never happen for 32-byte output)
-            okm = [0u8; 32];
-        }
-        okm
+        // Fixed context string (not dynamic for security)
+        const CONTEXT: &str = "hyprstream hmac v1";
+
+        // Build IKM: shared_secret || request_id || info
+        let mut ikm = Vec::with_capacity(40 + info.len());
+        ikm.extend_from_slice(self.as_bytes());
+        ikm.extend_from_slice(&request_id.to_le_bytes());
+        ikm.extend_from_slice(info);
+
+        derive_key(CONTEXT, &ikm)
     }
 }
 
@@ -297,6 +304,20 @@ mod ristretto_impl {
         }
     }
 
+    impl RistrettoPublic {
+        /// Deserialize from a byte slice (must be exactly 32 bytes).
+        ///
+        /// This is a convenience wrapper for streaming that handles &[u8] input.
+        pub fn from_slice(bytes: &[u8]) -> Option<Self> {
+            if bytes.len() != 32 {
+                return None;
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(bytes);
+            Self::from_bytes(&arr)
+        }
+    }
+
     /// Ristretto255 key exchange implementation.
     pub struct RistrettoKeyExchange;
 
@@ -367,7 +388,6 @@ pub use ristretto_impl::{
 mod p256_impl {
     use super::*;
     use p256::{
-        ecdh::EphemeralSecret,
         elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint},
         EncodedPoint, PublicKey, SecretKey,
     };
@@ -386,11 +406,29 @@ mod p256_impl {
     #[derive(Clone)]
     pub struct P256PublicKey(PublicKey);
 
+    impl P256PublicKey {
+        /// Deserialize from a byte slice (33-byte compressed or 65-byte uncompressed).
+        ///
+        /// Note: P-256 keys are NOT compatible with the 32-byte Ristretto format.
+        /// This method returns None for 32-byte inputs.
+        pub fn from_slice(bytes: &[u8]) -> Option<Self> {
+            // P-256 uses SEC1 encoding: 33 bytes compressed, 65 bytes uncompressed
+            // 32-byte inputs are invalid for P-256
+            let point = EncodedPoint::from_bytes(bytes).ok()?;
+            let pubkey: Option<PublicKey> = PublicKey::from_encoded_point(&point).into();
+            pubkey.map(P256PublicKey)
+        }
+
+        /// Serialize to compressed SEC1 format (33 bytes).
+        pub fn to_bytes(&self) -> Vec<u8> {
+            self.0.to_encoded_point(true).as_bytes().to_vec()
+        }
+    }
+
     impl AsRef<[u8]> for P256PublicKey {
         fn as_ref(&self) -> &[u8] {
-            // Return compressed point (33 bytes)
-            // Note: This creates a temporary, which is not ideal
-            // In practice, we'd cache this or use a different approach
+            // Note: This returns an empty slice because we can't return a reference
+            // to temporary data. Use to_bytes() for serialization instead.
             &[]
         }
     }
@@ -444,10 +482,24 @@ mod p256_impl {
     pub fn generate_ephemeral_keypair() -> (P256SecretKey, P256PublicKey) {
         EcdhP256KeyExchange::generate_keypair()
     }
+
+    /// Perform P-256 ECDH and return shared secret bytes.
+    ///
+    /// FIPS-mode equivalent of `ristretto_dh()`.
+    pub fn p256_dh(secret: &P256SecretKey, their_public: &P256PublicKey) -> [u8; 32] {
+        use p256::ecdh::diffie_hellman;
+
+        let shared = diffie_hellman(secret.0.to_nonzero_scalar(), their_public.0.as_affine());
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(shared.raw_secret_bytes());
+        bytes
+    }
 }
 
 #[cfg(feature = "fips")]
-pub use p256_impl::{generate_ephemeral_keypair, EcdhP256KeyExchange, P256PublicKey, P256SecretKey};
+pub use p256_impl::{
+    generate_ephemeral_keypair, p256_dh, EcdhP256KeyExchange, P256PublicKey, P256SecretKey,
+};
 
 // ============================================================================
 // Default Key Exchange Type
