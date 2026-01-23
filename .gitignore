@@ -8,3 +8,11 @@ target
 models
 libtorch
 .cargo
+
+# AppImage build artifacts
+appimage/libtorch-cache/
+appimage/build/
+appimage/output/
+appimage/appimagetool
+*.AppImage
+*.AppDir/

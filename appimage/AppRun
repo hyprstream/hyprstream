@@ -1,0 +1,157 @@
+#!/bin/bash
+# AppRun - Universal hyprstream launcher with automatic GPU backend detection
+# This script detects available GPU hardware and selects the appropriate binary/libraries.
+
+set -euo pipefail
+
+APPDIR="$(dirname "$(readlink -f "$0")")"
+
+# Logging helper (only when HYPRSTREAM_DEBUG is set)
+log_debug() {
+    if [[ -n "${HYPRSTREAM_DEBUG:-}" ]]; then
+        echo "[hyprstream] $*" >&2
+    fi
+}
+
+# Detect the best available GPU backend
+detect_backend() {
+    # Allow user override via environment variable
+    if [[ -n "${HYPRSTREAM_BACKEND:-}" ]]; then
+        log_debug "Using user-specified backend: $HYPRSTREAM_BACKEND"
+        echo "$HYPRSTREAM_BACKEND"
+        return
+    fi
+
+    # Check for NVIDIA GPU
+    if command -v nvidia-smi &>/dev/null; then
+        if nvidia-smi &>/dev/null 2>&1; then
+            # Get driver version to determine CUDA compatibility
+            local driver_version
+            driver_version=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d '[:space:]')
+
+            if [[ -n "$driver_version" ]]; then
+                local major_version="${driver_version%%.*}"
+                log_debug "Detected NVIDIA driver version: $driver_version (major: $major_version)"
+
+                # NVIDIA driver version to CUDA version mapping:
+                # - Driver 555+ supports CUDA 13.0
+                # - Driver 535+ supports CUDA 12.8
+                # - Driver 525+ supports CUDA 12.x
+                if (( major_version >= 555 )); then
+                    log_debug "Selecting CUDA 13.0 backend"
+                    echo "cuda130"
+                else
+                    log_debug "Selecting CUDA 12.8 backend"
+                    echo "cuda128"
+                fi
+                return
+            fi
+        fi
+    fi
+
+    # Check for AMD ROCm
+    if command -v rocm-smi &>/dev/null; then
+        if rocm-smi &>/dev/null 2>&1; then
+            log_debug "Detected AMD ROCm, selecting ROCm 7.1 backend"
+            echo "rocm71"
+            return
+        fi
+    fi
+
+    # Alternative ROCm detection via /opt/rocm
+    if [[ -d /opt/rocm ]] && [[ -x /opt/rocm/bin/rocm-smi ]]; then
+        if /opt/rocm/bin/rocm-smi &>/dev/null 2>&1; then
+            log_debug "Detected AMD ROCm via /opt/rocm, selecting ROCm 7.1 backend"
+            echo "rocm71"
+            return
+        fi
+    fi
+
+    # Fallback to CPU
+    log_debug "No GPU detected, falling back to CPU backend"
+    echo "cpu"
+}
+
+# Validate that the backend exists in this AppImage
+validate_backend() {
+    local backend="$1"
+    local binary="$APPDIR/usr/bin/hyprstream-$backend"
+    local libdir="$APPDIR/usr/lib/$backend/libtorch/lib"
+
+    if [[ ! -x "$binary" ]]; then
+        echo "Error: Backend '$backend' binary not found: $binary" >&2
+        echo "Available backends:" >&2
+        ls -1 "$APPDIR/usr/bin/" 2>/dev/null | grep '^hyprstream-' | sed 's/hyprstream-/  /' >&2
+        return 1
+    fi
+
+    if [[ ! -d "$libdir" ]]; then
+        echo "Error: Backend '$backend' libraries not found: $libdir" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+# List available backends (for --list-backends flag)
+list_backends() {
+    echo "Available backends in this AppImage:"
+    for binary in "$APPDIR/usr/bin/hyprstream-"*; do
+        if [[ -x "$binary" ]]; then
+            local backend="${binary##*hyprstream-}"
+            local status=""
+            if [[ "$backend" == "$(detect_backend)" ]]; then
+                status=" (auto-detected)"
+            fi
+            echo "  $backend$status"
+        fi
+    done
+    echo ""
+    echo "Override with: HYPRSTREAM_BACKEND=<backend> $0"
+    echo "Debug with:    HYPRSTREAM_DEBUG=1 $0"
+}
+
+# Handle special flags
+case "${1:-}" in
+    --list-backends)
+        list_backends
+        exit 0
+        ;;
+    --detect-gpu)
+        echo "Detected backend: $(detect_backend)"
+        exit 0
+        ;;
+esac
+
+# Main execution
+BACKEND=$(detect_backend)
+
+# Validate the selected backend
+if ! validate_backend "$BACKEND"; then
+    echo "Falling back to CPU backend..." >&2
+    BACKEND="cpu"
+    if ! validate_backend "$BACKEND"; then
+        echo "Fatal: No valid backend found in AppImage" >&2
+        exit 1
+    fi
+fi
+
+# Set up environment for the selected backend
+export LD_LIBRARY_PATH="$APPDIR/usr/lib/$BACKEND/libtorch/lib:${LD_LIBRARY_PATH:-}"
+export LIBTORCH="$APPDIR/usr/lib/$BACKEND/libtorch"
+export LIBTORCH_BYPASS_VERSION_CHECK=1
+
+# ROCm-specific environment
+if [[ "$BACKEND" == "rocm71" ]]; then
+    # Use system ROCm if available, otherwise bundled
+    if [[ -d /opt/rocm ]]; then
+        export ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
+    fi
+    export PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH:-gfx90a;gfx1100;gfx1101}"
+fi
+
+log_debug "Launching hyprstream with backend: $BACKEND"
+log_debug "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
+log_debug "LIBTORCH: $LIBTORCH"
+
+exec "$APPDIR/usr/bin/hyprstream-$BACKEND" "$@"

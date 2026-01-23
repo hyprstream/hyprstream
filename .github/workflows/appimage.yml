@@ -1,0 +1,316 @@
+name: Build AppImage
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+  LIBTORCH_VERSION: "2.10.0"
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
+
+jobs:
+  # Build each backend variant in parallel
+  build-variants:
+    name: Build ${{ matrix.variant }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cpu, cuda128, cuda130, rocm71]
+        include:
+          - variant: cpu
+            libtorch_url: "https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-2.10.0%2Bcpu.zip"
+          - variant: cuda128
+            libtorch_url: "https://download.pytorch.org/libtorch/cu128/libtorch-shared-with-deps-2.10.0%2Bcu128.zip"
+          - variant: cuda130
+            libtorch_url: "https://download.pytorch.org/libtorch/cu130/libtorch-shared-with-deps-2.10.0%2Bcu130.zip"
+          - variant: rocm71
+            libtorch_url: "https://download.pytorch.org/libtorch/rocm7.1/libtorch-shared-with-deps-2.10.0%2Brocm7.1.zip"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            capnproto \
+            libssl-dev \
+            libsystemd-dev \
+            pkg-config \
+            build-essential
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ matrix.variant }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ matrix.variant }}-
+            cargo-${{ runner.os }}-
+
+      - name: Download libtorch
+        run: |
+          mkdir -p libtorch-cache
+          curl -sSL -o libtorch.zip "${{ matrix.libtorch_url }}"
+          unzip -q libtorch.zip -d libtorch-cache
+          echo "LIBTORCH=$PWD/libtorch-cache/libtorch" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$PWD/libtorch-cache/libtorch/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+
+      - name: Build hyprstream
+        run: |
+          export LIBTORCH_BYPASS_VERSION_CHECK=1
+          cargo build --release --features otel
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p artifacts/${{ matrix.variant }}
+          cp target/release/hyprstream artifacts/${{ matrix.variant }}/hyprstream-${{ matrix.variant }}
+          # Package libtorch libraries (only .so files, not headers)
+          tar -czf artifacts/${{ matrix.variant }}/libtorch.tar.gz -C libtorch-cache/libtorch lib
+
+      - name: Upload variant artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: variant-${{ matrix.variant }}
+          path: artifacts/${{ matrix.variant }}/
+          retention-days: 1
+
+  # Assemble per-backend AppImages
+  assemble-per-backend:
+    name: AppImage (${{ matrix.variant }})
+    needs: build-variants
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        variant: [cpu, cuda128, cuda130, rocm71]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download variant artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: variant-${{ matrix.variant }}
+          path: artifacts/
+
+      - name: Download appimagetool
+        run: |
+          curl -sSL -o appimagetool \
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+          chmod +x appimagetool
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Assemble AppDir
+        run: |
+          APPDIR="hyprstream-${{ matrix.variant }}.AppDir"
+          mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib"
+
+          # Copy binary
+          cp "artifacts/hyprstream-${{ matrix.variant }}" "$APPDIR/usr/bin/hyprstream"
+          chmod +x "$APPDIR/usr/bin/hyprstream"
+
+          # Extract and copy libtorch
+          mkdir -p "$APPDIR/usr/lib/libtorch"
+          tar -xzf artifacts/libtorch.tar.gz -C "$APPDIR/usr/lib/libtorch"
+
+          # Copy AppRun with variant embedded
+          sed "s/HYPRSTREAM_VARIANT:-cpu/HYPRSTREAM_VARIANT:-${{ matrix.variant }}/" \
+            appimage/AppRun-single > "$APPDIR/AppRun"
+          chmod +x "$APPDIR/AppRun"
+
+          # Copy desktop and icon
+          cp appimage/hyprstream.desktop "$APPDIR/"
+          cp appimage/hyprstream.svg "$APPDIR/"
+
+      - name: Build AppImage
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          OUTPUT="hyprstream-${VERSION}-${{ matrix.variant }}-x86_64.AppImage"
+          ARCH=x86_64 ./appimagetool "hyprstream-${{ matrix.variant }}.AppDir" "$OUTPUT"
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: appimage-${{ matrix.variant }}
+          path: hyprstream-*-${{ matrix.variant }}-x86_64.AppImage
+          retention-days: 5
+
+  # Assemble universal AppImage with all backends
+  assemble-universal:
+    name: AppImage (universal)
+    needs: build-variants
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all variant artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: variant-*
+          path: artifacts/
+          merge-multiple: false
+
+      - name: Download appimagetool
+        run: |
+          curl -sSL -o appimagetool \
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+          chmod +x appimagetool
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Assemble universal AppDir
+        run: |
+          APPDIR="hyprstream-universal.AppDir"
+          mkdir -p "$APPDIR/usr/bin"
+
+          for variant in cpu cuda128 cuda130 rocm71; do
+            # Copy variant binary
+            cp "artifacts/variant-$variant/hyprstream-$variant" "$APPDIR/usr/bin/"
+            chmod +x "$APPDIR/usr/bin/hyprstream-$variant"
+
+            # Extract and copy libtorch for this variant
+            mkdir -p "$APPDIR/usr/lib/$variant/libtorch"
+            tar -xzf "artifacts/variant-$variant/libtorch.tar.gz" -C "$APPDIR/usr/lib/$variant/libtorch"
+          done
+
+          # Copy universal AppRun
+          cp appimage/AppRun "$APPDIR/"
+          chmod +x "$APPDIR/AppRun"
+
+          # Copy desktop and icon
+          cp appimage/hyprstream.desktop "$APPDIR/"
+          cp appimage/hyprstream.svg "$APPDIR/"
+
+      - name: Build universal AppImage
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          OUTPUT="hyprstream-${VERSION}-x86_64.AppImage"
+          ARCH=x86_64 ./appimagetool "hyprstream-universal.AppDir" "$OUTPUT"
+
+      - name: Upload universal AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: appimage-universal
+          path: hyprstream-*-x86_64.AppImage
+          retention-days: 5
+
+  # Create GitHub Release with all AppImages
+  release:
+    name: Create Release
+    needs: [assemble-per-backend, assemble-universal]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all AppImages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: appimage-*
+          path: appimages/
+          merge-multiple: true
+
+      - name: List AppImages
+        run: |
+          echo "AppImages to release:"
+          ls -lh appimages/
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Generate checksums
+        run: |
+          cd appimages
+          sha256sum *.AppImage > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: Hyprstream v${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            appimages/*.AppImage
+            appimages/SHA256SUMS.txt
+          body: |
+            ## AppImage Downloads
+
+            | File | Description |
+            |------|-------------|
+            | `hyprstream-${{ steps.version.outputs.version }}-x86_64.AppImage` | Universal (auto-detects GPU) |
+            | `hyprstream-${{ steps.version.outputs.version }}-cpu-x86_64.AppImage` | CPU only |
+            | `hyprstream-${{ steps.version.outputs.version }}-cuda128-x86_64.AppImage` | NVIDIA CUDA 12.8 |
+            | `hyprstream-${{ steps.version.outputs.version }}-cuda130-x86_64.AppImage` | NVIDIA CUDA 13.0 |
+            | `hyprstream-${{ steps.version.outputs.version }}-rocm71-x86_64.AppImage` | AMD ROCm 7.1 |
+
+            ### Usage
+
+            ```bash
+            # Download and make executable
+            chmod +x hyprstream-${{ steps.version.outputs.version }}-x86_64.AppImage
+
+            # Run (auto-detects GPU)
+            ./hyprstream-${{ steps.version.outputs.version }}-x86_64.AppImage server
+
+            # Override backend detection
+            HYPRSTREAM_BACKEND=cuda130 ./hyprstream-${{ steps.version.outputs.version }}-x86_64.AppImage server
+
+            # List available backends (universal only)
+            ./hyprstream-${{ steps.version.outputs.version }}-x86_64.AppImage --list-backends
+            ```
+
+            ### GPU Requirements
+
+            - **CUDA 12.8**: NVIDIA driver 535+
+            - **CUDA 13.0**: NVIDIA driver 555+
+            - **ROCm 7.1**: AMD GPU with ROCm 7.x installed
+
+      - name: Cleanup artifacts
+        uses: geekyeggo/delete-artifact@v4
+        with:
+          name: |
+            variant-*
+            appimage-*

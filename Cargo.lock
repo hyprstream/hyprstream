@@ -2587,7 +2587,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d162beedaa69905488a8da94f5ac3edb4dd4788b732fadb7bd120b2625c1976"
 dependencies = [
  "data-encoding",
- "syn 2.0.111",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -6258,7 +6258,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07033963ba89ebaf1584d767badaa2e8fcec21aedea6b8c0346d487d49c28667"
 dependencies = [
  "cfg-if 1.0.3",
- "windows-targets 0.53.3",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -11923,8 +11923,7 @@ checksum = "61c41af27dd6d1e27b1b16b489db798443478cef1f06a660c96db617ba5de3b1"
 
 [[package]]
 name = "tch"
-version = "0.21.0"
-source = "git+https://github.com/hyprstream/tch-rs?branch=hip#e8453bc37c5f3cd5815627cb897a0165ce430a40"
+version = "0.23.0"
 dependencies = [
  "half",
  "lazy_static",
@@ -12498,8 +12497,7 @@ dependencies = [
 
 [[package]]
 name = "torch-sys"
-version = "0.21.0"
-source = "git+https://github.com/hyprstream/tch-rs?branch=hip#e8453bc37c5f3cd5815627cb897a0165ce430a40"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "cc",

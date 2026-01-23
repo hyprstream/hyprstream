@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Hyprstream
+GenericName=LLM Inference Server
+Comment=High-performance LLM inference and training engine with Git-native model management
+Exec=hyprstream server
+Icon=hyprstream
+Terminal=true
+Categories=Development;Science;ArtificialIntelligence;
+Keywords=llm;ai;inference;machine-learning;pytorch;
+StartupNotify=false
