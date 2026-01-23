@@ -52,7 +52,6 @@ pub struct PolicyService {
     // Infrastructure (for Spawnable)
     context: Arc<zmq::Context>,
     transport: TransportConfig,
-    verifying_key: VerifyingKey,
 }
 
 impl PolicyService {
@@ -63,7 +62,6 @@ impl PolicyService {
         token_config: crate::config::TokenConfig,
         context: Arc<zmq::Context>,
         transport: TransportConfig,
-        verifying_key: VerifyingKey,
     ) -> Self {
         Self {
             policy_manager,
@@ -71,7 +69,6 @@ impl PolicyService {
             token_config,
             context,
             transport,
-            verifying_key,
         }
     }
 
@@ -286,8 +283,8 @@ impl ZmqService for PolicyService {
         &self.transport
     }
 
-    fn verifying_key(&self) -> VerifyingKey {
-        self.verifying_key
+    fn signing_key(&self) -> SigningKey {
+        (*self.signing_key).clone()
     }
 }
 
@@ -311,17 +308,23 @@ impl PolicyZmqClient {
     /// # Arguments
     /// * `signing_key` - Ed25519 signing key for request authentication
     /// * `identity` - Identity to include in requests (for authorization)
+    ///
+    /// # Note
+    /// Uses the same signing key for both request signing and response verification.
+    /// This is appropriate for internal communication where client and server share keys.
     pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
         let endpoint = registry().endpoint(SERVICE_NAME, SocketKind::Rep).to_zmq_string();
+        let server_verifying_key = signing_key.verifying_key();
         Self {
-            client: Arc::new(ZmqClient::new(&endpoint, signing_key, identity)),
+            client: Arc::new(ZmqClient::new(&endpoint, signing_key, server_verifying_key, identity)),
         }
     }
 
     /// Create a new policy client at a specific endpoint
     pub fn with_endpoint(endpoint: &str, signing_key: SigningKey, identity: RequestIdentity) -> Self {
+        let server_verifying_key = signing_key.verifying_key();
         Self {
-            client: Arc::new(ZmqClient::new(endpoint, signing_key, identity)),
+            client: Arc::new(ZmqClient::new(endpoint, signing_key, server_verifying_key, identity)),
         }
     }
 

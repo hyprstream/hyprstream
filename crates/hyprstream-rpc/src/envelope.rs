@@ -827,10 +827,15 @@ impl FromCapnp for SignedEnvelope {
     }
 }
 
-/// Response envelope (for future use).
+/// Signed response envelope for E2E authenticated responses.
 ///
-/// Currently responses don't carry identity, but this is available
-/// for tracking response provenance if needed.
+/// All RPC responses are signed to prevent MITM attacks on response data
+/// (e.g., server's DH public key in StreamInfo).
+///
+/// # Security
+///
+/// The signature covers `request_id || payload`, binding the response to
+/// a specific request and ensuring the payload hasn't been tampered with.
 #[derive(Debug, Clone)]
 pub struct ResponseEnvelope {
     /// Request ID this response corresponds to
@@ -838,12 +843,74 @@ pub struct ResponseEnvelope {
 
     /// Serialized inner response
     pub payload: Vec<u8>,
+
+    /// Ed25519 signature (64 bytes) over request_id || payload
+    pub signature: [u8; 64],
+
+    /// Ed25519 public key of the signer (32 bytes)
+    pub signer_pubkey: [u8; 32],
 }
 
 impl ResponseEnvelope {
-    /// Create a new response envelope.
-    pub fn new(request_id: u64, payload: Vec<u8>) -> Self {
-        Self { request_id, payload }
+    /// Create and sign a new response envelope.
+    ///
+    /// The signature covers `request_id || payload` to bind the response
+    /// to the specific request and prevent tampering.
+    pub fn new_signed(request_id: u64, payload: Vec<u8>, signing_key: &SigningKey) -> Self {
+        // Build signing data: request_id (8 bytes LE) || payload
+        let mut signing_data = Vec::with_capacity(8 + payload.len());
+        signing_data.extend_from_slice(&request_id.to_le_bytes());
+        signing_data.extend_from_slice(&payload);
+
+        let signature_obj = signing_key.sign(&signing_data);
+        let signature: [u8; 64] = signature_obj.to_bytes();
+        let signer_pubkey: [u8; 32] = signing_key.verifying_key().to_bytes();
+
+        Self {
+            request_id,
+            payload,
+            signature,
+            signer_pubkey,
+        }
+    }
+
+    /// Verify the response signature.
+    ///
+    /// # Arguments
+    ///
+    /// * `expected_pubkey` - Optional expected signer public key. If provided,
+    ///   verification fails if the signer doesn't match.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if signature is valid, `Err` otherwise.
+    pub fn verify(&self, expected_pubkey: Option<&VerifyingKey>) -> Result<()> {
+        // Check signer matches expected key if provided
+        let verifying_key = VerifyingKey::from_bytes(&self.signer_pubkey)
+            .map_err(|_| anyhow::anyhow!("Invalid signer public key"))?;
+
+        if let Some(expected) = expected_pubkey {
+            if verifying_key.to_bytes() != expected.to_bytes() {
+                anyhow::bail!("Response signed by unexpected key");
+            }
+        }
+
+        // Reconstruct signing data
+        let mut signing_data = Vec::with_capacity(8 + self.payload.len());
+        signing_data.extend_from_slice(&self.request_id.to_le_bytes());
+        signing_data.extend_from_slice(&self.payload);
+
+        // Verify signature
+        let signature = ed25519_dalek::Signature::from_bytes(&self.signature);
+        verifying_key
+            .verify_strict(&signing_data, &signature)
+            .map_err(|_| anyhow::anyhow!("Response signature verification failed"))
+    }
+
+    /// Get the signer's public key.
+    pub fn signer_pubkey(&self) -> Result<VerifyingKey> {
+        VerifyingKey::from_bytes(&self.signer_pubkey)
+            .map_err(|_| anyhow::anyhow!("Invalid signer public key"))
     }
 }
 
@@ -853,6 +920,8 @@ impl ToCapnp for ResponseEnvelope {
     fn write_to(&self, builder: &mut Self::Builder<'_>) {
         builder.set_request_id(self.request_id);
         builder.set_payload(&self.payload);
+        builder.set_signature(&self.signature);
+        builder.set_signer_pubkey(&self.signer_pubkey);
     }
 }
 
@@ -860,9 +929,25 @@ impl FromCapnp for ResponseEnvelope {
     type Reader<'a> = common_capnp::response_envelope::Reader<'a>;
 
     fn read_from(reader: Self::Reader<'_>) -> Result<Self> {
+        let sig_data = reader.get_signature()?;
+        if sig_data.len() != 64 {
+            anyhow::bail!("Invalid signature length: {}", sig_data.len());
+        }
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(sig_data);
+
+        let pubkey_data = reader.get_signer_pubkey()?;
+        if pubkey_data.len() != 32 {
+            anyhow::bail!("Invalid signer pubkey length: {}", pubkey_data.len());
+        }
+        let mut signer_pubkey = [0u8; 32];
+        signer_pubkey.copy_from_slice(pubkey_data);
+
         Ok(Self {
             request_id: reader.get_request_id(),
             payload: reader.get_payload()?.to_vec(),
+            signature,
+            signer_pubkey,
         })
     }
 }
@@ -913,6 +998,47 @@ pub fn unwrap_envelope(
     let payload = signed.payload().to_vec();
 
     Ok((ctx, payload))
+}
+
+/// Unwrap and verify a ResponseEnvelope from wire bytes.
+///
+/// Deserializes and verifies signature, then extracts the payload.
+///
+/// # Arguments
+///
+/// * `response` - Raw bytes containing a serialized ResponseEnvelope
+/// * `expected_pubkey` - Optional expected signer public key
+///
+/// # Returns
+///
+/// On success, returns `(request_id, payload)` where:
+/// - `request_id` correlates with the original request
+/// - `payload` is the inner response bytes
+///
+/// # Errors
+///
+/// Returns error if:
+/// - Deserialization fails
+/// - Signature verification fails
+/// - Signer doesn't match expected_pubkey (if provided)
+pub fn unwrap_response(
+    response: &[u8],
+    expected_pubkey: Option<&VerifyingKey>,
+) -> Result<(u64, Vec<u8>)> {
+    use capnp::serialize;
+
+    // Deserialize ResponseEnvelope from Cap'n Proto
+    let reader = serialize::read_message(
+        &mut std::io::Cursor::new(response),
+        capnp::message::ReaderOptions::default(),
+    )?;
+    let response_reader = reader.get_root::<crate::common_capnp::response_envelope::Reader>()?;
+    let envelope = ResponseEnvelope::read_from(response_reader)?;
+
+    // Verify signature
+    envelope.verify(expected_pubkey)?;
+
+    Ok((envelope.request_id, envelope.payload))
 }
 
 #[cfg(test)]

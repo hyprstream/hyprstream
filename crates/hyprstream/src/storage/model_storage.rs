@@ -113,7 +113,7 @@ impl ModelStorage {
 
         // Generate keypair for this service instance
         // TODO: Load from configuration for production
-        let (signing_key, verifying_key) = generate_signing_keypair();
+        let (signing_key, _verifying_key) = generate_signing_keypair();
 
         // Create policy client that connects to the already-running PolicyService
         // (PolicyService should be started by main.rs before any ModelStorage is created)
@@ -127,7 +127,7 @@ impl ModelStorage {
             policy_client.clone(),
             crate::zmq::global_context().clone(),
             registry_transport,
-            verifying_key,
+            signing_key.clone(),
         ).await
             .map_err(|e| anyhow::anyhow!("Failed to create registry service: {}", e))?;
         let manager = hyprstream_rpc::service::InprocManager::new();

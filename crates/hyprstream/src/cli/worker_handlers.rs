@@ -482,9 +482,9 @@ pub async fn handle_worker_exec(
 
 /// Handle `worker terminal` command - attach to container I/O streams
 ///
-/// This provides tmux-like terminal streaming:
-/// - Subscribes to stdout/stderr topics via ZMQ SUB
-/// - Pushes stdin to the container via ZMQ PUSH
+/// This provides tmux-like terminal streaming with DH-authenticated E2E security:
+/// - Performs DH key exchange with worker to derive topic + mac_key
+/// - Uses StreamHandle for HMAC-verified streaming
 /// - Handles detach sequence (default: Ctrl-])
 pub async fn handle_worker_terminal(
     client: &WorkerClient,
@@ -497,42 +497,53 @@ pub async fn handle_worker_terminal(
 
     info!(container_id = %container_id, "Attaching to container terminal");
 
-    // 1. Call Attach RPC to get topics
+    // 1. Call Attach RPC to get stream info and server pubkey
     let attach_response = client.attach(container_id).await?;
+
+    // 2. Generate client DH keypair
+    let (client_secret, client_pubkey) = hyprstream_rpc::generate_ephemeral_keypair();
+    let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
+
+    // 3. Complete DH handshake
+    let auth_response = client.start_fd_stream(&attach_response.stream_id, &client_pubkey_bytes).await?;
+    if !auth_response.authorized {
+        anyhow::bail!("FD stream authorization failed");
+    }
+
+    // 4. Derive stream keys from DH
+    let server_pub = hyprstream_rpc::crypto::RistrettoPublic::from_bytes(&attach_response.server_pubkey)
+        .ok_or_else(|| anyhow::anyhow!("Invalid server public key"))?;
+    let shared_secret = hyprstream_rpc::crypto::ristretto_dh(&client_secret, &server_pub);
+    let keys = hyprstream_rpc::crypto::derive_stream_keys(
+        &shared_secret,
+        &client_pubkey_bytes,
+        &attach_response.server_pubkey,
+    ).map_err(|e| anyhow::anyhow!("Key derivation failed: {}", e))?;
 
     println!(
         "Attached to container {}\n\
-         Stream endpoint: {}\n\
-         stdout topic: {}\n\
-         stderr topic: {}\n\
-         stdin topic: {}\n\
+         Stream ID: {}\n\
+         Endpoint: {}\n\
+         Topic: {}...\n\
          Detach with: {}",
         truncate_id(&attach_response.container_id, 12),
+        truncate_id(&attach_response.stream_id, 16),
         attach_response.stream_endpoint,
-        attach_response.stdout_topic,
-        attach_response.stderr_topic,
-        attach_response.stdin_topic,
+        &keys.topic[..16],
         detach_keys,
     );
 
-    // 2. Set up ZMQ sockets
+    // 5. Set up ZMQ subscriber with DH-derived topic
     let context = zmq::Context::new();
-
-    // SUB socket for stdout/stderr
     let sub_socket = context.socket(zmq::SUB)?;
     sub_socket.connect(&attach_response.stream_endpoint)?;
-    sub_socket.set_subscribe(attach_response.stdout_topic.as_bytes())?;
-    sub_socket.set_subscribe(attach_response.stderr_topic.as_bytes())?;
+    sub_socket.set_subscribe(keys.topic.as_bytes())?;
 
-    // PUSH socket for stdin (to StreamService PULL)
-    // The push endpoint is typically the same host but different port
-    let push_endpoint = attach_response
-        .stream_endpoint
-        .replace(":5560", ":5559"); // XPUB is 5560, PULL is 5559
-    let push_socket = context.socket(zmq::PUSH)?;
-    push_socket.connect(&push_endpoint)?;
+    // Create stream verifier for HMAC chain verification
+    use crate::services::rpc_types::StreamVerifier;
+    let mut verifier = StreamVerifier::new(*keys.mac_key, keys.topic.clone());
 
-    // 3. Set up terminal control
+    // 6. Set up terminal control
     let running = Arc::new(AtomicBool::new(true));
     let running_signal = running.clone();
 
@@ -547,38 +558,50 @@ pub async fn handle_worker_terminal(
 
     println!("\n--- Terminal attached. Press {} to detach ---\n", detach_keys);
 
-    // 4. Main I/O loop
-    // For a proper implementation, we'd use crossterm for raw mode
-    // and tokio for async I/O. This is a simplified version.
-
-    // Spawn receiver thread for stdout/stderr
-    let stdout_topic = attach_response.stdout_topic.clone();
-    let stderr_topic = attach_response.stderr_topic.clone();
+    // 7. Main I/O loop with HMAC-verified streaming
+    let topic_bytes = keys.topic.as_bytes().to_vec();
     let running_recv = running.clone();
 
     let recv_handle = std::thread::spawn(move || {
         while running_recv.load(Ordering::SeqCst) {
             // Poll with 100ms timeout
             if sub_socket.poll(zmq::POLLIN, 100).unwrap_or(0) > 0 {
-                if let Ok(msg) = sub_socket.recv_bytes(0) {
-                    // Message format: {topic}{streaming_capnp::StreamChunk}
-                    // For now, just print the raw data after topic
-                    let topic_len = if msg.starts_with(stdout_topic.as_bytes()) {
-                        stdout_topic.len()
-                    } else if msg.starts_with(stderr_topic.as_bytes()) {
-                        stderr_topic.len()
-                    } else {
+                // Receive multipart message: [topic, capnp, mac]
+                if let Ok(frames) = sub_socket.recv_multipart(0) {
+                    if frames.len() != 3 || frames[2].len() != 16 {
+                        tracing::warn!("Invalid StreamBlock format");
                         continue;
-                    };
+                    }
 
-                    // Extract payload (skip topic prefix and capnp overhead)
-                    // In a full implementation, we'd parse the wire format StreamChunk
-                    if msg.len() > topic_len {
-                        let payload = &msg[topic_len..];
-                        // Try to extract data from wire format
-                        if let Some(text) = extract_stream_chunk_data(payload) {
-                            print!("{}", String::from_utf8_lossy(&text));
-                            let _ = io::stdout().flush();
+                    // Verify topic matches
+                    if frames[0] != topic_bytes {
+                        continue;
+                    }
+
+                    // Verify HMAC and parse payloads
+                    match verifier.verify(&frames) {
+                        Ok(payloads) => {
+                            for payload in payloads {
+                                use crate::services::rpc_types::StreamPayload;
+                                match payload {
+                                    StreamPayload::Data(data) => {
+                                        // Worker FD data is raw bytes (terminal output)
+                                        print!("{}", String::from_utf8_lossy(&data));
+                                        let _ = io::stdout().flush();
+                                    }
+                                    StreamPayload::Complete(_) => {
+                                        println!("\n--- Stream complete ---");
+                                        return;
+                                    }
+                                    StreamPayload::Error(message) => {
+                                        eprintln!("\n--- Stream error: {} ---", message);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("StreamBlock verification failed: {}", e);
                         }
                     }
                 }
@@ -586,8 +609,8 @@ pub async fn handle_worker_terminal(
         }
     });
 
-    // Read stdin and send to container
-    // In a full implementation, we'd use raw mode for character-by-character input
+    // Read stdin (stdin streaming via StreamBuilder would be implemented here)
+    // For now, just wait for detach or stream completion
     use std::io::BufRead;
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
@@ -602,19 +625,9 @@ pub async fn handle_worker_terminal(
                 break;
             }
 
-            // Send line + newline as stdin chunk
-            let mut data = line.into_bytes();
-            data.push(b'\n');
-
-            // Build wire format message and send
-            // For now, send raw data (full implementation would build capnp)
-            let mut msg = attach_response.stdin_topic.as_bytes().to_vec();
-            msg.extend_from_slice(&data);
-
-            if let Err(e) = push_socket.send(&msg, 0) {
-                eprintln!("Failed to send stdin: {}", e);
-                break;
-            }
+            // TODO: Send stdin via authenticated StreamBuilder
+            // For now, stdin is not implemented (read-only terminal)
+            tracing::debug!("Stdin input (not sent): {}", line);
         }
     }
 
@@ -638,23 +651,6 @@ fn parse_detach_keys(keys: &str) -> u8 {
     }
 }
 
-/// Extract data from streaming_capnp::StreamChunk wire format message
-fn extract_stream_chunk_data(payload: &[u8]) -> Option<Vec<u8>> {
-    use capnp::serialize;
-
-    let _reader = serialize::read_message(
-        &mut std::io::Cursor::new(payload),
-        capnp::message::ReaderOptions::default(),
-    ).ok()?;
-
-    // Try to read as streaming_capnp::StreamChunk
-    // Note: This requires the capnp module to be accessible
-    // For now, return the raw payload and let the caller handle it
-    // In a full implementation, we'd properly deserialize the StreamChunk
-
-    // Fallback: return raw payload if capnp parsing fails
-    Some(payload.to_vec())
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Image Commands

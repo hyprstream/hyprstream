@@ -85,7 +85,6 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         TokenConfig::default(),
         global_context(),
         ctx.transport("policy", SocketKind::Rep),
-        ctx.verifying_key(),
     );
 
     Ok(Box::new(policy_service))
@@ -111,7 +110,7 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
             policy_client,
             global_context(),
             ctx.transport("registry", SocketKind::Rep),
-            ctx.verifying_key(),
+            ctx.signing_key().clone(),
         ))
     })?;
 
@@ -124,7 +123,7 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
 
 /// Factory for StreamService (PULL/XPUB queuing proxy with JWT validation)
 #[service_factory("streams")]
-fn create_streams_service(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+fn create_streams_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating StreamService with JWT validation and queuing");
 
     use crate::services::StreamService;
@@ -139,6 +138,7 @@ fn create_streams_service(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         global_context(),
         pub_transport,
         pull_transport,
+        ctx.verifying_key(),
     );
 
     Ok(Box::new(stream_service))
@@ -178,7 +178,6 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         model_storage,
         global_context(),
         ctx.transport("model", SocketKind::Rep),
-        ctx.verifying_key(),
     );
 
     Ok(Box::new(model_service))
@@ -239,7 +238,7 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         rafs_store,
         global_context(),
         ctx.transport("worker", SocketKind::Rep),
-        ctx.verifying_key(),
+        ctx.signing_key().clone(),
     )?;
 
     Ok(Box::new(worker_service))

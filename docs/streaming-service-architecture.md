@@ -61,9 +61,21 @@ StreamService is a **blind forwarder** - it does NOT verify HMACs.
 
 | Layer | Responsibility |
 |-------|----------------|
-| **InferenceService** | Derives DH keys, produces HMAC chain |
-| **StreamService** | Routes by topic, buffers for retransmit (blind) |
-| **Client** | Derives same DH keys, verifies HMAC chain |
+| **InferenceService** | Derives DH keys, produces HMAC chain, signs responses |
+| **StreamService** | Routes by topic, buffers for retransmit (blind), verifies registrations |
+| **Client** | Derives same DH keys, verifies HMAC chain, verifies response signatures |
+
+### Shared Signing Key
+
+All services use the **same Ed25519 signing key** loaded from:
+```
+~/.local/share/hyprstream/models/.registry/keys/signing.key
+```
+
+This key is:
+- **Generated once** on first startup (32 bytes, persisted)
+- **Loaded by all services** (systemd units and CLI)
+- **Used for both requests and responses** (bidirectional authentication)
 
 ### Security Properties
 
@@ -71,9 +83,31 @@ StreamService is a **blind forwarder** - it does NOT verify HMACs.
 |----------|----------------|
 | **Topic unpredictability** | DH-derived (InferenceService ↔ Client) |
 | **Registration auth** | SignedEnvelope with Ed25519 signature |
+| **Response auth** | ResponseEnvelope with Ed25519 signature (mandatory) |
 | **Data integrity** | Chained HMAC verified end-to-end by client |
 | **Stream binding** | Claims-based scope: `publish:stream:{topic}` |
 | **Replay protection** | Nonce cache on SignedEnvelope |
+
+### Request/Response Signing
+
+All ZMQ REQ/REP communication uses signed envelopes:
+
+```
+Request Flow:
+┌────────────────────────────────────────────────────────────┐
+│  Client                                          Service   │
+│    │                                                │      │
+│    │─── SignedEnvelope(RequestEnvelope) ───────────►│      │
+│    │       [signed with shared key]                 │      │
+│    │                                     [verify]   │      │
+│    │                                     [process]  │      │
+│    │◄── ResponseEnvelope ──────────────────────────│      │
+│    │       [signed with shared key]                 │      │
+│    │  [verify]                                      │      │
+└────────────────────────────────────────────────────────────┘
+```
+
+**No bypass possible**: ZmqClient requires `server_verifying_key` at construction and automatically verifies all responses.
 
 ## Components
 
@@ -137,6 +171,22 @@ SignedEnvelope {
     signature: [64 bytes],  // Ed25519
 }
 ```
+
+### ResponseEnvelope (REQ/REP Responses)
+
+All service responses are wrapped in signed `ResponseEnvelope`:
+
+```
+ResponseEnvelope {
+    requestId: 12345,           // Correlates with request
+    payload: [bytes],           // Service-specific response data
+    timestamp: 1762974327000,   // Unix timestamp (ms)
+    signature: [64 bytes],      // Ed25519 signature
+    signerPubkey: [32 bytes],   // Server's verifying key
+}
+```
+
+**Verification**: Client verifies `signature` over `(requestId || payload || timestamp)` using `signerPubkey`.
 
 ### Wire Formats: StreamChunk vs StreamBlock
 
@@ -462,22 +512,48 @@ loop {
 
 ### With InferenceService
 
+InferenceService receives the shared signing key from ModelService:
+
+```rust
+// ModelService starts InferenceService with shared key
+let service_handle = InferenceService::start_at(
+    &model_path,
+    runtime_config,
+    signing_key.verifying_key(),  // For request verification
+    signing_key.clone(),          // For response signing (MUST match)
+    policy_client,
+    &endpoint,
+).await?;
+```
+
+InferenceService uses the shared key for stream registration and response signing:
+
 ```rust
 // InferenceService derives keys and registers stream
 let (topic, mac_key) = derive_stream_keys(&shared_secret, ...)?;
 
-// Send registration via PUSH
+// Send registration via PUSH (signed with shared key)
 let register = StreamRegister { topic: topic.clone(), exp };
 let signed = sign_envelope(register, &signing_key)?;
 push_socket.send(serialize(&signed), 0)?;
 
-// Stream chunks via PUSH
+// Stream chunks via PUSH (HMAC authenticated)
 let mut hmac = ChainedStreamHmac::from_bytes(mac_key, request_id);
 for token in tokens {
     let mac = hmac.compute_next(&token);
     let chunk = StreamChunk { topic: topic.clone(), data: token, hmac: mac };
     push_socket.send(serialize(&chunk), 0)?;
 }
+
+// REQ/REP responses are signed with ResponseEnvelope (automatic in service loop)
+let response_bytes = {
+    let signed_response = ResponseEnvelope::new_signed(
+        request_id,
+        response_payload,
+        &signing_key,  // Same shared key
+    );
+    serialize(&signed_response)
+};
 ```
 
 ### With Client

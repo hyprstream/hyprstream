@@ -30,12 +30,13 @@ pub use hyprstream_workers::image::{
 pub use hyprstream_workers::runtime::{
     AttachResponse, Container, ContainerAttributes, ContainerConfig, ContainerFilter,
     ContainerMetadata, ContainerState, ContainerStats, ContainerStatsFilter, ContainerStatus,
-    ContainerStatusResponse, CpuUsage, ExecSyncResponse, FilesystemIdentifier, FilesystemUsage,
-    KeyValue, LinuxPodSandboxStats, MemoryUsage, NetworkInterfaceUsage, NetworkUsage, PodIP,
-    PodSandbox, PodSandboxAttributes, PodSandboxConfig, PodSandboxFilter, PodSandboxMetadata,
-    PodSandboxNetworkStatus, PodSandboxState, PodSandboxStats, PodSandboxStatsFilter,
-    PodSandboxStatus, PodSandboxStatusResponse, ProcessUsage, RuntimeCondition, RuntimeClient,
-    RuntimeStatus, StatusResponse, VersionResponse, ContainerImageSpec,
+    ContainerStatusResponse, CpuUsage, ExecSyncResponse, FdStreamAuthResponse, FilesystemIdentifier,
+    FilesystemUsage, KeyValue, LinuxPodSandboxStats, MemoryUsage, NetworkInterfaceUsage,
+    NetworkUsage, PodIP, PodSandbox, PodSandboxAttributes, PodSandboxConfig, PodSandboxFilter,
+    PodSandboxMetadata, PodSandboxNetworkStatus, PodSandboxState, PodSandboxStats,
+    PodSandboxStatsFilter, PodSandboxStatus, PodSandboxStatusResponse, ProcessUsage,
+    RuntimeCondition, RuntimeClient, RuntimeStatus, StatusResponse, VersionResponse,
+    ContainerImageSpec,
 };
 
 /// Service name for endpoint registry
@@ -131,6 +132,9 @@ pub trait RuntimeOps {
 
     /// Attach to container I/O streams.
     async fn attach(&self, container_id: &str) -> Result<AttachResponse>;
+
+    /// Start FD stream (DH handshake)
+    async fn start_fd_stream(&self, stream_id: &str, client_pubkey: &[u8; 32]) -> Result<FdStreamAuthResponse>;
 
     /// Detach from container I/O streams.
     async fn detach(&self, container_id: &str) -> Result<()>;
@@ -434,6 +438,19 @@ impl RuntimeOps for ZmqClient {
         parse_attach_response(&response)
     }
 
+    async fn start_fd_stream(&self, stream_id: &str, client_pubkey: &[u8; 32]) -> Result<FdStreamAuthResponse> {
+        let id = self.next_id();
+        let payload = serialize_message(|msg| {
+            let mut req = msg.init_root::<workers_capnp::runtime_request::Builder>();
+            req.set_id(id);
+            let mut start_req = req.init_start_fd_stream();
+            start_req.set_stream_id(stream_id);
+            start_req.set_client_pubkey(client_pubkey);
+        })?;
+        let response = self.call(payload, CallOptions::default()).await?;
+        parse_fd_stream_auth_response(&response)
+    }
+
     async fn detach(&self, container_id: &str) -> Result<()> {
         let id = self.next_id();
         let payload = serialize_message(|msg| {
@@ -616,15 +633,35 @@ fn parse_attach_response(response: &[u8]) -> Result<AttachResponse> {
         match resp.which()? {
             Which::AttachResponse(attach) => {
                 let attach = attach?;
+                let server_pubkey_data = attach.get_server_pubkey()?;
+                let mut server_pubkey = [0u8; 32];
+                if server_pubkey_data.len() == 32 {
+                    server_pubkey.copy_from_slice(server_pubkey_data);
+                }
                 Ok(AttachResponse {
                     container_id: attach.get_container_id()?.to_str()?.to_string(),
-                    stdin_topic: attach.get_stdin_topic()?.to_str()?.to_string(),
-                    stdout_topic: attach.get_stdout_topic()?.to_str()?.to_string(),
-                    stderr_topic: attach.get_stderr_topic()?.to_str()?.to_string(),
+                    stream_id: attach.get_stream_id()?.to_str()?.to_string(),
                     stream_endpoint: attach.get_stream_endpoint()?.to_str()?.to_string(),
+                    server_pubkey,
                 })
             }
             _ => Err(anyhow!("Expected attach_response")),
+        }
+    })
+}
+
+fn parse_fd_stream_auth_response(response: &[u8]) -> Result<FdStreamAuthResponse> {
+    parse_runtime_response(response, |resp| {
+        use workers_capnp::runtime_response::Which;
+        match resp.which()? {
+            Which::FdStreamAuthorized(auth) => {
+                let auth = auth?;
+                Ok(FdStreamAuthResponse {
+                    stream_id: auth.get_stream_id()?.to_str()?.to_string(),
+                    authorized: auth.get_authorized(),
+                })
+            }
+            _ => Err(anyhow!("Expected fd_stream_authorized response")),
         }
     })
 }
@@ -1414,17 +1451,23 @@ pub struct WorkerClient {
 
 impl WorkerClient {
     /// Create a new WorkerClient with the given signing key and identity
+    ///
+    /// # Note
+    /// Uses the same signing key for both request signing and response verification.
+    /// This is appropriate for internal communication where client and server share keys.
     pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
         let endpoint = registry().endpoint(SERVICE_NAME, SocketKind::Rep).to_zmq_string();
+        let server_verifying_key = signing_key.verifying_key();
         Self {
-            client: Arc::new(ZmqClient::new(&endpoint, signing_key, identity)),
+            client: Arc::new(ZmqClient::new(&endpoint, signing_key, server_verifying_key, identity)),
         }
     }
 
     /// Create a WorkerClient connected to a specific endpoint
     pub fn with_endpoint(endpoint: &str, signing_key: SigningKey, identity: RequestIdentity) -> Self {
+        let server_verifying_key = signing_key.verifying_key();
         Self {
-            client: Arc::new(ZmqClient::new(endpoint, signing_key, identity)),
+            client: Arc::new(ZmqClient::new(endpoint, signing_key, server_verifying_key, identity)),
         }
     }
 
@@ -1441,6 +1484,11 @@ impl WorkerClient {
     /// Attach to container I/O streams
     pub async fn attach(&self, container_id: &str) -> anyhow::Result<AttachResponse> {
         self.client.attach(container_id).await
+    }
+
+    /// Start FD stream (complete DH handshake)
+    pub async fn start_fd_stream(&self, stream_id: &str, client_pubkey: &[u8; 32]) -> anyhow::Result<FdStreamAuthResponse> {
+        self.client.start_fd_stream(stream_id, client_pubkey).await
     }
 
     /// Detach from container I/O streams

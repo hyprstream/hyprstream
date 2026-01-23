@@ -1251,7 +1251,7 @@ fn main() -> Result<()> {
                             rafs_store,
                             global_context().clone(),
                             worker_transport,
-                            verifying_key,
+                            signing_key.clone(),
                         )?;
                         let manager = InprocManager::new();
                         Some(manager.spawn(Box::new(worker_service))

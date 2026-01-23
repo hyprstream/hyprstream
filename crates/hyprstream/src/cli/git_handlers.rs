@@ -1,15 +1,11 @@
 //! Handlers for git-style CLI commands
 
 use crate::config::GenerationRequest;
-use crate::inference_capnp;
-use hyprstream_rpc::streaming_capnp;
 use crate::api::openai_compat::ChatMessage;
 use crate::services::ModelZmqClient;
 use crate::zmq::global_context;
 use crate::storage::{CheckoutOptions, ModelRef, ModelStorage};
 use anyhow::{bail, Result};
-use capnp::message::ReaderOptions;
-use capnp::serialize;
 use hyprstream_rpc::prelude::*;
 use std::io::{self, Write};
 use tracing::{debug, info, warn};
@@ -1155,92 +1151,53 @@ pub async fn handle_infer(
 
         info!("Subscribed to stream via StreamService");
 
+        // Create StreamVerifier for HMAC chain verification
+        use crate::services::rpc_types::StreamVerifier;
+        let mut verifier = StreamVerifier::new(*keys.mac_key, keys.topic.clone());
+
         println!();
-        loop {
-            match subscriber.recv_bytes(0) {
-                Ok(msg) => {
-                    // Message format: topic_bytes + capnp_bytes
-                    // Topic is DH-derived (64 hex chars), followed by Cap'n Proto StreamChunk
-                    // StreamChunk.data contains serialized InferencePayload
-                    let topic_len = keys.topic.len();  // 64 bytes
-                    if msg.len() <= topic_len {
-                        continue; // Too short, skip
+        'outer: loop {
+            // Receive multipart StreamBlock: [topic, capnp, 16-byte mac]
+            match subscriber.recv_multipart(0) {
+                Ok(frames) => {
+                    // Validate StreamBlock format
+                    if frames.len() != 3 || frames[2].len() != 16 {
+                        warn!(
+                            "Invalid StreamBlock: expected 3 frames with 16-byte MAC, got {} frames",
+                            frames.len()
+                        );
+                        continue;
                     }
 
-                    // Parse outer streaming_capnp::StreamChunk (wire format with HMAC)
-                    let chunk_bytes = &msg[topic_len..];
-                    let outer_reader = match serialize::read_message(
-                        &mut std::io::Cursor::new(chunk_bytes),
-                        ReaderOptions::default(),
-                    ) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            warn!("Failed to parse stream chunk: {}", e);
-                            continue;
-                        }
-                    };
-
-                    let outer_chunk = match outer_reader.get_root::<streaming_capnp::stream_chunk::Reader>() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            warn!("Failed to get stream chunk root: {}", e);
-                            continue;
-                        }
-                    };
-
-                    // Extract inner payload data from StreamChunk.data
-                    let inner_data = match outer_chunk.get_data() {
-                        Ok(d) => d,
-                        Err(e) => {
-                            warn!("Failed to get stream chunk data: {}", e);
-                            continue;
-                        }
-                    };
-
-                    // Parse inner inference_capnp::InferencePayload
-                    let inner_reader = match serialize::read_message(
-                        &mut std::io::Cursor::new(inner_data),
-                        ReaderOptions::default(),
-                    ) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            warn!("Failed to parse inference payload: {}", e);
-                            continue;
-                        }
-                    };
-
-                    let payload = match inner_reader.get_root::<inference_capnp::inference_payload::Reader>() {
+                    // Verify HMAC chain and parse payloads
+                    let payloads = match verifier.verify(&frames) {
                         Ok(p) => p,
                         Err(e) => {
-                            warn!("Failed to get inference payload root: {}", e);
+                            warn!("StreamBlock verification failed: {}", e);
                             continue;
                         }
                     };
 
-                    // Handle the union variant
-                    use inference_capnp::inference_payload::Which;
-                    match payload.which() {
-                        Ok(Which::Token(token)) => {
-                            if let Ok(t) = token {
-                                print!("{}", t.to_str().unwrap_or(""));
+                    // Process each payload in the block
+                    for payload in payloads {
+                        use crate::services::rpc_types::{InferenceStreamPayload, StreamPayloadExt};
+                        match payload.to_inference() {
+                            Ok(InferenceStreamPayload::Token(text)) => {
+                                print!("{}", text);
                                 let _ = io::stdout().flush();
                             }
-                        }
-                        Ok(Which::Complete(_stats)) => {
-                            // Stream completed
-                            break;
-                        }
-                        Ok(Which::Error(error_info)) => {
-                            if let Ok(e) = error_info {
-                                if let Ok(msg) = e.get_message() {
-                                    warn!("Stream error: {}", msg.to_str().unwrap_or("unknown"));
-                                }
+                            Ok(InferenceStreamPayload::Complete(_)) => {
+                                // Stream completed
+                                break 'outer;
                             }
-                            break;
-                        }
-                        Err(e) => {
-                            warn!("Failed to parse payload variant: {:?}", e);
-                            continue;
+                            Ok(InferenceStreamPayload::Error(message)) => {
+                                warn!("Stream error: {}", message);
+                                break 'outer;
+                            }
+                            Err(e) => {
+                                warn!("Failed to parse stream payload: {}", e);
+                                continue;
+                            }
                         }
                     }
                 }

@@ -59,22 +59,7 @@ struct StreamAuthResponse {
 # Wire Format (PUSH/PULL -> XPUB/SUB)
 # =============================================================================
 
-# Stream chunk - wire format for individual chunks
-#
-# Uses chained HMAC-SHA256 for authentication AND cryptographic ordering.
-# No sequence field needed - ordering is enforced by the HMAC chain:
-#   mac_0 = HMAC(key, topic_bytes || data_0)       # First chunk
-#   mac_n = HMAC(key, mac_{n-1} || data_n)         # Subsequent chunks
-#
-# Topic is inside the capnp message for generic extraction.
-struct StreamChunk {
-  topic @0 :Text;     # DH-derived routing topic (for XPUB prefix matching)
-  data @1 :Data;      # Serialized StreamPayload bytes
-  hmac @2 :Data;      # Chained HMAC-SHA256 (32 bytes)
-  prevHmac @3 :Data;  # Previous chunk's HMAC (empty for first chunk)
-}
-
-# Stream block - batched chunks with E2E authentication
+# Stream block - batched payloads with E2E authentication
 #
 # Wire format (ZMQ multipart):
 #   Frame 0:      topic (64 hex chars, DH-derived)
@@ -92,34 +77,45 @@ struct StreamBlock {
 }
 
 # =============================================================================
-# Payload Types (inside StreamChunk.data or StreamBlock.payloads)
+# Payload Types (inside StreamBlock.payloads)
 # =============================================================================
 
 # Stream payload - the actual content being streamed
 #
-# This is what gets serialized into StreamChunk.data.
-# Separates wire format (StreamChunk) from content (StreamPayload).
+# This is what gets serialized into StreamBlock.payloads.
+# Separates wire format (StreamBlock) from content (StreamPayload).
+#
+# Generic design: Applications interpret the binary data as needed:
+#   - Inference: UTF-8 text tokens
+#   - Worker I/O: Arbitrary binary (stdout/stderr/stdin)
+#
+# Note: Stream identity comes from the DH-derived topic, not from payload fields.
+# The topic cryptographically binds the stream to the DH key exchange.
 struct StreamPayload {
-  streamId @0 :Text;    # Stream identifier for correlation
-
   union {
-    token @1 :Text;               # Generated token text
-    complete @2 :StreamStats;     # Stream completion with stats
-    error @3 :StreamError;        # Error during generation
-    heartbeat @4 :Void;           # Keep-alive (no data)
+    data @0 :Data;                # Generic binary payload (tokens, I/O, etc.)
+    complete @1 :Data;            # App-specific completion metadata (serialized)
+    error @2 :StreamError;        # Error during streaming
+    heartbeat @3 :Void;           # Keep-alive (no data)
   }
 }
 
-# Stream completion statistics
-struct StreamStats {
-  tokensGenerated @0 :UInt32;
-  finishReason @1 :Text;          # "stop", "length", "eos", "error"
-  generationTimeMs @2 :UInt64;
-  tokensPerSecond @3 :Float32;
-  # Optional quality metrics
-  perplexity @4 :Float32;
-  avgEntropy @5 :Float32;
-}
+# =============================================================================
+# Completion Metadata
+# =============================================================================
+#
+# StreamPayload.complete contains app-specific completion metadata as raw bytes.
+# Applications serialize their own types into this field:
+#
+#   - Inference: Serialize InferenceComplete (see inference.capnp)
+#   - Worker I/O: Empty or app-specific status
+#
+# Example for inference (in inference.capnp):
+#   struct InferenceComplete {
+#     stats @0 :StreamStats;
+#   }
+#
+# The generic Data field allows each domain to define completion semantics.
 
 # Stream error information
 struct StreamError {

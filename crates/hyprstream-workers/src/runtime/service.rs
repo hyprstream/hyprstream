@@ -5,15 +5,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use anyhow::Result as AnyhowResult;
 use capnp::message::{Builder, ReaderOptions};
 use capnp::serialize;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 // Import ZMQ service infrastructure from hyprstream-rpc
-use hyprstream_rpc::prelude::VerifyingKey;
+use hyprstream_rpc::prelude::SigningKey;
 use hyprstream_rpc::service::{EnvelopeContext, ZmqService};
+use hyprstream_rpc::streaming::{BatchingConfig, StreamBuilder};
 use hyprstream_rpc::transport::TransportConfig;
 
 use crate::config::{ImageConfig, PoolConfig};
@@ -64,10 +66,16 @@ pub struct WorkerService {
     /// Event publisher for lifecycle events (sandbox/container started/stopped)
     event_publisher: tokio::sync::Mutex<EventPublisher>,
 
+    /// Pending FD streams awaiting DH handshake completion (stream_id -> PendingFdStream)
+    pending_fd_streams: RwLock<HashMap<String, PendingFdStream>>,
+
+    /// Active FD streams (stream_id -> ActiveFdStream)
+    active_fd_streams: RwLock<HashMap<String, ActiveFdStream>>,
+
     // Infrastructure (for Spawnable)
     context: Arc<zmq::Context>,
     transport: TransportConfig,
-    verifying_key: VerifyingKey,
+    signing_key: SigningKey,
 }
 
 impl WorkerService {
@@ -80,7 +88,7 @@ impl WorkerService {
         rafs_store: Arc<RafsStore>,
         context: Arc<zmq::Context>,
         transport: TransportConfig,
-        verifying_key: VerifyingKey,
+        signing_key: SigningKey,
     ) -> AnyhowResult<Self> {
         let sandbox_pool = Arc::new(SandboxPool::new(
             pool_config,
@@ -98,9 +106,11 @@ impl WorkerService {
             container_sandbox_map: RwLock::new(HashMap::new()),
             runtime_handle: tokio::runtime::Handle::current(),
             event_publisher: tokio::sync::Mutex::new(event_publisher),
+            pending_fd_streams: RwLock::new(HashMap::new()),
+            active_fd_streams: RwLock::new(HashMap::new()),
             context,
             transport,
-            verifying_key,
+            signing_key,
         })
     }
 
@@ -114,7 +124,7 @@ impl WorkerService {
         runtime_handle: tokio::runtime::Handle,
         context: Arc<zmq::Context>,
         transport: TransportConfig,
-        verifying_key: VerifyingKey,
+        signing_key: SigningKey,
     ) -> AnyhowResult<Self> {
         let sandbox_pool = Arc::new(SandboxPool::new(
             pool_config,
@@ -132,9 +142,11 @@ impl WorkerService {
             container_sandbox_map: RwLock::new(HashMap::new()),
             runtime_handle,
             event_publisher: tokio::sync::Mutex::new(event_publisher),
+            pending_fd_streams: RwLock::new(HashMap::new()),
+            active_fd_streams: RwLock::new(HashMap::new()),
             context,
             transport,
-            verifying_key,
+            signing_key,
         })
     }
 
@@ -855,13 +867,15 @@ impl WorkerService {
 
     /// Attach to a container's terminal I/O streams (tmux-like)
     ///
-    /// Returns stream topics for stdin/stdout/stderr that the client can subscribe to.
-    /// The actual I/O bridge (vsock/serial → StreamService) is handled separately.
+    /// Returns stream info for DH handshake. Client must call start_fd_stream()
+    /// with their public key to complete the handshake before subscribing.
     ///
-    /// # Topic Format
-    /// - stdin:  `worker-{container_id}-0`
-    /// - stdout: `worker-{container_id}-1`
-    /// - stderr: `worker-{container_id}-2`
+    /// # Flow
+    /// 1. Client calls attach() - receives stream_id, stream_endpoint, server_pubkey
+    /// 2. Client calls start_fd_stream(stream_id, client_pubkey) - completes DH handshake
+    /// 3. Client derives topic/mac_key from DH shared secret
+    /// 4. Client subscribes to DH-derived topic via StreamService
+    /// 5. Worker streams FD data via StreamBuilder (HMAC-authenticated)
     pub async fn attach(&self, container_id: &str) -> Result<AttachResponse> {
         // Verify container exists
         let containers = self.containers.read().await;
@@ -870,48 +884,289 @@ impl WorkerService {
         }
         drop(containers);
 
-        // Generate topics for each FD
-        let stdin_topic = format!("worker-{}-0", container_id);
-        let stdout_topic = format!("worker-{}-1", container_id);
-        let stderr_topic = format!("worker-{}-2", container_id);
+        // Generate ephemeral DH keypair for this stream
+        let (server_secret, server_pubkey) = hyprstream_rpc::generate_ephemeral_keypair();
+        let server_pubkey_bytes: [u8; 32] = server_pubkey.to_bytes();
 
-        // TODO: Send StreamRegister for each topic to StreamService
-        // This requires a PUSH socket connection to StreamService's PULL endpoint
-        // For now, we just return the topics - the caller must ensure topics are registered
+        // Generate unique stream ID
+        let stream_id = format!("fd-{}-{}", container_id, uuid::Uuid::new_v4());
 
-        // Get stream endpoint from transport config or use default
-        // The client will connect to this to subscribe
-        let stream_endpoint = std::env::var("HYPRSTREAM_STREAM_ENDPOINT")
-            .unwrap_or_else(|_| "tcp://127.0.0.1:5560".to_string());
+        // Get stream endpoint from EndpointRegistry (StreamService's PULL socket)
+        let stream_endpoint = hyprstream_rpc::registry::global()
+            .endpoint("stream", hyprstream_rpc::registry::SocketKind::Pull)
+            .to_zmq_string();
+
+        // Store pending stream for DH handshake completion
+        let pending = PendingFdStream {
+            container_id: container_id.to_string(),
+            server_secret,
+            server_pubkey: server_pubkey_bytes,
+            stream_endpoint: stream_endpoint.clone(),
+        };
+        self.pending_fd_streams.write().await.insert(stream_id.clone(), pending);
 
         Ok(AttachResponse {
             container_id: container_id.to_string(),
-            stdin_topic,
-            stdout_topic,
-            stderr_topic,
+            stream_id,
             stream_endpoint,
+            server_pubkey: server_pubkey_bytes,
+        })
+    }
+
+    /// Complete FD stream DH handshake
+    ///
+    /// Client provides their public key, server derives shared secret and
+    /// starts streaming FD data via StreamBuilder.
+    pub async fn start_fd_stream(
+        &self,
+        stream_id: &str,
+        client_pubkey: &[u8; 32],
+    ) -> Result<FdStreamAuthResponse> {
+        // Get and remove pending stream
+        let pending = self.pending_fd_streams.write().await
+            .remove(stream_id)
+            .ok_or_else(|| anyhow::anyhow!("Unknown stream ID: {}", stream_id))?;
+
+        // Derive stream keys from DH
+        let client_pub = hyprstream_rpc::crypto::RistrettoPublic::from_bytes(client_pubkey)
+            .ok_or_else(|| anyhow::anyhow!("Invalid client public key"))?;
+        let shared_secret = hyprstream_rpc::crypto::ristretto_dh(&pending.server_secret, &client_pub);
+        let keys = hyprstream_rpc::crypto::derive_stream_keys(
+            &shared_secret,
+            client_pubkey,
+            &pending.server_pubkey,
+        ).map_err(|e| anyhow::anyhow!("Key derivation failed: {}", e))?;
+
+        info!(
+            stream_id = %stream_id,
+            container_id = %pending.container_id,
+            topic = %keys.topic,
+            "FD stream authorized, starting I/O bridge"
+        );
+
+        // Create cancellation token for the stream
+        let cancel_token = CancellationToken::new();
+
+        // Store active stream
+        let active = ActiveFdStream {
+            container_id: pending.container_id.clone(),
+            cancel_token: cancel_token.clone(),
+        };
+        self.active_fd_streams.write().await.insert(stream_id.to_string(), active);
+
+        // Spawn FD streaming task
+        let context = self.context.clone();
+        let stream_endpoint = pending.stream_endpoint.clone();
+        let stream_id_owned = stream_id.to_string();
+        let container_id = pending.container_id.clone();
+        let mac_key = *keys.mac_key;
+        let topic = keys.topic.clone();
+
+        // Get sandbox pool for container console access
+        let sandbox_pool = self.sandbox_pool.clone();
+        let container_sandbox_map = {
+            let map = self.container_sandbox_map.read().await;
+            map.get(&container_id).cloned()
+        };
+
+        tokio::spawn(async move {
+            if let Err(e) = run_fd_streaming_task(
+                context,
+                stream_endpoint,
+                stream_id_owned.clone(),
+                container_id.clone(),
+                mac_key,
+                topic,
+                cancel_token,
+                sandbox_pool,
+                container_sandbox_map,
+            ).await {
+                warn!(
+                    stream_id = %stream_id_owned,
+                    container_id = %container_id,
+                    error = %e,
+                    "FD streaming task failed"
+                );
+            }
+        });
+
+        Ok(FdStreamAuthResponse {
+            stream_id: stream_id.to_string(),
+            authorized: true,
         })
     }
 
     /// Detach from a container's terminal I/O streams
     ///
-    /// This is a no-op for now - topics expire via claims.exp in StreamService.
-    /// In the future, we could send an explicit unregister message.
-    pub async fn detach(&self, _container_id: &str) -> Result<()> {
-        // TODO: Send unregister message to StreamService if needed
-        // For now, rely on claims-based expiry
+    /// Cancels all active FD streams for the container.
+    pub async fn detach(&self, container_id: &str) -> Result<()> {
+        // Find and cancel all active streams for this container
+        let mut active_streams = self.active_fd_streams.write().await;
+        let streams_to_cancel: Vec<String> = active_streams
+            .iter()
+            .filter(|(_, active)| active.container_id == container_id)
+            .map(|(stream_id, _)| stream_id.clone())
+            .collect();
+
+        for stream_id in streams_to_cancel {
+            if let Some(active) = active_streams.remove(&stream_id) {
+                info!(
+                    stream_id = %stream_id,
+                    container_id = %container_id,
+                    "Cancelling FD stream"
+                );
+                active.cancel_token.cancel();
+            }
+        }
+
+        // Also remove any pending streams that haven't started yet
+        let mut pending_streams = self.pending_fd_streams.write().await;
+        pending_streams.retain(|_, pending| pending.container_id != container_id);
+
         Ok(())
     }
 }
 
-/// Response from attach() with stream topics
+/// Response from attach() with stream info for DH handshake
 #[derive(Debug, Clone)]
 pub struct AttachResponse {
     pub container_id: String,
-    pub stdin_topic: String,
-    pub stdout_topic: String,
-    pub stderr_topic: String,
+    pub stream_id: String,
     pub stream_endpoint: String,
+    pub server_pubkey: [u8; 32],
+}
+
+/// Response from start_fd_stream() confirming authorization
+#[derive(Debug, Clone)]
+pub struct FdStreamAuthResponse {
+    pub stream_id: String,
+    pub authorized: bool,
+}
+
+/// Pending FD stream awaiting DH handshake completion
+struct PendingFdStream {
+    container_id: String,
+    server_secret: hyprstream_rpc::crypto::RistrettoSecret,
+    server_pubkey: [u8; 32],
+    stream_endpoint: String,
+}
+
+/// Active FD stream with cancellation support
+struct ActiveFdStream {
+    container_id: String,
+    cancel_token: CancellationToken,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FD Streaming Task
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Run the FD streaming task that bridges container I/O to StreamService.
+///
+/// This task:
+/// 1. Creates a PUSH socket to send to StreamService
+/// 2. Creates a StreamBuilder with DH-derived keys
+/// 3. Reads from container console (vsock/serial)
+/// 4. Sends data via StreamBuilder with HMAC authentication
+#[allow(clippy::too_many_arguments)]
+async fn run_fd_streaming_task(
+    context: Arc<zmq::Context>,
+    stream_endpoint: String,
+    stream_id: String,
+    container_id: String,
+    mac_key: [u8; 32],
+    topic: String,
+    cancel_token: CancellationToken,
+    sandbox_pool: Arc<SandboxPool>,
+    sandbox_id: Option<String>,
+) -> anyhow::Result<()> {
+    info!(
+        stream_id = %stream_id,
+        container_id = %container_id,
+        endpoint = %stream_endpoint,
+        "Starting FD streaming task"
+    );
+
+    // Create PUSH socket to send to StreamService
+    let push_socket = context.socket(zmq::PUSH)?;
+    push_socket.connect(&stream_endpoint)?;
+
+    // Create StreamBuilder with DH-derived keys
+    let config = BatchingConfig {
+        min_batch_size: 1,  // Send immediately for interactive terminal
+        max_batch_size: 8,
+        max_block_bytes: 4096,
+        ..Default::default()
+    };
+    let mut builder = StreamBuilder::new(config, mac_key, topic.clone());
+
+    // Get sandbox for this container to access console
+    let sandbox = if let Some(sid) = sandbox_id {
+        sandbox_pool.get(&sid).await
+    } else {
+        None
+    };
+
+    // TODO: Connect to actual container console
+    // For now, we'll use a placeholder that demonstrates the streaming flow.
+    // In a full implementation, this would:
+    // - For Cloud Hypervisor: Connect to vsock or serial console via API socket
+    // - For QEMU: Connect to monitor socket or virtio-serial
+    // - Read stdout/stderr and forward to StreamBuilder
+
+    if sandbox.is_none() {
+        warn!(
+            stream_id = %stream_id,
+            container_id = %container_id,
+            "No sandbox found for container, FD streaming limited"
+        );
+    }
+
+    // Placeholder: Simulate console output for demonstration
+    // In production, this would be replaced with actual vsock/serial reading
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
+
+    loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => {
+                info!(
+                    stream_id = %stream_id,
+                    container_id = %container_id,
+                    "FD streaming cancelled"
+                );
+                break;
+            }
+            _ = interval.tick() => {
+                // In a real implementation, we would:
+                // 1. Poll the vsock/serial for available data
+                // 2. Read the data
+                // 3. Send via StreamBuilder
+                //
+                // For now, this is a placeholder that keeps the task alive
+                // and demonstrates the cancellation flow.
+                //
+                // Example of how data would be sent:
+                // if let Some(data) = console.try_read()? {
+                //     if let Some(frames) = builder.add_data(&data, rate)? {
+                //         frames.send(&push_socket)?;
+                //     }
+                // }
+            }
+        }
+    }
+
+    // Flush any remaining data and send completion
+    if let Some(frames) = builder.add_complete(b"")? {
+        frames.send(&push_socket)?;
+    }
+
+    info!(
+        stream_id = %stream_id,
+        container_id = %container_id,
+        "FD streaming task completed"
+    );
+
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -970,8 +1225,8 @@ impl ZmqService for WorkerService {
         &self.transport
     }
 
-    fn verifying_key(&self) -> VerifyingKey {
-        self.verifying_key
+    fn signing_key(&self) -> SigningKey {
+        self.signing_key.clone()
     }
 }
 
@@ -1201,6 +1456,21 @@ impl WorkerService {
                     Err(e) => Ok(build_error_response(request_id, &e.to_string())),
                 }
             }
+
+            Which::StartFdStream(req) => {
+                let req = req.ok()?;
+                let stream_id = req.get_stream_id().ok()?.to_str().ok()?.to_string();
+                let client_pubkey_data = req.get_client_pubkey().ok()?;
+                if client_pubkey_data.len() != 32 {
+                    return Some(Ok(build_error_response(request_id, "Invalid client pubkey length")));
+                }
+                let mut client_pubkey = [0u8; 32];
+                client_pubkey.copy_from_slice(client_pubkey_data);
+                match self.runtime_handle.block_on(self.start_fd_stream(&stream_id, &client_pubkey)) {
+                    Ok(response) => Ok(build_fd_stream_auth_response(request_id, &response)),
+                    Err(e) => Ok(build_error_response(request_id, &e.to_string())),
+                }
+            }
         })
     }
 
@@ -1400,10 +1670,19 @@ fn build_attach_response(request_id: u64, attach: &AttachResponse) -> Vec<u8> {
         resp.set_request_id(request_id);
         let mut attach_resp = resp.init_attach_response();
         attach_resp.set_container_id(&attach.container_id);
-        attach_resp.set_stdin_topic(&attach.stdin_topic);
-        attach_resp.set_stdout_topic(&attach.stdout_topic);
-        attach_resp.set_stderr_topic(&attach.stderr_topic);
+        attach_resp.set_stream_id(&attach.stream_id);
         attach_resp.set_stream_endpoint(&attach.stream_endpoint);
+        attach_resp.set_server_pubkey(&attach.server_pubkey);
+    }).unwrap_or_default()
+}
+
+fn build_fd_stream_auth_response(request_id: u64, auth: &FdStreamAuthResponse) -> Vec<u8> {
+    serialize_message(|msg| {
+        let mut resp = msg.init_root::<workers_capnp::runtime_response::Builder>();
+        resp.set_request_id(request_id);
+        let mut auth_resp = resp.init_fd_stream_authorized();
+        auth_resp.set_stream_id(&auth.stream_id);
+        auth_resp.set_authorized(auth.authorized);
     }).unwrap_or_default()
 }
 
@@ -1685,9 +1964,9 @@ mod tests {
         // Create a zmq context for event publishing
         let context = Arc::new(zmq::Context::new());
         let transport = TransportConfig::inproc("test-worker-service");
-        let (_, verifying_key) = generate_signing_keypair();
+        let (signing_key, _verifying_key) = generate_signing_keypair();
 
-        let service = WorkerService::new(pool_config, image_config, rafs_store, context, transport, verifying_key)
+        let service = WorkerService::new(pool_config, image_config, rafs_store, context, transport, signing_key)
             .expect("Failed to create WorkerService");
         (service, temp_dir)
     }

@@ -64,9 +64,9 @@ impl Drop for HmacKey {
 /// ```ignore
 /// // Server side: create producer
 /// let mut producer = ChainedStreamHmac::new_producer(hmac_key, request_id);
-/// for chunk in chunks {
-///     let mac = producer.compute_next(&chunk);
-///     send(StreamChunk { request_id, data: chunk, hmac: mac });
+/// for payloads in batches {
+///     let mac = producer.compute_next(&payloads);
+///     send_multipart([topic, StreamBlock { payloads, prev_mac }, mac]);
 /// }
 ///
 /// // Client side: create verifier

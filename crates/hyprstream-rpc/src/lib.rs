@@ -63,6 +63,7 @@ pub mod envelope;
 pub mod error;
 pub mod registry;
 pub mod service;
+pub mod streaming;
 pub mod transport;
 
 /// Prelude for convenient imports.

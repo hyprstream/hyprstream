@@ -24,12 +24,19 @@ use hyprstream_rpc::prelude::*;
 // Re-export core types from hyprstream-rpc
 pub use hyprstream_rpc::service::{CallOptions, EnvelopeContext, ZmqClient as ZmqClientBase, ZmqService};
 
-/// Authenticated ZMQ client with automatic request signing.
+/// Authenticated ZMQ client with automatic request signing and response verification.
 ///
 /// This is a convenience wrapper around `hyprstream_rpc::ZmqClient` that
 /// automatically uses the global ZMQ context for `inproc://` connectivity.
 ///
 /// For direct context control, use `ZmqClientBase` from hyprstream-rpc.
+///
+/// # E2E Authentication
+///
+/// - **Requests**: Automatically signed with Ed25519
+/// - **Responses**: Automatically verified against server's public key
+///
+/// There is NO way to receive unverified response data.
 ///
 /// # Usage
 ///
@@ -39,7 +46,7 @@ pub use hyprstream_rpc::service::{CallOptions, EnvelopeContext, ZmqClient as Zmq
 /// ```ignore
 /// use crate::services::{ZmqClient, RegistryOps};
 ///
-/// let client = ZmqClient::new("inproc://hyprstream/registry", signing_key, identity);
+/// let client = ZmqClient::new("inproc://hyprstream/registry", signing_key, server_verifying_key, identity);
 /// let repos = client.list().await?;  // RegistryOps method
 /// ```
 pub struct ZmqClient {
@@ -47,17 +54,23 @@ pub struct ZmqClient {
 }
 
 impl ZmqClient {
-    /// Create a new client with signing credentials.
+    /// Create a new client with signing credentials and server verification key.
     ///
     /// Uses the global ZMQ context for `inproc://` connectivity.
     ///
     /// # Arguments
     /// * `endpoint` - ZMQ endpoint (e.g., `inproc://hyprstream/registry`)
     /// * `signing_key` - Ed25519 signing key for request authentication
+    /// * `server_verifying_key` - Server's Ed25519 public key for response verification
     /// * `identity` - Identity to include in requests (for authorization)
-    pub fn new(endpoint: &str, signing_key: SigningKey, identity: RequestIdentity) -> Self {
+    ///
+    /// # Security
+    ///
+    /// The `server_verifying_key` is MANDATORY. All responses are verified
+    /// against this key before being returned. There is no way to bypass verification.
+    pub fn new(endpoint: &str, signing_key: SigningKey, server_verifying_key: VerifyingKey, identity: RequestIdentity) -> Self {
         Self {
-            inner: ZmqClientBase::new(endpoint, global_context(), signing_key, identity),
+            inner: ZmqClientBase::new(endpoint, global_context(), signing_key, server_verifying_key, identity),
         }
     }
 
@@ -81,6 +94,11 @@ impl ZmqClient {
         self.inner.signing_key()
     }
 
+    /// Get the server's verifying key for response verification.
+    pub fn server_verifying_key(&self) -> &VerifyingKey {
+        self.inner.server_verifying_key()
+    }
+
     /// Sign and send a request.
     ///
     /// All requests are automatically wrapped in `SignedEnvelope`.
@@ -99,18 +117,21 @@ impl ZmqClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use hyprstream_rpc::crypto::generate_signing_keypair;
+    use hyprstream_rpc::service::RequestLoop;
+    use hyprstream_rpc::transport::TransportConfig;
 
     /// Test service with infrastructure (new pattern)
     struct EchoService {
         context: Arc<zmq::Context>,
         transport: TransportConfig,
-        verifying_key: VerifyingKey,
+        signing_key: SigningKey,
     }
 
     impl EchoService {
-        fn new(context: Arc<zmq::Context>, transport: TransportConfig, verifying_key: VerifyingKey) -> Self {
-            Self { context, transport, verifying_key }
+        fn new(context: Arc<zmq::Context>, transport: TransportConfig, signing_key: SigningKey) -> Self {
+            Self { context, transport, signing_key }
         }
     }
 
@@ -135,8 +156,8 @@ mod tests {
             &self.transport
         }
 
-        fn verifying_key(&self) -> VerifyingKey {
-            self.verifying_key
+        fn signing_key(&self) -> SigningKey {
+            self.signing_key.clone()
         }
     }
 
@@ -149,15 +170,15 @@ mod tests {
         let (signing_key, verifying_key) = generate_signing_keypair();
 
         // Create service with infrastructure
-        let service = EchoService::new(global_context(), transport.clone(), verifying_key);
+        let service = EchoService::new(global_context(), transport.clone(), signing_key.clone());
 
         // Start the service using RequestLoop from hyprstream-rpc
-        let runner = RequestLoopBase::new(transport, global_context(), verifying_key);
+        let runner = RequestLoop::new(transport, global_context(), signing_key.clone());
         let mut handle = runner.run(service).await.expect("test: start service");
 
-        // Use ZmqClient directly (handles signing internally)
-        let client = ZmqClient::new(&endpoint, signing_key, RequestIdentity::local());
-        let response = client.call(b"hello".to_vec(), None).await.expect("test: call");
+        // Use ZmqClient with server's verifying key for response verification
+        let client = ZmqClient::new(&endpoint, signing_key, verifying_key, RequestIdentity::local());
+        let response = client.call(b"hello".to_vec(), CallOptions::default()).await.expect("test: call");
 
         // Response should start with "from <user>:"
         let response_str = String::from_utf8_lossy(&response);
@@ -168,27 +189,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_invalid_signature_rejected() {
-        let transport = TransportConfig::inproc("test-invalid-sig-core");
+    async fn test_invalid_request_signature_rejected() {
+        let transport = TransportConfig::inproc("test-invalid-req-sig-core");
         let endpoint = transport.zmq_endpoint();
 
-        // Generate two keypairs - use one to sign, verify with other
-        let (signing_key, _) = generate_signing_keypair();
-        let (_, wrong_verifying_key) = generate_signing_keypair();
+        // Generate two keypairs - service uses one, client uses other
+        let (server_signing_key, server_verifying_key) = generate_signing_keypair();
+        let (client_signing_key, _client_verifying_key) = generate_signing_keypair();
 
-        // Create service (verifying_key here doesn't matter - RequestLoop uses its own)
-        let service = EchoService::new(global_context(), transport.clone(), wrong_verifying_key);
+        // Create service with server's key
+        let service = EchoService::new(global_context(), transport.clone(), server_signing_key.clone());
 
-        // Start the service with wrong key
-        let runner = RequestLoopBase::new(transport, global_context(), wrong_verifying_key);
+        // Start the service
+        let runner = RequestLoop::new(transport, global_context(), server_signing_key);
         let mut handle = runner.run(service).await.expect("test: start service");
 
-        // Sign with different key than service expects
-        let client = ZmqClient::new(&endpoint, signing_key, RequestIdentity::local());
-        let response = client.call(b"should fail".to_vec(), None).await.expect("test: call");
+        // Sign request with different key than service expects
+        // But verify responses with server's key
+        let client = ZmqClient::new(&endpoint, client_signing_key, server_verifying_key, RequestIdentity::local());
+        let result = client.call(b"should fail".to_vec(), CallOptions::default()).await;
 
-        // Response should be empty (verification failure)
-        assert!(response.is_empty(), "Invalid signature should return empty response");
+        // Request should be rejected by server
+        match result {
+            Ok(response) => {
+                assert!(response.is_empty(), "Invalid request signature should return empty response");
+            }
+            Err(_) => {
+                // Error is also acceptable
+            }
+        }
 
         handle.stop().await;
     }

@@ -630,8 +630,8 @@ impl InferenceResponse {
 
     /// Build an inference payload message with a token.
     ///
-    /// The payload is serialized into streaming_capnp::StreamChunk.data.
-    /// Ordering is handled by prevHmac in the outer StreamChunk wrapper.
+    /// The payload is serialized into streaming_capnp::StreamBlock.payloads.
+    /// Ordering is handled by prevMac in the outer StreamBlock wrapper.
     pub fn inference_token(stream_id: &str, token: &str) -> Vec<u8> {
         let mut msg = Builder::new_default();
         let mut payload = msg.init_root::<inference_capnp::inference_payload::Builder>();
@@ -694,71 +694,10 @@ impl InferenceResponse {
 // Authenticated Streaming Helpers
 // ============================================================================
 
-use hmac::{Hmac, Mac};
 use hyprstream_rpc::common_capnp;
 use hyprstream_rpc::streaming_capnp;
 use hyprstream_rpc::envelope::{RequestEnvelope, SignedEnvelope};
 use hyprstream_rpc::prelude::SigningKey;
-use sha2::Sha256;
-
-type HmacSha256 = Hmac<Sha256>;
-
-/// HMAC chain state for authenticated streaming.
-///
-/// Tracks the last HMAC for computing the chain:
-/// - mac_0 = HMAC(key, topic || data_0)
-/// - mac_n = HMAC(key, mac_{n-1} || data_n)
-#[derive(Clone)]
-pub struct HmacChainState {
-    /// HMAC key (derived from DH or pre-shared)
-    key: [u8; 32],
-    /// Last computed HMAC (None for first chunk)
-    last_hmac: Option<[u8; 32]>,
-    /// Topic for this stream
-    topic: String,
-}
-
-impl HmacChainState {
-    /// Create new HMAC chain state with a key and topic.
-    pub fn new(key: [u8; 32], topic: String) -> Self {
-        Self {
-            key,
-            last_hmac: None,
-            topic,
-        }
-    }
-
-    /// Compute HMAC for the next chunk and update chain state.
-    /// Returns (new_hmac, prev_hmac) where prev_hmac is None for first chunk.
-    pub fn compute_next(&mut self, data: &[u8]) -> ([u8; 32], Option<[u8; 32]>) {
-        let mut mac = HmacSha256::new_from_slice(&self.key)
-            .expect("HMAC accepts any key size");
-
-        let prev_hmac = self.last_hmac;
-
-        match &prev_hmac {
-            None => {
-                // First chunk: HMAC(key, topic || data)
-                mac.update(self.topic.as_bytes());
-                mac.update(data);
-            }
-            Some(prev) => {
-                // Subsequent chunks: HMAC(key, prev_hmac || data)
-                mac.update(prev);
-                mac.update(data);
-            }
-        }
-
-        let result: [u8; 32] = mac.finalize().into_bytes().into();
-        self.last_hmac = Some(result);
-        (result, prev_hmac)
-    }
-
-    /// Get the topic.
-    pub fn topic(&self) -> &str {
-        &self.topic
-    }
-}
 
 /// Build a StreamRegister message wrapped in SignedEnvelope.
 ///
@@ -809,90 +748,141 @@ pub fn build_stream_register_envelope(
     serialize::write_message(&mut bytes, &out).unwrap_or_default();
     bytes
 }
+// ============================================================================
+// StreamBlock Types - Re-exported from hyprstream-rpc
+// ============================================================================
 
-/// Build an authenticated StreamChunk with HMAC and prev_hmac for ordering.
-///
-/// The data is the inner payload (e.g., serialized InferencePayload).
-/// HMAC is computed using the chain state. prev_hmac enables out-of-order reconstruction.
-///
-/// # Arguments
-/// * `topic` - DH-derived topic for ZMQ routing (outer wrapper)
-/// * `data` - Inner payload (serialized InferencePayload)
-/// * `hmac_state` - HMAC chain state (uses topic from state for HMAC computation)
-pub fn build_authenticated_stream_chunk(
-    topic: &str,
-    data: &[u8],
-    hmac_state: &mut HmacChainState,
-) -> Vec<u8> {
-    let (hmac, prev_hmac) = hmac_state.compute_next(data);
+// Re-export generic streaming types from hyprstream-rpc
+pub use hyprstream_rpc::streaming::{
+    BatchingConfig,
+    StreamBuilder,
+    StreamFrames,
+    StreamHandle,
+    StreamHmacState,
+    StreamPayload,
+    StreamPayloadData,
+    StreamVerifier,
+};
 
-    let mut msg = Builder::new_default();
-    {
-        let mut chunk = msg.init_root::<streaming_capnp::stream_chunk::Builder>();
-        chunk.set_topic(topic);
-        chunk.set_data(data);
-        chunk.set_hmac(&hmac);
-        // prev_hmac enables receiver to reconstruct order from out-of-order delivery
-        chunk.set_prev_hmac(prev_hmac.as_ref().map(|h| h.as_slice()).unwrap_or(&[]));
+/// Alias for backwards compatibility
+pub type ParsedStreamPayload = StreamPayload;
+
+// ============================================================================
+// Inference-Specific Stream Types
+// ============================================================================
+
+/// Inference-specific completion metadata (serialized into StreamPayload.complete).
+///
+/// This is the application-layer completion data for inference streams.
+/// Serialized as JSON for simplicity and debuggability.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct InferenceComplete {
+    pub tokens_generated: usize,
+    pub generation_time_ms: u64,
+    pub tokens_per_second: f32,
+    pub finish_reason: String,
+    // Prefill metrics
+    pub prefill_tokens: usize,
+    pub prefill_time_ms: u64,
+    pub prefill_tokens_per_sec: f32,
+    // Inference metrics
+    pub inference_tokens: usize,
+    pub inference_time_ms: u64,
+    pub inference_tokens_per_sec: f32,
+    pub inference_tokens_per_sec_ema: f32,
+    // Optional quality metrics
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perplexity: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_entropy: Option<f32>,
+}
+
+impl InferenceComplete {
+    /// Serialize to bytes for StreamPayload.complete.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_default()
     }
 
-    let mut bytes = Vec::new();
-    serialize::write_message(&mut bytes, &msg).unwrap_or_default();
-    bytes
+    /// Deserialize from StreamPayload.complete bytes.
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        serde_json::from_slice(data).map_err(|e| anyhow::anyhow!("Failed to parse InferenceComplete: {}", e))
+    }
 }
 
-/// Build an authenticated stream chunk containing text (convenience wrapper).
-///
-/// Wraps the InferencePayload in streaming_capnp::StreamChunk with HMAC + prevHmac.
-///
-/// # Arguments
-/// * `stream_id` - Stream ID for inner message (client display/logging)
-/// * `token` - Token text
-/// * `hmac_state` - HMAC chain state (contains DH-derived topic for outer wrapper)
-pub fn build_authenticated_token_chunk(
-    stream_id: &str,
-    token: &str,
-    hmac_state: &mut HmacChainState,
-) -> Vec<u8> {
-    // Build inner InferencePayload (stream_id for client display)
-    let inner = InferenceResponse::inference_token(stream_id, token);
-    // Get topic before mutable borrow
-    let topic = hmac_state.topic().to_string();
-    // Wrap with DH-derived topic for ZMQ routing
-    build_authenticated_stream_chunk(&topic, &inner, hmac_state)
+impl From<&crate::runtime::GenerationStats> for InferenceComplete {
+    fn from(stats: &crate::runtime::GenerationStats) -> Self {
+        let finish_reason = match &stats.finish_reason {
+            Some(crate::config::FinishReason::MaxTokens) => "length",
+            Some(crate::config::FinishReason::EndOfSequence) => "eos",
+            Some(crate::config::FinishReason::Stop) => "stop",
+            Some(crate::config::FinishReason::StopToken(_)) => "stop",
+            Some(crate::config::FinishReason::Error(_)) => "error",
+            None => "unknown",
+        };
+        Self {
+            tokens_generated: stats.tokens_generated,
+            generation_time_ms: stats.generation_time_ms,
+            tokens_per_second: stats.tokens_per_second,
+            finish_reason: finish_reason.to_string(),
+            prefill_tokens: stats.prefill_tokens,
+            prefill_time_ms: stats.prefill_time_ms,
+            prefill_tokens_per_sec: stats.prefill_tokens_per_sec,
+            inference_tokens: stats.inference_tokens,
+            inference_time_ms: stats.inference_time_ms,
+            inference_tokens_per_sec: stats.inference_tokens_per_sec,
+            inference_tokens_per_sec_ema: stats.inference_tokens_per_sec_ema,
+            perplexity: stats.quality_metrics.as_ref().map(|m| m.perplexity),
+            avg_entropy: stats.quality_metrics.as_ref().map(|m| m.avg_entropy),
+        }
+    }
 }
 
-/// Build an authenticated stream chunk containing an error.
+/// Inference-specific stream payload (parsed from generic StreamPayload).
 ///
-/// # Arguments
-/// * `stream_id` - Stream ID for inner message (client display/logging)
-/// * `error` - Error message
-/// * `hmac_state` - HMAC chain state (contains DH-derived topic for outer wrapper)
-pub fn build_authenticated_error_chunk(
-    stream_id: &str,
-    error: &str,
-    hmac_state: &mut HmacChainState,
-) -> Vec<u8> {
-    let inner = InferenceResponse::inference_error(stream_id, error);
-    let topic = hmac_state.topic().to_string();
-    build_authenticated_stream_chunk(&topic, &inner, hmac_state)
+/// Provides typed access to inference stream data:
+/// - Token: UTF-8 text token
+/// - Error: Error message
+/// - Complete: Generation statistics
+///
+/// Note: Stream identity comes from the DH-derived topic, not from payload fields.
+/// The topic cryptographically binds the stream to the DH key exchange.
+#[derive(Debug, Clone)]
+pub enum InferenceStreamPayload {
+    /// UTF-8 text token
+    Token(String),
+    /// Error during streaming
+    Error(String),
+    /// Completion with generation statistics
+    Complete(InferenceComplete),
 }
 
-/// Build an authenticated stream chunk containing completion stats.
-///
-/// # Arguments
-/// * `stream_id` - Stream ID for inner message (client display/logging)
-/// * `stats` - Generation statistics
-/// * `hmac_state` - HMAC chain state (contains DH-derived topic for outer wrapper)
-pub fn build_authenticated_complete_chunk(
-    stream_id: &str,
-    stats: &GenerationStats,
-    hmac_state: &mut HmacChainState,
-) -> Vec<u8> {
-    let inner = InferenceResponse::inference_complete(stream_id, stats);
-    let topic = hmac_state.topic().to_string();
-    build_authenticated_stream_chunk(&topic, &inner, hmac_state)
+/// Extension trait to convert generic StreamPayload to inference-specific payload.
+pub trait StreamPayloadExt {
+    /// Convert generic payload to inference-specific payload.
+    ///
+    /// Interprets Data as UTF-8 text tokens and Complete as InferenceComplete.
+    fn to_inference(self) -> Result<InferenceStreamPayload>;
 }
+
+impl StreamPayloadExt for StreamPayload {
+    fn to_inference(self) -> Result<InferenceStreamPayload> {
+        match self {
+            StreamPayload::Data(data) => {
+                let text = String::from_utf8(data)
+                    .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in token: {}", e))?;
+                Ok(InferenceStreamPayload::Token(text))
+            }
+            StreamPayload::Error(message) => {
+                Ok(InferenceStreamPayload::Error(message))
+            }
+            StreamPayload::Complete(data) => {
+                let stats = InferenceComplete::from_bytes(&data)?;
+                Ok(InferenceStreamPayload::Complete(stats))
+            }
+        }
+    }
+}
+
 
 // ============================================================================
 // Policy Service Types

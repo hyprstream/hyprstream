@@ -337,6 +337,10 @@ pub struct RegistryZmq {
 
 impl RegistryZmq {
     /// Create a new registry client with signing credentials.
+    ///
+    /// # Note
+    /// Uses the same signing key for both request signing and response verification.
+    /// This is appropriate for internal communication where client and server share keys.
     pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
         let endpoint = registry().endpoint(SERVICE_NAME, SocketKind::Rep).to_zmq_string();
         Self::with_endpoint(&endpoint, signing_key, identity)
@@ -344,8 +348,9 @@ impl RegistryZmq {
 
     /// Create a registry client connected to a specific endpoint.
     pub fn with_endpoint(endpoint: &str, signing_key: SigningKey, identity: RequestIdentity) -> Self {
+        let server_verifying_key = signing_key.verifying_key();
         Self {
-            client: ZmqClient::new(endpoint, signing_key, identity),
+            client: ZmqClient::new(endpoint, signing_key, server_verifying_key, identity),
         }
     }
 
@@ -488,7 +493,7 @@ pub struct RegistryService {
     // Infrastructure (for Spawnable)
     context: Arc<zmq::Context>,
     transport: TransportConfig,
-    verifying_key: VerifyingKey,
+    signing_key: SigningKey,
 }
 
 impl RegistryService {
@@ -500,7 +505,7 @@ impl RegistryService {
         policy_client: PolicyZmqClient,
         context: Arc<zmq::Context>,
         transport: TransportConfig,
-        verifying_key: VerifyingKey,
+        signing_key: SigningKey,
     ) -> Result<Self> {
         let base_dir = base_dir.as_ref().to_path_buf();
         let registry = Git2DB::open(&base_dir).await?;
@@ -514,7 +519,7 @@ impl RegistryService {
             policy_client,
             context,
             transport,
-            verifying_key,
+            signing_key,
         })
     }
 
@@ -1535,8 +1540,8 @@ impl ZmqService for RegistryService {
         &self.transport
     }
 
-    fn verifying_key(&self) -> VerifyingKey {
-        self.verifying_key
+    fn signing_key(&self) -> SigningKey {
+        self.signing_key.clone()
     }
 }
 
@@ -1609,7 +1614,8 @@ impl RepositoryZmqClient {
 
     /// Create a ZmqClient with this client's credentials for raw RPC calls.
     fn create_inner_client(&self) -> ZmqClient {
-        ZmqClient::new(&self.endpoint, self.signing_key.clone(), self.identity.clone())
+        let server_verifying_key = self.signing_key.verifying_key();
+        ZmqClient::new(&self.endpoint, self.signing_key.clone(), server_verifying_key, self.identity.clone())
     }
 
     /// Parse a worktrees list response
@@ -2608,7 +2614,6 @@ mod tests {
             crate::config::TokenConfig::default(),
             context.clone(),
             policy_transport,
-            verifying_key,
         );
         let manager = InprocManager::new();
         let _policy_handle = manager.spawn(Box::new(policy_service)).await.expect("test: start policy service");
@@ -2627,7 +2632,7 @@ mod tests {
             policy_client,
             context.clone(),
             registry_transport,
-            verifying_key,
+            signing_key.clone(),
         ).await.expect("test: create registry service");
         let mut handle = manager.spawn(Box::new(registry_service)).await.expect("test: start registry service");
 

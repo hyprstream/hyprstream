@@ -5581,6 +5581,7 @@ dependencies = [
  "tmq",
  "tokio",
  "tokio-test",
+ "tokio-util",
  "tracing",
  "uuid 1.18.1",
  "walkdir",

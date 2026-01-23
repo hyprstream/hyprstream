@@ -25,7 +25,7 @@ fn main() {
             .expect("failed to compile common.capnp");
     }
 
-    // Compile streaming schema (StreamChunk, StreamBlock, StreamRegister, etc.)
+    // Compile streaming schema (StreamBlock, StreamPayload, StreamRegister, etc.)
     let streaming_schema = schema_dir.join("streaming.capnp");
     if streaming_schema.exists() {
         capnpc::CompilerCommand::new()

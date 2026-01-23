@@ -102,7 +102,7 @@ impl<S: ZmqService> Spawnable for S {
         // Extract infrastructure before consuming self
         let transport = ZmqService::transport(&*self).clone();
         let context = ZmqService::context(&*self).clone();
-        let verifying_key = ZmqService::verifying_key(&*self);
+        let signing_key = ZmqService::signing_key(&*self);
 
         // Create a single-threaded runtime for blocking execution
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -111,7 +111,7 @@ impl<S: ZmqService> Spawnable for S {
             .map_err(|e| crate::error::RpcError::SpawnFailed(format!("runtime: {}", e)))?;
 
         rt.block_on(async move {
-            let runner = RequestLoop::new(transport, context, verifying_key);
+            let runner = RequestLoop::new(transport, context, signing_key);
 
             match runner.run(*self).await {
                 Ok(mut handle) => {
@@ -776,7 +776,7 @@ impl ServiceManager for InprocManager {
 mod tests {
     use super::*;
     use crate::crypto::generate_signing_keypair;
-    use crate::prelude::VerifyingKey;
+    use crate::prelude::SigningKey;
     use crate::service::ZmqService;
     use anyhow::Result as AnyhowResult;
 
@@ -784,12 +784,12 @@ mod tests {
     struct EchoService {
         context: Arc<zmq::Context>,
         transport: TransportConfig,
-        verifying_key: VerifyingKey,
+        signing_key: SigningKey,
     }
 
     impl EchoService {
-        fn new(context: Arc<zmq::Context>, transport: TransportConfig, verifying_key: VerifyingKey) -> Self {
-            Self { context, transport, verifying_key }
+        fn new(context: Arc<zmq::Context>, transport: TransportConfig, signing_key: SigningKey) -> Self {
+            Self { context, transport, signing_key }
         }
     }
 
@@ -814,19 +814,19 @@ mod tests {
             &self.transport
         }
 
-        fn verifying_key(&self) -> VerifyingKey {
-            self.verifying_key
+        fn signing_key(&self) -> SigningKey {
+            self.signing_key.clone()
         }
     }
 
     #[tokio::test]
     async fn test_tokio_spawner() {
         let context = Arc::new(zmq::Context::new());
-        let (_, verifying_key) = generate_signing_keypair();
+        let (signing_key, _verifying_key) = generate_signing_keypair();
         let transport = TransportConfig::inproc("test-spawner-tokio");
 
         // Service is directly Spawnable - no wrapping needed
-        let service = EchoService::new(context, transport, verifying_key);
+        let service = EchoService::new(context, transport, signing_key);
 
         let spawner = ServiceSpawner::tokio();
         let mut spawned = spawner.spawn(service).await.unwrap();
@@ -839,11 +839,11 @@ mod tests {
     #[tokio::test]
     async fn test_thread_spawner() {
         let context = Arc::new(zmq::Context::new());
-        let (_, verifying_key) = generate_signing_keypair();
+        let (signing_key, _verifying_key) = generate_signing_keypair();
         let transport = TransportConfig::inproc("test-spawner-thread");
 
         // Service is directly Spawnable - no wrapping needed
-        let service = EchoService::new(context, transport, verifying_key);
+        let service = EchoService::new(context, transport, signing_key);
 
         let spawner = ServiceSpawner::threaded();
         let mut spawned = spawner.spawn(service).await.unwrap();

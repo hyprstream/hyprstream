@@ -190,7 +190,7 @@ fn default_flight_port() -> u16 { 50051 }
 /// StreamService configuration
 ///
 /// Controls the PULL/XPUB streaming proxy behavior including buffer sizes,
-/// message TTL, and retransmission settings.
+/// message TTL, retransmission settings, and StreamBlock batching.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamingConfig {
     /// Maximum pending messages per topic (for pre-subscribe queue and retransmit buffer)
@@ -207,6 +207,14 @@ pub struct StreamingConfig {
     /// Default: 5
     #[serde(default = "default_compact_interval_secs")]
     pub compact_interval_secs: u64,
+
+    /// StreamBlock batching configuration (rate control)
+    ///
+    /// Controls adaptive batching based on throughput rate.
+    /// Higher rates → larger batches (reduced overhead).
+    /// Lower rates → smaller batches (reduced latency).
+    #[serde(flatten, default)]
+    pub batching: hyprstream_rpc::streaming::BatchingConfig,
 }
 
 impl Default for StreamingConfig {
@@ -215,6 +223,7 @@ impl Default for StreamingConfig {
             max_pending_per_topic: default_max_pending_per_topic(),
             message_ttl_secs: default_message_ttl_secs(),
             compact_interval_secs: default_compact_interval_secs(),
+            batching: hyprstream_rpc::streaming::BatchingConfig::default(),
         }
     }
 }

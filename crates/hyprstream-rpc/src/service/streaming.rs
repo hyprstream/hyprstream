@@ -8,15 +8,15 @@
 //!    │─ SignedEnvelope(StreamRegister) ►│                              │
 //!    │   [verify sig, check claims]     │                              │
 //!    │                                  │                              │
-//!    │─ StreamChunk(topic,data,hmac) ──►│                              │
-//!    │   [extract topic from capnp]     │                              │
+//!    │─ StreamBlock [topic,capnp,mac] ─►│                              │
+//!    │   [extract topic from frame 0]   │                              │
 //!    │   [NO HMAC verification]         │                              │
-//!    │                                  │─ {topic}{StreamChunk} ──────►│
+//!    │                                  │─ [topic,capnp,mac] ─────────►│
 //!    │                                  │   [XPUB prefix routing]      │[verify HMAC chain]
 //!    │                                  │                              │
 //!    │                                  │◄─ StreamResume(topic,hmac) ──│
 //!    │                                  │   [find hmac in buffer]      │
-//!    │                                  │─ {buffered chunks...} ──────►│
+//!    │                                  │─ {buffered blocks...} ──────►│
 //! ```
 //!
 //! # Why PUSH/PULL instead of PUB/XSUB
@@ -38,9 +38,9 @@
 //!
 //! - **Topic derivation**: DH-derived topic (InferenceService ↔ Client) - unpredictable
 //! - **StreamRegister**: Signed capnp wrapped in `SignedEnvelope`, verified before accepting
-//! - **StreamChunk**: Contains DH-derived topic, data, and chained HMAC
+//! - **StreamBlock**: 3-frame multipart [topic, capnp, 16-byte MAC] with batched payloads
 //! - **Client verifies**: Client derives same keys from DH and verifies HMAC chain
-//! - **StreamResume**: Client provides last valid HMAC, service resends subsequent chunks
+//! - **StreamResume**: Client provides last valid HMAC, service resends subsequent blocks
 //!
 //! # Memory Management
 //!
@@ -55,6 +55,7 @@ use crate::auth::Scope;
 use crate::capnp::FromCapnp;
 use crate::common_capnp;
 use crate::streaming_capnp;
+use crate::crypto::VerifyingKey;
 use crate::envelope::{InMemoryNonceCache, SignedEnvelope};
 use crate::transport::TransportConfig;
 use anyhow::{anyhow, Result};
@@ -67,12 +68,12 @@ use tracing::{debug, error, info, trace, warn};
 
 /// A pending message waiting for a subscriber
 struct PendingMessage {
-    /// Original capnp-serialized StreamChunk bytes
-    data: Vec<u8>,
+    /// Message frames (multipart: [topic, capnp, mac])
+    frames: Vec<Vec<u8>>,
     /// When this message was received
     received_at: Instant,
-    /// The HMAC from this chunk (for retransmit buffer indexing)
-    hmac: [u8; 32],
+    /// The MAC from this message (for retransmit buffer indexing, 16 bytes)
+    mac: Vec<u8>,
 }
 
 /// State for an authorized stream
@@ -94,9 +95,16 @@ struct StreamState {
 }
 
 impl StreamState {
-    /// Find position in buffer matching the given HMAC
-    fn find_hmac_position(&self, hmac: &[u8; 32]) -> Option<usize> {
-        self.messages.iter().position(|msg| msg.hmac.ct_eq(hmac).into())
+    /// Find position in buffer matching the given MAC
+    /// Supports both 32-byte legacy HMAC and 16-byte StreamBlock MAC
+    fn find_mac_position(&self, mac: &[u8]) -> Option<usize> {
+        self.messages.iter().position(|msg| {
+            if msg.mac.len() == mac.len() {
+                msg.mac.ct_eq(mac).into()
+            } else {
+                false
+            }
+        })
     }
 }
 
@@ -133,8 +141,10 @@ pub struct StreamService {
     compact_interval: Duration,
 
     /// Nonce cache for replay protection on SignedEnvelope
-    #[allow(dead_code)]
     nonce_cache: Arc<InMemoryNonceCache>,
+
+    /// Verifying key for signature verification on StreamRegister messages
+    verifying_key: VerifyingKey,
 }
 
 impl StreamService {
@@ -145,6 +155,7 @@ impl StreamService {
     /// * `context` - ZMQ context
     /// * `pub_transport` - XPUB frontend config (client-facing, with optional CurveZMQ)
     /// * `pull_transport` - PULL backend config (receives from publishers)
+    /// * `verifying_key` - Ed25519 public key for verifying StreamRegister signatures
     ///
     /// # Security (E2E Authentication)
     ///
@@ -158,6 +169,7 @@ impl StreamService {
         context: Arc<zmq::Context>,
         pub_transport: TransportConfig,
         pull_transport: TransportConfig,
+        verifying_key: VerifyingKey,
     ) -> Self {
         let name = name.into();
 
@@ -186,6 +198,7 @@ impl StreamService {
             max_pending_per_topic: 1000,
             compact_interval: Duration::from_secs(5),
             nonce_cache: Arc::new(InMemoryNonceCache::new()),
+            verifying_key,
         }
     }
 
@@ -210,7 +223,7 @@ impl StreamService {
     /// Handle a SignedEnvelope(StreamRegister) message
     ///
     /// 1. Parse SignedEnvelope from capnp
-    /// 2. Verify signature (skip for now - trusted internal network)
+    /// 2. Verify signature against expected service pubkey
     /// 3. Parse StreamRegister from payload
     /// 4. Check claims allow publishing to this topic
     /// 5. Register the stream (topic is DH-derived, unpredictable)
@@ -232,9 +245,9 @@ impl StreamService {
         let signed_reader = reader.get_root::<common_capnp::signed_envelope::Reader>()?;
         let signed = SignedEnvelope::read_from(signed_reader)?;
 
-        // TODO: Verify signature against expected service pubkey
-        // For now, we trust the internal network (same machine IPC)
-        // In production, you'd verify against a known set of service pubkeys
+        // Verify signature against expected service pubkey (mandatory)
+        // Full verification with nonce cache for replay protection
+        signed.verify(&self.verifying_key, &*self.nonce_cache)?;
 
         // Parse StreamRegister from payload
         // Topic is DH-derived (64 hex chars), unpredictable
@@ -472,118 +485,44 @@ impl StreamService {
                 }
             }
 
-            // PULL → Handle SignedEnvelope(StreamRegister), StreamChunk, or StreamResume
+            // PULL → Handle SignedEnvelope(StreamRegister), StreamBlock, or StreamResume
             if items[0].is_readable() {
-                match pull.recv_bytes(0) {
-                    Ok(message) => {
-                        // Try to parse as SignedEnvelope (StreamRegister)
-                        if is_signed_envelope(&message) {
-                            match self.handle_register(&message, &mut streams) {
-                                Ok(topic) => {
-                                    info!(
-                                        service = %self.name,
-                                        topic = %topic,
-                                        "Stream registered via SignedEnvelope"
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        service = %self.name,
-                                        error = %e,
-                                        "Failed to process StreamRegister"
-                                    );
-                                }
-                            }
-                            continue;
-                        }
+                match pull.recv_multipart(0) {
+                    Ok(frames) => {
+                        // Check for 3-frame StreamBlock multipart: [topic, capnp, 16-byte mac]
+                        if frames.len() == 3 && frames[2].len() == 16 {
+                            // StreamBlock multipart format
+                            let topic = String::from_utf8_lossy(&frames[0]).to_string();
+                            let mac = frames[2].clone();
 
-                        // Try to parse as StreamResume (retransmit request)
-                        if let Some((topic, resume_hmac)) = parse_stream_resume(&message) {
-                            if let Some(state) = streams.get(&topic) {
-                                if let Some(start_idx) = state.find_hmac_position(&resume_hmac) {
-                                    // Resend all chunks after the resume point
-                                    let mut resent = 0;
-                                    for msg in state.messages.iter().skip(start_idx + 1) {
-                                        // Send with topic prefix for XPUB routing
-                                        let mut prefixed = topic.as_bytes().to_vec();
-                                        prefixed.extend_from_slice(&msg.data);
-                                        if let Err(e) = xpub.send(&prefixed, 0) {
-                                            error!(
-                                                service = %self.name,
-                                                topic = %topic,
-                                                error = %e,
-                                                "Failed to resend chunk on resume"
-                                            );
-                                            break;
-                                        }
-                                        resent += 1;
-                                    }
-                                    info!(
-                                        service = %self.name,
-                                        topic = %topic,
-                                        resent = resent,
-                                        "Processed StreamResume request"
-                                    );
-                                } else {
-                                    warn!(
-                                        service = %self.name,
-                                        topic = %topic,
-                                        "StreamResume HMAC not found in buffer"
-                                    );
-                                }
-                            } else {
-                                warn!(
-                                    service = %self.name,
-                                    topic = %topic,
-                                    "StreamResume for unknown topic"
-                                );
-                            }
-                            continue;
-                        }
-
-                        // Parse as StreamChunk capnp - blind forward (no HMAC verification)
-                        // Client verifies HMAC chain end-to-end
-                        if let Some((topic, _data, hmac)) = parse_stream_chunk(&message) {
                             if let Some(state) = streams.get_mut(&topic) {
-                                // Blind forward - no HMAC verification
-                                // Client verifies HMAC chain using DH-derived keys
-
                                 if state.subscribed {
-                                    // Subscriber exists → deliver immediately
-                                    // Send with topic prefix for XPUB routing
-                                    let mut prefixed = topic.as_bytes().to_vec();
-                                    prefixed.extend_from_slice(&message);
+                                    // Forward multipart message (topic is already first frame)
                                     trace!(
                                         service = %self.name,
                                         topic = %topic,
-                                        len = message.len(),
-                                        "Forwarding message to subscriber (blind)"
+                                        frames = frames.len(),
+                                        "Forwarding StreamBlock to subscriber (blind)"
                                     );
-                                    if let Err(e) = xpub.send(&prefixed, 0) {
+                                    if let Err(e) = send_multipart(&xpub, &frames) {
                                         error!(
                                             service = %self.name,
                                             topic = %topic,
                                             error = %e,
-                                            "Failed to deliver message to XPUB"
+                                            "Failed to forward StreamBlock"
                                         );
                                     }
                                 }
 
-                                // Always add to buffer for retransmission support
-                                // Enforce per-topic limit (drop oldest)
+                                // Buffer for retransmission
                                 while state.messages.len() >= self.max_pending_per_topic {
                                     state.messages.pop_front();
-                                    trace!(
-                                        service = %self.name,
-                                        topic = %topic,
-                                        "Dropped oldest message (queue full)"
-                                    );
                                 }
 
                                 state.messages.push_back(PendingMessage {
-                                    data: message,
+                                    frames,
                                     received_at: Instant::now(),
-                                    hmac,
+                                    mac,
                                 });
 
                                 if !state.subscribed {
@@ -591,24 +530,95 @@ impl StreamService {
                                         service = %self.name,
                                         topic = %topic,
                                         queue_len = state.messages.len(),
-                                        "Queued message for later delivery"
+                                        "Queued StreamBlock for later delivery"
                                     );
                                 }
                             } else {
-                                // Topic not registered - drop message
-                                // DH-derived topics are unpredictable, so this is
-                                // either a timing issue or an attack
                                 trace!(
                                     service = %self.name,
                                     topic = %topic,
-                                    "Dropping message for unregistered topic"
+                                    "Dropping StreamBlock for unregistered topic"
                                 );
                             }
-                        } else {
+                            continue;
+                        }
+
+                        // Single-frame message: SignedEnvelope or StreamResume
+                        if frames.len() == 1 {
+                            let message = &frames[0];
+
+                            // Try SignedEnvelope (StreamRegister)
+                            if is_signed_envelope(message) {
+                                match self.handle_register(message, &mut streams) {
+                                    Ok(topic) => {
+                                        info!(
+                                            service = %self.name,
+                                            topic = %topic,
+                                            "Stream registered via SignedEnvelope"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            service = %self.name,
+                                            error = %e,
+                                            "Failed to process StreamRegister"
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
+
+                            // Try StreamResume
+                            if let Some((topic, resume_mac)) = parse_stream_resume(message) {
+                                if let Some(state) = streams.get(&topic) {
+                                    if let Some(start_idx) = state.find_mac_position(&resume_mac) {
+                                        let mut resent = 0;
+                                        for msg in state.messages.iter().skip(start_idx + 1) {
+                                            if let Err(e) = send_multipart(&xpub, &msg.frames) {
+                                                error!(
+                                                    service = %self.name,
+                                                    topic = %topic,
+                                                    error = %e,
+                                                    "Failed to resend on resume"
+                                                );
+                                                break;
+                                            }
+                                            resent += 1;
+                                        }
+                                        info!(
+                                            service = %self.name,
+                                            topic = %topic,
+                                            resent = resent,
+                                            "Processed StreamResume request"
+                                        );
+                                    } else {
+                                        warn!(
+                                            service = %self.name,
+                                            topic = %topic,
+                                            "StreamResume MAC not found in buffer"
+                                        );
+                                    }
+                                } else {
+                                    warn!(
+                                        service = %self.name,
+                                        topic = %topic,
+                                        "StreamResume for unknown topic"
+                                    );
+                                }
+                                continue;
+                            }
+
+                            // Unknown single-frame message (legacy StreamChunk no longer supported)
                             warn!(
                                 service = %self.name,
                                 len = message.len(),
-                                "Received message with invalid format (not StreamChunk)"
+                                "Unknown single-frame message format"
+                            );
+                        } else {
+                            warn!(
+                                service = %self.name,
+                                frames = frames.len(),
+                                "Unexpected multipart frame count"
                             );
                         }
                     }
@@ -656,10 +666,8 @@ impl StreamService {
 
                                     for msg in state.messages.iter() {
                                         if now.duration_since(msg.received_at) <= self.message_ttl {
-                                            // Send with topic prefix for XPUB routing
-                                            let mut prefixed = topic.as_bytes().to_vec();
-                                            prefixed.extend_from_slice(&msg.data);
-                                            if let Err(e) = xpub.send(&prefixed, 0) {
+                                            // Send multipart (handles both single and multi-frame)
+                                            if let Err(e) = send_multipart(&xpub, &msg.frames) {
                                                 error!(
                                                     service = %self.name,
                                                     topic = %topic,
@@ -731,31 +739,6 @@ impl StreamService {
     }
 }
 
-/// Extract topic and HMAC from a StreamChunk capnp message
-///
-/// Returns (topic, data, hmac) if valid StreamChunk, None otherwise.
-fn parse_stream_chunk(msg: &[u8]) -> Option<(String, Vec<u8>, [u8; 32])> {
-    use capnp::serialize;
-
-    let reader = serialize::read_message(
-        &mut std::io::Cursor::new(msg),
-        capnp::message::ReaderOptions::default(),
-    ).ok()?;
-
-    let chunk = reader.get_root::<streaming_capnp::stream_chunk::Reader>().ok()?;
-    let topic = chunk.get_topic().ok()?.to_str().ok()?.to_string();
-    let data = chunk.get_data().ok()?.to_vec();
-    let hmac_data = chunk.get_hmac().ok()?;
-
-    if hmac_data.len() != 32 {
-        return None;
-    }
-    let mut hmac = [0u8; 32];
-    hmac.copy_from_slice(hmac_data);
-
-    Some((topic, data, hmac))
-}
-
 /// Parse a StreamRegister message from SignedEnvelope payload
 fn parse_stream_register(payload: &[u8]) -> Option<(String, i64)> {
     use capnp::serialize;
@@ -810,11 +793,28 @@ fn is_signed_envelope(msg: &[u8]) -> bool {
     };
 
     // Also check that signature is exactly 64 bytes (Ed25519 signature)
-    // This distinguishes SignedEnvelope from StreamChunk which has 32-byte HMAC
     let Ok(signature) = envelope.get_signature() else {
         return false;
     };
     signature.len() == 64
+}
+
+/// Send a multipart message over a ZMQ socket
+///
+/// Sends all but last frame with SNDMORE, then last frame without.
+fn send_multipart(socket: &zmq::Socket, frames: &[Vec<u8>]) -> Result<()> {
+    if frames.is_empty() {
+        return Err(anyhow!("Cannot send empty multipart message"));
+    }
+
+    let last_idx = frames.len() - 1;
+    for (i, frame) in frames.iter().enumerate() {
+        let flags = if i < last_idx { zmq::SNDMORE } else { 0 };
+        socket.send(frame.as_slice(), flags)
+            .map_err(|e| anyhow!("Failed to send frame {}: {}", i, e))?;
+    }
+
+    Ok(())
 }
 
 /// Implement Spawnable trait for StreamService

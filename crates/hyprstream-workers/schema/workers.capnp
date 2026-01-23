@@ -44,6 +44,9 @@ struct RuntimeRequest {
     # Terminal attach/detach (tmux-like I/O streaming)
     attach @19 :AttachRequest;
     detach @20 :Text;               # container_id
+
+    # FD stream authorization (DH handshake)
+    startFdStream @21 :StartFdStreamRequest;
   }
 }
 
@@ -69,6 +72,9 @@ struct RuntimeResponse {
 
     # Terminal attach response
     attachResponse @16 :AttachResponse;
+
+    # FD stream authorization response
+    fdStreamAuthorized @17 :FdStreamAuthResponse;
   }
 }
 
@@ -478,23 +484,43 @@ struct ExecSyncResult {
 }
 
 # Terminal Attach (tmux-like I/O streaming)
+#
+# Flow:
+#   1. Client sends AttachRequest
+#   2. Server returns AttachResponse with stream info and server pubkey
+#   3. Client sends StartFdStreamRequest with client pubkey for DH handshake
+#   4. Server returns FdStreamAuthResponse confirming authorization
+#   5. Client subscribes to DH-derived topic via StreamService
+#   6. Server streams FD data via StreamBuilder (HMAC-authenticated)
 
 struct AttachRequest {
   containerId @0 :Text;
-  # Optional: attach to specific FDs (default: stdin/stdout/stderr)
-  # 0 = stdin, 1 = stdout, 2 = stderr
+  # Optional: attach to specific FDs (default: stdout/stderr for output)
+  # 0 = stdin (client->container), 1 = stdout, 2 = stderr (container->client)
   fds @1 :List(UInt8);
 }
 
 struct AttachResponse {
   containerId @0 :Text;
-  # Stream topics for each FD
-  # Client subscribes to these topics via StreamService
-  stdinTopic @1 :Text;    # worker-{container_id}-0
-  stdoutTopic @2 :Text;   # worker-{container_id}-1
-  stderrTopic @3 :Text;   # worker-{container_id}-2
+  # Stream ID for this attach session
+  streamId @1 :Text;
   # StreamService endpoint for subscribing
-  streamEndpoint @4 :Text;
+  streamEndpoint @2 :Text;
+  # Server's ephemeral Ristretto255 public key (32 bytes) for DH
+  serverPubkey @3 :Data;
+}
+
+# FD stream authorization handshake (DH key exchange)
+struct StartFdStreamRequest {
+  streamId @0 :Text;
+  # Client's ephemeral Ristretto255 public key (32 bytes)
+  clientPubkey @1 :Data;
+}
+
+struct FdStreamAuthResponse {
+  streamId @0 :Text;
+  # Confirmation that stream is authorized
+  authorized @1 :Bool;
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════

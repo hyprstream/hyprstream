@@ -46,7 +46,7 @@
 
 use crate::auth::Operation;
 use crate::services::PolicyZmqClient;
-use crate::config::{FinishReason, GenerationRequest, GenerationResult, ModelInfo, TrainingMode};
+use crate::config::{FinishReason, GenerationRequest, GenerationResult, ModelInfo, StreamingConfig, TrainingMode};
 use crate::inference_capnp;
 use anyhow::bail;
 use crate::lora::LoRAConfig;
@@ -144,6 +144,7 @@ impl InferenceService {
         model_path: impl AsRef<Path>,
         config: RuntimeConfig,
         server_pubkey: VerifyingKey,
+        signing_key: SigningKey,
         policy_client: PolicyZmqClient,
         endpoint: &str,
     ) -> Result<hyprstream_rpc::service::SpawnedService> {
@@ -172,7 +173,7 @@ impl InferenceService {
                 };
 
             rt.block_on(async move {
-                match Self::initialize(model_path, config, model_id, server_pubkey, nonce_cache, policy_client).await {
+                match Self::initialize(model_path, config, model_id, server_pubkey, signing_key, nonce_cache, policy_client).await {
                     Ok(service) => {
                         // Pass init_tx to run_service_loop - it signals AFTER socket binding
                         Self::run_service_loop(service, &endpoint_owned, Some(init_tx)).await;
@@ -285,12 +286,15 @@ impl InferenceService {
 
         // Initialize the engine and load the model
         let server_pubkey = VerifyingKey::default(); // Callback mode doesn't need signature verification
+        // Generate signing key for callback mode (separate process, no shared key access)
+        let signing_key = hyprstream_rpc::crypto::signing::generate_signing_keypair().0;
         let nonce_cache = Arc::new(InMemoryNonceCache::new());
         let service = Self::initialize(
             model_path.clone(),
             config,
             model_ref.clone(),
             server_pubkey,
+            signing_key,
             nonce_cache,
             policy_client,
         )
@@ -460,6 +464,7 @@ impl InferenceService {
         config: RuntimeConfig,
         model_id: String,
         server_pubkey: VerifyingKey,
+        signing_key: SigningKey,
         nonce_cache: Arc<InMemoryNonceCache>,
         policy_client: PolicyZmqClient,
     ) -> Result<Self> {
@@ -515,9 +520,7 @@ impl InferenceService {
                 (None, None)
             };
 
-        // Generate signing key for stream registration
-        let signing_key = hyprstream_rpc::crypto::signing::generate_signing_keypair().0;
-
+        // Use provided signing key for response signing
         Ok(Self {
             engine: RwLock::new(engine),
             model_id,
@@ -639,8 +642,8 @@ impl InferenceService {
                 Ok((ctx, payload)) => (ctx, payload),
                 Err(e) => {
                     warn!("inference envelope verification failed: {}", e);
-                    let response = InferenceResponse::error(0, "envelope verification failed");
-                    let msg: Multipart = vec![response].into();
+                    // No valid request_id, send empty response (like RequestLoop does)
+                    let msg: Multipart = vec![vec![]].into();
                     receiver = match sender.send(msg).await {
                         Ok(r) => r,
                         Err(e) => {
@@ -659,16 +662,38 @@ impl InferenceService {
             );
 
             // Handle request - may return pending stream work (now async for policy checks)
-            let (response, pending_stream) = match service.handle_request(&envelope_ctx, &payload).await {
+            let request_id = envelope_ctx.request_id;
+            let (response_payload, pending_stream) = match service.handle_request(&envelope_ctx, &payload).await {
                 Ok((resp, pending)) => (resp, pending),
                 Err(e) => {
                     error!("inference request handling error: {}", e);
-                    (InferenceResponse::error(0, &e.to_string()), None)
+                    (InferenceResponse::error(request_id, &e.to_string()), None)
                 }
             };
 
-            // Send response via TMQ
-            let msg: Multipart = vec![response].into();
+            // Wrap response in signed envelope
+            let response_bytes = {
+                let signed_response = ResponseEnvelope::new_signed(
+                    request_id,
+                    response_payload,
+                    &service.signing_key,
+                );
+
+                let mut message = capnp::message::Builder::new_default();
+                let mut builder = message.init_root::<hyprstream_rpc::common_capnp::response_envelope::Builder>();
+                signed_response.write_to(&mut builder);
+
+                let mut bytes = Vec::new();
+                if let Err(e) = capnp::serialize::write_message(&mut bytes, &message) {
+                    error!("Failed to serialize signed response: {}", e);
+                    vec![]
+                } else {
+                    bytes
+                }
+            };
+
+            // Send signed response via TMQ
+            let msg: Multipart = vec![response_bytes].into();
             receiver = match sender.send(msg).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -849,20 +874,16 @@ impl InferenceService {
     /// 6. Service publishes chunks with HMAC chain (verified by client, not StreamService)
     /// 7. StreamService is blind forwarder (no HMAC verification)
     fn execute_stream(&self, pending: PendingStream) {
-        use crate::services::rpc_types::{
-            build_authenticated_complete_chunk, build_authenticated_error_chunk,
-            build_authenticated_token_chunk, HmacChainState,
-        };
+        use crate::services::rpc_types::StreamBuilder;
         use futures::StreamExt;
 
         let stream_id = pending.stream_id;
         let request = pending.request;
         let prompt = pending.prompt;
-        // Use DH-derived topic for ZMQ routing (not stream_id)
-        let _topic = pending.topic.as_bytes().to_vec();
 
-        // Initialize HMAC chain state with DH-derived mac_key and topic
-        let mut hmac_state = HmacChainState::new(pending.mac_key, pending.topic.clone());
+        // Use StreamBuilder with adaptive batching for StreamBlock format
+        let streaming_config = StreamingConfig::default();
+        let mut builder = StreamBuilder::new(streaming_config.batching.clone(), pending.mac_key, pending.topic.clone());
 
         // Apply TTT adaptation BEFORE streaming generation (if enabled)
         self.apply_ttt_adaptation(&prompt);
@@ -878,21 +899,12 @@ impl InferenceService {
         };
 
         // StreamService handles subscription forwarding (blind - no HMAC verification)
-        // We push chunks - StreamService queues until subscriber arrives, then delivers
+        // We push StreamBlocks - StreamService queues until subscriber arrives, then delivers
         trace!(
             stream_id = %stream_id,
             topic = %pending.topic,
-            "Starting E2E authenticated stream"
+            "Starting E2E authenticated stream with adaptive batching"
         );
-
-        // Helper to send StreamChunk via PUSH
-        // Note: PUSH/PULL doesn't use topic filtering (that's for PUB/SUB).
-        // StreamService parses the topic from the capnp and adds prefix when forwarding to XPUB.
-        let send_chunk = |data: &[u8]| -> Result<(), zmq::Error> {
-            // Blocking send - PUSH buffers at HWM if receiver is slow
-            // Timeout (1s) prevents indefinite blocking if StreamService is down
-            push_socket.send(data, 0)
-        };
 
         // Run the stream
         let engine = self.engine.read().unwrap();
@@ -906,52 +918,85 @@ impl InferenceService {
                     while let Some(chunk_result) = stream.next().await {
                         match chunk_result {
                             Ok(text) => {
-                                // Build authenticated chunk with HMAC chain
-                                // Ordering is via prevHmac in each chunk (no seq_num needed)
-                                let chunk_bytes = build_authenticated_token_chunk(
-                                    &stream_id,
-                                    &text,
-                                    &mut hmac_state,
-                                );
-                                if let Err(e) = send_chunk(&chunk_bytes) {
-                                    warn!("failed to send stream chunk: {}", e);
-                                    break;
+                                // Get live generation rate from stream stats (EMA for smooth batching)
+                                let rate = stream.stats().inference_tokens_per_sec_ema;
+
+                                // Add token with adaptive batching
+                                match builder.add_data(text.as_bytes(), rate) {
+                                    Ok(Some(frames)) => {
+                                        if let Err(e) = frames.send(push_socket) {
+                                            warn!("failed to send StreamBlock: {}", e);
+                                            break;
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        // Batching - not ready to send yet
+                                    }
+                                    Err(e) => {
+                                        warn!("failed to build StreamBlock: {}", e);
+                                        break;
+                                    }
                                 }
                             }
                             Err(e) => {
-                                let error_bytes = build_authenticated_error_chunk(
-                                    &stream_id,
-                                    &e.to_string(),
-                                    &mut hmac_state,
-                                );
-                                if let Err(send_err) = send_chunk(&error_bytes) {
-                                    tracing::error!("Failed to send stream error: {}", send_err);
+                                // Errors flush immediately
+                                match builder.add_error(&e.to_string()) {
+                                    Ok(Some(frames)) => {
+                                        if let Err(send_err) = frames.send(push_socket) {
+                                            tracing::error!("Failed to send stream error: {}", send_err);
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(build_err) => {
+                                        tracing::error!("Failed to build error block: {}", build_err);
+                                    }
                                 }
                                 break;
                             }
                         }
                     }
 
-                    // Send completion
+                    // Send completion (flushes immediately)
                     let stats = stream.stats();
-                    let complete_bytes = build_authenticated_complete_chunk(
-                        &stream_id,
-                        &stats,
-                        &mut hmac_state,
-                    );
-                    if let Err(e) = send_chunk(&complete_bytes) {
-                        tracing::error!("Failed to send stream completion: {}", e);
+                    let complete = crate::services::rpc_types::InferenceComplete::from(&stats);
+                    match builder.add_complete(&complete.to_bytes()) {
+                        Ok(Some(frames)) => {
+                            if let Err(e) = frames.send(push_socket) {
+                                tracing::error!("Failed to send stream completion: {}", e);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::error!("Failed to build completion block: {}", e);
+                        }
+                    }
+
+                    // Flush any remaining batched payloads
+                    match builder.finish() {
+                        Ok(Some(frames)) => {
+                            if let Err(e) = frames.send(push_socket) {
+                                tracing::error!("Failed to send final block: {}", e);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::error!("Failed to build final block: {}", e);
+                        }
                     }
                 });
             }
             Err(e) => {
-                let error_bytes = build_authenticated_error_chunk(
-                    &stream_id,
-                    &e.to_string(),
-                    &mut hmac_state,
-                );
-                if let Err(send_err) = send_chunk(&error_bytes) {
-                    tracing::error!("Failed to send initial stream error: {}", send_err);
+                // Initial error - flush immediately
+                match builder.add_error(&e.to_string()) {
+                    Ok(Some(frames)) => {
+                        if let Err(send_err) = frames.send(push_socket) {
+                            tracing::error!("Failed to send initial stream error: {}", send_err);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(build_err) => {
+                        tracing::error!("Failed to build initial error block: {}", build_err);
+                    }
                 }
             }
         }
@@ -1455,14 +1500,19 @@ pub struct InferenceZmqClient {
 
 impl InferenceZmqClient {
     /// Create a new inference client with signing credentials
+    ///
+    /// # Note
+    /// Uses the same signing key for both request signing and response verification.
+    /// This is appropriate for internal communication where client and server share keys.
     pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
         Self::with_endpoint(INFERENCE_ENDPOINT, signing_key, identity)
     }
 
     /// Create an inference client connected to a specific endpoint
     pub fn with_endpoint(endpoint: &str, signing_key: SigningKey, identity: RequestIdentity) -> Self {
+        let server_verifying_key = signing_key.verifying_key();
         Self {
-            client: std::sync::Arc::new(crate::services::ZmqClient::new(endpoint, signing_key, identity)),
+            client: std::sync::Arc::new(crate::services::ZmqClient::new(endpoint, signing_key, server_verifying_key, identity)),
         }
     }
 
@@ -2098,8 +2148,8 @@ impl InferenceZmqClient {
 /// - Complete: Stream finished with generation stats
 /// - Error: Generation failed
 ///
-/// Note: Ordering is handled by prevHmac in the outer common_capnp::StreamChunk wrapper.
-/// The inner inference StreamChunk no longer has sequence_num or hmac fields.
+/// Note: Ordering is handled by prevMac in the outer streaming_capnp::StreamBlock wrapper.
+/// Authentication via HMAC chain happens at the StreamBlock level.
 pub enum StreamChunkMessage {
     Chunk {
         text: String,
@@ -2116,8 +2166,8 @@ impl StreamChunkMessage {
     /// Parse an InferencePayload message from StreamService
     ///
     /// Note: This parses the inner inference_capnp::InferencePayload.
-    /// HMAC verification and ordering via prevHmac happen at the StreamService level
-    /// using the outer streaming_capnp::StreamChunk wrapper.
+    /// HMAC verification and ordering happen at the StreamBlock level
+    /// using the outer streaming_capnp::StreamBlock wrapper.
     pub fn from_capnp(payload: inference_capnp::inference_payload::Reader) -> Result<Self> {
         use inference_capnp::inference_payload::Which;
 
@@ -2151,6 +2201,7 @@ impl StreamChunkMessage {
                     inference_tokens: 0,
                     inference_time_ms: 0,
                     inference_tokens_per_sec: 0.0,
+                    inference_tokens_per_sec_ema: 0.0,
                 };
                 Ok(StreamChunkMessage::Complete { stats })
             }
@@ -2189,10 +2240,12 @@ pub struct StreamHandle {
     stream_id: String,
     /// DH-derived topic (64 hex chars) - used for ZMQ subscription
     topic: String,
-    /// DH-derived HMAC key for verifying chunk chain
-    mac_key: [u8; 32],
-    /// Last verified HMAC (for chain verification)
-    last_hmac: Option<[u8; 32]>,
+    /// StreamVerifier for HMAC chain verification (new StreamBlock format)
+    verifier: crate::services::rpc_types::StreamVerifier,
+    /// Buffer for parsed payloads (StreamBlock can contain multiple)
+    pending_payloads: std::collections::VecDeque<crate::services::rpc_types::StreamPayload>,
+    /// Whether stream has completed
+    stream_completed: bool,
     /// Claims for legacy JWT subscription (backwards compatibility)
     #[allow(dead_code)]
     claims: crate::auth::Claims,
@@ -2221,6 +2274,8 @@ impl StreamHandle {
         claims: crate::auth::Claims,
         signing_key: ed25519_dalek::SigningKey,
     ) -> Result<Self> {
+        use crate::services::rpc_types::StreamVerifier;
+
         // Create SUB socket
         let subscriber = context.socket(zmq::SUB)?;
 
@@ -2234,15 +2289,19 @@ impl StreamHandle {
             stream_id = %stream_id,
             topic = %topic,
             endpoint = %endpoint,
-            "Subscribed to E2E authenticated stream"
+            "Subscribed to E2E authenticated stream (StreamBlock format)"
         );
+
+        // Create verifier for HMAC chain verification
+        let verifier = StreamVerifier::new(mac_key, topic.clone());
 
         Ok(Self {
             subscriber,
             stream_id,
             topic,
-            mac_key,
-            last_hmac: None,
+            verifier,
+            pending_payloads: std::collections::VecDeque::new(),
+            stream_completed: false,
             claims,
             signing_key,
         })
@@ -2252,81 +2311,119 @@ impl StreamHandle {
     ///
     /// Returns `None` if the stream has ended (Complete or Error message received).
     ///
+    /// # StreamBlock Format
+    ///
+    /// Messages are received as 3-frame multipart: [topic, capnp StreamBlock, 16-byte mac]
+    /// The StreamBlock contains multiple payloads which are buffered and returned one at a time.
+    ///
     /// # HMAC Verification
     ///
-    /// Each chunk's HMAC is verified against the chain:
-    /// - First chunk: HMAC(mac_key, topic || data)
-    /// - Subsequent: HMAC(mac_key, prev_hmac || data)
+    /// Each block's HMAC is verified against the chain:
+    /// - First block: HMAC(mac_key, topic || capnp)[..16]
+    /// - Subsequent: HMAC(mac_key, prev_mac || capnp)[..16]
     ///
     /// If verification fails, returns an error.
     pub fn next_chunk(&mut self) -> Result<Option<StreamChunkMessage>> {
-        use hmac::{Hmac, Mac};
-        use sha2::Sha256;
-        use subtle::ConstantTimeEq;
+        use crate::services::rpc_types::StreamPayload;
 
-        type HmacSha256 = Hmac<Sha256>;
+        // Return buffered payloads first
+        if let Some(payload) = self.pending_payloads.pop_front() {
+            return Ok(Some(self.convert_payload(payload)));
+        }
+
+        // Stream completed, no more data
+        if self.stream_completed {
+            return Ok(None);
+        }
 
         // Receive multipart message from StreamService
-        // Format: [topic][payload (outer StreamChunk)]
+        // StreamBlock format: [topic, capnp, 16-byte mac]
         let msg = self.subscriber.recv_multipart(0)?;
 
-        if msg.len() < 2 {
-            bail!("Invalid message format: expected at least 2 parts, got {}", msg.len());
+        // Validate 3-frame StreamBlock format
+        if msg.len() != 3 || msg[2].len() != 16 {
+            bail!(
+                "Invalid StreamBlock format: expected 3 frames with 16-byte MAC, got {} frames{}",
+                msg.len(),
+                if msg.len() >= 3 { format!(" with {}-byte MAC", msg[2].len()) } else { String::new() }
+            );
         }
 
-        // Parse outer StreamChunk (streaming_capnp) for HMAC verification
-        let outer_reader = capnp::serialize::read_message(
-            &*msg[1],
-            capnp::message::ReaderOptions::new(),
-        )?;
-        let outer_chunk = outer_reader.get_root::<hyprstream_rpc::streaming_capnp::stream_chunk::Reader>()?;
+        // Verify and parse StreamBlock
+        let payloads = self.verifier.verify(&msg)?;
 
-        let hmac_data = outer_chunk.get_hmac()?;
-        let data = outer_chunk.get_data()?;
-
-        // Verify HMAC chain (if mac_key is set - skip for legacy mode)
-        if self.mac_key != [0u8; 32] && hmac_data.len() == 32 {
-            let mut expected_hmac = [0u8; 32];
-            expected_hmac.copy_from_slice(hmac_data);
-
-            let mut mac = HmacSha256::new_from_slice(&self.mac_key)
-                .expect("HMAC accepts any key size");
-
-            match &self.last_hmac {
-                None => {
-                    // First chunk: HMAC(key, topic || data)
-                    mac.update(self.topic.as_bytes());
-                    mac.update(data);
-                }
-                Some(prev) => {
-                    // Subsequent chunks: HMAC(key, prev_hmac || data)
-                    mac.update(prev);
-                    mac.update(data);
-                }
+        // Buffer all payloads
+        for payload in payloads {
+            // Check if this is a completion/error (marks end of stream)
+            let is_terminal = matches!(
+                payload,
+                StreamPayload::Complete { .. } | StreamPayload::Error { .. }
+            );
+            if is_terminal {
+                self.stream_completed = true;
             }
-
-            let computed: [u8; 32] = mac.finalize().into_bytes().into();
-            if computed.ct_eq(&expected_hmac).unwrap_u8() != 1 {
-                bail!("HMAC verification failed - stream may be tampered");
-            }
-
-            // Update chain state
-            self.last_hmac = Some(expected_hmac);
+            self.pending_payloads.push_back(payload);
         }
 
-        // Parse inner InferencePayload
-        let inner_reader = capnp::serialize::read_message(
-            data,
-            capnp::message::ReaderOptions::new(),
-        )?;
-        let payload = inner_reader.get_root::<inference_capnp::inference_payload::Reader>()?;
+        // Return first payload from buffer
+        if let Some(payload) = self.pending_payloads.pop_front() {
+            return Ok(Some(self.convert_payload(payload)));
+        }
 
-        let message = StreamChunkMessage::from_capnp(payload)?;
+        // Empty block (shouldn't happen but handle gracefully)
+        Ok(None)
+    }
 
-        if message.is_last() {
-            Ok(None)
-        } else {
-            Ok(Some(message))
+    /// Convert ParsedStreamPayload to StreamChunkMessage
+    fn convert_payload(&self, payload: crate::services::rpc_types::StreamPayload) -> StreamChunkMessage {
+        use crate::services::rpc_types::{InferenceStreamPayload, StreamPayloadExt};
+
+        // Convert generic payload to inference-specific
+        match payload.to_inference() {
+            Ok(InferenceStreamPayload::Token(text)) => {
+                StreamChunkMessage::Chunk { text }
+            }
+            Ok(InferenceStreamPayload::Error(message)) => {
+                StreamChunkMessage::Error { error: message }
+            }
+            Ok(InferenceStreamPayload::Complete(stats)) => {
+                // Build quality metrics if present
+                let quality_metrics = if stats.perplexity.is_some() || stats.avg_entropy.is_some() {
+                    Some(crate::runtime::generation_metrics::GenerationQualityMetrics {
+                        perplexity: stats.perplexity.unwrap_or(0.0),
+                        avg_entropy: stats.avg_entropy.unwrap_or(0.0),
+                        ..Default::default()
+                    })
+                } else {
+                    None
+                };
+
+                // Convert to GenerationStats with full metrics
+                let gen_stats = crate::runtime::GenerationStats {
+                    tokens_generated: stats.tokens_generated,
+                    generation_time_ms: stats.generation_time_ms,
+                    tokens_per_second: stats.tokens_per_second,
+                    finish_reason: Some(match stats.finish_reason.as_str() {
+                        "length" => crate::config::FinishReason::MaxTokens,
+                        "eos" => crate::config::FinishReason::EndOfSequence,
+                        "error" => crate::config::FinishReason::Error(String::new()),
+                        _ => crate::config::FinishReason::Stop,
+                    }),
+                    quality_metrics,
+                    prefill_tokens: stats.prefill_tokens,
+                    prefill_time_ms: stats.prefill_time_ms,
+                    prefill_tokens_per_sec: stats.prefill_tokens_per_sec,
+                    inference_tokens: stats.inference_tokens,
+                    inference_time_ms: stats.inference_time_ms,
+                    inference_tokens_per_sec: stats.inference_tokens_per_sec,
+                    inference_tokens_per_sec_ema: stats.inference_tokens_per_sec_ema,
+                };
+                StreamChunkMessage::Complete { stats: gen_stats }
+            }
+            Err(e) => {
+                // If parsing fails, return as error
+                StreamChunkMessage::Error { error: format!("Failed to parse payload: {}", e) }
+            }
         }
     }
 

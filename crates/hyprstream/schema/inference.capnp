@@ -8,7 +8,7 @@
 # Streaming Architecture:
 #   - Wire format types are in hyprstream-rpc/schema/streaming.capnp
 #   - This file defines inference-specific payload types
-#   - InferencePayload gets serialized into streaming.capnp::StreamChunk.data
+#   - InferencePayload gets serialized into streaming.capnp::StreamBlock.payloads
 
 struct InferenceRequest {
   # Request ID for tracking
@@ -147,10 +147,10 @@ struct StreamAuthResponse {
 }
 
 # =============================================================================
-# Inference Payload (serialized into streaming.capnp::StreamChunk.data)
+# Inference Payload (serialized into streaming.capnp::StreamBlock.payloads)
 # =============================================================================
 
-# The actual inference payload - gets serialized into wire format StreamChunk.data
+# The actual inference payload - gets serialized into wire format StreamBlock.payloads
 # This is the application-layer content, not the wire format.
 struct InferencePayload {
   streamId @0 :Text;
@@ -162,7 +162,34 @@ struct InferencePayload {
   }
 }
 
-# Inference-specific completion statistics (extends streaming.capnp::StreamStats)
+# Inference-specific completion statistics
+#
+# Serialized into StreamPayload.complete (streaming.capnp) as raw bytes.
+# Contains full generation metrics including prefill and inference breakdown.
+struct InferenceComplete {
+  # Overall metrics
+  tokensGenerated @0 :UInt32;
+  finishReason @1 :Text;          # "stop", "length", "eos", "error"
+  generationTimeMs @2 :UInt64;
+  tokensPerSecond @3 :Float32;
+
+  # Prefill metrics (processing the prompt)
+  prefillTokens @4 :UInt32;
+  prefillTimeMs @5 :UInt64;
+  prefillTokensPerSec @6 :Float32;
+
+  # Inference metrics (generating new tokens, excluding prefill)
+  inferenceTokens @7 :UInt32;
+  inferenceTimeMs @8 :UInt64;
+  inferenceTokensPerSec @9 :Float32;
+  inferenceTokensPerSecEma @10 :Float32;  # EMA for adaptive batching
+
+  # Optional quality metrics (0.0 means not set)
+  perplexity @11 :Float32;
+  avgEntropy @12 :Float32;
+}
+
+# Legacy inference stats (kept for backwards compatibility)
 struct InferenceStats {
   tokensGenerated @0 :UInt32;
   finishReason @1 :FinishReason;

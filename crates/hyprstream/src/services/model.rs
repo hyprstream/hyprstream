@@ -142,8 +142,6 @@ pub struct ModelService {
     // Infrastructure (for Spawnable)
     context: Arc<zmq::Context>,
     transport: TransportConfig,
-    /// Ed25519 verifying key for envelope verification
-    verifying_key: VerifyingKey,
 }
 
 impl ModelService {
@@ -155,7 +153,6 @@ impl ModelService {
         model_storage: Arc<ModelStorage>,
         context: Arc<zmq::Context>,
         transport: TransportConfig,
-        verifying_key: VerifyingKey,
     ) -> Self {
         // SAFETY: 5 is a valid non-zero value
         const DEFAULT_CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(5) {
@@ -174,7 +171,6 @@ impl ModelService {
             spawned_instances: RwLock::new(HashMap::new()),
             context,
             transport,
-            verifying_key,
         }
     }
 
@@ -187,7 +183,6 @@ impl ModelService {
         callback_router: crate::services::callback::CallbackRouter,
         context: Arc<zmq::Context>,
         transport: TransportConfig,
-        verifying_key: VerifyingKey,
     ) -> Self {
         const DEFAULT_CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(5) {
             Some(n) => n,
@@ -205,7 +200,6 @@ impl ModelService {
             spawned_instances: RwLock::new(HashMap::new()),
             context,
             transport,
-            verifying_key,
         }
     }
 
@@ -249,7 +243,8 @@ impl ModelService {
         let service_handle = InferenceService::start_at(
             &model_path,
             runtime_config,
-            self.verifying_key,
+            self.signing_key.verifying_key(),
+            self.signing_key.clone(),
             self.policy_client.clone(),
             &endpoint,
         )
@@ -777,8 +772,8 @@ impl crate::services::ZmqService for ModelService {
         &self.transport
     }
 
-    fn verifying_key(&self) -> VerifyingKey {
-        self.verifying_key
+    fn signing_key(&self) -> SigningKey {
+        self.signing_key.clone()
     }
 }
 
@@ -816,18 +811,24 @@ pub struct ModelZmqClient {
 
 impl ModelZmqClient {
     /// Create a new model client (endpoint from registry)
+    ///
+    /// # Note
+    /// Uses the same signing key for both request signing and response verification.
+    /// This is appropriate for internal communication where client and server share keys.
     pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
         let endpoint = registry().endpoint("model", SocketKind::Rep).to_zmq_string();
         tracing::debug!("ModelZmqClient connecting to endpoint: {}", endpoint);
+        let server_verifying_key = signing_key.verifying_key();
         Self {
-            client: Arc::new(ZmqClient::new(&endpoint, signing_key, identity)),
+            client: Arc::new(ZmqClient::new(&endpoint, signing_key, server_verifying_key, identity)),
         }
     }
 
     /// Create a model client at a specific endpoint
     pub fn with_endpoint(endpoint: &str, signing_key: SigningKey, identity: RequestIdentity) -> Self {
+        let server_verifying_key = signing_key.verifying_key();
         Self {
-            client: Arc::new(ZmqClient::new(endpoint, signing_key, identity)),
+            client: Arc::new(ZmqClient::new(endpoint, signing_key, server_verifying_key, identity)),
         }
     }
 

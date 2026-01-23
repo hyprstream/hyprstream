@@ -64,11 +64,18 @@ struct SignedEnvelope {
   signerPubkey @2 :Data;           # Ed25519 public key (32 bytes)
 }
 
-# Response envelope (for non-streaming responses)
-# Non-streaming responses don't need signatures (same connection, correlates with request)
+# Signed response envelope
+#
+# All RPC responses are signed for E2E authentication, preventing MITM attacks
+# on response data (e.g., DH public keys in StreamInfo).
+#
+# Signing: signature = Ed25519.sign(server_key, requestId || payload)
+# Verification: Ed25519.verify(signerPubkey, requestId || payload, signature)
 struct ResponseEnvelope {
-  requestId @0 :UInt64;  # Correlates with RequestEnvelope.requestId
-  payload @1 :Data;      # Serialized inner response
+  requestId @0 :UInt64;    # Correlates with RequestEnvelope.requestId
+  payload @1 :Data;        # Serialized inner response
+  signature @2 :Data;      # Ed25519 signature (64 bytes)
+  signerPubkey @3 :Data;   # Ed25519 public key (32 bytes)
 }
 
 # =============================================================================
@@ -77,8 +84,7 @@ struct ResponseEnvelope {
 #
 # The following types are now defined in streaming.capnp:
 #   - StreamInfo, StreamRegister, StreamStartRequest, StreamAuthResponse
-#   - StreamChunk, StreamBlock, StreamPayload
-#   - StreamStats, StreamError, StreamResume
+#   - StreamBlock, StreamPayload, StreamStats, StreamError, StreamResume
 #
 # Import with: using Streaming = import "streaming.capnp";
 

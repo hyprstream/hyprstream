@@ -74,7 +74,9 @@ impl CurveConfig {
 ///
 /// // In-process endpoint (no encryption needed)
 /// let inproc = TransportConfig::inproc("hyprstream/registry");
+/// ```
 ///
+/// ```ignore
 /// // IPC endpoint with CurveZMQ encryption
 /// let ipc = TransportConfig::ipc("/run/user/1000/hyprstream/service.sock")
 ///     .with_curve(server_keypair);

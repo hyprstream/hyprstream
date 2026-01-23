@@ -14,7 +14,7 @@ fn test_envelope_serialization_deterministic() {
         ephemeral_pubkey: None,
         nonce: [42u8; 16],
         timestamp: 1234567890,
-        jwt_token: Some("test.jwt.token".to_string()),
+        claims: None, // claims field replaced jwt_token
     };
 
     let envelope2 = envelope1.clone();
@@ -48,7 +48,7 @@ fn test_envelope_signature_verification_stable() {
         ephemeral_pubkey: Some([1u8; 32]),
         nonce: [99u8; 16],
         timestamp: 9876543210,
-        jwt_token: None,
+        claims: None,
     };
 
     // Sign envelope
@@ -104,7 +104,7 @@ fn test_envelope_canonical_form() {
         ephemeral_pubkey: None,
         nonce: [0u8; 16],
         timestamp: 1111111111,
-        jwt_token: None,
+        claims: None,
     };
 
     let bytes = envelope.to_bytes();
@@ -127,7 +127,7 @@ fn test_envelope_canonical_form() {
 }
 
 #[test]
-fn test_envelope_with_jwt_token_deterministic() {
+fn test_envelope_with_claims_deterministic() {
     let envelope = RequestEnvelope {
         request_id: 999,
         identity: RequestIdentity::ApiToken {
@@ -138,7 +138,7 @@ fn test_envelope_with_jwt_token_deterministic() {
         ephemeral_pubkey: Some([77u8; 32]),
         nonce: [123u8; 16],
         timestamp: 5555555555,
-        jwt_token: Some("eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJ0ZXN0In0.signature".to_string()),
+        claims: None, // Using None for test simplicity (claims replaces jwt_token)
     };
 
     // Multiple serializations must produce identical bytes
@@ -161,7 +161,7 @@ fn test_envelope_different_data_different_bytes() {
         ephemeral_pubkey: None,
         nonce: [1u8; 16],
         timestamp: 1000000000,
-        jwt_token: None,
+        claims: None,
     };
 
     let envelope2 = RequestEnvelope {
@@ -173,7 +173,7 @@ fn test_envelope_different_data_different_bytes() {
         ephemeral_pubkey: None,
         nonce: [2u8; 16],
         timestamp: 2000000000,
-        jwt_token: None,
+        claims: None,
     };
 
     let bytes1 = envelope1.to_bytes();

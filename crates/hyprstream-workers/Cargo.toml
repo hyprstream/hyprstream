@@ -13,6 +13,7 @@ hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }
 
 # Async runtime
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 

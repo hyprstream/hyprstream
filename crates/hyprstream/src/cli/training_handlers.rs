@@ -333,6 +333,7 @@ pub async fn handle_training_infer(
         &model_path,
         runtime_config,
         verifying_key,
+        signing_key.clone(),
         policy_client,
         INFERENCE_ENDPOINT,
     )
@@ -549,6 +550,7 @@ pub async fn handle_training_batch(
         &model_path,
         runtime_config,
         verifying_key,
+        signing_key.clone(),
         policy_client,
         INFERENCE_ENDPOINT,
     )
