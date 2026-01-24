@@ -157,9 +157,10 @@ ENV LD_LIBRARY_PATH=/opt/libtorch/lib:$LD_LIBRARY_PATH
 # Build the project with BuildKit cache mounts for Cargo registry
 # LIBTORCH is already set in the variant-specific builder stages
 # We do NOT use LIBTORCH_USE_PYTORCH since we're using manual downloads
+# Note: --no-default-features excludes systemd (not needed in containers)
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
-    cargo build --release --features otel
+    cargo build --release --no-default-features --features otel,gittorrent,xet
 
 #############################################
 # Runtime Stage Selection
