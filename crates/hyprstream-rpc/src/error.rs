@@ -1,4 +1,4 @@
-//! Error types for the RPC envelope system.
+//! Error types for the RPC system.
 
 use thiserror::Error;
 
@@ -43,4 +43,39 @@ pub enum EnvelopeError {
 }
 
 /// Result type alias for envelope operations.
-pub type EnvelopeResult<T> = Result<T, EnvelopeError>;
+pub type EnvelopeResult<T> = std::result::Result<T, EnvelopeError>;
+
+/// Errors that can occur during RPC operations.
+#[derive(Debug, Error)]
+pub enum RpcError {
+    /// Envelope error.
+    #[error("envelope error: {0}")]
+    Envelope(#[from] EnvelopeError),
+
+    /// Process spawn failed.
+    #[error("spawn failed: {0}")]
+    SpawnFailed(String),
+
+    /// Process stop failed.
+    #[error("stop failed: {0}")]
+    StopFailed(String),
+
+    /// Invalid operation for this backend/mode.
+    #[error("invalid operation: {0}")]
+    InvalidOperation(String),
+
+    /// ZMQ error.
+    #[error("zmq error: {0}")]
+    Zmq(#[from] zmq::Error),
+
+    /// IO error.
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// Other error.
+    #[error("{0}")]
+    Other(String),
+}
+
+/// Result type alias for RPC operations.
+pub type Result<T> = std::result::Result<T, RpcError>;

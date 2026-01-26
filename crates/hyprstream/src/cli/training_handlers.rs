@@ -329,10 +329,11 @@ pub async fn handle_training_infer(
     runtime_config.kv_quant_type = kv_quant.into();
 
     // Start InferenceService with TTT enabled
-    let service_handle = InferenceService::start_at(
+    let mut service_handle = InferenceService::start_at(
         &model_path,
         runtime_config,
         verifying_key,
+        signing_key.clone(),
         policy_client,
         INFERENCE_ENDPOINT,
     )
@@ -400,7 +401,7 @@ pub async fn handle_training_infer(
     println!("Run 'hyprstream training checkpoint {}' to commit changes", model_ref);
 
     // Stop service to properly release resources
-    service_handle.stop().await;
+    let _ = service_handle.stop().await;
 
     Ok(())
 }
@@ -544,10 +545,12 @@ pub async fn handle_training_batch(
     runtime_config.kv_quant_type = kv_quant.into();
 
     let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
-    let service_handle = InferenceService::start_at(
+    // Start InferenceService with TTT enabled
+    let mut service_handle = InferenceService::start_at(
         &model_path,
         runtime_config,
         verifying_key,
+        signing_key.clone(),
         policy_client,
         INFERENCE_ENDPOINT,
     )
@@ -637,7 +640,7 @@ pub async fn handle_training_batch(
 
     // Stop service - this saves final adapter weights
     println!("\nStopping InferenceService and saving weights...");
-    service_handle.stop().await;
+    let _ = service_handle.stop().await;
 
     let elapsed = start_time.elapsed();
     let total_tokens = total_input_tokens + total_output_tokens;
@@ -675,18 +678,19 @@ pub async fn handle_training_checkpoint(
         bail!("No adapters found in {}", model_path.display());
     }
 
-    // Check for dirty files
-    let repo = git2db::GitManager::global()
-        .get_repository(&model_path)?
-        .open()?;
+    // Check for dirty files using service layer
+    let repo_client = storage.registry().repo(&model_ref.model).await
+        .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
 
-    let statuses = repo.statuses(None)?;
-    let dirty_adapters: Vec<_> = statuses
-        .iter()
-        .filter(|s| {
-            s.path()
-                .map(|p| p.contains("adapters/") && p.ends_with(".safetensors"))
-                .unwrap_or(false)
+    let status = repo_client.status().await
+        .map_err(|e| anyhow::anyhow!("Failed to get repository status: {}", e))?;
+
+    // Filter for dirty adapter files
+    let dirty_adapters: Vec<_> = status.modified_files
+        .into_iter()
+        .filter(|p| {
+            let path_str = p.to_string_lossy();
+            path_str.contains("adapters/") && path_str.ends_with(".safetensors")
         })
         .collect();
 
@@ -696,20 +700,20 @@ pub async fn handle_training_checkpoint(
     }
 
     println!("Found {} modified adapter files:", dirty_adapters.len());
-    for status in &dirty_adapters {
-        if let Some(path) = status.path() {
-            println!("  {}", path);
-        }
+    for path in &dirty_adapters {
+        println!("  {}", path.display());
     }
 
-    // Stage adapter files
-    let mut index = repo.index()?;
+    // Stage adapter files using service layer
+    let mut files_to_stage: Vec<String> = Vec::new();
     for adapter in &adapters {
         let relative_path = adapter
             .path
             .strip_prefix(&model_path)
             .unwrap_or(&adapter.path);
-        index.add_path(relative_path)?;
+        files_to_stage.push(relative_path.to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid path: {:?}", relative_path))?
+            .to_string());
 
         // Also stage config if exists
         let config_path = adapter.path.with_extension("config.json");
@@ -717,12 +721,19 @@ pub async fn handle_training_checkpoint(
             let relative_config = config_path
                 .strip_prefix(&model_path)
                 .unwrap_or(&config_path);
-            index.add_path(relative_config)?;
+            files_to_stage.push(relative_config.to_str()
+                .ok_or_else(|| anyhow::anyhow!("Invalid path: {:?}", relative_config))?
+                .to_string());
         }
     }
-    index.write()?;
 
-    // Create commit
+    // Convert to string references for the async call
+    let files_refs: Vec<&str> = files_to_stage.iter().map(|s| s.as_str()).collect();
+
+    repo_client.stage_files(&files_refs).await
+        .map_err(|e| anyhow::anyhow!("Failed to stage files: {}", e))?;
+
+    // Create commit using service layer
     let commit_message = message.unwrap_or_else(|| {
         format!(
             "Training checkpoint: {} adapters updated\n\n\
@@ -731,18 +742,20 @@ pub async fn handle_training_checkpoint(
         )
     });
 
-    let tree_id = index.write_tree()?;
-    let tree = repo.find_tree(tree_id)?;
-    let head = repo.head()?.peel_to_commit()?;
-    let sig = repo.signature()?;
+    let commit_id = repo_client.commit(&commit_message).await
+        .map_err(|e| anyhow::anyhow!("Failed to create commit: {}", e))?;
 
-    let commit_id = repo.commit(Some("HEAD"), &sig, &sig, &commit_message, &tree, &[&head])?;
+    println!("\n✓ Created commit: {}", &commit_id[..8.min(commit_id.len())]);
 
-    println!("\n✓ Created commit: {}", &commit_id.to_string()[..8]);
-
-    // Push if requested
+    // Push if requested (requires direct repo access)
     if push {
         println!("Pushing to {}...", remote);
+
+        // For push, we still need direct repo access (no service layer API yet)
+        let repo = git2db::GitManager::global()
+            .get_repository(&model_path)?
+            .open()?;
+
         let mut remote_obj = repo.find_remote(remote)?;
         let refspec = format!(
             "refs/heads/{}:refs/heads/{}",

@@ -37,6 +37,12 @@ struct RegistryRequest {
     stageFiles @15 :StageFilesRequest;
     commit @16 :CommitRequest;
 
+    # Merge operations
+    merge @25 :MergeRequest;
+
+    # Status operations
+    status @26 :Text;      # repo_id
+
     # Reference operations
     getHead @17 :Text;      # repo_id
     getRef @18 :GetRefRequest;
@@ -70,6 +76,7 @@ struct RegistryResponse {
     refOid @9 :Text;
     health @10 :HealthStatus;
     remotes @11 :List(RemoteInfo);
+    repositoryStatus @12 :RepositoryStatus;
   }
 }
 
@@ -219,4 +226,23 @@ struct RenameRemoteRequest {
   repoId @0 :Text;
   oldName @1 :Text;
   newName @2 :Text;
+}
+
+# Merge Request
+
+struct MergeRequest {
+  repoId @0 :Text;
+  source @1 :Text;
+  message @2 :Text;           # Optional merge message
+}
+
+# Repository Status
+
+struct RepositoryStatus {
+  branch @0 :Text;             # Optional branch name
+  headOid @1 :Text;            # Optional HEAD commit OID
+  ahead @2 :UInt32;
+  behind @3 :UInt32;
+  isClean @4 :Bool;
+  modifiedFiles @5 :List(Text); # Paths of modified files
 }

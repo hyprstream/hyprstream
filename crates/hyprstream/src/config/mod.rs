@@ -50,7 +50,187 @@ pub struct HyprConfig {
     /// Git storage and P2P transport configuration
     #[serde(default)]
     pub git2db: git2db::config::Git2DBConfig,
+
+    /// Worker service configuration (optional)
+    ///
+    /// When present, the WorkerService will be started for container/sandbox management.
+    /// This enables Kata-based isolated workload execution.
+    #[serde(default)]
+    pub worker: Option<hyprstream_workers::config::WorkerConfig>,
+
+    /// Service management configuration
+    ///
+    /// Controls which services are started at startup in ipc-systemd mode.
+    #[serde(default)]
+    pub services: ServicesConfig,
+
+    /// JWT token configuration
+    #[serde(default)]
+    pub token: TokenConfig,
+
+    /// OpenAI-compatible HTTP API configuration
+    #[serde(default)]
+    pub oai: OAIConfig,
+
+    /// Arrow Flight SQL server configuration
+    #[serde(default)]
+    pub flight: FlightConfig,
+
+    /// StreamService configuration (buffer sizes, TTL, etc.)
+    #[serde(default)]
+    pub streaming: StreamingConfig,
 }
+
+/// JWT token issuance configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenConfig {
+    #[serde(default = "default_token_ttl")]
+    pub default_ttl_seconds: u32,
+
+    #[serde(default = "default_max_token_ttl")]
+    pub max_ttl_seconds: u32,
+}
+
+impl Default for TokenConfig {
+    fn default() -> Self {
+        Self {
+            default_ttl_seconds: 300,   // 5 minutes
+            max_ttl_seconds: 3600,      // 1 hour
+        }
+    }
+}
+
+fn default_token_ttl() -> u32 { 300 }
+fn default_max_token_ttl() -> u32 { 3600 }
+
+/// OpenAI-compatible HTTP API configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAIConfig {
+    /// Host address for HTTP server
+    #[serde(default = "default_oai_host")]
+    pub host: String,
+
+    /// Port for HTTP server
+    #[serde(default = "default_oai_port")]
+    pub port: u16,
+
+    /// TLS certificate path (optional)
+    #[serde(default)]
+    pub tls_cert: Option<PathBuf>,
+
+    /// TLS private key path (optional)
+    #[serde(default)]
+    pub tls_key: Option<PathBuf>,
+
+    /// Request timeout in seconds
+    #[serde(default = "default_oai_timeout")]
+    pub request_timeout_secs: u64,
+
+    /// CORS configuration
+    #[serde(default)]
+    pub cors: server::CorsConfig,
+}
+
+impl Default for OAIConfig {
+    fn default() -> Self {
+        Self {
+            host: default_oai_host(),
+            port: default_oai_port(),
+            tls_cert: None,
+            tls_key: None,
+            request_timeout_secs: default_oai_timeout(),
+            cors: server::CorsConfig::default(),
+        }
+    }
+}
+
+fn default_oai_host() -> String { "0.0.0.0".to_string() }
+fn default_oai_port() -> u16 { 8080 }
+fn default_oai_timeout() -> u64 { 300 }
+
+/// Arrow Flight SQL server configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlightConfig {
+    /// Host address for Flight SQL server
+    #[serde(default = "default_flight_host")]
+    pub host: String,
+
+    /// Port for Flight SQL server
+    #[serde(default = "default_flight_port")]
+    pub port: u16,
+
+    /// Default dataset to serve (optional)
+    #[serde(default)]
+    pub default_dataset: Option<String>,
+
+    /// TLS certificate path (optional)
+    #[serde(default)]
+    pub tls_cert: Option<PathBuf>,
+
+    /// TLS private key path (optional)
+    #[serde(default)]
+    pub tls_key: Option<PathBuf>,
+}
+
+impl Default for FlightConfig {
+    fn default() -> Self {
+        Self {
+            host: default_flight_host(),
+            port: default_flight_port(),
+            default_dataset: None,
+            tls_cert: None,
+            tls_key: None,
+        }
+    }
+}
+
+fn default_flight_host() -> String { "0.0.0.0".to_string() }
+fn default_flight_port() -> u16 { 50051 }
+
+/// StreamService configuration
+///
+/// Controls the PULL/XPUB streaming proxy behavior including buffer sizes,
+/// message TTL, retransmission settings, and StreamBlock batching.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamingConfig {
+    /// Maximum pending messages per topic (for pre-subscribe queue and retransmit buffer)
+    /// Default: 1000
+    #[serde(default = "default_max_pending_per_topic")]
+    pub max_pending_per_topic: usize,
+
+    /// Message TTL in seconds - messages older than this are dropped
+    /// Default: 30
+    #[serde(default = "default_message_ttl_secs")]
+    pub message_ttl_secs: u64,
+
+    /// Interval between compaction runs in seconds
+    /// Default: 5
+    #[serde(default = "default_compact_interval_secs")]
+    pub compact_interval_secs: u64,
+
+    /// StreamBlock batching configuration (rate control)
+    ///
+    /// Controls adaptive batching based on throughput rate.
+    /// Higher rates → larger batches (reduced overhead).
+    /// Lower rates → smaller batches (reduced latency).
+    #[serde(flatten, default)]
+    pub batching: hyprstream_rpc::streaming::BatchingConfig,
+}
+
+impl Default for StreamingConfig {
+    fn default() -> Self {
+        Self {
+            max_pending_per_topic: default_max_pending_per_topic(),
+            message_ttl_secs: default_message_ttl_secs(),
+            compact_interval_secs: default_compact_interval_secs(),
+            batching: hyprstream_rpc::streaming::BatchingConfig::default(),
+        }
+    }
+}
+
+fn default_max_pending_per_topic() -> usize { 1000 }
+fn default_message_ttl_secs() -> u64 { 30 }
+fn default_compact_interval_secs() -> u64 { 5 }
 
 /// Storage paths and directories configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +273,40 @@ impl Default for StorageConfig {
             config_dir,
         }
     }
+}
+
+/// Service management configuration
+///
+/// Controls which services are started at startup in ipc-systemd mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServicesConfig {
+    /// Services to start automatically at startup (ipc-systemd mode)
+    ///
+    /// Default: ["registry", "policy", "worker", "event"]
+    #[serde(default = "default_startup_services")]
+    pub startup: Vec<String>,
+}
+
+impl Default for ServicesConfig {
+    fn default() -> Self {
+        Self {
+            startup: default_startup_services(),
+        }
+    }
+}
+
+/// Default list of services to start at startup
+fn default_startup_services() -> Vec<String> {
+    vec![
+        "event".to_string(),     // Must start first (message bus)
+        "registry".to_string(),  // Model registry
+        "policy".to_string(),    // Authorization
+        "streams".to_string(),   // Streaming proxy with JWT validation
+        "worker".to_string(),    // Container workloads
+        "model".to_string(),     // Model management
+        "oai".to_string(),       // OpenAI-compatible HTTP API
+        "flight".to_string(),    // Arrow Flight SQL server
+    ]
 }
 
 /// Model loading and identification
@@ -269,6 +483,12 @@ pub struct HyprConfigBuilder {
     lora: LoRAConfig,
     storage: StorageConfig,
     git2db: git2db::config::Git2DBConfig,
+    worker: Option<hyprstream_workers::config::WorkerConfig>,
+    services: ServicesConfig,
+    token: TokenConfig,
+    oai: OAIConfig,
+    flight: FlightConfig,
+    streaming: StreamingConfig,
 }
 
 impl HyprConfigBuilder {
@@ -282,6 +502,12 @@ impl HyprConfigBuilder {
             lora: LoRAConfig::default(),
             storage: StorageConfig::default(),
             git2db: git2db::config::Git2DBConfig::default(),
+            worker: None,
+            services: ServicesConfig::default(),
+            token: TokenConfig::default(),
+            oai: OAIConfig::default(),
+            flight: FlightConfig::default(),
+            streaming: StreamingConfig::default(),
         }
     }
 
@@ -295,6 +521,12 @@ impl HyprConfigBuilder {
             lora: config.lora,
             storage: config.storage,
             git2db: config.git2db,
+            worker: config.worker,
+            services: config.services,
+            token: config.token,
+            oai: config.oai,
+            flight: config.flight,
+            streaming: config.streaming,
         }
     }
 
@@ -320,7 +552,19 @@ impl HyprConfigBuilder {
             lora: self.lora,
             storage: self.storage,
             git2db: self.git2db,
+            worker: self.worker,
+            services: self.services,
+            token: self.token,
+            oai: self.oai,
+            flight: self.flight,
+            streaming: self.streaming,
         }
+    }
+
+    /// Set the worker service configuration
+    pub fn worker(mut self, config: hyprstream_workers::config::WorkerConfig) -> Self {
+        self.worker = Some(config);
+        self
     }
 }
 

@@ -24,4 +24,24 @@ fn main() {
             .run()
             .expect("failed to compile common.capnp");
     }
+
+    // Compile streaming schema (StreamBlock, StreamPayload, StreamRegister, etc.)
+    let streaming_schema = schema_dir.join("streaming.capnp");
+    if streaming_schema.exists() {
+        capnpc::CompilerCommand::new()
+            .src_prefix("schema")
+            .file(&streaming_schema)
+            .run()
+            .expect("failed to compile streaming.capnp");
+    }
+
+    // Compile events schema (EventEnvelope, WorkerEvent)
+    let events_schema = schema_dir.join("events.capnp");
+    if events_schema.exists() {
+        capnpc::CompilerCommand::new()
+            .src_prefix("schema")
+            .file(&events_schema)
+            .run()
+            .expect("failed to compile events.capnp");
+    }
 }

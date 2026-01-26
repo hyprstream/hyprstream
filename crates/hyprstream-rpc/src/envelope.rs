@@ -40,6 +40,7 @@
 //!
 //! The nested structure makes clear exactly what is being signed.
 
+use crate::auth::Claims;
 use crate::capnp::{FromCapnp, ToCapnp};
 use crate::common_capnp;
 use crate::crypto::{SigningKey, VerifyingKey};
@@ -270,7 +271,7 @@ pub struct RequestEnvelope {
     /// Serialized inner request (e.g., RegistryRequest, InferenceRequest)
     pub payload: Vec<u8>,
 
-    /// X25519/P-256 ephemeral public key for stream HMAC key derivation (optional)
+    /// Ristretto255/P-256 ephemeral public key for stream HMAC key derivation (optional)
     pub ephemeral_pubkey: Option<[u8; 32]>,
 
     /// Random nonce for replay protection (16 bytes)
@@ -278,6 +279,11 @@ pub struct RequestEnvelope {
 
     /// Unix timestamp in milliseconds for expiration check
     pub timestamp: i64,
+
+    /// User authorization claims (protected by envelope signature)
+    /// Contains the user's identity, scopes, and expiration.
+    /// No separate JWT signature needed - the envelope signature covers this.
+    pub claims: Option<Claims>,
 }
 
 impl RequestEnvelope {
@@ -299,12 +305,19 @@ impl RequestEnvelope {
             ephemeral_pubkey: None,
             nonce,
             timestamp,
+            claims: None,
         }
     }
 
     /// Set ephemeral public key for streaming requests (DH key exchange).
     pub fn with_ephemeral_pubkey(mut self, pubkey: [u8; 32]) -> Self {
         self.ephemeral_pubkey = Some(pubkey);
+        self
+    }
+
+    /// Set user authorization claims.
+    pub fn with_claims(mut self, claims: Claims) -> Self {
+        self.claims = Some(claims);
         self
     }
 
@@ -338,24 +351,68 @@ impl RequestEnvelope {
         self.identity.casbin_subject()
     }
 
-    /// Serialize this envelope to canonical Cap'n Proto bytes.
+    /// Serialize this envelope to canonical Cap'n Proto bytes for signing.
+    ///
+    /// SECURITY: This method MUST produce deterministic output for cryptographic
+    /// signatures to work correctly. We use Cap'n Proto's canonical form as
+    /// specified in the encoding spec:
+    /// https://capnproto.org/encoding.html#canonicalization
+    ///
+    /// Canonical form guarantees:
+    /// - Same logical data → identical bytes (always)
+    /// - Preorder encoding (deterministic pointer ordering)
+    /// - Single segment (no segment boundary ambiguity)
+    /// - Truncated trailing zeros (no padding differences)
+    /// - No packing (binary format is deterministic)
+    /// - No segment table framing (redundant for signing)
     ///
     /// These bytes are what gets signed in a SignedEnvelope.
     pub fn to_bytes(&self) -> Vec<u8> {
         use capnp::message::Builder;
         use capnp::serialize;
+        use capnp::Word;
 
+        // Step 1: Build the message
         let mut message = Builder::new_default();
         {
             let mut builder = message.init_root::<common_capnp::request_envelope::Builder>();
             self.write_to(&mut builder);
         }
 
-        let mut bytes = Vec::new();
-        if let Err(e) = serialize::write_message(&mut bytes, &message) {
-            tracing::error!("RequestEnvelope serialization failed: {}", e);
+        // Step 2: Serialize to bytes first (to create a reader)
+        let mut temp_bytes = Vec::new();
+        if let Err(e) = serialize::write_message(&mut temp_bytes, &message) {
+            tracing::error!("RequestEnvelope temporary serialization failed: {}", e);
+            return Vec::new();
         }
-        bytes
+
+        // Step 3: Read back to get a Reader
+        let reader = match serialize::read_message(
+            &mut std::io::Cursor::new(&temp_bytes),
+            capnp::message::ReaderOptions::default(),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("RequestEnvelope reader creation failed: {}", e);
+                return Vec::new();
+            }
+        };
+
+        // Step 4: CRITICAL - Canonicalize before signing
+        // This ensures deterministic serialization as required by Cap'n Proto spec.
+        // Non-canonical serialization can produce different bytes for identical data,
+        // breaking signature verification across platforms/versions.
+        let canonical_words = match reader.canonicalize() {
+            Ok(words) => words,
+            Err(e) => {
+                tracing::error!("Envelope canonicalization failed: {}", e);
+                // Fall back to temp_bytes if canonicalization fails
+                return temp_bytes;
+            }
+        };
+
+        // Step 5: Convert Words to bytes (raw segment data, NO stream framing)
+        Word::words_to_bytes(&canonical_words).to_vec()
     }
 }
 
@@ -662,6 +719,9 @@ impl ToCapnp for RequestEnvelope {
         }
         builder.set_nonce(&self.nonce);
         builder.set_timestamp(self.timestamp);
+        if let Some(ref claims) = self.claims {
+            claims.write_to(&mut builder.reborrow().init_claims());
+        }
     }
 }
 
@@ -698,6 +758,14 @@ impl FromCapnp for RequestEnvelope {
             arr
         };
 
+        let claims = {
+            if reader.has_claims() {
+                Some(Claims::read_from(reader.get_claims()?)?)
+            } else {
+                None
+            }
+        };
+
         Ok(Self {
             request_id: reader.get_request_id(),
             identity: RequestIdentity::read_from(reader.get_identity()?)?,
@@ -705,6 +773,7 @@ impl FromCapnp for RequestEnvelope {
             ephemeral_pubkey,
             nonce,
             timestamp: reader.get_timestamp(),
+            claims,
         })
     }
 }
@@ -758,10 +827,15 @@ impl FromCapnp for SignedEnvelope {
     }
 }
 
-/// Response envelope (for future use).
+/// Signed response envelope for E2E authenticated responses.
 ///
-/// Currently responses don't carry identity, but this is available
-/// for tracking response provenance if needed.
+/// All RPC responses are signed to prevent MITM attacks on response data
+/// (e.g., server's DH public key in StreamInfo).
+///
+/// # Security
+///
+/// The signature covers `request_id || payload`, binding the response to
+/// a specific request and ensuring the payload hasn't been tampered with.
 #[derive(Debug, Clone)]
 pub struct ResponseEnvelope {
     /// Request ID this response corresponds to
@@ -769,12 +843,74 @@ pub struct ResponseEnvelope {
 
     /// Serialized inner response
     pub payload: Vec<u8>,
+
+    /// Ed25519 signature (64 bytes) over request_id || payload
+    pub signature: [u8; 64],
+
+    /// Ed25519 public key of the signer (32 bytes)
+    pub signer_pubkey: [u8; 32],
 }
 
 impl ResponseEnvelope {
-    /// Create a new response envelope.
-    pub fn new(request_id: u64, payload: Vec<u8>) -> Self {
-        Self { request_id, payload }
+    /// Create and sign a new response envelope.
+    ///
+    /// The signature covers `request_id || payload` to bind the response
+    /// to the specific request and prevent tampering.
+    pub fn new_signed(request_id: u64, payload: Vec<u8>, signing_key: &SigningKey) -> Self {
+        // Build signing data: request_id (8 bytes LE) || payload
+        let mut signing_data = Vec::with_capacity(8 + payload.len());
+        signing_data.extend_from_slice(&request_id.to_le_bytes());
+        signing_data.extend_from_slice(&payload);
+
+        let signature_obj = signing_key.sign(&signing_data);
+        let signature: [u8; 64] = signature_obj.to_bytes();
+        let signer_pubkey: [u8; 32] = signing_key.verifying_key().to_bytes();
+
+        Self {
+            request_id,
+            payload,
+            signature,
+            signer_pubkey,
+        }
+    }
+
+    /// Verify the response signature.
+    ///
+    /// # Arguments
+    ///
+    /// * `expected_pubkey` - Optional expected signer public key. If provided,
+    ///   verification fails if the signer doesn't match.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if signature is valid, `Err` otherwise.
+    pub fn verify(&self, expected_pubkey: Option<&VerifyingKey>) -> Result<()> {
+        // Check signer matches expected key if provided
+        let verifying_key = VerifyingKey::from_bytes(&self.signer_pubkey)
+            .map_err(|_| anyhow::anyhow!("Invalid signer public key"))?;
+
+        if let Some(expected) = expected_pubkey {
+            if verifying_key.to_bytes() != expected.to_bytes() {
+                anyhow::bail!("Response signed by unexpected key");
+            }
+        }
+
+        // Reconstruct signing data
+        let mut signing_data = Vec::with_capacity(8 + self.payload.len());
+        signing_data.extend_from_slice(&self.request_id.to_le_bytes());
+        signing_data.extend_from_slice(&self.payload);
+
+        // Verify signature
+        let signature = ed25519_dalek::Signature::from_bytes(&self.signature);
+        verifying_key
+            .verify_strict(&signing_data, &signature)
+            .map_err(|_| anyhow::anyhow!("Response signature verification failed"))
+    }
+
+    /// Get the signer's public key.
+    pub fn signer_pubkey(&self) -> Result<VerifyingKey> {
+        VerifyingKey::from_bytes(&self.signer_pubkey)
+            .map_err(|_| anyhow::anyhow!("Invalid signer public key"))
     }
 }
 
@@ -784,6 +920,8 @@ impl ToCapnp for ResponseEnvelope {
     fn write_to(&self, builder: &mut Self::Builder<'_>) {
         builder.set_request_id(self.request_id);
         builder.set_payload(&self.payload);
+        builder.set_signature(&self.signature);
+        builder.set_signer_pubkey(&self.signer_pubkey);
     }
 }
 
@@ -791,11 +929,116 @@ impl FromCapnp for ResponseEnvelope {
     type Reader<'a> = common_capnp::response_envelope::Reader<'a>;
 
     fn read_from(reader: Self::Reader<'_>) -> Result<Self> {
+        let sig_data = reader.get_signature()?;
+        if sig_data.len() != 64 {
+            anyhow::bail!("Invalid signature length: {}", sig_data.len());
+        }
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(sig_data);
+
+        let pubkey_data = reader.get_signer_pubkey()?;
+        if pubkey_data.len() != 32 {
+            anyhow::bail!("Invalid signer pubkey length: {}", pubkey_data.len());
+        }
+        let mut signer_pubkey = [0u8; 32];
+        signer_pubkey.copy_from_slice(pubkey_data);
+
         Ok(Self {
             request_id: reader.get_request_id(),
             payload: reader.get_payload()?.to_vec(),
+            signature,
+            signer_pubkey,
         })
     }
+}
+
+/// Unwrap and verify a SignedEnvelope from wire bytes.
+///
+/// Deserializes, verifies signature and replay protection, then extracts
+/// the context and payload.
+///
+/// # Arguments
+///
+/// * `request` - Raw bytes containing a serialized SignedEnvelope
+/// * `server_pubkey` - Expected Ed25519 public key of the signer
+/// * `nonce_cache` - Cache for replay protection
+///
+/// # Returns
+///
+/// On success, returns `(EnvelopeContext, payload)` where:
+/// - `EnvelopeContext` contains verified request metadata
+/// - `payload` is the inner request bytes
+///
+/// # Errors
+///
+/// Returns error if:
+/// - Deserialization fails
+/// - Signature verification fails
+/// - Replay attack detected (nonce reused or timestamp expired)
+pub fn unwrap_envelope(
+    request: &[u8],
+    server_pubkey: &VerifyingKey,
+    nonce_cache: &dyn NonceCache,
+) -> Result<(crate::service::EnvelopeContext, Vec<u8>)> {
+    use capnp::serialize;
+
+    // Deserialize SignedEnvelope from Cap'n Proto
+    let reader = serialize::read_message(
+        &mut std::io::Cursor::new(request),
+        capnp::message::ReaderOptions::default(),
+    )?;
+    let signed_reader = reader.get_root::<crate::common_capnp::signed_envelope::Reader>()?;
+    let signed = SignedEnvelope::read_from(signed_reader)?;
+
+    // Verify signature and replay protection
+    signed.verify(server_pubkey, nonce_cache)?;
+
+    // Extract context and payload
+    let ctx = crate::service::EnvelopeContext::from_verified(&signed);
+    let payload = signed.payload().to_vec();
+
+    Ok((ctx, payload))
+}
+
+/// Unwrap and verify a ResponseEnvelope from wire bytes.
+///
+/// Deserializes and verifies signature, then extracts the payload.
+///
+/// # Arguments
+///
+/// * `response` - Raw bytes containing a serialized ResponseEnvelope
+/// * `expected_pubkey` - Optional expected signer public key
+///
+/// # Returns
+///
+/// On success, returns `(request_id, payload)` where:
+/// - `request_id` correlates with the original request
+/// - `payload` is the inner response bytes
+///
+/// # Errors
+///
+/// Returns error if:
+/// - Deserialization fails
+/// - Signature verification fails
+/// - Signer doesn't match expected_pubkey (if provided)
+pub fn unwrap_response(
+    response: &[u8],
+    expected_pubkey: Option<&VerifyingKey>,
+) -> Result<(u64, Vec<u8>)> {
+    use capnp::serialize;
+
+    // Deserialize ResponseEnvelope from Cap'n Proto
+    let reader = serialize::read_message(
+        &mut std::io::Cursor::new(response),
+        capnp::message::ReaderOptions::default(),
+    )?;
+    let response_reader = reader.get_root::<crate::common_capnp::response_envelope::Reader>()?;
+    let envelope = ResponseEnvelope::read_from(response_reader)?;
+
+    // Verify signature
+    envelope.verify(expected_pubkey)?;
+
+    Ok((envelope.request_id, envelope.payload))
 }
 
 #[cfg(test)]

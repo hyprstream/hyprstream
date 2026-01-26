@@ -7,22 +7,24 @@ use crate::auth::Operation;
 use crate::services::PolicyZmqClient;
 use crate::registry_capnp;
 use crate::services::rpc_types::{HealthStatus, RemoteInfo, RegistryResponse, WorktreeData};
-use crate::services::{EnvelopeContext, ServiceRunner, ZmqClient, ZmqService};
+use crate::services::{CallOptions, EnvelopeContext, ZmqClient, ZmqService};
+use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::prelude::*;
+use hyprstream_rpc::registry::{global as registry, SocketKind};
 use hyprstream_rpc::{serialize_message, FromCapnp};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use capnp::message::{Builder, ReaderOptions};
 use capnp::serialize;
-use git2db::{Git2DB, RepoId, TrackedRepository, GitRef};
+use git2db::{Git2DB, RepoId, RepositoryStatus, TrackedRepository, GitRef};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
-/// Default endpoint for the registry service
-pub const REGISTRY_ENDPOINT: &str = "inproc://hyprstream/registry";
+/// Service name for endpoint registry
+const SERVICE_NAME: &str = "registry";
 
 // ============================================================================
 // Extension Trait for Registry Operations on ZmqClient
@@ -77,7 +79,7 @@ impl RegistryOps for ZmqClient {
             req.set_id(id);
             req.set_list(());
         })?;
-        let response = self.call(payload).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_repositories_response(&response)
     }
 
@@ -88,7 +90,7 @@ impl RegistryOps for ZmqClient {
             req.set_id(id);
             req.set_get(repo_id);
         })?;
-        let response = self.call(payload).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_optional_repository_response(&response)
     }
 
@@ -99,7 +101,7 @@ impl RegistryOps for ZmqClient {
             req.set_id(id);
             req.set_get_by_name(name);
         })?;
-        let response = self.call(payload).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_optional_repository_response(&response)
     }
 
@@ -110,7 +112,7 @@ impl RegistryOps for ZmqClient {
             req.set_id(id);
             req.set_list_branches(repo_id);
         })?;
-        let response = self.call(payload).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_branches_response(&response)
     }
 
@@ -121,7 +123,7 @@ impl RegistryOps for ZmqClient {
             req.set_id(id);
             req.set_health_check(());
         })?;
-        let response = self.call(payload).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_health_response(&response)
     }
 
@@ -138,7 +140,7 @@ impl RegistryOps for ZmqClient {
             clone_req.set_shallow(false);
             clone_req.set_depth(0);
         })?;
-        let response = self.call(payload).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_repo_id_response(&response)
     }
 
@@ -157,7 +159,7 @@ impl RegistryOps for ZmqClient {
                 reg_req.set_name(n);
             }
         })?;
-        let response = self.call(payload).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_success_response(&response)
     }
 
@@ -168,7 +170,7 @@ impl RegistryOps for ZmqClient {
             req.set_id(req_id);
             req.set_remove(&id.to_string());
         })?;
-        let response = self.call(payload).await?;
+        let response = self.call(payload, CallOptions::default()).await?;
         parse_success_response(&response)
     }
 }
@@ -335,14 +337,20 @@ pub struct RegistryZmq {
 
 impl RegistryZmq {
     /// Create a new registry client with signing credentials.
+    ///
+    /// # Note
+    /// Uses the same signing key for both request signing and response verification.
+    /// This is appropriate for internal communication where client and server share keys.
     pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
-        Self::with_endpoint(REGISTRY_ENDPOINT, signing_key, identity)
+        let endpoint = registry().endpoint(SERVICE_NAME, SocketKind::Rep).to_zmq_string();
+        Self::with_endpoint(&endpoint, signing_key, identity)
     }
 
     /// Create a registry client connected to a specific endpoint.
     pub fn with_endpoint(endpoint: &str, signing_key: SigningKey, identity: RequestIdentity) -> Self {
+        let server_verifying_key = signing_key.verifying_key();
         Self {
-            client: ZmqClient::new(endpoint, signing_key, identity),
+            client: ZmqClient::new(endpoint, signing_key, server_verifying_key, identity),
         }
     }
 
@@ -474,6 +482,7 @@ impl RegistryClient for RegistryZmq {
 /// The registry is wrapped in RwLock for interior mutability since some operations
 /// (like clone) require mutable access but ZmqService::handle_request takes &self.
 pub struct RegistryService {
+    // Business logic
     registry: RwLock<Git2DB>,
     #[allow(dead_code)] // Future: base directory for relative path operations
     base_dir: PathBuf,
@@ -481,15 +490,22 @@ pub struct RegistryService {
     runtime_handle: tokio::runtime::Handle,
     /// Policy client for authorization checks (uses ZMQ to PolicyService)
     policy_client: PolicyZmqClient,
+    // Infrastructure (for Spawnable)
+    context: Arc<zmq::Context>,
+    transport: TransportConfig,
+    signing_key: SigningKey,
 }
 
 impl RegistryService {
-    /// Create a new registry service
+    /// Create a new registry service with infrastructure
     ///
     /// Must be called from within a tokio runtime context.
     pub async fn new(
         base_dir: impl AsRef<Path>,
         policy_client: PolicyZmqClient,
+        context: Arc<zmq::Context>,
+        transport: TransportConfig,
+        signing_key: SigningKey,
     ) -> Result<Self> {
         let base_dir = base_dir.as_ref().to_path_buf();
         let registry = Git2DB::open(&base_dir).await?;
@@ -501,30 +517,10 @@ impl RegistryService {
             base_dir,
             runtime_handle,
             policy_client,
+            context,
+            transport,
+            signing_key,
         })
-    }
-
-    /// Start the registry service on the default endpoint
-    pub async fn start(
-        base_dir: impl AsRef<Path>,
-        server_pubkey: hyprstream_rpc::VerifyingKey,
-        policy_client: PolicyZmqClient,
-    ) -> Result<crate::services::ServiceHandle> {
-        Self::start_at(base_dir, server_pubkey, policy_client, REGISTRY_ENDPOINT).await
-    }
-
-    /// Start the registry service at a specific endpoint
-    ///
-    /// Waits for socket binding to complete before returning.
-    pub async fn start_at(
-        base_dir: impl AsRef<Path>,
-        server_pubkey: hyprstream_rpc::VerifyingKey,
-        policy_client: PolicyZmqClient,
-        endpoint: &str,
-    ) -> Result<crate::services::ServiceHandle> {
-        let service = Self::new(base_dir, policy_client).await?;
-        let runner = ServiceRunner::new(endpoint, server_pubkey);
-        runner.run(service).await
     }
 
     /// Check authorization for an operation.
@@ -544,7 +540,14 @@ impl RegistryService {
             self.runtime_handle.block_on(
                 self.policy_client.check(&subject, resource, operation)
             )
-        }).unwrap_or(false);
+        }).unwrap_or_else(|e| {
+            // Log error before denying - prevents silent failures
+            warn!(
+                "Policy check failed for {} on {}: {} - denying access",
+                subject, resource, e
+            );
+            false
+        });
 
         if allowed {
             None // Authorized
@@ -670,6 +673,36 @@ impl RegistryService {
             let handle = registry.repo(&id)?;
             let oid = handle.commit(message).await?;
             Ok(oid.to_string())
+        })
+    }
+
+    /// Handle merge
+    fn handle_merge(&self, repo_id: &str, source: &str, message: Option<&str>) -> Result<String> {
+        let id = Self::parse_repo_id(repo_id)?;
+        let source = source.to_string();
+        let message = message.map(|s| s.to_string());
+
+        // Use captured runtime handle instead of creating new runtime
+        self.runtime_handle.block_on(async {
+            let registry = self.registry.read()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let handle = registry.repo(&id)?;
+            let oid = handle.merge(&source, message.as_deref()).await?;
+            Ok(oid.to_string())
+        })
+    }
+
+    /// Handle status
+    fn handle_status(&self, repo_id: &str) -> Result<git2db::RepositoryStatus> {
+        let id = Self::parse_repo_id(repo_id)?;
+
+        // Use captured runtime handle instead of creating new runtime
+        self.runtime_handle.block_on(async {
+            let registry = self.registry.read()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let handle = registry.repo(&id)?;
+            let status = handle.status().await?;
+            Ok(status)
         })
     }
 
@@ -1254,6 +1287,41 @@ impl ZmqService for RegistryService {
                 }
             }
 
+            Which::Merge(merge_req) => {
+                let merge_req = merge_req?;
+                let repo_id = merge_req.get_repo_id()?.to_str()?;
+                // Authorization: Write on specific registry entry
+                let resource = format!("registry:{}", repo_id);
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                    return Ok(resp);
+                }
+                let source = merge_req.get_source()?.to_str()?;
+                let message = if merge_req.has_message() {
+                    Some(merge_req.get_message()?.to_str()?.to_string())
+                } else {
+                    None
+                };
+
+                match self.handle_merge(repo_id, source, message.as_deref()) {
+                    Ok(oid) => Ok(RegistryResponse::commit_oid(request_id, &oid)),
+                    Err(e) => Ok(RegistryResponse::error(request_id, &e.to_string())),
+                }
+            }
+
+            Which::Status(repo_id) => {
+                let repo_id = repo_id?.to_str()?;
+                // Authorization: Query on specific registry entry
+                let resource = format!("registry:{}", repo_id);
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
+                    return Ok(resp);
+                }
+
+                match self.handle_status(repo_id) {
+                    Ok(status) => Ok(RegistryResponse::repository_status(request_id, &status)),
+                    Err(e) => Ok(RegistryResponse::error(request_id, &e.to_string())),
+                }
+            }
+
             Which::HealthCheck(()) => {
                 // Health check is public (no authorization required)
                 match self.handle_health_check() {
@@ -1463,6 +1531,18 @@ impl ZmqService for RegistryService {
     fn name(&self) -> &str {
         "registry"
     }
+
+    fn context(&self) -> &Arc<zmq::Context> {
+        &self.context
+    }
+
+    fn transport(&self) -> &TransportConfig {
+        &self.transport
+    }
+
+    fn signing_key(&self) -> SigningKey {
+        self.signing_key.clone()
+    }
 }
 
 // ============================================================================
@@ -1534,7 +1614,8 @@ impl RepositoryZmqClient {
 
     /// Create a ZmqClient with this client's credentials for raw RPC calls.
     fn create_inner_client(&self) -> ZmqClient {
-        ZmqClient::new(&self.endpoint, self.signing_key.clone(), self.identity.clone())
+        let server_verifying_key = self.signing_key.verifying_key();
+        ZmqClient::new(&self.endpoint, self.signing_key.clone(), server_verifying_key, self.identity.clone())
     }
 
     /// Parse a worktrees list response
@@ -1671,7 +1752,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -1717,7 +1798,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         self.parse_worktrees_response(&response)
@@ -1757,7 +1838,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -1801,7 +1882,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         let reader = serialize::read_message(&*response, ReaderOptions::new())
@@ -1855,7 +1936,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -1899,7 +1980,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -1948,7 +2029,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -1995,7 +2076,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2036,7 +2117,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2085,7 +2166,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2136,7 +2217,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2177,7 +2258,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         self.parse_remotes_response(&response)
@@ -2204,7 +2285,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2248,7 +2329,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2293,7 +2374,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2342,7 +2423,7 @@ impl RepositoryClient for RepositoryZmqClient {
             bytes
         };
 
-        let response = client.call(bytes).await
+        let response = client.call(bytes, CallOptions::default()).await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
 
         // Parse response
@@ -2354,6 +2435,144 @@ impl RepositoryClient for RepositoryZmqClient {
         use registry_capnp::registry_response::Which;
         match resp.which() {
             Ok(Which::Success(())) => Ok(()),
+            Ok(Which::Error(err)) => {
+                let err = err.map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+                let msg = err.get_message()
+                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?
+                    .to_str()
+                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+                Err(RegistryServiceError::transport(msg))
+            }
+            _ => Err(RegistryServiceError::transport("Unexpected response type")),
+        }
+    }
+
+    async fn status(&self) -> Result<RepositoryStatus, RegistryServiceError> {
+        let client = self.create_inner_client();
+
+        // Build status request - scope builder to drop before await
+        let bytes = {
+            let id = client.next_id();
+            let mut message = Builder::new_default();
+            let mut req = message.init_root::<registry_capnp::registry_request::Builder>();
+            req.set_id(id);
+            req.set_status(&self.repo_id.to_string());
+
+            let mut bytes = Vec::new();
+            serialize::write_message(&mut bytes, &message)
+                .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+            bytes
+        };
+
+        let response = client.call(bytes, CallOptions::default()).await
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+
+        // Parse response
+        let reader = serialize::read_message(&*response, ReaderOptions::new())
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+        let resp = reader.get_root::<registry_capnp::registry_response::Reader>()
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+
+        use registry_capnp::registry_response::Which;
+        match resp.which() {
+            Ok(Which::RepositoryStatus(status_reader)) => {
+                let status = status_reader.map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+
+                // Convert branch (optional text)
+                let branch = if status.has_branch() {
+                    Some(status.get_branch()
+                        .map_err(|e| RegistryServiceError::transport(e.to_string()))?
+                        .to_str()
+                        .map_err(|e| RegistryServiceError::transport(e.to_string()))?
+                        .to_string())
+                } else {
+                    None
+                };
+
+                // Convert headOid (optional text)
+                let head = if status.has_head_oid() {
+                    let oid_str = status.get_head_oid()
+                        .map_err(|e| RegistryServiceError::transport(e.to_string()))?
+                        .to_str()
+                        .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+                    Some(git2db::Oid::from_str(oid_str)
+                        .map_err(|e| RegistryServiceError::transport(e.to_string()))?)
+                } else {
+                    None
+                };
+
+                // Convert modified files
+                let modified_files: Vec<PathBuf> = status.get_modified_files()
+                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?
+                    .iter()
+                    .filter_map(|text_result| {
+                        text_result.map(|text| {
+                            text.to_str().ok().map(|s| PathBuf::from(s))
+                        }).unwrap_or(None)
+                    })
+                    .collect();
+
+                Ok(RepositoryStatus {
+                    branch,
+                    head,
+                    ahead: status.get_ahead() as usize,
+                    behind: status.get_behind() as usize,
+                    is_clean: status.get_is_clean(),
+                    modified_files,
+                })
+            }
+            Ok(Which::Error(err)) => {
+                let err = err.map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+                let msg = err.get_message()
+                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?
+                    .to_str()
+                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+                Err(RegistryServiceError::transport(msg))
+            }
+            _ => Err(RegistryServiceError::transport("Unexpected response type")),
+        }
+    }
+
+    async fn merge(&self, source: &str, message: Option<&str>) -> Result<String, RegistryServiceError> {
+        let client = self.create_inner_client();
+
+        // Build merge request - scope builder to drop before await
+        let bytes = {
+            let id = client.next_id();
+            let mut message_builder = Builder::new_default();
+            let mut req = message_builder.init_root::<registry_capnp::registry_request::Builder>();
+            req.set_id(id);
+
+            let mut merge_req = req.init_merge();
+            merge_req.set_repo_id(&self.repo_id.to_string());
+            merge_req.set_source(source);
+            if let Some(msg) = message {
+                merge_req.set_message(msg);
+            }
+
+            let mut bytes = Vec::new();
+            serialize::write_message(&mut bytes, &message_builder)
+                .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+            bytes
+        };
+
+        let response = client.call(bytes, CallOptions::default()).await
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+
+        // Parse response
+        let reader = serialize::read_message(&*response, ReaderOptions::new())
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+        let resp = reader.get_root::<registry_capnp::registry_response::Reader>()
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+
+        use registry_capnp::registry_response::Which;
+        match resp.which() {
+            Ok(Which::CommitOid(oid)) => {
+                let oid = oid.map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+                Ok(oid.to_str()
+                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?
+                    .to_string())
+            }
             Ok(Which::Error(err)) => {
                 let err = err.map_err(|e| RegistryServiceError::transport(e.to_string()))?;
                 let msg = err.get_message()
@@ -2377,41 +2596,49 @@ mod tests {
 
     #[tokio::test]
     async fn test_registry_service_health_check() {
+        use hyprstream_rpc::service::InprocManager;
+        use hyprstream_rpc::transport::TransportConfig;
+
         let temp_dir = TempDir::new().expect("test: create temp dir");
+        let context = crate::zmq::global_context();
 
         // Generate keypair for signing/verification
         let (signing_key, verifying_key) = generate_signing_keypair();
 
         // Create a permissive policy manager and start PolicyService first
         let policy_manager = Arc::new(PolicyManager::permissive().await.expect("test: create policy manager"));
-        let _policy_handle = PolicyService::start_at(
+        let policy_transport = TransportConfig::inproc("test-policy-health");
+        let policy_service = PolicyService::new(
             policy_manager,
-            verifying_key,
-            "inproc://test-policy",
-        )
-        .await
-        .expect("test: start policy service");
+            Arc::new(signing_key.clone()),
+            crate::config::TokenConfig::default(),
+            context.clone(),
+            policy_transport,
+        );
+        let manager = InprocManager::new();
+        let _policy_handle = manager.spawn(Box::new(policy_service)).await.expect("test: start policy service");
 
         // Create policy client for RegistryService
-        let policy_client = PolicyZmqClient::new_at(
-            "inproc://test-policy",
+        let policy_client = PolicyZmqClient::with_endpoint(
+            "inproc://test-policy-health",
             signing_key.clone(),
             RequestIdentity::local(),
         );
 
         // Start the registry service with policy client
-        let handle = RegistryService::start_at(
+        let registry_transport = TransportConfig::inproc("test-registry-health");
+        let registry_service = RegistryService::new(
             temp_dir.path(),
-            verifying_key,
             policy_client,
-            "inproc://test-registry",
-        )
-        .await
-        .expect("test: start registry service");
+            context.clone(),
+            registry_transport,
+            signing_key.clone(),
+        ).await.expect("test: create registry service");
+        let mut handle = manager.spawn(Box::new(registry_service)).await.expect("test: start registry service");
 
         // Create signed client with matching key and local identity
         let client = RegistryZmqClient::with_endpoint(
-            "inproc://test-registry",
+            "inproc://test-registry-health",
             signing_key,
             RequestIdentity::local(),
         );
@@ -2420,6 +2647,6 @@ mod tests {
         assert!(result.is_ok(), "health_check should succeed: {:?}", result.err());
 
         // Stop the service
-        handle.stop().await;
+        let _ = handle.stop().await;
     }
 }

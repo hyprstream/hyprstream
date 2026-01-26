@@ -316,6 +316,40 @@ impl RegistryResponse {
         serialize::write_message(&mut bytes, &msg).unwrap_or_default();
         bytes
     }
+
+    /// Build a repository status response.
+    pub fn repository_status(request_id: u64, status: &git2db::RepositoryStatus) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut status_builder = response.init_repository_status();
+
+        // Set branch (optional)
+        if let Some(ref branch) = status.branch {
+            status_builder.set_branch(branch);
+        }
+
+        // Set head OID (optional)
+        if let Some(ref oid) = status.head {
+            status_builder.set_head_oid(&oid.to_string());
+        }
+
+        // Set other fields
+        status_builder.set_ahead(status.ahead as u32);
+        status_builder.set_behind(status.behind as u32);
+        status_builder.set_is_clean(status.is_clean);
+
+        // Set modified files
+        let mut files_builder = status_builder.init_modified_files(status.modified_files.len() as u32);
+        for (i, file) in status.modified_files.iter().enumerate() {
+            files_builder.set(i as u32, &file.to_string_lossy());
+        }
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
 }
 
 // ============================================================================
@@ -361,12 +395,38 @@ use crate::config::{FinishReason, GenerationResult, ModelInfo};
 use crate::runtime::GenerationStats;
 
 /// Stream started info returned by generate_stream.
-#[derive(Debug, Clone, FromCapnp)]
-#[capnp(inference_capnp::stream_info)]
+///
+/// Now includes server_pubkey for E2E authenticated streaming via DH.
+#[derive(Debug, Clone)]
 pub struct StreamStartedInfo {
-    #[capnp(rename = "stream_id")]
+    /// Stream ID for client display/logging
     pub stream_id: String,
+    /// StreamService SUB endpoint
     pub endpoint: String,
+    /// Server's ephemeral Ristretto255 public key for DH (32 bytes)
+    pub server_pubkey: [u8; 32],
+}
+
+impl FromCapnp for StreamStartedInfo {
+    type Reader<'a> = inference_capnp::stream_info::Reader<'a>;
+
+    fn read_from(reader: Self::Reader<'_>) -> Result<Self> {
+        let stream_id = reader.get_stream_id()?.to_str()?.to_string();
+        let endpoint = reader.get_endpoint()?.to_str()?.to_string();
+
+        let pubkey_data = reader.get_server_pubkey()?;
+        if pubkey_data.len() != 32 {
+            anyhow::bail!("Invalid server_pubkey length: {}", pubkey_data.len());
+        }
+        let mut server_pubkey = [0u8; 32];
+        server_pubkey.copy_from_slice(pubkey_data);
+
+        Ok(Self {
+            stream_id,
+            endpoint,
+            server_pubkey,
+        })
+    }
 }
 
 // ============================================================================
@@ -453,7 +513,13 @@ impl InferenceResponse {
     }
 
     /// Build a stream started response.
-    pub fn stream_started(request_id: u64, stream_id: &str, endpoint: &str) -> Vec<u8> {
+    ///
+    /// # Arguments
+    /// * `request_id` - Correlation ID for the request
+    /// * `stream_id` - Stream identifier (legacy, for client display)
+    /// * `endpoint` - StreamService SUB endpoint for client subscription
+    /// * `server_pubkey` - Server's ephemeral Ristretto255 public key for DH (32 bytes)
+    pub fn stream_started(request_id: u64, stream_id: &str, endpoint: &str, server_pubkey: &[u8; 32]) -> Vec<u8> {
         let mut msg = Builder::new_default();
         let mut response = msg.init_root::<inference_capnp::inference_response::Builder>();
         response.set_request_id(request_id);
@@ -461,6 +527,24 @@ impl InferenceResponse {
         let mut stream_info = response.init_stream_started();
         stream_info.set_stream_id(stream_id);
         stream_info.set_endpoint(endpoint);
+        stream_info.set_server_pubkey(server_pubkey);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a stream authorized response.
+    ///
+    /// Sent in response to StartStream to confirm stream subscription is authorized.
+    /// Future: will include server's ephemeral public key for DH key exchange.
+    pub fn stream_authorized(request_id: u64, stream_id: &str) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<inference_capnp::inference_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut auth_response = response.init_stream_authorized();
+        auth_response.set_stream_id(stream_id);
 
         let mut bytes = Vec::new();
         serialize::write_message(&mut bytes, &msg).unwrap_or_default();
@@ -544,27 +628,28 @@ impl InferenceResponse {
         bytes
     }
 
-    /// Build a stream chunk message.
-    pub fn stream_chunk(stream_id: &str, seq_num: u32, text: &str) -> Vec<u8> {
+    /// Build an inference payload message with a token.
+    ///
+    /// The payload is serialized into streaming_capnp::StreamBlock.payloads.
+    /// Ordering is handled by prevMac in the outer StreamBlock wrapper.
+    pub fn inference_token(stream_id: &str, token: &str) -> Vec<u8> {
         let mut msg = Builder::new_default();
-        let mut chunk = msg.init_root::<inference_capnp::stream_chunk::Builder>();
-        chunk.set_stream_id(stream_id);
-        chunk.set_sequence_num(seq_num);
-        chunk.set_text(text);
+        let mut payload = msg.init_root::<inference_capnp::inference_payload::Builder>();
+        payload.set_stream_id(stream_id);
+        payload.set_token(token);
 
         let mut bytes = Vec::new();
         serialize::write_message(&mut bytes, &msg).unwrap_or_default();
         bytes
     }
 
-    /// Build a stream error message.
-    pub fn stream_error(stream_id: &str, seq_num: u32, error: &str) -> Vec<u8> {
+    /// Build an inference payload error message.
+    pub fn inference_error(stream_id: &str, error: &str) -> Vec<u8> {
         let mut msg = Builder::new_default();
-        let mut chunk = msg.init_root::<inference_capnp::stream_chunk::Builder>();
-        chunk.set_stream_id(stream_id);
-        chunk.set_sequence_num(seq_num);
+        let mut payload = msg.init_root::<inference_capnp::inference_payload::Builder>();
+        payload.set_stream_id(stream_id);
 
-        let mut error_info = chunk.init_error();
+        let mut error_info = payload.init_error();
         error_info.set_message(error);
         error_info.set_code("GENERATION_ERROR");
         error_info.set_details("");
@@ -574,14 +659,13 @@ impl InferenceResponse {
         bytes
     }
 
-    /// Build a stream complete message.
-    pub fn stream_complete(stream_id: &str, seq_num: u32, stats: &GenerationStats) -> Vec<u8> {
+    /// Build an inference payload complete message.
+    pub fn inference_complete(stream_id: &str, stats: &GenerationStats) -> Vec<u8> {
         let mut msg = Builder::new_default();
-        let mut chunk = msg.init_root::<inference_capnp::stream_chunk::Builder>();
-        chunk.set_stream_id(stream_id);
-        chunk.set_sequence_num(seq_num);
+        let mut payload = msg.init_root::<inference_capnp::inference_payload::Builder>();
+        payload.set_stream_id(stream_id);
 
-        let mut complete = chunk.init_complete();
+        let mut complete = payload.init_complete();
         complete.set_tokens_generated(stats.tokens_generated as u32);
         // Use Stop as default if no finish_reason is set
         let finish_reason = stats.finish_reason.as_ref().unwrap_or(&FinishReason::Stop);
@@ -603,5 +687,288 @@ impl InferenceResponse {
             FinishReason::Error(_) => inference_capnp::FinishReason::Error,
             FinishReason::Stop => inference_capnp::FinishReason::Stop,
         }
+    }
+}
+
+// ============================================================================
+// Authenticated Streaming Helpers
+// ============================================================================
+
+use hyprstream_rpc::common_capnp;
+use hyprstream_rpc::streaming_capnp;
+use hyprstream_rpc::envelope::{RequestEnvelope, SignedEnvelope};
+use hyprstream_rpc::prelude::SigningKey;
+
+/// Build a StreamRegister message wrapped in SignedEnvelope.
+///
+/// This replaces the legacy "AUTHORIZE|topic|exp" format with secure signed registration.
+pub fn build_stream_register_envelope(
+    topic: &str,
+    exp: i64,
+    signing_key: &SigningKey,
+    claims: Option<hyprstream_rpc::auth::Claims>,
+) -> Vec<u8> {
+    use hyprstream_rpc::ToCapnp;
+
+    // Build StreamRegister payload
+    let mut register_msg = Builder::new_default();
+    {
+        let mut register = register_msg.init_root::<streaming_capnp::stream_register::Builder>();
+        register.set_topic(topic);
+        register.set_exp(exp);
+    }
+
+    let mut payload = Vec::new();
+    serialize::write_message(&mut payload, &register_msg).unwrap_or_default();
+
+    // Create request envelope
+    let envelope = RequestEnvelope {
+        request_id: 0, // Not used for stream registration
+        identity: hyprstream_rpc::envelope::RequestIdentity::Local {
+            user: "system".to_string(),
+        },
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64,
+        nonce: rand::random(),
+        payload,
+        claims,
+        ephemeral_pubkey: None, // TODO: Add DH for key derivation
+    };
+
+    // Sign and serialize
+    let signed = SignedEnvelope::new_signed(envelope, signing_key);
+
+    let mut out = Builder::new_default();
+    let mut builder = out.init_root::<common_capnp::signed_envelope::Builder>();
+    signed.write_to(&mut builder);
+
+    let mut bytes = Vec::new();
+    serialize::write_message(&mut bytes, &out).unwrap_or_default();
+    bytes
+}
+// ============================================================================
+// StreamBlock Types - Re-exported from hyprstream-rpc
+// ============================================================================
+
+// Re-export generic streaming types from hyprstream-rpc
+pub use hyprstream_rpc::streaming::{
+    BatchingConfig,
+    StreamBuilder,
+    StreamFrames,
+    StreamHandle,
+    StreamHmacState,
+    StreamPayload,
+    StreamPayloadData,
+    StreamVerifier,
+};
+
+/// Alias for backwards compatibility
+pub type ParsedStreamPayload = StreamPayload;
+
+// ============================================================================
+// Inference-Specific Stream Types
+// ============================================================================
+
+/// Inference-specific completion metadata (serialized into StreamPayload.complete).
+///
+/// This is the application-layer completion data for inference streams.
+/// Serialized as JSON for simplicity and debuggability.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct InferenceComplete {
+    pub tokens_generated: usize,
+    pub generation_time_ms: u64,
+    pub tokens_per_second: f32,
+    pub finish_reason: String,
+    // Prefill metrics
+    pub prefill_tokens: usize,
+    pub prefill_time_ms: u64,
+    pub prefill_tokens_per_sec: f32,
+    // Inference metrics
+    pub inference_tokens: usize,
+    pub inference_time_ms: u64,
+    pub inference_tokens_per_sec: f32,
+    pub inference_tokens_per_sec_ema: f32,
+    // Optional quality metrics
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perplexity: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_entropy: Option<f32>,
+}
+
+impl InferenceComplete {
+    /// Serialize to bytes for StreamPayload.complete.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+
+    /// Deserialize from StreamPayload.complete bytes.
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        serde_json::from_slice(data).map_err(|e| anyhow::anyhow!("Failed to parse InferenceComplete: {}", e))
+    }
+}
+
+impl From<&crate::runtime::GenerationStats> for InferenceComplete {
+    fn from(stats: &crate::runtime::GenerationStats) -> Self {
+        let finish_reason = match &stats.finish_reason {
+            Some(crate::config::FinishReason::MaxTokens) => "length",
+            Some(crate::config::FinishReason::EndOfSequence) => "eos",
+            Some(crate::config::FinishReason::Stop) => "stop",
+            Some(crate::config::FinishReason::StopToken(_)) => "stop",
+            Some(crate::config::FinishReason::Error(_)) => "error",
+            None => "unknown",
+        };
+        Self {
+            tokens_generated: stats.tokens_generated,
+            generation_time_ms: stats.generation_time_ms,
+            tokens_per_second: stats.tokens_per_second,
+            finish_reason: finish_reason.to_string(),
+            prefill_tokens: stats.prefill_tokens,
+            prefill_time_ms: stats.prefill_time_ms,
+            prefill_tokens_per_sec: stats.prefill_tokens_per_sec,
+            inference_tokens: stats.inference_tokens,
+            inference_time_ms: stats.inference_time_ms,
+            inference_tokens_per_sec: stats.inference_tokens_per_sec,
+            inference_tokens_per_sec_ema: stats.inference_tokens_per_sec_ema,
+            perplexity: stats.quality_metrics.as_ref().map(|m| m.perplexity),
+            avg_entropy: stats.quality_metrics.as_ref().map(|m| m.avg_entropy),
+        }
+    }
+}
+
+/// Inference-specific stream payload (parsed from generic StreamPayload).
+///
+/// Provides typed access to inference stream data:
+/// - Token: UTF-8 text token
+/// - Error: Error message
+/// - Complete: Generation statistics
+///
+/// Note: Stream identity comes from the DH-derived topic, not from payload fields.
+/// The topic cryptographically binds the stream to the DH key exchange.
+#[derive(Debug, Clone)]
+pub enum InferenceStreamPayload {
+    /// UTF-8 text token
+    Token(String),
+    /// Error during streaming
+    Error(String),
+    /// Completion with generation statistics
+    Complete(InferenceComplete),
+}
+
+/// Extension trait to convert generic StreamPayload to inference-specific payload.
+pub trait StreamPayloadExt {
+    /// Convert generic payload to inference-specific payload.
+    ///
+    /// Interprets Data as UTF-8 text tokens and Complete as InferenceComplete.
+    fn to_inference(self) -> Result<InferenceStreamPayload>;
+}
+
+impl StreamPayloadExt for StreamPayload {
+    fn to_inference(self) -> Result<InferenceStreamPayload> {
+        match self {
+            StreamPayload::Data(data) => {
+                let text = String::from_utf8(data)
+                    .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in token: {}", e))?;
+                Ok(InferenceStreamPayload::Token(text))
+            }
+            StreamPayload::Error(message) => {
+                Ok(InferenceStreamPayload::Error(message))
+            }
+            StreamPayload::Complete(data) => {
+                let stats = InferenceComplete::from_bytes(&data)?;
+                Ok(InferenceStreamPayload::Complete(stats))
+            }
+        }
+    }
+}
+
+
+// ============================================================================
+// Policy Service Types
+// ============================================================================
+
+use crate::policy_capnp;
+
+/// Token information response.
+#[derive(Debug, Clone, FromCapnp)]
+#[capnp(policy_capnp::token_info)]
+pub struct TokenInfo {
+    pub token: String,
+    pub expires_at: i64,
+}
+
+// ============================================================================
+// Policy Service Response Helper
+// ============================================================================
+
+/// Helper for building policy service responses.
+///
+/// Eliminates boilerplate by providing typed response builders.
+///
+/// # Example
+///
+/// ```ignore
+/// // Before (manual - 12 lines):
+/// let mut msg = Builder::new_default();
+/// let mut response = msg.init_root::<policy_response::Builder>();
+/// response.set_request_id(id);
+/// let mut token_info = response.init_success();
+/// token_info.set_token(&token);
+/// // ... 7 more lines
+///
+/// // After (1 line):
+/// PolicyResponse::token_success(id, &token, expires_at)
+/// ```
+pub struct PolicyResponse;
+
+impl PolicyResponse {
+    /// Build an error response.
+    pub fn error(request_id: u64, message: &str, code: &str) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<policy_capnp::issue_token_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut error_info = response.init_error();
+        error_info.set_message(message);
+        error_info.set_code(code);
+        error_info.set_details("");
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build an unauthorized error response.
+    pub fn unauthorized(request_id: u64, scope: &str) -> Vec<u8> {
+        Self::error(
+            request_id,
+            &format!("Access denied for scope: {}", scope),
+            "UNAUTHORIZED"
+        )
+    }
+
+    /// Build a TTL exceeded error response.
+    pub fn ttl_exceeded(request_id: u64, requested: u32, max: u32) -> Vec<u8> {
+        Self::error(
+            request_id,
+            &format!("TTL exceeds maximum: {} > {}", requested, max),
+            "TTL_EXCEEDED"
+        )
+    }
+
+    /// Build a token success response.
+    pub fn token_success(request_id: u64, token: &str, expires_at: i64) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<policy_capnp::issue_token_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut token_info = response.init_success();
+        token_info.set_token(token);
+        token_info.set_expires_at(expires_at);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
     }
 }

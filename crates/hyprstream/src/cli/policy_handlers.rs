@@ -459,9 +459,19 @@ pub async fn handle_token_create(
         format!("token-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"))
     });
 
+    // Parse scopes into structured Scope objects
+    use hyprstream_rpc::auth::Scope;
+    let parsed_scopes: Result<Vec<Scope>> = scopes
+        .iter()
+        .map(|s| Scope::parse(s))
+        .collect();
+    let parsed_scopes = parsed_scopes.context("Invalid scope format. Expected 'action:resource:identifier'")?;
+
     // Create JWT claims with prefixed subject (token:user)
+    let now = chrono::Utc::now().timestamp();
+    let exp = (chrono::Utc::now() + duration).timestamp();
     let prefixed_subject = format!("token:{}", user);
-    let claims = Claims::new(&prefixed_subject, duration, scopes.clone(), admin);
+    let claims = Claims::new(prefixed_subject.clone(), now, exp, parsed_scopes, admin);
 
     // Encode and sign the JWT
     let token = jwt::encode(&claims, signing_key);
@@ -474,7 +484,9 @@ pub async fn handle_token_create(
     println!();
     println!("  Name:    {} (reference only, not in token)", name);
 
-    if let Some(expires_at) = claims.expires_at() {
+    // Calculate expiration for display
+    let expires_at = chrono::DateTime::from_timestamp(exp, 0);
+    if let Some(expires_at) = expires_at {
         let days = duration.num_days();
         println!("  Expires: {} ({} days)", expires_at.format("%Y-%m-%d %H:%M UTC"), days);
     } else {

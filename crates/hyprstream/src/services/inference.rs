@@ -3,7 +3,7 @@
 //! This service wraps TorchEngine and provides a ZMQ interface for inference operations.
 //! It uses:
 //! - REQ/REP for standard requests (generate, model_info, lora operations, etc.)
-//! - PUB/SUB for streaming generation (via stream IDs)
+//! - PUB (via StreamService) for streaming generation with JWT authorization
 //!
 //! # Thread Model
 //!
@@ -14,27 +14,47 @@
 //! # Streaming Architecture
 //!
 //! ```text
-//! Client                          Service
-//!   │                               │
-//!   │──── REQ: GenerateStream ─────►│
-//!   │◄─── REP: { stream_id } ───────│
-//!   │                               │
-//!   │  SUB: inproc://inference/stream/{id}
-//!   │◄──── PUB: chunk "Hello" ──────│
-//!   │◄──── PUB: chunk " world" ─────│
-//!   │◄──── PUB: StreamComplete ─────│
+//! Client                    InferenceService         StreamService
+//!   │                            │                         │
+//!   │─ REQ: GenerateStream ─────►│                         │
+//!   │◄─ REP: {stream_id,endpoint}│                         │
+//!   │                            │                         │
+//!   │                            │── PUB: chunks ─────────►│ (validates JWT)
+//!   │                            │                         │
+//!   │  SUB: stream-{id}|{jwt} ───────────────────────────►│
+//!   │◄────────────────── chunks (JWT stripped) ───────────│
+//! ```
+//!
+//! InferenceService publishes to StreamService's XSUB (PUB socket).
+//! StreamService validates JWT at subscription and forwards to clients.
+//!
+//! # Authorization (Future Enhancement)
+//!
+//! Currently uses manual Casbin checks via `check_auth()`. Can be refactored to use
+//! `#[authorize]` macro when moving to typed handlers:
+//!
+//! ```ignore
+//! #[register_scopes]
+//! impl InferenceService {
+//!     #[authorize(action = "infer", resource = "model", identifier_field = "model")]
+//!     fn handle_generate(&self, ctx: &EnvelopeContext, req: GenerateRequest) -> Result<Vec<u8>> {
+//!         // JWT validation and scope checks automatically enforced
+//!         // ctx.user_claims is guaranteed to exist here
+//!     }
+//! }
 //! ```
 
 use crate::auth::Operation;
 use crate::services::PolicyZmqClient;
-use crate::config::{FinishReason, GenerationRequest, GenerationResult, ModelInfo, TrainingMode};
+use crate::config::{FinishReason, GenerationRequest, GenerationResult, ModelInfo, StreamingConfig, TrainingMode};
 use crate::inference_capnp;
+use anyhow::bail;
 use crate::lora::LoRAConfig;
 use crate::runtime::kv_cache::CacheOwner;
 use crate::runtime::model_config::ModelConfig;
 use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
-use crate::services::rpc_types::InferenceResponse;
-use crate::services::EnvelopeContext;
+use crate::services::rpc_types::{InferenceResponse, StreamStartedInfo};
+use crate::services::{CallOptions, EnvelopeContext};
 use crate::training::{TTTConfig, TestTimeTrainer};
 use crate::zmq::global_context;
 use anyhow::{anyhow, Result};
@@ -42,27 +62,12 @@ use capnp::message::{Builder, ReaderOptions};
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::serialize_message;
 use capnp::serialize;
-use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::sync::mpsc;
+use std::sync::{Arc, RwLock};
+use tmq::{reply, Multipart};
 use tokio::runtime::Handle;
 use tokenizers::Tokenizer;
 use tracing::{debug, error, info, trace, warn};
-use uuid::Uuid;
-
-// ============================================================================
-// PolicyChecker - Thread-safe wrapper for policy checks from single-threaded runtime
-// ============================================================================
-
-/// Request sent to the policy checker thread
-struct PolicyCheckRequest {
-    subject: String,
-    resource: String,
-    operation: Operation,
-    response_tx: mpsc::Sender<bool>,
-}
 
 /// Pending stream to be executed after REP response is sent.
 ///
@@ -73,80 +78,10 @@ struct PendingStream {
     request: GenerationRequest,
     stream_id: String,
     prompt: String, // For training collection (stored as String for simplicity)
-}
-
-/// Thread-safe policy checker that runs on a dedicated thread with its own runtime.
-///
-/// This allows InferenceService (single-threaded runtime) to call async PolicyZmqClient
-/// without nesting runtimes. The PolicyChecker thread runs a multi-threaded runtime
-/// where TMQ async I/O works properly.
-#[derive(Clone)]
-pub struct PolicyChecker {
-    request_tx: mpsc::Sender<PolicyCheckRequest>,
-}
-
-impl PolicyChecker {
-    /// Create a new PolicyChecker and start its background thread.
-    ///
-    /// The background thread runs a multi-threaded tokio runtime and processes
-    /// policy check requests via synchronous channels.
-    pub fn start(policy_client: PolicyZmqClient) -> Self {
-        let (request_tx, request_rx) = mpsc::channel::<PolicyCheckRequest>();
-
-        std::thread::spawn(move || {
-            // Create a multi-threaded runtime for this thread
-            let rt = match tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)  // Single worker is enough for policy checks
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    tracing::error!("Failed to create policy checker runtime: {}", e);
-                    return;
-                }
-            };
-
-            rt.block_on(async move {
-                // Process requests until the channel is closed
-                while let Ok(req) = request_rx.recv() {
-                    let allowed = policy_client
-                        .check(&req.subject, &req.resource, req.operation)
-                        .await
-                        .unwrap_or(false);
-
-                    // Send response (ignore errors if receiver dropped)
-                    let _ = req.response_tx.send(allowed);
-                }
-            });
-        });
-
-        Self { request_tx }
-    }
-
-    /// Check if subject is allowed to perform operation on resource.
-    ///
-    /// This is synchronous and safe to call from any context (including
-    /// inside `block_on`). Internally sends request to background thread.
-    pub fn check(&self, subject: &str, resource: &str, operation: Operation) -> bool {
-        let (response_tx, response_rx) = mpsc::channel();
-
-        let request = PolicyCheckRequest {
-            subject: subject.to_string(),
-            resource: resource.to_string(),
-            operation,
-            response_tx,
-        };
-
-        // Send request to background thread
-        if self.request_tx.send(request).is_err() {
-            warn!("Policy checker thread died, denying request");
-            return false;
-        }
-
-        // Wait for response (blocking, but background thread does async I/O)
-        response_rx.recv().unwrap_or(false)
-    }
+    /// DH-derived topic for ZMQ routing (64 hex chars)
+    topic: String,
+    /// DH-derived HMAC key for authenticated stream chunks
+    mac_key: [u8; 32],
 }
 
 /// Default endpoint for the inference service
@@ -159,8 +94,7 @@ pub const INFERENCE_ENDPOINT: &str = "inproc://hyprstream/inference";
 /// ZMQ-based inference service
 ///
 /// Wraps TorchEngine and provides a Cap'n Proto interface over ZMQ.
-/// Runs on a dedicated thread for thread safety with tch-rs types.
-/// Uses RefCell for interior mutability since it runs on a single thread.
+/// Thread-safe via RwLock for multi-threaded access.
 ///
 /// # Security
 ///
@@ -169,59 +103,51 @@ pub const INFERENCE_ENDPOINT: &str = "inproc://hyprstream/inference";
 ///
 /// # Streaming Architecture
 ///
-/// Uses a single XPUB socket for all streaming generation:
+/// Uses a single PUB socket connected to StreamService:
 /// - Topic-based multiplexing: `stream-{id}` prefix on each message
-/// - XPUB receives subscription events (knows when clients connect)
-/// - No 10ms sleep hack - waits for subscription before streaming
-/// - Clients use XSUB to subscribe to their stream topic
+/// - StreamService validates JWT at subscription (prevents hijacking)
+/// - InferenceService just publishes chunks (no authorization logic)
+/// - Clients subscribe via StreamService with JWT tokens
 pub struct InferenceService {
-    engine: RefCell<TorchEngine>,
-    stream_id_counter: AtomicU64,
+    engine: RwLock<TorchEngine>,
     /// Model identifier for events
     model_id: String,
     /// Model path for checkpoint management
     #[allow(dead_code)] // Future: checkpoint management
     model_path: PathBuf,
     /// Current session ID for events
-    session_id: RefCell<Option<String>>,
+    session_id: RwLock<Option<String>>,
     /// Runtime handle for async operations (reused instead of creating new runtimes)
     #[allow(dead_code)] // Reserved for future async operations
     runtime_handle: Handle,
-    /// Single XPUB socket for all streaming (initialized in run_service_loop)
-    xpub_socket: RefCell<Option<zmq::Socket>>,
+    /// Single PUSH socket for streaming (connects to StreamService's PULL, initialized in run_service_loop)
+    /// PUSH buffers at HWM instead of dropping - solves the subscriber race condition.
+    /// Note: Field name retained as xpub_socket for compatibility with execute_stream
+    xpub_socket: RwLock<Option<zmq::Socket>>,
     /// Server's Ed25519 verifying key for signature verification
     server_pubkey: VerifyingKey,
+    /// Service signing key for stream registration (generated at init)
+    signing_key: SigningKey,
     /// Nonce cache for replay protection
     nonce_cache: Arc<InMemoryNonceCache>,
-    /// Policy checker for authorization (runs on separate thread with its own runtime)
-    policy_checker: PolicyChecker,
+    /// Policy client for authorization checks (async via TMQ)
+    policy_client: PolicyZmqClient,
     /// Optional TTT trainer (initialized from config.json)
     ttt_trainer: Option<Arc<TestTimeTrainer>>,
     /// Tokenizer for TTT adaptation
     tokenizer: Option<Arc<Tokenizer>>,
-    /// Unique stream endpoint for this service instance (each InferenceService has its own)
-    stream_endpoint: String,
 }
 
 impl InferenceService {
-    /// Start the inference service at the default endpoint
-    pub async fn start(
-        model_path: impl AsRef<Path>,
-        config: RuntimeConfig,
-        server_pubkey: VerifyingKey,
-        policy_client: PolicyZmqClient,
-    ) -> Result<crate::services::ServiceHandle> {
-        Self::start_at(model_path, config, server_pubkey, policy_client, INFERENCE_ENDPOINT).await
-    }
-
     /// Start the inference service at a specific endpoint
     pub async fn start_at(
         model_path: impl AsRef<Path>,
         config: RuntimeConfig,
         server_pubkey: VerifyingKey,
+        signing_key: SigningKey,
         policy_client: PolicyZmqClient,
         endpoint: &str,
-    ) -> Result<crate::services::ServiceHandle> {
+    ) -> Result<hyprstream_rpc::service::SpawnedService> {
         let model_path = model_path.as_ref().to_path_buf();
         let endpoint_owned = endpoint.to_string();
         let model_id = model_path
@@ -247,10 +173,10 @@ impl InferenceService {
                 };
 
             rt.block_on(async move {
-                match Self::initialize(model_path, config, model_id, server_pubkey, nonce_cache, policy_client).await {
+                match Self::initialize(model_path, config, model_id, server_pubkey, signing_key, nonce_cache, policy_client).await {
                     Ok(service) => {
                         // Pass init_tx to run_service_loop - it signals AFTER socket binding
-                        Self::run_service_loop(service, &endpoint_owned, Some(init_tx));
+                        Self::run_service_loop(service, &endpoint_owned, Some(init_tx)).await;
                     }
                     Err(e) => {
                         if init_tx.send(Err(e)).is_err() {
@@ -269,7 +195,267 @@ impl InferenceService {
         info!("Inference service started at {}", endpoint);
 
         // Return a dummy handle (the service manages its own lifecycle)
-        Ok(crate::services::ServiceHandle::dummy())
+        Ok(hyprstream_rpc::service::SpawnedService::dummy())
+    }
+
+    /// Start inference service in callback mode
+    ///
+    /// This mode is used when InferenceService is spawned as a separate process.
+    /// The service:
+    /// 1. Connects DEALER to ModelService's ROUTER (callback endpoint)
+    /// 2. Sends Register message with its stream endpoint
+    /// 3. Waits for LoadModel command
+    /// 4. Loads the model
+    /// 5. Enters command loop handling Infer/Shutdown
+    ///
+    /// # Arguments
+    /// * `instance_id` - Unique ID for this instance (e.g., "inference-a1b2c3d4")
+    /// * `callback_endpoint` - ModelService's ROUTER endpoint for callbacks
+    /// * `config` - Runtime configuration
+    /// * `policy_client` - Policy client for authorization
+    pub async fn start_with_callback(
+        instance_id: String,
+        callback_endpoint: String,
+        config: RuntimeConfig,
+        policy_client: PolicyZmqClient,
+    ) -> Result<()> {
+        info!(
+            "Starting InferenceService {} in callback mode (callback={})",
+            instance_id, callback_endpoint
+        );
+
+        // Run in current thread (we're likely spawned as a separate process)
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        rt.block_on(async move {
+            Self::run_callback_mode(instance_id, callback_endpoint, config, policy_client).await
+        })
+    }
+
+    /// Run the callback mode loop
+    async fn run_callback_mode(
+        instance_id: String,
+        callback_endpoint: String,
+        config: RuntimeConfig,
+        policy_client: PolicyZmqClient,
+    ) -> Result<()> {
+        let ctx = global_context();
+
+        // Create DEALER socket and connect to callback endpoint
+        let dealer = ctx.socket(zmq::DEALER)?;
+        dealer.set_identity(instance_id.as_bytes())?;
+        dealer.set_rcvtimeo(100)?; // 100ms timeout for polling
+        dealer.connect(&callback_endpoint)?;
+        info!("Connected DEALER to {}", callback_endpoint);
+
+        // Create PUSH socket for streaming (connects to StreamService's PULL)
+        // PUSH buffers at HWM instead of dropping, solving the race condition
+        // where messages are published before client subscribes
+        let push_socket = ctx.socket(zmq::PUSH)?;
+
+        // Set socket options for reliability
+        // HWM of 100K messages provides ~10 seconds buffer at 10K msg/s
+        if let Err(e) = push_socket.set_sndhwm(100_000) {
+            warn!("Failed to set send HWM on PUSH socket: {}", e);
+        }
+        // 1 second timeout prevents infinite blocking if StreamService is down
+        if let Err(e) = push_socket.set_sndtimeo(1000) {
+            warn!("Failed to set send timeout on PUSH socket: {}", e);
+        }
+
+        let stream_push_endpoint = hyprstream_rpc::registry::global()
+            .endpoint("streams", hyprstream_rpc::registry::SocketKind::Push)
+            .to_zmq_string();
+        push_socket.connect(&stream_push_endpoint)?;
+        info!("PUSH connected to StreamService at {}", stream_push_endpoint);
+
+        // Get StreamService's Sub endpoint for client subscriptions
+        let stream_sub_endpoint = hyprstream_rpc::registry::global()
+            .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
+            .to_zmq_string();
+
+        // Send Register message (this IS the ready signal)
+        let register_msg = Self::build_register(&instance_id, &stream_sub_endpoint)?;
+        dealer.send(&register_msg, 0)?;
+        info!("Sent Register to callback");
+
+        // Wait for LoadModel command
+        let (model_path, model_ref) = Self::wait_for_load_model(&dealer)?;
+
+        // Initialize the engine and load the model
+        let server_pubkey = VerifyingKey::default(); // Callback mode doesn't need signature verification
+        // Generate signing key for callback mode (separate process, no shared key access)
+        let signing_key = hyprstream_rpc::crypto::signing::generate_signing_keypair().0;
+        let nonce_cache = Arc::new(InMemoryNonceCache::new());
+        let service = Self::initialize(
+            model_path.clone(),
+            config,
+            model_ref.clone(),
+            server_pubkey,
+            signing_key,
+            nonce_cache,
+            policy_client,
+        )
+        .await?;
+
+        // Set the PUSH socket (xpub_socket field name kept for compatibility)
+        *service.xpub_socket.write().unwrap() = Some(push_socket);
+
+        // Send LoadModelResponse
+        let response = Self::build_load_model_response(true, "")?;
+        dealer.send(&response, 0)?;
+        info!("Model {} loaded, sent response", model_ref);
+
+        // Enter command loop
+        Self::callback_command_loop(service, &dealer).await
+    }
+
+    /// Wait for LoadModel command from DEALER
+    fn wait_for_load_model(dealer: &zmq::Socket) -> Result<(PathBuf, String)> {
+        loop {
+            match dealer.recv_bytes(0) {
+                Ok(data) => {
+                    let reader = serialize::read_message(
+                        &mut std::io::Cursor::new(&data),
+                        ReaderOptions::new(),
+                    )?;
+                    let cmd = reader.get_root::<crate::model_capnp::inference_command::Reader>()?;
+
+                    use crate::model_capnp::inference_command::Which;
+                    match cmd.which()? {
+                        Which::LoadModel(load) => {
+                            let load = load?;
+                            let model_ref = load.get_model_ref()?.to_str()?.to_string();
+                            let model_path = PathBuf::from(load.get_model_path()?.to_str()?);
+                            return Ok((model_path, model_ref));
+                        }
+                        Which::Shutdown(()) => {
+                            info!("Received Shutdown before LoadModel, exiting");
+                            std::process::exit(0);
+                        }
+                        Which::Infer(_) => {
+                            warn!("Received Infer before LoadModel, ignoring");
+                        }
+                    }
+                }
+                Err(zmq::Error::EAGAIN) => {
+                    // Timeout, continue waiting
+                    continue;
+                }
+                Err(e) => {
+                    return Err(anyhow!("DEALER recv error: {}", e));
+                }
+            }
+        }
+    }
+
+    /// Callback mode command loop
+    async fn callback_command_loop(mut service: Self, dealer: &zmq::Socket) -> Result<()> {
+        loop {
+            match dealer.recv_bytes(0) {
+                Ok(data) => {
+                    let response = service.handle_callback_command(&data).await?;
+                    dealer.send(&response, 0)?;
+                }
+                Err(zmq::Error::EAGAIN) => {
+                    // Timeout, continue
+                    continue;
+                }
+                Err(e) => {
+                    error!("DEALER recv error: {}", e);
+                    return Err(anyhow!("DEALER recv error: {}", e));
+                }
+            }
+        }
+    }
+
+    /// Handle a command from the callback channel
+    async fn handle_callback_command(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+        let reader = serialize::read_message(
+            &mut std::io::Cursor::new(data),
+            ReaderOptions::new(),
+        )?;
+        let cmd = reader.get_root::<crate::model_capnp::inference_command::Reader>()?;
+
+        use crate::model_capnp::inference_command::Which;
+        match cmd.which()? {
+            Which::LoadModel(_) => {
+                // Already loaded, return success
+                Self::build_load_model_response(true, "")
+            }
+            Which::Shutdown(()) => {
+                info!("Received Shutdown command, exiting");
+                std::process::exit(0);
+            }
+            Which::Infer(infer_data) => {
+                let infer_data = infer_data?;
+                // infer_data contains serialized InferenceRequest
+                self.handle_callback_infer(infer_data).await
+            }
+        }
+    }
+
+    /// Handle inference request from callback channel
+    async fn handle_callback_infer(&mut self, request_data: &[u8]) -> Result<Vec<u8>> {
+        // Parse InferenceRequest
+        let reader = serialize::read_message(
+            &mut std::io::Cursor::new(request_data),
+            ReaderOptions::new(),
+        )?;
+        let req = reader.get_root::<inference_capnp::inference_request::Reader>()?;
+        let request_id = req.get_id();
+
+        // Create a context for the handler (callback mode uses local identity)
+        // Note: Callback mode doesn't use signed envelopes, so we construct context directly
+        use hyprstream_rpc::envelope::RequestEnvelope;
+        use hyprstream_rpc::crypto::signing::generate_signing_keypair;
+
+        let envelope = RequestEnvelope {
+            request_id,
+            identity: RequestIdentity::local(),
+            payload: vec![],
+            ephemeral_pubkey: None,
+            nonce: [0u8; 16],
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            claims: None,
+        };
+
+        // Create a minimal signed envelope for context extraction
+        let (signing_key, _) = generate_signing_keypair();
+        let signed = hyprstream_rpc::envelope::SignedEnvelope::new_signed(envelope, &signing_key);
+        let ctx = EnvelopeContext::from_verified(&signed);
+
+        // Reuse existing request handling
+        let (response, _pending_stream) = self.handle_request(&ctx, request_data).await?;
+        Ok(response)
+    }
+
+    /// Build Register message
+    fn build_register(id: &str, stream_endpoint: &str) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut reg = message.init_root::<crate::model_capnp::register::Builder>();
+            reg.set_id(id);
+            reg.set_stream_endpoint(stream_endpoint);
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    /// Build LoadModelCommandResponse
+    fn build_load_model_response(success: bool, error: &str) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut resp = message.init_root::<crate::model_capnp::load_model_command_response::Builder>();
+            resp.set_success(success);
+            resp.set_error(error);
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
     }
 
     /// Initialize the service
@@ -278,15 +464,12 @@ impl InferenceService {
         config: RuntimeConfig,
         model_id: String,
         server_pubkey: VerifyingKey,
+        signing_key: SigningKey,
         nonce_cache: Arc<InMemoryNonceCache>,
         policy_client: PolicyZmqClient,
     ) -> Result<Self> {
         // Capture runtime handle for reuse in handlers
         let runtime_handle = Handle::current();
-
-        // Start PolicyChecker on a dedicated thread with its own runtime.
-        // This allows synchronous policy checks from within our single-threaded runtime.
-        let policy_checker = PolicyChecker::start(policy_client);
 
         let mut engine = TorchEngine::new(config.clone())?;
         RuntimeEngine::load_model(&mut engine, &model_path).await?;
@@ -337,199 +520,201 @@ impl InferenceService {
                 (None, None)
             };
 
-        // Generate unique stream endpoint for this service instance
-        // Each InferenceService gets its own XPUB endpoint (UUID-based)
-        let stream_endpoint = format!("inproc://hyprstream/inference/stream/{}", Uuid::new_v4());
-
+        // Use provided signing key for response signing
         Ok(Self {
-            engine: RefCell::new(engine),
-            stream_id_counter: AtomicU64::new(1),
+            engine: RwLock::new(engine),
             model_id,
             model_path,
-            session_id: RefCell::new(None),
+            session_id: RwLock::new(None),
             runtime_handle,
-            xpub_socket: RefCell::new(None), // Initialized in run_service_loop
+            xpub_socket: RwLock::new(None), // Initialized in run_service_loop
             server_pubkey,
+            signing_key,
             nonce_cache,
-            policy_checker,
+            policy_client,
             ttt_trainer,
             tokenizer,
-            stream_endpoint,
         })
     }
 
-    /// Run the service loop (blocking)
+    /// Run the service loop (async with TMQ)
     ///
     /// The `ready_tx` channel signals when sockets are bound and the service is ready.
     /// This ensures callers wait for actual readiness, not just initialization.
-    fn run_service_loop(
+    async fn run_service_loop(
         service: Self,
         endpoint: &str,
         ready_tx: Option<tokio::sync::oneshot::Sender<Result<()>>>,
     ) {
         let ctx = global_context();
 
-        // Helper to signal error and return
+        // Helper to signal error
         let signal_error = |tx: Option<tokio::sync::oneshot::Sender<Result<()>>>, err: anyhow::Error| {
             if let Some(tx) = tx {
                 let _ = tx.send(Err(err));
             }
         };
 
-        // Create REP socket for RPC
-        let socket = match ctx.socket(zmq::REP) {
-            Ok(s) => s,
+        // Create REP socket with TMQ for async I/O
+        let mut receiver = match reply(&*ctx).set_linger(0).bind(endpoint) {
+            Ok(r) => r,
             Err(e) => {
-                let err = anyhow!("failed to create REP socket: {}", e);
+                let err = anyhow!("failed to bind REP to {}: {}", endpoint, e);
                 error!("{}", err);
                 signal_error(ready_tx, err);
                 return;
             }
         };
 
-        // Set socket options
-        if let Err(e) = socket.set_rcvtimeo(100) {
-            warn!("failed to set receive timeout: {}", e);
-        }
-
-        // Bind to endpoint
-        if let Err(e) = socket.bind(endpoint) {
-            let err = anyhow!("failed to bind to {}: {}", endpoint, e);
-            error!("{}", err);
-            signal_error(ready_tx, err);
-            return;
-        }
-
-        // Create single XPUB socket for all streaming
-        // Topic-based multiplexing: clients subscribe to "stream-{id}"
-        let xpub_socket = match ctx.socket(zmq::XPUB) {
+        // Create PUSH socket for streaming (connects to StreamService's PULL)
+        // PUSH buffers at HWM instead of dropping, solving the race condition
+        // where messages are published before client subscribes
+        let push_socket = match ctx.socket(zmq::PUSH) {
             Ok(s) => s,
             Err(e) => {
-                let err = anyhow!("failed to create XPUB socket: {}", e);
+                let err = anyhow!("failed to create PUSH socket: {}", e);
                 error!("{}", err);
                 signal_error(ready_tx, err);
                 return;
             }
         };
 
-        // Enable XPUB_VERBOSE to receive all subscription events
-        // (not just unique ones) - useful for debugging
-        if let Err(e) = xpub_socket.set_xpub_verbose(true) {
-            warn!("failed to set XPUB_VERBOSE: {}", e);
+        // Set socket options for reliability
+        // HWM of 100K messages provides ~10 seconds buffer at 10K msg/s
+        if let Err(e) = push_socket.set_sndhwm(100_000) {
+            warn!("Failed to set send HWM on PUSH socket: {}", e);
+        }
+        // 1 second timeout prevents infinite blocking if StreamService is down
+        if let Err(e) = push_socket.set_sndtimeo(1000) {
+            warn!("Failed to set send timeout on PUSH socket: {}", e);
         }
 
-        // Non-blocking mode for checking subscriptions
-        if let Err(e) = xpub_socket.set_rcvtimeo(0) {
-            warn!("failed to set XPUB receive timeout: {}", e);
-        }
+        // Connect to StreamService's Push endpoint (PULL backend)
+        let stream_push_endpoint = hyprstream_rpc::registry::global()
+            .endpoint("streams", hyprstream_rpc::registry::SocketKind::Push)
+            .to_zmq_string();
 
-        // Bind XPUB to this service's unique streaming endpoint
-        if let Err(e) = xpub_socket.bind(&service.stream_endpoint) {
-            let err = anyhow!("failed to bind XPUB to {}: {}", service.stream_endpoint, e);
+        if let Err(e) = push_socket.connect(&stream_push_endpoint) {
+            let err = anyhow!("failed to connect PUSH to {}: {}", stream_push_endpoint, e);
             error!("{}", err);
             signal_error(ready_tx, err);
             return;
         }
 
-        // Store XPUB socket in service for use by handle_generate_stream
-        *service.xpub_socket.borrow_mut() = Some(xpub_socket);
+        // Store PUSH socket in service for use by execute_stream
+        // Note: Field name still xpub_socket for compatibility, but now holds PUSH socket
+        *service.xpub_socket.write().unwrap() = Some(push_socket);
 
-        info!("inference service bound to {} (RPC) and {} (streaming)", endpoint, service.stream_endpoint);
+        info!("inference service bound to {} (RPC) and connected to {} (streaming)", endpoint, stream_push_endpoint);
 
-        // Signal ready AFTER sockets are bound - this is the correct semantics
+        // Signal ready - ZMQ connection will establish asynchronously
+        // With immediate=false, messages queue until connection is ready
+        // execute_stream handles connection errors gracefully
         if let Some(tx) = ready_tx {
             if tx.send(Ok(())).is_err() {
                 warn!("Failed to signal service ready - receiver dropped");
             }
         }
 
-        // Main service loop
+        // Main service loop (async with TMQ)
         loop {
-            match socket.recv_bytes(0) {
-                Ok(request) => {
-                    trace!("inference received request ({} bytes)", request.len());
-
-                    // Unwrap and verify SignedEnvelope
-                    let (ctx, payload) = match Self::unwrap_envelope(&request, &service.server_pubkey, &*service.nonce_cache) {
-                        Ok((ctx, payload)) => (ctx, payload),
-                        Err(e) => {
-                            warn!("inference envelope verification failed: {}", e);
-                            // Send error response
-                            let response = InferenceResponse::error(0, "envelope verification failed");
-                            if let Err(e) = socket.send(&response, 0) {
-                                error!("failed to send error response: {}", e);
-                            }
-                            continue;
-                        }
-                    };
-
-                    debug!(
-                        "Inference request from {} (envelope_id={})",
-                        ctx.casbin_subject(),
-                        ctx.request_id
-                    );
-
-                    // Handle request - may return pending stream work
-                    let (response, pending_stream) = match service.handle_request(&ctx, &payload) {
-                        Ok((resp, pending)) => (resp, pending),
-                        Err(e) => {
-                            error!("inference request handling error: {}", e);
-                            (InferenceResponse::error(0, &e.to_string()), None)
-                        }
-                    };
-
-                    // Send response FIRST (before any streaming)
-                    if let Err(e) = socket.send(&response, 0) {
-                        error!("failed to send response: {}", e);
-                    }
-
-                    // THEN execute any pending stream (after response is sent)
-                    // This solves the streaming deadlock - client can subscribe after
-                    // receiving the stream_id in the response
-                    if let Some(pending) = pending_stream {
-                        service.execute_stream(pending);
-                    }
+            let result = receiver.recv().await;
+            let (request_msg, sender) = match result {
+                Ok((msg, sender)) => (msg, sender),
+                Err(e) => {
+                    // recv() consumes the receiver, so on error we must exit
+                    // A recv error typically means socket/context problem
+                    error!("inference recv error (fatal): {}", e);
+                    return;
                 }
-                Err(zmq::Error::EAGAIN) => {
-                    // Timeout, continue
+            };
+
+            // Extract bytes from multipart message
+            let request: Vec<u8> = request_msg
+                .into_iter()
+                .flat_map(|frame| frame.to_vec())
+                .collect();
+
+            trace!("inference received request ({} bytes)", request.len());
+
+            // Unwrap and verify SignedEnvelope
+            let (envelope_ctx, payload) = match hyprstream_rpc::unwrap_envelope(&request, &service.server_pubkey, &*service.nonce_cache) {
+                Ok((ctx, payload)) => (ctx, payload),
+                Err(e) => {
+                    warn!("inference envelope verification failed: {}", e);
+                    // No valid request_id, send empty response (like RequestLoop does)
+                    let msg: Multipart = vec![vec![]].into();
+                    receiver = match sender.send(msg).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            error!("failed to send error response: {}", e);
+                            return;
+                        }
+                    };
                     continue;
                 }
+            };
+
+            debug!(
+                "Inference request from {} (envelope_id={})",
+                envelope_ctx.casbin_subject(),
+                envelope_ctx.request_id
+            );
+
+            // Handle request - may return pending stream work (now async for policy checks)
+            let request_id = envelope_ctx.request_id;
+            let (response_payload, pending_stream) = match service.handle_request(&envelope_ctx, &payload).await {
+                Ok((resp, pending)) => (resp, pending),
                 Err(e) => {
-                    warn!("inference recv error: {}", e);
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    error!("inference request handling error: {}", e);
+                    (InferenceResponse::error(request_id, &e.to_string()), None)
                 }
+            };
+
+            // Wrap response in signed envelope
+            let response_bytes = {
+                let signed_response = ResponseEnvelope::new_signed(
+                    request_id,
+                    response_payload,
+                    &service.signing_key,
+                );
+
+                let mut message = capnp::message::Builder::new_default();
+                let mut builder = message.init_root::<hyprstream_rpc::common_capnp::response_envelope::Builder>();
+                signed_response.write_to(&mut builder);
+
+                let mut bytes = Vec::new();
+                if let Err(e) = capnp::serialize::write_message(&mut bytes, &message) {
+                    error!("Failed to serialize signed response: {}", e);
+                    vec![]
+                } else {
+                    bytes
+                }
+            };
+
+            // Send signed response via TMQ
+            let msg: Multipart = vec![response_bytes].into();
+            receiver = match sender.send(msg).await {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("failed to send response: {}", e);
+                    return;
+                }
+            };
+
+            // THEN execute any pending stream (after response is sent)
+            // This solves the streaming deadlock - client can subscribe after
+            // receiving the stream_id in the response
+            if let Some(pending) = pending_stream {
+                service.execute_stream(pending);
             }
         }
     }
 
-    /// Unwrap and verify a SignedEnvelope from wire bytes.
-    fn unwrap_envelope(
-        request: &[u8],
-        server_pubkey: &VerifyingKey,
-        nonce_cache: &dyn NonceCache,
-    ) -> Result<(EnvelopeContext, Vec<u8>)> {
-        // Deserialize SignedEnvelope from Cap'n Proto
-        let reader = serialize::read_message(
-            &mut std::io::Cursor::new(request),
-            ReaderOptions::default(),
-        )?;
-        let signed_reader = reader.get_root::<hyprstream_rpc::common_capnp::signed_envelope::Reader>()?;
-        let signed = SignedEnvelope::read_from(signed_reader)?;
-
-        // Verify signature and replay protection
-        signed.verify(server_pubkey, nonce_cache)?;
-
-        // Extract context and payload
-        let ctx = EnvelopeContext::from_verified(&signed);
-        let payload = signed.payload().to_vec();
-
-        Ok((ctx, payload))
-    }
-
     /// Generate next stream ID
     fn next_stream_id(&self) -> String {
-        let id = self.stream_id_counter.fetch_add(1, Ordering::Relaxed);
-        format!("stream-{}", id)
+        use uuid::Uuid;
+        format!("stream-{}", Uuid::new_v4())
     }
 
     /// Apply TTT adaptation if enabled (adapts model to input BEFORE generation)
@@ -559,7 +744,7 @@ impl InferenceService {
         let input_tokens: Vec<u32> = encoding.get_ids().to_vec();
 
         // Apply TTT adaptation BEFORE generation
-        let engine = self.engine.borrow();
+        let engine = self.engine.read().unwrap();
         match ttt_trainer.adapt(&*engine, &input_tokens) {
             Ok(result) => {
                 if result.skipped {
@@ -585,160 +770,233 @@ impl InferenceService {
         // Use futures::executor::block_on because we're already inside a tokio runtime
         // (run_service_loop runs in rt.block_on), and tokio's block_on can't be nested.
         // futures::executor::block_on works because it's a simple single-threaded executor.
-        let engine = self.engine.borrow();
+        let engine = self.engine.read().unwrap();
         futures::executor::block_on(async {
             RuntimeEngine::generate_with_params(&*engine, request).await
         })
     }
 
-    /// Prepare for streaming generation - returns stream_id immediately.
+    /// Prepare for streaming generation with DH-based key derivation.
     ///
     /// This is the first phase of streaming that runs BEFORE the REP response is sent.
     /// The actual streaming happens in `execute_stream` which runs AFTER the response.
     ///
-    /// This solves the deadlock where:
-    /// - Service waits for subscription before returning response
-    /// - Client can't subscribe without the stream_id from response
-    fn prepare_stream(&self, request: GenerationRequest) -> (String, PendingStream) {
+    /// # DH Key Exchange
+    ///
+    /// 1. Server generates ephemeral Ristretto255 keypair
+    /// 2. Server computes shared secret: DH(server_secret, client_ephemeral_pubkey)
+    /// 3. Both parties derive topic and mac_key from shared secret using HKDF
+    /// 4. Topic is used for ZMQ routing (replaces stream_id prefix)
+    /// 5. mac_key is used for HMAC chain (E2E authentication)
+    ///
+    /// # Returns
+    ///
+    /// (stream_id, server_pubkey, pending) where:
+    /// - stream_id: For client display/logging (not used for routing)
+    /// - server_pubkey: 32-byte Ristretto255 public key for client to derive same keys
+    /// - pending: Stream state including DH-derived topic and mac_key
+    fn prepare_stream(
+        &self,
+        request: GenerationRequest,
+        client_ephemeral_pubkey: Option<&[u8]>,
+    ) -> Result<(String, [u8; 32], PendingStream)> {
+        use hyprstream_rpc::crypto::{
+            derive_stream_keys, generate_ephemeral_keypair, ristretto_dh, RistrettoPublic,
+        };
+
         let stream_id = self.next_stream_id();
-        let prompt = request.prompt.as_str().to_string(); // Convert to String for training
+        let prompt = request.prompt.as_str().to_string();
+
+        // Generate server ephemeral Ristretto255 keypair for this stream
+        let (server_secret, server_pubkey) = generate_ephemeral_keypair();
+        let server_pubkey_bytes: [u8; 32] = server_pubkey.to_bytes();
+
+        // DH key derivation is required - no legacy fallback
+        let client_pub_bytes = client_ephemeral_pubkey
+            .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
+
+        if client_pub_bytes.len() != 32 {
+            bail!(
+                "Invalid client ephemeral pubkey length: expected 32, got {}",
+                client_pub_bytes.len()
+            );
+        }
+
+        // Convert to fixed-size array
+        let mut client_pub: [u8; 32] = [0u8; 32];
+        client_pub.copy_from_slice(client_pub_bytes);
+
+        // Parse and validate client Ristretto public key
+        let client_ristretto_pubkey = RistrettoPublic::from_bytes(&client_pub)
+            .ok_or_else(|| anyhow!("Invalid client Ristretto public key encoding"))?;
+
+        // Compute Ristretto255 DH shared secret
+        let shared_secret = ristretto_dh(&server_secret, &client_ristretto_pubkey);
+
+        // Derive topic and mac_key using HKDF
+        let keys = derive_stream_keys(
+            &shared_secret,
+            &client_pub,
+            &server_pubkey_bytes,
+        )?;
+
+        debug!(
+            stream_id = %stream_id,
+            topic = %keys.topic,
+            "DH-derived stream keys"
+        );
+
+        let (topic, mac_key) = (keys.topic, *keys.mac_key);
 
         let pending = PendingStream {
             request,
             stream_id: stream_id.clone(),
             prompt,
+            topic,
+            mac_key,
         };
 
-        (stream_id, pending)
+        Ok((stream_id, server_pubkey_bytes, pending))
     }
 
     /// Execute streaming generation - called AFTER REP response is sent.
     ///
-    /// Uses a single XPUB socket with topic-based multiplexing.
-    /// The stream_id is used as the topic prefix for all messages.
+    /// Uses a PUSH socket connected to StreamService with DH-derived topic.
+    /// The topic is derived from DH shared secret, not guessable from stream_id.
     ///
-    /// # Protocol (with deferred streaming)
+    /// # Protocol (E2E Authenticated via DH)
     ///
-    /// 1. Client calls generate_stream via REQ/REP
-    /// 2. Service generates stream_id (prepare_stream)
-    /// 3. Service sends REP response (stream_id, endpoint)
-    /// 4. Client receives response and subscribes to topic "stream-{id}"
-    /// 5. Service waits for subscription (execute_stream - this function)
-    /// 6. Service generates tokens and streams via XPUB
+    /// 1. Client calls generate_stream with ephemeral pubkey in envelope
+    /// 2. Service generates ephemeral keypair, computes DH shared secret
+    /// 3. Both derive topic and mac_key from DH using HKDF
+    /// 4. Service returns server_pubkey in response (client derives same keys)
+    /// 5. Client subscribes to DH-derived topic (unpredictable, non-colliding)
+    /// 6. Service publishes chunks with HMAC chain (verified by client, not StreamService)
+    /// 7. StreamService is blind forwarder (no HMAC verification)
     fn execute_stream(&self, pending: PendingStream) {
+        use crate::services::rpc_types::StreamBuilder;
         use futures::StreamExt;
 
         let stream_id = pending.stream_id;
         let request = pending.request;
         let prompt = pending.prompt;
-        let topic = stream_id.as_bytes().to_vec();
+
+        // Use StreamBuilder with adaptive batching for StreamBlock format
+        let streaming_config = StreamingConfig::default();
+        let mut builder = StreamBuilder::new(streaming_config.batching.clone(), pending.mac_key, pending.topic.clone());
 
         // Apply TTT adaptation BEFORE streaming generation (if enabled)
         self.apply_ttt_adaptation(&prompt);
 
-        // Get XPUB socket (created in run_service_loop)
-        let xpub_guard = self.xpub_socket.borrow();
-        let xpub = match xpub_guard.as_ref() {
+        // Get PUSH socket (created in run_service_loop, connects to StreamService's PULL)
+        let pub_guard = self.xpub_socket.read().unwrap();
+        let push_socket = match pub_guard.as_ref() {
             Some(socket) => socket,
             None => {
-                error!("XPUB socket not initialized for streaming");
+                error!("PUSH socket not initialized for streaming");
                 return;
             }
         };
 
-        // Wait for subscription event from client
-        // XPUB receives: 0x01 + topic (subscribe) or 0x00 + topic (unsubscribe)
-        // Timeout after 5 seconds if no subscriber
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(5);
-        let mut subscribed = false;
-
-        while start.elapsed() < timeout {
-            match xpub.recv_bytes(zmq::DONTWAIT) {
-                Ok(sub_msg) if !sub_msg.is_empty() => {
-                    let is_subscribe = sub_msg[0] == 0x01;
-                    let sub_topic = &sub_msg[1..];
-
-                    if is_subscribe && sub_topic == topic.as_slice() {
-                        trace!("client subscribed to stream {}", stream_id);
-                        subscribed = true;
-                        break;
-                    }
-                    // Other subscription event, continue waiting
-                }
-                Ok(_) => {} // Empty message, continue
-                Err(zmq::Error::EAGAIN) => {
-                    // No subscription yet, yield briefly
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                Err(e) => {
-                    warn!("XPUB recv error: {}", e);
-                    break;
-                }
-            }
-        }
-
-        if !subscribed {
-            warn!("no subscriber for stream {} after timeout", stream_id);
-            // Continue anyway - client may have subscribed before we started checking
-        }
-
-        // Helper to send topic-prefixed message
-        let send_with_topic = |data: &[u8]| -> Result<(), zmq::Error> {
-            // ZMQ topic filtering uses prefix matching
-            // Message format: topic_bytes + data_bytes
-            let mut msg = Vec::with_capacity(topic.len() + data.len());
-            msg.extend_from_slice(&topic);
-            msg.extend_from_slice(data);
-            xpub.send(&msg, 0)
-        };
+        // StreamService handles subscription forwarding (blind - no HMAC verification)
+        // We push StreamBlocks - StreamService queues until subscriber arrives, then delivers
+        trace!(
+            stream_id = %stream_id,
+            topic = %pending.topic,
+            "Starting E2E authenticated stream with adaptive batching"
+        );
 
         // Run the stream
-        let engine = self.engine.borrow();
+        let engine = self.engine.read().unwrap();
         let stream_result = engine.generate(request);
 
         match stream_result {
             Ok(mut stream) => {
-                let mut seq_num: u32 = 0;
-
                 // Use futures::executor::block_on because we're already inside a tokio runtime
                 // (run_service_loop runs in rt.block_on), and tokio's block_on can't be nested.
                 futures::executor::block_on(async {
                     while let Some(chunk_result) = stream.next().await {
                         match chunk_result {
                             Ok(text) => {
-                                // Build and send chunk message with topic prefix
-                                let chunk_bytes =
-                                    InferenceResponse::stream_chunk(&stream_id, seq_num, &text);
-                                if let Err(e) = send_with_topic(&chunk_bytes) {
-                                    warn!("failed to send stream chunk: {}", e);
-                                    break;
+                                // Get live generation rate from stream stats (EMA for smooth batching)
+                                let rate = stream.stats().inference_tokens_per_sec_ema;
+
+                                // Add token with adaptive batching
+                                match builder.add_data(text.as_bytes(), rate) {
+                                    Ok(Some(frames)) => {
+                                        if let Err(e) = frames.send(push_socket) {
+                                            warn!("failed to send StreamBlock: {}", e);
+                                            break;
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        // Batching - not ready to send yet
+                                    }
+                                    Err(e) => {
+                                        warn!("failed to build StreamBlock: {}", e);
+                                        break;
+                                    }
                                 }
-                                seq_num += 1;
                             }
                             Err(e) => {
-                                let error_bytes =
-                                    InferenceResponse::stream_error(&stream_id, seq_num, &e.to_string());
-                                if let Err(send_err) = send_with_topic(&error_bytes) {
-                                    tracing::error!("Failed to send stream error: {}", send_err);
+                                // Errors flush immediately
+                                match builder.add_error(&e.to_string()) {
+                                    Ok(Some(frames)) => {
+                                        if let Err(send_err) = frames.send(push_socket) {
+                                            tracing::error!("Failed to send stream error: {}", send_err);
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(build_err) => {
+                                        tracing::error!("Failed to build error block: {}", build_err);
+                                    }
                                 }
                                 break;
                             }
                         }
                     }
 
-                    // Send completion
+                    // Send completion (flushes immediately)
                     let stats = stream.stats();
-                    let complete_bytes = InferenceResponse::stream_complete(&stream_id, seq_num, &stats);
-                    if let Err(e) = send_with_topic(&complete_bytes) {
-                        tracing::error!("Failed to send stream completion: {}", e);
+                    let complete = crate::services::rpc_types::InferenceComplete::from(&stats);
+                    match builder.add_complete(&complete.to_bytes()) {
+                        Ok(Some(frames)) => {
+                            if let Err(e) = frames.send(push_socket) {
+                                tracing::error!("Failed to send stream completion: {}", e);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::error!("Failed to build completion block: {}", e);
+                        }
+                    }
+
+                    // Flush any remaining batched payloads
+                    match builder.finish() {
+                        Ok(Some(frames)) => {
+                            if let Err(e) = frames.send(push_socket) {
+                                tracing::error!("Failed to send final block: {}", e);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::error!("Failed to build final block: {}", e);
+                        }
                     }
                 });
             }
             Err(e) => {
-                let error_bytes = InferenceResponse::stream_error(&stream_id, 0, &e.to_string());
-                if let Err(send_err) = send_with_topic(&error_bytes) {
-                    tracing::error!("Failed to send initial stream error: {}", send_err);
+                // Initial error - flush immediately
+                match builder.add_error(&e.to_string()) {
+                    Ok(Some(frames)) => {
+                        if let Err(send_err) = frames.send(push_socket) {
+                            tracing::error!("Failed to send initial stream error: {}", send_err);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(build_err) => {
+                        tracing::error!("Failed to build initial error block: {}", build_err);
+                    }
                 }
             }
         }
@@ -746,12 +1004,12 @@ impl InferenceService {
 
     /// Handle model info request
     fn handle_model_info(&self) -> ModelInfo {
-        RuntimeEngine::model_info(&*self.engine.borrow())
+        RuntimeEngine::model_info(&*self.engine.read().unwrap())
     }
 
     /// Handle is ready request
     fn handle_is_ready(&self) -> bool {
-        self.engine.borrow().is_loaded()
+        self.engine.read().unwrap().is_loaded()
     }
 
     /// Handle apply chat template
@@ -761,56 +1019,56 @@ impl InferenceService {
         add_generation_prompt: bool,
     ) -> Result<String> {
         self.engine
-            .borrow()
+            .read().unwrap()
             .apply_chat_template(&messages, add_generation_prompt)
     }
 
     /// Handle create LoRA
     fn handle_create_lora(&self, config: LoRAConfig) -> Result<()> {
-        self.engine.borrow_mut().create_lora(config)
+        self.engine.write().unwrap().create_lora(config)
     }
 
     /// Handle load LoRA
     fn handle_load_lora(&self, path: &Path) -> Result<()> {
         // Use futures::executor::block_on to avoid nesting tokio runtimes
-        let mut engine = self.engine.borrow_mut();
+        let mut engine = self.engine.write().unwrap();
         futures::executor::block_on(async { engine.load_lora_from_file(path).await })
     }
 
     /// Handle save LoRA
     fn handle_save_lora(&self, path: &str) -> Result<()> {
-        self.engine.borrow().save_lora(path)
+        self.engine.read().unwrap().save_lora(path)
     }
 
     /// Handle unload LoRA
     fn handle_unload_lora(&self) -> Result<()> {
-        self.engine.borrow_mut().unload_lora()
+        self.engine.write().unwrap().unload_lora()
     }
 
     /// Handle has LoRA
     fn handle_has_lora(&self) -> bool {
-        self.engine.borrow().has_lora_model()
+        self.engine.read().unwrap().has_lora_model()
     }
 
     /// Handle set session
     fn handle_set_session(&self, session_id: String) -> Result<()> {
         // Track session ID for events
-        *self.session_id.borrow_mut() = Some(session_id.clone());
+        *self.session_id.write().unwrap() = Some(session_id.clone());
         self.engine
-            .borrow_mut()
+            .write().unwrap()
             .set_session(CacheOwner::Session(session_id))
     }
 
     /// Handle clear session
     fn handle_clear_session(&self) {
-        *self.session_id.borrow_mut() = None;
-        self.engine.borrow_mut().clear_kv_cache();
+        *self.session_id.write().unwrap() = None;
+        self.engine.write().unwrap().clear_kv_cache();
     }
 
     /// Handle release session
     fn handle_release_session(&self, session_id: &str) -> Result<()> {
         self.engine
-            .borrow_mut()
+            .write().unwrap()
             .release_session(&CacheOwner::Session(session_id.to_string()))
     }
 
@@ -874,9 +1132,8 @@ impl InferenceService {
     /// Check authorization for an operation.
     ///
     /// Returns the unauthorized response if the check fails, or None if authorized.
-    /// Uses PolicyChecker which runs on a separate thread with its own runtime.
-    /// This is safe to call from any context (including inside block_on).
-    fn check_auth(
+    /// Uses PolicyZmqClient for async policy checks via TMQ.
+    async fn check_auth(
         &self,
         ctx: &EnvelopeContext,
         request_id: u64,
@@ -884,10 +1141,12 @@ impl InferenceService {
         operation: Operation,
     ) -> Option<Vec<u8>> {
         let subject = ctx.casbin_subject();
-        // PolicyChecker runs on a separate thread with its own runtime,
-        // so this synchronous call is safe even from within our single-threaded runtime.
-        // TMQ async I/O happens on the PolicyChecker thread.
-        let allowed = self.policy_checker.check(&subject, resource, operation);
+
+        // Async policy check via TMQ
+        let allowed = self.policy_client
+            .check(&subject, resource, operation)
+            .await
+            .unwrap_or(false);
 
         if allowed {
             None // Authorized
@@ -912,7 +1171,7 @@ impl InferenceService {
     /// Returns (response_bytes, pending_stream) where pending_stream is Some
     /// for streaming requests. The caller should send the response FIRST,
     /// then execute the pending stream.
-    fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<PendingStream>)> {
+    async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<PendingStream>)> {
         // Log identity for audit trail
         trace!(
             "Inference request from {} (envelope_id={}, authenticated={})",
@@ -935,7 +1194,7 @@ impl InferenceService {
         match req.which()? {
             Which::Generate(gen_req) => {
                 // Authorization: Infer on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Infer) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Infer).await {
                     return Ok((resp, None));
                 }
                 let gen_req = gen_req?;
@@ -949,33 +1208,84 @@ impl InferenceService {
 
             Which::GenerateStream(gen_req) => {
                 // Authorization: Infer on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Infer) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Infer).await {
                     return Ok((resp, None));
                 }
                 let gen_req = gen_req?;
                 let request = self.parse_generation_request(gen_req)?;
 
-                // Prepare stream but don't execute yet - return pending work
-                let (stream_id, pending) = self.prepare_stream(request);
+                // Prepare stream with DH key derivation
+                // Extract client ephemeral pubkey from envelope for DH
+                let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
+                let (stream_id, server_pubkey, pending) = self.prepare_stream(request, client_ephemeral_pubkey)?;
 
-                // Return response with stream_id - client will subscribe, then we execute
-                let response = InferenceResponse::stream_started(request_id, &stream_id, &self.stream_endpoint);
+                // Pre-authorize the stream subscription BEFORE returning response
+                // This way client can subscribe immediately without calling start_stream
+                // Include expiry from claims so StreamService can GC expired entries
+                let exp = ctx.claims().map(|c| c.exp).unwrap_or_else(|| {
+                    // Default: 5 minutes from now if no claims
+                    chrono::Utc::now().timestamp() + 300
+                });
+
+                // Register using DH-derived topic (not stream_id)
+                // StreamService uses this topic for subscription prefix matching
+                let push_guard = self.xpub_socket.read().unwrap();
+                if let Some(ref push_socket) = *push_guard {
+                    // Build SignedEnvelope(StreamRegister) with DH-derived topic
+                    let claims = ctx.claims().cloned();
+                    let register_msg = crate::services::rpc_types::build_stream_register_envelope(
+                        &pending.topic, // Use DH-derived topic for registration
+                        exp,
+                        &self.signing_key,
+                        claims,
+                    );
+                    if let Err(e) = push_socket.send(&register_msg, 0) {
+                        error!(
+                            stream_id = %stream_id,
+                            topic = %pending.topic,
+                            error = %e,
+                            "Failed to pre-authorize stream"
+                        );
+                        // Continue anyway - client can retry with start_stream
+                    } else {
+                        info!(
+                            stream_id = %stream_id,
+                            topic = %pending.topic,
+                            exp = exp,
+                            "Stream pre-authorized for subscription (DH-derived topic)"
+                        );
+                    }
+                }
+                drop(push_guard);
+
+                // Get StreamService's Sub endpoint (where clients subscribe)
+                let stream_sub_endpoint = hyprstream_rpc::registry::global()
+                    .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
+                    .to_zmq_string();
+
+                // Return response with stream_id AND server_pubkey for client DH
+                let response = InferenceResponse::stream_started(
+                    request_id,
+                    &stream_id,
+                    &stream_sub_endpoint,
+                    &server_pubkey,
+                );
                 Ok((response, Some(pending)))
             }
 
             Which::ModelInfo(()) => {
                 // Authorization: Query on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query).await {
                     return Ok((resp, None));
                 }
                 let info = self.handle_model_info();
-                let has_lora = self.engine.borrow().has_lora_model();
+                let has_lora = self.engine.read().unwrap().has_lora_model();
                 Ok((InferenceResponse::model_info(request_id, &info, has_lora), None))
             }
 
             Which::IsReady(()) => {
                 // Authorization: Query on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query).await {
                     return Ok((resp, None));
                 }
                 let ready = self.handle_is_ready();
@@ -984,7 +1294,7 @@ impl InferenceService {
 
             Which::ApplyChatTemplate(template_req) => {
                 // Authorization: Query on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query).await {
                     return Ok((resp, None));
                 }
                 let template_req = template_req?;
@@ -1009,7 +1319,7 @@ impl InferenceService {
 
             Which::CreateLora(lora_config) => {
                 // Authorization: Write on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
                     return Ok((resp, None));
                 }
                 let lora_config = lora_config?;
@@ -1033,7 +1343,7 @@ impl InferenceService {
 
             Which::LoadLora(path) => {
                 // Authorization: Write on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
                     return Ok((resp, None));
                 }
                 let path = path?.to_str()?;
@@ -1045,7 +1355,7 @@ impl InferenceService {
 
             Which::SaveLora(path) => {
                 // Authorization: Write on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
                     return Ok((resp, None));
                 }
                 let path = path?.to_str()?;
@@ -1057,7 +1367,7 @@ impl InferenceService {
 
             Which::UnloadLora(()) => {
                 // Authorization: Write on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
                     return Ok((resp, None));
                 }
                 match self.handle_unload_lora() {
@@ -1068,7 +1378,7 @@ impl InferenceService {
 
             Which::HasLora(()) => {
                 // Authorization: Query on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query).await {
                     return Ok((resp, None));
                 }
                 let has_lora = self.handle_has_lora();
@@ -1077,7 +1387,7 @@ impl InferenceService {
 
             Which::SetSession(session_id) => {
                 // Authorization: Write on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
                     return Ok((resp, None));
                 }
                 let session_id = session_id?.to_str()?.to_string();
@@ -1089,7 +1399,7 @@ impl InferenceService {
 
             Which::ClearSession(()) => {
                 // Authorization: Write on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
                     return Ok((resp, None));
                 }
                 self.handle_clear_session();
@@ -1098,7 +1408,7 @@ impl InferenceService {
 
             Which::ReleaseSession(session_id) => {
                 // Authorization: Write on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
                     return Ok((resp, None));
                 }
                 let session_id = session_id?.to_str()?;
@@ -1110,17 +1420,63 @@ impl InferenceService {
 
             Which::HealthCheck(()) => {
                 // Health check is public (no authorization required)
-                let model_loaded = self.engine.borrow().is_loaded();
+                let model_loaded = self.engine.read().unwrap().is_loaded();
                 Ok((InferenceResponse::health(request_id, model_loaded), None))
             }
 
             Which::Shutdown(()) => {
                 // Authorization: Manage on inference (shutdown requires admin)
-                if let Some(resp) = self.check_auth(ctx, request_id, "inference", Operation::Manage) {
+                if let Some(resp) = self.check_auth(ctx, request_id, "inference", Operation::Manage).await {
                     return Ok((resp, None));
                 }
                 info!("Inference service shutdown requested");
                 Ok((InferenceResponse::success(request_id), None))
+            }
+
+            Which::StartStream(start_req) => {
+                // Authorization: Infer on inference:{model} (same as generating)
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Infer).await {
+                    return Ok((resp, None));
+                }
+
+                let start_req = start_req?;
+                let stream_id = start_req.get_stream_id()?.to_str()?.to_string();
+
+                // Validate stream_id format
+                if !stream_id.starts_with("stream-") {
+                    return Ok((InferenceResponse::error(request_id, "Invalid stream_id format"), None));
+                }
+
+                // Send AUTHORIZE message to StreamService via PUSH socket
+                // This tells StreamService this stream is authorized for subscription
+                // Include expiry from claims so StreamService can GC expired entries
+                let exp = ctx.claims().map(|c| c.exp).unwrap_or_else(|| {
+                    // Default: 5 minutes from now if no claims
+                    chrono::Utc::now().timestamp() + 300
+                });
+
+                let push_guard = self.xpub_socket.read().unwrap();
+                if let Some(ref push_socket) = *push_guard {
+                    // Build SignedEnvelope(StreamRegister) - secure registration
+                    let claims = ctx.claims().cloned();
+                    let register_msg = crate::services::rpc_types::build_stream_register_envelope(
+                        &stream_id,
+                        exp,
+                        &self.signing_key,
+                        claims,
+                    );
+                    if let Err(e) = push_socket.send(&register_msg, 0) {
+                        error!(stream_id = %stream_id, error = %e, "Failed to send authorize message to StreamService");
+                        return Ok((InferenceResponse::error(request_id, &format!("Stream authorization failed: {}", e)), None));
+                    }
+                    info!(stream_id = %stream_id, exp = exp, "Stream authorized for subscription (SignedEnvelope)");
+                } else {
+                    error!(stream_id = %stream_id, "No PUSH socket available for stream authorization");
+                    return Ok((InferenceResponse::error(request_id, "Stream service not available"), None));
+                }
+                drop(push_guard);
+
+                Ok((InferenceResponse::stream_authorized(request_id, &stream_id), None))
             }
         }
     }
@@ -1144,14 +1500,19 @@ pub struct InferenceZmqClient {
 
 impl InferenceZmqClient {
     /// Create a new inference client with signing credentials
+    ///
+    /// # Note
+    /// Uses the same signing key for both request signing and response verification.
+    /// This is appropriate for internal communication where client and server share keys.
     pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
         Self::with_endpoint(INFERENCE_ENDPOINT, signing_key, identity)
     }
 
     /// Create an inference client connected to a specific endpoint
     pub fn with_endpoint(endpoint: &str, signing_key: SigningKey, identity: RequestIdentity) -> Self {
+        let server_verifying_key = signing_key.verifying_key();
         Self {
-            client: std::sync::Arc::new(crate::services::ZmqClient::new(endpoint, signing_key, identity)),
+            client: std::sync::Arc::new(crate::services::ZmqClient::new(endpoint, signing_key, server_verifying_key, identity)),
         }
     }
 
@@ -1204,7 +1565,7 @@ impl InferenceZmqClient {
         let mut bytes = Vec::new();
         serialize::write_message(&mut bytes, &message)?;
 
-        let response = self.client.call(bytes).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_generation_result(&response)
     }
 
@@ -1216,7 +1577,7 @@ impl InferenceZmqClient {
             req.set_id(id);
             req.set_is_ready(());
         })?;
-        let response = self.client.call(bytes).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_ready_response(&response)
     }
 
@@ -1228,7 +1589,7 @@ impl InferenceZmqClient {
             req.set_id(id);
             req.set_model_info(());
         })?;
-        let response = self.client.call(bytes).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_model_info_response(&response)
     }
 
@@ -1240,14 +1601,25 @@ impl InferenceZmqClient {
             req.set_id(id);
             req.set_health_check(());
         })?;
-        let response = self.client.call(bytes).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_health_response(&response)
     }
 
-    /// Start streaming generation
+    /// Start streaming generation with E2E authentication.
     ///
-    /// Returns the stream ID and endpoint for subscribing to chunks.
-    pub async fn generate_stream(&self, request: &GenerationRequest) -> Result<(String, String)> {
+    /// Returns StreamStartedInfo containing:
+    /// - stream_id: For client display/logging
+    /// - endpoint: StreamService SUB endpoint
+    /// - server_pubkey: Server's ephemeral Ristretto255 public key for DH
+    ///
+    /// # Arguments
+    /// * `request` - Generation parameters
+    /// * `ephemeral_pubkey` - Client's ephemeral Ristretto255 public key for DH (enables E2E auth)
+    pub async fn generate_stream(
+        &self,
+        request: &GenerationRequest,
+        ephemeral_pubkey: Option<[u8; 32]>,
+    ) -> Result<StreamStartedInfo> {
         let id = self.next_id();
 
         let mut message = Builder::new_default();
@@ -1275,8 +1647,156 @@ impl InferenceZmqClient {
         let mut bytes = Vec::new();
         serialize::write_message(&mut bytes, &message)?;
 
-        let response = self.client.call(bytes).await?;
+        let opts = match ephemeral_pubkey {
+            Some(pk) => CallOptions::default().ephemeral_pubkey(pk),
+            None => CallOptions::default(),
+        };
+        let response = self.client.call(bytes, opts).await?;
         self.parse_stream_started_response(&response)
+    }
+
+    /// Authorize a stream subscription
+    ///
+    /// After calling `generate_stream`, the client must call this method to authorize
+    /// subscription before subscribing to the stream. This sends an AUTHORIZE message
+    /// to StreamService which validates the stream_id and allows the subscription.
+    ///
+    /// # Arguments
+    /// * `stream_id` - The stream ID returned by `generate_stream`
+    ///
+    /// # Returns
+    /// The confirmed stream_id on success.
+    ///
+    /// # Future
+    /// Will support DH key exchange for encrypted streams.
+    pub async fn start_stream(&self, stream_id: &str) -> Result<String> {
+        let id = self.next_id();
+
+        let mut message = Builder::new_default();
+        let mut req = message.init_root::<inference_capnp::inference_request::Builder>();
+        req.set_id(id);
+
+        let mut start_req = req.init_start_stream();
+        start_req.set_stream_id(stream_id);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+
+        let response = self.client.call(bytes, CallOptions::default()).await?;
+        self.parse_stream_authorized_response(&response)
+    }
+
+    /// Start streaming generation and return a handle for receiving chunks.
+    ///
+    /// This is a convenience method that calls `generate_stream` and creates a `StreamHandle`
+    /// for receiving chunks from StreamService.
+    ///
+    /// # Arguments
+    /// * `request` - Generation request
+    ///
+    /// # Returns
+    /// A `StreamHandle` that can be used to receive stream chunks via `next_chunk()`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let (stream_id, endpoint) = client.generate_stream(&request).await?;
+    /// let handle = StreamHandle::new(
+    ///     &context,
+    ///     stream_id,
+    ///     &endpoint,
+    ///     claims.clone(),
+    ///     signing_key.clone(),
+    /// )?;
+    ///
+    /// while let Some(chunk) = handle.next_chunk()? {
+    ///     match chunk {
+    ///         StreamChunkMessage::Chunk { text, .. } => {
+    ///             print!("{}", text);
+    ///         }
+    ///         StreamChunkMessage::Complete { stats, .. } => {
+    ///             println!("\nDone: {} tokens", stats.tokens_generated);
+    ///             break;
+    ///         }
+    ///         StreamChunkMessage::Error { error, .. } => {
+    ///             eprintln!("Error: {}", error);
+    ///             break;
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    /// Start streaming generation with E2E authenticated handle.
+    ///
+    /// # E2E Authentication Flow
+    ///
+    /// 1. Client generates ephemeral Ristretto255 keypair
+    /// 2. Client sends request (TODO: include client pubkey in envelope)
+    /// 3. Server returns server_pubkey in StreamInfo
+    /// 4. Client derives (topic, mac_key) from DH shared secret
+    /// 5. Client subscribes to DH-derived topic
+    /// 6. Client verifies HMAC chain on received chunks
+    ///
+    /// # Note
+    ///
+    /// Currently falls back to legacy mode because the ZmqClient doesn't yet
+    /// support setting ephemeral_pubkey in the request envelope. The infrastructure
+    /// for E2E authentication is in place; full integration requires:
+    /// - Adding `call_with_ephemeral` to ZmqClient
+    /// - Including client ephemeral pubkey in the envelope
+    pub async fn generate_stream_handle(
+        &self,
+        request: &GenerationRequest,
+        claims: crate::auth::Claims,
+    ) -> Result<StreamHandle> {
+        use hyprstream_rpc::crypto::{
+            derive_stream_keys, generate_ephemeral_keypair, ristretto_dh, RistrettoPublic,
+        };
+
+        // Generate client ephemeral Ristretto255 keypair for DH
+        let (client_secret, client_pubkey) = generate_ephemeral_keypair();
+        let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
+
+        // Call generate_stream with ephemeral pubkey for E2E auth
+        let info = self.generate_stream(request, Some(client_pubkey_bytes)).await?;
+
+        // Attempt E2E authentication if server provided pubkey
+        let use_e2e = info.server_pubkey != [0u8; 32];
+
+        use crate::zmq::global_context;
+
+        // E2E authentication is required - server must provide Ristretto255 public key
+        if !use_e2e {
+            anyhow::bail!(
+                "Server did not provide Ristretto255 public key - E2E authentication required"
+            );
+        }
+
+        // Derive stream keys from Ristretto255 DH
+        let server_ristretto_pubkey = RistrettoPublic::from_bytes(&info.server_pubkey)
+            .ok_or_else(|| anyhow::anyhow!("Invalid server Ristretto255 public key encoding"))?;
+
+        let shared_secret = ristretto_dh(&client_secret, &server_ristretto_pubkey);
+
+        let keys = derive_stream_keys(
+            &shared_secret,
+            &client_pubkey_bytes,
+            &info.server_pubkey,
+        )?;
+
+        tracing::info!(
+            stream_id = %info.stream_id,
+            topic = %keys.topic,
+            "Creating E2E authenticated stream handle"
+        );
+
+        StreamHandle::new(
+            &global_context(),
+            info.stream_id,
+            &info.endpoint,
+            keys.topic,
+            *keys.mac_key,
+            claims,
+            self.client.signing_key().clone(),
+        )
     }
 
     /// Apply chat template to messages
@@ -1303,7 +1823,7 @@ impl InferenceZmqClient {
         let mut bytes = Vec::new();
         serialize::write_message(&mut bytes, &message)?;
 
-        let response = self.client.call(bytes).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_template_result_response(&response)
     }
 
@@ -1327,7 +1847,7 @@ impl InferenceZmqClient {
         let mut bytes = Vec::new();
         serialize::write_message(&mut bytes, &message)?;
 
-        let response = self.client.call(bytes).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_success_response(&response)
     }
 
@@ -1340,7 +1860,7 @@ impl InferenceZmqClient {
             req.set_id(id);
             req.set_load_lora(&path_str);
         })?;
-        let response = self.client.call(bytes).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_success_response(&response)
     }
 
@@ -1352,7 +1872,7 @@ impl InferenceZmqClient {
             req.set_id(id);
             req.set_save_lora(path);
         })?;
-        let response = self.client.call(bytes).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_success_response(&response)
     }
 
@@ -1364,7 +1884,7 @@ impl InferenceZmqClient {
             req.set_id(id);
             req.set_unload_lora(());
         })?;
-        let response = self.client.call(bytes).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_success_response(&response)
     }
 
@@ -1376,7 +1896,7 @@ impl InferenceZmqClient {
             req.set_id(id);
             req.set_has_lora(());
         })?;
-        let response = self.client.call(bytes).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_has_lora_response(&response)
     }
 
@@ -1388,7 +1908,7 @@ impl InferenceZmqClient {
             req.set_id(id);
             req.set_set_session(session_id);
         })?;
-        let response = self.client.call(bytes).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_success_response(&response)
     }
 
@@ -1400,7 +1920,7 @@ impl InferenceZmqClient {
             req.set_id(id);
             req.set_clear_session(());
         })?;
-        let response = self.client.call(bytes).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_success_response(&response)
     }
 
@@ -1412,7 +1932,7 @@ impl InferenceZmqClient {
             req.set_id(id);
             req.set_release_session(session_id);
         })?;
-        let response = self.client.call(bytes).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_success_response(&response)
     }
 
@@ -1424,7 +1944,7 @@ impl InferenceZmqClient {
             req.set_id(id);
             req.set_shutdown(());
         })?;
-        let response = self.client.call(bytes).await?;
+        let response = self.client.call(bytes, CallOptions::default()).await?;
         self.parse_success_response(&response)
     }
 
@@ -1525,7 +2045,10 @@ impl InferenceZmqClient {
     }
 
     /// Parse stream started response
-    fn parse_stream_started_response(&self, response: &[u8]) -> Result<(String, String)> {
+    /// Parse stream started response (with server_pubkey for E2E authentication)
+    fn parse_stream_started_response(&self, response: &[u8]) -> Result<StreamStartedInfo> {
+        use hyprstream_rpc::capnp::FromCapnp;
+
         let reader = serialize::read_message(response, ReaderOptions::new())?;
         let resp = reader.get_root::<inference_capnp::inference_response::Reader>()?;
 
@@ -1533,9 +2056,27 @@ impl InferenceZmqClient {
         match resp.which()? {
             Which::StreamStarted(info) => {
                 let info = info?;
-                let stream_id = info.get_stream_id()?.to_str()?.to_string();
-                let endpoint = info.get_endpoint()?.to_str()?.to_string();
-                Ok((stream_id, endpoint))
+                StreamStartedInfo::read_from(info)
+            }
+            Which::Error(err) => {
+                let err = err?;
+                Err(anyhow!("{}", err.get_message()?.to_str()?))
+            }
+            _ => Err(anyhow!("Unexpected response type")),
+        }
+    }
+
+    /// Parse stream authorized response
+    fn parse_stream_authorized_response(&self, response: &[u8]) -> Result<String> {
+        let reader = serialize::read_message(response, ReaderOptions::new())?;
+        let resp = reader.get_root::<inference_capnp::inference_response::Reader>()?;
+
+        use inference_capnp::inference_response::Which;
+        match resp.which()? {
+            Which::StreamAuthorized(auth) => {
+                let auth = auth?;
+                let stream_id = auth.get_stream_id()?.to_str()?.to_string();
+                Ok(stream_id)
             }
             Which::Error(err) => {
                 let err = err?;
@@ -1593,6 +2134,307 @@ impl InferenceZmqClient {
             }
             _ => Err(anyhow!("Unexpected response type")),
         }
+    }
+}
+
+// ============================================================================
+// StreamChunkMessage - Client-side stream message handling
+// ============================================================================
+
+/// Message received from StreamService during streaming generation.
+///
+/// Represents one of three possible message types:
+/// - Chunk: Text chunk from the model
+/// - Complete: Stream finished with generation stats
+/// - Error: Generation failed
+///
+/// Note: Ordering is handled by prevMac in the outer streaming_capnp::StreamBlock wrapper.
+/// Authentication via HMAC chain happens at the StreamBlock level.
+pub enum StreamChunkMessage {
+    Chunk {
+        text: String,
+    },
+    Complete {
+        stats: crate::runtime::GenerationStats,
+    },
+    Error {
+        error: String,
+    },
+}
+
+impl StreamChunkMessage {
+    /// Parse an InferencePayload message from StreamService
+    ///
+    /// Note: This parses the inner inference_capnp::InferencePayload.
+    /// HMAC verification and ordering happen at the StreamBlock level
+    /// using the outer streaming_capnp::StreamBlock wrapper.
+    pub fn from_capnp(payload: inference_capnp::inference_payload::Reader) -> Result<Self> {
+        use inference_capnp::inference_payload::Which;
+
+        let stream_id = payload.get_stream_id()?.to_str()?.to_string();
+        tracing::trace!(stream_id = %stream_id, "Parsing inference payload");
+
+        // Parse union variant
+        match payload.which()? {
+            Which::Token(token) => {
+                let token = token?.to_str()?.to_string();
+                Ok(StreamChunkMessage::Chunk { text: token })
+            }
+            Which::Complete(complete) => {
+                let complete = complete?;
+                let finish_reason = match complete.get_finish_reason()? {
+                    inference_capnp::FinishReason::MaxTokens => FinishReason::MaxTokens,
+                    inference_capnp::FinishReason::StopToken => FinishReason::StopToken(String::new()),
+                    inference_capnp::FinishReason::EndOfSequence => FinishReason::EndOfSequence,
+                    inference_capnp::FinishReason::Error => FinishReason::Error(String::new()),
+                    inference_capnp::FinishReason::Stop => FinishReason::Stop,
+                };
+                let stats = crate::runtime::GenerationStats {
+                    tokens_generated: complete.get_tokens_generated() as usize,
+                    finish_reason: Some(finish_reason),
+                    generation_time_ms: complete.get_generation_time_ms(),
+                    tokens_per_second: complete.get_tokens_per_second(),
+                    quality_metrics: None,
+                    prefill_tokens: 0,
+                    prefill_time_ms: 0,
+                    prefill_tokens_per_sec: 0.0,
+                    inference_tokens: 0,
+                    inference_time_ms: 0,
+                    inference_tokens_per_sec: 0.0,
+                    inference_tokens_per_sec_ema: 0.0,
+                };
+                Ok(StreamChunkMessage::Complete { stats })
+            }
+            Which::Error(error) => {
+                let error = error?;
+                let error_msg = error.get_message()?.to_str()?.to_string();
+                Ok(StreamChunkMessage::Error {
+                    error: error_msg,
+                })
+            }
+        }
+    }
+
+    /// Returns true if this is the last message (Complete or Error)
+    pub fn is_last(&self) -> bool {
+        matches!(self, StreamChunkMessage::Complete { .. } | StreamChunkMessage::Error { .. })
+    }
+}
+
+/// Handle for receiving stream chunks from StreamService with E2E authentication.
+///
+/// Subscribes to StreamService using DH-derived topic and verifies HMAC chain.
+///
+/// # E2E Authentication Protocol
+///
+/// 1. Client generates ephemeral keypair, includes pubkey in request envelope
+/// 2. Server generates ephemeral keypair, returns pubkey in StreamInfo
+/// 3. Both derive: shared_secret = DH(my_secret, their_pubkey)
+/// 4. Both derive: (topic, mac_key) = HKDF(shared_secret, pubkeys)
+/// 5. Client subscribes to DH-derived topic (unpredictable, non-colliding)
+/// 6. Client verifies HMAC chain on received chunks
+pub struct StreamHandle {
+    /// ZMQ SUB socket
+    subscriber: zmq::Socket,
+    /// Stream ID (for display/logging only, not used for routing)
+    stream_id: String,
+    /// DH-derived topic (64 hex chars) - used for ZMQ subscription
+    topic: String,
+    /// StreamVerifier for HMAC chain verification (new StreamBlock format)
+    verifier: crate::services::rpc_types::StreamVerifier,
+    /// Buffer for parsed payloads (StreamBlock can contain multiple)
+    pending_payloads: std::collections::VecDeque<crate::services::rpc_types::StreamPayload>,
+    /// Whether stream has completed
+    stream_completed: bool,
+    /// Claims for legacy JWT subscription (backwards compatibility)
+    #[allow(dead_code)]
+    claims: crate::auth::Claims,
+    /// Signing key for legacy JWT subscription
+    #[allow(dead_code)]
+    signing_key: ed25519_dalek::SigningKey,
+}
+
+impl StreamHandle {
+    /// Create a new E2E authenticated stream handle.
+    ///
+    /// # Arguments
+    /// * `context` - ZMQ context
+    /// * `stream_id` - Stream ID for display/logging
+    /// * `endpoint` - StreamService SUB endpoint
+    /// * `topic` - DH-derived topic for ZMQ subscription (from Ristretto255 key exchange)
+    /// * `mac_key` - DH-derived HMAC key for chain verification
+    /// * `claims` - User authorization claims
+    /// * `signing_key` - Ed25519 signing key
+    pub fn new(
+        context: &zmq::Context,
+        stream_id: String,
+        endpoint: &str,
+        topic: String,
+        mac_key: [u8; 32],
+        claims: crate::auth::Claims,
+        signing_key: ed25519_dalek::SigningKey,
+    ) -> Result<Self> {
+        use crate::services::rpc_types::StreamVerifier;
+
+        // Create SUB socket
+        let subscriber = context.socket(zmq::SUB)?;
+
+        // Connect to StreamService endpoint
+        subscriber.connect(endpoint)?;
+
+        // Subscribe to DH-derived topic (E2E authentication via Ristretto255)
+        subscriber.set_subscribe(topic.as_bytes())?;
+
+        tracing::info!(
+            stream_id = %stream_id,
+            topic = %topic,
+            endpoint = %endpoint,
+            "Subscribed to E2E authenticated stream (StreamBlock format)"
+        );
+
+        // Create verifier for HMAC chain verification
+        let verifier = StreamVerifier::new(mac_key, topic.clone());
+
+        Ok(Self {
+            subscriber,
+            stream_id,
+            topic,
+            verifier,
+            pending_payloads: std::collections::VecDeque::new(),
+            stream_completed: false,
+            claims,
+            signing_key,
+        })
+    }
+
+    /// Receive next chunk (blocking) with HMAC verification.
+    ///
+    /// Returns `None` if the stream has ended (Complete or Error message received).
+    ///
+    /// # StreamBlock Format
+    ///
+    /// Messages are received as 3-frame multipart: [topic, capnp StreamBlock, 16-byte mac]
+    /// The StreamBlock contains multiple payloads which are buffered and returned one at a time.
+    ///
+    /// # HMAC Verification
+    ///
+    /// Each block's HMAC is verified against the chain:
+    /// - First block: HMAC(mac_key, topic || capnp)[..16]
+    /// - Subsequent: HMAC(mac_key, prev_mac || capnp)[..16]
+    ///
+    /// If verification fails, returns an error.
+    pub fn next_chunk(&mut self) -> Result<Option<StreamChunkMessage>> {
+        use crate::services::rpc_types::StreamPayload;
+
+        // Return buffered payloads first
+        if let Some(payload) = self.pending_payloads.pop_front() {
+            return Ok(Some(self.convert_payload(payload)));
+        }
+
+        // Stream completed, no more data
+        if self.stream_completed {
+            return Ok(None);
+        }
+
+        // Receive multipart message from StreamService
+        // StreamBlock format: [topic, capnp, 16-byte mac]
+        let msg = self.subscriber.recv_multipart(0)?;
+
+        // Validate 3-frame StreamBlock format
+        if msg.len() != 3 || msg[2].len() != 16 {
+            bail!(
+                "Invalid StreamBlock format: expected 3 frames with 16-byte MAC, got {} frames{}",
+                msg.len(),
+                if msg.len() >= 3 { format!(" with {}-byte MAC", msg[2].len()) } else { String::new() }
+            );
+        }
+
+        // Verify and parse StreamBlock
+        let payloads = self.verifier.verify(&msg)?;
+
+        // Buffer all payloads
+        for payload in payloads {
+            // Check if this is a completion/error (marks end of stream)
+            let is_terminal = matches!(
+                payload,
+                StreamPayload::Complete { .. } | StreamPayload::Error { .. }
+            );
+            if is_terminal {
+                self.stream_completed = true;
+            }
+            self.pending_payloads.push_back(payload);
+        }
+
+        // Return first payload from buffer
+        if let Some(payload) = self.pending_payloads.pop_front() {
+            return Ok(Some(self.convert_payload(payload)));
+        }
+
+        // Empty block (shouldn't happen but handle gracefully)
+        Ok(None)
+    }
+
+    /// Convert ParsedStreamPayload to StreamChunkMessage
+    fn convert_payload(&self, payload: crate::services::rpc_types::StreamPayload) -> StreamChunkMessage {
+        use crate::services::rpc_types::{InferenceStreamPayload, StreamPayloadExt};
+
+        // Convert generic payload to inference-specific
+        match payload.to_inference() {
+            Ok(InferenceStreamPayload::Token(text)) => {
+                StreamChunkMessage::Chunk { text }
+            }
+            Ok(InferenceStreamPayload::Error(message)) => {
+                StreamChunkMessage::Error { error: message }
+            }
+            Ok(InferenceStreamPayload::Complete(stats)) => {
+                // Build quality metrics if present
+                let quality_metrics = if stats.perplexity.is_some() || stats.avg_entropy.is_some() {
+                    Some(crate::runtime::generation_metrics::GenerationQualityMetrics {
+                        perplexity: stats.perplexity.unwrap_or(0.0),
+                        avg_entropy: stats.avg_entropy.unwrap_or(0.0),
+                        ..Default::default()
+                    })
+                } else {
+                    None
+                };
+
+                // Convert to GenerationStats with full metrics
+                let gen_stats = crate::runtime::GenerationStats {
+                    tokens_generated: stats.tokens_generated,
+                    generation_time_ms: stats.generation_time_ms,
+                    tokens_per_second: stats.tokens_per_second,
+                    finish_reason: Some(match stats.finish_reason.as_str() {
+                        "length" => crate::config::FinishReason::MaxTokens,
+                        "eos" => crate::config::FinishReason::EndOfSequence,
+                        "error" => crate::config::FinishReason::Error(String::new()),
+                        _ => crate::config::FinishReason::Stop,
+                    }),
+                    quality_metrics,
+                    prefill_tokens: stats.prefill_tokens,
+                    prefill_time_ms: stats.prefill_time_ms,
+                    prefill_tokens_per_sec: stats.prefill_tokens_per_sec,
+                    inference_tokens: stats.inference_tokens,
+                    inference_time_ms: stats.inference_time_ms,
+                    inference_tokens_per_sec: stats.inference_tokens_per_sec,
+                    inference_tokens_per_sec_ema: stats.inference_tokens_per_sec_ema,
+                };
+                StreamChunkMessage::Complete { stats: gen_stats }
+            }
+            Err(e) => {
+                // If parsing fails, return as error
+                StreamChunkMessage::Error { error: format!("Failed to parse payload: {}", e) }
+            }
+        }
+    }
+
+    /// Get the stream ID (for display/logging)
+    pub fn stream_id(&self) -> &str {
+        &self.stream_id
+    }
+
+    /// Get the DH-derived topic (for debugging)
+    pub fn topic(&self) -> &str {
+        &self.topic
     }
 }
 

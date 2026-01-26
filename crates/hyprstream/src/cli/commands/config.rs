@@ -159,6 +159,46 @@ impl ConfigSection for LoggingConfig {
     }
 }
 
+/// Service management configuration
+#[derive(Debug, Clone, Default, Args, Deserialize)]
+pub struct ServicesConfigCli {
+    /// Comma-separated list of services to start at startup
+    ///
+    /// Example: --services-startup registry,policy,worker,event
+    /// Environment: HYPRSTREAM_SERVICES_STARTUP=registry,policy,worker,event
+    #[arg(long = "services-startup", env = "HYPRSTREAM_SERVICES_STARTUP", value_delimiter = ',')]
+    #[serde(skip)]
+    pub startup: Option<Vec<String>>,
+}
+
+impl ConfigSection for ServicesConfigCli {
+    fn options() -> Vec<ConfigOptionDef<String>> {
+        vec![
+            ConfigOptionDef::new(
+                "services.startup",
+                "Comma-separated list of services to start at startup (registry, policy, worker, event)",
+            )
+            .with_env("HYPRSTREAM_SERVICES_STARTUP")
+            .with_cli("services-startup"),
+        ]
+    }
+
+    fn from_config<'de, D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct ServicesConfigFile {
+            startup: Option<Vec<String>>,
+        }
+
+        let config = ServicesConfigFile::deserialize(deserializer)?;
+        Ok(ServicesConfigCli {
+            startup: config.startup,
+        })
+    }
+}
+
 /// Credentials for authentication
 #[derive(Debug, Clone, Deserialize)]
 pub struct Credentials {

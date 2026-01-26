@@ -131,12 +131,18 @@ m = (g(r.sub, p.sub) || keyMatch(r.sub, p.sub)) && \
 /// Add explicit policies for access grants
 ///
 /// Policy format: p, subject, domain, resource, action, effect
-const DEFAULT_POLICY_CSV: &str = r#"# Default deny-all policy (secure default)
-# Add explicit policies below to grant access.
+const DEFAULT_POLICY_CSV: &str = r#"# Default policy (secure default with local user access)
+# Add explicit policies below to grant additional access.
 #
 # Policy format: p, subject, domain, resource, action, effect
 #
-# Examples:
+# Default policies for local users (CLI operations):
+p, local:*, *, registry, query, allow
+p, local:*, *, registry:*, query, allow
+p, local:*, *, registry:*, write, allow
+p, local:*, *, model:*, infer, allow
+#
+# Examples for additional policies:
 #   p, admin, *, *, *, allow             # Admin has full access to all domains
 #   p, trainer, HfModel, model:*, train, allow  # Trainer can train HfModel domain
 #   p, user, HfModel, model:*, infer, allow     # User can infer in HfModel domain
@@ -146,7 +152,7 @@ const DEFAULT_POLICY_CSV: &str = r#"# Default deny-all policy (secure default)
 # Role assignments:
 #   g, alice, trainer        # Assign alice to trainer role
 #
-# IMPORTANT: Without policies, all access is denied.
+# IMPORTANT: Add policies above to grant access to specific users/roles.
 "#;
 
 /// Validate policy.csv format before loading

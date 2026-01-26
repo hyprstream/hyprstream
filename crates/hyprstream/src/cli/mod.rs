@@ -8,23 +8,28 @@
 
 pub mod commands;
 pub mod context;
+pub mod daemon;
 pub mod git_handlers;
 pub mod handlers;
 pub mod policy_handlers;
 pub mod remote_handlers;
+pub mod systemd_setup;
 pub mod training_handlers;
+pub mod worker_handlers;
 pub mod worktree_handlers;
 
 pub use context::AppContext;
 pub use git_handlers::{
-    apply_policy_template_to_model, handle_branch, handle_checkout, handle_clone, handle_commit,
-    handle_infer, handle_info, handle_list, handle_merge, handle_pull,
-    handle_push, handle_remove, handle_status, MergeOptions,
+    apply_policy_template_to_model, handle_branch, handle_checkout, handle_clone,
+    handle_infer, handle_info, handle_list, handle_pull, handle_remove, handle_status,
 };
+
+#[cfg(feature = "experimental")]
+pub use git_handlers::{handle_commit, handle_merge, handle_push, MergeOptions};
 pub use training_handlers::{
     handle_training_batch, handle_training_checkpoint, handle_training_infer, handle_training_init,
 };
-pub use handlers::{handle_config, handle_server, FlightServerConfig};
+pub use handlers::handle_config;
 pub use worktree_handlers::{
     handle_worktree_add, handle_worktree_info, handle_worktree_list, handle_worktree_remove,
 };
@@ -37,6 +42,12 @@ pub use policy_handlers::{
 pub use remote_handlers::{
     handle_remote_add, handle_remote_list, handle_remote_remove, handle_remote_rename,
     handle_remote_set_url,
+};
+pub use worker_handlers::{
+    handle_images_df, handle_images_list, handle_images_pull, handle_images_rm,
+    handle_worker_exec, handle_worker_list, handle_worker_restart, handle_worker_rm,
+    handle_worker_run, handle_worker_start, handle_worker_stats, handle_worker_status,
+    handle_worker_stop, handle_worker_terminal,
 };
 
 /// Device preference strategy

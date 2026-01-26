@@ -451,9 +451,19 @@ async fn test_registry_clone_with_auth_callbacks() {
 
     // Verify the default worktree exists and has the expected files
     // registry.clone() creates worktrees at {repo_dir}/worktrees/{branch}
+    // The branch name depends on git's init.defaultBranch config (main or master)
     let repo_dir = registry_path.join("cloned-repo");
-    let default_worktree = repo_dir.join("worktrees").join("main");
-    assert!(default_worktree.exists(), "Default worktree should exist");
+    let default_branch = bare_repo
+        .head()
+        .ok()
+        .and_then(|h| h.shorthand().map(String::from))
+        .unwrap_or_else(|| "main".to_string());
+    let default_worktree = repo_dir.join("worktrees").join(&default_branch);
+    assert!(
+        default_worktree.exists(),
+        "Default worktree should exist at {:?}",
+        default_worktree
+    );
     assert!(
         default_worktree.join("README.md").exists(),
         "README.md should exist in the worktree"

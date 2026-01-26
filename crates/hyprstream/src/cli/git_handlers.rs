@@ -1,18 +1,11 @@
 //! Handlers for git-style CLI commands
 
-use crate::cli::commands::model::GitInfo;
 use crate::config::GenerationRequest;
-use crate::inference_capnp;
-use crate::runtime::template_engine::ChatMessage;
-use crate::runtime::RuntimeConfig;
-use crate::services::{
-    InferenceService, InferenceZmqClient, PolicyZmqClient, INFERENCE_ENDPOINT,
-};
+use crate::api::openai_compat::ChatMessage;
+use crate::services::ModelZmqClient;
 use crate::zmq::global_context;
-use crate::storage::{CheckoutOptions, GitRef, ModelRef, ModelStorage};
+use crate::storage::{CheckoutOptions, ModelRef, ModelStorage};
 use anyhow::{bail, Result};
-use capnp::message::ReaderOptions;
-use capnp::serialize;
 use hyprstream_rpc::prelude::*;
 use std::io::{self, Write};
 use tracing::{debug, info, warn};
@@ -137,6 +130,16 @@ pub async fn handle_status(
 }
 
 /// Handle commit command
+///
+/// TODO: This function still uses local git2 operations for advanced features.
+/// The following need to be added to RepositoryClient:
+/// - Detailed status with file-level change types (A/M/D/R/??)
+/// - Amend support
+/// - Custom author support
+/// - Different staging modes (stage_all vs stage_all_including_untracked)
+///
+/// **EXPERIMENTAL**: This feature is behind the `experimental` flag.
+#[cfg(feature = "experimental")]
 pub async fn handle_commit(
     storage: &ModelStorage,
     model_ref_str: &str,
@@ -160,8 +163,9 @@ pub async fn handle_commit(
     let branch_name = match &model_ref.git_ref {
         git2db::GitRef::Branch(name) => name.clone(),
         git2db::GitRef::DefaultBranch => {
-            let base_ref = ModelRef::new(model_ref.model.clone());
-            storage.get_default_branch(&base_ref).await?
+            // Get repository client from registry service
+            let repo_client = storage.registry().repo(&model_ref.model).await?;
+            repo_client.default_branch().await?
         }
         git2db::GitRef::Tag(tag) => {
             anyhow::bail!(
@@ -183,17 +187,21 @@ pub async fn handle_commit(
         }
     };
 
-    // Get worktree path (this verifies it exists)
-    let worktree_path = storage.get_worktree_path(&model_ref, &branch_name).await
-        .map_err(|e| anyhow::anyhow!(
-            "Worktree '{}' does not exist for model '{}'.\n\nCreate it first with:\n  hyprstream branch {} {}\n\nError: {}",
-            branch_name, model_ref.model, model_ref.model, branch_name, e
+    // Get repository client
+    let repo_client = storage.registry().repo(&model_ref.model).await?;
+
+    // Check if worktree exists
+    let worktree_path = repo_client.worktree_path(&branch_name).await?
+        .ok_or_else(|| anyhow::anyhow!(
+            "Worktree '{}' does not exist for model '{}'.\n\nCreate it first with:\n  hyprstream branch {} {}",
+            branch_name, model_ref.model, model_ref.model, branch_name
         ))?;
 
     info!("Operating on worktree: {}", worktree_path.display());
 
-    // Check for changes if not allowing empty commits
-    // Open the worktree repository directly to check status
+    // TODO: Use RepositoryClient.status() here once it provides detailed file status
+    // For now, we need to use git2 directly to get detailed status for verbose/dry-run output
+    // TEMPORARY: Local git2 access for detailed status
     let worktree_repo = git2::Repository::open(&worktree_path)?;
     let statuses = worktree_repo.statuses(None)?;
     let has_changes = !statuses.is_empty();
@@ -204,7 +212,8 @@ pub async fn handle_commit(
         return Ok(());
     }
 
-    // Show what will be committed
+    // Show what will be committed (needs detailed status)
+    // TODO: Replace with RepositoryClient method that returns detailed file status
     if verbose || dry_run {
         println!("\n→ Changes to be committed:");
 
@@ -270,8 +279,13 @@ pub async fn handle_commit(
         return Ok(());
     }
 
-    // Stage files based on flags
-    // We need to work with the worktree repository directly, not the bare repo
+    // TODO: The following features need to be added to RepositoryClient:
+    // - stage_all_including_untracked() for all_untracked mode
+    // - commit_with_author() for custom author
+    // - amend_commit() for amend mode
+    //
+    // For now, we use git2 directly for these advanced features
+    // TEMPORARY: Local git2 access for staging and committing
     let mut index = worktree_repo.index()?;
 
     if all_untracked {
@@ -286,9 +300,10 @@ pub async fn handle_commit(
 
     index.write()?;
 
-    // Perform commit operation in worktree
+    // Perform commit operation
     let commit_oid = if amend {
-        // Amend the previous commit
+        // TODO: Add RepositoryClient.amend_commit(message) method
+        // TEMPORARY: Local git2 access for amend
         info!("Amending previous commit");
 
         let tree_id = index.write_tree()?;
@@ -296,28 +311,25 @@ pub async fn handle_commit(
         let head = worktree_repo.head()?;
         let commit_to_amend = head.peel_to_commit()?;
 
-        // Use commit_amend to properly amend
         commit_to_amend.amend(
-            Some("HEAD"),               // Update HEAD
-            None,                        // Keep original author
-            None,                        // Keep committer timestamp (update by default)
-            None,                        // Keep encoding
-            Some(message),              // New message
-            Some(&tree),                // New tree
+            Some("HEAD"),
+            None,
+            None,
+            None,
+            Some(message),
+            Some(&tree),
         )?
-    } else {
-        // Create new commit
+    } else if author.is_some() || author_name.is_some() || author_email.is_some() {
+        // TODO: Add RepositoryClient.commit_with_author(message, author_name, author_email) method
+        // TEMPORARY: Local git2 access for custom author
         let tree_id = index.write_tree()?;
         let tree = worktree_repo.find_tree(tree_id)?;
         let head = worktree_repo.head()?;
         let parent_commit = head.peel_to_commit()?;
 
-        // Parse author if provided
         let signature = if let Some(author_str) = author {
-            // Parse "Name <email>" format
             let re = regex::Regex::new(r"^(.+?)\s*<(.+?)>$")?;
             if let Some(captures) = re.captures(&author_str) {
-                // SAFETY: capture groups 1 and 2 exist because regex matched
                 let name = captures.get(1)
                     .ok_or_else(|| anyhow::anyhow!("Invalid author format: missing name"))?
                     .as_str().trim();
@@ -331,16 +343,12 @@ pub async fn handle_commit(
                     author_str
                 );
             }
-        } else if author_name.is_some() || author_email.is_some() {
-            // Use author-name and author-email if provided
+        } else {
             let name = author_name.as_deref()
                 .ok_or_else(|| anyhow::anyhow!("--author-name required when using --author-email"))?;
             let email = author_email.as_deref()
                 .ok_or_else(|| anyhow::anyhow!("--author-email required when using --author-name"))?;
             git2::Signature::now(name, email)?
-        } else {
-            // Default signature from git config
-            worktree_repo.signature()?
         };
 
         worktree_repo.commit(
@@ -351,6 +359,11 @@ pub async fn handle_commit(
             &tree,
             &[&parent_commit],
         )?
+    } else {
+        // Simple commit - can use RepositoryClient
+        repo_client.stage_all().await?;
+        let oid_string = repo_client.commit(message).await?;
+        git2::Oid::from_str(&oid_string)?
     };
 
     // Success output
@@ -425,23 +438,32 @@ pub async fn handle_list(
         .map(|u| u.to_string_lossy().to_string())
         .unwrap_or_else(|| "anonymous".to_string());
 
+    // Get archetype registry for capability detection
+    let archetype_registry = crate::archetypes::global_registry();
+
     // Get storage paths for model directories
     let storage_paths = crate::storage::StoragePaths::new()?;
     let models_dir = storage_paths.models_dir()?;
 
-    // Get archetype registry for capability detection
-    let archetype_registry = crate::archetypes::global_registry();
-
     // Collect models with git info and capabilities
-    let mut git_repos = Vec::new();
+    let mut models_with_info = Vec::new();
     for (model_ref, metadata) in models {
-        // Get git info from the bare repository
-        // The bare repo is at: models/{name}/{name}.git/
-        let bare_repo_path = models_dir
-            .join(&model_ref.model)
-            .join(format!("{}.git", model_ref.model));
+        // Get commit hash via service layer (avoids GitManager::global())
+        let commit = match storage.registry().repo(&model_ref.model).await {
+            Ok(repo_client) => {
+                match repo_client.get_head().await {
+                    Ok(head_oid) => {
+                        // Truncate to 7 characters for display
+                        head_oid.chars().take(7).collect::<String>()
+                    }
+                    Err(_) => "unknown".to_string(),
+                }
+            }
+            Err(_) => "unknown".to_string(),
+        };
 
-        let git_info = GitInfo::from_bare_repo(&bare_repo_path);
+        // Get ref name from ModelRef
+        let git_ref = model_ref.git_ref_str().unwrap_or_else(|| "detached".to_string());
 
         // Detect capabilities from worktree path
         let worktree_path = models_dir
@@ -460,7 +482,7 @@ pub async fn handle_list(
             domains.capabilities.to_ids().join(",")
         };
 
-        git_repos.push((model_ref, metadata, git_info, domains, access_str));
+        models_with_info.push((model_ref, metadata, commit, git_ref, domains, access_str));
     }
 
     // Table format with DOMAINS and ACCESS columns
@@ -470,7 +492,7 @@ pub async fn handle_list(
     );
     println!("{}", "-".repeat(111));
 
-    for (_model_ref, metadata, git_info, domains, access_str) in &git_repos {
+    for (_model_ref, metadata, commit, git_ref, domains, access_str) in &models_with_info {
         let size_str = if let Some(size) = metadata.size_bytes {
             format!("{:.1}GB", size as f64 / (1024.0 * 1024.0 * 1024.0))
         } else {
@@ -479,19 +501,8 @@ pub async fn handle_list(
 
         let domains_str = domains.domains_display();
 
-        // Get git ref and commit from GitInfo, but use metadata.is_dirty from service layer
-        // (GitInfo::from_bare_repo can't detect dirty status - bare repos have no working dir)
-        let (git_ref, commit) = match git_info {
-            Some(git) => (
-                git.current_ref
-                    .clone()
-                    .unwrap_or_else(|| "detached".to_string()),
-                git.short_commit
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
-            ),
-            None => ("n/a".to_string(), "n/a".to_string()),
-        };
+        // commit and git_ref are now available directly from the tuple
+        // (fetched via service layer, avoiding GitManager::global() initialization)
         let status = if metadata.is_dirty { "dirty" } else { "clean" };
 
         println!(
@@ -500,7 +511,7 @@ pub async fn handle_list(
         );
     }
 
-    if git_repos.is_empty() {
+    if models_with_info.is_empty() {
         println!("No models match the specified filters.");
     }
 
@@ -605,6 +616,8 @@ pub async fn handle_clone(
 }
 
 /// Handle info command
+///
+/// TODO: Adapter listing still uses local filesystem access. Consider moving to ModelService.
 pub async fn handle_info(
     storage: &ModelStorage,
     model: &str,
@@ -615,44 +628,28 @@ pub async fn handle_info(
 
     let model_ref = ModelRef::parse(model)?;
 
-    // Try to get git2db metadata
-    let repo_metadata = if let Ok(_repo_id) = storage.resolve_repo_id(&model_ref).await {
-        // Access registry through storage method
-        match storage.get_bare_repo_path(&model_ref).await {
-            Ok(_) => {
-                // We know the model exists, try to get its metadata via the bare repo
-                // Since we can't easily access git2db internals, we'll get info from git directly
-                let bare_repo_path = storage.get_models_dir()
-                    .join(&model_ref.model)
-                    .join(format!("{}.git", &model_ref.model));
+    // Get repository client from service layer
+    let repo_client = storage.registry().repo(&model_ref.model).await?;
 
-                if let Ok(bare_repo) = git2::Repository::open(&bare_repo_path) {
-                    // Get remote URL
-                    let url = bare_repo.find_remote("origin")
-                        .ok()
-                        .and_then(|r| r.url().map(|s| s.to_string()))
-                        .unwrap_or_else(|| "unknown".to_string());
+    // Get repository metadata via RepositoryClient
+    let repo_metadata = {
+        // Get remote URL
+        let remotes = repo_client.list_remotes().await.ok();
+        let url = remotes
+            .as_ref()
+            .and_then(|r| r.iter().find(|remote| remote.name == "origin"))
+            .map(|remote| remote.url.clone())
+            .unwrap_or_else(|| "unknown".to_string());
 
-                    // Get current HEAD
-                    let current_oid = bare_repo.head()
-                        .ok()
-                        .and_then(|h| h.target())
-                        .map(|oid| oid.to_string());
+        // Get current HEAD
+        let current_oid = repo_client.get_head().await.ok();
 
-                    Some((
-                        Some(model_ref.model.clone()),
-                        url,
-                        model_ref.git_ref.to_string(),
-                        current_oid,
-                    ))
-                } else {
-                    None
-                }
-            }
-            Err(_) => None,
-        }
-    } else {
-        None
+        Some((
+            Some(model_ref.model.clone()),
+            url,
+            model_ref.git_ref.to_string(),
+            current_oid,
+        ))
     };
 
     // Get model path - this may fail for bare repos due to git2db bug
@@ -697,22 +694,10 @@ pub async fn handle_info(
             }
         }
 
-        // Get display ref - avoid calling get_default_branch which fails on bare repos
+        // Get display ref using RepositoryClient
         let display_ref = match &model_ref.git_ref {
             crate::storage::GitRef::DefaultBranch => {
-                // Try to determine default branch from worktree directory names
-                let worktrees_dir = storage.get_models_dir()
-                    .join(&model_ref.model)
-                    .join("worktrees");
-
-                if worktrees_dir.join("main").exists() {
-                    "main".to_string()
-                } else if worktrees_dir.join("master").exists() {
-                    "master".to_string()
-                } else {
-                    // Fallback
-                    "unknown".to_string()
-                }
+                repo_client.default_branch().await.unwrap_or_else(|_| "unknown".to_string())
             }
             _ => model_ref.git_ref.to_string(),
         };
@@ -735,151 +720,82 @@ pub async fn handle_info(
         }
     }
 
-    // Get bare repository information
-    let bare_repo_path = storage.get_models_dir()
-        .join(&model_ref.model)
-        .join(format!("{}.git", &model_ref.model));
+    // Get bare repository information via RepositoryClient
+    println!("\nRepository Information:");
 
-    if bare_repo_path.exists() {
-        println!("\nBare Repository:");
-        println!("  Path: {}", bare_repo_path.display());
-
-        // Try to open the bare repo to get more information
-        if let Ok(bare_repo) = git2::Repository::open(&bare_repo_path) {
-            // Get remote information
-            if let Ok(remotes) = bare_repo.remotes() {
-                for remote_name in remotes.iter().flatten() {
-                    if let Ok(remote) = bare_repo.find_remote(remote_name) {
-                        if let Some(url) = remote.url() {
-                            println!("  Remote '{}': {}", remote_name, url);
-                        }
-                    }
-                }
+    // Get remote information
+    if let Ok(remotes) = repo_client.list_remotes().await {
+        if !remotes.is_empty() {
+            for remote in remotes {
+                println!("  Remote '{}': {}", remote.name, remote.url);
             }
-
-            // Get branches
-            if let Ok(branches) = bare_repo.branches(Some(git2::BranchType::Local)) {
-                let branch_names: Vec<String> = branches
-                    .filter_map(|b| b.ok())
-                    .filter_map(|(branch, _)| branch.name().ok().flatten().map(|s| s.to_string()))
-                    .collect();
-
-                if !branch_names.is_empty() {
-                    println!("  Local branches: {}", branch_names.join(", "));
-                }
-            }
-
-            // Get tags
-            if let Ok(tag_names) = bare_repo.tag_names(None) {
-                let tags: Vec<&str> = tag_names.iter().flatten().collect();
-                if !tags.is_empty() {
-                    println!("  Tags: {}", tags.join(", "));
-                }
-            }
-
-            // Repository size (approximate)
-            if let Ok(metadata) = std::fs::metadata(&bare_repo_path) {
-                if metadata.is_dir() {
-                    let mut total_size = 0u64;
-                    if let Ok(entries) = walkdir::WalkDir::new(&bare_repo_path)
-                        .into_iter()
-                        .collect::<std::result::Result<Vec<_>, _>>()
-                    {
-                        for entry in entries {
-                            if entry.file_type().is_file() {
-                                if let Ok(meta) = entry.metadata() {
-                                    total_size += meta.len();
-                                }
-                            }
-                        }
-                    }
-                    println!("  Repository size: {:.2} MB", total_size as f64 / 1_048_576.0);
-                }
-            }
-        } else {
-            println!("  (Unable to inspect bare repository)");
         }
     }
 
-    // Get git status from the worktree directly
-    // Note: storage.status() currently fails for bare repos, so we get status from worktree
+    // Get branches
+    if let Ok(branches) = repo_client.list_branches().await {
+        if !branches.is_empty() {
+            println!("  Local branches: {}", branches.join(", "));
+        }
+    }
+
+    // TODO: Add list_tags() method to RepositoryClient
+    // TEMPORARY: Size calculation - this could be moved to RepositoryClient as get_repo_size()
+    let bare_repo_path = storage.get_models_dir()
+        .join(&model_ref.model)
+        .join(format!("{}.git", &model_ref.model));
+    if bare_repo_path.exists() {
+        if let Ok(metadata) = std::fs::metadata(&bare_repo_path) {
+            if metadata.is_dir() {
+                let mut total_size = 0u64;
+                if let Ok(entries) = walkdir::WalkDir::new(&bare_repo_path)
+                    .into_iter()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                {
+                    for entry in entries {
+                        if entry.file_type().is_file() {
+                            if let Ok(meta) = entry.metadata() {
+                                total_size += meta.len();
+                            }
+                        }
+                    }
+                }
+                println!("  Repository size: {:.2} MB", total_size as f64 / 1_048_576.0);
+            }
+        }
+    }
+
+    // Get git status via RepositoryClient
     println!("\nWorktree Status:");
 
-    // Try to open the worktree as a repository to get its status
-    match git2::Repository::open(&model_path) {
-        Ok(repo) => {
-        // Get current branch/HEAD info
-        if let Ok(head) = repo.head() {
-            let branch_name = head.shorthand().unwrap_or("detached");
-            println!("  Current branch/ref: {}", branch_name);
+    match repo_client.status().await {
+        Ok(status) => {
+            println!(
+                "  Current branch/ref: {}",
+                status.branch.as_deref().unwrap_or("detached")
+            );
 
-            if let Some(oid) = head.target() {
-                println!("  HEAD commit: {}", &oid.to_string()[..8]);
+            if let Some(head_oid) = status.head {
+                println!("  HEAD commit: {}", &head_oid.to_string()[..8]);
             }
-        } else {
-            println!("  Current branch/ref: detached");
-        }
 
-        // Get working tree status
-        if let Ok(statuses) = repo.statuses(None) {
-            if statuses.is_empty() {
-                println!("  Working tree: clean");
-            } else {
+            if !status.is_clean {
                 println!("  Working tree: dirty");
-                let modified_count = statuses.iter().count();
-                println!("  Modified files: {}", modified_count);
-
+                println!("  Modified files: {}", status.modified_files.len());
                 if verbose {
-                    for entry in statuses.iter() {
-                        if let Some(path) = entry.path() {
-                            let status = entry.status();
-                            let prefix = if status.contains(git2::Status::INDEX_NEW) ||
-                                           status.contains(git2::Status::WT_NEW) {
-                                "A"
-                            } else if status.contains(git2::Status::INDEX_MODIFIED) ||
-                                      status.contains(git2::Status::WT_MODIFIED) {
-                                "M"
-                            } else if status.contains(git2::Status::INDEX_DELETED) ||
-                                      status.contains(git2::Status::WT_DELETED) {
-                                "D"
-                            } else {
-                                "?"
-                            };
-                            println!("    {} {}", prefix, path);
-                        }
+                    // TODO: RepositoryStatus should include detailed file change types (A/M/D)
+                    // For now we just show M for all modified files
+                    for file in &status.modified_files {
+                        println!("    M {}", file.display());
                     }
                 }
-            }
-        } else {
-            println!("  Working tree: unable to get status");
-        }
-        }
-        Err(_) => {
-            // Fallback: try to use storage.status() which may work for non-bare repos
-            match storage.status(&model_ref).await {
-            Ok(status) => {
-                println!(
-                    "  Current branch/ref: {}",
-                    status.branch.as_deref().unwrap_or("detached")
-                );
-
-                if !status.is_clean {
-                    println!("  Working tree: dirty");
-                    println!("  Modified files: {}", status.modified_files.len());
-                    if verbose {
-                        for file in &status.modified_files {
-                            println!("    M {}", file.display());
-                        }
-                    }
-                } else {
-                    println!("  Working tree: clean");
-                }
-            }
-            Err(e) => {
-                println!("  Unable to get status: {}", e);
-                debug!("Status error details: {:?}", e);
+            } else {
+                println!("  Working tree: clean");
             }
         }
+        Err(e) => {
+            println!("  Unable to get status: {}", e);
+            debug!("Status error details: {:?}", e);
         }
     }
 
@@ -1103,10 +1019,10 @@ pub async fn handle_infer(
     seed: Option<u32>,
     stream: bool,
     _force_download: bool,
-    max_context: Option<usize>,
-    kv_quant: crate::cli::commands::KVQuantArg,
+    _max_context: Option<usize>,
+    _kv_quant: crate::cli::commands::KVQuantArg,
     signing_key: SigningKey,
-    verifying_key: VerifyingKey,
+    _verifying_key: VerifyingKey,
 ) -> Result<()> {
     use crate::config::TrainingMode;
     use crate::runtime::model_config::ModelConfig;
@@ -1118,25 +1034,15 @@ pub async fn handle_infer(
     );
 
     // Parse model reference and get path
+    // TODO: This should eventually be handled by ModelService, but for now we need it
+    // to ensure training mode is disabled before the service loads the model
     let model_ref = ModelRef::parse(model_ref_str)?;
-    let storage_paths = crate::storage::StoragePaths::new()?;
-    let models_dir = storage_paths.models_dir()?;
-    let model_path = match storage.get_model_path(&model_ref).await {
-        Ok(path) => path,
-        Err(_) => models_dir.join(&model_ref.model),
-    };
-
-    if !model_path.exists() {
-        eprintln!("❌ Model '{}' not found", model_ref.model);
-        eprintln!("   Use 'hyprstream list' to see available models");
-        return Err(anyhow::anyhow!("Model '{}' not found", model_ref.model));
-    }
-
-    info!("Using model at: {}", model_path.display());
+    let model_path = storage.get_model_path(&model_ref).await?;
 
     // CRITICAL: Force training mode to Disabled for CLI infer command
     // This ensures hyprstream infer is ALWAYS read-only, regardless of model config.
     // For training inference, use `hyprstream training infer` instead.
+    // TODO: Move this logic into ModelService initialization
     if let Some(mut training_config) = ModelConfig::load_training_config(&model_path) {
         if training_config.mode != TrainingMode::Disabled {
             debug!(
@@ -1151,45 +1057,30 @@ pub async fn handle_infer(
         }
     }
 
-    // PolicyService is already running (started by main.rs).
-    // Create policy client with the same keypair to connect to it.
-    let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
+    // ModelService is already running (started by main.rs in inproc mode, or by systemd in ipc-systemd mode).
+    // Create ModelZmqClient to talk to ModelService.
+    let model_client = ModelZmqClient::new(signing_key.clone(), RequestIdentity::local());
 
-    // Configure runtime
-    let mut runtime_config = RuntimeConfig::default();
-    runtime_config.max_context = max_context;
-    runtime_config.kv_quant_type = kv_quant.into();
-    // Note: Training mode is already forced to Disabled in the config file above
-
-    // Start InferenceService (loads model, adapters, trainer automatically)
-    let service_handle = InferenceService::start_at(
-        &model_path,
-        runtime_config,
-        verifying_key,
-        policy_client,
-        INFERENCE_ENDPOINT,
-    )
-    .await?;
-
-    // Create client for service communication
-    let client = InferenceZmqClient::new(signing_key, RequestIdentity::local());
-
-    // Apply chat template to the prompt via service
+    // Apply chat template to the prompt via ModelService
+    // The ModelService will load the model if needed and apply the template
     let messages = vec![ChatMessage {
         role: "user".to_string(),
-        content: prompt.to_string(),
+        content: Some(prompt.to_string()),
+        function_call: None,
     }];
 
-    let formatted_prompt = match client.apply_chat_template(&messages, true).await {
+    let formatted_prompt = match model_client.apply_chat_template(model_ref_str, &messages, true).await {
         Ok(formatted) => formatted,
         Err(e) => {
             tracing::warn!("Could not apply chat template: {}. Using raw prompt.", e);
-            prompt.to_string()
+            crate::config::TemplatedPrompt::new(prompt.to_string())
         }
     };
 
     // Build generation request
-    let mut request_builder = GenerationRequest::builder(formatted_prompt)
+    // Load model-specific sampling params as defaults, but allow CLI overrides
+    // TODO: ModelService should handle this, but for now load from config
+    let mut request_builder = GenerationRequest::builder(formatted_prompt.into_inner())
         .apply_config(
             &crate::config::SamplingParams::from_model_path(&model_path)
                 .await
@@ -1215,76 +1106,98 @@ pub async fn handle_infer(
         request.max_tokens, request.temperature, request.top_p, request.top_k, request.repeat_penalty
     );
 
-    // Generate via service (handles adapter loading, training collection, auth)
+    // Generate via ModelService (handles model loading, adapter loading, training collection, auth)
     if stream {
-        // Streaming via ZMQ pub/sub
-        let (stream_id, endpoint) = client.generate_stream(&request).await?;
-        info!("Streaming started: stream_id={}, endpoint={}", stream_id, endpoint);
+        // E2E authenticated streaming via Ristretto255 DH key exchange
+        use hyprstream_rpc::crypto::{
+            derive_stream_keys, generate_ephemeral_keypair, ristretto_dh, RistrettoPublic,
+        };
+
+        // Generate client ephemeral Ristretto255 keypair for DH
+        let (client_secret, client_pubkey) = generate_ephemeral_keypair();
+        let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
+
+        // Start stream with client ephemeral pubkey
+        let stream_info = model_client.infer_stream(model_ref_str, &request, client_pubkey_bytes).await?;
+        let stream_id = stream_info.stream_id;
+        let server_pubkey = RistrettoPublic::from_bytes(&stream_info.server_pubkey)
+            .ok_or_else(|| anyhow::anyhow!("Invalid server Ristretto public key encoding"))?;
+
+        // Derive stream keys using Ristretto255 DH
+        let shared_secret = ristretto_dh(&client_secret, &server_pubkey);
+        let keys = derive_stream_keys(
+            &shared_secret,
+            &client_pubkey_bytes,
+            &stream_info.server_pubkey,
+        )?;
+
+        info!("Streaming started: stream_id={}, topic={}", stream_id, &keys.topic[..16]);
+
+        // Get StreamService endpoint from registry
+        let stream_sub_endpoint = hyprstream_rpc::registry::global()
+            .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
+            .to_zmq_string();
 
         // Subscribe to stream chunks using global context
         // (inproc:// only works within the same ZMQ context)
         let ctx = global_context();
         let subscriber = ctx.socket(zmq::SUB)?;
-        subscriber.connect(&endpoint)?;
-        subscriber.set_subscribe(stream_id.as_bytes())?;
+        subscriber.connect(&stream_sub_endpoint)?;
+
+        // Subscribe to DH-derived topic (64 hex chars)
+        // Stream was pre-authorized during infer_stream, so we can subscribe immediately
+        subscriber.set_subscribe(keys.topic.as_bytes())?;
         subscriber.set_rcvtimeo(30000)?; // 30s timeout
 
+        info!("Subscribed to stream via StreamService");
+
+        // Create StreamVerifier for HMAC chain verification
+        use crate::services::rpc_types::StreamVerifier;
+        let mut verifier = StreamVerifier::new(*keys.mac_key, keys.topic.clone());
+
         println!();
-        loop {
-            match subscriber.recv_bytes(0) {
-                Ok(msg) => {
-                    // Message format: topic_bytes + capnp_bytes
-                    // Topic is the stream_id, followed by Cap'n Proto StreamChunk
-                    let topic_len = stream_id.as_bytes().len();
-                    if msg.len() <= topic_len {
-                        continue; // Too short, skip
+        'outer: loop {
+            // Receive multipart StreamBlock: [topic, capnp, 16-byte mac]
+            match subscriber.recv_multipart(0) {
+                Ok(frames) => {
+                    // Validate StreamBlock format
+                    if frames.len() != 3 || frames[2].len() != 16 {
+                        warn!(
+                            "Invalid StreamBlock: expected 3 frames with 16-byte MAC, got {} frames",
+                            frames.len()
+                        );
+                        continue;
                     }
 
-                    // Parse Cap'n Proto StreamChunk after the topic prefix
-                    let chunk_bytes = &msg[topic_len..];
-                    let reader = match serialize::read_message(
-                        &mut std::io::Cursor::new(chunk_bytes),
-                        ReaderOptions::default(),
-                    ) {
-                        Ok(r) => r,
+                    // Verify HMAC chain and parse payloads
+                    let payloads = match verifier.verify(&frames) {
+                        Ok(p) => p,
                         Err(e) => {
-                            warn!("Failed to parse stream chunk: {}", e);
+                            warn!("StreamBlock verification failed: {}", e);
                             continue;
                         }
                     };
 
-                    let chunk = match reader.get_root::<inference_capnp::stream_chunk::Reader>() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            warn!("Failed to get stream chunk root: {}", e);
-                            continue;
-                        }
-                    };
-
-                    // Handle the union variant
-                    use inference_capnp::stream_chunk::Which;
-                    match chunk.which() {
-                        Ok(Which::Text(text)) => {
-                            if let Ok(t) = text {
-                                print!("{}", t.to_str().unwrap_or(""));
+                    // Process each payload in the block
+                    for payload in payloads {
+                        use crate::services::rpc_types::{InferenceStreamPayload, StreamPayloadExt};
+                        match payload.to_inference() {
+                            Ok(InferenceStreamPayload::Token(text)) => {
+                                print!("{}", text);
                                 let _ = io::stdout().flush();
                             }
-                        }
-                        Ok(Which::Complete(_stats)) => {
-                            // Stream completed
-                            break;
-                        }
-                        Ok(Which::Error(error_info)) => {
-                            if let Ok(e) = error_info {
-                                if let Ok(msg) = e.get_message() {
-                                    warn!("Stream error: {}", msg.to_str().unwrap_or("unknown"));
-                                }
+                            Ok(InferenceStreamPayload::Complete(_)) => {
+                                // Stream completed
+                                break 'outer;
                             }
-                            break;
-                        }
-                        Err(e) => {
-                            warn!("Failed to parse chunk variant: {:?}", e);
-                            continue;
+                            Ok(InferenceStreamPayload::Error(message)) => {
+                                warn!("Stream error: {}", message);
+                                break 'outer;
+                            }
+                            Err(e) => {
+                                warn!("Failed to parse stream payload: {}", e);
+                                continue;
+                            }
                         }
                     }
                 }
@@ -1301,8 +1214,8 @@ pub async fn handle_infer(
         }
         println!();
     } else {
-        // Non-streaming: get full response
-        let result = client.generate(&request).await?;
+        // Non-streaming: get full response via ModelService
+        let result = model_client.infer(model_ref_str, &request).await?;
 
         println!("\n{}", result.text);
         info!(
@@ -1326,13 +1239,19 @@ pub async fn handle_infer(
         }
     }
 
-    // Stop the service
-    service_handle.stop().await;
-
     Ok(())
 }
 
 /// Handle push command
+///
+/// TODO: This function still uses local git operations.
+/// Need to add the following to RepositoryClient:
+/// - push(remote, refspec, force) method
+/// - set_upstream_tracking(remote, branch) method
+///
+/// **EXPERIMENTAL**: This feature is behind the `experimental` flag.
+/// It requires service layer implementation to be complete.
+#[cfg(feature = "experimental")]
 pub async fn handle_push(
     storage: &ModelStorage,
     model: &str,
@@ -1347,7 +1266,8 @@ pub async fn handle_push(
     let branch_name = branch.as_deref();
     let model_ref = ModelRef::new(model.to_string());
 
-    // Open repository for push operations
+    // TODO: Replace with RepositoryClient.push() once available
+    // TEMPORARY: Using storage.open_repo() for push operations
     let repo = storage.open_repo(&model_ref).await?;
 
     // Get current branch or specified branch
@@ -1377,6 +1297,12 @@ pub async fn handle_push(
 }
 
 /// Handle pull command
+///
+/// TODO: This currently uses RepositoryClient.update() which does fetch+merge,
+/// but doesn't provide control over merge strategy (fast-forward vs regular merge).
+/// Consider adding more granular methods to RepositoryClient:
+/// - fetch_remote(remote, refspec)
+/// - merge_with_strategy(ref, strategy)
 pub async fn handle_pull(
     storage: &ModelStorage,
     model: &str,
@@ -1387,57 +1313,30 @@ pub async fn handle_pull(
     info!("Pulling model {} from remote", model);
 
     let remote_name = remote.as_deref().unwrap_or("origin");
-    let branch_name = branch.as_deref();
     let model_ref = ModelRef::new(model.to_string());
 
-    // Open repository for pull operations
-    let repo = storage.open_repo(&model_ref).await?;
+    // Get repository client from service layer
+    let repo_client = storage.registry().repo(&model_ref.model).await?;
 
-    // Fetch from remote
-    let mut remote = repo.find_remote(remote_name)?;
-    remote.fetch(&["refs/heads/*:refs/remotes/origin/*"], None, None)?;
-
-    // Get current branch or specified branch
-    let pull_branch = if let Some(b) = branch_name {
-        b.to_string()
+    // Build refspec for fetch
+    let refspec = if let Some(ref branch_name) = branch {
+        Some(format!("refs/heads/{}", branch_name))
     } else {
-        repo.head()?
-            .shorthand()
-            .ok_or_else(|| anyhow::anyhow!("Could not determine current branch"))?
-            .to_string()
+        None
     };
 
-    // Get the remote tracking branch
-    let remote_ref = format!("refs/remotes/{}/{}", remote_name, pull_branch);
-    let fetch_head = repo.find_reference(&remote_ref)?;
-    let fetch_commit = repo.reference_to_annotated_commit(&fetch_head)?;
-
-    // Merge the fetched changes
-    let (analysis, _) = repo.merge_analysis(&[&fetch_commit])?;
-
-    if analysis.is_up_to_date() {
-        println!("✓ Already up to date");
-    } else if analysis.is_fast_forward() {
-        // Fast-forward merge
-        let refname = format!("refs/heads/{}", pull_branch);
-        let mut reference = repo.find_reference(&refname)?;
-        reference.set_target(fetch_commit.id(), "Fast-forward")?;
-        repo.set_head(&refname)?;
-        repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
-        println!("✓ Fast-forwarded to latest");
-    } else if analysis.is_normal() {
-        // Normal merge
-        repo.merge(&[&fetch_commit], None, None)?;
-        println!("✓ Merged remote changes");
-    }
+    // Use RepositoryClient.update() to fetch and merge
+    // Note: This does a basic fetch+merge, doesn't expose merge analysis or fast-forward control
+    repo_client.update(refspec.as_deref()).await?;
 
     println!("✓ Pulled latest changes for model {}", model);
     println!("  Remote: {}", remote_name);
-    if let Some(b) = branch_name {
+    if let Some(ref b) = branch {
         println!("  Branch: {}", b);
     }
     if rebase {
-        println!("  Strategy: rebase");
+        println!("  Strategy: rebase (note: currently performs merge)");
+        warn!("Rebase strategy not yet implemented at service layer");
     } else {
         println!("  Strategy: merge");
     }
@@ -1445,225 +1344,10 @@ pub async fn handle_pull(
     Ok(())
 }
 
-/// Build git2::MergeOptions from our MergeOptions
-fn build_git2_merge_options(options: &MergeOptions) -> Result<git2::MergeOptions> {
-    let mut merge_opts = git2::MergeOptions::new();
-
-    // Apply strategy-based settings
-    if let Some(strategy) = &options.strategy {
-        match strategy.as_str() {
-            "ours" => {
-                merge_opts.file_favor(git2::FileFavor::Ours);
-            }
-            "theirs" => {
-                merge_opts.file_favor(git2::FileFavor::Theirs);
-            }
-            "recursive" => {
-                // recursive is the default, enable rename detection
-                merge_opts.find_renames(true);
-            }
-            "resolve" => {
-                // Simple two-way merge
-                merge_opts.find_renames(false);
-            }
-            "subtree" => {
-                // Subtree merge - no specific git2 option, but find renames
-                merge_opts.find_renames(true);
-            }
-            "octopus" => {
-                bail!("Octopus strategy (multi-branch merge) not supported for two-branch merges");
-            }
-            _ => {
-                bail!("Unknown merge strategy: '{}'. Supported: ours, theirs, recursive, resolve, subtree", strategy);
-            }
-        }
-    }
-
-    // Apply strategy options (-X options)
-    for opt in &options.strategy_option {
-        match opt.as_str() {
-            "ours" => {
-                merge_opts.file_favor(git2::FileFavor::Ours);
-            }
-            "theirs" => {
-                merge_opts.file_favor(git2::FileFavor::Theirs);
-            }
-            "patience" => {
-                merge_opts.patience(true);
-            }
-            "diff-algorithm=patience" => {
-                merge_opts.patience(true);
-            }
-            "diff-algorithm=minimal" => {
-                merge_opts.minimal(true);
-            }
-            "ignore-space-change" | "ignore-all-space" => {
-                merge_opts.ignore_whitespace_change(true);
-            }
-            "ignore-space-at-eol" => {
-                merge_opts.ignore_whitespace_eol(true);
-            }
-            "ignore-cr-at-eol" => {
-                // git2 doesn't have direct support, but ignore-whitespace-eol covers this
-                merge_opts.ignore_whitespace_eol(true);
-            }
-            "renormalize" => {
-                // Not directly supported in git2, but we can note it
-                if !options.quiet {
-                    eprintln!("Warning: renormalize strategy option not fully supported");
-                }
-            }
-            "no-renames" => {
-                merge_opts.find_renames(false);
-            }
-            "find-renames" => {
-                merge_opts.find_renames(true);
-            }
-            opt if opt.starts_with("find-renames=") => {
-                merge_opts.find_renames(true);
-                if let Some(threshold_str) = opt.strip_prefix("find-renames=") {
-                    if let Ok(threshold) = threshold_str.parse::<u32>() {
-                        merge_opts.rename_threshold(threshold);
-                    }
-                }
-            }
-            opt if opt.starts_with("rename-threshold=") => {
-                if let Some(threshold_str) = opt.strip_prefix("rename-threshold=") {
-                    if let Ok(threshold) = threshold_str.parse::<u32>() {
-                        merge_opts.rename_threshold(threshold);
-                    }
-                }
-            }
-            opt if opt.starts_with("subtree") => {
-                // Subtree strategy - find renames enabled
-                merge_opts.find_renames(true);
-            }
-            _ => {
-                if !options.quiet {
-                    eprintln!("Warning: unknown or unsupported strategy option: '{}'", opt);
-                }
-            }
-        }
-    }
-
-    // Default: enable rename detection for better merge results
-    if options.strategy.is_none() && options.strategy_option.is_empty() {
-        merge_opts.find_renames(true);
-    }
-
-    Ok(merge_opts)
-}
-
-/// Perform merge operation in a repository
-fn perform_merge(
-    repo: &git2::Repository,
-    source: &str,
-    options: &MergeOptions,
-) -> Result<git2::Oid> {
-    // Resolve source branch reference
-    let source_ref = repo
-        .find_reference(&format!("refs/heads/{}", source))
-        .or_else(|_| repo.find_reference(&format!("refs/remotes/origin/{}", source)))
-        .or_else(|_| repo.find_reference(source))
-        .map_err(|e| anyhow::anyhow!("Source branch '{}' not found: {}", source, e))?;
-
-    let source_commit = source_ref
-        .peel_to_commit()
-        .map_err(|e| anyhow::anyhow!("Failed to resolve source commit: {}", e))?;
-
-    let annotated_commit = repo
-        .find_annotated_commit(source_commit.id())
-        .map_err(|e| anyhow::anyhow!("Failed to create annotated commit: {}", e))?;
-
-    // Perform merge analysis
-    let (merge_analysis, _) = repo
-        .merge_analysis(&[&annotated_commit])
-        .map_err(|e| anyhow::anyhow!("Merge analysis failed: {}", e))?;
-
-    // Already up-to-date
-    if merge_analysis.is_up_to_date() {
-        return Ok(source_commit.id());
-    }
-
-    // Check fast-forward constraints
-    if options.ff_only && !merge_analysis.is_fast_forward() {
-        bail!("Cannot fast-forward - branches have diverged");
-    }
-
-    // Fast-forward merge (if possible and not --no-ff)
-    if merge_analysis.is_fast_forward() && !options.no_ff {
-        let mut head_ref = repo
-            .head()
-            .map_err(|e| anyhow::anyhow!("Failed to get HEAD: {}", e))?;
-
-        head_ref
-            .set_target(source_commit.id(), "Fast-forward merge")
-            .map_err(|e| anyhow::anyhow!("Failed to update HEAD: {}", e))?;
-
-        repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))
-            .map_err(|e| anyhow::anyhow!("Checkout failed: {}", e))?;
-
-        return Ok(source_commit.id());
-    }
-
-    // Build merge options based on strategy and strategy options
-    let mut merge_opts = build_git2_merge_options(options)?;
-
-    // Regular merge (create merge commit)
-    repo.merge(&[&annotated_commit], Some(&mut merge_opts), None)
-        .map_err(|e| anyhow::anyhow!("Merge failed: {}", e))?;
-
-    // Check for conflicts
-    let index = repo
-        .index()
-        .map_err(|e| anyhow::anyhow!("Failed to get index: {}", e))?;
-
-    if index.has_conflicts() {
-        bail!("Merge conflicts detected");
-    }
-
-    // Create merge commit
-    let sig = git2db::GitManager::global().create_signature(None, None)?;
-
-    let mut index = repo
-        .index()
-        .map_err(|e| anyhow::anyhow!("Failed to get index: {}", e))?;
-
-    let tree_id = index
-        .write_tree()
-        .map_err(|e| anyhow::anyhow!("Failed to write tree: {}", e))?;
-
-    let tree = repo
-        .find_tree(tree_id)
-        .map_err(|e| anyhow::anyhow!("Failed to find tree: {}", e))?;
-
-    let parent = repo
-        .head()
-        .map_err(|e| anyhow::anyhow!("Failed to get HEAD: {}", e))?
-        .peel_to_commit()
-        .map_err(|e| anyhow::anyhow!("Failed to resolve HEAD commit: {}", e))?;
-
-    let message = options.message.as_deref().unwrap_or("Merge branch");
-    let full_message = format!("{} '{}'", message, source);
-
-    let merge_oid = repo
-        .commit(
-            Some("HEAD"),
-            &sig,
-            &sig,
-            &full_message,
-            &tree,
-            &[&parent, &source_commit],
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to create merge commit: {}", e))?;
-
-    repo.cleanup_state()
-        .map_err(|e| anyhow::anyhow!("Failed to cleanup merge state: {}", e))?;
-
-    Ok(merge_oid)
-}
-
 /// Options for merge command
+///
+/// **EXPERIMENTAL**: This is behind the `experimental` flag.
+#[cfg(feature = "experimental")]
 pub struct MergeOptions {
     pub ff: bool,
     pub no_ff: bool,
@@ -1684,6 +1368,11 @@ pub struct MergeOptions {
 }
 
 /// Handle merge command
+///
+/// **EXPERIMENTAL**: This feature is behind the `experimental` flag.
+/// Basic merge functionality works via RepositoryClient.merge(), but conflict
+/// resolution (--abort, --continue, --quit) still needs service layer implementation.
+#[cfg(feature = "experimental")]
 pub async fn handle_merge(
     storage: &ModelStorage,
     target: &str,
@@ -1702,63 +1391,19 @@ pub async fn handle_merge(
         info!("Merging '{}' into '{}'", source, target_ref);
     }
 
-    // Extract target branch from ModelRef
-    let target_branch = match &target_ref.git_ref {
-        GitRef::Branch(b) => b.clone(),
-        GitRef::DefaultBranch => {
-            // Use default branch if not specified
-            storage.get_default_branch(&target_ref).await?
-        },
-        _ => {
-            bail!("Target must be a branch reference, not tag or commit: {}", target_ref.git_ref.display_name());
-        }
+    // Get repository client from service layer
+    let repo_client = storage.registry().repo(&target_ref.model).await
+        .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
+
+    // Build merge message
+    let message = if let Some(msg) = &options.message {
+        Some(msg.as_str())
+    } else {
+        None
     };
 
-    // Ensure worktree exists for target branch (create if needed)
-    let worktree_path = match storage.get_worktree_path(&target_ref, &target_branch).await {
-        Ok(path) if path.exists() => path,
-        _ => {
-            if !options.quiet {
-                println!("→ Creating worktree for target branch '{}'", target_branch);
-            }
-            storage.create_worktree(&target_ref, &target_branch).await?
-        }
-    };
-
-    if options.verbose {
-        println!("  Worktree: {}", worktree_path.display());
-    }
-
-    // Open the worktree repository (not the bare repo)
-    let repo = git2::Repository::open(&worktree_path)
-        .map_err(|e| anyhow::anyhow!("Failed to open worktree repository: {}", e))?;
-
-    // Verify we're on the target branch
-    let head = repo.head().map_err(|e| anyhow::anyhow!("Failed to get HEAD: {}", e))?;
-    let current_branch = head.shorthand().unwrap_or("<detached>");
-
-    if current_branch != target_branch {
-        // The worktree should already be on the correct branch
-        // This shouldn't normally happen, but if it does, we can fix it
-        if options.verbose {
-            println!("  Switching to target branch '{}' (currently on '{}')", target_branch, current_branch);
-        }
-
-        let branch_ref = repo.find_branch(&target_branch, git2::BranchType::Local)
-            .map_err(|e| anyhow::anyhow!("Target branch '{}' not found: {}", target_branch, e))?;
-
-        let commit = branch_ref.get().peel_to_commit()
-            .map_err(|e| anyhow::anyhow!("Failed to get commit for branch '{}': {}", target_branch, e))?;
-
-        repo.checkout_tree(commit.as_object(), Some(git2::build::CheckoutBuilder::new().force()))
-            .map_err(|e| anyhow::anyhow!("Failed to checkout '{}': {}", target_branch, e))?;
-
-        repo.set_head(&format!("refs/heads/{}", target_branch))
-            .map_err(|e| anyhow::anyhow!("Failed to set HEAD to '{}': {}", target_branch, e))?;
-    }
-
-    // Perform the merge directly in the worktree
-    let merge_result = perform_merge(&repo, source, &options);
+    // Perform merge via service layer
+    let merge_result = repo_client.merge(source, message).await;
 
     match merge_result {
         Ok(merge_oid) => {
@@ -1777,7 +1422,7 @@ pub async fn handle_merge(
 
                     // Show commit ID
                     if options.verbose {
-                        println!("  Commit: {}", merge_oid);
+                        println!("  Commit: {}", &merge_oid[..8.min(merge_oid.len())]);
                     }
                 }
             }
@@ -1786,22 +1431,32 @@ pub async fn handle_merge(
         },
         Err(e) => {
             // Check if it's a merge conflict
-            if e.to_string().contains("conflict") {
+            let err_msg = e.to_string();
+            if err_msg.contains("conflict") || err_msg.contains("Conflict") {
                 eprintln!("✗ Merge conflict detected");
-                eprintln!("\nResolve conflicts in: {}", worktree_path.display());
+                eprintln!("\nResolve conflicts in the repository");
                 eprintln!("\nThen run:");
                 eprintln!("  hyprstream merge {} --continue", target);
                 eprintln!("\nOr abort the merge:");
                 eprintln!("  hyprstream merge {} --abort", target);
                 bail!("Merge conflicts must be resolved manually");
             } else {
-                Err(e)
+                Err(e.into())
             }
         }
     }
 }
 
 /// Handle merge conflict resolution (--abort, --continue, --quit)
+///
+/// TODO: This function still uses local git operations for merge conflict resolution.
+/// Need to add the following to RepositoryClient:
+/// - abort_merge() - Reset to ORIG_HEAD and cleanup merge state
+/// - continue_merge(message) - Check conflicts resolved, create merge commit
+/// - quit_merge() - Remove merge state but keep changes
+///
+/// **EXPERIMENTAL**: This is behind the `experimental` flag.
+#[cfg(feature = "experimental")]
 async fn handle_merge_conflict_resolution(
     storage: &ModelStorage,
     target: &str,
@@ -1809,21 +1464,26 @@ async fn handle_merge_conflict_resolution(
 ) -> Result<()> {
     let target_ref = ModelRef::parse(target)?;
 
+    // Get repository client
+    let repo_client = storage.registry().repo(&target_ref.model).await?;
+
     // Get target branch
     let target_branch = match &target_ref.git_ref {
         GitRef::Branch(b) => b.clone(),
-        GitRef::DefaultBranch => storage.get_default_branch(&target_ref).await?,
+        GitRef::DefaultBranch => repo_client.default_branch().await?,
         _ => bail!("Target must be a branch reference"),
     };
 
-    // Get worktree path
-    let worktree_path = storage.get_worktree_path(&target_ref, &target_branch).await?;
+    // Get worktree path via RepositoryClient
+    let worktree_path = repo_client.worktree_path(&target_branch).await?
+        .ok_or_else(|| anyhow::anyhow!("Worktree not found for branch {}", target_branch))?;
 
     if !worktree_path.exists() {
         bail!("Worktree not found: {}", worktree_path.display());
     }
 
-    // Open repository
+    // TODO: Replace with RepositoryClient methods once available
+    // TEMPORARY: Using storage.open_repo() for conflict resolution
     let repo = storage.open_repo(&target_ref).await?;
 
     if options.abort {
@@ -1861,7 +1521,7 @@ async fn handle_merge_conflict_resolution(
         let tree_id = index.write_tree()?;
         let tree = repo.find_tree(tree_id)?;
 
-        let sig = git2db::GitManager::global().create_signature(None, None)?;
+        let sig = repo.signature()?;
 
         // Get parent commits
         let head = repo.head()?.peel_to_commit()?;

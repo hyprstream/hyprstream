@@ -2201,7 +2201,10 @@ pub struct GenerationStats {
     // Inference metrics (generating new tokens, excluding prefill)
     pub inference_tokens: usize,
     pub inference_time_ms: u64,
+    /// Cumulative average: tokens / time (accurate for final reporting)
     pub inference_tokens_per_sec: f32,
+    /// Exponential moving average (responsive for real-time adaptive batching)
+    pub inference_tokens_per_sec_ema: f32,
 }
 
 /// Stream that yields decoded UTF-8 text chunks during generation.
@@ -2272,6 +2275,12 @@ pub struct TextStream<'a> {
     prefill_time_ms: Option<u64>,
     /// Timestamp when first token was sampled (after prefill completes)
     first_token_time: Option<std::time::Instant>,
+
+    // EMA rate tracking for adaptive batching
+    /// Timestamp when the last token was generated (for inter-token timing)
+    last_token_time: Option<std::time::Instant>,
+    /// Exponential moving average of tokens per second
+    ema_tokens_per_sec: f32,
 }
 
 impl<'a> TextStream<'a> {
@@ -2366,6 +2375,8 @@ impl<'a> TextStream<'a> {
             recent_tokens_buffer: Vec::with_capacity(repeat_last_n),
             prefill_time_ms: None,
             first_token_time: None,
+            last_token_time: None,
+            ema_tokens_per_sec: 0.0,
         })
     }
 
@@ -2387,10 +2398,19 @@ impl<'a> TextStream<'a> {
             .map(|t| t.elapsed().as_millis() as u64)
             .unwrap_or(0);
         let inference_tokens = self.tokens_generated;
+
+        // Cumulative average for final reporting
         let inference_tokens_per_sec = if inference_time_ms > 0 {
             (inference_tokens as f32 * 1000.0) / inference_time_ms as f32
         } else {
             0.0
+        };
+
+        // EMA for real-time adaptive batching (falls back to cumulative if not yet initialized)
+        let inference_tokens_per_sec_ema = if self.ema_tokens_per_sec > 0.0 {
+            self.ema_tokens_per_sec
+        } else {
+            inference_tokens_per_sec
         };
 
         // Finalize quality metrics from accumulator
@@ -2418,7 +2438,34 @@ impl<'a> TextStream<'a> {
             inference_tokens,
             inference_time_ms,
             inference_tokens_per_sec,
+            inference_tokens_per_sec_ema,
         }
+    }
+
+    /// Update EMA rate after generating a token.
+    ///
+    /// Uses exponential moving average with alpha=0.3 to smooth rate measurements.
+    /// This handles initial acceleration gracefully without needing warmup hacks.
+    fn update_ema_rate(&mut self) {
+        let now = std::time::Instant::now();
+
+        if let Some(last_time) = self.last_token_time {
+            let elapsed_secs = last_time.elapsed().as_secs_f32();
+            if elapsed_secs > 0.0 {
+                let instantaneous_rate = 1.0 / elapsed_secs;
+
+                // EMA: alpha=0.3 gives good responsiveness while smoothing noise
+                const ALPHA: f32 = 0.3;
+                if self.ema_tokens_per_sec > 0.0 {
+                    self.ema_tokens_per_sec = ALPHA * instantaneous_rate + (1.0 - ALPHA) * self.ema_tokens_per_sec;
+                } else {
+                    // First measurement - use instantaneous rate
+                    self.ema_tokens_per_sec = instantaneous_rate;
+                }
+            }
+        }
+
+        self.last_token_time = Some(now);
     }
 
     fn sample_next_token(&mut self) -> Result<u32> {
@@ -2692,6 +2739,7 @@ impl<'a> Stream for TextStream<'a> {
                     let token_i64 = next_token as i64;
                     self.last_generated = Some(token_i64);
                     self.tokens_generated += 1;
+                    self.update_ema_rate();
 
                     self.recent_tokens.push_back(token_i64);
                     if self.recent_tokens.len() > self.repeat_last_n {
@@ -2712,6 +2760,7 @@ impl<'a> Stream for TextStream<'a> {
                     let token_i64 = next_token as i64;
                     self.last_generated = Some(token_i64);
                     self.tokens_generated += 1;
+                    self.update_ema_rate();
 
                     self.recent_tokens.push_back(token_i64);
                     if self.recent_tokens.len() > self.repeat_last_n {

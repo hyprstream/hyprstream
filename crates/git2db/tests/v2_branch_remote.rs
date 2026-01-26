@@ -84,14 +84,18 @@ async fn test_branch_list() {
     let repo = registry.repo(&repo_id).unwrap();
     let branches = repo.branch().list().await.unwrap();
 
-    // Should have at least main branch
-    let branch_names: Vec<_> = branches
-        .iter()
-        .filter(|b| b.is_local())
-        .map(|b| b.name.as_str())
-        .collect();
+    // Should have at least one local branch (the default branch, whatever it's named)
+    let local_branches: Vec<_> = branches.iter().filter(|b| b.is_local()).collect();
 
-    assert!(branch_names.contains(&"main") || branch_names.contains(&"master"));
+    assert!(
+        !local_branches.is_empty(),
+        "Should have at least one local branch"
+    );
+    // The default branch should be marked as HEAD
+    assert!(
+        local_branches.iter().any(|b| b.is_head),
+        "One branch should be HEAD"
+    );
 }
 
 #[tokio::test]
@@ -113,10 +117,13 @@ async fn test_branch_current() {
     let repo = registry.repo(&repo_id).unwrap();
     let current = repo.branch().current().await.unwrap();
 
-    assert!(current.is_some());
+    assert!(current.is_some(), "Should have a current branch");
     let current_branch = current.unwrap();
-    assert!(current_branch.is_head);
-    assert!(current_branch.name == "main" || current_branch.name == "master");
+    assert!(current_branch.is_head, "Current branch should be HEAD");
+    assert!(
+        !current_branch.name.is_empty(),
+        "Current branch should have a name"
+    );
 }
 
 #[tokio::test]

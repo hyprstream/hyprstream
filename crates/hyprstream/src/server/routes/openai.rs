@@ -25,6 +25,11 @@ use crate::{
     server::{state::ServerState, AuthenticatedUser},
 };
 
+// E2E authenticated streaming via Ristretto255 DH key exchange
+use hyprstream_rpc::crypto::{
+    derive_stream_keys, generate_ephemeral_keypair, ristretto_dh, RistrettoPublic,
+};
+
 /// RAII guard for metrics cleanup
 struct MetricsGuard<'a> {
     metrics: &'a crate::server::state::Metrics,
@@ -476,11 +481,15 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
             gen_request.max_tokens, gen_request.temperature, gen_request.top_p, gen_request.top_k, gen_request.repeat_penalty
         );
 
-        // Start ZMQ stream - returns (zmq_stream_id, endpoint)
-        let (zmq_stream_id, endpoint) = match state.model_client.infer_stream(&model_name, &gen_request).await {
-            Ok((id, ep)) => {
-                info!("ZMQ stream started: id={}, endpoint={}", id, ep);
-                (id, ep)
+        // Generate client ephemeral Ristretto255 keypair for DH key exchange
+        let (client_secret, client_pubkey) = generate_ephemeral_keypair();
+        let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
+
+        // Start ZMQ stream - returns StreamStartedInfo with stream_id, endpoint, server_pubkey
+        let stream_info = match state.model_client.infer_stream(&model_name, &gen_request, client_pubkey_bytes).await {
+            Ok(info) => {
+                info!("ZMQ stream started: id={}, endpoint={}", info.stream_id, info.endpoint);
+                info
             }
             Err(e) => {
                 error!("Failed to start ZMQ stream: {}", e);
@@ -488,8 +497,33 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                 return;
             }
         };
+        let _zmq_stream_id = stream_info.stream_id; // Keep for logging, but topic is DH-derived
+        let endpoint = stream_info.endpoint;
 
-        // Create ZMQ SUB socket and subscribe to stream topic
+        // Derive stream keys using Ristretto255 DH key exchange
+        let server_pubkey = match RistrettoPublic::from_bytes(&stream_info.server_pubkey) {
+            Some(pk) => pk,
+            None => {
+                error!("Invalid server Ristretto public key encoding");
+                let _ = tx.send(Err(anyhow::anyhow!("Invalid server public key"))).await;
+                return;
+            }
+        };
+        let shared_secret = ristretto_dh(&client_secret, &server_pubkey);
+        let stream_keys = match derive_stream_keys(
+            &shared_secret,
+            &client_pubkey_bytes,
+            &stream_info.server_pubkey,
+        ) {
+            Ok(keys) => keys,
+            Err(e) => {
+                error!("Failed to derive stream keys: {}", e);
+                let _ = tx.send(Err(anyhow::anyhow!("Failed to derive stream keys: {}", e))).await;
+                return;
+            }
+        };
+
+        // Create ZMQ SUB socket and subscribe to DH-derived topic
         let ctx = crate::zmq::global_context();
         let sub_socket = match ctx.socket(zmq::SUB) {
             Ok(s) => s,
@@ -506,7 +540,8 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
             return;
         }
 
-        if let Err(e) = sub_socket.set_subscribe(zmq_stream_id.as_bytes()) {
+        // Subscribe to DH-derived topic (64 hex chars)
+        if let Err(e) = sub_socket.set_subscribe(stream_keys.topic.as_bytes()) {
             error!("Failed to subscribe to stream: {}", e);
             let _ = tx.send(Err(anyhow::anyhow!("Failed to subscribe to stream: {}", e))).await;
             return;
@@ -520,6 +555,10 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
 
         // OpenAI-style stream ID for SSE responses
         let sse_stream_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+
+        // Create StreamVerifier for HMAC chain verification
+        use crate::services::rpc_types::StreamVerifier;
+        let mut verifier = StreamVerifier::new(*stream_keys.mac_key, stream_keys.topic.clone());
 
         // Send initial role message
         let initial_msg = serde_json::json!({
@@ -538,164 +577,105 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
         });
         let _ = tx.send(Ok(initial_msg)).await;
 
-        // ZMQ receive loop - forward tokens to SSE
-        info!("Starting ZMQ streaming receive loop...");
-        let topic_len = zmq_stream_id.len();
+        // ZMQ receive loop - forward StreamBlock payloads to SSE
+        info!("Starting ZMQ streaming receive loop (StreamBlock format)...");
 
-        loop {
+        'outer: loop {
             // Check if client disconnected (channel closed)
             if tx.is_closed() {
                 info!("Client disconnected, stopping stream");
                 break;
             }
 
-            match sub_socket.recv_bytes(0) {
-                Ok(msg) => {
-                    // Strip topic prefix to get Cap'n Proto data
-                    if msg.len() <= topic_len {
-                        continue; // Empty message after topic
+            // Receive multipart StreamBlock: [topic, capnp, 16-byte mac]
+            match sub_socket.recv_multipart(0) {
+                Ok(frames) => {
+                    // Validate StreamBlock format
+                    if frames.len() != 3 || frames[2].len() != 16 {
+                        error!(
+                            "Invalid StreamBlock: expected 3 frames with 16-byte MAC, got {} frames",
+                            frames.len()
+                        );
+                        continue;
                     }
-                    let data = &msg[topic_len..];
 
-                    // Parse Cap'n Proto StreamChunk
-                    use capnp::message::ReaderOptions;
-                    use capnp::serialize;
-                    use crate::inference_capnp;
-
-                    let reader = match serialize::read_message(
-                        &mut std::io::Cursor::new(data),
-                        ReaderOptions::default(),
-                    ) {
-                        Ok(r) => r,
+                    // Verify HMAC chain and parse payloads
+                    let payloads = match verifier.verify(&frames) {
+                        Ok(p) => p,
                         Err(e) => {
-                            error!("Failed to parse stream chunk: {}", e);
+                            error!("StreamBlock verification failed: {}", e);
                             continue;
                         }
                     };
 
-                    let chunk = match reader.get_root::<inference_capnp::stream_chunk::Reader>() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            error!("Failed to get stream chunk root: {}", e);
-                            continue;
-                        }
-                    };
+                    // Process each payload in the block
+                    for payload in payloads {
+                        use crate::services::rpc_types::{InferenceStreamPayload, StreamPayloadExt};
+                        match payload.to_inference() {
+                            Ok(InferenceStreamPayload::Token(text)) => {
+                                let sse_chunk = serde_json::json!({
+                                    "id": sse_stream_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": chrono::Utc::now().timestamp(),
+                                    "model": model_name,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {
+                                            "content": text
+                                        },
+                                        "finish_reason": null
+                                    }]
+                                });
 
-                    // Extract chunk data into owned values BEFORE any await
-                    // (capnp readers contain raw pointers and cannot be held across await points)
-                    use inference_capnp::stream_chunk::Which;
-                    enum ChunkAction {
-                        SendText(String),
-                        Complete { finish_reason: String, gen_time_ms: u64, toks_per_sec: f32, toks_gen: u32 },
-                        Error(String),
-                        Continue,
-                    }
-
-                    let action = match chunk.which() {
-                        Ok(Which::Text(text_result)) => {
-                            match text_result {
-                                Ok(t) => ChunkAction::SendText(t.to_string().unwrap_or_default()),
-                                Err(_) => ChunkAction::Continue,
+                                if tx.send(Ok(sse_chunk)).await.is_err() {
+                                    info!("Client disconnected during streaming");
+                                    break 'outer;
+                                }
                             }
-                        }
-                        Ok(Which::Complete(stats_result)) => {
-                            if let Ok(stats) = stats_result {
-                                let toks = stats.get_tokens_generated();
-                                let fr = match stats.get_finish_reason() {
-                                    Ok(inference_capnp::FinishReason::MaxTokens) => "length",
+                            Ok(InferenceStreamPayload::Complete(stats)) => {
+                                info!(
+                                    "Streaming complete: {} tokens in {}ms ({:.2} tok/s)",
+                                    stats.tokens_generated,
+                                    stats.generation_time_ms,
+                                    stats.tokens_per_second
+                                );
+
+                                state.metrics.total_tokens.fetch_add(
+                                    stats.tokens_generated as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+
+                                // Map finish_reason to OpenAI format
+                                let oai_finish_reason = match stats.finish_reason.as_str() {
+                                    "max_tokens" | "MaxTokens" | "length" => "length",
                                     _ => "stop",
                                 };
-                                ChunkAction::Complete {
-                                    finish_reason: fr.to_string(),
-                                    gen_time_ms: stats.get_generation_time_ms(),
-                                    toks_per_sec: stats.get_tokens_per_second(),
-                                    toks_gen: toks,
-                                }
-                            } else {
-                                ChunkAction::Complete {
-                                    finish_reason: "stop".to_string(),
-                                    gen_time_ms: 0,
-                                    toks_per_sec: 0.0,
-                                    toks_gen: 0,
-                                }
+
+                                let completion_msg = serde_json::json!({
+                                    "id": sse_stream_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": chrono::Utc::now().timestamp(),
+                                    "model": model_name,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {},
+                                        "finish_reason": oai_finish_reason
+                                    }]
+                                });
+                                let _ = tx.send(Ok(completion_msg)).await;
+
+                                let _ = tx.send(Ok(serde_json::json!({"done": true}))).await;
+                                break 'outer;
                             }
-                        }
-                        Ok(Which::Error(error_result)) => {
-                            let msg = if let Ok(err) = error_result {
-                                err.get_message()
-                                    .ok()
-                                    .and_then(|r| r.to_str().ok())
-                                    .unwrap_or("Unknown error")
-                                    .to_string()
-                            } else {
-                                "Stream error".to_string()
-                            };
-                            ChunkAction::Error(msg)
-                        }
-                        Err(e) => {
-                            error!("Failed to parse stream chunk variant: {:?}", e);
-                            ChunkAction::Continue
-                        }
-                    };
-                    // chunk is now dropped, safe to use awaits
-
-                    match action {
-                        ChunkAction::SendText(text) => {
-                            let sse_chunk = serde_json::json!({
-                                "id": sse_stream_id,
-                                "object": "chat.completion.chunk",
-                                "created": chrono::Utc::now().timestamp(),
-                                "model": model_name,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {
-                                        "content": text
-                                    },
-                                    "finish_reason": null
-                                }]
-                            });
-
-                            if tx.send(Ok(sse_chunk)).await.is_err() {
-                                info!("Client disconnected during streaming");
-                                break;
+                            Ok(InferenceStreamPayload::Error(message)) => {
+                                error!("Stream error: {}", message);
+                                let _ = tx.send(Err(anyhow::anyhow!("Generation error: {}", message))).await;
+                                break 'outer;
                             }
-                        }
-                        ChunkAction::Complete { finish_reason, gen_time_ms, toks_per_sec, toks_gen } => {
-                            info!(
-                                "Streaming complete: {} tokens in {}ms ({:.2} tok/s)",
-                                toks_gen,
-                                gen_time_ms,
-                                toks_per_sec
-                            );
-
-                            state.metrics.total_tokens.fetch_add(
-                                toks_gen as u64,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-
-                            let completion_msg = serde_json::json!({
-                                "id": sse_stream_id,
-                                "object": "chat.completion.chunk",
-                                "created": chrono::Utc::now().timestamp(),
-                                "model": model_name,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {},
-                                    "finish_reason": finish_reason
-                                }]
-                            });
-                            let _ = tx.send(Ok(completion_msg)).await;
-
-                            let _ = tx.send(Ok(serde_json::json!({"done": true}))).await;
-                            break;
-                        }
-                        ChunkAction::Error(error_msg) => {
-                            error!("Stream error: {}", error_msg);
-                            let _ = tx.send(Err(anyhow::anyhow!("Generation error: {}", error_msg))).await;
-                            break;
-                        }
-                        ChunkAction::Continue => {
-                            continue;
+                            Err(e) => {
+                                error!("Failed to parse stream payload: {}", e);
+                                continue;
+                            }
                         }
                     }
                 }

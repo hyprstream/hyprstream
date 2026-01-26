@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
+use hyprstream_rpc::service::ServiceManager;
 
 use super::model_ref::{validate_model_name, ModelRef};
 
@@ -66,7 +67,7 @@ pub struct CacheStats {
 /// Model storage using a shared registry service.
 ///
 /// Registry operations (list, clone, register) go through the service client.
-/// Repository operations (worktrees, branches) use local git access via GitManager.
+/// Repository operations (worktrees, branches) use the service layer.
 pub struct ModelStorage {
     base_dir: PathBuf,
     client: Arc<dyn RegistryClient>,
@@ -79,6 +80,11 @@ impl ModelStorage {
     /// from a parent component that manages the shared registry.
     pub fn new(client: Arc<dyn RegistryClient>, base_dir: PathBuf) -> Self {
         Self { client, base_dir }
+    }
+
+    /// Get the registry client (for accessing repository operations)
+    pub fn registry(&self) -> &Arc<dyn RegistryClient> {
+        &self.client
     }
 
     /// Create ModelStorage with default configuration.
@@ -107,15 +113,25 @@ impl ModelStorage {
 
         // Generate keypair for this service instance
         // TODO: Load from configuration for production
-        let (signing_key, verifying_key) = generate_signing_keypair();
+        let (signing_key, _verifying_key) = generate_signing_keypair();
 
         // Create policy client that connects to the already-running PolicyService
         // (PolicyService should be started by main.rs before any ModelStorage is created)
         // If PolicyService isn't running, policy checks will fail gracefully
         let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
 
-        // Start ZMQ-based registry service (waits for socket binding)
-        let _service_handle = RegistryService::start(&base_dir, verifying_key, policy_client)
+        // Start ZMQ-based registry service using unified pattern (service includes infrastructure)
+        let registry_transport = hyprstream_rpc::transport::TransportConfig::inproc("hyprstream/registry");
+        let registry_service = RegistryService::new(
+            &base_dir,
+            policy_client.clone(),
+            crate::zmq::global_context().clone(),
+            registry_transport,
+            signing_key.clone(),
+        ).await
+            .map_err(|e| anyhow::anyhow!("Failed to create registry service: {}", e))?;
+        let manager = hyprstream_rpc::service::InprocManager::new();
+        let _service_handle = manager.spawn(Box::new(registry_service))
             .await
             .map_err(|e| anyhow::anyhow!("Failed to start registry service: {}", e))?;
 
@@ -321,11 +337,6 @@ impl ModelStorage {
         }
 
         Ok(())
-    }
-
-    /// Get the registry client for advanced operations
-    pub fn registry(&self) -> &Arc<dyn RegistryClient> {
-        &self.client
     }
 
     /// Open repository for direct git operations
@@ -584,12 +595,15 @@ impl ModelStorage {
 
     /// Remove a worktree for a model
     pub async fn remove_worktree(&self, model_ref: &ModelRef, branch: &str) -> Result<()> {
-        let bare_repo_path = self.get_bare_repo_path(model_ref).await?;
+        // Get the worktree path for this branch
+        let worktree_path = self.get_worktree_path(model_ref, branch).await?;
 
-        // Use GitManager's high-level worktree removal with automatic cleanup
-        // This method is already optimized and handles storage driver cleanup properly
-        git2db::GitManager::global()
-            .remove_worktree(&bare_repo_path, branch, Some(&self.base_dir))
+        // Use RepositoryClient to remove worktree via service layer
+        // This routes through the service which handles storage driver cleanup properly
+        let repo_client = self.client.repo(&model_ref.model).await
+            .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
+
+        repo_client.remove_worktree(&worktree_path).await
             .map_err(|e| anyhow::anyhow!("Failed to remove worktree: {}", e))?;
 
         Ok(())

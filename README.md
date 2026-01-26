@@ -279,7 +279,7 @@ graph TD
     Engine --> Training[Training System]
 
     Models --> Git[Git Repository]
-    Git --> Branches[Adapter Branches]
+    Git --> Adapters[adapters/ Directory]
     Git --> Worktrees[Training Worktrees]
 
     Training --> Checkpoint[Checkpoint Manager]
@@ -397,8 +397,38 @@ export HYPRSTREAM_GENERATION_TIMEOUT=120
 
 ## Security & Authentication
 
-Hyprstream implements layered security-in-depth with a built-in policy engine, Ed25519-signed ZMQ+CapnProto RPC requests at the application layer and CURVE encryption.
+Hyprstream implements layered security-in-depth:
 
+### Security Layers
+
+| Layer | Technology | Purpose |
+|-------|------------|---------|
+| **Transport** | CURVE encryption (TCP) | End-to-end encryption for TCP connections |
+| **Application** | Ed25519 signed envelopes | Request authentication and integrity |
+| **Authorization** | Casbin policy engine | RBAC/ABAC access control |
+
+### RPC Architecture
+
+All inter-service communication uses ZeroMQ with Cap'n Proto serialization:
+
+- **REQ/REP**: Synchronous RPC calls (policy checks, model queries)
+- **PUB/SUB**: Event streaming (sandbox lifecycle, training progress)
+- **XPUB/XSUB**: Steerable proxy for event distribution
+
+Every request is wrapped in a `SignedEnvelope`:
+- Ed25519 signature over the request payload
+- Nonce for replay protection
+- Timestamp for clock skew validation
+- Request identity (Local user, API token, Peer, or Anonymous)
+
+### Service Spawning
+
+Services can run in multiple modes:
+- **Tokio task**: In-process async execution
+- **Dedicated thread**: For `!Send` types (e.g., tch-rs tensors)
+- **Subprocess**: Isolated process with systemd or standalone backend
+
+See [docs/rpc-architecture.md](docs/rpc-architecture.md) for detailed RPC infrastructure documentation.
 
 ## Policy Engine
 
@@ -435,8 +465,7 @@ hyprstream policy token create --user alice --name "my-token" --expires 1d
 curl -H "Authorization: Bearer hypr_eyJ..." http://localhost:8080/v1/models
 ```
 
-See [docs/security.md](docs/security.md) for detailed documentation.
-See [docs/architecture.md](docs/architecture.md) for detailed architecture documentation.
+See [docs/rpc-architecture.md](docs/rpc-architecture.md) for detailed RPC and service infrastructure documentation.
 
 ## Telemetry & Observability
 

@@ -25,6 +25,10 @@ struct ModelRequest {
     infer @5 :InferRequest;
     inferStream @6 :InferRequest;
 
+    # Stream authorization handshake (routes to InferenceService)
+    # Client must call this after inferStream to authorize SUB subscription
+    startStream @9 :StartStreamRequest;
+
     # Health/Lifecycle
     healthCheck @7 :Void;
 
@@ -50,6 +54,8 @@ struct ModelResponse {
     health @8 :ModelHealthStatus;
     # Templated prompt string
     templateResult @9 :Text;
+    # Stream authorization confirmation
+    streamAuthorized @10 :StreamAuthInfo;
   }
 }
 
@@ -59,10 +65,16 @@ struct ErrorInfo {
   code @1 :Text;
 }
 
-# Stream info for streaming responses
+# =============================================================================
+# Stream Setup (aligns with streaming.capnp::StreamInfo)
+# =============================================================================
+
+# Stream info for streaming responses (includes server pubkey for E2E auth)
+# Note: Matches streaming.capnp::StreamInfo for consistency
 struct StreamInfo {
   streamId @0 :Text;
   endpoint @1 :Text;
+  serverPubkey @2 :Data;  # Server's ephemeral Ristretto255 public key (32 bytes) for DH
 }
 
 # Load model request
@@ -85,6 +97,22 @@ struct ModelStatusRequest {
 struct InferRequest {
   modelRef @0 :Text;
   request @1 :Data;  # Serialized GenerationRequest (Cap'n Proto bytes)
+}
+
+# Start stream request (authorizes SUB subscription)
+# Client must call this after inferStream to authorize subscription
+# Note: Aligns with streaming.capnp::StreamStartRequest
+struct StartStreamRequest {
+  modelRef @0 :Text;      # Model that started the stream
+  streamId @1 :Text;      # Stream ID from inferStream response (e.g., "stream-uuid")
+  clientPubkey @2 :Data;  # Client's ephemeral Ristretto255 public key (32 bytes) for DH
+}
+
+# Stream authorization response
+# Note: Aligns with streaming.capnp::StreamAuthResponse
+struct StreamAuthInfo {
+  streamId @0 :Text;
+  serverPubkey @1 :Data;  # Server's ephemeral Ristretto255 public key (if not in StreamInfo)
 }
 
 # Response when model is loaded
@@ -135,4 +163,46 @@ struct ApplyChatTemplateRequest {
   modelRef @0 :Text;
   messages @1 :List(ChatMessage);
   addGenerationPrompt @2 :Bool;  # Whether to add assistant prompt at end
+}
+
+# =============================================================================
+# Callback Protocol (InferenceService → ModelService)
+# =============================================================================
+#
+# InferenceService spawns, connects DEALER to ModelService's ROUTER callback
+# socket, and sends Register. ModelService then uses the same connection for
+# commands (LoadModel, Infer, Shutdown). This eliminates race conditions.
+
+# Sent by InferenceService when it connects back to ModelService
+struct Register {
+  id @0 :Text;              # Instance ID (e.g., "inference-a1b2c3d4")
+  streamEndpoint @1 :Text;  # XPUB endpoint for token streaming
+}
+
+# Response to Register (optional, for acknowledgment)
+struct RegisterResponse {
+  success @0 :Bool;
+  error @1 :Text;
+}
+
+# Command wrapper for ModelService → InferenceService
+struct InferenceCommand {
+  union {
+    loadModel @0 :LoadModelCommand;
+    shutdown @1 :Void;
+    # Infer uses existing InferenceRequest via request field
+    infer @2 :Data;  # Serialized InferenceRequest
+  }
+}
+
+# Load model command sent over callback connection
+struct LoadModelCommand {
+  modelRef @0 :Text;    # e.g., "qwen3-small:main"
+  modelPath @1 :Text;   # Resolved path to model directory
+}
+
+# Response to LoadModelCommand
+struct LoadModelCommandResponse {
+  success @0 :Bool;
+  error @1 :Text;
 }

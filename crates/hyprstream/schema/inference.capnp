@@ -4,6 +4,11 @@
 #
 # The inference service uses REQ/REP pattern for request handling.
 # Streaming uses PUB/SUB with stream IDs for chunk delivery.
+#
+# Streaming Architecture:
+#   - Wire format types are in hyprstream-rpc/schema/streaming.capnp
+#   - This file defines inference-specific payload types
+#   - InferencePayload gets serialized into streaming.capnp::StreamBlock.payloads
 
 struct InferenceRequest {
   # Request ID for tracking
@@ -32,6 +37,11 @@ struct InferenceRequest {
     # Health/Lifecycle
     healthCheck @14 :Void;
     shutdown @15 :Void;
+
+    # Stream authorization handshake
+    # Client calls this after generateStream to authorize subscription
+    # Future: will include client public key for DH key exchange
+    startStream @16 :StartStreamRequest;
   }
 }
 
@@ -57,6 +67,10 @@ struct InferenceResponse {
     sessionCleared @14 :Void;
     sessionReleased @15 :Void;
     health @16 :HealthStatus;
+
+    # Stream authorization response
+    # Future: will include server public key for DH key exchange
+    streamAuthorized @17 :StreamAuthResponse;
   }
 }
 
@@ -107,30 +121,81 @@ enum FinishReason {
   stop @4;
 }
 
+# =============================================================================
+# Stream Setup (aligns with streaming.capnp::StreamInfo)
+# =============================================================================
+
+# Response when starting a stream - contains info needed to subscribe
+# Note: Matches streaming.capnp::StreamInfo for consistency
 struct StreamInfo {
   streamId @0 :Text;
   endpoint @1 :Text;
+  serverPubkey @2 :Data;  # Server's ephemeral Ristretto255 public key (32 bytes) for DH
 }
 
-# Streaming messages (sent via PUB/SUB)
+# Stream authorization handshake
+# Note: Matches streaming.capnp::StreamStartRequest/StreamAuthResponse
 
-struct StreamChunk {
+struct StartStreamRequest {
   streamId @0 :Text;
-  sequenceNum @1 :UInt32;
+  clientPubkey @1 :Data;  # Client's ephemeral Ristretto255 public key (32 bytes)
+}
+
+struct StreamAuthResponse {
+  streamId @0 :Text;
+  serverPubkey @1 :Data;  # Server's ephemeral Ristretto255 public key (if not in StreamInfo)
+}
+
+# =============================================================================
+# Inference Payload (serialized into streaming.capnp::StreamBlock.payloads)
+# =============================================================================
+
+# The actual inference payload - gets serialized into wire format StreamBlock.payloads
+# This is the application-layer content, not the wire format.
+struct InferencePayload {
+  streamId @0 :Text;
 
   union {
-    text @2 :Text;
-    complete @3 :StreamStats;
-    error @4 :ErrorInfo;
+    token @1 :Text;                   # Generated token text
+    complete @2 :InferenceStats;      # Generation complete with stats
+    error @3 :ErrorInfo;              # Error during generation
   }
 }
 
-struct StreamStats {
+# Inference-specific completion statistics
+#
+# Serialized into StreamPayload.complete (streaming.capnp) as raw bytes.
+# Contains full generation metrics including prefill and inference breakdown.
+struct InferenceComplete {
+  # Overall metrics
+  tokensGenerated @0 :UInt32;
+  finishReason @1 :Text;          # "stop", "length", "eos", "error"
+  generationTimeMs @2 :UInt64;
+  tokensPerSecond @3 :Float32;
+
+  # Prefill metrics (processing the prompt)
+  prefillTokens @4 :UInt32;
+  prefillTimeMs @5 :UInt64;
+  prefillTokensPerSec @6 :Float32;
+
+  # Inference metrics (generating new tokens, excluding prefill)
+  inferenceTokens @7 :UInt32;
+  inferenceTimeMs @8 :UInt64;
+  inferenceTokensPerSec @9 :Float32;
+  inferenceTokensPerSecEma @10 :Float32;  # EMA for adaptive batching
+
+  # Optional quality metrics (0.0 means not set)
+  perplexity @11 :Float32;
+  avgEntropy @12 :Float32;
+}
+
+# Legacy inference stats (kept for backwards compatibility)
+struct InferenceStats {
   tokensGenerated @0 :UInt32;
   finishReason @1 :FinishReason;
   generationTimeMs @2 :UInt64;
   tokensPerSecond @3 :Float32;
-  qualityMetrics @4 :QualityMetrics;
+  qualityMetrics @4 :QualityMetrics;  # Inference-specific quality metrics
 }
 
 # Chat Template

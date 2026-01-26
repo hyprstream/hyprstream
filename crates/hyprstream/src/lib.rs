@@ -56,6 +56,8 @@ pub mod schema;
 pub mod server;
 pub mod services;
 pub mod storage;
+#[cfg(unix)]
+pub mod systemd;
 pub mod training;
 pub mod zmq;
 
