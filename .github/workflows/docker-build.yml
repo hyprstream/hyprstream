@@ -23,17 +23,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [cpu, cuda-129, rocm-6.4]
+        variant: [cpu, cuda128, cuda130, rocm71]
         include:
           - variant: cpu
             tag_suffix: cpu
             docker_variant: cpu
-          - variant: cuda-129
-            tag_suffix: cuda-129
-            docker_variant: cuda
-          - variant: rocm-6.4
-            tag_suffix: rocm-6.4
-            docker_variant: rocm
+          - variant: cuda128
+            tag_suffix: cuda128
+            docker_variant: cuda128
+          - variant: cuda130
+            tag_suffix: cuda130
+            docker_variant: cuda130
+          - variant: rocm71
+            tag_suffix: rocm71
+            docker_variant: rocm71
 
     steps:
     - name: Clean up disk space before build

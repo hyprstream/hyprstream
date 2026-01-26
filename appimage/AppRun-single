@@ -1,0 +1,34 @@
+#!/bin/bash
+# AppRun-single - Single-backend hyprstream launcher
+# Used for per-backend AppImages (cpu, cuda128, cuda130, rocm71)
+# The HYPRSTREAM_VARIANT variable is set during AppImage assembly.
+
+set -euo pipefail
+
+APPDIR="$(dirname "$(readlink -f "$0")")"
+
+# The backend variant is embedded during build
+# This will be replaced by the build script with: cpu, cuda128, cuda130, or rocm71
+BACKEND="${HYPRSTREAM_VARIANT:-cpu}"
+
+# Set up environment
+export LD_LIBRARY_PATH="$APPDIR/usr/lib/libtorch/lib:${LD_LIBRARY_PATH:-}"
+export LIBTORCH="$APPDIR/usr/lib/libtorch"
+export LIBTORCH_BYPASS_VERSION_CHECK=1
+
+# ROCm-specific environment
+if [[ "$BACKEND" == "rocm71" ]]; then
+    if [[ -d /opt/rocm ]]; then
+        export ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
+    fi
+    export PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH:-gfx90a;gfx1100;gfx1101}"
+fi
+
+# Debug output
+if [[ -n "${HYPRSTREAM_DEBUG:-}" ]]; then
+    echo "[hyprstream] Backend: $BACKEND" >&2
+    echo "[hyprstream] LD_LIBRARY_PATH: $LD_LIBRARY_PATH" >&2
+    echo "[hyprstream] LIBTORCH: $LIBTORCH" >&2
+fi
+
+exec "$APPDIR/usr/bin/hyprstream" "$@"

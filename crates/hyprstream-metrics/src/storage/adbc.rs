@@ -104,12 +104,14 @@ impl CacheEviction for AdbcBackend {
 #[async_trait]
 impl StorageBackend for AdbcBackend {
     async fn init(&self) -> Result<(), Status> {
+        // Note: Using VARCHAR for view_definition instead of JSON to avoid
+        // requiring database-specific JSON extensions. We handle JSON via serde.
         self.execute_statement(
             r#"
             CREATE TABLE IF NOT EXISTS view_metadata (
                 view_name VARCHAR PRIMARY KEY,
                 source_table VARCHAR NOT NULL,
-                view_definition JSON NOT NULL,
+                view_definition VARCHAR NOT NULL,
                 created_at TIMESTAMP NOT NULL
             );
             "#,

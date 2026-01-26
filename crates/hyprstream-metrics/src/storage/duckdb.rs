@@ -35,12 +35,14 @@ impl DuckDbBackend {
             .map_err(|e| Status::internal(e.to_string()))?;
 
         // Initialize tables synchronously
+        // Note: Using VARCHAR for view_definition instead of JSON to avoid
+        // requiring the json extension. We handle JSON via serde anyway.
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS view_metadata (
                 view_name VARCHAR PRIMARY KEY,
                 source_table VARCHAR NOT NULL,
-                view_definition JSON NOT NULL,
+                view_definition VARCHAR NOT NULL,
                 created_at BIGINT NOT NULL
             );
             "#,
