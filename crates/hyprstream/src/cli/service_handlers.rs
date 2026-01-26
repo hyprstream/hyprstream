@@ -320,28 +320,56 @@ pub async fn handle_service_status(
         println!("  Type:          standalone (process spawner)");
     }
 
-    // Service status
+    // Service status - check both systemd and daemon PID files
     println!("\nService Status:");
-    println!("  {:<15} {:<10} {}", "SERVICE", "STATUS", "NOTES");
+    println!("  {:<15} {:<10} {}", "SERVICE", "STATUS", "MODE");
     println!("  {}", "-".repeat(45));
 
-    if hyprstream_rpc::has_systemd() {
-        let manager = hyprstream_rpc::detect_service_manager().await?;
-
-        for service in config_services {
-            let (icon, status, notes) = match manager.is_active(service).await {
-                Ok(true) => ("\u{2713}", "running", String::new()),
-                Ok(false) => ("\u{25CB}", "stopped", String::new()),
-                Err(e) => ("\u{2717}", "error", format!("{}", e)),
-            };
-            println!("  {:<15} {} {:<8} {}", service, icon, status, notes);
-        }
+    let runtime_dir = hyprstream_rpc::paths::runtime_dir();
+    let manager = if hyprstream_rpc::has_systemd() {
+        Some(hyprstream_rpc::detect_service_manager().await?)
     } else {
-        // For standalone, check if processes are running
-        for service in config_services {
-            println!("  {:<15} {} {:<8}", service, "\u{2014}", "unknown");
-        }
-        println!("\n  Note: Process status detection not available in standalone mode");
+        None
+    };
+
+    for service in config_services {
+        // Check systemd status
+        let systemd_running = if let Some(ref mgr) = manager {
+            mgr.is_active(service).await.unwrap_or(false)
+        } else {
+            false
+        };
+
+        // Check daemon PID file
+        let daemon_running = {
+            let pid_file = runtime_dir.join(format!("{}.pid", service));
+            if pid_file.exists() {
+                if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                        let nix_pid = nix::unistd::Pid::from_raw(pid);
+                        // Signal 0 checks if process exists
+                        matches!(
+                            nix::sys::signal::kill(nix_pid, None),
+                            Ok(()) | Err(nix::errno::Errno::EPERM)
+                        )
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+
+        let (icon, status, mode) = match (systemd_running, daemon_running) {
+            (true, true) => ("\u{2713}", "running", "systemd+daemon"),
+            (true, false) => ("\u{2713}", "running", "systemd"),
+            (false, true) => ("\u{2713}", "running", "daemon"),
+            (false, false) => ("\u{25CB}", "stopped", ""),
+        };
+        println!("  {:<15} {} {:<10} {}", service, icon, status, mode);
     }
 
     // Verbose: show unit file contents
