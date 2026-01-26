@@ -133,6 +133,31 @@ pub fn is_root() -> bool {
     nix::unistd::geteuid().is_root()
 }
 
+/// Get the stable executable path for spawning subprocesses or systemd units.
+///
+/// When running from an AppImage, `current_exe()` returns the temporary mount path
+/// (e.g., `/tmp/.mount_hyprXXX/usr/bin/hyprstream`) which becomes invalid when the
+/// AppImage exits. Instead, we use the `$APPIMAGE` environment variable which
+/// points to the stable AppImage file path.
+///
+/// See: <https://docs.appimage.org/packaging-guide/environment-variables.html>
+///
+/// # Returns
+/// - `$APPIMAGE` path if set and the file exists
+/// - `current_exe()` otherwise
+pub fn executable_path() -> std::io::Result<PathBuf> {
+    // Check for AppImage environment variable first
+    if let Ok(appimage_path) = std::env::var("APPIMAGE") {
+        let path = PathBuf::from(&appimage_path);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    // Fall back to current executable
+    std::env::current_exe()
+}
+
 /// Get the current user's UID
 pub fn current_uid() -> u32 {
     nix::unistd::getuid().as_raw()

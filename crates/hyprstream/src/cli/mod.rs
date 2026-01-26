@@ -13,6 +13,7 @@ pub mod git_handlers;
 pub mod handlers;
 pub mod policy_handlers;
 pub mod remote_handlers;
+pub mod service_handlers;
 pub mod systemd_setup;
 pub mod training_handlers;
 pub mod worker_handlers;
@@ -48,6 +49,10 @@ pub use worker_handlers::{
     handle_worker_exec, handle_worker_list, handle_worker_restart, handle_worker_rm,
     handle_worker_run, handle_worker_start, handle_worker_stats, handle_worker_status,
     handle_worker_stop, handle_worker_terminal,
+};
+pub use service_handlers::{
+    handle_service_install, handle_service_upgrade, handle_service_reinstall,
+    handle_service_uninstall, handle_service_start, handle_service_stop, handle_service_status,
 };
 
 /// Device preference strategy
