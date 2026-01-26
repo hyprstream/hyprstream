@@ -1,175 +1,142 @@
-Hyprstream has limited support for running inside of Docker.
+# Running Hyprstream in Docker
 
-These images use the non-systemd release and are not built on the AppImage,
-but install hyprstream atop a Debian base image.
+Hyprstream supports containerized deployment using Docker Compose with a multi-service architecture.
 
-Running Hyprstream in Docker does not require privileged containers, except to
-support microvm based Workers, an optional feature.
+Services communicate via ZeroMQ over a shared tmpfs IPC volume, enabling efficient inter-process communication without network overhead.
 
-Multi-host deployments of Hyprstream an support Workers running outside of Docker,
-or in a privileged container, and non-worker services running in unprivileged user containers.
+## Quick Start
 
-### Run with Docker:
-
-0. Set the tag
-
-```
-export TAG=latest-cuda-129 # or latest-rocm-6.4, latest-cpu, etc.
-```
-
-1. Setup policies:
-
-```
-# WARNING: this allows all local systems users administrative access to hyprstream.
-$ sudo docker run --rm -it -v hyprstream-models:/root/.local/share/hyprstream hyprstreamv-rocm policy apply-template local
-```
-
-2. Pull model(s):
-
-```
-$ sudo docker run --rm -it -v hyprstream-models:/root/.local/share/hyprstream hyprstream:$TAG clone https://huggingface.co/qwen/qwen3-0.6b
-```
-
-3. Test inference and GPU initialization
-
-```
-$ sudo docker run --rm -it -v hyprstream-models:/root/.local/share/hyprstream hyprstream:$TAG infer --prompt "hello world" qwen3-0.6b:main
-```
-
-
-4. Deploy openai compatible server:
-
-```
-$ sudo docker run --rm -it -v hyprstream-models:/root/.local/share/hyprstream --device=/dev/kfd --device=/dev/dri hyprstream:$TAG server
-```
-
-### Building Docker images
-
-#### ROCm:
-
-$ docker build -t hyprstreamv-rocm --build-arg variant=rocm .
-
-#### Nvidia:
-
-$ docker build -t hyprstreamv-cuda --build-arg variant=cuda .
-
-#### CPU:
-
-$ docker build -t hyprstreamv-cpu .
-
-### Building from Source
-
-#### 1. Clone Repository
+### 1. Select your GPU profile and start services
 
 ```bash
-git clone https://github.com/hyprstream/hyprstream.git
-cd hyprstream
+# CPU inference
+docker compose --profile cpu up -d
+
+# NVIDIA CUDA GPU
+docker compose --profile cuda up -d
+
+# AMD ROCm GPU
+docker compose --profile rocm up -d
 ```
 
-#### 2. Install libtorch
-
-You have three options for obtaining libtorch:
-
-**Option A: Automatic Download (Recommended)**
-```bash
-# tch-rs will automatically download libtorch during build
-# CPU version is downloaded by default
-cargo build --release
-```
-
-**Option B: Download from PyTorch**
-```bash
-# CUDA 12.9 version
-wget https://download.pytorch.org/libtorch/cu129/libtorch-cxx11-abi-shared-with-deps-2.8.0%2Bcu129.zip
-unzip libtorch-cxx11-abi-shared-with-deps-2.8.0+cu129.zip
-
-# CUDA 13.0 Nightly
-wget https://download.pytorch.org/libtorch/nightly/cu130/libtorch-shared-with-deps-latest.zip
-unzip libtorch-shared-with-deps-latest.zip
-
-# ROCm 6.4
-wget https://download.pytorch.org/libtorch/rocm6.4/libtorch-shared-with-deps-2.8.0%2Brocm6.4.zip
-unzip libtorch-shared-with-deps-2.8.0%2Brocm6.4.zip
-```
-
-**Option C: Use Existing PyTorch Installation**
-```bash
-# If you have PyTorch installed via pip/conda
-export LIBTORCH_USE_PYTORCH=1
-```
-
-#### 3. Set Environment Variables
-
-Configure libtorch location:
+### 2. Setup policies (required before first use)
 
 ```bash
-# Option 1: Set LIBTORCH to the directory containing 'lib' and 'include'
-export LIBTORCH=/path/to/libtorch
-
-# Option 2: Set individual paths
-export LIBTORCH_INCLUDE=/path/to/libtorch
-export LIBTORCH_LIB=/path/to/libtorch
-
-# Option 3: Use system-wide installation
-# libtorch installed at /usr/lib/libtorch.so is detected automatically
-
-# Add to library path
-export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
+# Allow local users administrative access
+docker compose run --rm client policy apply-template local
 ```
 
-#### 4. Build with Backend Selection
-
-**CPU Backend (Default)**
-```bash
-# Automatic download
-cargo build --release
-
-# Or with manual libtorch
-export LIBTORCH=/path/to/libtorch-cpu
-export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
-cargo build --release
-```
-
-**CUDA Backend**
-```bash
-# Set CUDA version for automatic download
-export TORCH_CUDA_VERSION=cu118  # or cu121, cu124
-cargo build --release
-```
-
-**ROCm Backend (AMD GPUs)**
-```bash
-# Set environment variables
-export ROCM_PATH=/opt/rocm
-export LIBTORCH=/path/to/libtorch-rocm
-export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
-export PYTORCH_ROCM_ARCH=gfx90a  # or gfx1100, gfx1101, etc.
-
-# Build with ROCm feature
-cargo build --release
-```
-
-#### 5. Run
+### 3. Clone a model
 
 ```bash
-# The binary will be at ./target/release/hyprstream
-./target/release/hyprstream --help
+docker compose run --rm client clone https://huggingface.co/Qwen/Qwen3-0.6B
 ```
 
-### Additional Build Options
+### 4. Test inference
 
-**Static Linking**
 ```bash
-export LIBTORCH_STATIC=1
-cargo build --release
+docker compose run --rm client infer qwen3-0.6b:main --prompt "Hello, world!"
 ```
 
-**Combining Features**
+### 5. Use the OpenAI-compatible API
+
+The API is exposed on port 8010 by default:
+
 ```bash
-# CUDA + OpenTelemetry
-cargo build --release --no-default-features --features tch-cuda,otel
+curl http://localhost:8010/v1/models
 
-# ROCm + XET support
-cargo build --release --no-default-features --features tch-rocm,xet
+curl -X POST http://localhost:8010/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-0.6b:main",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
 ```
 
+## Service Architecture
+
+Docker Compose runs Hyprstream as separate microservices:
+
+| Service | Description | Profile |
+|---------|-------------|---------|
+| `event` | Event bus (PUB/SUB) | all |
+| `registry` | Model registry | all |
+| `policy` | Authorization (Casbin) | all |
+| `streams` | Token streaming | all |
+| `model` | Model inference (CPU) | cpu |
+| `model-cuda` | Model inference (NVIDIA) | cuda |
+| `model-rocm` | Model inference (AMD) | rocm |
+| `oai` | OpenAI-compatible API | all |
+| `client` | CLI client | client |
+| `flight` | Flight SQL service | flight |
+| `worker` | Kata VM workers | workers |
+
+### Optional Services
+
+```bash
+# Include Flight SQL service
+docker compose --profile cpu --profile flight up -d
+
+# Include worker service (requires privileged container)
+docker compose --profile cpu --profile workers up -d
+
+# Run CLI commands interactively
+docker compose run --rm client
+```
+
+## Available Image Tags
+
+Images are published to `ghcr.io/hyprstream/hyprstream`:
+
+| Tag | Description |
+|-----|-------------|
+| `latest-cpu` | CPU-only inference |
+| `latest-cuda128` | NVIDIA CUDA 12.8 |
+| `latest-cuda130` | NVIDIA CUDA 13.0 |
+| `latest-rocm` | AMD ROCm 7.1 |
+
+Override the default tag:
+
+```bash
+TAG=latest-cuda130 docker compose --profile cuda up -d
+```
+
+## Volumes
+
+| Volume | Purpose |
+|--------|---------|
+| `models` | Persistent model storage and signing keys |
+| `ipc` | Tmpfs for inter-service ZeroMQ sockets |
+
+## Building Docker Images
+
+```bash
+# CPU
+docker build -t hyprstream:cpu --build-arg VARIANT=cpu .
+
+# NVIDIA CUDA 12.8
+docker build -t hyprstream:cuda128 --build-arg VARIANT=cuda128 .
+
+# NVIDIA CUDA 13.0
+docker build -t hyprstream:cuda130 --build-arg VARIANT=cuda130 .
+
+# AMD ROCm 7.1
+docker build -t hyprstream:rocm --build-arg VARIANT=rocm71 .
+```
+
+### Build arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `VARIANT` | `cpu` | Build variant: `cpu`, `cuda128`, `cuda130`, `rocm71` |
+| `DEBIAN_VERSION` | `bookworm` | Debian base image version |
+| `LIBTORCH_VERSION` | `2.10.0` | PyTorch/LibTorch version |
+
+## Privileged Containers
+
+Running Hyprstream in Docker does not require privileged containers, except for:
+
+- **Workers service**: Requires privileged mode for Kata VM sandboxing (`--privileged`)
+- **Device access**: GPU containers need device passthrough (handled automatically by profiles)
+
+Multi-host deployments can run Workers outside Docker or in privileged containers while keeping inference services in unprivileged containers.
