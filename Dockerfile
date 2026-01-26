@@ -263,4 +263,4 @@ EXPOSE 8080 50051
 
 # Run hyprstream
 ENTRYPOINT ["hyprstream"]
-CMD ["server"]
+CMD []
