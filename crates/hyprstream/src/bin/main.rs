@@ -9,7 +9,7 @@ use tracing::info;
 
 // Core application imports
 use hyprstream_core::auth::PolicyManager;
-use hyprstream_core::cli::commands::{Commands, ExecutionMode, TrainingAction};
+use hyprstream_core::cli::commands::{Commands, ExecutionMode, ServiceAction, TrainingAction};
 use hyprstream_core::cli::{
     handle_branch, handle_checkout, handle_clone, handle_infer, handle_info,
     handle_list, handle_policy_apply, handle_policy_apply_template,
@@ -26,6 +26,9 @@ use hyprstream_core::cli::{
     handle_worker_run, handle_worker_start, handle_worker_stats, handle_worker_status,
     handle_worker_terminal,
     handle_worker_stop,
+    // Service handlers
+    handle_service_install, handle_service_upgrade, handle_service_reinstall,
+    handle_service_uninstall, handle_service_start, handle_service_stop, handle_service_status,
 };
 
 #[cfg(feature = "experimental")]
@@ -65,7 +68,7 @@ use tracing_appender::rolling::{RollingFileAppender, Rotation};
 #[derive(Parser)]
 #[command(
     name = "hyprstream",
-    version = env!("CARGO_PKG_VERSION"),
+    version = env!("BUILD_VERSION"),
     about = "Real-time adaptive ML inference server with dynamic sparse weight adjustments",
     long_about = None
 )]
@@ -373,20 +376,6 @@ fn main() -> Result<()> {
 
     info!("Execution mode: {}", execution_mode);
 
-    // ========== SYSTEMD SOCKET UNITS ==========
-    // Ensure socket units are installed (idempotent) when using systemd mode
-    #[cfg(feature = "systemd")]
-    let _ = {
-        use hyprstream_core::cli::commands::ExecutionMode;
-        if execution_mode == ExecutionMode::IpcSystemd {
-            use hyprstream_core::cli::systemd_setup::ensure_units;
-            if std::env::var("HYPRSTREAM_NO_SYSTEMD").is_err() {
-                // Install systemd unit files for configured services
-                ensure_units(&config.services.startup);
-            }
-        }
-    };
-
     // ========== ENDPOINT REGISTRY INITIALIZATION ==========
     // Initialize the endpoint registry based on execution mode
     {
@@ -486,18 +475,9 @@ fn main() -> Result<()> {
         })
         .context("Failed to initialize services")?
     } else {
-        // For systemd/standalone modes, ensure services are running then connect via IPC
+        // For systemd/standalone modes, connect via IPC (services must be started explicitly)
         _registry_runtime
         .block_on(async {
-            use hyprstream_rpc::service::manager::detect as detect_manager;
-
-            // Ensure services are running (idempotent)
-            // Use configured startup services from config
-            let manager = detect_manager().await?;
-            for service in &config.services.startup {
-                manager.ensure(service).await?;
-            }
-
             let models_dir = config.models_dir();
             let keys_dir = models_dir.join(".registry").join("keys");
             let signing_key = load_or_generate_signing_key(&keys_dir).await?;
@@ -1316,154 +1296,230 @@ fn main() -> Result<()> {
             )?;
         }
 
-        // Service command: Run individual services for systemd socket activation
-        Commands::Service { name, ipc, callback } => {
+        // Service management and lifecycle commands
+        Commands::Service { action } => {
+            let services = config_for_service.services.startup.clone();
 
-            // Check if this is inference callback mode (inference@{id})
-            if let Some(callback_endpoint) = callback {
-                use anyhow::anyhow;
-                use hyprstream_core::services::InferenceService;
+            match action {
+                ServiceAction::Install { services: filter } => {
+                    with_runtime(
+                        RuntimeConfig {
+                            device: DeviceConfig::request_cpu(),
+                            multi_threaded: false,
+                        },
+                        || async move {
+                            handle_service_install(&services, filter).await
+                        },
+                    )?;
+                }
 
-                // Extract instance ID from name (e.g., "inference@abc123" -> "abc123")
-                let instance_id = if let Some(id) = name.strip_prefix("inference@") {
-                    id.to_string()
-                } else {
-                    return Err(anyhow!("--callback requires inference@{{id}} format (got: {})", name));
-                };
+                ServiceAction::Upgrade { services: filter } => {
+                    with_runtime(
+                        RuntimeConfig {
+                            device: DeviceConfig::request_cpu(),
+                            multi_threaded: false,
+                        },
+                        || async move {
+                            handle_service_upgrade(&services, filter).await
+                        },
+                    )?;
+                }
 
-                info!("Starting InferenceService in callback mode: {} -> {}", instance_id, callback_endpoint);
+                ServiceAction::Reinstall { services: filter } => {
+                    with_runtime(
+                        RuntimeConfig {
+                            device: DeviceConfig::request_cpu(),
+                            multi_threaded: false,
+                        },
+                        || async move {
+                            handle_service_reinstall(&services, filter).await
+                        },
+                    )?;
+                }
 
-                // Run in async context
-                return with_runtime(
-                    RuntimeConfig {
-                        device: DeviceConfig::request_cpu(),
-                        multi_threaded: false, // Single-threaded for inference
-                    },
-                    || async move {
-                        // Callback mode uses the PolicyService via ZMQ
-                        let data_dir = dirs::data_local_dir()
-                            .unwrap_or_else(|| std::path::PathBuf::from("."))
-                            .join("hyprstream");
-                        let keys_dir = data_dir.join("keys");
-                        let signing_key = load_or_generate_signing_key(&keys_dir).await?;
-                        let policy_client = PolicyZmqClient::new(
-                            signing_key.clone(),
-                            hyprstream_rpc::RequestIdentity::local(),
-                        );
+                ServiceAction::Uninstall { services: filter } => {
+                    with_runtime(
+                        RuntimeConfig {
+                            device: DeviceConfig::request_cpu(),
+                            multi_threaded: false,
+                        },
+                        || async move {
+                            handle_service_uninstall(&services, filter).await
+                        },
+                    )?;
+                }
 
-                        // Use default RuntimeConfig (inference will use model-specific config)
-                        let runtime_config = hyprstream_core::runtime::RuntimeConfig::default();
-
-                        // Start in callback mode (this blocks until shutdown)
-                        InferenceService::start_with_callback(
-                            instance_id,
-                            callback_endpoint,
-                            runtime_config,
-                            policy_client,
-                        ).await
-                    },
-                );
-            }
-
-            // Services must run with IPC sockets for distributed mode
-            let rpc_mode = if ipc {
-                hyprstream_rpc::registry::EndpointMode::Ipc
-            } else {
-                hyprstream_rpc::registry::EndpointMode::Inproc
-            };
-            // Note: worker endpoint mode now handled internally by factory
-
-            // Capture config for use in async block
-            let config = config_for_service;
-
-            with_runtime(
-                RuntimeConfig {
-                    device: DeviceConfig::request_cpu(),
-                    multi_threaded: true,
-                },
-                || async move {
-                    // Set up signal handler for graceful shutdown
-                    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
-                    // Spawn signal handler task
-                    tokio::spawn(async move {
-                        let _ = tokio::signal::ctrl_c().await;
-                        info!("Received shutdown signal");
-                        let _ = shutdown_tx.send(());
-                    });
-
-                    // Initialize endpoint registry for service process
-                    {
-                        use hyprstream_rpc::registry::init as init_registry;
-                        let runtime_dir = if ipc {
-                            Some(hyprstream_rpc::paths::runtime_dir())
-                        } else {
-                            None
-                        };
-                        init_registry(rpc_mode, runtime_dir);
-                    }
-
-                    // ========== UNIFIED SERVICE STARTUP via Factory ==========
-                    // Load signing key for ServiceContext
-                    let models_dir = config.models_dir();
-                    let keys_dir = models_dir.join(".registry").join("keys");
-                    let signing_key = load_or_generate_signing_key(&keys_dir).await?;
-                    let verifying_key = signing_key.verifying_key();
-
-                    // Create ServiceContext for factory
-                    let ctx = ServiceContext::new(
-                        global_context(),
-                        signing_key.clone(),
-                        verifying_key,
-                        ipc,
-                        models_dir.clone(),
-                    );
-
-                    // Look up service factory
-                    let factory = get_factory(&name)
-                        .ok_or_else(|| {
-                            let available: Vec<_> = hyprstream_rpc::service::list_factories()
-                                .map(|f| f.name)
-                                .collect();
-                            anyhow::anyhow!(
-                                "Unknown service: '{}'. Available services: {}",
-                                name,
-                                available.join(", ")
-                            )
+                ServiceAction::Start { name, foreground, daemon, ipc, callback } => {
+                    if foreground {
+                        // Foreground mode: run service directly (for systemd ExecStart)
+                        let name = name.ok_or_else(|| {
+                            anyhow::anyhow!("--foreground requires a service name")
                         })?;
 
-                    info!("Starting {} service in standalone mode (IPC: {})", name, ipc);
+                        // Check if this is inference callback mode (inference@{id})
+                        if let Some(callback_endpoint) = callback {
+                            use hyprstream_core::services::InferenceService;
 
-                    // Create and spawn the service
-                    let spawnable = (factory.factory)(&ctx)
-                        .context(format!("Failed to create {} service", name))?;
-                    let manager = InprocManager::new();
-                    let mut handle = manager.spawn(spawnable)
-                        .await
-                        .context(format!("Failed to start {} service", name))?;
+                            // Extract instance ID from name (e.g., "inference@abc123" -> "abc123")
+                            let instance_id = if let Some(id) = name.strip_prefix("inference@") {
+                                id.to_string()
+                            } else {
+                                return Err(anyhow::anyhow!("--callback requires inference@{{id}} format (got: {})", name));
+                            };
 
-                    // Publish ready event
-                    if let Ok(mut publisher) = hyprstream_workers::EventPublisher::new(&global_context(), "system") {
-                        let _ = publisher.publish_raw(&format!("system.{}.ready", name), b"").await;
+                            info!("Starting InferenceService in callback mode: {} -> {}", instance_id, callback_endpoint);
+
+                            return with_runtime(
+                                RuntimeConfig {
+                                    device: DeviceConfig::request_cpu(),
+                                    multi_threaded: false,
+                                },
+                                || async move {
+                                    let data_dir = dirs::data_local_dir()
+                                        .unwrap_or_else(|| std::path::PathBuf::from("."))
+                                        .join("hyprstream");
+                                    let keys_dir = data_dir.join("keys");
+                                    let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+                                    let policy_client = PolicyZmqClient::new(
+                                        signing_key.clone(),
+                                        hyprstream_rpc::RequestIdentity::local(),
+                                    );
+
+                                    let runtime_config = hyprstream_core::runtime::RuntimeConfig::default();
+
+                                    InferenceService::start_with_callback(
+                                        instance_id,
+                                        callback_endpoint,
+                                        runtime_config,
+                                        policy_client,
+                                    ).await
+                                },
+                            );
+                        }
+
+                        // Standard foreground service startup
+                        let rpc_mode = if ipc {
+                            hyprstream_rpc::registry::EndpointMode::Ipc
+                        } else {
+                            hyprstream_rpc::registry::EndpointMode::Inproc
+                        };
+
+                        let config = config_for_service;
+
+                        with_runtime(
+                            RuntimeConfig {
+                                device: DeviceConfig::request_cpu(),
+                                multi_threaded: true,
+                            },
+                            || async move {
+                                let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+                                tokio::spawn(async move {
+                                    let _ = tokio::signal::ctrl_c().await;
+                                    info!("Received shutdown signal");
+                                    let _ = shutdown_tx.send(());
+                                });
+
+                                {
+                                    use hyprstream_rpc::registry::init as init_registry;
+                                    let runtime_dir = if ipc {
+                                        Some(hyprstream_rpc::paths::runtime_dir())
+                                    } else {
+                                        None
+                                    };
+                                    init_registry(rpc_mode, runtime_dir);
+                                }
+
+                                let models_dir = config.models_dir();
+                                let keys_dir = models_dir.join(".registry").join("keys");
+                                let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+                                let verifying_key = signing_key.verifying_key();
+
+                                let ctx = ServiceContext::new(
+                                    global_context(),
+                                    signing_key.clone(),
+                                    verifying_key,
+                                    ipc,
+                                    models_dir.clone(),
+                                );
+
+                                let factory = get_factory(&name)
+                                    .ok_or_else(|| {
+                                        let available: Vec<_> = hyprstream_rpc::service::list_factories()
+                                            .map(|f| f.name)
+                                            .collect();
+                                        anyhow::anyhow!(
+                                            "Unknown service: '{}'. Available services: {}",
+                                            name,
+                                            available.join(", ")
+                                        )
+                                    })?;
+
+                                info!("Starting {} service in standalone mode (IPC: {})", name, ipc);
+
+                                let spawnable = (factory.factory)(&ctx)
+                                    .context(format!("Failed to create {} service", name))?;
+                                let manager = InprocManager::new();
+                                let mut handle = manager.spawn(spawnable)
+                                    .await
+                                    .context(format!("Failed to start {} service", name))?;
+
+                                if let Ok(mut publisher) = hyprstream_workers::EventPublisher::new(&global_context(), "system") {
+                                    let _ = publisher.publish_raw(&format!("system.{}.ready", name), b"").await;
+                                }
+
+                                info!("{} service ready, waiting for shutdown signal", name);
+
+                                let _ = shutdown_rx.await;
+
+                                if let Ok(mut publisher) = hyprstream_workers::EventPublisher::new(&global_context(), "system") {
+                                    let _ = publisher.publish_raw(&format!("system.{}.stopping", name), b"").await;
+                                }
+
+                                let _ = handle.stop().await;
+                                info!("{} service stopped", name);
+
+                                Ok(())
+                            },
+                        )?;
+                    } else {
+                        // Non-foreground: start via systemd or spawn in background
+                        with_runtime(
+                            RuntimeConfig {
+                                device: DeviceConfig::request_cpu(),
+                                multi_threaded: false,
+                            },
+                            || async move {
+                                handle_service_start(&services, name, daemon).await
+                            },
+                        )?;
                     }
+                }
 
-                    info!("{} service ready, waiting for shutdown signal", name);
+                ServiceAction::Stop { name } => {
+                    with_runtime(
+                        RuntimeConfig {
+                            device: DeviceConfig::request_cpu(),
+                            multi_threaded: false,
+                        },
+                        || async move {
+                            handle_service_stop(&services, name).await
+                        },
+                    )?;
+                }
 
-                    // Wait for shutdown
-                    let _ = shutdown_rx.await;
-
-                    // Publish stopping event
-                    if let Ok(mut publisher) = hyprstream_workers::EventPublisher::new(&global_context(), "system") {
-                        let _ = publisher.publish_raw(&format!("system.{}.stopping", name), b"").await;
-                    }
-
-                    // Stop service
-                    let _ = handle.stop().await;
-                    info!("{} service stopped", name);
-
-                    Ok(())
-                },
-            )?;
+                ServiceAction::Status { verbose } => {
+                    with_runtime(
+                        RuntimeConfig {
+                            device: DeviceConfig::request_cpu(),
+                            multi_threaded: false,
+                        },
+                        || async move {
+                            handle_service_status(&services, verbose).await
+                        },
+                    )?;
+                }
+            }
         }
 
     };

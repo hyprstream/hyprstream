@@ -2,7 +2,9 @@
 //!
 //! Generates socket and service unit files for hyprstream services.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+
+use crate::paths;
 
 /// Generate a systemd socket unit for a service
 ///
@@ -30,8 +32,17 @@ WantedBy=sockets.target
 ///
 /// Environment variables (LD_LIBRARY_PATH, LIBTORCH) are captured from
 /// the process environment and forwarded to the service unit.
+///
+/// Executable path priority for systemd units:
+/// 1. Installed binary at `~/.local/bin/hyprstream` (stable, survives updates)
+/// 2. `$APPIMAGE` path (when running from AppImage)
+/// 3. `current_exe()` fallback
 pub fn service_unit(service: &str) -> Result<String> {
-    let exec = std::env::current_exe()?;
+    // Prefer installed binary for systemd units (stable location)
+    let exec = paths::installed_executable_path()
+        .map(Ok)
+        .unwrap_or_else(|| paths::executable_path())
+        .context("Failed to get executable path")?;
 
     // Capture environment variables to forward to the service
     let ld_library_path = std::env::var("LD_LIBRARY_PATH").ok();
@@ -59,7 +70,7 @@ Description=Hyprstream {service} Service
 
 [Service]
 Type=notify
-ExecStart={exec} service {service} --ipc{env_section}
+ExecStart={exec} service start {service} --foreground{env_section}
 Restart=on-failure
 
 [Install]

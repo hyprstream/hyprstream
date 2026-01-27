@@ -61,8 +61,8 @@ impl SpawnerBackend for StandaloneBackend {
             cmd.env(key, value);
         }
 
-        // Enable kill on drop for cleanup
-        cmd.kill_on_drop(true);
+        // Disable kill on drop - daemon processes should outlive the spawner
+        cmd.kill_on_drop(false);
 
         // Spawn the process
         let child = cmd.spawn().map_err(|e| {
@@ -80,6 +80,15 @@ impl SpawnerBackend for StandaloneBackend {
         // Store the child handle
         self.processes
             .insert(id.clone(), Arc::new(Mutex::new(child)));
+
+        // Write PID file for daemon tracking
+        let pid_file = crate::paths::service_pid_file(&config.name);
+        if let Some(parent) = pid_file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(&pid_file, pid.to_string()) {
+            tracing::warn!("Failed to write PID file {:?}: {}", pid_file, e);
+        }
 
         tracing::info!(
             name = %config.name,

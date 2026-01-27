@@ -477,33 +477,106 @@ pub enum Commands {
     /// - `worker images` - Image management
     Worker(WorkerCommand),
 
-    /// Run a single service (for systemd socket activation or callback mode)
+    /// Service management and lifecycle commands
     ///
-    /// This command is used internally by systemd to run individual services.
-    /// Systemd socket activation spawns these when a connection arrives.
+    /// Install, manage, and control hyprstream services. Supports both systemd
+    /// (when available) and standalone process management.
     ///
     /// Examples:
-    ///   hyprstream service event --ipc    # Run event service with IPC sockets
-    ///   hyprstream service worker --ipc   # Run worker service with IPC sockets
-    ///   hyprstream service registry --ipc # Run registry service with IPC sockets
-    ///   hyprstream service inference@abc123 --callback ipc:///run/hyprstream/callback.sock
+    ///   hyprstream service install        # Install units and start all services
+    ///   hyprstream service status         # Show service status
+    ///   hyprstream service start registry # Start specific service
+    ///   hyprstream service stop           # Stop all services
+    ///   hyprstream service start registry --foreground  # Run in foreground (for systemd)
     Service {
-        /// Service name: event, worker, registry, policy, or inference@{id} for callback mode
-        name: String,
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
 
-        /// Use IPC sockets for distributed mode (required for systemd socket activation)
-        #[arg(long, default_value = "false")]
+/// Service management actions
+#[derive(Subcommand)]
+pub enum ServiceAction {
+    /// Install systemd units and start all services
+    ///
+    /// Creates systemd user unit files and starts all configured services.
+    /// Idempotent - safe to run multiple times.
+    Install {
+        /// Operate on specific services only (comma-separated)
+        #[arg(long, short = 's', value_delimiter = ',')]
+        services: Option<Vec<String>>,
+    },
+
+    /// Upgrade units with current binary path and restart services
+    ///
+    /// Useful after updating the hyprstream binary or moving the AppImage.
+    /// Updates unit files to point to the current executable location.
+    Upgrade {
+        /// Operate on specific services only
+        #[arg(long, short = 's', value_delimiter = ',')]
+        services: Option<Vec<String>>,
+    },
+
+    /// Full reset: stop, uninstall, reinstall, and start services
+    ///
+    /// Use this when services are in a broken state or after major changes.
+    Reinstall {
+        /// Operate on specific services only
+        #[arg(long, short = 's', value_delimiter = ',')]
+        services: Option<Vec<String>>,
+    },
+
+    /// Stop and remove systemd units
+    Uninstall {
+        /// Operate on specific services only
+        #[arg(long, short = 's', value_delimiter = ',')]
+        services: Option<Vec<String>>,
+    },
+
+    /// Start services (via systemd or direct spawn)
+    ///
+    /// Without --foreground: Uses systemd if available, else spawns background process.
+    /// With --foreground: Runs service in foreground (used by systemd ExecStart).
+    /// With --daemon: Bypasses systemd and spawns process directly.
+    Start {
+        /// Service name (all services if omitted)
+        name: Option<String>,
+
+        /// Run in foreground instead of background
+        ///
+        /// Used by systemd unit files (ExecStart) to run the service process.
+        /// When running manually, keeps the service attached to the terminal.
+        #[arg(long, short = 'f', visible_alias = "fg")]
+        foreground: bool,
+
+        /// Force daemon mode (bypass systemd, spawn process directly)
+        ///
+        /// Use this to run services as standalone daemons even when systemd is available.
+        #[arg(long, short = 'd')]
+        daemon: bool,
+
+        /// Use IPC sockets for distributed mode
+        #[arg(long)]
         ipc: bool,
 
-        /// Callback endpoint for callback mode (inference service only)
-        ///
-        /// When specified, the inference service runs in callback mode:
-        /// 1. Connects DEALER to this ROUTER endpoint
-        /// 2. Sends Register message with its stream endpoint
-        /// 3. Waits for LoadModel command
-        /// 4. Handles Infer/Shutdown commands
+        /// Callback endpoint for inference service callback mode
         #[arg(long)]
         callback: Option<String>,
+    },
+
+    /// Stop services
+    Stop {
+        /// Service name (all services if omitted)
+        name: Option<String>,
+    },
+
+    /// Show service status
+    ///
+    /// Displays running services, unit file locations, and execution mode.
+    Status {
+        /// Show verbose output including unit file contents
+        #[arg(long, short = 'v')]
+        verbose: bool,
     },
 }
 

@@ -2,6 +2,7 @@
 
 use std::env;
 use std::path::Path;
+use std::process::Command;
 
 fn main() {
     if std::env::var("DOCS_RS").is_ok() {
@@ -10,6 +11,11 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=schema/");
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/index");
+
+    // Capture git info for version string
+    capture_git_info();
 
     // Compile Cap'n Proto schemas
     compile_capnp_schemas();
@@ -93,4 +99,109 @@ fn compile_capnp_schemas() {
             .run()
             .expect("failed to compile model.capnp");
     }
+}
+
+/// Capture git info and export as environment variables for the build
+///
+/// Exports:
+/// - GIT_SHA: 7-char commit SHA (e.g., "abc1234")
+/// - GIT_BRANCH: sanitized branch name (e.g., "main", "feature-auth")
+/// - GIT_DIRTY: "true" or "false"
+fn capture_git_info() {
+    // Get commit SHA (short)
+    let sha = Command::new("git")
+        .args(["rev-parse", "--short=7", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    // Get branch name
+    let branch = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .map(|b| if b == "HEAD" { String::new() } else { b }) // Detached HEAD
+        .unwrap_or_default();
+
+    // Check if worktree is dirty
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false);
+
+    // Sanitize branch name for filesystem safety
+    let sanitized_branch = sanitize_git_ref(&branch);
+
+    // Export individual components as environment variables
+    println!("cargo:rustc-env=GIT_SHA={}", sha);
+    println!("cargo:rustc-env=GIT_BRANCH={}", sanitized_branch);
+    println!("cargo:rustc-env=GIT_DIRTY={}", dirty);
+
+    // Build complete version string
+    let cargo_version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_string());
+    let build_version = if sha.is_empty() {
+        cargo_version
+    } else {
+        let mut v = format!("{}+", cargo_version);
+        if !sanitized_branch.is_empty() {
+            v.push_str(&sanitized_branch);
+            v.push('.');
+        }
+        v.push('g');
+        v.push_str(&sha);
+        if dirty {
+            v.push_str(".dirty");
+        }
+        v
+    };
+    println!("cargo:rustc-env=BUILD_VERSION={}", build_version);
+}
+
+/// Sanitize a git ref name for safe use in filesystem paths
+///
+/// - Lowercase
+/// - Replace `/`, `.`, ` ` with `-`
+/// - Remove other special characters
+/// - Collapse multiple `-` into one
+/// - Trim leading/trailing `-`
+/// - Limit to 50 characters
+fn sanitize_git_ref(ref_name: &str) -> String {
+    let sanitized: String = ref_name
+        .to_lowercase()
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | '0'..='9' | '-' | '_' => c,
+            '/' | '.' | ' ' => '-',
+            _ => '-',
+        })
+        .collect();
+
+    // Collapse multiple dashes and trim
+    let mut result = String::with_capacity(sanitized.len());
+    let mut last_was_dash = true; // Start true to trim leading dashes
+    for c in sanitized.chars().take(50) {
+        if c == '-' {
+            if !last_was_dash {
+                result.push(c);
+                last_was_dash = true;
+            }
+        } else {
+            result.push(c);
+            last_was_dash = false;
+        }
+    }
+
+    // Trim trailing dash
+    if result.ends_with('-') {
+        result.pop();
+    }
+
+    result
 }
