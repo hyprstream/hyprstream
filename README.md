@@ -1,4 +1,4 @@
-# HyprStream: agentic cloud operating system and orchestrator
+# HyprStream: agentic infrastructure for continously learning applications
 
 [![Rust](https://github.com/hyprstream/hyprstream/actions/workflows/rust.yml/badge.svg)](https://github.com/hyprstream/hyprstream/actions/workflows/rust.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE-AGPLV3)
@@ -6,7 +6,7 @@
 
 ## Overview
 
-HyprStream is an agentic cloud operating system for local and distributed computing, for continous development, integration, and deployment of software and AI/ML models. Primary features include an LLM inference and training engine built in Rust, with PyTorch, featuring integrated training capabilities, version control, and secure tool use with microvm containers.
+HyprStream is an agentic cloud infrastructure for applications that learn, build, and run. Integrating continous development, training, integration, and deployment of software and AI/ML models. Primary features include an LLM inference and training engine built in Rust, with PyTorch, featuring integrated training capabilities, version control, and secure tool use with microvm containers.
 
 Users may communicate with open weight and custom LLMs via Hyprstream with an OpenAI API.
 
