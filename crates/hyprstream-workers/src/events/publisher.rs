@@ -42,7 +42,7 @@ impl EventPublisher {
     pub fn new(context: &Arc<zmq::Context>, source: &str) -> Result<Self> {
         let endpoint = match registry::try_global() {
             Some(reg) => reg.endpoint("events", SocketKind::Pub).to_zmq_string(),
-            None => endpoints::PUB.to_string(),
+            None => endpoints::PUB.to_owned(),
         };
         Self::with_endpoint(context, source, &endpoint)
     }
@@ -71,7 +71,7 @@ impl EventPublisher {
 
         Ok(Self {
             socket,
-            source: source.to_string(),
+            source: source.to_owned(),
         })
     }
 
@@ -135,7 +135,7 @@ impl EventPublisher {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     #[test]
     fn test_topic_validation() {

@@ -38,7 +38,7 @@ pub fn create_tag(repo_path: impl AsRef<Path>, tag_name: &str) -> Result<()> {
 
     // Create lightweight tag (overwrites if exists)
     repo.tag_lightweight(tag_name, &commit.into_object(), true)
-        .with_context(|| format!("Failed to create tag '{}'", tag_name))?;
+        .with_context(|| format!("Failed to create tag '{tag_name}'"))?;
 
     tracing::debug!("Created tag '{}' at {}", tag_name, commit_id);
 

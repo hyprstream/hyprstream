@@ -84,3 +84,6 @@ tokio-test = "0.4"
 default = []
 # Enable additional debug logging
 debug = []
+
+[lints]
+workspace = true

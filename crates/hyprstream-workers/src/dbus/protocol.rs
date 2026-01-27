@@ -9,18 +9,15 @@ use std::collections::HashMap;
 /// D-Bus bus type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum BusType {
     /// System bus (/var/run/dbus/system_bus_socket)
     System,
     /// Session bus ($DBUS_SESSION_BUS_ADDRESS)
+    #[default]
     Session,
 }
 
-impl Default for BusType {
-    fn default() -> Self {
-        BusType::Session
-    }
-}
 
 impl std::fmt::Display for BusType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -285,7 +282,7 @@ impl DbusError {
     pub fn access_denied(resource: &str) -> Self {
         Self::new(
             "org.freedesktop.DBus.Error.AccessDenied",
-            format!("Access denied to {}", resource),
+            format!("Access denied to {resource}"),
         )
     }
 
@@ -293,7 +290,7 @@ impl DbusError {
     pub fn service_unknown(service: &str) -> Self {
         Self::new(
             "org.freedesktop.DBus.Error.ServiceUnknown",
-            format!("Service {} is not available", service),
+            format!("Service {service} is not available"),
         )
     }
 
@@ -301,7 +298,7 @@ impl DbusError {
     pub fn method_not_found(interface: &str, method: &str) -> Self {
         Self::new(
             "org.freedesktop.DBus.Error.UnknownMethod",
-            format!("Method {}.{} not found", interface, method),
+            format!("Method {interface}.{method} not found"),
         )
     }
 }
@@ -403,8 +400,8 @@ mod tests {
     #[test]
     fn test_dbus_value_serialization() {
         let value = DbusValue::Dict(HashMap::from([
-            ("app_name".to_string(), DbusValue::String("test".to_string())),
-            ("urgency".to_string(), DbusValue::Uint32(1)),
+            ("app_name".to_owned(), DbusValue::String("test".to_owned())),
+            ("urgency".to_owned(), DbusValue::Uint32(1)),
         ]));
 
         let json = serde_json::to_string(&value).unwrap();
@@ -428,7 +425,7 @@ mod tests {
             "Notify",
         )
         .bus(BusType::Session)
-        .arg(DbusValue::String("app".to_string()))
+        .arg(DbusValue::String("app".to_owned()))
         .arg(DbusValue::Uint32(0))
         .timeout(5000);
 

@@ -155,7 +155,7 @@ impl ModelCache {
         // Create cached entry
         let cached_model = CachedModel {
             commit_id,
-            model_ref: model_ref_str.to_string(),
+            model_ref: model_ref_str.to_owned(),
             client: client.clone(),
             last_accessed: std::time::Instant::now(),
         };
@@ -344,7 +344,7 @@ impl ModelCache {
             if let Ok(worktrees) = repo.worktrees() {
                 for worktree_name in worktrees.iter().flatten() {
                     if worktree_name.starts_with("cache-") {
-                        cache_worktrees.push(worktree_name.to_string());
+                        cache_worktrees.push(worktree_name.to_owned());
                     }
                 }
             }

@@ -87,7 +87,7 @@ impl CapabilitySet {
             self.by_id.insert(id);
             Ok(())
         } else {
-            Err(UnknownCapability(id.to_string()))
+            Err(UnknownCapability(id.to_owned()))
         }
     }
 

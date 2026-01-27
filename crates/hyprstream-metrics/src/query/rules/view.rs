@@ -84,15 +84,14 @@ impl ViewOptimizationRule {
     async fn find_matching_view(&self, plan: &LogicalPlan) -> Result<Option<ViewMetadata>> {
         // Get list of available views
         let views = self.storage.list_views().await.map_err(|e| {
-            datafusion::error::DataFusionError::Internal(format!("Failed to list views: {}", e))
+            datafusion::error::DataFusionError::Internal(format!("Failed to list views: {e}"))
         })?;
 
         // For each view, check if it can be used for this query
         for view_name in views {
             let view = self.storage.get_view(&view_name).await.map_err(|e| {
                 datafusion::error::DataFusionError::Internal(format!(
-                    "Failed to get view metadata: {}",
-                    e
+                    "Failed to get view metadata: {e}"
                 ))
             })?;
 
@@ -137,8 +136,7 @@ impl ViewOptimizationRule {
                 )
                 .map_err(|e| {
                     datafusion::error::DataFusionError::Internal(format!(
-                        "Failed to convert schema: {}",
-                        e
+                        "Failed to convert schema: {e}"
                     ))
                 })?;
                 let df_schema = Arc::new(df_schema);
@@ -181,12 +179,12 @@ impl OptimizerRule for ViewOptimizationRule {
         // Get matching view and rewrite plan
         // Note: This is a blocking operation, but it's acceptable for testing
         let views = futures::executor::block_on(self.storage.list_views())
-            .map_err(|e| datafusion::error::DataFusionError::Internal(format!("Failed to list views: {}", e)))?;
+            .map_err(|e| datafusion::error::DataFusionError::Internal(format!("Failed to list views: {e}")))?;
         
         // For each view, check if it can be used for this query
         for view_name in views {
             let view = futures::executor::block_on(self.storage.get_view(&view_name))
-                .map_err(|e| datafusion::error::DataFusionError::Internal(format!("Failed to get view metadata: {}", e)))?;
+                .map_err(|e| datafusion::error::DataFusionError::Internal(format!("Failed to get view metadata: {e}")))?;
             
             if self.can_use_view(&plan, &view)? {
                 let new_plan = self.rewrite_with_view(&plan, &view)?;
@@ -210,7 +208,7 @@ mod tests {
         // Create test backend
         let backend = Arc::new(DuckDbBackend::new_in_memory().unwrap());
         backend.init().await.map_err(|e|
-            datafusion::error::DataFusionError::Internal(format!("Failed to init backend: {}", e))
+            datafusion::error::DataFusionError::Internal(format!("Failed to init backend: {e}"))
         )?;
 
         // Create source table
@@ -222,13 +220,13 @@ mod tests {
             .create_table("test_source", &source_schema)
             .await
             .map_err(|e|
-                datafusion::error::DataFusionError::Internal(format!("Failed to create table: {}", e))
+                datafusion::error::DataFusionError::Internal(format!("Failed to create table: {e}"))
             )?;
 
         // Create view
         let view_def = ViewDefinition::new(
-            "test_source".to_string(),
-            vec!["metric".to_string(), "value".to_string()],
+            "test_source".to_owned(),
+            vec!["metric".to_owned(), "value".to_owned()],
             vec![],
             None,
             None,
@@ -241,7 +239,7 @@ mod tests {
             .create_view("test_view", view_def)
             .await
             .map_err(|e|
-                datafusion::error::DataFusionError::Internal(format!("Failed to create view: {}", e))
+                datafusion::error::DataFusionError::Internal(format!("Failed to create view: {e}"))
             )?;
 
         // Create optimizer rule
@@ -251,7 +249,7 @@ mod tests {
         let arrow_schema = source_schema.as_ref().clone();
         let df_schema = DFSchema::try_from(arrow_schema.clone())
             .map_err(|e|
-                datafusion::error::DataFusionError::Internal(format!("Failed to convert schema: {}", e))
+                datafusion::error::DataFusionError::Internal(format!("Failed to convert schema: {e}"))
             )?;
         let plan = LogicalPlan::TableScan(TableScan {
             table_name: "test_source".into(),

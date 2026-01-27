@@ -108,7 +108,7 @@ fn extract_cache_owner(headers: &HeaderMap) -> CacheOwner {
         .filter(|s| !s.is_empty())
     {
         trace!("Using session-based caching for session: {}", session_id);
-        CacheOwner::Session(session_id.to_string())
+        CacheOwner::Session(session_id.to_owned())
     } else {
         // Stateless request - generate unique ID
         let request_id = std::time::SystemTime::now()
@@ -131,7 +131,7 @@ fn extract_user_from_auth(auth_user: Option<&AuthenticatedUser>) -> String {
     }
 
     trace!("No authentication provided, using anonymous identity");
-    "anonymous".to_string()
+    "anonymous".to_owned()
 }
 
 /// Helper: Resolve model name to filesystem path (also validates inference capability)
@@ -145,7 +145,7 @@ async fn resolve_model_path(
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(
-                    format!("Invalid model reference: {}", e),
+                    format!("Invalid model reference: {e}"),
                     "invalid_model_ref",
                     "parse_error",
                 )),
@@ -181,7 +181,7 @@ async fn resolve_model_path(
         Err(e) => Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse::new(
-                format!("Model path not found: {}", e),
+                format!("Model path not found: {e}"),
                 "model_not_found",
                 "path_error",
             )),
@@ -246,7 +246,7 @@ async fn chat_completions(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
-                    format!("Policy check failed: {}", e),
+                    format!("Policy check failed: {e}"),
                     "policy_error",
                     "internal_error",
                 )),
@@ -312,7 +312,7 @@ async fn chat_completions(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
-                    format!("Failed to apply chat template: {}", e),
+                    format!("Failed to apply chat template: {e}"),
                     "template_error",
                     "internal_error",
                 )),
@@ -361,13 +361,13 @@ async fn chat_completions(
 
             let response = ChatCompletionResponse {
                 id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
-                object: "chat.completion".to_string(),
+                object: "chat.completion".to_owned(),
                 created: chrono::Utc::now().timestamp(),
                 model: request.model.clone(),
                 choices: vec![ChatChoice {
                     index: 0,
                     message: ChatMessage {
-                        role: "assistant".to_string(),
+                        role: "assistant".to_owned(),
                         content: Some(generation.text),
                         function_call: None,
                     },
@@ -378,8 +378,7 @@ async fn chat_completions(
                             FinishReason::EndOfSequence => "stop",
                             FinishReason::Stop => "stop",
                             FinishReason::Error(_) => "stop",
-                        }
-                        .to_string(),
+                        }.to_owned(),
                     ),
                 }],
                 usage: Some(Usage {
@@ -707,12 +706,12 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                 } else {
                     // Send data chunk
                     Ok(axum::response::sse::Event::default()
-                        .data(serde_json::to_string(&json).unwrap_or_else(|_| "{}".to_string())))
+                        .data(serde_json::to_string(&json).unwrap_or_else(|_| "{}".to_owned())))
                 }
             }
             Err(e) => {
                 // Send error
-                Ok(axum::response::sse::Event::default().data(format!("{{\"error\": \"{}\"}}", e)))
+                Ok(axum::response::sse::Event::default().data(format!("{{\"error\": \"{e}\"}}")))
             }
         }
     });
@@ -767,7 +766,7 @@ async fn completions(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
-                    format!("Policy check failed: {}", e),
+                    format!("Policy check failed: {e}"),
                     "policy_error",
                     "internal_error",
                 )),
@@ -797,7 +796,7 @@ async fn completions(
     // Convert raw prompt to chat format and apply template via ZMQ ModelService
     // The completions endpoint expects raw text, but modern models need templated input
     let messages = vec![ChatMessage {
-        role: "user".to_string(),
+        role: "user".to_owned(),
         content: Some(request.prompt.clone()),
         function_call: None,
     }];
@@ -813,7 +812,7 @@ async fn completions(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
-                    format!("Template formatting failed: {}", e),
+                    format!("Template formatting failed: {e}"),
                     "template_error",
                     "template_formatting_failed",
                 )),
@@ -842,14 +841,14 @@ async fn completions(
         Ok(generation) => {
             let response = CompletionResponse {
                 id: format!("cmpl-{}", uuid::Uuid::new_v4()),
-                object: "text_completion".to_string(),
+                object: "text_completion".to_owned(),
                 created: chrono::Utc::now().timestamp(),
                 model: request.model.clone(),
                 choices: vec![CompletionChoice {
                     text: generation.text,
                     index: 0,
                     logprobs: None,
-                    finish_reason: Some("stop".to_string()),
+                    finish_reason: Some("stop".to_owned()),
                 }],
                 usage: Some(Usage {
                     prompt_tokens: request.prompt.len() / 4, // Rough estimate: 4 chars per token
@@ -911,7 +910,7 @@ async fn list_models(State(state): State<ServerState>) -> impl IntoResponse {
                 let model_id = model_ref.to_string();
 
                 // Build owned_by field with worktree metadata
-                let mut owned_by_parts = vec!["system".to_string()];
+                let mut owned_by_parts = vec!["system".to_owned()];
 
                 // Add worktree metadata tags (driver, space saved, age)
                 if !metadata.tags.is_empty() {
@@ -925,7 +924,7 @@ async fn list_models(State(state): State<ServerState>) -> impl IntoResponse {
 
                 models.push(Model {
                     id: model_id,
-                    object: "model".to_string(),
+                    object: "model".to_owned(),
                     created: metadata.created_at,
                     owned_by,
                 });
@@ -938,7 +937,7 @@ async fn list_models(State(state): State<ServerState>) -> impl IntoResponse {
 
     // Add no-cache headers
     let mut response = Json(ListModelsResponse {
-        object: "list".to_string(),
+        object: "list".to_owned(),
         data: models,
     })
     .into_response();

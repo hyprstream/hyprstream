@@ -52,9 +52,9 @@ impl ModelRef {
                 // Use git2db's GitRef::parse() and convert error
                 let git_ref = GitRef::parse(r)
                     .map_err(|e| anyhow::anyhow!("Failed to parse git ref '{}': {}", r, e))?;
-                (m.to_string(), git_ref)
+                (m.to_owned(), git_ref)
             }
-            None => (s.to_string(), GitRef::DefaultBranch),
+            None => (s.to_owned(), GitRef::DefaultBranch),
         };
 
         // Validate model name
@@ -174,12 +174,12 @@ mod tests {
         // Model with branch
         let ref2 = ModelRef::parse("llama3:main").expect("test: parse model ref");
         assert_eq!(ref2.model, "llama3");
-        assert_eq!(ref2.git_ref, GitRef::Branch("main".to_string()));
+        assert_eq!(ref2.git_ref, GitRef::Branch("main".to_owned()));
 
         // Model with tag (must use explicit tag syntax)
         let ref3 = ModelRef::parse("llama3:tags/v2.0").expect("test: parse model ref");
         assert_eq!(ref3.model, "llama3");
-        assert_eq!(ref3.git_ref, GitRef::Tag("v2.0".to_string()));
+        assert_eq!(ref3.git_ref, GitRef::Tag("v2.0".to_owned()));
 
         // Model with commit SHA
         let ref4 = ModelRef::parse("llama3:1234567890abcdef1234567890abcdef12345678").expect("test: parse model ref");
@@ -193,7 +193,7 @@ mod tests {
         // Model with revspec
         let ref5 = ModelRef::parse("llama3:HEAD~1").expect("test: parse model ref");
         assert_eq!(ref5.model, "llama3");
-        assert_eq!(ref5.git_ref, GitRef::Revspec("HEAD~1".to_string()));
+        assert_eq!(ref5.git_ref, GitRef::Revspec("HEAD~1".to_owned()));
 
         // UUID backwards compatibility
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
@@ -207,7 +207,7 @@ mod tests {
         // Test GitRef parsing (now using git2db's GitRef::parse)
         assert_eq!(
             GitRef::parse("main").expect("test: parse git ref"),
-            GitRef::Branch("main".to_string())
+            GitRef::Branch("main".to_owned())
         );
         // Explicit tag syntax required
         assert!(matches!(
@@ -243,13 +243,13 @@ mod tests {
         // Test display_name (git2db's API)
         assert_eq!(GitRef::DefaultBranch.display_name(), "HEAD");
         assert_eq!(
-            GitRef::Branch("main".to_string()).display_name(),
+            GitRef::Branch("main".to_owned()).display_name(),
             "main"
         );
         // git2db's Tag display includes tags/ prefix
-        assert!(GitRef::Tag("v1.0".to_string()).display_name().contains("v1.0"));
+        assert!(GitRef::Tag("v1.0".to_owned()).display_name().contains("v1.0"));
         assert_eq!(
-            GitRef::Revspec("HEAD~1".to_string()).display_name(),
+            GitRef::Revspec("HEAD~1".to_owned()).display_name(),
             "HEAD~1"
         );
 
@@ -264,7 +264,7 @@ mod tests {
         let model_ref = ModelRef::parse("llama3:main").expect("test: parse model ref");
 
         // Should have compatible git_ref_str method
-        assert_eq!(model_ref.git_ref_str(), Some("main".to_string()));
+        assert_eq!(model_ref.git_ref_str(), Some("main".to_owned()));
 
         // Should display the same as before
         assert_eq!(model_ref.to_string(), "llama3:main");

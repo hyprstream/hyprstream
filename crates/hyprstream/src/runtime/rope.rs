@@ -297,7 +297,7 @@ impl RoPEManager {
     ) -> Result<&mut RoPE> {
         if !self.ropes.contains_key(layer_name) {
             let rope = RoPE::new(dim, base, max_seq_len, device)?;
-            self.ropes.insert(layer_name.to_string(), rope);
+            self.ropes.insert(layer_name.to_owned(), rope);
         }
         self.ropes
             .get_mut(layer_name)
@@ -316,7 +316,7 @@ impl RoPEManager {
     ) -> Result<&mut RoPE> {
         if !self.ropes.contains_key(layer_name) {
             let rope = RoPE::new_with_dtype(dim, base, max_seq_len, device, dtype)?;
-            self.ropes.insert(layer_name.to_string(), rope);
+            self.ropes.insert(layer_name.to_owned(), rope);
         }
         self.ropes
             .get_mut(layer_name)
@@ -349,7 +349,7 @@ mod tests {
         let mut rope = RoPE::new(64, 10000.0, 2048, device).expect("test: create rope");
 
         // Create test tensor: [batch=1, seq=8, heads=2, dim=64]
-        let x = Tensor::randn(&[1, 8, 2, 64], (Kind::Float, device));
+        let x = Tensor::randn([1, 8, 2, 64], (Kind::Float, device));
         let result = rope.forward(&x, None).expect("test: rope forward");
 
         assert_eq!(result.size(), x.size());
@@ -362,7 +362,7 @@ mod tests {
         let mut rope = RoPE::new(128, 1000000.0, 4096, device).expect("test: create rope");
 
         // Create test tensor: [batch=1, seq=16, heads=32, dim=128]
-        let x = Tensor::randn(&[1, 16, 32, 128], (Kind::Float, device));
+        let x = Tensor::randn([1, 16, 32, 128], (Kind::Float, device));
         let result = rope.forward(&x, None).expect("test: rope forward");
 
         assert_eq!(result.size(), x.size());
@@ -388,18 +388,18 @@ mod tests {
         let mut rope = RoPE::new(64, 10000.0, 2048, device).expect("test: create rope");
 
         // Test the exact shape from the error: [1, 6, 32, 64]
-        let x = Tensor::randn(&[1, 6, 32, 64], (Kind::Float, device));
+        let x = Tensor::randn([1, 6, 32, 64], (Kind::Float, device));
         let result = rope.forward(&x, None).expect("test: rope forward");
 
         assert_eq!(result.size(), vec![1, 6, 32, 64]);
 
         // Test with different batch dimensions
-        let x2 = Tensor::randn(&[2, 8, 16, 64], (Kind::Float, device));
+        let x2 = Tensor::randn([2, 8, 16, 64], (Kind::Float, device));
         let result2 = rope.forward(&x2, None).expect("test: rope forward");
         assert_eq!(result2.size(), vec![2, 8, 16, 64]);
 
         // Test 3D tensor (no batch dimension)
-        let x3 = Tensor::randn(&[10, 4, 64], (Kind::Float, device));
+        let x3 = Tensor::randn([10, 4, 64], (Kind::Float, device));
         let result3 = rope.forward(&x3, None).expect("test: rope forward");
         assert_eq!(result3.size(), vec![10, 4, 64]);
     }

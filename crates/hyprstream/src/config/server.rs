@@ -40,10 +40,10 @@ fn default_cors_enabled() -> bool {
 }
 fn default_cors_origins() -> Vec<String> {
     vec![
-        "http://localhost:3000".to_string(),
-        "http://localhost:3001".to_string(),
-        "http://127.0.0.1:3000".to_string(),
-        "http://127.0.0.1:3001".to_string(),
+        "http://localhost:3000".to_owned(),
+        "http://localhost:3001".to_owned(),
+        "http://127.0.0.1:3000".to_owned(),
+        "http://127.0.0.1:3001".to_owned(),
     ]
 }
 fn default_cors_credentials() -> bool {
@@ -201,7 +201,7 @@ pub struct ServerConfig {
 
 // Default value functions for serde
 fn default_host() -> String {
-    "0.0.0.0".to_string()
+    "0.0.0.0".to_owned()
 }
 fn default_port() -> u16 {
     50051
@@ -225,7 +225,7 @@ fn default_cancellation_check_interval() -> u64 {
     100
 }
 fn default_tls_min_version() -> String {
-    "1.2".to_string()
+    "1.2".to_owned()
 }
 
 impl Default for ServerConfig {
@@ -462,7 +462,7 @@ impl ServerConfigBuilder {
         if let Ok(models) = std::env::var("HYPRSTREAM_PRELOAD_MODELS") {
             self.config.preload_models = models
                 .split(',')
-                .map(|s| s.trim().to_string())
+                .map(|s| s.trim().to_owned())
                 .filter(|s| !s.is_empty())
                 .collect();
         }
@@ -475,17 +475,17 @@ impl ServerConfigBuilder {
         if let Ok(cors_origins) = std::env::var("HYPRSTREAM_CORS_ORIGINS") {
             self.config.cors.allowed_origins = cors_origins
                 .split(',')
-                .map(|s| s.trim().to_string())
+                .map(|s| s.trim().to_owned())
                 .filter(|s| !s.is_empty())
                 .collect();
 
-            if self.config.cors.allowed_origins.contains(&"*".to_string()) {
+            if self.config.cors.allowed_origins.contains(&"*".to_owned()) {
                 self.config.cors.allow_credentials = false;
             }
         }
 
         if let Ok(cors_credentials) = std::env::var("HYPRSTREAM_CORS_CREDENTIALS") {
-            if !self.config.cors.allowed_origins.contains(&"*".to_string()) {
+            if !self.config.cors.allowed_origins.contains(&"*".to_owned()) {
                 self.config.cors.allow_credentials = cors_credentials.to_lowercase() == "true";
             }
         }

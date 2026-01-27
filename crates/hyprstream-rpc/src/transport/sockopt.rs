@@ -69,8 +69,7 @@ mod tests {
         let supported = supports_use_fd();
         let (major, minor, patch) = zmq::version();
         println!(
-            "libzmq version: {}.{}.{}, ZMQ_USE_FD supported: {}",
-            major, minor, patch, supported
+            "libzmq version: {major}.{minor}.{patch}, ZMQ_USE_FD supported: {supported}"
         );
     }
 

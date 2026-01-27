@@ -160,8 +160,8 @@ mod tests {
     #[tokio::test]
     async fn test_initialize_idempotent() {
         let config = XetConfig {
-            endpoint: "https://cas.xet.dev".to_string(),
-            token: Some("test".to_string()),
+            endpoint: "https://cas.xet.dev".to_owned(),
+            token: Some("test".to_owned()),
             compression: None,
         };
 

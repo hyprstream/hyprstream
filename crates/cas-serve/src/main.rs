@@ -88,14 +88,14 @@ impl CasServer {
         let xorb_path = self
             .storage_path
             .join("xorbs")
-            .join(format!("default.{}", hash));
+            .join(format!("default.{hash}"));
 
         match tokio::fs::read(&xorb_path).await {
             Ok(data) => Response::file(&data),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Response::error(ErrorCode::NotFound, format!("XORB not found: {}", hash))
+                Response::error(ErrorCode::NotFound, format!("XORB not found: {hash}"))
             }
-            Err(e) => Response::error(ErrorCode::IoError, format!("Failed to read file: {}", e)),
+            Err(e) => Response::error(ErrorCode::IoError, format!("Failed to read file: {e}")),
         }
     }
 
@@ -109,7 +109,7 @@ impl CasServer {
         let xorb_path = self
             .storage_path
             .join("xorbs")
-            .join(format!("default.{}", hash));
+            .join(format!("default.{hash}"));
 
         let exists = xorb_path.exists();
         Response::Exists { exists }
@@ -122,7 +122,7 @@ impl CasServer {
         let decoded = match base64::engine::general_purpose::STANDARD.decode(data) {
             Ok(d) => d,
             Err(e) => {
-                return Response::error(ErrorCode::InvalidRequest, format!("Invalid base64: {}", e))
+                return Response::error(ErrorCode::InvalidRequest, format!("Invalid base64: {e}"))
             }
         };
 
@@ -135,14 +135,14 @@ impl CasServer {
         if let Err(e) = tokio::fs::create_dir_all(&xorbs_dir).await {
             return Response::error(
                 ErrorCode::IoError,
-                format!("Failed to create xorbs directory: {}", e),
+                format!("Failed to create xorbs directory: {e}"),
             );
         }
 
         // Write the XORB file
-        let xorb_path = xorbs_dir.join(format!("default.{}", hash_hex));
+        let xorb_path = xorbs_dir.join(format!("default.{hash_hex}"));
         if let Err(e) = tokio::fs::write(&xorb_path, &decoded).await {
-            return Response::error(ErrorCode::UploadFailed, format!("Failed to write XORB: {}", e));
+            return Response::error(ErrorCode::UploadFailed, format!("Failed to write XORB: {e}"));
         }
 
         Response::UploadSuccess { hash: hash_hex }
@@ -213,10 +213,10 @@ fn main() -> anyhow::Result<()> {
             Err(e) => {
                 let response = Response::error(
                     ErrorCode::InvalidRequest,
-                    format!("Failed to parse request: {}", e),
+                    format!("Failed to parse request: {e}"),
                 );
                 let json = serde_json::to_string(&response)?;
-                writeln!(stdout_lock, "{}", json)?;
+                writeln!(stdout_lock, "{json}")?;
                 stdout_lock.flush()?;
                 continue;
             }
@@ -231,7 +231,7 @@ fn main() -> anyhow::Result<()> {
         // Send response
         let json = serde_json::to_string(&response)?;
         debug!("Sending: {}", json);
-        writeln!(stdout_lock, "{}", json)?;
+        writeln!(stdout_lock, "{json}")?;
         stdout_lock.flush()?;
 
         // Exit on shutdown

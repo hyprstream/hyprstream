@@ -50,7 +50,7 @@ pub struct FlightConfig {
 impl Default for FlightConfig {
     fn default() -> Self {
         Self {
-            host: "127.0.0.1".to_string(),
+            host: "127.0.0.1".to_owned(),
             port: 50051,
             tls_cert: None,
             tls_key: None,
@@ -126,8 +126,8 @@ pub async fn start_flight_server(
         let tracked = registry_client
             .get_by_name(dataset_name)
             .await
-            .map_err(|e| format!("Failed to look up dataset: {}", e))?
-            .ok_or_else(|| format!("Dataset '{}' not found in registry", dataset_name))?;
+            .map_err(|e| format!("Failed to look up dataset: {e}"))?
+            .ok_or_else(|| format!("Dataset '{dataset_name}' not found in registry"))?;
 
         let dataset_path = PathBuf::from(&tracked.worktree_path);
 
@@ -142,23 +142,23 @@ pub async fn start_flight_server(
         if db_path.exists() {
             db_path.to_string_lossy().to_string()
         } else {
-            ":memory:".to_string()
+            ":memory:".to_owned()
         }
     } else {
         info!("Starting Flight SQL server with in-memory database");
-        ":memory:".to_string()
+        ":memory:".to_owned()
     };
 
     // Create DuckDB backend
     let backend = DuckDbBackend::new(connection_string, HashMap::new(), None)
-        .map_err(|e| format!("Failed to create DuckDB backend: {}", e))?;
+        .map_err(|e| format!("Failed to create DuckDB backend: {e}"))?;
 
     let addr = config.addr()?;
 
     // Create Flight SQL server
     let flight_service = FlightSqlServer::new(StorageBackendType::DuckDb(backend))
         .await
-        .map_err(|e| format!("Failed to create Flight SQL server: {}", e))?
+        .map_err(|e| format!("Failed to create Flight SQL server: {e}"))?
         .into_service();
 
     let mut server = Server::builder();

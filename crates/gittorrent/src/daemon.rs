@@ -89,7 +89,7 @@ impl GitTorrentDaemon {
         let git_listener = if config.enable_git_server {
             let addr = format!("{}:{}", config.service.bind_address, config.git_port);
             Some(TcpListener::bind(&addr).await
-                .map_err(|e| Error::other(format!("Failed to bind Git server to {}: {}", addr, e)))?)
+                .map_err(|e| Error::other(format!("Failed to bind Git server to {addr}: {e}")))?)
         } else {
             None
         };
@@ -115,8 +115,8 @@ impl GitTorrentDaemon {
 
         // Start Git protocol server if enabled
         if let Some(ref listener) = self.git_listener {
-            let _service = self.service.clone();
-            let repositories = self.repositories.clone();
+            let _service = Arc::clone(&self.service);
+            let repositories = Arc::clone(&self.repositories);
             let listener_addr = listener.local_addr().map_err(Error::from)?;
 
             tokio::spawn(async move {
@@ -131,8 +131,8 @@ impl GitTorrentDaemon {
         }
 
         // Start periodic announcement of repositories
-        let service = self.service.clone();
-        let repositories = self.repositories.clone();
+        let service = Arc::clone(&self.service);
+        let repositories = Arc::clone(&self.repositories);
 
         tokio::spawn(async move {
             Self::run_announcement_loop(service, repositories).await;
@@ -163,8 +163,7 @@ impl GitTorrentDaemon {
                 if path.join(".git").exists() || path.join("objects").exists() {
                     let name = path.file_name()
                         .and_then(|n| n.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
+                        .unwrap_or("unknown").to_owned();
 
                     let size = self.calculate_repository_size(&path).await?;
 
@@ -334,7 +333,7 @@ mod tests {
         let daemon = GitTorrentDaemon::new(config).await.unwrap();
 
         // Add repository
-        daemon.add_repository("test-repo".to_string(), repo_dir).await.unwrap();
+        daemon.add_repository("test-repo".to_owned(), repo_dir).await.unwrap();
 
         // Check it was added
         let repos = daemon.list_repositories().await;

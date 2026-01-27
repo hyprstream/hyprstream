@@ -74,7 +74,7 @@ impl StoragePaths {
                 let entry = entry?;
                 if entry.file_type()?.is_file() {
                     if let Some(name) = entry.file_name().to_str() {
-                        models.push(name.to_string());
+                        models.push(name.to_owned());
                     }
                 }
             }
@@ -94,7 +94,7 @@ impl StoragePaths {
                 let entry = entry?;
                 if entry.file_type()?.is_file() {
                     if let Some(name) = entry.file_name().to_str() {
-                        loras.push(name.to_string());
+                        loras.push(name.to_owned());
                     }
                 }
             }

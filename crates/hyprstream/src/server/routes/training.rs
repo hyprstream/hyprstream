@@ -83,7 +83,7 @@ async fn start_training(
     Json(config): Json<TrainingConfig>,
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
-    let resource = format!("model:{}", lora_id);
+    let resource = format!("model:{lora_id}");
     if !state.policy_client.check(&user, &resource, Operation::Train).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
@@ -120,7 +120,7 @@ async fn stop_training(
     Path(lora_id): Path<String>,
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
-    let resource = format!("model:{}", lora_id);
+    let resource = format!("model:{lora_id}");
     if !state.policy_client.check(&user, &resource, Operation::Train).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
@@ -153,7 +153,7 @@ async fn get_status(
     Path(lora_id): Path<String>,
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
-    let resource = format!("model:{}", lora_id);
+    let resource = format!("model:{lora_id}");
     if !state.policy_client.check(&user, &resource, Operation::Query).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
@@ -184,7 +184,7 @@ async fn submit_samples(
     Json(request): Json<SubmitSamplesRequest>,
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
-    let resource = format!("model:{}", lora_id);
+    let resource = format!("model:{lora_id}");
     if !state.policy_client.check(&user, &resource, Operation::Train).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
@@ -334,10 +334,10 @@ async fn commit_checkpoint(
             }
         })
         .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+        .unwrap_or_else(|| "unknown".to_owned());
 
     let user = server::extract_user(auth_user.as_ref());
-    let resource = format!("model:{}", model_id);
+    let resource = format!("model:{model_id}");
     if !state.policy_client.check(&user, &resource, Operation::Write).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,

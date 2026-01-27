@@ -199,13 +199,13 @@ mod tests {
 
     #[test]
     fn test_error_display() {
-        let err = WorkerError::SandboxNotFound("abc123".to_string());
+        let err = WorkerError::SandboxNotFound("abc123".to_owned());
         assert_eq!(err.to_string(), "Sandbox not found: abc123");
 
         let err = WorkerError::Unauthorized {
-            subject: "anonymous".to_string(),
-            operation: "execute".to_string(),
-            resource: "sandbox:*".to_string(),
+            subject: "anonymous".to_owned(),
+            operation: "execute".to_owned(),
+            resource: "sandbox:*".to_owned(),
         };
         assert!(err.to_string().contains("anonymous"));
         assert!(err.to_string().contains("execute"));

@@ -128,10 +128,10 @@ mod transport_registry_tests {
         assert!(registry.register_transport(format!("sec_my_transport_{}", test_id), factory.clone()).is_ok());
 
         // Invalid schemes
-        assert!(registry.register_transport("".to_string(), factory.clone()).is_err());
-        assert!(registry.register_transport("http://".to_string(), factory.clone()).is_err());
-        assert!(registry.register_transport("http://invalid".to_string(), factory.clone()).is_err());
-        assert!(registry.register_transport("transport with spaces".to_string(), factory.clone()).is_err());
+        assert!(registry.register_transport("".to_owned(), factory.clone()).is_err());
+        assert!(registry.register_transport("http://".to_owned(), factory.clone()).is_err());
+        assert!(registry.register_transport("http://invalid".to_owned(), factory.clone()).is_err());
+        assert!(registry.register_transport("transport with spaces".to_owned(), factory.clone()).is_err());
     }
 
     #[test]

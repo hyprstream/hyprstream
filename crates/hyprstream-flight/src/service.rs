@@ -46,12 +46,12 @@ enum SqlCommand {
 impl Command {
     fn from_json(cmd: &[u8]) -> Result<Self, Status> {
         let value: serde_json::Value = serde_json::from_slice(cmd)
-            .map_err(|e| Status::invalid_argument(format!("Invalid JSON: {}", e)))?;
+            .map_err(|e| Status::invalid_argument(format!("Invalid JSON: {e}")))?;
 
         match value.get("type").and_then(|t| t.as_str()) {
             Some("table") => {
                 let cmd_bytes = serde_json::to_vec(&value["data"])
-                    .map_err(|e| Status::internal(format!("Failed to serialize command: {}", e)))?;
+                    .map_err(|e| Status::internal(format!("Failed to serialize command: {e}")))?;
                 let cmd = TableCommand::from_json(&cmd_bytes)?;
                 Ok(Command::Table(cmd))
             }
@@ -59,7 +59,7 @@ impl Command {
                 let sql =
                     String::from_utf8(value["data"].as_str().unwrap_or("").as_bytes().to_vec())
                         .map_err(|e| {
-                            Status::invalid_argument(format!("Invalid SQL string: {}", e))
+                            Status::invalid_argument(format!("Invalid SQL string: {e}"))
                         })?;
                 Ok(Command::Sql(SqlCommand::Execute(sql)))
             }
@@ -67,7 +67,7 @@ impl Command {
                 let sql =
                     String::from_utf8(value["data"].as_str().unwrap_or("").as_bytes().to_vec())
                         .map_err(|e| {
-                            Status::invalid_argument(format!("Invalid SQL string: {}", e))
+                            Status::invalid_argument(format!("Invalid SQL string: {e}"))
                         })?;
                 Ok(Command::Sql(SqlCommand::Query(sql)))
             }
@@ -88,20 +88,20 @@ enum TableCommand {
 impl TableCommand {
     fn from_json(cmd: &[u8]) -> Result<Self, Status> {
         let value: serde_json::Value = serde_json::from_slice(cmd)
-            .map_err(|e| Status::invalid_argument(format!("Invalid JSON: {}", e)))?;
+            .map_err(|e| Status::invalid_argument(format!("Invalid JSON: {e}")))?;
 
         match value.get("type").and_then(|t| t.as_str()) {
             Some("create_table") => {
                 let cmd: CreateTableCmd =
                     serde_json::from_value(value["data"].clone()).map_err(|e| {
-                        Status::invalid_argument(format!("Invalid create table command: {}", e))
+                        Status::invalid_argument(format!("Invalid create table command: {e}"))
                     })?;
 
                 let schema = arrow_ipc::reader::StreamReader::try_new(
                     std::io::Cursor::new(&cmd.schema_bytes[..]),
                     None,
                 )
-                .map_err(|e| Status::invalid_argument(format!("Invalid schema bytes: {}", e)))?
+                .map_err(|e| Status::invalid_argument(format!("Invalid schema bytes: {e}")))?
                 .schema()
                 .clone();
 
@@ -113,25 +113,24 @@ impl TableCommand {
             Some("create_view") => {
                 let definition: ViewDefinition =
                     serde_json::from_value(value["data"]["definition"].clone()).map_err(|e| {
-                        Status::invalid_argument(format!("Invalid view definition: {}", e))
+                        Status::invalid_argument(format!("Invalid view definition: {e}"))
                     })?;
                 let name = value["data"]["name"]
                     .as_str()
-                    .ok_or_else(|| Status::invalid_argument("Missing view name"))?
-                    .to_string();
+                    .ok_or_else(|| Status::invalid_argument("Missing view name"))?.to_owned();
                 Ok(TableCommand::CreateView { name, definition })
             }
             Some("drop_table") => {
                 let name = value["data"]["name"]
                     .as_str()
                     .ok_or_else(|| Status::invalid_argument("Missing table name"))?;
-                Ok(TableCommand::DropTable(name.to_string()))
+                Ok(TableCommand::DropTable(name.to_owned()))
             }
             Some("drop_view") => {
                 let name = value["data"]["name"]
                     .as_str()
                     .ok_or_else(|| Status::invalid_argument("Missing view name"))?;
-                Ok(TableCommand::DropView(name.to_string()))
+                Ok(TableCommand::DropView(name.to_owned()))
             }
             _ => Err(Status::invalid_argument("Invalid command type")),
         }
@@ -178,7 +177,7 @@ impl FlightSqlService for FlightSqlServer {
     ) -> Result<Response<FlightInfo>, Status> {
         // Use QueryOrchestrator to prepare and get schema
         let cached_stmt = self.orchestrator.prepare(&query.query).await
-            .map_err(|e| Status::internal(format!("Query preparation failed: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Query preparation failed: {e}")))?;
 
         let schema = cached_stmt.schema.clone();
         let handle = cached_stmt.handle;
@@ -186,7 +185,7 @@ impl FlightSqlService for FlightSqlServer {
         // Store SQL with handle for do_get (for compatibility with Flight SQL protocol)
         {
             let mut statements = self.prepared_statements.lock()
-                .map_err(|e| Status::internal(format!("Lock error: {}", e)))?;
+                .map_err(|e| Status::internal(format!("Lock error: {e}")))?;
             statements.push((handle, query.query));
         }
 
@@ -200,7 +199,7 @@ impl FlightSqlService for FlightSqlServer {
         // Create FlightInfo with schema and endpoint
         let info = FlightInfo::new()
             .try_with_schema(schema.as_ref())
-            .map_err(|e| Status::internal(format!("Unable to serialize schema: {}", e)))?
+            .map_err(|e| Status::internal(format!("Unable to serialize schema: {e}")))?
             .with_descriptor(flight_descriptor)
             .with_endpoint(FlightEndpoint::new()
                 .with_ticket(Ticket {
@@ -233,12 +232,11 @@ impl FlightSqlService for FlightSqlServer {
 
         // Execute using the orchestrator's cached physical plan
         let result_stream = self.orchestrator.execute(&cached_stmt).await
-            .map_err(|e| Status::internal(format!("Query execution failed: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Query execution failed: {e}")))?;
 
         // Convert DataFusion stream to Flight stream
         let stream = result_stream
-            .map_err(|e| FlightError::ExternalError(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            .map_err(|e| FlightError::ExternalError(Box::new(std::io::Error::other(
                 e.to_string(),
             ))));
 
@@ -290,7 +288,7 @@ impl FlightSqlServer {
         // Create query orchestrator with the storage backend
         let orchestrator = QueryOrchestrator::new(backend.clone() as Arc<dyn StorageBackend>)
             .await
-            .map_err(|e| Status::internal(format!("Failed to create query orchestrator: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Failed to create query orchestrator: {e}")))?;
 
         Ok(Self {
             backend,
@@ -340,20 +338,20 @@ impl FlightSqlServer {
             Command::Sql(SqlCommand::Execute(sql)) => {
                 // Execute statement via orchestrator
                 self.orchestrator.query_collect(&sql).await
-                    .map_err(|e| Status::internal(format!("Query execution failed: {}", e)))?;
+                    .map_err(|e| Status::internal(format!("Query execution failed: {e}")))?;
                 Ok(vec![])
             }
             Command::Sql(SqlCommand::Query(sql)) => {
                 // Prepare statement via orchestrator
                 let cached_stmt = self.orchestrator.prepare(&sql).await
-                    .map_err(|e| Status::internal(format!("Query preparation failed: {}", e)))?;
+                    .map_err(|e| Status::internal(format!("Query preparation failed: {e}")))?;
 
                 let handle = cached_stmt.handle;
 
                 // Store SQL with handle for do_get compatibility
                 {
                     let mut statements = self.prepared_statements.lock()
-                        .map_err(|e| Status::internal(format!("Lock error: {}", e)))?;
+                        .map_err(|e| Status::internal(format!("Lock error: {e}")))?;
                     statements.push((handle, sql.clone()));
                 }
 

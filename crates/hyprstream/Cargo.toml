@@ -157,3 +157,6 @@ capnpc.workspace = true  # Cap'n Proto schema compiler
 criterion.workspace = true
 tempfile.workspace = true
 tokio-stream.workspace = true
+
+[lints]
+workspace = true

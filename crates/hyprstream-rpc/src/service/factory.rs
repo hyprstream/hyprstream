@@ -112,7 +112,7 @@ impl ServiceContext {
     pub fn transport(&self, service: &str, kind: SocketKind) -> TransportConfig {
         if self.ipc {
             let runtime_dir = crate::paths::runtime_dir();
-            TransportConfig::ipc(runtime_dir.join(format!("{}.sock", service)))
+            TransportConfig::ipc(runtime_dir.join(format!("{service}.sock")))
         } else {
             global_registry().endpoint(service, kind)
         }

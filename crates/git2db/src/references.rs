@@ -58,33 +58,33 @@ impl GitRef {
                 return Ok(GitRef::Commit(oid));
             } else if ref_str.len() >= 7 {
                 // Short SHA - treat as revspec for now
-                return Ok(GitRef::Revspec(ref_str.to_string()));
+                return Ok(GitRef::Revspec(ref_str.to_owned()));
             }
         }
 
         // Check for tag prefix
         if let Some(tag_name) = ref_str.strip_prefix("refs/tags/") {
-            return Ok(GitRef::Tag(tag_name.to_string()));
+            return Ok(GitRef::Tag(tag_name.to_owned()));
         }
 
         if let Some(tag_name) = ref_str.strip_prefix("tags/") {
-            return Ok(GitRef::Tag(tag_name.to_string()));
+            return Ok(GitRef::Tag(tag_name.to_owned()));
         }
 
         // Check for branch prefix
         if let Some(branch_name) = ref_str.strip_prefix("refs/heads/") {
-            return Ok(GitRef::Branch(branch_name.to_string()));
+            return Ok(GitRef::Branch(branch_name.to_owned()));
         }
 
         if let Some(branch_name) = ref_str.strip_prefix("origin/") {
-            return Ok(GitRef::Branch(branch_name.to_string()));
+            return Ok(GitRef::Branch(branch_name.to_owned()));
         }
 
         // Default to branch name or revspec
-        if git2::Reference::is_valid_name(&format!("refs/heads/{}", ref_str)) {
-            Ok(GitRef::Branch(ref_str.to_string()))
+        if git2::Reference::is_valid_name(&format!("refs/heads/{ref_str}")) {
+            Ok(GitRef::Branch(ref_str.to_owned()))
         } else {
-            Ok(GitRef::Revspec(ref_str.to_string()))
+            Ok(GitRef::Revspec(ref_str.to_owned()))
         }
     }
 
@@ -92,8 +92,8 @@ impl GitRef {
     pub fn to_ref_string(&self) -> Option<String> {
         match self {
             GitRef::DefaultBranch => None,
-            GitRef::Branch(name) => Some(format!("refs/heads/{}", name)),
-            GitRef::Tag(name) => Some(format!("refs/tags/{}", name)),
+            GitRef::Branch(name) => Some(format!("refs/heads/{name}")),
+            GitRef::Tag(name) => Some(format!("refs/tags/{name}")),
             GitRef::Commit(oid) => Some(oid.to_string()),
             GitRef::Revspec(spec) => Some(spec.clone()),
         }
@@ -102,10 +102,10 @@ impl GitRef {
     /// Get display name for the reference
     pub fn display_name(&self) -> String {
         match self {
-            GitRef::DefaultBranch => "HEAD".to_string(),
+            GitRef::DefaultBranch => "HEAD".to_owned(),
             GitRef::Branch(name) => name.clone(),
-            GitRef::Tag(name) => format!("tags/{}", name),
-            GitRef::Commit(oid) => format!("{:.8}", oid),
+            GitRef::Tag(name) => format!("tags/{name}"),
+            GitRef::Commit(oid) => format!("{oid:.8}"),
             GitRef::Revspec(spec) => spec.clone(),
         }
     }
@@ -149,7 +149,7 @@ pub trait IntoGitRef {
 
 impl IntoGitRef for &str {
     fn into_git_ref(self) -> GitRef {
-        GitRef::parse(self).unwrap_or_else(|_| GitRef::Revspec(self.to_string()))
+        GitRef::parse(self).unwrap_or_else(|_| GitRef::Revspec(self.to_owned()))
     }
 }
 
@@ -252,7 +252,7 @@ impl ReferenceResolver {
             resolve_in_repo(&repo, &git_ref)
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))??;
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))??;
 
         // Update cache (sync - just HashMap write)
         {
@@ -285,7 +285,7 @@ impl ReferenceResolver {
             match &git_ref {
                 GitRef::DefaultBranch => match repo.head() {
                     Ok(head_ref) => {
-                        let name = head_ref.shorthand().unwrap_or("HEAD").to_string();
+                        let name = head_ref.shorthand().unwrap_or("HEAD").to_owned();
                         let target = head_ref.target().unwrap_or_else(Oid::zero);
                         let ref_type = head_ref.kind().unwrap_or(git2::ReferenceType::Direct);
                         Ok(Some(ReferenceInfo {
@@ -299,7 +299,7 @@ impl ReferenceResolver {
                 },
 
                 GitRef::Branch(branch_name) => {
-                    let ref_name = format!("refs/heads/{}", branch_name);
+                    let ref_name = format!("refs/heads/{branch_name}");
                     match repo.find_reference(&ref_name) {
                         Ok(reference) => {
                             let target = reference.target().unwrap_or_else(Oid::zero);
@@ -323,7 +323,7 @@ impl ReferenceResolver {
                 }
 
                 GitRef::Tag(tag_name) => {
-                    let ref_name = format!("refs/tags/{}", tag_name);
+                    let ref_name = format!("refs/tags/{tag_name}");
                     match repo.find_reference(&ref_name) {
                         Ok(reference) => {
                             let target = reference.target().unwrap_or_else(Oid::zero);
@@ -346,7 +346,7 @@ impl ReferenceResolver {
             }
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
     }
 
     /// List all references in repository
@@ -365,12 +365,12 @@ impl ReferenceResolver {
 
             // Iterate through all references
             let refs = repo.references().map_err(|e| {
-                Git2DBError::repository(&repo_path, format!("Failed to list references: {}", e))
+                Git2DBError::repository(&repo_path, format!("Failed to list references: {e}"))
             })?;
 
             for reference in refs {
                 let reference = reference.map_err(|e| {
-                    Git2DBError::repository(&repo_path, format!("Failed to read reference: {}", e))
+                    Git2DBError::repository(&repo_path, format!("Failed to read reference: {e}"))
                 })?;
 
                 if let Some(name) = reference.shorthand() {
@@ -385,7 +385,7 @@ impl ReferenceResolver {
                         .unwrap_or(false);
 
                     references.push(ReferenceInfo {
-                        name: name.to_string(),
+                        name: name.to_owned(),
                         target,
                         ref_type,
                         is_head,
@@ -396,7 +396,7 @@ impl ReferenceResolver {
             Ok(references)
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
     }
 
     /// Get the default branch name
@@ -411,7 +411,7 @@ impl ReferenceResolver {
             if let Ok(head_ref) = repo.head() {
                 if let Some(name) = head_ref.symbolic_target() {
                     if let Some(branch_name) = name.strip_prefix("refs/heads/") {
-                        return Ok(branch_name.to_string());
+                        return Ok(branch_name.to_owned());
                     }
                 }
             }
@@ -422,28 +422,28 @@ impl ReferenceResolver {
                     .find_branch(default_name, git2::BranchType::Local)
                     .is_ok()
                 {
-                    return Ok(default_name.to_string());
+                    return Ok(default_name.to_owned());
                 }
             }
 
             // Fallback: get the first branch
             let mut branches = repo.branches(Some(git2::BranchType::Local)).map_err(|e| {
-                Git2DBError::repository(&repo_path, format!("Failed to list branches: {}", e))
+                Git2DBError::repository(&repo_path, format!("Failed to list branches: {e}"))
             })?;
 
             if let Some(Ok((branch, _))) = branches.next() {
                 if let Some(name) = branch.name().map_err(|e| {
-                    Git2DBError::repository(&repo_path, format!("Failed to get branch name: {}", e))
+                    Git2DBError::repository(&repo_path, format!("Failed to get branch name: {e}"))
                 })? {
-                    return Ok(name.to_string());
+                    return Ok(name.to_owned());
                 }
             }
 
             // Final fallback
-            Ok("main".to_string())
+            Ok("main".to_owned())
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
     }
 
     /// Clear the reference cache
@@ -461,17 +461,17 @@ fn resolve_in_repo(repo: &Repository, git_ref: &GitRef) -> Git2DBResult<Oid> {
             .head()
             .and_then(|head| head.peel_to_commit())
             .map(|commit| commit.id())
-            .map_err(|e| Git2DBError::reference("HEAD", format!("Failed to resolve HEAD: {}", e))),
+            .map_err(|e| Git2DBError::reference("HEAD", format!("Failed to resolve HEAD: {e}"))),
 
         GitRef::Commit(oid) => {
             // Verify the commit exists
             repo.find_commit(*oid).map(|_| *oid).map_err(|e| {
-                Git2DBError::reference(oid.to_string(), format!("Commit not found: {}", e))
+                Git2DBError::reference(oid.to_string(), format!("Commit not found: {e}"))
             })
         }
 
         GitRef::Branch(branch_name) => {
-            let ref_str = format!("refs/heads/{}", branch_name);
+            let ref_str = format!("refs/heads/{branch_name}");
             // Try to find as a reference first
             if let Ok(reference) = repo.find_reference(&ref_str) {
                 reference
@@ -480,7 +480,7 @@ fn resolve_in_repo(repo: &Repository, git_ref: &GitRef) -> Git2DBResult<Oid> {
                     .map_err(|e| {
                         Git2DBError::reference(
                             &ref_str,
-                            format!("Failed to resolve reference: {}", e),
+                            format!("Failed to resolve reference: {e}"),
                         )
                     })
             } else {
@@ -491,14 +491,14 @@ fn resolve_in_repo(repo: &Repository, git_ref: &GitRef) -> Git2DBResult<Oid> {
                     .map_err(|e| {
                         Git2DBError::reference(
                             &ref_str,
-                            format!("Failed to resolve revspec: {}", e),
+                            format!("Failed to resolve revspec: {e}"),
                         )
                     })
             }
         }
 
         GitRef::Tag(tag_name) => {
-            let ref_str = format!("refs/tags/{}", tag_name);
+            let ref_str = format!("refs/tags/{tag_name}");
             // Try to find as a reference first
             if let Ok(reference) = repo.find_reference(&ref_str) {
                 reference
@@ -507,7 +507,7 @@ fn resolve_in_repo(repo: &Repository, git_ref: &GitRef) -> Git2DBResult<Oid> {
                     .map_err(|e| {
                         Git2DBError::reference(
                             &ref_str,
-                            format!("Failed to resolve reference: {}", e),
+                            format!("Failed to resolve reference: {e}"),
                         )
                     })
             } else {
@@ -518,7 +518,7 @@ fn resolve_in_repo(repo: &Repository, git_ref: &GitRef) -> Git2DBResult<Oid> {
                     .map_err(|e| {
                         Git2DBError::reference(
                             &ref_str,
-                            format!("Failed to resolve revspec: {}", e),
+                            format!("Failed to resolve revspec: {e}"),
                         )
                     })
             }
@@ -535,7 +535,7 @@ fn resolve_in_repo(repo: &Repository, git_ref: &GitRef) -> Git2DBResult<Oid> {
                     .map_err(|e| {
                         Git2DBError::reference(
                             &ref_str,
-                            format!("Failed to resolve reference: {}", e),
+                            format!("Failed to resolve reference: {e}"),
                         )
                     })
             } else {
@@ -546,7 +546,7 @@ fn resolve_in_repo(repo: &Repository, git_ref: &GitRef) -> Git2DBResult<Oid> {
                     .map_err(|e| {
                         Git2DBError::reference(
                             &ref_str,
-                            format!("Failed to resolve revspec: {}", e),
+                            format!("Failed to resolve revspec: {e}"),
                         )
                     })
             }
@@ -564,19 +564,19 @@ mod tests {
         assert_eq!(GitRef::parse("HEAD").unwrap(), GitRef::DefaultBranch);
         assert_eq!(
             GitRef::parse("main").unwrap(),
-            GitRef::Branch("main".to_string())
+            GitRef::Branch("main".to_owned())
         );
         assert_eq!(
             GitRef::parse("refs/heads/main").unwrap(),
-            GitRef::Branch("main".to_string())
+            GitRef::Branch("main".to_owned())
         );
         assert_eq!(
             GitRef::parse("refs/tags/v1.0").unwrap(),
-            GitRef::Tag("v1.0".to_string())
+            GitRef::Tag("v1.0".to_owned())
         );
         assert_eq!(
             GitRef::parse("tags/v1.0").unwrap(),
-            GitRef::Tag("v1.0".to_string())
+            GitRef::Tag("v1.0".to_owned())
         );
 
         // Test commit hash
@@ -590,17 +590,17 @@ mod tests {
         // Test short hash (should be revspec)
         assert_eq!(
             GitRef::parse("1234567").unwrap(),
-            GitRef::Revspec("1234567".to_string())
+            GitRef::Revspec("1234567".to_owned())
         );
     }
 
     #[test]
     fn test_git_ref_display() {
         assert_eq!(GitRef::DefaultBranch.display_name(), "HEAD");
-        assert_eq!(GitRef::Branch("main".to_string()).display_name(), "main");
-        assert_eq!(GitRef::Tag("v1.0".to_string()).display_name(), "tags/v1.0");
+        assert_eq!(GitRef::Branch("main".to_owned()).display_name(), "main");
+        assert_eq!(GitRef::Tag("v1.0".to_owned()).display_name(), "tags/v1.0");
         assert_eq!(
-            GitRef::Revspec("feature".to_string()).display_name(),
+            GitRef::Revspec("feature".to_owned()).display_name(),
             "feature"
         );
     }
@@ -609,12 +609,12 @@ mod tests {
     fn test_git_ref_to_ref_string() {
         assert_eq!(GitRef::DefaultBranch.to_ref_string(), None);
         assert_eq!(
-            GitRef::Branch("main".to_string()).to_ref_string(),
-            Some("refs/heads/main".to_string())
+            GitRef::Branch("main".to_owned()).to_ref_string(),
+            Some("refs/heads/main".to_owned())
         );
         assert_eq!(
-            GitRef::Tag("v1.0".to_string()).to_ref_string(),
-            Some("refs/tags/v1.0".to_string())
+            GitRef::Tag("v1.0".to_owned()).to_ref_string(),
+            Some("refs/tags/v1.0".to_owned())
         );
     }
 }

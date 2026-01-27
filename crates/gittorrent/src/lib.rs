@@ -42,7 +42,9 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::const_is_empty)]
     fn test_version() {
+        // VERSION comes from CARGO_PKG_VERSION and is always non-empty
         assert!(!VERSION.is_empty());
     }
 }

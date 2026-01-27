@@ -144,7 +144,7 @@ impl Default for OAIConfig {
     }
 }
 
-fn default_oai_host() -> String { "0.0.0.0".to_string() }
+fn default_oai_host() -> String { "0.0.0.0".to_owned() }
 fn default_oai_port() -> u16 { 8080 }
 fn default_oai_timeout() -> u64 { 300 }
 
@@ -184,7 +184,7 @@ impl Default for FlightConfig {
     }
 }
 
-fn default_flight_host() -> String { "0.0.0.0".to_string() }
+fn default_flight_host() -> String { "0.0.0.0".to_owned() }
 fn default_flight_port() -> u16 { 50051 }
 
 /// StreamService configuration
@@ -298,14 +298,14 @@ impl Default for ServicesConfig {
 /// Default list of services to start at startup
 fn default_startup_services() -> Vec<String> {
     vec![
-        "event".to_string(),     // Must start first (message bus)
-        "registry".to_string(),  // Model registry
-        "policy".to_string(),    // Authorization
-        "streams".to_string(),   // Streaming proxy with JWT validation
-        "worker".to_string(),    // Container workloads
-        "model".to_string(),     // Model management
-        "oai".to_string(),       // OpenAI-compatible HTTP API
-        "flight".to_string(),    // Arrow Flight SQL server
+        "event".to_owned(),     // Must start first (message bus)
+        "registry".to_owned(),  // Model registry
+        "policy".to_owned(),    // Authorization
+        "streams".to_owned(),   // Streaming proxy with JWT validation
+        "worker".to_owned(),    // Container workloads
+        "model".to_owned(),     // Model management
+        "oai".to_owned(),       // OpenAI-compatible HTTP API
+        "flight".to_owned(),    // Arrow Flight SQL server
     ]
 }
 
@@ -404,7 +404,7 @@ impl Default for RuntimeConfig {
             gpu_layers: None,
             mmap: true,
             kv_cache_size_mb: 2048,
-            precision_mode: Some("auto".to_string()),
+            precision_mode: Some("auto".to_owned()),
             max_concurrent_loads: 2,
             max_concurrent_generations: 10,
             default_generation_timeout_ms: 120000, // 2 minutes
@@ -442,7 +442,7 @@ impl Default for GenerationConfig {
             top_p: 0.9,
             top_k: Some(40),
             repeat_penalty: 1.1,
-            stop_tokens: vec!["</s>".to_string(), "<|endoftext|>".to_string()],
+            stop_tokens: vec!["</s>".to_owned(), "<|endoftext|>".to_owned()],
             seed: None,
             stream: false,
         }
@@ -583,12 +583,12 @@ impl HyprConfig {
     /// Load configuration using the config crate with XDG directories and environment variables
     pub fn load() -> Result<Self, ConfigError> {
         let storage = StoragePaths::new().map_err(|e| {
-            ConfigError::Message(format!("Failed to initialize storage paths: {}", e))
+            ConfigError::Message(format!("Failed to initialize storage paths: {e}"))
         })?;
 
         let config_dir = storage
             .config_dir()
-            .map_err(|e| ConfigError::Message(format!("Failed to get config directory: {}", e)))?;
+            .map_err(|e| ConfigError::Message(format!("Failed to get config directory: {e}")))?;
 
         let settings = Config::builder()
             // Load from default configuration structure
@@ -731,9 +731,8 @@ impl HyprConfig {
         config.model.name = model_path
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-        config.model.architecture = "auto".to_string(); // Auto-detect from model
+            .unwrap_or("unknown").to_owned();
+        config.model.architecture = "auto".to_owned(); // Auto-detect from model
 
         // Update storage paths to use XDG directories
         config.storage = StorageConfig {
@@ -883,17 +882,17 @@ impl SamplingParams {
     /// Parse HuggingFace generation_config.json format
     fn from_generation_config(config: &serde_json::Value) -> Self {
         Self {
-            temperature: config.get("temperature").and_then(|v| v.as_f64()).map(|v| v as f32),
-            top_k: config.get("top_k").and_then(|v| v.as_u64()).map(|v| v as usize),
-            top_p: config.get("top_p").and_then(|v| v.as_f64()).map(|v| v as f32),
-            repeat_penalty: config.get("repetition_penalty").and_then(|v| v.as_f64()).map(|v| v as f32),
-            max_tokens: config.get("max_new_tokens").and_then(|v| v.as_u64()).map(|v| v as usize)
-                .or_else(|| config.get("max_length").and_then(|v| v.as_u64()).map(|v| v as usize)),
-            length_penalty: config.get("length_penalty").and_then(|v| v.as_f64()).map(|v| v as f32),
-            typical_p: config.get("typical_p").and_then(|v| v.as_f64()).map(|v| v as f32),
-            epsilon_cutoff: config.get("epsilon_cutoff").and_then(|v| v.as_f64()).map(|v| v as f32),
-            eta_cutoff: config.get("eta_cutoff").and_then(|v| v.as_f64()).map(|v| v as f32),
-            do_sample: config.get("do_sample").and_then(|v| v.as_bool()),
+            temperature: config.get("temperature").and_then(serde_json::Value::as_f64).map(|v| v as f32),
+            top_k: config.get("top_k").and_then(serde_json::Value::as_u64).map(|v| v as usize),
+            top_p: config.get("top_p").and_then(serde_json::Value::as_f64).map(|v| v as f32),
+            repeat_penalty: config.get("repetition_penalty").and_then(serde_json::Value::as_f64).map(|v| v as f32),
+            max_tokens: config.get("max_new_tokens").and_then(serde_json::Value::as_u64).map(|v| v as usize)
+                .or_else(|| config.get("max_length").and_then(serde_json::Value::as_u64).map(|v| v as usize)),
+            length_penalty: config.get("length_penalty").and_then(serde_json::Value::as_f64).map(|v| v as f32),
+            typical_p: config.get("typical_p").and_then(serde_json::Value::as_f64).map(|v| v as f32),
+            epsilon_cutoff: config.get("epsilon_cutoff").and_then(serde_json::Value::as_f64).map(|v| v as f32),
+            eta_cutoff: config.get("eta_cutoff").and_then(serde_json::Value::as_f64).map(|v| v as f32),
+            do_sample: config.get("do_sample").and_then(serde_json::Value::as_bool),
             stop_tokens: config.get("eos_token_id").and_then(|v| {
                 if let Some(arr) = v.as_array() {
                     let tokens: Vec<String> = arr.iter()
@@ -904,7 +903,7 @@ impl SamplingParams {
                     None
                 }
             }),
-            seed: config.get("seed").and_then(|v| v.as_u64()),
+            seed: config.get("seed").and_then(serde_json::Value::as_u64),
             repeat_last_n: None,
             timeout_ms: None,
         }
@@ -1165,7 +1164,7 @@ mod tests {
             .max_tokens(1000)
             .build();
 
-        assert_eq!(request.prompt, TemplatedPrompt::new("test prompt".to_string()));
+        assert_eq!(request.prompt, TemplatedPrompt::new("test prompt".to_owned()));
         assert_eq!(request.temperature, 0.8);
         assert_eq!(request.top_k, Some(30));
         assert_eq!(request.max_tokens, 1000);
@@ -1229,7 +1228,7 @@ mod tests {
             .max_tokens(512)
             .build();
 
-        assert_eq!(request.prompt, TemplatedPrompt::new("test prompt".to_string()));
+        assert_eq!(request.prompt, TemplatedPrompt::new("test prompt".to_owned()));
         assert_eq!(request.temperature, 0.8);
         assert_eq!(request.max_tokens, 512);
         assert_eq!(request.top_p, 0.95);
@@ -1250,7 +1249,7 @@ mod tests {
         assert_eq!(resolved.max_tokens, 2048);
         assert_eq!(resolved.top_p, 0.95);
         assert_eq!(resolved.repeat_penalty, 1.0);
-        assert_eq!(resolved.do_sample, true);
+        assert!(resolved.do_sample);
     }
 }
 

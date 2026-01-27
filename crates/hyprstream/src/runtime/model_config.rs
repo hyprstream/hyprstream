@@ -179,7 +179,7 @@ impl ModelConfig {
         // Extract all configuration values from the appropriate source
         let config = Self {
             architecture: architecture.clone(),
-            model_type: json["model_type"].as_str().unwrap_or("unknown").to_string(),
+            model_type: json["model_type"].as_str().unwrap_or("unknown").to_owned(),
             version: Self::detect_version(&json, &architecture),
 
             hidden_size: config_source["hidden_size"].as_u64().unwrap_or(4096) as usize,
@@ -212,14 +212,13 @@ impl ModelConfig {
 
             hidden_activation: config_source["hidden_activation"]
                 .as_str()
-                .unwrap_or("silu")
-                .to_string(),
+                .unwrap_or("silu").to_owned(),
 
             use_qk_norm: config_source["use_qk_norm"].as_bool().unwrap_or(false),
             scale_embeddings: config_source["scale_embeddings"].as_bool().unwrap_or(false),
             query_pre_attn_scalar: config_source["query_pre_attn_scalar"].as_f64().map(|v| v as f32),
 
-            dtype: "bfloat16".to_string(),
+            dtype: "bfloat16".to_owned(),
             use_flash_attention: true,
             use_kv_cache: true,
         };
@@ -266,7 +265,7 @@ impl ModelConfig {
                 "qwen" | "qwen2" | "qwen3" => ModelArchitecture::Qwen,
                 "gemma" => ModelArchitecture::Gemma,
                 "mistral" => ModelArchitecture::Mistral,
-                _ => ModelArchitecture::Unknown(model_type.to_string()),
+                _ => ModelArchitecture::Unknown(model_type.to_owned()),
             };
         }
 
@@ -280,13 +279,13 @@ impl ModelConfig {
                         s if s.contains("qwen") => ModelArchitecture::Qwen,
                         s if s.contains("gemma") => ModelArchitecture::Gemma,
                         s if s.contains("mistral") => ModelArchitecture::Mistral,
-                        _ => ModelArchitecture::Unknown(arch_str.to_string()),
+                        _ => ModelArchitecture::Unknown(arch_str.to_owned()),
                     };
                 }
             }
         }
 
-        ModelArchitecture::Unknown("unknown".to_string())
+        ModelArchitecture::Unknown("unknown".to_owned())
     }
 
     fn detect_architecture_from_weights(weights: &HashMap<String, Tensor>) -> ModelArchitecture {
@@ -373,7 +372,7 @@ impl ModelConfig {
 
     fn parse_rope_scaling(json: &serde_json::Value) -> Option<RopeScaling> {
         json["rope_scaling"].as_object().map(|obj| RopeScaling {
-            rope_type: obj["type"].as_str().unwrap_or("linear").to_string(),
+            rope_type: obj["type"].as_str().unwrap_or("linear").to_owned(),
             factor: obj["factor"].as_f64().unwrap_or(1.0) as f32,
         })
     }
@@ -474,7 +473,7 @@ impl Default for ModelConfig {
     fn default() -> Self {
         Self {
             architecture: ModelArchitecture::Llama,
-            model_type: "llama".to_string(),
+            model_type: "llama".to_owned(),
             version: 2,
             hidden_size: 4096,
             num_hidden_layers: 32,
@@ -488,11 +487,11 @@ impl Default for ModelConfig {
             rope_scaling: None,
             rms_norm_eps: 1e-5,
             layer_norm_eps: None,
-            hidden_activation: "silu".to_string(),
+            hidden_activation: "silu".to_owned(),
             use_qk_norm: false,
             scale_embeddings: false,
             query_pre_attn_scalar: None,
-            dtype: "bfloat16".to_string(),
+            dtype: "bfloat16".to_owned(),
             use_flash_attention: true,
             use_kv_cache: true,
         }

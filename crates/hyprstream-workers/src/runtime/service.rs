@@ -93,7 +93,7 @@ impl WorkerService {
         let sandbox_pool = Arc::new(SandboxPool::new(
             pool_config,
             image_config,
-            rafs_store.clone(),
+            Arc::clone(&rafs_store),
         ));
 
         // Create event publisher for worker lifecycle events
@@ -129,7 +129,7 @@ impl WorkerService {
         let sandbox_pool = Arc::new(SandboxPool::new(
             pool_config,
             image_config,
-            rafs_store.clone(),
+            Arc::clone(&rafs_store),
         ));
 
         // Create event publisher for worker lifecycle events
@@ -164,32 +164,6 @@ impl WorkerService {
         Ok(())
     }
 
-    /// Start the WorkerService as a ZMQ service on the default endpoint
-    ///
-    /// This creates the service, initializes it, and starts it using the
-    /// endpoint from the registry with the provided ZMQ context and verifying key.
-    ///
-    /// # Arguments
-    ///
-    /// * `pool_config` - Configuration for the sandbox pool
-    /// * `image_config` - Configuration for image management
-    /// * `context` - ZMQ context for socket creation (required for inproc://)
-    /// * `verifying_key` - Server's public key for signature verification
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let handle = WorkerService::start(
-    ///     pool_config,
-    ///     image_config,
-    ///     global_context(),
-    ///     verifying_key,
-    /// ).await?;
-    ///
-    /// // Later, to stop the service:
-    /// handle.stop().await;
-    /// ```
-
     // ─────────────────────────────────────────────────────────────────────────
     // Runtime Information
     // ─────────────────────────────────────────────────────────────────────────
@@ -197,10 +171,10 @@ impl WorkerService {
     /// Get runtime version information
     pub async fn version(&self, _version: &str) -> Result<VersionResponse> {
         Ok(VersionResponse {
-            version: "v1".to_string(),
-            runtime_name: RUNTIME_NAME.to_string(),
-            runtime_version: RUNTIME_VERSION.to_string(),
-            runtime_api_version: "v1".to_string(),
+            version: "v1".to_owned(),
+            runtime_name: RUNTIME_NAME.to_owned(),
+            runtime_version: RUNTIME_VERSION.to_owned(),
+            runtime_api_version: "v1".to_owned(),
         })
     }
 
@@ -208,25 +182,25 @@ impl WorkerService {
     pub async fn status(&self, verbose: bool) -> Result<StatusResponse> {
         let conditions = vec![
             RuntimeCondition {
-                condition_type: "RuntimeReady".to_string(),
+                condition_type: "RuntimeReady".to_owned(),
                 status: true,
-                reason: "".to_string(),
-                message: "Runtime is ready".to_string(),
+                reason: "".to_owned(),
+                message: "Runtime is ready".to_owned(),
             },
             RuntimeCondition {
-                condition_type: "NetworkReady".to_string(),
+                condition_type: "NetworkReady".to_owned(),
                 status: true,
-                reason: "".to_string(),
-                message: "Network is ready".to_string(),
+                reason: "".to_owned(),
+                message: "Network is ready".to_owned(),
             },
         ];
 
         let mut info = HashMap::new();
         if verbose {
             let stats = self.sandbox_pool.stats().await;
-            info.insert("warm_pool_size".to_string(), stats.warm_count.to_string());
-            info.insert("active_sandboxes".to_string(), stats.active_count.to_string());
-            info.insert("max_sandboxes".to_string(), stats.max_sandboxes.to_string());
+            info.insert("warm_pool_size".to_owned(), stats.warm_count.to_string());
+            info.insert("active_sandboxes".to_owned(), stats.active_count.to_string());
+            info.insert("max_sandboxes".to_owned(), stats.max_sandboxes.to_string());
         }
 
         Ok(StatusResponse {
@@ -298,8 +272,8 @@ impl WorkerService {
 
         // Publish sandbox stopped event with structured payload
         let event = SandboxStopped {
-            sandbox_id: pod_sandbox_id.to_string(),
-            reason: "stopped".to_string(),
+            sandbox_id: pod_sandbox_id.to_owned(),
+            reason: "stopped".to_owned(),
             exit_code: 0,
         };
         let payload = serialize_sandbox_stopped(&event).unwrap_or_default();
@@ -345,16 +319,16 @@ impl WorkerService {
             .sandbox_pool
             .get(pod_sandbox_id)
             .await
-            .ok_or_else(|| WorkerError::SandboxNotFound(pod_sandbox_id.to_string()))?;
+            .ok_or_else(|| WorkerError::SandboxNotFound(pod_sandbox_id.to_owned()))?;
 
         let mut info = HashMap::new();
         if verbose {
             // Get PIDs from hypervisor (host-level VM management)
             let pids = sandbox.get_pids().await;
-            let pid_str = pids.map_or("none".to_string(), |p| {
-                p.iter().map(|pid| pid.to_string()).collect::<Vec<_>>().join(",")
+            let pid_str = pids.map_or_else(|| "none".to_owned(), |p| {
+                p.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(",")
             });
-            info.insert("vm_pids".to_string(), pid_str);
+            info.insert("vm_pids".to_owned(), pid_str);
         }
 
         Ok(PodSandboxStatusResponse {
@@ -409,13 +383,13 @@ impl WorkerService {
             .sandbox_pool
             .get(pod_sandbox_id)
             .await
-            .ok_or_else(|| WorkerError::SandboxNotFound(pod_sandbox_id.to_string()))?;
+            .ok_or_else(|| WorkerError::SandboxNotFound(pod_sandbox_id.to_owned()))?;
 
         if !sandbox.is_ready() {
             return Err(WorkerError::SandboxInvalidState {
-                sandbox_id: pod_sandbox_id.to_string(),
-                state: "NotReady".to_string(),
-                expected: "Ready".to_string(),
+                sandbox_id: pod_sandbox_id.to_owned(),
+                state: "NotReady".to_owned(),
+                expected: "Ready".to_owned(),
             });
         }
 
@@ -435,7 +409,7 @@ impl WorkerService {
         }
 
         // Create container
-        let container = Container::new(container_id.clone(), pod_sandbox_id.to_string(), config);
+        let container = Container::new(container_id.clone(), pod_sandbox_id.to_owned(), config);
 
         // Store container
         {
@@ -444,7 +418,7 @@ impl WorkerService {
         }
         {
             let mut map = self.container_sandbox_map.write().await;
-            map.insert(container_id.clone(), pod_sandbox_id.to_string());
+            map.insert(container_id.clone(), pod_sandbox_id.to_owned());
         }
 
         tracing::info!(
@@ -469,7 +443,7 @@ impl WorkerService {
             let map = self.container_sandbox_map.read().await;
             map.get(container_id)
                 .cloned()
-                .ok_or_else(|| WorkerError::ContainerNotFound(container_id.to_string()))?
+                .ok_or_else(|| WorkerError::ContainerNotFound(container_id.to_owned()))?
         };
 
         let sandbox = self
@@ -482,8 +456,8 @@ impl WorkerService {
         if !sandbox.is_ready() {
             return Err(WorkerError::SandboxInvalidState {
                 sandbox_id: sandbox_id.clone(),
-                state: "NotReady".to_string(),
-                expected: "Ready".to_string(),
+                state: "NotReady".to_owned(),
+                expected: "Ready".to_owned(),
             });
         }
 
@@ -491,13 +465,13 @@ impl WorkerService {
 
         let container = containers
             .get_mut(container_id)
-            .ok_or_else(|| WorkerError::ContainerNotFound(container_id.to_string()))?;
+            .ok_or_else(|| WorkerError::ContainerNotFound(container_id.to_owned()))?;
 
         if container.state != ContainerState::ContainerCreated {
             return Err(WorkerError::ContainerInvalidState {
-                container_id: container_id.to_string(),
+                container_id: container_id.to_owned(),
                 state: format!("{:?}", container.state),
-                expected: "ContainerCreated".to_string(),
+                expected: "ContainerCreated".to_owned(),
             });
         }
 
@@ -530,7 +504,7 @@ impl WorkerService {
 
         // Publish container started event with structured payload
         let event = ContainerStarted {
-            container_id: container_id.to_string(),
+            container_id: container_id.to_owned(),
             sandbox_id: sandbox_id.clone(),
             image,
         };
@@ -551,7 +525,7 @@ impl WorkerService {
 
         let container = containers
             .get_mut(container_id)
-            .ok_or_else(|| WorkerError::ContainerNotFound(container_id.to_string()))?;
+            .ok_or_else(|| WorkerError::ContainerNotFound(container_id.to_owned()))?;
 
         if container.state != ContainerState::ContainerRunning {
             // Already stopped
@@ -582,10 +556,10 @@ impl WorkerService {
 
         // Publish container stopped event with structured payload
         let event = ContainerStopped {
-            container_id: container_id.to_string(),
+            container_id: container_id.to_owned(),
             sandbox_id,
             exit_code,
-            reason: "stopped".to_string(),
+            reason: "stopped".to_owned(),
         };
         let payload = serialize_container_stopped(&event).unwrap_or_default();
         self.publish_event(container_id, "stopped", &payload).await;
@@ -600,13 +574,13 @@ impl WorkerService {
             let mut containers = self.containers.write().await;
             let container = containers
                 .get(container_id)
-                .ok_or_else(|| WorkerError::ContainerNotFound(container_id.to_string()))?;
+                .ok_or_else(|| WorkerError::ContainerNotFound(container_id.to_owned()))?;
 
             if container.state == ContainerState::ContainerRunning {
                 return Err(WorkerError::ContainerInvalidState {
-                    container_id: container_id.to_string(),
-                    state: "ContainerRunning".to_string(),
-                    expected: "ContainerExited or ContainerCreated".to_string(),
+                    container_id: container_id.to_owned(),
+                    state: "ContainerRunning".to_owned(),
+                    expected: "ContainerExited or ContainerCreated".to_owned(),
                 });
             }
 
@@ -633,11 +607,11 @@ impl WorkerService {
 
         let container = containers
             .get(container_id)
-            .ok_or_else(|| WorkerError::ContainerNotFound(container_id.to_string()))?;
+            .ok_or_else(|| WorkerError::ContainerNotFound(container_id.to_owned()))?;
 
         let mut info = HashMap::new();
         if verbose {
-            info.insert("pid".to_string(), container.pid.map_or("none".to_string(), |p| p.to_string()));
+            info.insert("pid".to_owned(), container.pid.map_or_else(|| "none".to_owned(), |p| p.to_string()));
         }
 
         Ok(ContainerStatusResponse {
@@ -696,13 +670,13 @@ impl WorkerService {
 
         let container = containers
             .get(container_id)
-            .ok_or_else(|| WorkerError::ContainerNotFound(container_id.to_string()))?;
+            .ok_or_else(|| WorkerError::ContainerNotFound(container_id.to_owned()))?;
 
         if container.state != ContainerState::ContainerRunning {
             return Err(WorkerError::ContainerInvalidState {
-                container_id: container_id.to_string(),
+                container_id: container_id.to_owned(),
                 state: format!("{:?}", container.state),
-                expected: "ContainerRunning".to_string(),
+                expected: "ContainerRunning".to_owned(),
             });
         }
 
@@ -719,8 +693,7 @@ impl WorkerService {
         // Return error indicating exec is not supported
         Err(WorkerError::ExecFailed(
             "exec not supported in host-level mode without guest agent. \
-             Configure VM image with workload or use vsock agent."
-                .to_string(),
+             Configure VM image with workload or use vsock agent.".to_owned(),
         ))
     }
 
@@ -734,7 +707,7 @@ impl WorkerService {
             .sandbox_pool
             .get(pod_sandbox_id)
             .await
-            .ok_or_else(|| WorkerError::SandboxNotFound(pod_sandbox_id.to_string()))?;
+            .ok_or_else(|| WorkerError::SandboxNotFound(pod_sandbox_id.to_owned()))?;
 
         // TODO: Get actual stats from VM
         Ok(super::client::PodSandboxStats {
@@ -796,7 +769,7 @@ impl WorkerService {
 
         let container = containers
             .get(container_id)
-            .ok_or_else(|| WorkerError::ContainerNotFound(container_id.to_string()))?;
+            .ok_or_else(|| WorkerError::ContainerNotFound(container_id.to_owned()))?;
 
         // TODO: Get actual stats from container
         Ok(ContainerStats {
@@ -898,7 +871,7 @@ impl WorkerService {
 
         // Store pending stream for DH handshake completion
         let pending = PendingFdStream {
-            container_id: container_id.to_string(),
+            container_id: container_id.to_owned(),
             server_secret,
             server_pubkey: server_pubkey_bytes,
             stream_endpoint: stream_endpoint.clone(),
@@ -906,7 +879,7 @@ impl WorkerService {
         self.pending_fd_streams.write().await.insert(stream_id.clone(), pending);
 
         Ok(AttachResponse {
-            container_id: container_id.to_string(),
+            container_id: container_id.to_owned(),
             stream_id,
             stream_endpoint,
             server_pubkey: server_pubkey_bytes,
@@ -952,12 +925,12 @@ impl WorkerService {
             container_id: pending.container_id.clone(),
             cancel_token: cancel_token.clone(),
         };
-        self.active_fd_streams.write().await.insert(stream_id.to_string(), active);
+        self.active_fd_streams.write().await.insert(stream_id.to_owned(), active);
 
         // Spawn FD streaming task
         let context = self.context.clone();
         let stream_endpoint = pending.stream_endpoint.clone();
-        let stream_id_owned = stream_id.to_string();
+        let stream_id_owned = stream_id.to_owned();
         let container_id = pending.container_id.clone();
         let mac_key = *keys.mac_key;
         let topic = keys.topic.clone();
@@ -991,7 +964,7 @@ impl WorkerService {
         });
 
         Ok(FdStreamAuthResponse {
-            stream_id: stream_id.to_string(),
+            stream_id: stream_id.to_owned(),
             authorized: true,
         })
     }
@@ -1399,7 +1372,7 @@ impl WorkerService {
                 let cmd_list = try_capnp!(exec_req.get_cmd());
                 let mut cmd: Vec<String> = Vec::new();
                 for i in 0..cmd_list.len() {
-                    cmd.push(try_capnp!(try_capnp!(cmd_list.get(i)).to_str()).to_string());
+                    cmd.push(try_capnp!(try_capnp!(cmd_list.get(i)).to_str()).to_owned());
                 }
                 let timeout = exec_req.get_timeout();
                 match self.runtime_handle.block_on(self.exec_sync(container_id, &cmd, timeout)) {
@@ -1442,7 +1415,7 @@ impl WorkerService {
 
             Which::Attach(attach_req) => {
                 let attach_req = attach_req.ok()?;
-                let container_id = attach_req.get_container_id().ok()?.to_str().ok()?.to_string();
+                let container_id = attach_req.get_container_id().ok()?.to_str().ok()?.to_owned();
                 match self.runtime_handle.block_on(self.attach(&container_id)) {
                     Ok(response) => Ok(build_attach_response(request_id, &response)),
                     Err(e) => Ok(build_error_response(request_id, &e.to_string())),
@@ -1450,7 +1423,7 @@ impl WorkerService {
             }
 
             Which::Detach(container_id) => {
-                let container_id = container_id.ok()?.to_str().ok()?.to_string();
+                let container_id = container_id.ok()?.to_str().ok()?.to_owned();
                 match self.runtime_handle.block_on(self.detach(&container_id)) {
                     Ok(()) => Ok(build_success_response(request_id)),
                     Err(e) => Ok(build_error_response(request_id, &e.to_string())),
@@ -1459,7 +1432,7 @@ impl WorkerService {
 
             Which::StartFdStream(req) => {
                 let req = req.ok()?;
-                let stream_id = req.get_stream_id().ok()?.to_str().ok()?.to_string();
+                let stream_id = req.get_stream_id().ok()?.to_str().ok()?.to_owned();
                 let client_pubkey_data = req.get_client_pubkey().ok()?;
                 if client_pubkey_data.len() != 32 {
                     return Some(Ok(build_error_response(request_id, "Invalid client pubkey length")));
@@ -1527,7 +1500,7 @@ impl WorkerService {
                 };
                 let image_ref = match image_spec.get_image() {
                     Ok(s) => match s.to_str() {
-                        Ok(s) => s.to_string(),
+                        Ok(s) => s.to_owned(),
                         Err(e) => return Some(Ok(build_image_error_response(request_id, &e.to_string()))),
                     },
                     Err(e) => return Some(Ok(build_image_error_response(request_id, &e.to_string()))),
@@ -1550,7 +1523,7 @@ impl WorkerService {
                 };
                 let image_ref = match image_spec.get_image() {
                     Ok(s) => match s.to_str() {
-                        Ok(s) => s.to_string(),
+                        Ok(s) => s.to_owned(),
                         Err(e) => return Some(Ok(build_image_error_response(request_id, &e.to_string()))),
                     },
                     Err(e) => return Some(Ok(build_image_error_response(request_id, &e.to_string()))),
@@ -1562,12 +1535,10 @@ impl WorkerService {
                         Ok(auth_reader) => {
                             let username = auth_reader.get_username().ok()
                                 .and_then(|s| s.to_str().ok())
-                                .unwrap_or_default()
-                                .to_string();
+                                .unwrap_or_default().to_owned();
                             let password = auth_reader.get_password().ok()
                                 .and_then(|s| s.to_str().ok())
-                                .unwrap_or_default()
-                                .to_string();
+                                .unwrap_or_default().to_owned();
                             if !username.is_empty() {
                                 Some(crate::image::AuthConfig {
                                     username,
@@ -1597,7 +1568,7 @@ impl WorkerService {
                 };
                 let image_ref = match image_spec.get_image() {
                     Ok(s) => match s.to_str() {
-                        Ok(s) => s.to_string(),
+                        Ok(s) => s.to_owned(),
                         Err(e) => return Some(Ok(build_image_error_response(request_id, &e.to_string()))),
                     },
                     Err(e) => return Some(Ok(build_image_error_response(request_id, &e.to_string()))),

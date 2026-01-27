@@ -65,7 +65,7 @@ impl Default for GemmaConfig {
             sliding_window: None,
             layer_types: vec![],
             query_pre_attn_scalar: None,
-            hidden_activation: "silu".to_string(),
+            hidden_activation: "silu".to_owned(),
         }
     }
 }
@@ -470,7 +470,7 @@ impl GemmaMLP {
         // Apply activation based on config
         let gate = match self.activation.as_str() {
             "gelu_pytorch_tanh" => self.gelu_pytorch_tanh(&gate_pre_activation)?,
-            "silu" | _ => gate_pre_activation.silu(),
+            _ => gate_pre_activation.silu(),  // silu is default
         };
 
         let up = hidden_2d.matmul(&self.up_proj.transpose(0, 1));
@@ -632,7 +632,7 @@ impl GemmaModel {
         let mut config = Self::detect_config_from_weights(weights)?;
 
         // Override with Gemma3-specific settings
-        config.hidden_activation = "gelu_pytorch_tanh".to_string();
+        config.hidden_activation = "gelu_pytorch_tanh".to_owned();
         config.query_pre_attn_scalar = Some(256.0);
         config.sliding_window = Some(512);
         config.rope_theta = 1000000.0; // Global attention theta
@@ -664,14 +664,14 @@ impl GemmaModel {
         let embed_tokens = weights
             .get("model.embed_tokens.weight")
             .or_else(|| weights.get("embed_tokens.weight"))
-            .map(|t| t.shallow_clone());
+            .map(tch::Tensor::shallow_clone);
 
         // Gemma uses weight tying - lm_head shares weights with embed_tokens
         // Keep lm_head as [vocab_size, hidden_size], transpose during use
         let lm_head = weights
             .get("lm_head.weight")
             .or_else(|| weights.get("model.lm_head.weight"))
-            .map(|t| t.shallow_clone());
+            .map(tch::Tensor::shallow_clone);
 
         if lm_head.is_none() && embed_tokens.is_some() {
             tracing::info!("Gemma model uses weight tying (lm_head = embed_tokens.T)");
@@ -769,39 +769,39 @@ impl GemmaModel {
         config: &GemmaConfig,
         _device: &Device,
     ) -> Result<Option<GemmaLayer>> {
-        let prefix = format!("model.layers.{}", layer_idx);
+        let prefix = format!("model.layers.{layer_idx}");
 
         // Check if layer exists
-        if !weights.contains_key(&format!("{}.self_attn.q_proj.weight", prefix)) {
+        if !weights.contains_key(&format!("{prefix}.self_attn.q_proj.weight")) {
             return Ok(None);
         }
 
         // Get attention weights - SafeTensors stores as [out_features, in_features]
         // Keep them as-is, we'll transpose during matmul
         let q_proj = weights
-            .get(&format!("{}.self_attn.q_proj.weight", prefix))
+            .get(&format!("{prefix}.self_attn.q_proj.weight"))
             .ok_or_else(|| anyhow!("Missing q_proj weight"))?
             .shallow_clone();
         let k_proj = weights
-            .get(&format!("{}.self_attn.k_proj.weight", prefix))
+            .get(&format!("{prefix}.self_attn.k_proj.weight"))
             .ok_or_else(|| anyhow!("Missing k_proj weight"))?
             .shallow_clone();
         let v_proj = weights
-            .get(&format!("{}.self_attn.v_proj.weight", prefix))
+            .get(&format!("{prefix}.self_attn.v_proj.weight"))
             .ok_or_else(|| anyhow!("Missing v_proj weight"))?
             .shallow_clone();
         let o_proj = weights
-            .get(&format!("{}.self_attn.o_proj.weight", prefix))
+            .get(&format!("{prefix}.self_attn.o_proj.weight"))
             .ok_or_else(|| anyhow!("Missing o_proj weight"))?
             .shallow_clone();
 
         // Check for QK-norm weights (Gemma3)
         let q_norm = weights
-            .get(&format!("{}.self_attn.q_norm.weight", prefix))
-            .map(|t| t.shallow_clone());
+            .get(&format!("{prefix}.self_attn.q_norm.weight"))
+            .map(tch::Tensor::shallow_clone);
         let k_norm = weights
-            .get(&format!("{}.self_attn.k_norm.weight", prefix))
-            .map(|t| t.shallow_clone());
+            .get(&format!("{prefix}.self_attn.k_norm.weight"))
+            .map(tch::Tensor::shallow_clone);
 
         // Determine layer type from config or use default pattern
         let layer_type = if !config.layer_types.is_empty() && layer_idx < config.layer_types.len() {
@@ -810,12 +810,12 @@ impl GemmaModel {
         } else if config.sliding_window.is_some() {
             // Fallback: Every 6th layer is global, others are local
             if (layer_idx + 1).is_multiple_of(6) {
-                "global".to_string()
+                "global".to_owned()
             } else {
-                "local".to_string()
+                "local".to_owned()
             }
         } else {
-            "global".to_string()
+            "global".to_owned()
         };
 
         // Use different RoPE theta for local vs global
@@ -850,15 +850,15 @@ impl GemmaModel {
         // Build MLP - keep weights as [out, in], transpose during matmul
         let mlp = GemmaMLP {
             gate_proj: weights
-                .get(&format!("{}.mlp.gate_proj.weight", prefix))
+                .get(&format!("{prefix}.mlp.gate_proj.weight"))
                 .ok_or_else(|| anyhow!("Missing gate_proj weight"))?
                 .shallow_clone(),
             up_proj: weights
-                .get(&format!("{}.mlp.up_proj.weight", prefix))
+                .get(&format!("{prefix}.mlp.up_proj.weight"))
                 .ok_or_else(|| anyhow!("Missing up_proj weight"))?
                 .shallow_clone(),
             down_proj: weights
-                .get(&format!("{}.mlp.down_proj.weight", prefix))
+                .get(&format!("{prefix}.mlp.down_proj.weight"))
                 .ok_or_else(|| anyhow!("Missing down_proj weight"))?
                 .shallow_clone(),
             activation: config.hidden_activation.clone(),
@@ -870,7 +870,7 @@ impl GemmaModel {
 
         let input_layernorm = RMSNorm {
             weight: weights
-                .get(&format!("{}.input_layernorm.weight", prefix))
+                .get(&format!("{prefix}.input_layernorm.weight"))
                 .ok_or_else(|| anyhow!("Missing input_layernorm weight"))?
                 .shallow_clone(),
             eps: config.rms_norm_eps,
@@ -879,7 +879,7 @@ impl GemmaModel {
 
         let post_attention_layernorm = RMSNorm {
             weight: weights
-                .get(&format!("{}.post_attention_layernorm.weight", prefix))
+                .get(&format!("{prefix}.post_attention_layernorm.weight"))
                 .ok_or_else(|| anyhow!("Missing post_attention_layernorm weight"))?
                 .shallow_clone(),
             eps: config.rms_norm_eps,
@@ -905,9 +905,9 @@ impl GemmaModel {
             .map(|arr| {
                 arr.iter()
                     .map(|v| match v.as_str().unwrap_or("") {
-                        "sliding_attention" => "local".to_string(),
-                        "full_attention" => "global".to_string(),
-                        _ => "global".to_string(),
+                        "sliding_attention" => "local".to_owned(),
+                        "full_attention" => "global".to_owned(),
+                        _ => "global".to_owned(),
                     })
                     .collect()
             })
@@ -925,59 +925,58 @@ impl GemmaModel {
         Ok(GemmaConfig {
             num_attention_heads: config
                 .get("num_attention_heads")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(4) as usize,
             num_key_value_heads: config
                 .get("num_key_value_heads")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(1) as usize,
             hidden_size: config
                 .get("hidden_size")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(640) as usize,
             head_dim: config
                 .get("head_dim")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(256) as usize,
             intermediate_size: config
                 .get("intermediate_size")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(2048) as usize,
             max_position_embeddings: config
                 .get("max_position_embeddings")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(32768) as usize,
             rms_norm_eps: config
                 .get("rms_norm_eps")
-                .and_then(|v| v.as_f64())
+                .and_then(serde_json::Value::as_f64)
                 .unwrap_or(1e-6) as f32,
             vocab_size: config
                 .get("vocab_size")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(262144) as usize,
             num_hidden_layers: config
                 .get("num_hidden_layers")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(18) as usize,
             rope_theta: config
                 .get("rope_theta")
-                .and_then(|v| v.as_f64())
+                .and_then(serde_json::Value::as_f64)
                 .unwrap_or(1000000.0) as f32,
             rope_local_base_freq: config
                 .get("rope_local_base_freq")
-                .and_then(|v| v.as_f64())
+                .and_then(serde_json::Value::as_f64)
                 .unwrap_or(10000.0) as f32,
             sliding_window: config
                 .get("sliding_window")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .map(|v| v as usize),
             layer_types,
             query_pre_attn_scalar,
             hidden_activation: config
                 .get("hidden_activation")
                 .and_then(|v| v.as_str())
-                .unwrap_or("silu")
-                .to_string(),
+                .unwrap_or("silu").to_owned(),
         })
     }
 }
@@ -1233,7 +1232,7 @@ mod tests {
         let config = GemmaConfig::default();
         let model = GemmaModel {
             config: config.clone(),
-            device: device.clone(),
+            device,
             dtype: DType::Float,
             embed_tokens: None,
             layers: vec![],
@@ -1242,14 +1241,14 @@ mod tests {
         };
 
         // Test tensor for key/value with shape [1, 21, 1024] (4 * 256)
-        let kv_tensor = Tensor::randn(&[1, 21, 1024], (DType::Float, device));
+        let kv_tensor = Tensor::randn([1, 21, 1024], (DType::Float, device));
 
         // Reshape for key/value (MQA)
         let reshaped = model.reshape_for_attention(&kv_tensor, true).expect("test: reshape kv");
         assert_eq!(reshaped.size(), &[1, 21, 4, 256]); // 4 KV heads, 256 head_dim
 
         // Test tensor for query with shape [1, 21, 4096] (16 * 256)
-        let q_tensor = Tensor::randn(&[1, 21, 4096], (DType::Float, device));
+        let q_tensor = Tensor::randn([1, 21, 4096], (DType::Float, device));
 
         // Reshape for query
         let reshaped = model.reshape_for_attention(&q_tensor, false).expect("test: reshape q");
@@ -1260,10 +1259,10 @@ mod tests {
     fn test_kv_expansion_for_mqa() {
         let device = Device::Cpu;
         let attn = GemmaAttention {
-            q_proj: Tensor::zeros(&[1024, 4096], (DType::Float, device)),
-            k_proj: Tensor::zeros(&[1024, 1024], (DType::Float, device)),
-            v_proj: Tensor::zeros(&[1024, 1024], (DType::Float, device)),
-            o_proj: Tensor::zeros(&[4096, 1024], (DType::Float, device)),
+            q_proj: Tensor::zeros([1024, 4096], (DType::Float, device)),
+            k_proj: Tensor::zeros([1024, 1024], (DType::Float, device)),
+            v_proj: Tensor::zeros([1024, 1024], (DType::Float, device)),
+            o_proj: Tensor::zeros([4096, 1024], (DType::Float, device)),
             num_heads: 16,
             num_kv_heads: 4,
             head_dim: 256,
@@ -1272,11 +1271,11 @@ mod tests {
             k_norm: None,
             query_pre_attn_scalar: None,
             sliding_window: None,
-            layer_type: "full_attention".to_string(),
+            layer_type: "full_attention".to_owned(),
         };
 
         // Create KV tensor with 4 heads
-        let kv = Tensor::randn(&[2, 10, 4, 256], (DType::Float, device));
+        let kv = Tensor::randn([2, 10, 4, 256], (DType::Float, device));
 
         // Expand to match 16 query heads
         let expanded = attn.expand_kv_for_mqa(&kv).expect("test: expand kv for mqa");

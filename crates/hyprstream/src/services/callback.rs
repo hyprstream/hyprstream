@@ -80,7 +80,7 @@ impl CallbackRouter {
     pub fn new(ctx: Arc<zmq::Context>) -> Result<Self> {
         let endpoint = match try_registry() {
             Some(reg) => reg.endpoint("model", SocketKind::Router).to_zmq_string(),
-            None => FALLBACK_CALLBACK_ENDPOINT.to_string(),
+            None => FALLBACK_CALLBACK_ENDPOINT.to_owned(),
         };
         Self::with_endpoint(ctx, &endpoint)
     }
@@ -102,7 +102,7 @@ impl CallbackRouter {
         Ok(Self {
             ctx,
             router: Mutex::new(router),
-            endpoint: endpoint.to_string(),
+            endpoint: endpoint.to_owned(),
             instances: RwLock::new(HashMap::new()),
         })
     }
@@ -191,7 +191,7 @@ impl CallbackRouter {
         let router = self.router.lock().map_err(|e| anyhow!("Lock poisoned: {}", e))?;
 
         // ROUTER format: [identity, empty, payload]
-        router.send_multipart(&[&instance.identity, &empty, &payload], 0)?;
+        router.send_multipart([&instance.identity, &empty, &payload], 0)?;
         trace!("Sent LoadModel to {}", instance.id);
 
         Ok(())
@@ -237,7 +237,7 @@ impl CallbackRouter {
         let payload = self.build_shutdown()?;
         let empty: Vec<u8> = Vec::new();
         let router = self.router.lock().map_err(|e| anyhow!("Lock poisoned: {}", e))?;
-        router.send_multipart(&[&instance.identity, &empty, &payload], 0)?;
+        router.send_multipart([&instance.identity, &empty, &payload], 0)?;
         trace!("Sent Shutdown to {}", instance.id);
         Ok(())
     }
@@ -247,7 +247,7 @@ impl CallbackRouter {
         let payload = self.build_infer(request_bytes)?;
         let empty: Vec<u8> = Vec::new();
         let router = self.router.lock().map_err(|e| anyhow!("Lock poisoned: {}", e))?;
-        router.send_multipart(&[&instance.identity, &empty, &payload], 0)?;
+        router.send_multipart([&instance.identity, &empty, &payload], 0)?;
         trace!("Sent Infer to {}", instance.id);
         Ok(())
     }
@@ -295,8 +295,8 @@ impl CallbackRouter {
         )?;
         let reg = reader.get_root::<model_capnp::register::Reader>()?;
 
-        let id = reg.get_id()?.to_str()?.to_string();
-        let stream_endpoint = reg.get_stream_endpoint()?.to_str()?.to_string();
+        let id = reg.get_id()?.to_str()?.to_owned();
+        let stream_endpoint = reg.get_stream_endpoint()?.to_str()?.to_owned();
 
         Ok((id, stream_endpoint))
     }

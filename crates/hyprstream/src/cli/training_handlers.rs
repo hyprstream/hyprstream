@@ -129,10 +129,9 @@ pub async fn handle_training_init(
     println!("\n✓ Training initialization complete!");
     println!("\n→ Next steps:");
     println!(
-        "  hyprstream training infer {} --prompt \"...\"",
-        model_ref
+        "  hyprstream training infer {model_ref} --prompt \"...\""
     );
-    println!("  hyprstream training checkpoint {}", model_ref);
+    println!("  hyprstream training checkpoint {model_ref}");
 
     Ok(())
 }
@@ -157,7 +156,7 @@ async fn init_adapter_at_path(
     let adapter_base_name = adapter_name.unwrap_or("default");
     let indexed_adapter_name = adapter_manager.create_indexed_name(adapter_base_name, index)?;
 
-    println!("\n→ Initializing adapter: {}", indexed_adapter_name);
+    println!("\n→ Initializing adapter: {indexed_adapter_name}");
 
     // Create adapter configuration
     let adapter_config = crate::storage::AdapterConfig {
@@ -166,7 +165,7 @@ async fn init_adapter_at_path(
         learning_rate: learning_rate as f64,
         batch_size: 4,
         epochs: 10,
-        model_ref: model_ref_str.to_string(),
+        model_ref: model_ref_str.to_owned(),
         training_data: None,
         ..Default::default()
     };
@@ -183,13 +182,13 @@ async fn init_adapter_at_path(
         alpha: alpha as f32,
         dropout: 0.1,
         target_modules: vec![
-            "q_proj".to_string(),
-            "k_proj".to_string(),
-            "v_proj".to_string(),
-            "o_proj".to_string(),
-            "gate_proj".to_string(),
-            "up_proj".to_string(),
-            "down_proj".to_string(),
+            "q_proj".to_owned(),
+            "k_proj".to_owned(),
+            "v_proj".to_owned(),
+            "o_proj".to_owned(),
+            "gate_proj".to_owned(),
+            "up_proj".to_owned(),
+            "down_proj".to_owned(),
         ],
         learning_rate,
     };
@@ -199,7 +198,7 @@ async fn init_adapter_at_path(
     // Save adapter weights
     let adapter_path = adapter_manager
         .adapters_dir
-        .join(format!("{}.safetensors", indexed_adapter_name));
+        .join(format!("{indexed_adapter_name}.safetensors"));
     let adapter_path_str = adapter_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("adapter path is not valid UTF-8"))?;
@@ -208,13 +207,12 @@ async fn init_adapter_at_path(
     // Save adapter config
     let config_path = adapter_manager
         .adapters_dir
-        .join(format!("{}.config.json", indexed_adapter_name));
+        .join(format!("{indexed_adapter_name}.config.json"));
     let config_json = serde_json::to_string_pretty(&adapter_config)?;
     std::fs::write(&config_path, config_json)?;
 
     println!(
-        "✓ Created adapter: adapters/{}.safetensors",
-        indexed_adapter_name
+        "✓ Created adapter: adapters/{indexed_adapter_name}.safetensors"
     );
 
     // Save training mode config
@@ -242,7 +240,7 @@ fn save_training_config(
 
     let training_config = HyprstreamTrainingConfig {
         mode: mode.clone(),
-        target_adapter: Some(target_adapter.to_string()),
+        target_adapter: Some(target_adapter.to_owned()),
         learning_rate: learning_rate as f64,
         batch_size: 4,
         steps_per_cycle: 10,
@@ -344,15 +342,15 @@ pub async fn handle_training_infer(
 
     // Apply chat template
     let messages = vec![ChatMessage {
-        role: "user".to_string(),
-        content: prompt.to_string(),
+        role: "user".to_owned(),
+        content: prompt.to_owned(),
     }];
 
     let formatted_prompt = match client.apply_chat_template(&messages, true).await {
         Ok(formatted) => formatted,
         Err(e) => {
             warn!("Could not apply chat template: {}. Using raw prompt.", e);
-            prompt.to_string()
+            prompt.to_owned()
         }
     };
 
@@ -398,7 +396,7 @@ pub async fn handle_training_infer(
     println!("{}", response.text);
 
     println!("\n[TTT applied - adapter weights modified]");
-    println!("Run 'hyprstream training checkpoint {}' to commit changes", model_ref);
+    println!("Run 'hyprstream training checkpoint {model_ref}' to commit changes");
 
     // Stop service to properly release resources
     let _ = service_handle.stop().await;
@@ -484,11 +482,9 @@ pub async fn handle_training_batch(
     let mut files: Vec<PathBuf> = Vec::new();
 
     for file_pattern in &input_files {
-        for entry in glob(file_pattern)? {
-            if let Ok(path) = entry {
-                if path.is_file() {
-                    files.push(path);
-                }
+        for path in (glob(file_pattern)?).flatten() {
+            if path.is_file() {
+                files.push(path);
             }
         }
     }
@@ -498,11 +494,9 @@ pub async fn handle_training_batch(
             bail!("Input directory does not exist: {}", dir.display());
         }
         let full_pattern = dir.join(pattern);
-        for entry in glob(&full_pattern.to_string_lossy())? {
-            if let Ok(path) = entry {
-                if path.is_file() {
-                    files.push(path);
-                }
+        for path in (glob(&full_pattern.to_string_lossy())?).flatten() {
+            if path.is_file() {
+                files.push(path);
             }
         }
     }
@@ -519,7 +513,7 @@ pub async fn handle_training_batch(
         .collect();
 
     let total_files = files.len();
-    println!("Found {} files to process", total_files);
+    println!("Found {total_files} files to process");
 
     // Ensure TTT is enabled in model config
     ensure_ttt_enabled(&model_path)?;
@@ -527,7 +521,7 @@ pub async fn handle_training_batch(
     // Load test set (for future validation)
     let test_files: Vec<PathBuf> = if let Some(ref pattern) = test_set {
         glob(pattern)?
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|p| p.is_file())
             .collect()
     } else {
@@ -539,7 +533,7 @@ pub async fn handle_training_batch(
     }
 
     // Start InferenceService with TTT enabled
-    println!("Starting InferenceService for {}...", model_ref_str);
+    println!("Starting InferenceService for {model_ref_str}...");
     let mut runtime_config = RuntimeConfig::default();
     runtime_config.max_context = max_context;
     runtime_config.kv_quant_type = kv_quant.into();
@@ -588,8 +582,7 @@ pub async fn handle_training_batch(
                         .or_else(|| parsed.get("text"))
                         .or_else(|| parsed.get("content"))
                         .and_then(|v| v.as_str())
-                        .unwrap_or(&chunk)
-                        .to_string()
+                        .unwrap_or(&chunk).to_owned()
                 } else {
                     chunk.clone()
                 }
@@ -622,14 +615,13 @@ pub async fn handle_training_batch(
             let rate = processed as f32 / elapsed;
             let tokens_per_sec = (total_input_tokens + total_output_tokens) as f32 / elapsed;
             println!(
-                "[{}/{}] {:.1} files/sec, {} input tokens, {} output tokens ({:.0} tok/s)",
-                processed, total_files, rate, total_input_tokens, total_output_tokens, tokens_per_sec
+                "[{processed}/{total_files}] {rate:.1} files/sec, {total_input_tokens} input tokens, {total_output_tokens} output tokens ({tokens_per_sec:.0} tok/s)"
             );
         }
 
         // Checkpoint - save adapter weights
         if processed % checkpoint_interval == 0 {
-            println!("\n→ Checkpoint at {} files...", processed);
+            println!("\n→ Checkpoint at {processed} files...");
             // Request the service to save weights (if supported), or save manually
             if let Some(adapter) = adapters.first() {
                 println!("  Adapter: {}", adapter.name);
@@ -646,12 +638,12 @@ pub async fn handle_training_batch(
     let total_tokens = total_input_tokens + total_output_tokens;
     let tokens_per_sec = total_tokens as f32 / elapsed.as_secs_f32();
     println!("\n✓ Batch training complete!");
-    println!("  Processed: {} files", processed);
-    println!("  Input tokens: {}", total_input_tokens);
-    println!("  Output tokens: {}", total_output_tokens);
-    println!("  Total tokens: {} ({:.0} tok/s)", total_tokens, tokens_per_sec);
+    println!("  Processed: {processed} files");
+    println!("  Input tokens: {total_input_tokens}");
+    println!("  Output tokens: {total_output_tokens}");
+    println!("  Total tokens: {total_tokens} ({tokens_per_sec:.0} tok/s)");
     println!("  Time: {:.1}s", elapsed.as_secs_f32());
-    println!("\n→ Run 'hyprstream training checkpoint {}' to commit", model_ref);
+    println!("\n→ Run 'hyprstream training checkpoint {model_ref}' to commit");
 
     Ok(())
 }
@@ -712,8 +704,7 @@ pub async fn handle_training_checkpoint(
             .strip_prefix(&model_path)
             .unwrap_or(&adapter.path);
         files_to_stage.push(relative_path.to_str()
-            .ok_or_else(|| anyhow::anyhow!("Invalid path: {:?}", relative_path))?
-            .to_string());
+            .ok_or_else(|| anyhow::anyhow!("Invalid path: {:?}", relative_path))?.to_owned());
 
         // Also stage config if exists
         let config_path = adapter.path.with_extension("config.json");
@@ -722,13 +713,12 @@ pub async fn handle_training_checkpoint(
                 .strip_prefix(&model_path)
                 .unwrap_or(&config_path);
             files_to_stage.push(relative_config.to_str()
-                .ok_or_else(|| anyhow::anyhow!("Invalid path: {:?}", relative_config))?
-                .to_string());
+                .ok_or_else(|| anyhow::anyhow!("Invalid path: {:?}", relative_config))?.to_owned());
         }
     }
 
     // Convert to string references for the async call
-    let files_refs: Vec<&str> = files_to_stage.iter().map(|s| s.as_str()).collect();
+    let files_refs: Vec<&str> = files_to_stage.iter().map(std::string::String::as_str).collect();
 
     repo_client.stage_files(&files_refs).await
         .map_err(|e| anyhow::anyhow!("Failed to stage files: {}", e))?;
@@ -749,7 +739,7 @@ pub async fn handle_training_checkpoint(
 
     // Push if requested (requires direct repo access)
     if push {
-        println!("Pushing to {}...", remote);
+        println!("Pushing to {remote}...");
 
         // For push, we still need direct repo access (no service layer API yet)
         let repo = git2db::GitManager::global()
@@ -759,11 +749,11 @@ pub async fn handle_training_checkpoint(
         let mut remote_obj = repo.find_remote(remote)?;
         let refspec = format!(
             "refs/heads/{}:refs/heads/{}",
-            model_ref.git_ref.to_string(),
-            model_ref.git_ref.to_string()
+            model_ref.git_ref,
+            model_ref.git_ref
         );
         remote_obj.push(&[&refspec], None)?;
-        println!("✓ Pushed to {}", remote);
+        println!("✓ Pushed to {remote}");
     }
 
     Ok(())

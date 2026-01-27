@@ -83,7 +83,7 @@ pub async fn get_listener(addr: &str) -> Result<TcpListener> {
     debug!("Socket activation not available, binding to {}", addr);
     let listener = TcpListener::bind(addr)
         .await
-        .with_context(|| format!("Failed to bind to {}", addr))?;
+        .with_context(|| format!("Failed to bind to {addr}"))?;
 
     let local_addr = listener.local_addr()?;
     info!("Server listening on {} (direct bind)", local_addr);
@@ -209,10 +209,10 @@ pub fn get_all_tcp_listeners() -> Result<Vec<TcpListener>> {
             Ok(Some(std_listener)) => {
                 std_listener
                     .set_nonblocking(true)
-                    .with_context(|| format!("Failed to set socket {} non-blocking", index))?;
+                    .with_context(|| format!("Failed to set socket {index} non-blocking"))?;
 
                 let listener = TcpListener::from_std(std_listener)
-                    .with_context(|| format!("Failed to convert socket {} to tokio", index))?;
+                    .with_context(|| format!("Failed to convert socket {index} to tokio"))?;
 
                 listeners.push(listener);
                 index += 1;

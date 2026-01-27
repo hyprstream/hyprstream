@@ -151,7 +151,7 @@ impl CheckpointManager {
     /// # Example
     /// ```ignore
     /// let manager = CheckpointManager::new(model_path)?
-    ///     .with_target_adapter("01_coding".to_string());
+    ///     .with_target_adapter("01_coding".to_owned());
     /// ```
     pub fn with_target_adapter(mut self, adapter_name: String) -> Self {
         self.target_adapter = Some(adapter_name);
@@ -243,7 +243,7 @@ impl CheckpointManager {
                 // Save diff file
                 let diff_path = self
                     .checkpoint_dir
-                    .join(format!("diff_from_{}_to_{}.bin", base_step, step));
+                    .join(format!("diff_from_{base_step}_to_{step}.bin"));
                 fs::write(&diff_path, changes).await?;
                 return Ok(diff_path);
             }
@@ -288,7 +288,7 @@ impl CheckpointManager {
         let adapters_dir = self.model_path.join("adapters");
         fs::create_dir_all(&adapters_dir).await?;
 
-        let adapter_path = adapters_dir.join(format!("{}.safetensors", adapter_name));
+        let adapter_path = adapters_dir.join(format!("{adapter_name}.safetensors"));
 
         // Copy checkpoint to adapter path
         #[cfg(target_os = "linux")]
@@ -341,7 +341,7 @@ impl CheckpointManager {
 
         // Switch branch if specified
         if let Some(branch_name) = branch {
-            let branch_ref = format!("refs/heads/{}", branch_name);
+            let branch_ref = format!("refs/heads/{branch_name}");
             if repo.find_reference(&branch_ref).is_ok() {
                 repo.set_head(&branch_ref)?;
                 repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
@@ -668,7 +668,7 @@ impl CheckpointManager {
 
             if !current_branch.contains(branch) {
                 // Switch to the branch if not already on it
-                let branch_ref = format!("refs/heads/{}", branch);
+                let branch_ref = format!("refs/heads/{branch}");
                 repo.set_head(&branch_ref)?;
                 repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
             }
@@ -689,9 +689,9 @@ impl CheckpointManager {
 
         let parent_commit = repo.head()?.peel_to_commit()?;
         let message = if let Some(name) = branch_name.as_ref() {
-            format!("Training checkpoint step {} (branch: {})", step, name)
+            format!("Training checkpoint step {step} (branch: {name})")
         } else {
-            format!("Training checkpoint step {}", step)
+            format!("Training checkpoint step {step}")
         };
 
         repo.commit(Some("HEAD"), &sig, &sig, &message, &tree, &[&parent_commit])?;
@@ -699,9 +699,9 @@ impl CheckpointManager {
         // For major checkpoints, create human-friendly tags
         if step.is_multiple_of(50000) {
             let tag_name = if let Some(branch) = branch_name {
-                format!("checkpoint-{}-step-{}", branch, step)
+                format!("checkpoint-{branch}-step-{step}")
             } else {
-                format!("checkpoint-step-{}", step)
+                format!("checkpoint-step-{step}")
             };
 
             // Create checkpoint tag

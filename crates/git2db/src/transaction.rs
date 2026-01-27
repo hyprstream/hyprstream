@@ -133,7 +133,7 @@ impl Git2DB {
         mode: IsolationMode,
     ) -> Git2DBResult<TransactionHandle> {
         let tx_id = Uuid::new_v4();
-        let tx_name = format!("tx-{}", tx_id);
+        let tx_name = format!("tx-{tx_id}");
         let worktree_path = self.registry_path().join(".worktrees").join(&tx_name);
 
         info!("Starting transaction {} with mode {:?}", tx_id, mode);
@@ -150,7 +150,7 @@ impl Git2DB {
                     let repo = Repository::open(&registry_path).map_err(|e| {
                         Git2DBError::repository(
                             &registry_path,
-                            format!("Failed to open registry: {}", e),
+                            format!("Failed to open registry: {e}"),
                         )
                     })?;
 
@@ -159,20 +159,20 @@ impl Git2DB {
 
                     repo.worktree(&tx_name_clone, &worktree_path_clone, Some(&opts))
                         .map_err(|e| {
-                            Git2DBError::internal(format!("Failed to create worktree: {}", e))
+                            Git2DBError::internal(format!("Failed to create worktree: {e}"))
                         })?;
 
                     Ok(())
                 })
                 .await
-                .map_err(|e| Git2DBError::internal(format!("Join error: {}", e)))??;
+                .map_err(|e| Git2DBError::internal(format!("Join error: {e}")))??;
 
                 info!("Created git worktree at {:?}", worktree_path);
             }
             IsolationMode::CopyOnWrite => {
                 // Just create directory for metadata snapshot
                 fs::create_dir_all(&worktree_path).await.map_err(|e| {
-                    Git2DBError::internal(format!("Failed to create snapshot directory: {}", e))
+                    Git2DBError::internal(format!("Failed to create snapshot directory: {e}"))
                 })?;
             }
             IsolationMode::Optimistic => {
@@ -182,7 +182,7 @@ impl Git2DB {
 
         // Create snapshot of current registry state
         let snapshot = RegistrySnapshot {
-            version: self.version().to_string(),
+            version: self.version().to_owned(),
             repositories: self.list().map(|r| (r.id.0, r.clone())).collect(),
         };
 
@@ -246,8 +246,8 @@ impl TransactionHandle {
 
         state.operations.push(Operation::Clone {
             id: repo_id.clone(),
-            name: name.to_string(),
-            url: url.to_string(),
+            name: name.to_owned(),
+            url: url.to_owned(),
         });
 
         Ok(repo_id)
@@ -334,8 +334,8 @@ impl TransactionHandle {
 
         let result_id = Arc::new(RwLock::new(None));
         state.operations.push(Operation::Upsert {
-            name: name.to_string(),
-            url: url.to_string(),
+            name: name.to_owned(),
+            url: url.to_owned(),
             result_id: Arc::clone(&result_id),
         });
 
@@ -352,7 +352,7 @@ impl TransactionHandle {
         state
             .operations
             .iter()
-            .map(|op| format!("{:?}", op))
+            .map(|op| format!("{op:?}"))
             .collect()
     }
 
@@ -504,25 +504,25 @@ impl TransactionHandle {
                     let repo = Repository::open(&registry_path).map_err(|e| {
                         Git2DBError::repository(
                             &registry_path,
-                            format!("Failed to open registry: {}", e),
+                            format!("Failed to open registry: {e}"),
                         )
                     })?;
 
                     let worktree = repo.find_worktree(&worktree_name).map_err(|e| {
-                        Git2DBError::internal(format!("Failed to find worktree: {}", e))
+                        Git2DBError::internal(format!("Failed to find worktree: {e}"))
                     })?;
 
                     let mut opts = WorktreePruneOptions::new();
                     opts.working_tree(true); // Remove filesystem data
 
                     worktree.prune(Some(&mut opts)).map_err(|e| {
-                        Git2DBError::internal(format!("Failed to prune worktree: {}", e))
+                        Git2DBError::internal(format!("Failed to prune worktree: {e}"))
                     })?;
 
                     Ok(())
                 })
                 .await
-                .map_err(|e| Git2DBError::internal(format!("Join error: {}", e)))??;
+                .map_err(|e| Git2DBError::internal(format!("Join error: {e}")))??;
 
                 info!("Pruned git worktree {}", worktree_name_log);
             }
@@ -532,7 +532,7 @@ impl TransactionHandle {
                     tokio::fs::remove_dir_all(&state.worktree_path)
                         .await
                         .map_err(|e| {
-                            Git2DBError::internal(format!("Failed to remove snapshot dir: {}", e))
+                            Git2DBError::internal(format!("Failed to remove snapshot dir: {e}"))
                         })?;
                 }
             }
@@ -561,7 +561,7 @@ impl<'a> Transaction<'a> {
         info!("Starting legacy transaction: {}", tx_id);
 
         fs::create_dir_all(&worktree_path).await.map_err(|e| {
-            Git2DBError::internal(format!("Failed to create worktree directory: {}", e))
+            Git2DBError::internal(format!("Failed to create worktree directory: {e}"))
         })?;
 
         Ok(Self {
@@ -574,7 +574,7 @@ impl<'a> Transaction<'a> {
 
     pub async fn remove(&mut self, id: &RepoId) -> Git2DBResult<()> {
         debug!("Legacy transaction {}: remove {}", self.tx_id, id);
-        self.operations.push(format!("remove {}", id));
+        self.operations.push(format!("remove {id}"));
         self.registry.remove_repository(id).await
     }
 
@@ -584,7 +584,7 @@ impl<'a> Transaction<'a> {
             self.tx_id, name, url
         );
         self.operations
-            .push(format!("ensure {} from {}", name, url));
+            .push(format!("ensure {name} from {url}"));
         self.registry.upsert_repository(name, url).await
     }
 
@@ -593,13 +593,13 @@ impl<'a> Transaction<'a> {
             "Legacy transaction {}: clone {} from {}",
             self.tx_id, name, url
         );
-        self.operations.push(format!("clone {} from {}", name, url));
+        self.operations.push(format!("clone {name} from {url}"));
         self.registry.add_repository(name, url).await
     }
 
     pub async fn update(&mut self, id: &RepoId, new_url: Option<String>) -> Git2DBResult<()> {
         debug!("Legacy transaction {}: update {}", self.tx_id, id);
-        self.operations.push(format!("update {}", id));
+        self.operations.push(format!("update {id}"));
         self.registry.update_repository(id, new_url).await
     }
 
@@ -617,7 +617,7 @@ impl<'a> Transaction<'a> {
         if self.worktree_path.exists() {
             fs::remove_dir_all(&self.worktree_path)
                 .await
-                .map_err(|e| Git2DBError::internal(format!("Failed to cleanup worktree: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to cleanup worktree: {e}")))?;
         }
 
         Ok(())
@@ -633,7 +633,7 @@ impl<'a> Transaction<'a> {
         if self.worktree_path.exists() {
             fs::remove_dir_all(&self.worktree_path)
                 .await
-                .map_err(|e| Git2DBError::internal(format!("Failed to cleanup worktree: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to cleanup worktree: {e}")))?;
         }
 
         Ok(())
@@ -642,7 +642,7 @@ impl<'a> Transaction<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     // Integration tests will be in tests/ directory
 }

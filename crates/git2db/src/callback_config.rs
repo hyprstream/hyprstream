@@ -205,7 +205,7 @@ impl CallbackConfig {
 
     fn handle_certificate(
         config: &CertificateConfig,
-        cert: &Cert,
+        cert: &Cert<'_>,
     ) -> Result<git2::CertificateCheckStatus, git2::Error> {
         use git2::CertificateCheckStatus;
 
@@ -234,13 +234,13 @@ impl CallbackConfig {
         }
     }
 
-    fn handle_progress(config: &ProgressConfig, stats: git2::Progress) {
+    fn handle_progress(config: &ProgressConfig, stats: git2::Progress<'_>) {
         match config {
             ProgressConfig::None => {}
             ProgressConfig::Stdout => {
                 let current = stats.received_objects();
                 let total = stats.total_objects();
-                println!("Progress: {}/{} objects", current, total);
+                println!("Progress: {current}/{total} objects");
             }
             ProgressConfig::Channel(reporter) => {
                 let current = stats.received_objects();
@@ -332,7 +332,7 @@ mod tests {
     fn test_builder_pattern() {
         let config = CallbackConfigBuilder::new()
             .auth(AuthStrategy::SshAgent {
-                username: Some("git".to_string()),
+                username: Some("git".to_owned()),
             })
             .progress(ProgressConfig::Stdout)
             .certificates(CertificateConfig::AcceptAll)

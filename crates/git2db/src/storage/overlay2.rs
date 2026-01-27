@@ -80,14 +80,14 @@ impl Driver for Overlay2Driver {
         let mount_dir = overlay_base.join("mount");
 
         tokio::fs::create_dir_all(&upper_dir).await.map_err(|e| {
-            Git2DBError::internal(format!("Failed to create upper directory: {}", e))
+            Git2DBError::internal(format!("Failed to create upper directory: {e}"))
         })?;
         tokio::fs::create_dir_all(&work_dir).await.map_err(|e| {
-            Git2DBError::internal(format!("Failed to create work directory: {}", e))
+            Git2DBError::internal(format!("Failed to create work directory: {e}"))
         })?;
         tokio::fs::create_dir_all(&mount_dir)
             .await
-            .map_err(|e| Git2DBError::internal(format!("Failed to create mount point: {}", e)))?;
+            .map_err(|e| Git2DBError::internal(format!("Failed to create mount point: {e}")))?;
 
         info!(
             "Creating overlay2 worktree: id={}, lower={}, mount={}",
@@ -150,7 +150,7 @@ impl Driver for Overlay2Driver {
 
         Ok(WorktreeHandle::with_cleanup(
             opts.worktree_path.clone(),
-            format!("overlay2-{}", mount_method),
+            format!("overlay2-{mount_method}"),
             cleanup,
         ))
     }
@@ -180,7 +180,7 @@ impl Driver for Overlay2Driver {
             let worktree_path = entry.path();
 
             // Skip non-directories and git's internal directories
-            if !worktree_path.is_dir() || worktree_path.file_name().map_or(false, |name| {
+            if !worktree_path.is_dir() || worktree_path.file_name().is_some_and(|name| {
                 name.to_string_lossy().starts_with(".git")
             }) {
                 continue;
@@ -188,7 +188,7 @@ impl Driver for Overlay2Driver {
 
             // Check if this is an overlay2 worktree by looking for overlay signatures
             if self.is_overlay2_worktree(&worktree_path) {
-                worktrees.push(WorktreeHandle::new(worktree_path, "overlay2".to_string()));
+                worktrees.push(WorktreeHandle::new(worktree_path, "overlay2".to_owned()));
             }
         }
 
@@ -203,7 +203,7 @@ impl Driver for Overlay2Driver {
             .join(branch);
 
         if worktree_path.exists() && self.is_overlay2_worktree(&worktree_path) {
-            Ok(Some(WorktreeHandle::new(worktree_path, "overlay2".to_string())))
+            Ok(Some(WorktreeHandle::new(worktree_path, "overlay2".to_owned())))
         } else {
             Ok(None)
         }
@@ -253,7 +253,7 @@ impl Overlay2Driver {
                 debug!("Attempting kernel overlayfs mount");
                 match Self::mount_kernel(target, &mount_opts).await {
                     Ok(()) => {
-                        return Ok("kernel".to_string());
+                        return Ok("kernel".to_owned());
                     }
                     Err(e) => {
                         debug!("Kernel overlayfs failed, trying next method: {}", e);
@@ -267,7 +267,7 @@ impl Overlay2Driver {
             debug!("Attempting user namespace overlayfs mount");
             match Self::mount_userns(lower, upper, work, target).await {
                 Ok(()) => {
-                    return Ok("userns".to_string());
+                    return Ok("userns".to_owned());
                 }
                 Err(e) => {
                     debug!("User namespace mount failed, trying next method: {}", e);
@@ -279,7 +279,7 @@ impl Overlay2Driver {
         debug!("Attempting FUSE overlayfs mount");
         match Self::mount_fuse(target, &mount_opts).await {
             Ok(()) => {
-                return Ok("fuse".to_string());
+                return Ok("fuse".to_owned());
             }
             Err(e) => {
                 debug!("FUSE overlayfs failed: {}", e);
@@ -291,7 +291,7 @@ impl Overlay2Driver {
             "All overlayfs mount methods failed. Ensure one of: \
              1) Kernel overlayfs + CAP_SYS_ADMIN capability, \
              2) User namespace support (unprivileged_userns_clone=1), \
-             3) fuse-overlayfs binary installed and available".to_string()
+             3) fuse-overlayfs binary installed and available".to_owned()
         ))
     }
 
@@ -308,7 +308,7 @@ impl Overlay2Driver {
             Some(mount_opts),
         )
         .map_err(|e| {
-            Git2DBError::internal(format!("Failed to mount kernel overlayfs: {}", e))
+            Git2DBError::internal(format!("Failed to mount kernel overlayfs: {e}"))
         })
     }
 
@@ -321,10 +321,7 @@ impl Overlay2Driver {
 
         // Try to create a test namespace
         use nix::sched::{unshare, CloneFlags};
-        match unshare(CloneFlags::CLONE_NEWUSER) {
-            Ok(_) => true,
-            Err(_) => false,
-        }
+        unshare(CloneFlags::CLONE_NEWUSER).is_ok()
     }
 
     /// Mount using user namespace
@@ -354,13 +351,12 @@ impl Overlay2Driver {
             .arg(target)
             .output()
             .await
-            .map_err(|e| Git2DBError::internal(format!("Failed to execute unshare: {}", e)))?;
+            .map_err(|e| Git2DBError::internal(format!("Failed to execute unshare: {e}")))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(Git2DBError::internal(format!(
-                "User namespace mount failed: {}",
-                stderr
+                "User namespace mount failed: {stderr}"
             )));
         }
 
@@ -376,14 +372,13 @@ impl Overlay2Driver {
             .output()
             .await
             .map_err(|e| {
-                Git2DBError::internal(format!("Failed to execute fuse-overlayfs: {}", e))
+                Git2DBError::internal(format!("Failed to execute fuse-overlayfs: {e}"))
             })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(Git2DBError::internal(format!(
-                "FUSE overlayfs failed: {}",
-                stderr
+                "FUSE overlayfs failed: {stderr}"
             )));
         }
 
@@ -410,7 +405,7 @@ impl Overlay2Driver {
             .arg(target)
             .output()
             .await
-            .map_err(|e| Git2DBError::internal(format!("Failed to execute umount: {}", e)))?;
+            .map_err(|e| Git2DBError::internal(format!("Failed to execute umount: {e}")))?;
 
         if !output.status.success() {
             // Try lazy unmount as last resort
@@ -439,22 +434,21 @@ impl Overlay2Driver {
     ) -> Git2DBResult<()> {
         // Open the base repository
         let repo = git2::Repository::open(base_repo)
-            .map_err(|e| Git2DBError::internal(format!("Failed to open repository: {}", e)))?;
+            .map_err(|e| Git2DBError::internal(format!("Failed to open repository: {e}")))?;
 
         // Resolve ref_spec to a commit
         let object = repo.revparse_single(ref_spec).map_err(|e| {
-            Git2DBError::internal(format!("Failed to resolve ref '{}': {}", ref_spec, e))
+            Git2DBError::internal(format!("Failed to resolve ref '{ref_spec}': {e}"))
         })?;
 
         let commit = object.peel_to_commit().map_err(|e| {
             Git2DBError::internal(format!(
-                "Ref '{}' does not point to a commit: {}",
-                ref_spec, e
+                "Ref '{ref_spec}' does not point to a commit: {e}"
             ))
         })?;
 
         // Check if this is a branch
-        let branch_ref_name = format!("refs/heads/{}", ref_spec);
+        let branch_ref_name = format!("refs/heads/{ref_spec}");
         let is_branch = repo.find_reference(&branch_ref_name).is_ok();
 
         // Create worktree name
@@ -473,7 +467,7 @@ impl Overlay2Driver {
                 worktree_path,
                 Some(git2::WorktreeAddOptions::new().reference(Some(&reference))),
             )
-            .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {}", e)))?;
+            .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {e}")))?;
 
             info!(
                 "Created overlay2 worktree at {} for branch '{}' (commit: {})",
@@ -483,7 +477,7 @@ impl Overlay2Driver {
             );
         } else {
             repo.worktree(worktree_name, worktree_path, None)
-                .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {e}")))?;
 
             let wt_repo = git2::Repository::open(worktree_path)?;
             wt_repo.set_head_detached(commit.id())?;

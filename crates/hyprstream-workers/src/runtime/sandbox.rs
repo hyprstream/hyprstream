@@ -382,7 +382,7 @@ impl PodSandbox {
             created_at: Utc::now(),
             labels: config.labels.clone(),
             annotations: config.annotations.clone(),
-            runtime_handler: "kata".to_string(),
+            runtime_handler: "kata".to_owned(),
             hypervisor: None,
             sandbox_path,
             api_socket: None,

@@ -57,8 +57,8 @@ impl LayerNorm {
         device: Device,
         dtype: DType,
     ) -> Result<Self> {
-        let weight_key = format!("{}.weight", prefix);
-        let bias_key = format!("{}.bias", prefix);
+        let weight_key = format!("{prefix}.weight");
+        let bias_key = format!("{prefix}.bias");
 
         let weight = weights
             .get(&weight_key)
@@ -80,7 +80,7 @@ impl LayerNorm {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        Ok(x.layer_norm(&[self.weight.size()[0]], Some(&self.weight), Some(&self.bias), self.eps, true))
+        Ok(x.layer_norm([self.weight.size()[0]], Some(&self.weight), Some(&self.bias), self.eps, true))
     }
 }
 
@@ -106,25 +106,25 @@ impl SigLIPAttention {
         dtype: DType,
     ) -> Result<Self> {
         let qkv_weight = weights
-            .get(&format!("{}.qkv.weight", prefix))
+            .get(&format!("{prefix}.qkv.weight"))
             .ok_or_else(|| anyhow!("Missing QKV weight: {}.qkv.weight", prefix))?
             .to_device(device)
             .to_kind(dtype);
 
         let qkv_bias = weights
-            .get(&format!("{}.qkv.bias", prefix))
+            .get(&format!("{prefix}.qkv.bias"))
             .ok_or_else(|| anyhow!("Missing QKV bias: {}.qkv.bias", prefix))?
             .to_device(device)
             .to_kind(dtype);
 
         let proj_weight = weights
-            .get(&format!("{}.proj.weight", prefix))
+            .get(&format!("{prefix}.proj.weight"))
             .ok_or_else(|| anyhow!("Missing proj weight: {}.proj.weight", prefix))?
             .to_device(device)
             .to_kind(dtype);
 
         let proj_bias = weights
-            .get(&format!("{}.proj.bias", prefix))
+            .get(&format!("{prefix}.proj.bias"))
             .ok_or_else(|| anyhow!("Missing proj bias: {}.proj.bias", prefix))?
             .to_device(device)
             .to_kind(dtype);
@@ -150,10 +150,10 @@ impl SigLIPAttention {
         let qkv = x.matmul(&self.qkv_weight.tr()) + &self.qkv_bias;
 
         // Reshape to [B, N, 3, num_heads, head_dim]
-        let qkv = qkv.reshape(&[batch_size, seq_len, 3, self.num_heads as i64, self.head_dim as i64]);
+        let qkv = qkv.reshape([batch_size, seq_len, 3, self.num_heads as i64, self.head_dim as i64]);
 
         // Permute to [3, B, num_heads, N, head_dim]
-        let qkv = qkv.permute(&[2, 0, 3, 1, 4]);
+        let qkv = qkv.permute([2, 0, 3, 1, 4]);
 
         // Split into Q, K, V
         let q = qkv.get(0) * self.scale;
@@ -171,7 +171,7 @@ impl SigLIPAttention {
         let out = out
             .transpose(1, 2)
             .contiguous()
-            .reshape(&[batch_size, seq_len, (self.num_heads * self.head_dim) as i64]);
+            .reshape([batch_size, seq_len, (self.num_heads * self.head_dim) as i64]);
 
         // Output projection
         let out = out.matmul(&self.proj_weight.tr()) + &self.proj_bias;
@@ -197,25 +197,25 @@ impl SigLIPMlp {
         dtype: DType,
     ) -> Result<Self> {
         let fc1_weight = weights
-            .get(&format!("{}.fc1.weight", prefix))
+            .get(&format!("{prefix}.fc1.weight"))
             .ok_or_else(|| anyhow!("Missing MLP fc1 weight: {}.fc1.weight", prefix))?
             .to_device(device)
             .to_kind(dtype);
 
         let fc1_bias = weights
-            .get(&format!("{}.fc1.bias", prefix))
+            .get(&format!("{prefix}.fc1.bias"))
             .ok_or_else(|| anyhow!("Missing MLP fc1 bias: {}.fc1.bias", prefix))?
             .to_device(device)
             .to_kind(dtype);
 
         let fc2_weight = weights
-            .get(&format!("{}.fc2.weight", prefix))
+            .get(&format!("{prefix}.fc2.weight"))
             .ok_or_else(|| anyhow!("Missing MLP fc2 weight: {}.fc2.weight", prefix))?
             .to_device(device)
             .to_kind(dtype);
 
         let fc2_bias = weights
-            .get(&format!("{}.fc2.bias", prefix))
+            .get(&format!("{prefix}.fc2.bias"))
             .ok_or_else(|| anyhow!("Missing MLP fc2 bias: {}.fc2.bias", prefix))?
             .to_device(device)
             .to_kind(dtype);
@@ -260,14 +260,14 @@ impl SigLIPBlock {
     ) -> Result<Self> {
         let norm1 = LayerNorm::from_weights(
             weights,
-            &format!("{}.norm1", prefix),
+            &format!("{prefix}.norm1"),
             device,
             dtype,
         )?;
 
         let attn = SigLIPAttention::from_weights(
             weights,
-            &format!("{}.attn", prefix),
+            &format!("{prefix}.attn"),
             hidden_size,
             num_heads,
             device,
@@ -276,14 +276,14 @@ impl SigLIPBlock {
 
         let norm2 = LayerNorm::from_weights(
             weights,
-            &format!("{}.norm2", prefix),
+            &format!("{prefix}.norm2"),
             device,
             dtype,
         )?;
 
         let mlp = SigLIPMlp::from_weights(
             weights,
-            &format!("{}.mlp", prefix),
+            &format!("{prefix}.mlp"),
             device,
             dtype,
         )?;
@@ -333,57 +333,57 @@ impl AttentionPool {
         dtype: DType,
     ) -> Result<Self> {
         let latent = weights
-            .get(&format!("{}.latent", prefix))
+            .get(&format!("{prefix}.latent"))
             .ok_or_else(|| anyhow!("Missing attention pool latent: {}.latent", prefix))?
             .to_device(device)
             .to_kind(dtype);
 
         let q_weight = weights
-            .get(&format!("{}.q.weight", prefix))
+            .get(&format!("{prefix}.q.weight"))
             .ok_or_else(|| anyhow!("Missing attention pool Q weight: {}.q.weight", prefix))?
             .to_device(device)
             .to_kind(dtype);
 
         let q_bias = weights
-            .get(&format!("{}.q.bias", prefix))
+            .get(&format!("{prefix}.q.bias"))
             .ok_or_else(|| anyhow!("Missing attention pool Q bias: {}.q.bias", prefix))?
             .to_device(device)
             .to_kind(dtype);
 
         let kv_weight = weights
-            .get(&format!("{}.kv.weight", prefix))
+            .get(&format!("{prefix}.kv.weight"))
             .ok_or_else(|| anyhow!("Missing attention pool KV weight: {}.kv.weight", prefix))?
             .to_device(device)
             .to_kind(dtype);
 
         let kv_bias = weights
-            .get(&format!("{}.kv.bias", prefix))
+            .get(&format!("{prefix}.kv.bias"))
             .ok_or_else(|| anyhow!("Missing attention pool KV bias: {}.kv.bias", prefix))?
             .to_device(device)
             .to_kind(dtype);
 
         let proj_weight = weights
-            .get(&format!("{}.proj.weight", prefix))
+            .get(&format!("{prefix}.proj.weight"))
             .ok_or_else(|| anyhow!("Missing attention pool proj weight: {}.proj.weight", prefix))?
             .to_device(device)
             .to_kind(dtype);
 
         let proj_bias = weights
-            .get(&format!("{}.proj.bias", prefix))
+            .get(&format!("{prefix}.proj.bias"))
             .ok_or_else(|| anyhow!("Missing attention pool proj bias: {}.proj.bias", prefix))?
             .to_device(device)
             .to_kind(dtype);
 
         let norm = LayerNorm::from_weights(
             weights,
-            &format!("{}.norm", prefix),
+            &format!("{prefix}.norm"),
             device,
             dtype,
         )?;
 
         let mlp = SigLIPMlp::from_weights(
             weights,
-            &format!("{}.mlp", prefix),
+            &format!("{prefix}.mlp"),
             device,
             dtype,
         )?;
@@ -418,7 +418,7 @@ impl AttentionPool {
             // Should be 2D [num_queries, hidden_size]
             latent
         };
-        let latent = latent.unsqueeze(0).expand(&[batch_size, -1, -1], false);
+        let latent = latent.unsqueeze(0).expand([batch_size, -1, -1], false);
 
         // Q from latent
         let q = latent.matmul(&self.q_weight.tr()) + &self.q_bias;
@@ -426,13 +426,13 @@ impl AttentionPool {
 
         // K, V from input
         let kv = x.matmul(&self.kv_weight.tr()) + &self.kv_bias;
-        let kv = kv.reshape(&[batch_size, seq_len, 2, self.num_heads as i64, self.head_dim as i64]);
-        let kv = kv.permute(&[2, 0, 3, 1, 4]);
+        let kv = kv.reshape([batch_size, seq_len, 2, self.num_heads as i64, self.head_dim as i64]);
+        let kv = kv.permute([2, 0, 3, 1, 4]);
         let k = kv.get(0);
         let v = kv.get(1);
 
         // Reshape Q: [B, num_queries, num_heads, head_dim]
-        let q = q.reshape(&[batch_size, num_queries, self.num_heads as i64, self.head_dim as i64]);
+        let q = q.reshape([batch_size, num_queries, self.num_heads as i64, self.head_dim as i64]);
         let q = q.transpose(1, 2);  // [B, num_heads, num_queries, head_dim]
 
         // Attention
@@ -447,7 +447,7 @@ impl AttentionPool {
         let out = out
             .transpose(1, 2)
             .contiguous()
-            .reshape(&[batch_size, num_queries, hidden_size]);
+            .reshape([batch_size, num_queries, hidden_size]);
 
         // Output projection
         let out = out.matmul(&self.proj_weight.tr()) + &self.proj_bias;
@@ -483,18 +483,18 @@ impl SigLIPVisionTransformer {
 
         // Patch embedding (Conv2d projection)
         let patch_embed_weight = weights
-            .get(&format!("{}.patch_embed.proj.weight", prefix))
+            .get(&format!("{prefix}.patch_embed.proj.weight"))
             .ok_or_else(|| anyhow!("Missing patch embed weight: {}.patch_embed.proj.weight", prefix))?
             .to_device(device)
             .to_kind(dtype);
 
         let patch_embed_bias = weights
-            .get(&format!("{}.patch_embed.proj.bias", prefix))
+            .get(&format!("{prefix}.patch_embed.proj.bias"))
             .map(|t| t.to_device(device).to_kind(dtype));
 
         // Position embeddings
         let pos_embed = weights
-            .get(&format!("{}.pos_embed", prefix))
+            .get(&format!("{prefix}.pos_embed"))
             .ok_or_else(|| anyhow!("Missing position embeddings: {}.pos_embed", prefix))?
             .to_device(device)
             .to_kind(dtype);
@@ -504,7 +504,7 @@ impl SigLIPVisionTransformer {
         // Transformer blocks
         let mut blocks = Vec::new();
         for i in 0..config.num_hidden_layers {
-            let block_prefix = format!("{}.blocks.{}", prefix, i);
+            let block_prefix = format!("{prefix}.blocks.{i}");
             let block = SigLIPBlock::from_weights(
                 weights,
                 &block_prefix,
@@ -520,7 +520,7 @@ impl SigLIPVisionTransformer {
         // Final layer norm
         let norm = LayerNorm::from_weights(
             weights,
-            &format!("{}.norm", prefix),
+            &format!("{prefix}.norm"),
             device,
             dtype,
         )?;
@@ -529,7 +529,7 @@ impl SigLIPVisionTransformer {
         let attn_pool = if config.use_attention_pool {
             Some(AttentionPool::from_weights(
                 weights,
-                &format!("{}.attn_pool", prefix),
+                &format!("{prefix}.attn_pool"),
                 config.hidden_size,
                 config.num_attention_heads,
                 device,
@@ -563,23 +563,23 @@ impl SigLIPVisionTransformer {
         let mut x = images.conv2d(
             &self.patch_embed_weight,
             self.patch_embed_bias.as_ref(),
-            &[stride, stride],  // stride
-            &[0, 0],            // padding
-            &[1, 1],            // dilation
+            [stride, stride],  // stride
+            [0, 0],            // padding
+            [1, 1],            // dilation
             1,                  // groups
         );
 
         // Reshape: [B, hidden_size, H', W'] -> [B, num_patches, hidden_size]
         let (_, hidden_size, h, w) = x.size4()?;
         let num_patches = h * w;
-        x = x.permute(&[0, 2, 3, 1])  // [B, H', W', hidden_size]
-            .reshape(&[batch_size, num_patches, hidden_size]);
+        x = x.permute([0, 2, 3, 1])  // [B, H', W', hidden_size]
+            .reshape([batch_size, num_patches, hidden_size]);
 
         debug!("After patch embed: {:?}", x.size());
 
         // Add position embeddings
         // pos_embed is typically [1, num_patches, hidden_size]
-        x = x + &self.pos_embed;
+        x += &self.pos_embed;
 
         // Transformer blocks
         for (i, block) in self.blocks.iter().enumerate() {

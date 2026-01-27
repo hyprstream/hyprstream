@@ -29,7 +29,7 @@ pub async fn execute_sparse_query(
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let addr = addr.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 3000)));
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
     if verbose {
         info!("Executing sparse query: {}", query);
@@ -52,9 +52,10 @@ pub async fn execute_sparse_query(
         .unwrap_or("default");
 
     // Make REST API call for embeddings
-    let url = format!("{}/v1/inference/{}/embeddings", base_url, lora_id);
+    let url = format!("{base_url}/v1/inference/{lora_id}/embeddings");
+    let empty_input = json!("");
     let request_body = json!({
-        "input": embedding_query.get("input").unwrap_or(&json!("")),
+        "input": embedding_query.get("input").unwrap_or(&empty_input),
         "model": "text-embedding-ada-002"
     });
 
@@ -92,7 +93,7 @@ pub async fn handle_embedding_query(
     _tls_skip_verify: bool,
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let addr = host.unwrap_or_else(|| "localhost:50051".to_string());
+    let addr = host.unwrap_or_else(|| "localhost:50051".to_owned());
 
     // Create Config with TLS settings if certificates are provided
     let config = match (tls_cert, tls_key) {
@@ -123,7 +124,7 @@ pub async fn handle_embedding_query(
     // Execute embedding query
     execute_sparse_query(
         Some(socket_addr),
-        query.to_string(),
+        query.to_owned(),
         config.as_ref(),
         verbose,
     )
@@ -166,7 +167,7 @@ pub async fn create_lora_via_api(
     sparsity: f32,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let client = create_http_client();
-    let url = format!("{}/v1/lora/create", base_url);
+    let url = format!("{base_url}/v1/lora/create");
 
     let request_body = json!({
         "name": name,
@@ -187,8 +188,7 @@ pub async fn create_lora_via_api(
         let status_code = response.status();
         let error_text = response.text().await?;
         Err(format!(
-            "Failed to create LoRA: HTTP {} - {}",
-            status_code, error_text
+            "Failed to create LoRA: HTTP {status_code} - {error_text}"
         )
         .into())
     }
@@ -197,7 +197,7 @@ pub async fn create_lora_via_api(
 /// List LoRA adapters via REST API
 pub async fn list_lora_via_api(base_url: &str) -> Result<Value, Box<dyn std::error::Error>> {
     let client = create_http_client();
-    let url = format!("{}/v1/lora/list", base_url);
+    let url = format!("{base_url}/v1/lora/list");
 
     let response = client.get(&url).send().await?;
 
@@ -208,8 +208,7 @@ pub async fn list_lora_via_api(base_url: &str) -> Result<Value, Box<dyn std::err
         let status_code = response.status();
         let error_text = response.text().await?;
         Err(format!(
-            "Failed to list LoRA adapters: HTTP {} - {}",
-            status_code, error_text
+            "Failed to list LoRA adapters: HTTP {status_code} - {error_text}"
         )
         .into())
     }
@@ -221,7 +220,7 @@ pub async fn get_lora_info_via_api(
     lora_id: &str,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let client = create_http_client();
-    let url = format!("{}/v1/lora/{}/info", base_url, lora_id);
+    let url = format!("{base_url}/v1/lora/{lora_id}/info");
 
     let response = client.get(&url).send().await?;
 
@@ -232,8 +231,7 @@ pub async fn get_lora_info_via_api(
         let status_code = response.status();
         let error_text = response.text().await?;
         Err(format!(
-            "Failed to get LoRA info: HTTP {} - {}",
-            status_code, error_text
+            "Failed to get LoRA info: HTTP {status_code} - {error_text}"
         )
         .into())
     }
@@ -247,7 +245,7 @@ pub async fn start_training_via_api(
     batch_size: usize,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let client = create_http_client();
-    let url = format!("{}/v1/training/{}/start", base_url, lora_id);
+    let url = format!("{base_url}/v1/training/{lora_id}/start");
 
     let request_body = json!({
         "learning_rate": learning_rate,
@@ -265,8 +263,7 @@ pub async fn start_training_via_api(
         let status_code = response.status();
         let error_text = response.text().await?;
         Err(format!(
-            "Failed to start training: HTTP {} - {}",
-            status_code, error_text
+            "Failed to start training: HTTP {status_code} - {error_text}"
         )
         .into())
     }
@@ -278,7 +275,7 @@ pub async fn get_training_status_via_api(
     lora_id: &str,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let client = create_http_client();
-    let url = format!("{}/v1/training/{}/status", base_url, lora_id);
+    let url = format!("{base_url}/v1/training/{lora_id}/status");
 
     let response = client.get(&url).send().await?;
 
@@ -289,8 +286,7 @@ pub async fn get_training_status_via_api(
         let status_code = response.status();
         let error_text = response.text().await?;
         Err(format!(
-            "Failed to get training status: HTTP {} - {}",
-            status_code, error_text
+            "Failed to get training status: HTTP {status_code} - {error_text}"
         )
         .into())
     }
@@ -306,7 +302,7 @@ pub async fn chat_completion_via_api(
     stream: bool,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let client = create_http_client();
-    let url = format!("{}/v1/inference/{}/chat/completions", base_url, lora_id);
+    let url = format!("{base_url}/v1/inference/{lora_id}/chat/completions");
 
     let request_body = json!({
         "model": format!("lora-{}", lora_id),
@@ -325,14 +321,11 @@ pub async fn chat_completion_via_api(
         let status_code = response.status();
         let error_text = response.text().await?;
         Err(format!(
-            "Failed to perform chat completion: HTTP {} - {}",
-            status_code, error_text
+            "Failed to perform chat completion: HTTP {status_code} - {error_text}"
         )
         .into())
     }
 }
-
-/// Handle chat command - inference with models/composed models
 
 /// Handle pre-training command - NOT IMPLEMENTED
 pub async fn handle_pretrain(

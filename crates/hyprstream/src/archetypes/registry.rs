@@ -68,7 +68,7 @@ impl DetectedDomains {
     pub fn has_in_domain<C: Capability>(&self, domain: &str) -> bool {
         self.domain_capabilities
             .get(domain)
-            .map(|caps| caps.has::<C>())
+            .map(crate::archetypes::CapabilitySet::has::<C>)
             .unwrap_or(false)
     }
 

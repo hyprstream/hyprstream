@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
     match run_git_remote_helper(Some(config), Some(url)).await {
         Ok(()) => {}
         Err(e) => {
-            eprintln!("error {}", e);
+            eprintln!("error {e}");
             std::process::exit(1);
         }
     }

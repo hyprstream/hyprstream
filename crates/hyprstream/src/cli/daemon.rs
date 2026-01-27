@@ -79,7 +79,7 @@ pub fn maybe_daemonize(
             let path = PathBuf::from(dir);
             if !path.exists() {
                 std::fs::create_dir_all(&path)
-                    .with_context(|| format!("Failed to create working directory: {}", dir))?;
+                    .with_context(|| format!("Failed to create working directory: {dir}"))?;
             }
             daemon = daemon.working_directory(path);
         }
@@ -159,7 +159,7 @@ pub fn stop_daemon(pid_file: Option<String>) -> Result<()> {
     let pid: u32 = pid_str
         .trim()
         .parse()
-        .with_context(|| format!("Invalid PID in file: {}", pid_str))?;
+        .with_context(|| format!("Invalid PID in file: {pid_str}"))?;
 
     #[cfg(unix)]
     {
@@ -168,7 +168,7 @@ pub fn stop_daemon(pid_file: Option<String>) -> Result<()> {
 
         info!("Sending SIGTERM to process {}", pid);
         kill(Pid::from_raw(pid as i32), Signal::SIGTERM)
-            .with_context(|| format!("Failed to send SIGTERM to PID {}", pid))?;
+            .with_context(|| format!("Failed to send SIGTERM to PID {pid}"))?;
 
         // Remove PID file
         let _ = std::fs::remove_file(&pid_path);
@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn test_check_running_no_file() {
         // Should return None if PID file doesn't exist
-        let result = check_running(Some("/nonexistent/path/hyprstream.pid".to_string()));
+        let result = check_running(Some("/nonexistent/path/hyprstream.pid".to_owned()));
         assert!(result.is_none());
     }
 

@@ -169,7 +169,7 @@ impl LoRATrainer {
         self.total_tokens += labels.size()[0] as u64 * labels.size()[1] as u64;
 
         // Update best loss
-        if self.best_loss.map_or(true, |best| loss_value < best) {
+        if self.best_loss.is_none_or(|best| loss_value < best) {
             self.best_loss = Some(loss_value);
         }
 
@@ -215,7 +215,7 @@ impl LoRATrainer {
             .vs
             .trainable_variables()
             .iter()
-            .map(|v| v.shallow_clone())
+            .map(tch::Tensor::shallow_clone)
             .collect();
 
         // Clip gradients manually since tch doesn't have utils::clip_grad_norm
@@ -264,7 +264,7 @@ impl LoRATrainer {
     /// Save checkpoint
     pub fn save_checkpoint(&self, lora_model: &LoRAModel, path: &str) -> Result<()> {
         // Save LoRA weights
-        lora_model.save(&format!("{}/lora_weights.pt", path))?;
+        lora_model.save(&format!("{path}/lora_weights.pt"))?;
 
         // Save training state
         let state = serde_json::json!({
@@ -273,7 +273,7 @@ impl LoRATrainer {
         });
 
         std::fs::write(
-            format!("{}/trainer_state.json", path),
+            format!("{path}/trainer_state.json"),
             serde_json::to_string_pretty(&state)?,
         )?;
 
@@ -284,10 +284,10 @@ impl LoRATrainer {
     /// Load checkpoint
     pub fn load_checkpoint(&mut self, lora_model: &mut LoRAModel, path: &str) -> Result<()> {
         // Load LoRA weights
-        lora_model.load(&format!("{}/lora_weights.pt", path))?;
+        lora_model.load(&format!("{path}/lora_weights.pt"))?;
 
         // Load training state
-        let state_str = std::fs::read_to_string(format!("{}/trainer_state.json", path))?;
+        let state_str = std::fs::read_to_string(format!("{path}/trainer_state.json"))?;
         let state: serde_json::Value = serde_json::from_str(&state_str)?;
 
         self.global_step = state["global_step"].as_u64().unwrap_or(0) as usize;

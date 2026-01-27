@@ -144,7 +144,7 @@ impl Driver for ReflinkDriver {
                         );
 
                         // Return handle (no special cleanup needed - just rm like vfs)
-                        Ok(WorktreeHandle::new(worktree_path, "reflink".to_string()))
+                        Ok(WorktreeHandle::new(worktree_path, "reflink".to_owned()))
                     }
                     Err(e) => {
                         // SECURITY: Clean up partially created worktree on reflink failure
@@ -185,7 +185,7 @@ impl Driver for ReflinkDriver {
             let worktree_path = entry.path();
 
             // Skip non-directories and git's internal directories
-            if !worktree_path.is_dir() || worktree_path.file_name().map_or(false, |name| {
+            if !worktree_path.is_dir() || worktree_path.file_name().is_some_and(|name| {
                 name.to_string_lossy().starts_with(".git")
             }) {
                 continue;
@@ -193,7 +193,7 @@ impl Driver for ReflinkDriver {
 
             // For Reflink driver, any directory with a .git inside is a valid worktree
             if worktree_path.join(".git").exists() {
-                worktrees.push(WorktreeHandle::new(worktree_path, "reflink".to_string()));
+                worktrees.push(WorktreeHandle::new(worktree_path, "reflink".to_owned()));
             }
         }
 
@@ -207,7 +207,7 @@ impl Driver for ReflinkDriver {
             .join(branch);
 
         if worktree_path.exists() && worktree_path.join(".git").exists() {
-            Ok(Some(WorktreeHandle::new(worktree_path, "reflink".to_string())))
+            Ok(Some(WorktreeHandle::new(worktree_path, "reflink".to_owned())))
         } else {
             Ok(None)
         }
@@ -226,28 +226,27 @@ impl ReflinkDriver {
         // Ensure parent directory exists
         if let Some(parent) = worktree_path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                Git2DBError::internal(format!("Failed to create parent directory: {}", e))
+                Git2DBError::internal(format!("Failed to create parent directory: {e}"))
             })?;
         }
 
         // Open the base repository
         let repo = git2::Repository::open(base_repo)
-            .map_err(|e| Git2DBError::internal(format!("Failed to open repository: {}", e)))?;
+            .map_err(|e| Git2DBError::internal(format!("Failed to open repository: {e}")))?;
 
         // Resolve ref_spec to a commit
         let object = repo.revparse_single(ref_spec).map_err(|e| {
-            Git2DBError::internal(format!("Failed to resolve ref '{}': {}", ref_spec, e))
+            Git2DBError::internal(format!("Failed to resolve ref '{ref_spec}': {e}"))
         })?;
 
         let commit = object.peel_to_commit().map_err(|e| {
             Git2DBError::internal(format!(
-                "Ref '{}' does not point to a commit: {}",
-                ref_spec, e
+                "Ref '{ref_spec}' does not point to a commit: {e}"
             ))
         })?;
 
         // Check if this is a branch
-        let branch_ref_name = format!("refs/heads/{}", ref_spec);
+        let branch_ref_name = format!("refs/heads/{ref_spec}");
         let is_branch = repo.find_reference(&branch_ref_name).is_ok();
 
         // Create worktree name
@@ -266,7 +265,7 @@ impl ReflinkDriver {
                 worktree_path,
                 Some(git2::WorktreeAddOptions::new().reference(Some(&reference))),
             )
-            .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {}", e)))?;
+            .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {e}")))?;
 
             info!(
                 "Created git worktree at {} for branch '{}' (commit: {})",
@@ -276,16 +275,16 @@ impl ReflinkDriver {
             );
         } else {
             repo.worktree(worktree_name, worktree_path, None)
-                .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {e}")))?;
 
             let wt_repo = git2::Repository::open(worktree_path)?;
             wt_repo.set_head_detached(commit.id()).map_err(|e| {
-                Git2DBError::internal(format!("Failed to set detached HEAD: {}", e))
+                Git2DBError::internal(format!("Failed to set detached HEAD: {e}"))
             })?;
 
             wt_repo
                 .checkout_head(Some(git2::build::CheckoutBuilder::default().force()))
-                .map_err(|e| Git2DBError::internal(format!("Failed to checkout HEAD: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to checkout HEAD: {e}")))?;
 
             info!(
                 "Created git worktree at {} for ref '{}' (detached HEAD at {})",
@@ -321,7 +320,7 @@ impl ReflinkDriver {
 
         spawn_blocking(move || Self::reflink_directory(&base, &worktree))
             .await
-            .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
+            .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
     }
 
     /// Recursively reflink files in directory
@@ -335,7 +334,7 @@ impl ReflinkDriver {
             .filter_entry(|e| e.file_name() != ".git")
         {
             let entry = entry.map_err(|e| {
-                Git2DBError::internal(format!("Failed to walk directory: {}", e))
+                Git2DBError::internal(format!("Failed to walk directory: {e}"))
             })?;
 
             if !entry.file_type().is_file() {
@@ -343,7 +342,7 @@ impl ReflinkDriver {
             }
 
             let rel_path = entry.path().strip_prefix(target).map_err(|e| {
-                Git2DBError::internal(format!("Failed to get relative path: {}", e))
+                Git2DBError::internal(format!("Failed to get relative path: {e}"))
             })?;
 
             // Prevent path traversal

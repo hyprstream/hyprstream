@@ -173,7 +173,7 @@ mod tests {
         match backend_type {
             ProcessBackend::Standalone => println!("Using standalone backend"),
             ProcessBackend::Systemd { user_mode } => {
-                println!("Using systemd backend (user_mode: {})", user_mode)
+                println!("Using systemd backend (user_mode: {user_mode})")
             }
         }
     }
@@ -207,7 +207,7 @@ mod tests {
                 assert!(!running, "Process should be stopped");
             }
             Err(e) => {
-                eprintln!("Could not spawn test process: {}", e);
+                eprintln!("Could not spawn test process: {e}");
             }
         }
     }

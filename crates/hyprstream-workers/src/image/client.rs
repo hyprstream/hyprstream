@@ -137,7 +137,7 @@ impl ImageZmq {
     /// Create a new ImageZmq client
     pub fn new(endpoint: &str) -> Self {
         Self {
-            _endpoint: endpoint.to_string(),
+            _endpoint: endpoint.to_owned(),
         }
     }
 }

@@ -55,7 +55,7 @@ impl EventSubscriber {
     pub fn new(context: &Arc<zmq::Context>) -> Result<Self> {
         let endpoint = match registry::try_global() {
             Some(reg) => reg.endpoint("events", SocketKind::Sub).to_zmq_string(),
-            None => endpoints::SUB.to_string(),
+            None => endpoints::SUB.to_owned(),
         };
         Self::with_endpoint(context, &endpoint)
     }
@@ -186,7 +186,7 @@ impl EventSubscriber {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     #[test]
     fn test_subscription_patterns() {
@@ -199,7 +199,7 @@ mod tests {
         ];
 
         for pattern in patterns {
-            assert!(pattern.is_ascii(), "Pattern should be ASCII: {}", pattern);
+            assert!(pattern.is_ascii(), "Pattern should be ASCII: {pattern}");
         }
     }
 }

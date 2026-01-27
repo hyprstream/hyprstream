@@ -278,15 +278,11 @@ fn get_rename(attrs: &[Attribute]) -> Option<String> {
         if attr.path().is_ident("capnp") {
             if let Meta::List(list) = &attr.meta {
                 // Parse as key = value
-                if let Ok(expr) = syn::parse2::<Expr>(list.tokens.clone()) {
-                    if let Expr::Assign(assign) = expr {
-                        if let Expr::Path(path) = &*assign.left {
-                            if path.path.is_ident("rename") {
-                                if let Expr::Lit(lit) = &*assign.right {
-                                    if let syn::Lit::Str(s) = &lit.lit {
-                                        return Some(s.value());
-                                    }
-                                }
+                if let Ok(Expr::Assign(assign)) = syn::parse2::<Expr>(list.tokens.clone()) {
+                    if let Expr::Path(path) = &*assign.left {
+                        if path.path.is_ident("rename") {
+                            if let Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) = &*assign.right {
+                                return Some(s.value());
                             }
                         }
                     }
@@ -300,7 +296,7 @@ fn get_rename(attrs: &[Attribute]) -> Option<String> {
 /// Cap'n Proto Rust uses snake_case for accessors.
 /// This function simply returns the name as-is.
 fn to_accessor_name(s: &str) -> String {
-    s.to_string()
+    s.to_owned()
 }
 
 /// Check if type is Option<T>
@@ -543,17 +539,11 @@ pub fn rpc_method(attr: TokenStream, item: TokenStream) -> TokenStream {
     } else if args_list.len() == 1 {
         // Simple variant with single argument
         let arg_name = &args_list[0].pat;
-        let arg_type = &args_list[0].ty;
+        let _arg_type = &args_list[0].ty;
 
-        // Check if it's a reference type (&str, &T)
-        if is_reference_type(arg_type) {
-            quote! {
-                req.#setter_name(#arg_name);
-            }
-        } else {
-            quote! {
-                req.#setter_name(#arg_name);
-            }
+        // Set the argument on the request builder
+        quote! {
+            req.#setter_name(#arg_name);
         }
     } else {
         // Multiple arguments - need custom handling or init_* with multiple setters
@@ -565,7 +555,7 @@ pub fn rpc_method(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // Generate response parsing
-    let response_parser = generate_response_parser(&response_schema, &response_variant, return_type);
+    let response_parser = generate_response_parser(response_schema, &response_variant, return_type);
 
     // Generate the full method implementation
     let expanded = quote! {
@@ -594,7 +584,7 @@ struct RpcMethodArgs {
 }
 
 impl syn::parse::Parse for RpcMethodArgs {
-    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
         let mut request = None;
         let mut response = None;
         let mut variant = None;
@@ -625,7 +615,7 @@ impl syn::parse::Parse for RpcMethodArgs {
                     complex = lit.value();
                 }
                 other => {
-                    return Err(syn::Error::new(ident.span(), format!("unknown attribute: {}", other)));
+                    return Err(syn::Error::new(ident.span(), format!("unknown attribute: {other}")));
                 }
             }
 
@@ -643,11 +633,6 @@ impl syn::parse::Parse for RpcMethodArgs {
             complex,
         })
     }
-}
-
-/// Check if type is a reference (&T, &str, etc.)
-fn is_reference_type(ty: &syn::Type) -> bool {
-    matches!(ty, syn::Type::Reference(_))
 }
 
 /// Generate response parsing code based on return type
@@ -826,7 +811,7 @@ struct AuthorizeArgs {
 }
 
 impl syn::parse::Parse for AuthorizeArgs {
-    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
         let mut action = None;
         let mut resource = None;
         let mut identifier_field = None;
@@ -848,7 +833,7 @@ impl syn::parse::Parse for AuthorizeArgs {
                     let lit: syn::LitStr = input.parse()?;
                     identifier_field = Some(lit.value());
                 }
-                other => return Err(syn::Error::new(ident.span(), format!("unknown attribute: {}", other))),
+                other => return Err(syn::Error::new(ident.span(), format!("unknown attribute: {other}"))),
             }
 
             if input.peek(syn::Token![,]) {
@@ -920,8 +905,8 @@ pub fn register_scopes(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Generate inventory submissions
     let registrations: Vec<_> = scopes.iter().map(|(action, resource)| {
-        let example = format!("{}:{}:*", action, resource);
-        let description = format!("{} on {}", action, resource);
+        let example = format!("{action}:{resource}:*");
+        let description = format!("{action} on {resource}");
 
         quote! {
             inventory::submit! {

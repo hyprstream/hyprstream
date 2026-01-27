@@ -327,7 +327,7 @@ mod ristretto_impl {
 
         fn generate_keypair() -> (Self::SecretKey, Self::PublicKey) {
             let secret = Scalar::random(&mut rand::thread_rng());
-            let public_point = &RISTRETTO_BASEPOINT_POINT * &secret;
+            let public_point = RISTRETTO_BASEPOINT_POINT * secret;
             (
                 RistrettoSecret(secret),
                 RistrettoPublic::from_point(public_point),
@@ -546,7 +546,7 @@ mod tests {
 
     #[test]
     fn test_different_request_ids_different_keys() {
-        let (secret_a, public_a) = DefaultKeyExchange::generate_keypair();
+        let (_secret_a, public_a) = DefaultKeyExchange::generate_keypair();
         let (secret_b, _public_b) = DefaultKeyExchange::generate_keypair();
 
         let shared = DefaultKeyExchange::derive_shared(&secret_b, &public_a).unwrap();

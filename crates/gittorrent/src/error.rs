@@ -71,31 +71,31 @@ pub enum Error {
 // libp2p error conversions
 impl From<libp2p::swarm::DialError> for Error {
     fn from(err: libp2p::swarm::DialError) -> Self {
-        Error::Libp2p(format!("Dial error: {}", err))
+        Error::Libp2p(format!("Dial error: {err}"))
     }
 }
 
 impl From<libp2p::noise::Error> for Error {
     fn from(err: libp2p::noise::Error) -> Self {
-        Error::Libp2p(format!("Noise error: {}", err))
+        Error::Libp2p(format!("Noise error: {err}"))
     }
 }
 
 impl From<libp2p::TransportError<std::io::Error>> for Error {
     fn from(err: libp2p::TransportError<std::io::Error>) -> Self {
-        Error::Libp2p(format!("Transport error: {}", err))
+        Error::Libp2p(format!("Transport error: {err}"))
     }
 }
 
 impl From<libp2p::multiaddr::Error> for Error {
     fn from(err: libp2p::multiaddr::Error) -> Self {
-        Error::Libp2p(format!("Multiaddr error: {}", err))
+        Error::Libp2p(format!("Multiaddr error: {err}"))
     }
 }
 
 impl From<tokio::sync::oneshot::error::RecvError> for Error {
     fn from(err: tokio::sync::oneshot::error::RecvError) -> Self {
-        Error::Other(format!("Channel receive error: {}", err))
+        Error::Other(format!("Channel receive error: {err}"))
     }
 }
 
@@ -108,7 +108,7 @@ impl From<std::convert::Infallible> for Error {
 
 impl<T> From<tokio::sync::mpsc::error::SendError<T>> for Error {
     fn from(err: tokio::sync::mpsc::error::SendError<T>) -> Self {
-        Error::Other(format!("Channel send error: {}", err))
+        Error::Other(format!("Channel send error: {err}"))
     }
 }
 

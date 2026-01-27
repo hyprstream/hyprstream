@@ -30,7 +30,7 @@ impl Default for ImagePreprocessConfig {
         Self {
             image_size: 384,
             mean: [0.48145466, 0.4578275, 0.40821073],
-            std: [0.26862954, 0.26130258, 0.27577711],
+            std: [0.26862954, 0.261_302_6, 0.275_777_1],
             convert_rgb: true,
         }
     }
@@ -72,12 +72,8 @@ pub fn load_image(
     // Load image using image crate
     let img = image::open(path).map_err(|e| anyhow!("Failed to load image: {}", e))?;
 
-    // Convert to RGB if needed
-    let img = if config.convert_rgb {
-        img.to_rgb8()
-    } else {
-        img.to_rgb8() // Always RGB for now
-    };
+    // Convert to RGB (always needed for model input)
+    let img = img.to_rgb8();
 
     // Resize to target size (keeping aspect ratio, then center crop)
     let img = image::imageops::resize(
@@ -97,10 +93,10 @@ pub fn load_image(
 
     // Reshape to [H, W, C]
     let tensor = Tensor::from_slice(&img_vec)
-        .reshape(&[height as i64, width as i64, 3]);
+        .reshape([height as i64, width as i64, 3]);
 
     // Transpose to [C, H, W]
-    let tensor = tensor.permute(&[2, 0, 1]);
+    let tensor = tensor.permute([2, 0, 1]);
 
     // Normalize
     let tensor = normalize_tensor(&tensor, &config.mean, &config.std)?;
@@ -159,17 +155,17 @@ pub fn create_fallback_image(
 
     // Create solid color image [C, H, W]
     let r_channel = Tensor::full(
-        &[1, config.image_size as i64, config.image_size as i64],
+        [1, config.image_size as i64, config.image_size as i64],
         r as f64,
         (Kind::Float, device),
     );
     let g_channel = Tensor::full(
-        &[1, config.image_size as i64, config.image_size as i64],
+        [1, config.image_size as i64, config.image_size as i64],
         g as f64,
         (Kind::Float, device),
     );
     let b_channel = Tensor::full(
-        &[1, config.image_size as i64, config.image_size as i64],
+        [1, config.image_size as i64, config.image_size as i64],
         b as f64,
         (Kind::Float, device),
     );
@@ -190,10 +186,10 @@ pub fn create_fallback_image(
 fn normalize_tensor(tensor: &Tensor, mean: &[f32; 3], std: &[f32; 3]) -> Result<Tensor> {
     let mean_tensor = Tensor::from_slice(mean)
         .to_device(tensor.device())
-        .reshape(&[3, 1, 1]);
+        .reshape([3, 1, 1]);
     let std_tensor = Tensor::from_slice(std)
         .to_device(tensor.device())
-        .reshape(&[3, 1, 1]);
+        .reshape([3, 1, 1]);
 
     Ok((tensor - mean_tensor) / std_tensor)
 }
@@ -294,7 +290,7 @@ mod tests {
     #[test]
     fn test_normalize_tensor() {
         let device = Device::Cpu;
-        let tensor = Tensor::ones(&[3, 224, 224], (Kind::Float, device));
+        let tensor = Tensor::ones([3, 224, 224], (Kind::Float, device));
 
         let mean = [0.5, 0.5, 0.5];
         let std = [0.5, 0.5, 0.5];
@@ -302,7 +298,7 @@ mod tests {
         let normalized = normalize_tensor(&tensor, &mean, &std).expect("test: normalize tensor");
 
         // After normalization: (1.0 - 0.5) / 0.5 = 1.0
-        let expected = Tensor::ones(&[3, 224, 224], (Kind::Float, device));
+        let expected = Tensor::ones([3, 224, 224], (Kind::Float, device));
 
         assert!((normalized - expected).abs().mean(Kind::Float).double_value(&[]) < 1e-6);
     }

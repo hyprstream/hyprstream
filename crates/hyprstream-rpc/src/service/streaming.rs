@@ -257,8 +257,8 @@ impl StreamService {
         // Check claims allow publishing to this topic
         if let Some(claims) = &signed.envelope.claims {
             let required = Scope::new(
-                "publish".to_string(),
-                "stream".to_string(),
+                "publish".to_owned(),
+                "stream".to_owned(),
                 topic.clone(),
             );
             let has_scope = claims.admin || claims.scopes.iter().any(|s| s.grants(&required));
@@ -392,16 +392,16 @@ impl StreamService {
     ) -> Result<(), crate::error::RpcError> {
         // Create CTRL socket for shutdown (PAIR pattern)
         let ctrl = self.context.socket(zmq::PAIR)
-            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("CTRL socket: {}", e)))?;
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("CTRL socket: {e}")))?;
         let ctrl_endpoint = format!("inproc://stream-ctrl-{}", self.name);
         ctrl.bind(&ctrl_endpoint)
-            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("CTRL bind: {}", e)))?;
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("CTRL bind: {e}")))?;
 
         // Spawn shutdown listener thread
         let ctrl_sender = self.context.socket(zmq::PAIR)
-            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("CTRL sender: {}", e)))?;
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("CTRL sender: {e}")))?;
         ctrl_sender.connect(&ctrl_endpoint)
-            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("CTRL connect: {}", e)))?;
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("CTRL connect: {e}")))?;
 
         let name_clone = self.name.clone();
         std::thread::spawn(move || {
@@ -473,12 +473,12 @@ impl StreamService {
 
             // Poll with 1 second timeout (allows periodic compaction)
             zmq::poll(&mut items, 1000)
-                .map_err(|e| crate::error::RpcError::SpawnFailed(format!("Poll failed: {}", e)))?;
+                .map_err(|e| crate::error::RpcError::SpawnFailed(format!("Poll failed: {e}")))?;
 
             // Check CTRL socket for shutdown
             if items[2].is_readable() {
                 if let Ok(msg) = ctrl.recv_string(0) {
-                    if msg.as_ref().map(|s| s.as_str()) == Ok("TERMINATE") {
+                    if msg.as_ref().map(std::string::String::as_str) == Ok("TERMINATE") {
                         info!(service = %self.name, "Received TERMINATE signal, stopping proxy");
                         break;
                     }
@@ -749,7 +749,7 @@ fn parse_stream_register(payload: &[u8]) -> Option<(String, i64)> {
     ).ok()?;
 
     let register = reader.get_root::<streaming_capnp::stream_register::Reader>().ok()?;
-    let topic = register.get_topic().ok()?.to_str().ok()?.to_string();
+    let topic = register.get_topic().ok()?.to_str().ok()?.to_owned();
     let exp = register.get_exp();
 
     Some((topic, exp))
@@ -765,7 +765,7 @@ fn parse_stream_resume(msg: &[u8]) -> Option<(String, [u8; 32])> {
     ).ok()?;
 
     let resume = reader.get_root::<streaming_capnp::stream_resume::Reader>().ok()?;
-    let topic = resume.get_topic().ok()?.to_str().ok()?.to_string();
+    let topic = resume.get_topic().ok()?.to_str().ok()?.to_owned();
     let hmac_data = resume.get_resume_from_hmac().ok()?;
 
     if hmac_data.len() != 32 {
@@ -854,9 +854,9 @@ impl crate::service::spawner::Spawnable for StreamService {
 
         // Setup sockets BEFORE signaling ready
         let xpub = self.setup_xpub()
-            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("XPUB setup: {}", e)))?;
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("XPUB setup: {e}")))?;
         let pull = self.setup_pull()
-            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("PULL setup: {}", e)))?;
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("PULL setup: {e}")))?;
 
         // Signal ready AFTER sockets are bound
         if let Some(tx) = on_ready {

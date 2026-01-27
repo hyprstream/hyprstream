@@ -31,7 +31,7 @@ impl GitHash {
     /// - 64 hex chars -> SHA256
     /// - Other lengths -> Error
     pub fn from_hex(s: &str) -> crate::Result<Self> {
-        let bytes = hex::decode(s).map_err(|_| crate::Error::InvalidHash(s.to_string()))?;
+        let bytes = hex::decode(s).map_err(|_| crate::Error::InvalidHash(s.to_owned()))?;
         match bytes.len() {
             20 => {
                 let mut arr = [0u8; 20];
@@ -43,7 +43,7 @@ impl GitHash {
                 arr.copy_from_slice(&bytes);
                 Ok(GitHash::Sha256(arr))
             }
-            _ => Err(crate::Error::InvalidHash(s.to_string())),
+            _ => Err(crate::Error::InvalidHash(s.to_owned())),
         }
     }
 
@@ -222,8 +222,7 @@ impl GitTorrentUrl {
     pub fn parse(url: &str) -> crate::Result<Self> {
         if !url.starts_with("gittorrent://") {
             return Err(crate::Error::InvalidUrl(format!(
-                "URL must start with gittorrent://: {}",
-                url
+                "URL must start with gittorrent://: {url}"
             )));
         }
 
@@ -256,13 +255,13 @@ impl GitTorrentUrl {
             let repo = &repo[1..]; // Remove leading slash
 
             Ok(GitTorrentUrl::GitServer {
-                server: server.to_string(),
-                repo: repo.to_string(),
+                server: server.to_owned(),
+                repo: repo.to_owned(),
             })
         } else {
             // No slash, assume it's a username
             Ok(GitTorrentUrl::Username {
-                username: main_part.to_string(),
+                username: main_part.to_owned(),
             })
         }
     }
@@ -286,16 +285,16 @@ impl std::fmt::Display for GitTorrentUrl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             GitTorrentUrl::Commit { hash } => {
-                write!(f, "gittorrent://{}", hash)
+                write!(f, "gittorrent://{hash}")
             }
             GitTorrentUrl::CommitWithRefs { hash } => {
-                write!(f, "gittorrent://{}?refs", hash)
+                write!(f, "gittorrent://{hash}?refs")
             }
             GitTorrentUrl::GitServer { server, repo } => {
-                write!(f, "gittorrent://{}/{}", server, repo)
+                write!(f, "gittorrent://{server}/{repo}")
             }
             GitTorrentUrl::Username { username } => {
-                write!(f, "gittorrent://{}", username)
+                write!(f, "gittorrent://{username}")
             }
         }
     }
@@ -363,12 +362,12 @@ mod tests {
         let test_hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
         // Test commit URL
-        let url1 = GitTorrentUrl::parse(&format!("gittorrent://{}", test_hash)).unwrap();
-        assert_eq!(url1.to_string(), format!("gittorrent://{}", test_hash));
+        let url1 = GitTorrentUrl::parse(&format!("gittorrent://{test_hash}")).unwrap();
+        assert_eq!(url1.to_string(), format!("gittorrent://{test_hash}"));
 
         // Test commit with refs URL
-        let url2 = GitTorrentUrl::parse(&format!("gittorrent://{}?refs", test_hash)).unwrap();
-        assert_eq!(url2.to_string(), format!("gittorrent://{}?refs", test_hash));
+        let url2 = GitTorrentUrl::parse(&format!("gittorrent://{test_hash}?refs")).unwrap();
+        assert_eq!(url2.to_string(), format!("gittorrent://{test_hash}?refs"));
     }
 
     #[test]
@@ -442,7 +441,7 @@ mod tests {
     fn test_git_hash_display() {
         let sha1_hex = "0123456789abcdef0123456789abcdef01234567";
         let hash = GitHash::from_hex(sha1_hex).unwrap();
-        assert_eq!(format!("{}", hash), sha1_hex);
+        assert_eq!(format!("{hash}"), sha1_hex);
     }
 
     #[test]

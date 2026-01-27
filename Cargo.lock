@@ -5321,7 +5321,7 @@ dependencies = [
 
 [[package]]
 name = "hyprstream"
-version = "0.1.0-alpha-7"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-stream",

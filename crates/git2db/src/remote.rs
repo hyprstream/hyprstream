@@ -62,31 +62,30 @@ impl<'a> RemoteManager<'a> {
     /// Similar to `git remote add <name> <url>`
     pub async fn add(&self, name: &str, url: &str) -> Git2DBResult<()> {
         let path = self.repo_path()?;
-        let name = name.to_string();
-        let url = url.to_string();
+        let name = name.to_owned();
+        let url = url.to_owned();
 
         tokio::task::spawn_blocking(move || -> Git2DBResult<()> {
             let repo = Repository::open(&path).map_err(|e| {
-                Git2DBError::repository(&path, format!("Failed to open repository: {}", e))
+                Git2DBError::repository(&path, format!("Failed to open repository: {e}"))
             })?;
 
             // Check if remote already exists
             if repo.find_remote(&name).is_ok() {
                 return Err(Git2DBError::configuration(format!(
-                    "Remote '{}' already exists",
-                    name
+                    "Remote '{name}' already exists"
                 )));
             }
 
             // Add remote to git config
             repo.remote(&name, &url).map_err(|e| {
-                Git2DBError::configuration(format!("Failed to add remote '{}': {}", name, e))
+                Git2DBError::configuration(format!("Failed to add remote '{name}': {e}"))
             })?;
 
             Ok(())
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))??;
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))??;
 
         // Update registry metadata
         self.update_metadata_remotes().await?;
@@ -99,26 +98,26 @@ impl<'a> RemoteManager<'a> {
     /// Similar to `git remote remove <name>`
     pub async fn remove(&self, name: &str) -> Git2DBResult<()> {
         let path = self.repo_path()?;
-        let name = name.to_string();
+        let name = name.to_owned();
 
         tokio::task::spawn_blocking(move || -> Git2DBResult<()> {
             let repo = Repository::open(&path).map_err(|e| {
-                Git2DBError::repository(&path, format!("Failed to open repository: {}", e))
+                Git2DBError::repository(&path, format!("Failed to open repository: {e}"))
             })?;
 
             // Check if remote exists
             repo.find_remote(&name)
-                .map_err(|_| Git2DBError::configuration(format!("Remote '{}' not found", name)))?;
+                .map_err(|_| Git2DBError::configuration(format!("Remote '{name}' not found")))?;
 
             // Remove from git config
             repo.remote_delete(&name).map_err(|e| {
-                Git2DBError::configuration(format!("Failed to remove remote '{}': {}", name, e))
+                Git2DBError::configuration(format!("Failed to remove remote '{name}': {e}"))
             })?;
 
             Ok(())
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))??;
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))??;
 
         // Update registry metadata
         self.update_metadata_remotes().await?;
@@ -131,30 +130,29 @@ impl<'a> RemoteManager<'a> {
     /// Similar to `git remote set-url <name> <url>`
     pub async fn set_url(&self, name: &str, url: &str) -> Git2DBResult<()> {
         let path = self.repo_path()?;
-        let name = name.to_string();
-        let url = url.to_string();
+        let name = name.to_owned();
+        let url = url.to_owned();
 
         tokio::task::spawn_blocking(move || -> Git2DBResult<()> {
             let repo = Repository::open(&path).map_err(|e| {
-                Git2DBError::repository(&path, format!("Failed to open repository: {}", e))
+                Git2DBError::repository(&path, format!("Failed to open repository: {e}"))
             })?;
 
             // Verify remote exists
             repo.find_remote(&name)
-                .map_err(|_| Git2DBError::configuration(format!("Remote '{}' not found", name)))?;
+                .map_err(|_| Git2DBError::configuration(format!("Remote '{name}' not found")))?;
 
             // Update URL
             repo.remote_set_url(&name, &url).map_err(|e| {
                 Git2DBError::configuration(format!(
-                    "Failed to set URL for remote '{}': {}",
-                    name, e
+                    "Failed to set URL for remote '{name}': {e}"
                 ))
             })?;
 
             Ok(())
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))??;
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))??;
 
         // Update registry metadata
         self.update_metadata_remotes().await?;
@@ -167,39 +165,37 @@ impl<'a> RemoteManager<'a> {
     /// Similar to `git remote rename <old> <new>`
     pub async fn rename(&self, old_name: &str, new_name: &str) -> Git2DBResult<()> {
         let path = self.repo_path()?;
-        let old_name = old_name.to_string();
-        let new_name = new_name.to_string();
+        let old_name = old_name.to_owned();
+        let new_name = new_name.to_owned();
 
         tokio::task::spawn_blocking(move || -> Git2DBResult<()> {
             let repo = Repository::open(&path).map_err(|e| {
-                Git2DBError::repository(&path, format!("Failed to open repository: {}", e))
+                Git2DBError::repository(&path, format!("Failed to open repository: {e}"))
             })?;
 
             // Verify old remote exists
             repo.find_remote(&old_name).map_err(|_| {
-                Git2DBError::configuration(format!("Remote '{}' not found", old_name))
+                Git2DBError::configuration(format!("Remote '{old_name}' not found"))
             })?;
 
             // Check new name doesn't exist
             if repo.find_remote(&new_name).is_ok() {
                 return Err(Git2DBError::configuration(format!(
-                    "Remote '{}' already exists",
-                    new_name
+                    "Remote '{new_name}' already exists"
                 )));
             }
 
             // Rename remote
             repo.remote_rename(&old_name, &new_name).map_err(|e| {
                 Git2DBError::configuration(format!(
-                    "Failed to rename remote '{}' to '{}': {}",
-                    old_name, new_name, e
+                    "Failed to rename remote '{old_name}' to '{new_name}': {e}"
                 ))
             })?;
 
             Ok(())
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))??;
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))??;
 
         // Update registry metadata
         self.update_metadata_remotes().await?;
@@ -215,18 +211,18 @@ impl<'a> RemoteManager<'a> {
 
         tokio::task::spawn_blocking(move || -> Git2DBResult<Vec<Remote>> {
             let repo = Repository::open(&path).map_err(|e| {
-                Git2DBError::repository(&path, format!("Failed to open repository: {}", e))
+                Git2DBError::repository(&path, format!("Failed to open repository: {e}"))
             })?;
 
             let remote_names = repo
                 .remotes()
-                .map_err(|e| Git2DBError::internal(format!("Failed to list remotes: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to list remotes: {e}")))?;
 
             let mut remotes = Vec::new();
 
             for name in remote_names.iter().flatten() {
                 if let Ok(remote) = repo.find_remote(name) {
-                    let url = remote.url().unwrap_or("").to_string();
+                    let url = remote.url().unwrap_or("").to_owned();
                     let fetch_refspec = remote
                         .fetch_refspecs()
                         .map_err(|_| Git2DBError::internal("Failed to get fetch refspecs"))?;
@@ -234,14 +230,14 @@ impl<'a> RemoteManager<'a> {
                     let fetch_refs: Vec<String> = fetch_refspec
                         .iter()
                         .flatten()
-                        .map(|s| s.to_string())
+                        .map(std::borrow::ToOwned::to_owned)
                         .collect();
 
                     remotes.push(Remote {
-                        name: name.to_string(),
+                        name: name.to_owned(),
                         url,
                         fetch_refs,
-                        push_url: remote.pushurl().map(|s| s.to_string()),
+                        push_url: remote.pushurl().map(std::borrow::ToOwned::to_owned),
                     });
                 }
             }
@@ -249,7 +245,7 @@ impl<'a> RemoteManager<'a> {
             Ok(remotes)
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
     }
 
     /// Get default remote (usually "origin")

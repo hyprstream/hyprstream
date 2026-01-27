@@ -133,7 +133,7 @@ impl TrainingService {
 
         // Create training session
         let session = TrainingSession {
-            lora_id: lora_id.to_string(),
+            lora_id: lora_id.to_owned(),
             config: config.clone(),
             samples_processed: 0,
             current_loss: 0.0,
@@ -145,7 +145,7 @@ impl TrainingService {
         // Register session
         {
             let mut sessions = self.sessions.write().await;
-            sessions.insert(lora_id.to_string(), session);
+            sessions.insert(lora_id.to_owned(), session);
         }
 
         // Create bounded sample queue to prevent memory pressure
@@ -153,11 +153,11 @@ impl TrainingService {
         let (tx, mut rx) = mpsc::channel::<TrainingSample>(queue_size);
         {
             let mut queues = self.sample_queues.write().await;
-            queues.insert(lora_id.to_string(), tx);
+            queues.insert(lora_id.to_owned(), tx);
         }
 
         // Start background training task
-        let lora_id_clone = lora_id.to_string();
+        let lora_id_clone = lora_id.to_owned();
 
         let sessions = self.sessions.clone();
         let stats = self.stats.clone();
@@ -201,7 +201,7 @@ impl TrainingService {
         // Store task handle
         {
             let mut handles = self.task_handles.lock().await;
-            handles.insert(lora_id.to_string(), handle);
+            handles.insert(lora_id.to_owned(), handle);
         }
 
         Ok(())
@@ -320,7 +320,7 @@ impl TrainingService {
         lora_id: &str,
         _adapter_ids: Vec<String>,
     ) -> Result<String> {
-        Ok(format!("lora-session-{}", lora_id))
+        Ok(format!("lora-session-{lora_id}"))
     }
 
     /// Run inference (delegated to inference API)
@@ -330,7 +330,7 @@ impl TrainingService {
         _input: GenerationRequest,
     ) -> Result<GenerationResult> {
         Ok(GenerationResult {
-            text: "Inference not yet implemented".to_string(),
+            text: "Inference not yet implemented".to_owned(),
             tokens_generated: 0,
             finish_reason: crate::config::FinishReason::Stop,
             generation_time_ms: 0,
@@ -355,7 +355,7 @@ impl TrainingService {
     pub async fn generate_embedding(&self, lora_id: &str, _input: &str) -> Result<Vec<f32>> {
         // Create temporary inference session
         let session_id = self
-            .create_inference_session(lora_id, vec![lora_id.to_string()])
+            .create_inference_session(lora_id, vec![lora_id.to_owned()])
             .await?;
 
         // Generate embedding (simplified - would use actual model)

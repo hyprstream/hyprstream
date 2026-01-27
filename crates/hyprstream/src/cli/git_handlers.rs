@@ -20,15 +20,15 @@ pub async fn handle_branch(
 ) -> Result<()> {
     info!("Creating branch {} for model {}", branch_name, model);
 
-    let model_ref = ModelRef::new(model.to_string());
+    let model_ref = ModelRef::new(model.to_owned());
 
     // Create branch using ModelStorage helper
     storage.create_branch(&model_ref, branch_name, from_ref.as_deref()).await?;
 
-    println!("✓ Created branch {}", branch_name);
+    println!("✓ Created branch {branch_name}");
 
     if let Some(ref from) = from_ref {
-        println!("  Branch created from: {}", from);
+        println!("  Branch created from: {from}");
     }
 
     // Create worktree for the branch
@@ -43,8 +43,8 @@ pub async fn handle_branch(
     // Show helpful next steps
     println!("\n→ Next steps:");
     println!("  cd {}", worktree_path.display());
-    println!("  hyprstream status {}:{}", model, branch_name);
-    println!("  hyprstream lt {}:{} --adapter my-adapter", model, branch_name);
+    println!("  hyprstream status {model}:{branch_name}");
+    println!("  hyprstream lt {model}:{branch_name} --adapter my-adapter");
 
     Ok(())
 }
@@ -380,17 +380,17 @@ pub async fn handle_commit(
 
 /// Print model status in a nice format using git2db's RepositoryStatus
 fn print_model_status(model_name: &str, status: &git2db::RepositoryStatus, verbose: bool) {
-    println!("Model: {}", model_name);
+    println!("Model: {model_name}");
 
     // Show current branch/commit
     if let Some(branch) = &status.branch {
         if let Some(head) = status.head {
-            println!("Current ref: {} ({})", branch, head);
+            println!("Current ref: {branch} ({head})");
         } else {
-            println!("Current ref: {}", branch);
+            println!("Current ref: {branch}");
         }
     } else if let Some(head) = status.head {
-        println!("Current ref: detached HEAD ({})", head);
+        println!("Current ref: detached HEAD ({head})");
     } else {
         println!("Current ref: unknown");
     }
@@ -436,7 +436,7 @@ pub async fn handle_list(
     // Get current user for permission checks (OS user for CLI)
     let current_user = users::get_current_username()
         .map(|u| u.to_string_lossy().to_string())
-        .unwrap_or_else(|| "anonymous".to_string());
+        .unwrap_or_else(|| "anonymous".to_owned());
 
     // Get archetype registry for capability detection
     let archetype_registry = crate::archetypes::global_registry();
@@ -456,20 +456,20 @@ pub async fn handle_list(
                         // Truncate to 7 characters for display
                         head_oid.chars().take(7).collect::<String>()
                     }
-                    Err(_) => "unknown".to_string(),
+                    Err(_) => "unknown".to_owned(),
                 }
             }
-            Err(_) => "unknown".to_string(),
+            Err(_) => "unknown".to_owned(),
         };
 
         // Get ref name from ModelRef
-        let git_ref = model_ref.git_ref_str().unwrap_or_else(|| "detached".to_string());
+        let git_ref = model_ref.git_ref_str().unwrap_or_else(|| "detached".to_owned());
 
         // Detect capabilities from worktree path
         let worktree_path = models_dir
             .join(&model_ref.model)
             .join("worktrees")
-            .join(model_ref.git_ref_str().unwrap_or_else(|| "main".to_string()));
+            .join(model_ref.git_ref_str().unwrap_or_else(|| "main".to_owned()));
         let detected = archetype_registry.detect(&worktree_path);
         let domains = detected.to_detected_domains();
 
@@ -496,7 +496,7 @@ pub async fn handle_list(
         let size_str = if let Some(size) = metadata.size_bytes {
             format!("{:.1}GB", size as f64 / (1024.0 * 1024.0 * 1024.0))
         } else {
-            "n/a".to_string()
+            "n/a".to_owned()
         };
 
         let domains_str = domains.domains_display();
@@ -532,16 +532,16 @@ pub async fn handle_clone(
 ) -> Result<()> {
     if !quiet {
         info!("Cloning model from {}", repo_url);
-        println!("📦 Cloning model from: {}", repo_url);
+        println!("📦 Cloning model from: {repo_url}");
 
         if let Some(ref b) = branch {
-            println!("   Branch: {}", b);
+            println!("   Branch: {b}");
         }
 
         if full {
             println!("   Mode: Full history");
         } else if depth > 0 {
-            println!("   Depth: {} commits", depth);
+            println!("   Depth: {depth} commits");
         }
 
         if verbose {
@@ -557,8 +557,7 @@ pub async fn handle_clone(
             .split('/')
             .next_back()
             .unwrap_or("")
-            .trim_end_matches(".git")
-            .to_string();
+            .trim_end_matches(".git").to_owned();
 
         if extracted.is_empty() {
             anyhow::bail!(
@@ -581,11 +580,11 @@ pub async fn handle_clone(
         storage
             .get_default_branch(&ModelRef::new(model_name.clone()))
             .await
-            .unwrap_or_else(|_| "main".to_string())
+            .unwrap_or_else(|_| "main".to_owned())
     };
 
     if !quiet {
-        println!("   Creating worktree for branch: {}", worktree_branch);
+        println!("   Creating worktree for branch: {worktree_branch}");
     }
     let model_ref = ModelRef::new(model_name.clone());
     storage.create_worktree(&model_ref, &worktree_branch).await?;
@@ -639,7 +638,7 @@ pub async fn handle_info(
             .as_ref()
             .and_then(|r| r.iter().find(|remote| remote.name == "origin"))
             .map(|remote| remote.url.clone())
-            .unwrap_or_else(|| "unknown".to_string());
+            .unwrap_or_else(|| "unknown".to_owned());
 
         // Get current HEAD
         let current_oid = repo_client.get_head().await.ok();
@@ -684,11 +683,11 @@ pub async fn handle_info(
         if let Some((name, url, tracking_ref, current_oid)) = &repo_metadata {
             if let Some(n) = name {
                 if n != &model_ref.model {
-                    println!("  Registry name: {}", n);
+                    println!("  Registry name: {n}");
                 }
             }
-            println!("  Origin URL: {}", url);
-            println!("  Tracking ref: {}", tracking_ref);
+            println!("  Origin URL: {url}");
+            println!("  Tracking ref: {tracking_ref}");
             if let Some(oid) = current_oid {
                 println!("  Current OID: {}", &oid[..8.min(oid.len())]);
             }
@@ -697,12 +696,12 @@ pub async fn handle_info(
         // Get display ref using RepositoryClient
         let display_ref = match &model_ref.git_ref {
             crate::storage::GitRef::DefaultBranch => {
-                repo_client.default_branch().await.unwrap_or_else(|_| "unknown".to_string())
+                repo_client.default_branch().await.unwrap_or_else(|_| "unknown".to_owned())
             }
             _ => model_ref.git_ref.to_string(),
         };
 
-        println!("Reference: {}", display_ref);
+        println!("Reference: {display_ref}");
         println!("Path: {}", model_path.display());
 
         // Detect and display archetypes
@@ -712,7 +711,7 @@ pub async fn handle_info(
         if !detected.is_empty() {
             println!("\nArchetypes:");
             for archetype in &detected.archetypes {
-                println!("  - {}", archetype);
+                println!("  - {archetype}");
             }
             println!("Capabilities: {}", detected.capabilities);
         } else {
@@ -794,7 +793,7 @@ pub async fn handle_info(
             }
         }
         Err(e) => {
-            println!("  Unable to get status: {}", e);
+            println!("  Unable to get status: {e}");
             debug!("Status error details: {:?}", e);
         }
     }
@@ -818,7 +817,7 @@ pub async fn handle_info(
             }
 
             println!("\nModel Size:");
-            println!("  Files: {}", file_count);
+            println!("  Files: {file_count}");
             println!("  Total size: {:.2} MB", total_size as f64 / 1_048_576.0);
         }
     }
@@ -891,7 +890,7 @@ pub async fn handle_info(
         }
         Err(e) => {
             if verbose {
-                println!("\nAdapters: Error listing adapters: {}", e);
+                println!("\nAdapters: Error listing adapters: {e}");
             } else {
                 println!("\nAdapters: Unable to list");
             }
@@ -935,12 +934,12 @@ pub async fn apply_policy_template_to_model(
     let existing_content = if policy_path.exists() {
         tokio::fs::read_to_string(&policy_path).await?
     } else {
-        default_policy_header().to_string()
+        default_policy_header().to_owned()
     };
 
     // Check if template rules already exist
     if existing_content.contains(template.rules.trim()) {
-        println!("✓ Policy template '{}' already applied", template_name);
+        println!("✓ Policy template '{template_name}' already applied");
         return Ok(());
     }
 
@@ -963,7 +962,7 @@ pub async fn apply_policy_template_to_model(
     }
 
     // Commit the change
-    let commit_msg = format!("policy: apply {} template for model {}", template_name, model);
+    let commit_msg = format!("policy: apply {template_name} template for model {model}");
 
     Command::new("git")
         .current_dir(&registry_path)
@@ -977,7 +976,7 @@ pub async fn apply_policy_template_to_model(
         .output()
         .ok();
 
-    println!("✓ Applied policy template: {}", template_name);
+    println!("✓ Applied policy template: {template_name}");
     println!("  {}", template.description);
 
     Ok(())
@@ -1064,8 +1063,8 @@ pub async fn handle_infer(
     // Apply chat template to the prompt via ModelService
     // The ModelService will load the model if needed and apply the template
     let messages = vec![ChatMessage {
-        role: "user".to_string(),
-        content: Some(prompt.to_string()),
+        role: "user".to_owned(),
+        content: Some(prompt.to_owned()),
         function_call: None,
     }];
 
@@ -1073,7 +1072,7 @@ pub async fn handle_infer(
         Ok(formatted) => formatted,
         Err(e) => {
             tracing::warn!("Could not apply chat template: {}. Using raw prompt.", e);
-            crate::config::TemplatedPrompt::new(prompt.to_string())
+            crate::config::TemplatedPrompt::new(prompt.to_owned())
         }
     };
 
@@ -1183,7 +1182,7 @@ pub async fn handle_infer(
                         use crate::services::rpc_types::{InferenceStreamPayload, StreamPayloadExt};
                         match payload.to_inference() {
                             Ok(InferenceStreamPayload::Token(text)) => {
-                                print!("{}", text);
+                                print!("{text}");
                                 let _ = io::stdout().flush();
                             }
                             Ok(InferenceStreamPayload::Complete(_)) => {
@@ -1313,26 +1312,22 @@ pub async fn handle_pull(
     info!("Pulling model {} from remote", model);
 
     let remote_name = remote.as_deref().unwrap_or("origin");
-    let model_ref = ModelRef::new(model.to_string());
+    let model_ref = ModelRef::new(model.to_owned());
 
     // Get repository client from service layer
     let repo_client = storage.registry().repo(&model_ref.model).await?;
 
     // Build refspec for fetch
-    let refspec = if let Some(ref branch_name) = branch {
-        Some(format!("refs/heads/{}", branch_name))
-    } else {
-        None
-    };
+    let refspec = branch.as_ref().map(|branch_name| format!("refs/heads/{branch_name}"));
 
     // Use RepositoryClient.update() to fetch and merge
     // Note: This does a basic fetch+merge, doesn't expose merge analysis or fast-forward control
     repo_client.update(refspec.as_deref()).await?;
 
-    println!("✓ Pulled latest changes for model {}", model);
-    println!("  Remote: {}", remote_name);
+    println!("✓ Pulled latest changes for model {model}");
+    println!("  Remote: {remote_name}");
     if let Some(ref b) = branch {
-        println!("  Branch: {}", b);
+        println!("  Branch: {b}");
     }
     if rebase {
         println!("  Strategy: rebase (note: currently performs merge)");
@@ -1747,13 +1742,13 @@ pub async fn handle_remove(
             Err(e) => {
                 // Check if it's a permission error and provide helpful message
                 if e.kind() == std::io::ErrorKind::PermissionDenied {
-                    eprintln!("❌ Failed to remove model files: {}", e);
+                    eprintln!("❌ Failed to remove model files: {e}");
                     eprintln!("   This may be due to overlay filesystem mounts.");
                     eprintln!("   Try running with sudo or manually unmount any overlayfs mounts:");
                     eprintln!("   $ mount | grep {}", model_path.display());
                     eprintln!("   $ sudo umount <mount_path>");
                 } else {
-                    eprintln!("❌ Failed to remove model files: {}", e);
+                    eprintln!("❌ Failed to remove model files: {e}");
                 }
                 return Err(anyhow::anyhow!("Failed to remove model files: {}", e));
             }

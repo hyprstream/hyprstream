@@ -25,7 +25,7 @@ use std::path::PathBuf;
 /// registry.register(adapter_id)
 ///     .name("my-adapter")
 ///     .worktree_path(PathBuf::from("/models/working/adapter-uuid"))
-///     .tracking_ref(GitRef::Branch("adapter/uuid".to_string()))
+///     .tracking_ref(GitRef::Branch("adapter/uuid".to_owned()))
 ///     .metadata("type", "adapter")
 ///     .metadata("base_model", "llama-uuid")
 ///     .exec()

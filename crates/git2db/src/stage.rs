@@ -73,12 +73,12 @@ impl<'a> StageManager<'a> {
 
         tokio::task::spawn_blocking(move || -> Git2DBResult<()> {
             let repo = Repository::open(&repo_path).map_err(|e| {
-                Git2DBError::repository(&repo_path, format!("Failed to open repository: {}", e))
+                Git2DBError::repository(&repo_path, format!("Failed to open repository: {e}"))
             })?;
 
             let mut index = repo
                 .index()
-                .map_err(|e| Git2DBError::internal(format!("Failed to get index: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to get index: {e}")))?;
 
             index.add_path(&file_path).map_err(|e| {
                 Git2DBError::internal(format!(
@@ -90,12 +90,12 @@ impl<'a> StageManager<'a> {
 
             index
                 .write()
-                .map_err(|e| Git2DBError::internal(format!("Failed to write index: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to write index: {e}")))?;
 
             Ok(())
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
     }
 
     /// Add all changes to the staging area
@@ -106,26 +106,26 @@ impl<'a> StageManager<'a> {
 
         tokio::task::spawn_blocking(move || -> Git2DBResult<()> {
             let repo = Repository::open(&repo_path).map_err(|e| {
-                Git2DBError::repository(&repo_path, format!("Failed to open repository: {}", e))
+                Git2DBError::repository(&repo_path, format!("Failed to open repository: {e}"))
             })?;
 
             let mut index = repo
                 .index()
-                .map_err(|e| Git2DBError::internal(format!("Failed to get index: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to get index: {e}")))?;
 
             // Add all files (new, modified, deleted)
             index
                 .add_all(["."].iter(), IndexAddOption::DEFAULT, None)
-                .map_err(|e| Git2DBError::internal(format!("Failed to add all: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to add all: {e}")))?;
 
             index
                 .write()
-                .map_err(|e| Git2DBError::internal(format!("Failed to write index: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to write index: {e}")))?;
 
             Ok(())
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
     }
 
     /// Remove a file from the staging area and working directory
@@ -137,12 +137,12 @@ impl<'a> StageManager<'a> {
 
         tokio::task::spawn_blocking(move || -> Git2DBResult<()> {
             let repo = Repository::open(&repo_path).map_err(|e| {
-                Git2DBError::repository(&repo_path, format!("Failed to open repository: {}", e))
+                Git2DBError::repository(&repo_path, format!("Failed to open repository: {e}"))
             })?;
 
             let mut index = repo
                 .index()
-                .map_err(|e| Git2DBError::internal(format!("Failed to get index: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to get index: {e}")))?;
 
             index.remove_path(&file_path).map_err(|e| {
                 Git2DBError::internal(format!(
@@ -154,12 +154,12 @@ impl<'a> StageManager<'a> {
 
             index
                 .write()
-                .map_err(|e| Git2DBError::internal(format!("Failed to write index: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to write index: {e}")))?;
 
             Ok(())
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
     }
 
     /// Unstage a file (remove from staging area but keep changes)
@@ -171,16 +171,16 @@ impl<'a> StageManager<'a> {
 
         tokio::task::spawn_blocking(move || -> Git2DBResult<()> {
             let repo = Repository::open(&repo_path).map_err(|e| {
-                Git2DBError::repository(&repo_path, format!("Failed to open repository: {}", e))
+                Git2DBError::repository(&repo_path, format!("Failed to open repository: {e}"))
             })?;
 
             // Get HEAD commit
             let head = repo.head().map_err(|e| {
-                Git2DBError::reference("HEAD", format!("Failed to get HEAD: {}", e))
+                Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}"))
             })?;
 
             let head_commit = head.peel_to_commit().map_err(|e| {
-                Git2DBError::reference("HEAD", format!("Failed to get HEAD commit: {}", e))
+                Git2DBError::reference("HEAD", format!("Failed to get HEAD commit: {e}"))
             })?;
 
             // Reset the path to HEAD
@@ -196,7 +196,7 @@ impl<'a> StageManager<'a> {
             Ok(())
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
     }
 
     /// Reset all staged changes
@@ -207,26 +207,26 @@ impl<'a> StageManager<'a> {
 
         tokio::task::spawn_blocking(move || -> Git2DBResult<()> {
             let repo = Repository::open(&repo_path).map_err(|e| {
-                Git2DBError::repository(&repo_path, format!("Failed to open repository: {}", e))
+                Git2DBError::repository(&repo_path, format!("Failed to open repository: {e}"))
             })?;
 
             let head = repo.head().map_err(|e| {
-                Git2DBError::reference("HEAD", format!("Failed to get HEAD: {}", e))
+                Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}"))
             })?;
 
             let head_commit = head.peel_to_commit().map_err(|e| {
-                Git2DBError::reference("HEAD", format!("Failed to get HEAD commit: {}", e))
+                Git2DBError::reference("HEAD", format!("Failed to get HEAD commit: {e}"))
             })?;
 
             repo.reset(head_commit.as_object(), git2::ResetType::Mixed, None)
                 .map_err(|e| {
-                    Git2DBError::internal(format!("Failed to reset staging area: {}", e))
+                    Git2DBError::internal(format!("Failed to reset staging area: {e}"))
                 })?;
 
             Ok(())
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
     }
 
     /// Get status of all files in the repository
@@ -237,7 +237,7 @@ impl<'a> StageManager<'a> {
 
         tokio::task::spawn_blocking(move || -> Git2DBResult<Vec<StagedFile>> {
             let repo = Repository::open(&repo_path).map_err(|e| {
-                Git2DBError::repository(&repo_path, format!("Failed to open repository: {}", e))
+                Git2DBError::repository(&repo_path, format!("Failed to open repository: {e}"))
             })?;
 
             let mut opts = StatusOptions::new();
@@ -245,7 +245,7 @@ impl<'a> StageManager<'a> {
             opts.recurse_untracked_dirs(true);
 
             let statuses = repo.statuses(Some(&mut opts)).map_err(|e| {
-                Git2DBError::internal(format!("Failed to get repository status: {}", e))
+                Git2DBError::internal(format!("Failed to get repository status: {e}"))
             })?;
 
             let mut files = Vec::new();
@@ -271,7 +271,7 @@ impl<'a> StageManager<'a> {
             Ok(files)
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
     }
 
     /// Get only staged files
@@ -290,7 +290,7 @@ impl<'a> StageManager<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     // Tests will be added for staging operations
 }

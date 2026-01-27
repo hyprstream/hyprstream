@@ -89,7 +89,7 @@ impl ContextRecord {
                 Arc::new(Int64Array::from(vec![self.token_count])) as ArrayRef,
             ],
         )
-        .map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))?;
+        .map_err(|e| Status::internal(format!("Failed to create record batch: {e}")))?;
 
         Ok(batch)
     }
@@ -136,7 +136,7 @@ impl ContextRecord {
                 Arc::new(Int64Array::from(token_counts)) as ArrayRef,
             ],
         )
-        .map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))?;
+        .map_err(|e| Status::internal(format!("Failed to create record batch: {e}")))?;
 
         Ok(batch)
     }
@@ -163,7 +163,7 @@ impl<B: StorageBackend> ContextStore<B> {
     pub fn new(backend: Arc<B>, table_name: &str, embedding_dim: i32) -> Self {
         Self {
             backend,
-            table_name: table_name.to_string(),
+            table_name: table_name.to_owned(),
             embedding_dim,
         }
     }
@@ -216,7 +216,7 @@ impl<B: StorageBackend> ContextStore<B> {
                 if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
                     for i in 0..arr.len() {
                         if !arr.is_null(i) {
-                            conversation_ids.push(arr.value(i).to_string());
+                            conversation_ids.push(arr.value(i).to_owned());
                         }
                     }
                 }
@@ -236,7 +236,7 @@ impl<B: StorageBackend> ContextStore<B> {
         // Escape single quotes to prevent SQL injection
         let escaped_model_id = model_id.replace('\'', "''");
         let quality_filter = min_quality
-            .map(|q| format!(" AND quality_score >= {}", q))
+            .map(|q| format!(" AND quality_score >= {q}"))
             .unwrap_or_default();
 
         let sql = format!(
@@ -253,7 +253,7 @@ impl<B: StorageBackend> ContextStore<B> {
                 if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
                     for i in 0..arr.len() {
                         if !arr.is_null(i) {
-                            conversation_ids.push(arr.value(i).to_string());
+                            conversation_ids.push(arr.value(i).to_owned());
                         }
                     }
                 }
@@ -275,7 +275,7 @@ impl<B: StorageBackend> ContextStore<B> {
     ) -> Result<Vec<SearchResult>, Status> {
         // Build query with optional quality filter
         let quality_filter = min_quality
-            .map(|q| format!(" WHERE quality_score >= {}", q))
+            .map(|q| format!(" WHERE quality_score >= {q}"))
             .unwrap_or_default();
 
         let sql = format!(
@@ -338,8 +338,8 @@ impl<B: StorageBackend> ContextStore<B> {
             };
 
             results.push(SearchResult {
-                id: id_col.value(i).to_string(),
-                conversation_id: conv_id_col.value(i).to_string(),
+                id: id_col.value(i).to_owned(),
+                conversation_id: conv_id_col.value(i).to_owned(),
                 score,
                 quality_score: quality_col.and_then(|c| {
                     if c.is_null(i) {
@@ -387,11 +387,11 @@ mod tests {
     #[test]
     fn test_context_record_to_batch() {
         let record = ContextRecord {
-            id: "test-id".to_string(),
-            conversation_id: "conv-123".to_string(),
-            session_id: Some("sess-456".to_string()),
+            id: "test-id".to_owned(),
+            conversation_id: "conv-123".to_owned(),
+            session_id: Some("sess-456".to_owned()),
             embedding: vec![0.1; 768],
-            model_id: "qwen3-small".to_string(),
+            model_id: "qwen3-small".to_owned(),
             timestamp: 1234567890,
             quality_score: Some(0.85),
             token_count: Some(100),
@@ -406,21 +406,21 @@ mod tests {
     fn test_batch_records() {
         let records = vec![
             ContextRecord {
-                id: "id-1".to_string(),
-                conversation_id: "conv-1".to_string(),
+                id: "id-1".to_owned(),
+                conversation_id: "conv-1".to_owned(),
                 session_id: None,
                 embedding: vec![0.1; 768],
-                model_id: "model-1".to_string(),
+                model_id: "model-1".to_owned(),
                 timestamp: 1000,
                 quality_score: Some(0.9),
                 token_count: Some(50),
             },
             ContextRecord {
-                id: "id-2".to_string(),
-                conversation_id: "conv-2".to_string(),
-                session_id: Some("sess-1".to_string()),
+                id: "id-2".to_owned(),
+                conversation_id: "conv-2".to_owned(),
+                session_id: Some("sess-1".to_owned()),
                 embedding: vec![0.2; 768],
-                model_id: "model-1".to_string(),
+                model_id: "model-1".to_owned(),
                 timestamp: 2000,
                 quality_score: None,
                 token_count: None,

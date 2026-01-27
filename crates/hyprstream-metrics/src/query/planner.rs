@@ -141,6 +141,12 @@ pub struct OptimizerContext {
     pub available_optimizations: Vec<OptimizationHint>,
 }
 
+impl Default for OptimizerContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OptimizerContext {
     pub fn new() -> Self {
         Self {
@@ -202,14 +208,14 @@ mod tests {
 
         // Create test query
         let query = Query {
-            sql: "SELECT * FROM test_table".to_string(),
+            sql: "SELECT * FROM test_table".to_owned(),
             schema_hint: None,
             hints: vec![OptimizationHint::PreferViews],
         };
 
         // Plan should succeed
         let plan = planner.create_logical_plan(&query).await?;
-        assert!(plan.schema().fields().len() > 0);
+        assert!(!plan.schema().fields().is_empty());
 
         Ok(())
     }

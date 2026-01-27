@@ -27,7 +27,7 @@ pub async fn handle_policy_show(
         // Show raw CSV content
         if policy_path.exists() {
             let content = tokio::fs::read_to_string(&policy_path).await?;
-            println!("{}", content);
+            println!("{content}");
         } else {
             println!("# No policy file exists");
         }
@@ -52,9 +52,9 @@ pub async fn handle_policy_show(
             println!("├────────────────────┼────────────────────┼────────────────────┤");
 
             for p in &policies {
-                let sub = p.get(0).map(|s| s.as_str()).unwrap_or("");
-                let obj = p.get(1).map(|s| s.as_str()).unwrap_or("");
-                let act = p.get(2).map(|s| s.as_str()).unwrap_or("");
+                let sub = p.first().map(std::string::String::as_str).unwrap_or("");
+                let obj = p.get(1).map(std::string::String::as_str).unwrap_or("");
+                let act = p.get(2).map(std::string::String::as_str).unwrap_or("");
                 println!(
                     "│ {:18} │ {:18} │ {:18} │",
                     truncate_str(sub, 18),
@@ -75,8 +75,8 @@ pub async fn handle_policy_show(
             println!("├────────────────────┼───────────────────────┤");
 
             for g in &groupings {
-                let user = g.get(0).map(|s| s.as_str()).unwrap_or("");
-                let role = g.get(1).map(|s| s.as_str()).unwrap_or("");
+                let user = g.first().map(std::string::String::as_str).unwrap_or("");
+                let role = g.get(1).map(std::string::String::as_str).unwrap_or("");
                 println!(
                     "│ {:18} │ {:21} │",
                     truncate_str(user, 18),
@@ -128,12 +128,12 @@ pub async fn handle_policy_history(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    println!("{}", stdout);
+    println!("{stdout}");
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stderr.is_empty() {
-            eprintln!("{}", stderr);
+            eprintln!("{stderr}");
         }
     }
 
@@ -153,7 +153,7 @@ pub async fn handle_policy_edit(policy_manager: &PolicyManager) -> Result<()> {
     // Get editor from environment
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vi".to_string());
+        .unwrap_or_else(|_| "vi".to_owned());
 
     println!("Opening {} in {}", policy_path.display(), editor);
     println!();
@@ -166,7 +166,7 @@ pub async fn handle_policy_edit(policy_manager: &PolicyManager) -> Result<()> {
     let status = Command::new(&editor)
         .arg(&policy_path)
         .status()
-        .context(format!("Failed to run editor: {}", editor))?;
+        .context(format!("Failed to run editor: {editor}"))?;
 
     if !status.success() {
         anyhow::bail!("Editor exited with non-zero status");
@@ -201,11 +201,11 @@ pub async fn handle_policy_diff(
         .context("Failed to run git diff")?;
 
     if output.stdout.is_empty() {
-        println!("No changes from {} policy.", git_ref);
+        println!("No changes from {git_ref} policy.");
         return Ok(());
     }
 
-    println!("Changes vs {}:\n", git_ref);
+    println!("Changes vs {git_ref}:\n");
     print!("{}", String::from_utf8_lossy(&output.stdout));
 
     Ok(())
@@ -247,7 +247,7 @@ pub async fn handle_policy_apply(
     // Generate commit message
     let commit_msg = message.unwrap_or_else(|| {
         let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-        format!("policy: update access control rules ({})", timestamp)
+        format!("policy: update access control rules ({timestamp})")
     });
 
     // Validate the new policy before committing
@@ -285,7 +285,7 @@ pub async fn handle_policy_apply(
 
     println!();
     println!("✓ Policy applied successfully.");
-    println!("  {}", commit_msg);
+    println!("  {commit_msg}");
 
     Ok(())
 }
@@ -309,14 +309,13 @@ pub async fn handle_policy_rollback(
         .context("Failed to get commit info")?;
 
     let target_commit = String::from_utf8_lossy(&log_output.stdout)
-        .trim()
-        .to_string();
+        .trim().to_owned();
 
     if target_commit.is_empty() {
         anyhow::bail!("Invalid git ref: {}", git_ref);
     }
 
-    println!("Rolling back to: {}", target_commit);
+    println!("Rolling back to: {target_commit}");
 
     // Show diff
     let diff_output = Command::new("git")
@@ -359,7 +358,7 @@ pub async fn handle_policy_rollback(
     }
 
     // Commit the rollback
-    let commit_msg = format!("policy: rollback to {}", git_ref);
+    let commit_msg = format!("policy: rollback to {git_ref}");
 
     Command::new("git")
         .current_dir(registry_dir)
@@ -385,7 +384,7 @@ pub async fn handle_policy_rollback(
     policy_manager.reload().await?;
 
     println!();
-    println!("✓ Policy rolled back to {}", git_ref);
+    println!("✓ Policy rolled back to {git_ref}");
 
     Ok(())
 }
@@ -413,9 +412,9 @@ pub async fn handle_policy_check(
 
     let allowed = policy_manager.check(user, resource, operation).await;
 
-    println!("User:     {}", user);
-    println!("Resource: {}", resource);
-    println!("Action:   {}", action);
+    println!("User:     {user}");
+    println!("Resource: {resource}");
+    println!("Action:   {action}");
     println!();
 
     if allowed {
@@ -470,7 +469,7 @@ pub async fn handle_token_create(
     // Create JWT claims with prefixed subject (token:user)
     let now = chrono::Utc::now().timestamp();
     let exp = (chrono::Utc::now() + duration).timestamp();
-    let prefixed_subject = format!("token:{}", user);
+    let prefixed_subject = format!("token:{user}");
     let claims = Claims::new(prefixed_subject.clone(), now, exp, parsed_scopes, admin);
 
     // Encode and sign the JWT
@@ -478,11 +477,11 @@ pub async fn handle_token_create(
 
     // Display the token (only shown once)
     println!();
-    println!("JWT token created for subject '{}':", prefixed_subject);
+    println!("JWT token created for subject '{prefixed_subject}':");
     println!();
-    println!("  {}", token);
+    println!("  {token}");
     println!();
-    println!("  Name:    {} (reference only, not in token)", name);
+    println!("  Name:    {name} (reference only, not in token)");
 
     // Calculate expiration for display
     let expires_at = chrono::DateTime::from_timestamp(exp, 0);
@@ -493,7 +492,7 @@ pub async fn handle_token_create(
         println!("  Expires: never");
     }
 
-    if scopes.is_empty() || scopes.contains(&"*".to_string()) {
+    if scopes.is_empty() || scopes.contains(&"*".to_owned()) {
         println!("  Scopes:  * (all resources)");
     } else {
         println!("  Scopes:  {}", scopes.join(", "));
@@ -571,7 +570,7 @@ fn parse_duration(s: &str) -> Result<Option<Duration>> {
 
     let num: i64 = num_str
         .parse()
-        .context(format!("Invalid duration number: {}", num_str))?;
+        .context(format!("Invalid duration number: {num_str}"))?;
 
     let duration = match unit {
         'd' => Duration::days(num),
@@ -603,7 +602,7 @@ fn has_uncommitted_changes(policies_dir: &Path) -> Result<bool> {
 /// Truncate a string to max length, adding "..." if truncated
 fn truncate_str(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
-        s.to_string()
+        s.to_owned()
     } else if max_len > 3 {
         format!("{}...", &s[..max_len - 3])
     } else {
@@ -677,7 +676,7 @@ pub async fn handle_policy_list_templates() -> Result<()> {
     let templates = get_templates();
 
     println!("Available policy templates:\n");
-    println!("{:<20} {}", "NAME", "DESCRIPTION");
+    println!("{:<20} DESCRIPTION", "NAME");
     println!("{}", "-".repeat(60));
 
     for template in templates {
@@ -712,25 +711,25 @@ pub async fn handle_policy_apply_template(
     let existing_content = if policy_path.exists() {
         tokio::fs::read_to_string(&policy_path).await?
     } else {
-        default_policy_template().to_string()
+        default_policy_template().to_owned()
     };
 
     // Check if template rules already exist
     if existing_content.contains(template.rules.trim()) {
-        println!("Template '{}' is already applied.", template_name);
+        println!("Template '{template_name}' is already applied.");
         return Ok(());
     }
 
     // Append the template rules
     let new_content = format!("{}\n{}", existing_content.trim_end(), template.rules);
 
-    println!("Applying template: {}", template_name);
+    println!("Applying template: {template_name}");
     println!("Description: {}", template.description);
     println!();
     println!("Rules to add:");
     for line in template.rules.lines() {
         if !line.trim().is_empty() && !line.starts_with('#') {
-            println!("  + {}", line);
+            println!("  + {line}");
         }
     }
     println!();
@@ -763,7 +762,7 @@ pub async fn handle_policy_apply_template(
     }
 
     // Commit the change
-    let commit_msg = format!("policy: apply {} template", template_name);
+    let commit_msg = format!("policy: apply {template_name} template");
 
     Command::new("git")
         .current_dir(registry_dir)
@@ -786,7 +785,7 @@ pub async fn handle_policy_apply_template(
     }
 
     println!();
-    println!("✓ Template '{}' applied successfully.", template_name);
+    println!("✓ Template '{template_name}' applied successfully.");
 
     Ok(())
 }

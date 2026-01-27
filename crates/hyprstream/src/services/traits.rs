@@ -93,7 +93,7 @@ pub trait RegistryClient: Send + Sync {
     /// If no cache is available, returns `false` (use `exists_async` for reliable check).
     fn exists(&self, name: &str) -> bool {
         if let Some(repos) = self.cached_list() {
-            repos.iter().any(|t| t.name.as_ref() == Some(&name.to_string()))
+            repos.iter().any(|t| t.name.as_ref() == Some(&name.to_owned()))
         } else {
             false
         }

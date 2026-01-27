@@ -19,8 +19,8 @@ pub enum ConnectionError {
 impl fmt::Display for ConnectionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConnectionError::Timeout(msg) => write!(f, "Connection timeout: {}", msg),
-            ConnectionError::Other(e) => write!(f, "Connection error: {}", e),
+            ConnectionError::Timeout(msg) => write!(f, "Connection timeout: {msg}"),
+            ConnectionError::Other(e) => write!(f, "Connection error: {e}"),
         }
     }
 }

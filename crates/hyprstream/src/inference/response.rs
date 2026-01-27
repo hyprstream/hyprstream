@@ -108,7 +108,7 @@ impl StreamStats {
             generation_time_ms: stats.generation_time_ms,
             tokens_per_second: stats.tokens_per_second,
             finish_reason: stats.finish_reason.clone(),
-            quality_metrics: stats.quality_metrics.clone(),
+            quality_metrics: stats.quality_metrics,
         }
     }
 }
@@ -125,13 +125,13 @@ mod tests {
         let mut handle = StreamHandle::new(chunk_rx, stats_rx);
 
         // Send some chunks
-        chunk_tx.send(Ok("Hello".to_string())).await.expect("test: send chunk");
-        chunk_tx.send(Ok(" World".to_string())).await.expect("test: send chunk");
+        chunk_tx.send(Ok("Hello".to_owned())).await.expect("test: send chunk");
+        chunk_tx.send(Ok(" World".to_owned())).await.expect("test: send chunk");
         drop(chunk_tx); // Close channel
 
         // Receive chunks
-        assert_eq!(handle.next().await, Some(Ok("Hello".to_string())));
-        assert_eq!(handle.next().await, Some(Ok(" World".to_string())));
+        assert_eq!(handle.next().await, Some(Ok("Hello".to_owned())));
+        assert_eq!(handle.next().await, Some(Ok(" World".to_owned())));
         assert_eq!(handle.next().await, None);
 
         // Send stats

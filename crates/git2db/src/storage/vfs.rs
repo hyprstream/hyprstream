@@ -51,7 +51,7 @@ impl Driver for VfsDriver {
         // Ensure parent directory exists
         if let Some(parent) = opts.worktree_path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                Git2DBError::internal(format!("Failed to create parent directory: {}", e))
+                Git2DBError::internal(format!("Failed to create parent directory: {e}"))
             })?;
         }
 
@@ -68,7 +68,7 @@ impl Driver for VfsDriver {
         // Return handle (no special cleanup needed for plain directories)
         Ok(WorktreeHandle::new(
             opts.worktree_path.clone(),
-            "vfs".to_string(),
+            "vfs".to_owned(),
         ))
     }
 
@@ -89,7 +89,7 @@ impl Driver for VfsDriver {
             let worktree_path = entry.path();
 
             // Skip non-directories and git's internal directories
-            if !worktree_path.is_dir() || worktree_path.file_name().map_or(false, |name| {
+            if !worktree_path.is_dir() || worktree_path.file_name().is_some_and(|name| {
                 name.to_string_lossy().starts_with(".git")
             }) {
                 continue;
@@ -97,7 +97,7 @@ impl Driver for VfsDriver {
 
             // For VFS driver, any directory with a .git inside is a valid worktree
             if worktree_path.join(".git").exists() {
-                worktrees.push(WorktreeHandle::new(worktree_path, "vfs".to_string()));
+                worktrees.push(WorktreeHandle::new(worktree_path, "vfs".to_owned()));
             }
         }
 
@@ -111,7 +111,7 @@ impl Driver for VfsDriver {
             .join(branch);
 
         if worktree_path.exists() && worktree_path.join(".git").exists() {
-            Ok(Some(WorktreeHandle::new(worktree_path, "vfs".to_string())))
+            Ok(Some(WorktreeHandle::new(worktree_path, "vfs".to_owned())))
         } else {
             Ok(None)
         }
@@ -125,7 +125,7 @@ impl VfsDriver {
     async fn create_git_worktree(&self, opts: &DriverOpts) -> Git2DBResult<()> {
         // Open the base repository
         let repo = git2::Repository::open(&opts.base_repo)
-            .map_err(|e| Git2DBError::internal(format!("Failed to open repository: {}", e)))?;
+            .map_err(|e| Git2DBError::internal(format!("Failed to open repository: {e}")))?;
 
         // Resolve ref_spec to a commit using git_revparse_single
         let object = repo.revparse_single(&opts.ref_spec).map_err(|e| {
@@ -161,7 +161,7 @@ impl VfsDriver {
                 &opts.worktree_path,
                 Some(git2::WorktreeAddOptions::new().reference(Some(&reference))),
             )
-            .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {}", e)))?;
+            .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {e}")))?;
 
             info!(
                 "Created git worktree at {} for branch '{}' (commit: {})",
@@ -172,18 +172,18 @@ impl VfsDriver {
         } else {
             // Commit/Tag/Symbolic: Create with detached HEAD
             repo.worktree(worktree_name, &opts.worktree_path, None)
-                .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {e}")))?;
 
             // Set detached HEAD to the resolved commit
             let wt_repo = git2::Repository::open(&opts.worktree_path)?;
             wt_repo.set_head_detached(commit.id()).map_err(|e| {
-                Git2DBError::internal(format!("Failed to set detached HEAD: {}", e))
+                Git2DBError::internal(format!("Failed to set detached HEAD: {e}"))
             })?;
 
             // Checkout the commit
             wt_repo
                 .checkout_head(Some(git2::build::CheckoutBuilder::default().force()))
-                .map_err(|e| Git2DBError::internal(format!("Failed to checkout HEAD: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to checkout HEAD: {e}")))?;
 
             info!(
                 "Created git worktree at {} for ref '{}' (detached HEAD at {})",

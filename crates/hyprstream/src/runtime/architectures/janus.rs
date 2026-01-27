@@ -271,7 +271,7 @@ impl VisionTransformerLayer {
     ) -> Result<Self> {
         let self_attn = MultiHeadAttention::from_weights(
             weights,
-            &format!("{}.self_attn", prefix),
+            &format!("{prefix}.self_attn"),
             hidden_size,
             device,
             dtype,
@@ -279,7 +279,7 @@ impl VisionTransformerLayer {
 
         let mlp = Mlp::from_weights(
             weights,
-            &format!("{}.mlp", prefix),
+            &format!("{prefix}.mlp"),
             hidden_size,
             hidden_size * 4,  // Standard 4x expansion
             device,
@@ -288,7 +288,7 @@ impl VisionTransformerLayer {
 
         let ln_1 = LayerNorm::from_weights(
             weights,
-            &format!("{}.ln_1", prefix),
+            &format!("{prefix}.ln_1"),
             hidden_size,
             device,
             dtype,
@@ -296,7 +296,7 @@ impl VisionTransformerLayer {
 
         let ln_2 = LayerNorm::from_weights(
             weights,
-            &format!("{}.ln_2", prefix),
+            &format!("{prefix}.ln_2"),
             hidden_size,
             device,
             dtype,
@@ -345,28 +345,28 @@ impl MultiHeadAttention {
         dtype: DType,
     ) -> Result<Self> {
         let mut q_proj = weights
-            .get(&format!("{}.q_proj.weight", prefix))
+            .get(&format!("{prefix}.q_proj.weight"))
             .ok_or_else(|| anyhow!("Missing q_proj weight"))?
             .shallow_clone();
         q_proj = q_proj.to_device(device);
         q_proj = q_proj.to_kind(dtype);
 
         let mut k_proj = weights
-            .get(&format!("{}.k_proj.weight", prefix))
+            .get(&format!("{prefix}.k_proj.weight"))
             .ok_or_else(|| anyhow!("Missing k_proj weight"))?
             .shallow_clone();
         k_proj = k_proj.to_device(device);
         k_proj = k_proj.to_kind(dtype);
 
         let mut v_proj = weights
-            .get(&format!("{}.v_proj.weight", prefix))
+            .get(&format!("{prefix}.v_proj.weight"))
             .ok_or_else(|| anyhow!("Missing v_proj weight"))?
             .shallow_clone();
         v_proj = v_proj.to_device(device);
         v_proj = v_proj.to_kind(dtype);
 
         let mut out_proj = weights
-            .get(&format!("{}.out_proj.weight", prefix))
+            .get(&format!("{prefix}.out_proj.weight"))
             .ok_or_else(|| anyhow!("Missing out_proj weight"))?
             .shallow_clone();
         out_proj = out_proj.to_device(device);
@@ -395,11 +395,11 @@ impl MultiHeadAttention {
         let v = x.matmul(&self.v_proj.transpose(0, 1));
 
         // Reshape for multi-head attention
-        let q = q.reshape(&[batch_size, seq_len, self.num_heads as i64, self.head_dim as i64])
+        let q = q.reshape([batch_size, seq_len, self.num_heads as i64, self.head_dim as i64])
             .transpose(1, 2);  // [B, H, N, D]
-        let k = k.reshape(&[batch_size, seq_len, self.num_heads as i64, self.head_dim as i64])
+        let k = k.reshape([batch_size, seq_len, self.num_heads as i64, self.head_dim as i64])
             .transpose(1, 2);
-        let v = v.reshape(&[batch_size, seq_len, self.num_heads as i64, self.head_dim as i64])
+        let v = v.reshape([batch_size, seq_len, self.num_heads as i64, self.head_dim as i64])
             .transpose(1, 2);
 
         // Scaled dot-product attention
@@ -411,7 +411,7 @@ impl MultiHeadAttention {
 
         // Reshape back
         let attn_output = attn_output.transpose(1, 2)
-            .reshape(&[batch_size, seq_len, -1]);
+            .reshape([batch_size, seq_len, -1]);
 
         // Output projection
         let output = attn_output.matmul(&self.out_proj.transpose(0, 1));
@@ -436,14 +436,14 @@ impl Mlp {
         dtype: DType,
     ) -> Result<Self> {
         let mut fc1 = weights
-            .get(&format!("{}.fc1.weight", prefix))
+            .get(&format!("{prefix}.fc1.weight"))
             .ok_or_else(|| anyhow!("Missing fc1 weight"))?
             .shallow_clone();
         fc1 = fc1.to_device(device);
         fc1 = fc1.to_kind(dtype);
 
         let mut fc2 = weights
-            .get(&format!("{}.fc2.weight", prefix))
+            .get(&format!("{prefix}.fc2.weight"))
             .ok_or_else(|| anyhow!("Missing fc2 weight"))?
             .shallow_clone();
         fc2 = fc2.to_device(device);
@@ -476,14 +476,14 @@ impl LayerNorm {
         dtype: DType,
     ) -> Result<Self> {
         let mut weight = weights
-            .get(&format!("{}.weight", prefix))
+            .get(&format!("{prefix}.weight"))
             .ok_or_else(|| anyhow!("Missing layer norm weight"))?
             .shallow_clone();
         weight = weight.to_device(device);
         weight = weight.to_kind(dtype);
 
         let bias = weights
-            .get(&format!("{}.bias", prefix))
+            .get(&format!("{prefix}.bias"))
             .map(|b| {
                 let mut b = b.shallow_clone();
                 b = b.to_device(device);
@@ -546,14 +546,14 @@ impl MlpProjector {
 
             // First linear layer
             let mut layer0_weight = weights
-                .get(&format!("{}.layers.0.weight", prefix))
+                .get(&format!("{prefix}.layers.0.weight"))
                 .ok_or_else(|| anyhow!("Missing projector layer 0 weight"))?
                 .shallow_clone();
             layer0_weight = layer0_weight.to_device(device);
             layer0_weight = layer0_weight.to_kind(dtype);
 
             let mut layer0_bias = weights
-                .get(&format!("{}.layers.0.bias", prefix))
+                .get(&format!("{prefix}.layers.0.bias"))
                 .ok_or_else(|| anyhow!("Missing projector layer 0 bias"))?
                 .shallow_clone();
             layer0_bias = layer0_bias.to_device(device);
@@ -561,14 +561,14 @@ impl MlpProjector {
 
             // Second linear layer (index 2 in Sequential, after GELU at index 1)
             let mut layer2_weight = weights
-                .get(&format!("{}.layers.2.weight", prefix))
+                .get(&format!("{prefix}.layers.2.weight"))
                 .ok_or_else(|| anyhow!("Missing projector layer 2 weight"))?
                 .shallow_clone();
             layer2_weight = layer2_weight.to_device(device);
             layer2_weight = layer2_weight.to_kind(dtype);
 
             let mut layer2_bias = weights
-                .get(&format!("{}.layers.2.bias", prefix))
+                .get(&format!("{prefix}.layers.2.bias"))
                 .ok_or_else(|| anyhow!("Missing projector layer 2 bias"))?
                 .shallow_clone();
             layer2_bias = layer2_bias.to_device(device);
@@ -582,14 +582,14 @@ impl MlpProjector {
         } else {
             // Single linear layer
             let mut weight = weights
-                .get(&format!("{}.layers.0.weight", prefix))
+                .get(&format!("{prefix}.layers.0.weight"))
                 .ok_or_else(|| anyhow!("Missing projector weight"))?
                 .shallow_clone();
             weight = weight.to_device(device);
             weight = weight.to_kind(dtype);
 
             let mut bias = weights
-                .get(&format!("{}.layers.0.bias", prefix))
+                .get(&format!("{prefix}.layers.0.bias"))
                 .ok_or_else(|| anyhow!("Missing projector bias"))?
                 .shallow_clone();
             bias = bias.to_device(device);
@@ -734,7 +734,7 @@ impl JanusModel {
         for (key, tensor) in weights {
             if let Some(suffix) = key.strip_prefix("language_model.") {
                 // Remove prefix for language model
-                language_weights.insert(suffix.to_string(), tensor.shallow_clone());
+                language_weights.insert(suffix.to_owned(), tensor.shallow_clone());
             } else if key.starts_with("vision_model.") {
                 vision_weights.insert(key.clone(), tensor.shallow_clone());
             } else if key.starts_with("aligner.") {
@@ -810,7 +810,7 @@ impl JanusModel {
                 images.shallow_clone()
             } else {
                 // [batch, n_images, 3, h, w] → [batch*n_images, 3, h, w]
-                images.reshape(&[batch_size * n_images, channels, height, width])
+                images.reshape([batch_size * n_images, channels, height, width])
             };
 
             // Encode images through vision encoder
@@ -836,7 +836,7 @@ impl JanusModel {
             // Reshape from [batch*n_images, num_patches, hidden]
             // to [batch, n_images*num_patches, hidden]
             let image_embeds_reshaped = image_embeds
-                .reshape(&[batch_size, n_images * num_patches, language_hidden]);
+                .reshape([batch_size, n_images * num_patches, language_hidden]);
 
             debug!(
                 "Image embeddings reshaped: {:?}",
@@ -871,7 +871,7 @@ impl JanusModel {
                 emb_mask.shallow_clone()
             } else {
                 // [batch, n_images, num_patches] → [batch, n_images*num_patches]
-                emb_mask.reshape(&[batch_size, n_images * emb_mask_patches])
+                emb_mask.reshape([batch_size, n_images * emb_mask_patches])
             };
 
             // Replace image placeholders with actual image embeddings
@@ -960,10 +960,10 @@ impl JanusModel {
             }
 
             // Find all valid image embeddings
-            let emb_mask_flat = batch_emb_mask.reshape(&[-1]);
-            let image_flat = batch_image_embeds.reshape(&[-1, hidden_dim]);
+            let emb_mask_flat = batch_emb_mask.reshape([-1]);
+            let image_flat = batch_image_embeds.reshape([-1, hidden_dim]);
             let valid_image_embeds = image_flat.masked_select(&emb_mask_flat.unsqueeze(-1))
-                .reshape(&[num_positions, hidden_dim]);
+                .reshape([num_positions, hidden_dim]);
 
             debug!(
                 "Batch {}: Merging {} image embeddings at {} positions",
@@ -977,7 +977,7 @@ impl JanusModel {
                 let img_row = valid_image_embeds.get(i);
 
                 // Update in-place
-                let _ = row.copy_(&img_row);
+                row.copy_(&img_row);
             }
         }
 
@@ -1229,8 +1229,8 @@ pub fn replace_janus_placeholders(
             .unsqueeze(0); // [1, seq_len]
 
         let seq_len = input_ids.len();
-        let images_seq_mask = Tensor::zeros(&[1, seq_len as i64], (DType::Bool, device));
-        let images_emb_mask = Tensor::zeros(&[1, 1, config.num_image_tokens as i64], (DType::Bool, device));
+        let images_seq_mask = Tensor::zeros([1, seq_len as i64], (DType::Bool, device));
+        let images_emb_mask = Tensor::zeros([1, 1, config.num_image_tokens as i64], (DType::Bool, device));
 
         return Ok(JanusPlaceholderReplacement {
             input_ids: input_ids_tensor,
@@ -1252,7 +1252,7 @@ pub fn replace_janus_placeholders(
 
         // Replace placeholder with: <boi> + 576 x <image> + <eoi>
         new_tokens.push(config.image_start_id as i64);
-        new_tokens.extend(std::iter::repeat(config.image_token_id as i64).take(config.num_image_tokens));
+        new_tokens.extend(std::iter::repeat_n(config.image_token_id as i64, config.num_image_tokens));
         new_tokens.push(config.image_end_id as i64);
 
         last_pos = placeholder_idx + 1;
@@ -1318,7 +1318,7 @@ pub fn replace_janus_placeholders(
     // Create images_emb_mask: all vision embeddings are valid
     // Shape: [1, num_images, num_image_tokens] - all True
     let images_emb_mask = Tensor::ones(
-        &[1, num_images as i64, config.num_image_tokens as i64],
+        [1, num_images as i64, config.num_image_tokens as i64],
         (DType::Bool, device)
     );
 

@@ -13,7 +13,7 @@
 //! let options = CloneOptions::builder()
 //!     .callback_config(
 //!         CallbackConfigBuilder::new()
-//!             .auth(AuthStrategy::SshAgent { username: Some("git".to_string()) })
+//!             .auth(AuthStrategy::SshAgent { username: Some("git".to_owned()) })
 //!             .progress(ProgressConfig::Stdout)
 //!             .build()
 //!     )
@@ -233,9 +233,9 @@ mod tests {
             .timeout(60)
             .build();
 
-        assert_eq!(options.shallow, true);
+        assert!(options.shallow);
         assert_eq!(options.depth, Some(5));
-        assert_eq!(options.branch, Some("main".to_string()));
+        assert_eq!(options.branch, Some("main".to_owned()));
         assert_eq!(options.timeout_seconds, Some(60));
     }
 

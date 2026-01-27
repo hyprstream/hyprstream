@@ -139,19 +139,19 @@ impl std::fmt::Debug for InferenceRequest {
                 write!(f, "InferenceRequest::CreateLora {{ rank: {} }}", config.rank)
             }
             Self::LoadLora { path, .. } => {
-                write!(f, "InferenceRequest::LoadLora {{ path: {:?} }}", path)
+                write!(f, "InferenceRequest::LoadLora {{ path: {path:?} }}")
             }
             Self::SaveLora { path, .. } => {
-                write!(f, "InferenceRequest::SaveLora {{ path: {:?} }}", path)
+                write!(f, "InferenceRequest::SaveLora {{ path: {path:?} }}")
             }
             Self::UnloadLora { .. } => write!(f, "InferenceRequest::UnloadLora"),
             Self::HasLora { .. } => write!(f, "InferenceRequest::HasLora"),
             Self::SetSession { session_id, .. } => {
-                write!(f, "InferenceRequest::SetSession {{ session_id: {:?} }}", session_id)
+                write!(f, "InferenceRequest::SetSession {{ session_id: {session_id:?} }}")
             }
             Self::ClearSession { .. } => write!(f, "InferenceRequest::ClearSession"),
             Self::ReleaseSession { session_id, .. } => {
-                write!(f, "InferenceRequest::ReleaseSession {{ session_id: {:?} }}", session_id)
+                write!(f, "InferenceRequest::ReleaseSession {{ session_id: {session_id:?} }}")
             }
             Self::HealthCheck { .. } => write!(f, "InferenceRequest::HealthCheck"),
             Self::Shutdown { .. } => write!(f, "InferenceRequest::Shutdown"),

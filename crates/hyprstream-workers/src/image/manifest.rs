@@ -51,20 +51,20 @@ impl ImageReference {
         // Check for digest reference
         let (image_part, reference, is_digest) = if let Some(idx) = image.rfind('@') {
             let (img, digest) = image.split_at(idx);
-            (img.to_string(), digest[1..].to_string(), true)
+            (img.to_owned(), digest[1..].to_string(), true)
         } else if let Some(idx) = image.rfind(':') {
             // Check if this colon is part of a port number (host:port/repo)
             let before_colon = &image[..idx];
             if before_colon.contains('/') || !before_colon.contains('.') {
                 // It's a tag separator
                 let (img, tag) = image.split_at(idx);
-                (img.to_string(), tag[1..].to_string(), false)
+                (img.to_owned(), tag[1..].to_string(), false)
             } else {
                 // It's a port separator, use default tag
-                (image.to_string(), "latest".to_string(), false)
+                (image.to_owned(), "latest".to_owned(), false)
             }
         } else {
-            (image.to_string(), "latest".to_string(), false)
+            (image.to_owned(), "latest".to_owned(), false)
         };
 
         // Parse host and repository
@@ -77,24 +77,24 @@ impl ImageReference {
                 || potential_host.contains(':')
                 || potential_host == "localhost"
             {
-                let host = potential_host.to_string();
+                let host = potential_host.to_owned();
                 let repo = image_part[first_slash + 1..].to_string();
                 (host, repo)
             } else {
                 // No explicit host, use Docker Hub
-                ("docker.io".to_string(), image_part)
+                ("docker.io".to_owned(), image_part)
             }
         } else {
             // Simple name like "alpine" -> docker.io/library/alpine
             (
-                "docker.io".to_string(),
-                format!("library/{}", image_part),
+                "docker.io".to_owned(),
+                format!("library/{image_part}"),
             )
         };
 
         // Docker Hub's actual registry host
         let host = if host == "docker.io" {
-            "registry-1.docker.io".to_string()
+            "registry-1.docker.io".to_owned()
         } else {
             host
         };
@@ -313,7 +313,7 @@ impl ManifestFetcher {
             .client
             .get(url)
             .header(ACCEPT, accept_header())
-            .header(AUTHORIZATION, format!("Bearer {}", token))
+            .header(AUTHORIZATION, format!("Bearer {token}"))
             .send()
             .await?;
 
@@ -336,7 +336,7 @@ impl ManifestFetcher {
                     media_types::DOCKER_MANIFEST
                 ),
             )
-            .header(AUTHORIZATION, format!("Bearer {}", token))
+            .header(AUTHORIZATION, format!("Bearer {token}"))
             .send()
             .await?;
 
@@ -354,7 +354,7 @@ impl ManifestFetcher {
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
+            .map(std::borrow::ToOwned::to_owned)
             .unwrap_or_default();
 
         let body = resp.text().await.context("failed to read response body")?;
@@ -486,8 +486,8 @@ fn parse_www_authenticate(header: &str) -> Result<HashMap<String, String>> {
     for part in header.split(',') {
         let part = part.trim();
         if let Some(eq_idx) = part.find('=') {
-            let key = part[..eq_idx].trim().to_string();
-            let value = part[eq_idx + 1..].trim().trim_matches('"').to_string();
+            let key = part[..eq_idx].trim().to_owned();
+            let value = part[eq_idx + 1..].trim().trim_matches('"').to_owned();
             params.insert(key, value);
         }
     }
@@ -554,10 +554,10 @@ mod tests {
     fn test_parse_www_authenticate() {
         let header = r#"Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/alpine:pull""#;
         let params = parse_www_authenticate(header).unwrap();
-        assert_eq!(params.get("realm").unwrap(), "https://auth.docker.io/token");
-        assert_eq!(params.get("service").unwrap(), "registry.docker.io");
+        assert_eq!(&params["realm"], "https://auth.docker.io/token");
+        assert_eq!(&params["service"], "registry.docker.io");
         assert_eq!(
-            params.get("scope").unwrap(),
+            &params["scope"],
             "repository:library/alpine:pull"
         );
     }

@@ -77,7 +77,7 @@ impl LoRAIntegrationExample {
             // Apply LoRA to Q projection if it exists
             if let Some(q_lora) = lora_model
                 .layers
-                .get(&format!("layer.{}.self_attn.q_proj", layer_idx))
+                .get(&format!("layer.{layer_idx}.self_attn.q_proj"))
             {
                 hidden_states = Self::apply_lora_to_layer(
                     &base_attn_output,
@@ -97,7 +97,7 @@ impl LoRAIntegrationExample {
             // Apply LoRA to V projection if it exists
             if let Some(v_lora) = lora_model
                 .layers
-                .get(&format!("layer.{}.self_attn.v_proj", layer_idx))
+                .get(&format!("layer.{layer_idx}.self_attn.v_proj"))
             {
                 let v_input = if training {
                     hidden_states.set_requires_grad(true)

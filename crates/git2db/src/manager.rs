@@ -260,7 +260,7 @@ impl GitManager {
 
         // Add SSH agent authentication
         callback_builder = callback_builder.auth(AuthStrategy::SshAgent {
-            username: Some("git".to_string()),
+            username: Some("git".to_owned()),
         });
 
         // Add default credential helper if enabled (for git credentials, osxkeychain, etc.)
@@ -303,7 +303,7 @@ impl GitManager {
     pub fn get_repository<P: AsRef<Path>>(&self, path: P) -> Git2DBResult<RepositoryCache> {
         let path_ref = path.as_ref();
         let path = path_ref.canonicalize().map_err(|e| {
-            Git2DBError::invalid_path(path_ref, format!("Failed to canonicalize: {}", e))
+            Git2DBError::invalid_path(path_ref, format!("Failed to canonicalize: {e}"))
         })?;
 
         // Check cache first (lock-free read with DashMap)
@@ -323,7 +323,7 @@ impl GitManager {
         // Cache miss - open repository
         trace!("Repository cache miss for {:?}", path);
         let repository = Repository::open(&path).map_err(|e| {
-            Git2DBError::repository(&path, format!("Failed to open repository: {}", e))
+            Git2DBError::repository(&path, format!("Failed to open repository: {e}"))
         })?;
 
         let cache = RepositoryCache::new(repository, path.clone());
@@ -430,7 +430,7 @@ impl GitManager {
     /// let options = CloneOptions::builder()
     ///     .callback_config(
     ///         CallbackConfigBuilder::new()
-    ///             .auth(AuthStrategy::SshAgent { username: Some("git".to_string()) })
+    ///             .auth(AuthStrategy::SshAgent { username: Some("git".to_owned()) })
     ///             .progress(ProgressConfig::Stdout)
     ///             .build()
     ///     )
@@ -449,14 +449,14 @@ impl GitManager {
         use tokio::task::spawn_blocking;
 
         // Convert inputs to owned types for spawn_blocking
-        let url = url.to_string();
+        let url = url.to_owned();
         let target_path = target_path.to_path_buf();
         let options = options.unwrap_or_else(|| self.default_clone_options());
 
         // Acquire operation permit
         let _permit =
             self.operation_semaphore.acquire().await.map_err(|e| {
-                Git2DBError::internal(format!("Failed to acquire semaphore: {}", e))
+                Git2DBError::internal(format!("Failed to acquire semaphore: {e}"))
             })?;
 
         // Track operation
@@ -476,7 +476,7 @@ impl GitManager {
             // Relative path - join with current dir and validate
             let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             scoped_join(&current_dir, &target_path).map_err(|e| {
-                Git2DBError::invalid_path(&target_path, format!("Path validation failed: {}", e))
+                Git2DBError::invalid_path(&target_path, format!("Path validation failed: {e}"))
             })?
         };
 
@@ -485,7 +485,7 @@ impl GitManager {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
                 Git2DBError::repository(
                     &validated_path,
-                    format!("Failed to create parent directory: {}", e),
+                    format!("Failed to create parent directory: {e}"),
                 )
             })?;
         }
@@ -515,7 +515,7 @@ impl GitManager {
             let repo = builder.clone(&url, &validated_path).map_err(|e| {
                 Git2DBError::repository(
                     &validated_path,
-                    format!("Failed to clone repository: {}", e),
+                    format!("Failed to clone repository: {e}"),
                 )
             })?;
 
@@ -523,7 +523,7 @@ impl GitManager {
             Ok(repo)
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))??;
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))??;
 
         // Clean up operation tracking
         {
@@ -544,7 +544,7 @@ impl GitManager {
         let sig_email = email.unwrap_or(&self.config.signature.email);
 
         Signature::now(sig_name, sig_email)
-            .map_err(|e| Git2DBError::internal(format!("Failed to create signature: {}", e)))
+            .map_err(|e| Git2DBError::internal(format!("Failed to create signature: {e}")))
     }
 
     /// Remove a worktree with cleanup
@@ -556,7 +556,7 @@ impl GitManager {
     ) -> Git2DBResult<()> {
         let base_repo_path = if let Some(base) = base_dir {
             self.validate_path(base, base_repo_path)
-                .map_err(|e| Git2DBError::internal(format!("Invalid base repo path: {}", e)))?
+                .map_err(|e| Git2DBError::internal(format!("Invalid base repo path: {e}")))?
         } else {
             base_repo_path.to_path_buf()
         };
@@ -568,7 +568,7 @@ impl GitManager {
 
         // Find and prune worktree
         let wt = repo.find_worktree(worktree_name).map_err(|e| {
-            Git2DBError::repository(&base_repo_path, format!("Failed to find worktree: {}", e))
+            Git2DBError::repository(&base_repo_path, format!("Failed to find worktree: {e}"))
         })?;
 
         // Configure prune options:
@@ -580,7 +580,7 @@ impl GitManager {
 
         wt.prune(Some(&mut opts))
             .map_err(|e| {
-                Git2DBError::repository(&base_repo_path, format!("Failed to prune worktree: {}", e))
+                Git2DBError::repository(&base_repo_path, format!("Failed to prune worktree: {e}"))
             })?;
 
         info!("Successfully removed worktree '{}'", worktree_name);
@@ -593,13 +593,13 @@ impl GitManager {
         let repo = repo_cache.open()?;
 
         let worktrees = repo.worktrees().map_err(|e| {
-            Git2DBError::repository(repo_path, format!("Failed to list worktrees: {}", e))
+            Git2DBError::repository(repo_path, format!("Failed to list worktrees: {e}"))
         })?;
 
         Ok(worktrees
             .into_iter()
             .flatten()
-            .map(|s| s.to_string())
+            .map(std::borrow::ToOwned::to_owned)
             .collect())
     }
 
@@ -641,7 +641,7 @@ impl GitManager {
         scheme: &str,
         factory: Arc<dyn crate::transport::TransportFactory>,
     ) -> Result<(), Git2DBError> {
-        let scheme = scheme.to_string();
+        let scheme = scheme.to_owned();
         self.transport_registry
             .register_transport(scheme.clone(), factory.clone())?;
         info!(

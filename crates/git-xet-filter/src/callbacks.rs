@@ -234,8 +234,8 @@ fn smudge_data(payload: &XetFilterPayload, input: &[u8], path: &str) -> Result<V
     let content = payload
         .runtime
         .block_on(payload.storage.smudge_bytes(pointer_str))
-        .map_err(|e| XetError::new(XetErrorKind::RuntimeError, format!("Runtime error: {}", e)))?
-        .map_err(|e| XetError::new(XetErrorKind::DownloadFailed, format!("Download failed: {}", e)))?;
+        .map_err(|e| XetError::new(XetErrorKind::RuntimeError, format!("Runtime error: {e}")))?
+        .map_err(|e| XetError::new(XetErrorKind::DownloadFailed, format!("Download failed: {e}")))?;
 
     tracing::debug!("XET smudge {}: pointer -> {} bytes", path, content.len());
     Ok(content)
@@ -251,19 +251,19 @@ fn clean_data(payload: &XetFilterPayload, input: &[u8], path: &str) -> Result<Ve
 
     // Write to temporary file for upload
     let temp_file = tempfile::NamedTempFile::new().map_err(|e| {
-        XetError::new(XetErrorKind::IoError, format!("Failed to create temp file: {}", e))
+        XetError::new(XetErrorKind::IoError, format!("Failed to create temp file: {e}"))
     })?;
 
     std::fs::write(temp_file.path(), input).map_err(|e| {
-        XetError::new(XetErrorKind::IoError, format!("Failed to write temp file: {}", e))
+        XetError::new(XetErrorKind::IoError, format!("Failed to write temp file: {e}"))
     })?;
 
     // Upload to XET CAS
     let pointer = payload
         .runtime
         .block_on(payload.storage.clean_file(temp_file.path()))
-        .map_err(|e| XetError::new(XetErrorKind::RuntimeError, format!("Runtime error: {}", e)))?
-        .map_err(|e| XetError::new(XetErrorKind::UploadFailed, format!("Upload failed: {}", e)))?;
+        .map_err(|e| XetError::new(XetErrorKind::RuntimeError, format!("Runtime error: {e}")))?
+        .map_err(|e| XetError::new(XetErrorKind::UploadFailed, format!("Upload failed: {e}")))?;
 
     tracing::debug!("XET clean {}: {} bytes -> pointer", path, input.len());
     Ok(pointer.into_bytes())
@@ -360,7 +360,7 @@ pub extern "C" fn xet_filter_stream(
             return -1;
         }
         match CStr::from_ptr(path_ptr).to_str() {
-            Ok(s) => s.to_string(),
+            Ok(s) => s.to_owned(),
             Err(_) => {
                 tracing::error!("XET filter: invalid UTF-8 in path");
                 return -1;

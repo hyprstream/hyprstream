@@ -124,7 +124,7 @@ impl TTTResult {
             steps_performed: 0,
             adaptation_time_ms: 0,
             skipped: true,
-            skip_reason: Some(reason.to_string()),
+            skip_reason: Some(reason.to_owned()),
         }
     }
 }
@@ -233,11 +233,11 @@ impl TestTimeTrainer {
 
         // TTT adaptation loop
         let mut losses = Vec::with_capacity(self.config.gradient_steps);
-        let initial_loss: f32;
+        
 
         // First step to get initial loss
         let loss = self.compute_ntp_loss(engine, &tokens)?;
-        initial_loss = loss.double_value(&[]) as f32;
+        let initial_loss: f32 = loss.double_value(&[]) as f32;
         losses.push(initial_loss);
 
         // Gradient step
@@ -296,10 +296,10 @@ impl TestTimeTrainer {
         // Slice logits: all but last position
         let pred_logits = logits
             .narrow(1, 0, seq_len - 1)
-            .reshape(&[-1, vocab_size]); // [(seq_len-1), vocab_size]
+            .reshape([-1, vocab_size]); // [(seq_len-1), vocab_size]
 
         // Slice labels: all but first position
-        let target_ids = input_ids.narrow(1, 1, seq_len - 1).reshape(&[-1]); // [seq_len-1]
+        let target_ids = input_ids.narrow(1, 1, seq_len - 1).reshape([-1]); // [seq_len-1]
 
         // Cross-entropy loss
         let loss = pred_logits.cross_entropy_loss::<Tensor>(
@@ -372,7 +372,7 @@ mod tests {
     fn test_ttt_result_skipped() {
         let result = TTTResult::skipped("test reason");
         assert!(result.skipped);
-        assert_eq!(result.skip_reason, Some("test reason".to_string()));
+        assert_eq!(result.skip_reason, Some("test reason".to_owned()));
         assert_eq!(result.steps_performed, 0);
     }
 

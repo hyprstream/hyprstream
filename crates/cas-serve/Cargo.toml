@@ -37,3 +37,6 @@ tracing-subscriber.workspace = true
 base64 = "0.22"
 dirs = "5.0"
 shellexpand = "3.1"
+
+[lints]
+workspace = true

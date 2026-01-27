@@ -125,7 +125,7 @@ impl Ed25519KeyPair {
         let mut pk_array = [0u8; 32];
         pk_array.copy_from_slice(public_key);
         let verifying_key = VerifyingKey::from_bytes(&pk_array)
-            .map_err(|e| Error::crypto(format!("Invalid public key: {}", e)))?;
+            .map_err(|e| Error::crypto(format!("Invalid public key: {e}")))?;
 
         let mut sig_array = [0u8; 64];
         sig_array.copy_from_slice(signature);

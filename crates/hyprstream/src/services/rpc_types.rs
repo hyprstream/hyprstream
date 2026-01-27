@@ -67,9 +67,9 @@ impl FromCapnp for WorktreeData {
             path: PathBuf::from(reader.get_path()?.to_str()?),
             branch_name: {
                 let b = reader.get_branch_name()?.to_str()?;
-                if b.is_empty() { None } else { Some(b.to_string()) }
+                if b.is_empty() { None } else { Some(b.to_owned()) }
             },
-            head_oid: reader.get_head_oid()?.to_str()?.to_string(),
+            head_oid: reader.get_head_oid()?.to_str()?.to_owned(),
             is_locked: reader.get_is_locked(),
             is_dirty: reader.get_is_dirty(),
         })
@@ -80,7 +80,7 @@ impl ToCapnp for WorktreeData {
     type Builder<'a> = registry_capnp::worktree_info::Builder<'a>;
 
     fn write_to(&self, builder: &mut Self::Builder<'_>) {
-        builder.set_path(&self.path.to_string_lossy());
+        builder.set_path(self.path.to_string_lossy());
         if let Some(ref branch) = self.branch_name {
             builder.set_branch_name(branch);
         }
@@ -142,9 +142,8 @@ impl RegistryResponse {
         response.set_request_id(request_id);
 
         let mut error_info = response.init_error();
-        error_info.set_message(&format!(
-            "unauthorized: {} cannot {} on {}",
-            subject, operation, resource
+        error_info.set_message(format!(
+            "unauthorized: {subject} cannot {operation} on {resource}"
         ));
         error_info.set_code("UNAUTHORIZED");
         error_info.set_details("");
@@ -259,7 +258,7 @@ impl RegistryResponse {
         let mut msg = Builder::new_default();
         let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
         response.set_request_id(request_id);
-        response.set_path(&path.to_string_lossy());
+        response.set_path(path.to_string_lossy());
 
         let mut bytes = Vec::new();
         serialize::write_message(&mut bytes, &msg).unwrap_or_default();
@@ -273,13 +272,13 @@ impl RegistryResponse {
         response.set_request_id(request_id);
 
         let mut repo_builder = response.init_repository();
-        repo_builder.set_id(&repo.id.to_string());
+        repo_builder.set_id(repo.id.to_string());
         if let Some(ref name) = repo.name {
             repo_builder.set_name(name);
         }
         repo_builder.set_url(&repo.url);
-        repo_builder.set_worktree_path(&repo.worktree_path.to_string_lossy());
-        repo_builder.set_tracking_ref(&repo.tracking_ref.to_string());
+        repo_builder.set_worktree_path(repo.worktree_path.to_string_lossy());
+        repo_builder.set_tracking_ref(repo.tracking_ref.to_string());
         if let Some(ref oid) = repo.current_oid {
             repo_builder.set_current_oid(oid);
         }
@@ -299,13 +298,13 @@ impl RegistryResponse {
         let mut repos_builder = response.init_repositories(repos.len() as u32);
         for (i, repo) in repos.iter().enumerate() {
             let mut repo_builder = repos_builder.reborrow().get(i as u32);
-            repo_builder.set_id(&repo.id.to_string());
+            repo_builder.set_id(repo.id.to_string());
             if let Some(ref name) = repo.name {
                 repo_builder.set_name(name);
             }
             repo_builder.set_url(&repo.url);
-            repo_builder.set_worktree_path(&repo.worktree_path.to_string_lossy());
-            repo_builder.set_tracking_ref(&repo.tracking_ref.to_string());
+            repo_builder.set_worktree_path(repo.worktree_path.to_string_lossy());
+            repo_builder.set_tracking_ref(repo.tracking_ref.to_string());
             if let Some(ref oid) = repo.current_oid {
                 repo_builder.set_current_oid(oid);
             }
@@ -332,7 +331,7 @@ impl RegistryResponse {
 
         // Set head OID (optional)
         if let Some(ref oid) = status.head {
-            status_builder.set_head_oid(&oid.to_string());
+            status_builder.set_head_oid(oid.to_string());
         }
 
         // Set other fields
@@ -343,7 +342,7 @@ impl RegistryResponse {
         // Set modified files
         let mut files_builder = status_builder.init_modified_files(status.modified_files.len() as u32);
         for (i, file) in status.modified_files.iter().enumerate() {
-            files_builder.set(i as u32, &file.to_string_lossy());
+            files_builder.set(i as u32, file.to_string_lossy());
         }
 
         let mut bytes = Vec::new();
@@ -411,8 +410,8 @@ impl FromCapnp for StreamStartedInfo {
     type Reader<'a> = inference_capnp::stream_info::Reader<'a>;
 
     fn read_from(reader: Self::Reader<'_>) -> Result<Self> {
-        let stream_id = reader.get_stream_id()?.to_str()?.to_string();
-        let endpoint = reader.get_endpoint()?.to_str()?.to_string();
+        let stream_id = reader.get_stream_id()?.to_str()?.to_owned();
+        let endpoint = reader.get_endpoint()?.to_str()?.to_owned();
 
         let pubkey_data = reader.get_server_pubkey()?;
         if pubkey_data.len() != 32 {
@@ -462,9 +461,8 @@ impl InferenceResponse {
         response.set_request_id(request_id);
 
         let mut error_info = response.init_error();
-        error_info.set_message(&format!(
-            "unauthorized: {} cannot {} on {}",
-            subject, operation, resource
+        error_info.set_message(format!(
+            "unauthorized: {subject} cannot {operation} on {resource}"
         ));
         error_info.set_code("UNAUTHORIZED");
         error_info.set_details("");
@@ -725,7 +723,7 @@ pub fn build_stream_register_envelope(
     let envelope = RequestEnvelope {
         request_id: 0, // Not used for stream registration
         identity: hyprstream_rpc::envelope::RequestIdentity::Local {
-            user: "system".to_string(),
+            user: "system".to_owned(),
         },
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -823,7 +821,7 @@ impl From<&crate::runtime::GenerationStats> for InferenceComplete {
             tokens_generated: stats.tokens_generated,
             generation_time_ms: stats.generation_time_ms,
             tokens_per_second: stats.tokens_per_second,
-            finish_reason: finish_reason.to_string(),
+            finish_reason: finish_reason.to_owned(),
             prefill_tokens: stats.prefill_tokens,
             prefill_time_ms: stats.prefill_time_ms,
             prefill_tokens_per_sec: stats.prefill_tokens_per_sec,
@@ -943,7 +941,7 @@ impl PolicyResponse {
     pub fn unauthorized(request_id: u64, scope: &str) -> Vec<u8> {
         Self::error(
             request_id,
-            &format!("Access denied for scope: {}", scope),
+            &format!("Access denied for scope: {scope}"),
             "UNAUTHORIZED"
         )
     }
@@ -952,7 +950,7 @@ impl PolicyResponse {
     pub fn ttl_exceeded(request_id: u64, requested: u32, max: u32) -> Vec<u8> {
         Self::error(
             request_id,
-            &format!("TTL exceeds maximum: {} > {}", requested, max),
+            &format!("TTL exceeds maximum: {requested} > {max}"),
             "TTL_EXCEEDED"
         )
     }

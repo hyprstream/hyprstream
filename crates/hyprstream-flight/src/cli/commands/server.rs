@@ -56,7 +56,7 @@ impl Default for ServerConfig {
             tls_cert: None,
             tls_key: None,
             tls_client_ca: None,
-            tls_min_version: Some("1.2".to_string()),
+            tls_min_version: Some("1.2".to_owned()),
             tls_cipher_list: None,
             tls_prefer_server_ciphers: Some(true),
         }
@@ -144,7 +144,7 @@ impl ConfigSection for ServerConfig {
             tls_cert: config.tls_cert,
             tls_key: config.tls_key,
             tls_client_ca: config.tls_client_ca,
-            tls_min_version: config.tls_min_version.or(Some("1.2".to_string())),
+            tls_min_version: config.tls_min_version.or(Some("1.2".to_owned())),
             tls_cipher_list: config.tls_cipher_list,
             tls_prefer_server_ciphers: config.tls_prefer_server_ciphers.or(Some(true)),
         })

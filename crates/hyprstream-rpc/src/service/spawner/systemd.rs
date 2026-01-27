@@ -45,7 +45,7 @@ impl SystemdBackend {
 
         Self {
             user_mode,
-            slice: "hyprstream-workers.slice".to_string(),
+            slice: "hyprstream-workers.slice".to_owned(),
         }
     }
 
@@ -53,7 +53,7 @@ impl SystemdBackend {
     pub fn with_user_mode(user_mode: bool) -> Self {
         Self {
             user_mode,
-            slice: "hyprstream-workers.slice".to_string(),
+            slice: "hyprstream-workers.slice".to_owned(),
         }
     }
 
@@ -80,7 +80,7 @@ impl SystemdBackend {
     /// Generate a unique unit name.
     fn generate_unit_name(&self, name: &str) -> String {
         let short_uuid = &Uuid::new_v4().to_string()[..8];
-        format!("hyprstream-{}-{}.service", name, short_uuid)
+        format!("hyprstream-{name}-{short_uuid}.service")
     }
 
     /// Build systemd-run command.
@@ -108,12 +108,12 @@ impl SystemdBackend {
 
         // Memory limit
         if let Some(ref limit) = config.memory_limit {
-            cmd.arg(format!("--property=MemoryMax={}", limit));
+            cmd.arg(format!("--property=MemoryMax={limit}"));
         }
 
         // CPU quota
         if let Some(quota) = config.cpu_quota {
-            cmd.arg(format!("--property=CPUQuota={}%", quota));
+            cmd.arg(format!("--property=CPUQuota={quota}%"));
         }
 
         // Restart on failure
@@ -129,12 +129,12 @@ impl SystemdBackend {
 
         // Environment variables
         for (key, value) in &config.env {
-            cmd.arg("--setenv").arg(format!("{}={}", key, value));
+            cmd.arg("--setenv").arg(format!("{key}={value}"));
         }
 
         // Custom unit properties
         for (key, value) in &config.unit_properties {
-            cmd.arg(format!("--property={}={}", key, value));
+            cmd.arg(format!("--property={key}={value}"));
         }
 
         // The actual command to run
@@ -202,7 +202,7 @@ impl SpawnerBackend for SystemdBackend {
             ProcessKind::SystemdUnit(name) => name,
             ProcessKind::Direct(_) => {
                 return Err(RpcError::InvalidOperation(
-                    "SystemdBackend cannot stop direct processes".to_string(),
+                    "SystemdBackend cannot stop direct processes".to_owned(),
                 ));
             }
         };
@@ -223,8 +223,7 @@ impl SpawnerBackend for SystemdBackend {
 
         let output = cmd.output().await.map_err(|e| {
             RpcError::StopFailed(format!(
-                "failed to run systemctl stop for {}: {}",
-                unit_name, e
+                "failed to run systemctl stop for {unit_name}: {e}"
             ))
         })?;
 
@@ -253,7 +252,7 @@ impl SpawnerBackend for SystemdBackend {
             ProcessKind::SystemdUnit(name) => name,
             ProcessKind::Direct(_) => {
                 return Err(RpcError::InvalidOperation(
-                    "SystemdBackend cannot check direct processes".to_string(),
+                    "SystemdBackend cannot check direct processes".to_owned(),
                 ));
             }
         };
@@ -269,8 +268,7 @@ impl SpawnerBackend for SystemdBackend {
 
         let status = cmd.status().await.map_err(|e| {
             RpcError::Other(format!(
-                "failed to run systemctl is-active for {}: {}",
-                unit_name, e
+                "failed to run systemctl is-active for {unit_name}: {e}"
             ))
         })?;
 
@@ -291,7 +289,7 @@ mod tests {
     fn test_is_available() {
         // This will depend on the test environment
         let available = SystemdBackend::is_available();
-        println!("Systemd available: {}", available);
+        println!("Systemd available: {available}");
     }
 
     #[test]

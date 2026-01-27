@@ -142,13 +142,13 @@ impl DbusBridgeService {
 
                 if !self.config.allow_system_bus {
                     return Err(WorkerError::ConfigError(
-                        "System bus access not allowed".to_string(),
+                        "System bus access not allowed".to_owned(),
                     ));
                 }
 
                 let conn = zbus::Connection::system()
                     .await
-                    .map_err(|e| WorkerError::Internal(format!("Failed to connect to system bus: {}", e)))?;
+                    .map_err(|e| WorkerError::Internal(format!("Failed to connect to system bus: {e}")))?;
 
                 *guard = Some(conn.clone());
                 Ok(conn)
@@ -161,13 +161,13 @@ impl DbusBridgeService {
 
                 if !self.config.allow_session_bus {
                     return Err(WorkerError::ConfigError(
-                        "Session bus access not allowed".to_string(),
+                        "Session bus access not allowed".to_owned(),
                     ));
                 }
 
                 let conn = zbus::Connection::session()
                     .await
-                    .map_err(|e| WorkerError::Internal(format!("Failed to connect to session bus: {}", e)))?;
+                    .map_err(|e| WorkerError::Internal(format!("Failed to connect to session bus: {e}")))?;
 
                 *guard = Some(conn.clone());
                 Ok(conn)
@@ -258,28 +258,28 @@ impl DbusBridgeService {
             .destination
             .as_str()
             .try_into()
-            .map_err(|e| WorkerError::Internal(format!("Invalid destination: {}", e)))?;
+            .map_err(|e| WorkerError::Internal(format!("Invalid destination: {e}")))?;
 
         // Parse interface name
         let interface: InterfaceName = call
             .interface
             .as_str()
             .try_into()
-            .map_err(|e| WorkerError::Internal(format!("Invalid interface: {}", e)))?;
+            .map_err(|e| WorkerError::Internal(format!("Invalid interface: {e}")))?;
 
         // Parse object path
         let path: ObjectPath = call
             .path
             .as_str()
             .try_into()
-            .map_err(|e| WorkerError::Internal(format!("Invalid object path: {}", e)))?;
+            .map_err(|e| WorkerError::Internal(format!("Invalid object path: {e}")))?;
 
         // Parse method name
         let method: MemberName = call
             .method
             .as_str()
             .try_into()
-            .map_err(|e| WorkerError::Internal(format!("Invalid method name: {}", e)))?;
+            .map_err(|e| WorkerError::Internal(format!("Invalid method name: {e}")))?;
 
         // Make the D-Bus call with timeout
         // Note: This simplified version sends no arguments - full implementation would convert DbusValue
@@ -288,8 +288,7 @@ impl DbusBridgeService {
         let reply = tokio::time::timeout(timeout, call_future)
             .await
             .map_err(|_| WorkerError::Internal(format!(
-                "D-Bus call timed out after {:?}",
-                timeout
+                "D-Bus call timed out after {timeout:?}"
             )))?;
 
         match reply {
@@ -297,7 +296,7 @@ impl DbusBridgeService {
                 // Full implementation would parse _msg.body() into DbusValue vec
                 Ok(Vec::new())
             }
-            Err(e) => Err(WorkerError::Internal(format!("D-Bus call failed: {}", e))),
+            Err(e) => Err(WorkerError::Internal(format!("D-Bus call failed: {e}"))),
         }
     }
 
@@ -349,28 +348,28 @@ impl DbusBridgeService {
             .destination
             .as_str()
             .try_into()
-            .map_err(|e| WorkerError::Internal(format!("Invalid destination: {}", e)))?;
+            .map_err(|e| WorkerError::Internal(format!("Invalid destination: {e}")))?;
 
         // Parse object path
         let path: ObjectPath = get
             .path
             .as_str()
             .try_into()
-            .map_err(|e| WorkerError::Internal(format!("Invalid object path: {}", e)))?;
+            .map_err(|e| WorkerError::Internal(format!("Invalid object path: {e}")))?;
 
         // Parse interface for the property
         let interface: InterfaceName = get
             .interface
             .as_str()
             .try_into()
-            .map_err(|e| WorkerError::Internal(format!("Invalid interface: {}", e)))?;
+            .map_err(|e| WorkerError::Internal(format!("Invalid interface: {e}")))?;
 
         // Parse property name
         let property: MemberName = get
             .property
             .as_str()
             .try_into()
-            .map_err(|e| WorkerError::Internal(format!("Invalid property name: {}", e)))?;
+            .map_err(|e| WorkerError::Internal(format!("Invalid property name: {e}")))?;
 
         // Call org.freedesktop.DBus.Properties.Get
         let properties_interface: InterfaceName = "org.freedesktop.DBus.Properties"
@@ -389,13 +388,13 @@ impl DbusBridgeService {
                 &(interface.as_str(), property.as_str()),
             )
             .await
-            .map_err(|e| WorkerError::Internal(format!("D-Bus property get failed: {}", e)))?;
+            .map_err(|e| WorkerError::Internal(format!("D-Bus property get failed: {e}")))?;
 
         // Parse the reply - Properties.Get returns a variant
         // For now, return the debug representation as a string
         // Full implementation would properly convert zvariant::Value to DbusValue
         let body = reply.body();
-        Ok(DbusValue::String(format!("{:?}", body)))
+        Ok(DbusValue::String(format!("{body:?}")))
     }
 
     /// Handle a property set request
@@ -446,28 +445,28 @@ impl DbusBridgeService {
             .destination
             .as_str()
             .try_into()
-            .map_err(|e| WorkerError::Internal(format!("Invalid destination: {}", e)))?;
+            .map_err(|e| WorkerError::Internal(format!("Invalid destination: {e}")))?;
 
         // Parse object path
         let path: ObjectPath = set
             .path
             .as_str()
             .try_into()
-            .map_err(|e| WorkerError::Internal(format!("Invalid object path: {}", e)))?;
+            .map_err(|e| WorkerError::Internal(format!("Invalid object path: {e}")))?;
 
         // Parse interface for the property
         let interface: InterfaceName = set
             .interface
             .as_str()
             .try_into()
-            .map_err(|e| WorkerError::Internal(format!("Invalid interface: {}", e)))?;
+            .map_err(|e| WorkerError::Internal(format!("Invalid interface: {e}")))?;
 
         // Parse property name
         let property: MemberName = set
             .property
             .as_str()
             .try_into()
-            .map_err(|e| WorkerError::Internal(format!("Invalid property name: {}", e)))?;
+            .map_err(|e| WorkerError::Internal(format!("Invalid property name: {e}")))?;
 
         // Convert DbusValue to zvariant::Value
         let zvalue = dbus_value_to_zvariant(&set.value)?;
@@ -488,7 +487,7 @@ impl DbusBridgeService {
             &(interface.as_str(), property.as_str(), Value::from(zvalue)),
         )
         .await
-        .map_err(|e| WorkerError::Internal(format!("D-Bus property set failed: {}", e)))?;
+        .map_err(|e| WorkerError::Internal(format!("D-Bus property set failed: {e}")))?;
 
         Ok(())
     }
@@ -535,7 +534,7 @@ impl DbusBridgeService {
             subscription_id.clone(),
             SignalSubscription {
                 id: subscription_id.clone(),
-                container_id: container_id.to_string(),
+                container_id: container_id.to_owned(),
                 bus: sub.bus,
                 interface: sub.interface,
                 signal: sub.signal,
@@ -559,7 +558,7 @@ impl DbusBridgeService {
         if let Some((_, sub)) = self.subscriptions.remove(subscription_id) {
             if sub.container_id != container_id {
                 // Put it back - not their subscription
-                self.subscriptions.insert(subscription_id.to_string(), sub);
+                self.subscriptions.insert(subscription_id.to_owned(), sub);
                 return DbusResponse::error(
                     "org.freedesktop.DBus.Error.AccessDenied",
                     "Cannot unsubscribe from another container's subscription",
@@ -592,7 +591,7 @@ impl DbusBridgeService {
     /// Create a new D-Bus bridge service (stub)
     pub async fn new(_config: DbusBridgeConfig) -> Result<Self> {
         Err(WorkerError::ConfigError(
-            "D-Bus bridge requires the 'dbus' feature to be enabled".to_string(),
+            "D-Bus bridge requires the 'dbus' feature to be enabled".to_owned(),
         ))
     }
 }
@@ -615,7 +614,7 @@ fn dbus_value_to_zvariant(value: &DbusValue) -> Result<String> {
         DbusValue::Variant(inner) => dbus_value_to_zvariant(inner),
         DbusValue::Array(_) | DbusValue::Dict(_) | DbusValue::Bytes(_) => {
             Err(WorkerError::Internal(
-                "Complex D-Bus types (Array, Dict, Bytes) not yet supported for property set".to_string(),
+                "Complex D-Bus types (Array, Dict, Bytes) not yet supported for property set".to_owned(),
             ))
         }
     }
@@ -680,8 +679,8 @@ mod tests {
             bus: BusType::Session,
             sender: None,
             path: None,
-            interface: "org.freedesktop.DBus".to_string(),
-            signal: "NameOwnerChanged".to_string(),
+            interface: "org.freedesktop.DBus".to_owned(),
+            signal: "NameOwnerChanged".to_owned(),
         });
 
         let response = bridge.handle_request("container-1", request).await;
@@ -721,8 +720,8 @@ mod tests {
                 bus: BusType::Session,
                 sender: None,
                 path: None,
-                interface: "org.test".to_string(),
-                signal: "Test".to_string(),
+                interface: "org.test".to_owned(),
+                signal: "Test".to_owned(),
             });
             bridge.handle_request(container, request).await;
         }

@@ -105,7 +105,7 @@ impl SpawnerBackend for StandaloneBackend {
             ProcessKind::Direct(pid) => *pid,
             ProcessKind::SystemdUnit(_) => {
                 return Err(RpcError::InvalidOperation(
-                    "StandaloneBackend cannot stop systemd units".to_string(),
+                    "StandaloneBackend cannot stop systemd units".to_owned(),
                 ));
             }
         };
@@ -200,7 +200,7 @@ impl SpawnerBackend for StandaloneBackend {
             ProcessKind::Direct(pid) => *pid,
             ProcessKind::SystemdUnit(_) => {
                 return Err(RpcError::InvalidOperation(
-                    "StandaloneBackend cannot check systemd units".to_string(),
+                    "StandaloneBackend cannot check systemd units".to_owned(),
                 ));
             }
         };
@@ -270,7 +270,7 @@ mod tests {
             }
             Err(e) => {
                 // sleep might not be available in some test environments
-                eprintln!("Could not spawn test process: {}", e);
+                eprintln!("Could not spawn test process: {e}");
             }
         }
     }

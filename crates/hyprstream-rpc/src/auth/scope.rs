@@ -11,6 +11,7 @@ use crate::common_capnp;
 use crate::capnp::{ToCapnp, FromCapnp};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// Structured scope for fine-grained authorization.
 ///
@@ -42,10 +43,16 @@ impl FromCapnp for Scope {
 
     fn read_from(reader: Self::Reader<'_>) -> Result<Self> {
         Ok(Self {
-            action: reader.get_action()?.to_str()?.to_string(),
-            resource: reader.get_resource()?.to_str()?.to_string(),
-            identifier: reader.get_identifier()?.to_str()?.to_string(),
+            action: reader.get_action()?.to_str()?.to_owned(),
+            resource: reader.get_resource()?.to_str()?.to_owned(),
+            identifier: reader.get_identifier()?.to_str()?.to_owned(),
         })
+    }
+}
+
+impl fmt::Display for Scope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}:{}", self.action, self.resource, self.identifier)
     }
 }
 
@@ -66,15 +73,10 @@ impl Scope {
             return Err(anyhow!("Invalid scope format: {}", s));
         }
         Ok(Self::new(
-            parts[0].to_string(),
-            parts[1].to_string(),
-            parts[2].to_string(),
+            parts[0].to_owned(),
+            parts[1].to_owned(),
+            parts[2].to_owned(),
         ))
-    }
-
-    /// Format as "action:resource:identifier"
-    pub fn to_string(&self) -> String {
-        format!("{}:{}:{}", self.action, self.resource, self.identifier)
     }
 
     /// Check if this scope grants permission for the required scope.
@@ -116,7 +118,7 @@ mod tests {
 
     #[test]
     fn test_scope_to_string() {
-        let scope = Scope::new("infer".to_string(), "model".to_string(), "qwen-7b".to_string());
+        let scope = Scope::new("infer".to_owned(), "model".to_owned(), "qwen-7b".to_owned());
         assert_eq!(scope.to_string(), "infer:model:qwen-7b");
     }
 

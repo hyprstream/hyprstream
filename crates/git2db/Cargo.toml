@@ -91,3 +91,6 @@ xet-storage = ["git-xet-filter/xet-storage", "data", "cas_client", "cas_object",
 overlayfs = ["nix/mount", "nix/sched", "dep:caps"]
 # Enable reflink worktree support (cross-platform CoW)
 reflink = ["reflink-copy", "walkdir"]
+
+[lints]
+workspace = true

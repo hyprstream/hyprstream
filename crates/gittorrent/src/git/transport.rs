@@ -36,7 +36,7 @@ pub trait TransportFactory {
 
 impl TransportFactory for GittorrentTransportFactory {
     fn create_transport(&self, url: &str) -> anyhow::Result<Box<dyn SmartSubtransport>> {
-        Ok(Box::new(GittorrentTransport::new(url, self.service.clone())?))
+        Ok(Box::new(GittorrentTransport::new(url, Arc::clone(&self.service))?))
     }
 
     fn supports_url(&self, url: &str) -> bool {
@@ -79,7 +79,7 @@ impl SmartSubtransport for GittorrentTransport {
                 // Handle fetch operations (upload-pack)
                 GittorrentStream::new_upload_pack(
                     self.url.clone(),
-                    self.service.clone(),
+                    Arc::clone(&self.service),
                 ).map(|s| Box::new(s) as Box<dyn SmartSubtransportStream>)
                 .map_err(|e| git2::Error::from_str(&e.to_string()))
             }
@@ -87,7 +87,7 @@ impl SmartSubtransport for GittorrentTransport {
                 // Handle push operations (receive-pack)
                 GittorrentStream::new_receive_pack(
                     self.url.clone(),
-                    self.service.clone(),
+                    Arc::clone(&self.service),
                 ).map(|s| Box::new(s) as Box<dyn SmartSubtransportStream>)
                 .map_err(|e| git2::Error::from_str(&e.to_string()))
             }
@@ -95,7 +95,7 @@ impl SmartSubtransport for GittorrentTransport {
                 // Handle reference discovery for fetch
                 GittorrentStream::new_upload_pack(
                     self.url.clone(),
-                    self.service.clone(),
+                    Arc::clone(&self.service),
                 ).map(|s| Box::new(s) as Box<dyn SmartSubtransportStream>)
                 .map_err(|e| git2::Error::from_str(&e.to_string()))
             }
@@ -103,7 +103,7 @@ impl SmartSubtransport for GittorrentTransport {
                 // Handle reference discovery for push
                 GittorrentStream::new_receive_pack(
                     self.url.clone(),
-                    self.service.clone(),
+                    Arc::clone(&self.service),
                 ).map(|s| Box::new(s) as Box<dyn SmartSubtransportStream>)
                 .map_err(|e| git2::Error::from_str(&e.to_string()))
             }
@@ -226,16 +226,16 @@ pub fn register_gittorrent_transport(service: Arc<GitTorrentService>) -> Result<
 
             tracing::debug!("Creating GitTorrent transport for URL: {}", url);
 
-            match GittorrentTransport::new(url, factory.service.clone()) {
+            match GittorrentTransport::new(url, Arc::clone(&factory.service)) {
                 Ok(subtransport) => {
                     git2::transport::Transport::smart(remote, true, subtransport)
                 },
                 Err(e) => {
                     tracing::error!("Failed to create GitTorrent transport: {}", e);
-                    Err(git2::Error::from_str(&format!("Transport creation failed: {}", e)))
+                    Err(git2::Error::from_str(&format!("Transport creation failed: {e}")))
                 }
             }
-        }).map_err(|e| Error::other(format!("Failed to register gittorrent transport: {}", e)))?;
+        }).map_err(|e| Error::other(format!("Failed to register gittorrent transport: {e}")))?;
     }
 
     tracing::info!("GitTorrent transport registered for gittorrent:// URLs");

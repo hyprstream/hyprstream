@@ -22,7 +22,7 @@ fn test_clone_options_is_send() {
         .callback_config(
             CallbackConfigBuilder::new()
                 .auth(AuthStrategy::SshAgent {
-                    username: Some("git".to_string()),
+                    username: Some("git".to_owned()),
                 })
                 .progress(ProgressConfig::Stdout)
                 .build(),
@@ -44,7 +44,7 @@ impl git2db::callback_config::ProgressReporter for TestProgressReporter {
     fn report(&self, stage: &str, current: usize, total: usize) {
         let mut counter = self.counter.lock();
         *counter += 1;
-        println!("Progress [{}]: {}/{}", stage, current, total);
+        println!("Progress [{stage}]: {current}/{total}");
     }
 }
 
@@ -127,7 +127,7 @@ async fn test_concurrent_clones_with_send() {
         .map(|i| {
             tokio::spawn(async move {
                 let temp_dir = TempDir::new().unwrap();
-                let target_path = temp_dir.path().join(format!("repo_{}", i));
+                let target_path = temp_dir.path().join(format!("repo_{i}"));
 
                 let options = CloneOptionsBuilder::new()
                     .callback_config(
@@ -165,10 +165,10 @@ async fn test_concurrent_clones_with_send() {
 fn test_callback_config_auth_strategies() {
     let config = CallbackConfigBuilder::new()
         .auth(AuthStrategy::SshAgent {
-            username: Some("git".to_string()),
+            username: Some("git".to_owned()),
         })
         .auth(AuthStrategy::Token {
-            token: "test_token".to_string(),
+            token: "test_token".to_owned(),
         })
         .auth(AuthStrategy::Default)
         .build();

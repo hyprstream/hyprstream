@@ -144,7 +144,7 @@ mod tests {
 
         let systemd = SpawnedProcess::new(
             "test-2",
-            ProcessKind::SystemdUnit("test.service".to_string()),
+            ProcessKind::SystemdUnit("test.service".to_owned()),
         );
         assert!(!systemd.is_direct());
         assert!(systemd.is_systemd());

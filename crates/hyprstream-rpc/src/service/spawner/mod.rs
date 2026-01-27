@@ -260,8 +260,8 @@ mod tests {
         assert_eq!(config.executable.to_str().unwrap(), "/usr/bin/test");
         assert_eq!(config.args, vec!["--foo", "bar"]);
         assert_eq!(config.working_dir.unwrap().to_str().unwrap(), "/tmp");
-        assert_eq!(config.env, vec![("KEY".to_string(), "VALUE".to_string())]);
-        assert_eq!(config.memory_limit, Some("1G".to_string()));
+        assert_eq!(config.env, vec![("KEY".to_owned(), "VALUE".to_owned())]);
+        assert_eq!(config.memory_limit, Some("1G".to_owned()));
         assert_eq!(config.cpu_quota, Some(200));
         assert!(config.restart_on_failure);
     }
@@ -276,7 +276,7 @@ mod tests {
 
         let systemd = SpawnedProcess::new(
             "test-2",
-            ProcessKind::SystemdUnit("test.service".to_string()),
+            ProcessKind::SystemdUnit("test.service".to_owned()),
         );
         assert!(!systemd.is_direct());
         assert!(systemd.is_systemd());

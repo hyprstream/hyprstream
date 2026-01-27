@@ -106,21 +106,21 @@ impl AdapterManager {
                     let name_str = &base_name[underscore_pos + 1..];
 
                     if let Ok(idx) = index_str.parse::<u32>() {
-                        (idx, name_str.to_string())
+                        (idx, name_str.to_owned())
                     } else {
                         // If parsing fails, treat whole name as adapter name with index 999
-                        (999, base_name.to_string())
+                        (999, base_name.to_owned())
                     }
                 } else {
                     // No index prefix, assign high index
-                    (999, base_name.to_string())
+                    (999, base_name.to_owned())
                 };
 
                 let metadata = std::fs::metadata(&path)?;
-                let config_path = self.adapters_dir.join(format!("{}.config.json", base_name));
+                let config_path = self.adapters_dir.join(format!("{base_name}.config.json"));
 
                 adapters.push(AdapterInfo {
-                    filename: name_str.to_string(),
+                    filename: name_str.to_owned(),
                     index,
                     name,
                     path,
@@ -156,7 +156,7 @@ impl AdapterManager {
         } else {
             self.get_next_index()?
         };
-        Ok(format!("{:02}_{}", idx, name))
+        Ok(format!("{idx:02}_{name}"))
     }
 
     /// Initialize adapter with proper implementation
@@ -174,23 +174,23 @@ impl AdapterManager {
             self.get_next_index()?
         };
 
-        let adapter_name = format!("{:02}_{}", idx, name);
+        let adapter_name = format!("{idx:02}_{name}");
         let adapter_path = self
             .adapters_dir
-            .join(format!("{}.safetensors", adapter_name));
+            .join(format!("{adapter_name}.safetensors"));
 
         // Save configuration file
         let config_path = self
             .adapters_dir
-            .join(format!("{}.config.json", adapter_name));
+            .join(format!("{adapter_name}.config.json"));
         let config_json = serde_json::to_string_pretty(&config)
             .with_context(|| "Failed to serialize adapter config")?;
         std::fs::write(&config_path, config_json)
-            .with_context(|| format!("Failed to write adapter config: {:?}", config_path))?;
+            .with_context(|| format!("Failed to write adapter config: {config_path:?}"))?;
 
         // Create empty adapter file (weights will be added during training)
         std::fs::File::create(&adapter_path)
-            .with_context(|| format!("Failed to create adapter file: {:?}", adapter_path))?;
+            .with_context(|| format!("Failed to create adapter file: {adapter_path:?}"))?;
 
         Ok(adapter_path)
     }
@@ -205,9 +205,9 @@ impl AdapterManager {
     pub fn load_adapter_config(&self, adapter_name: &str) -> Result<AdapterConfig> {
         let config_path = self
             .adapters_dir
-            .join(format!("{}.config.json", adapter_name));
+            .join(format!("{adapter_name}.config.json"));
         let config_str = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("Failed to read adapter config: {:?}", config_path))?;
+            .with_context(|| format!("Failed to read adapter config: {config_path:?}"))?;
         let config: AdapterConfig = serde_json::from_str(&config_str)?;
         Ok(config)
     }
@@ -300,7 +300,7 @@ mod tests {
         let manager = AdapterManager::new(&model_path);
 
         let mut config = AdapterConfig::default();
-        config.model_ref = "test_model".to_string();
+        config.model_ref = "test_model".to_owned();
 
         // Initialize adapter with auto-index
         let adapter_path = manager

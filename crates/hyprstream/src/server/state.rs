@@ -150,7 +150,7 @@ impl ServerState {
         use hyprstream_metrics::storage::duckdb::DuckDbBackend;
         use hyprstream_metrics::StorageBackend;
 
-        let backend = Arc::new(DuckDbBackend::new(db_path.to_string(), std::collections::HashMap::new(), None)?);
+        let backend = Arc::new(DuckDbBackend::new(db_path.to_owned(), std::collections::HashMap::new(), None)?);
         backend.init().await.map_err(|e| anyhow::anyhow!("Failed to init DuckDB: {}", e))?;
         backend.create_table("context", &context_schema(embedding_dim)).await
             .map_err(|e| anyhow::anyhow!("Failed to create context table: {}", e))?;

@@ -49,8 +49,7 @@ impl TableManager {
         let mut tables = self.tables.write().await;
         if tables.contains_key(&name) {
             return Err(Status::already_exists(format!(
-                "Table {} already exists",
-                name
+                "Table {name} already exists"
             )));
         }
         tables.insert(name, schema);
@@ -62,7 +61,7 @@ impl TableManager {
         tables
             .get(name)
             .cloned()
-            .ok_or_else(|| Status::not_found(format!("Table {} not found", name)))
+            .ok_or_else(|| Status::not_found(format!("Table {name} not found")))
     }
 
     pub async fn create_aggregation_view(
@@ -79,8 +78,7 @@ impl TableManager {
             let tables = self.tables.read().await;
             if !tables.contains_key(&source_table) {
                 return Err(Status::not_found(format!(
-                    "Source table {} not found",
-                    source_table
+                    "Source table {source_table} not found"
                 )));
             }
 
@@ -89,8 +87,7 @@ impl TableManager {
             for col in &aggregate_columns {
                 if !schema.fields().iter().any(|f| f.name() == col) {
                     return Err(Status::invalid_argument(format!(
-                        "Column {} not found in source table {}",
-                        col, source_table
+                        "Column {col} not found in source table {source_table}"
                     )));
                 }
             }
@@ -107,8 +104,7 @@ impl TableManager {
         let mut views = self.views.write().await;
         if views.contains_key(&name) {
             return Err(Status::already_exists(format!(
-                "View {} already exists",
-                name
+                "View {name} already exists"
             )));
         }
         views.insert(name, view);
@@ -120,7 +116,7 @@ impl TableManager {
         views
             .get(name)
             .cloned()
-            .ok_or_else(|| Status::not_found(format!("View {} not found", name)))
+            .ok_or_else(|| Status::not_found(format!("View {name} not found")))
     }
 
     pub async fn list_tables(&self) -> Vec<String> {
@@ -136,7 +132,7 @@ impl TableManager {
     pub async fn drop_table(&self, name: &str) -> Result<(), Status> {
         let mut tables = self.tables.write().await;
         if tables.remove(name).is_none() {
-            return Err(Status::not_found(format!("Table {} not found", name)));
+            return Err(Status::not_found(format!("Table {name} not found")));
         }
         Ok(())
     }
@@ -144,7 +140,7 @@ impl TableManager {
     pub async fn drop_aggregation_view(&self, name: &str) -> Result<(), Status> {
         let mut views = self.views.write().await;
         if views.remove(name).is_none() {
-            return Err(Status::not_found(format!("View {} not found", name)));
+            return Err(Status::not_found(format!("View {name} not found")));
         }
         Ok(())
     }

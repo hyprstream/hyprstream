@@ -124,7 +124,7 @@ impl Git2DBError {
             Self::WorktreeExists { path } => {
                 format!("Worktree already exists at {}", path.display())
             }
-            Self::Cancelled { operation } => format!("Operation cancelled: {}", operation),
+            Self::Cancelled { operation } => format!("Operation cancelled: {operation}"),
             Self::InvalidOperation { message } => message.clone(),
             Self::Internal { message } => message.clone(),
             Self::Lfs { message, .. } => message.clone(),
@@ -154,7 +154,7 @@ impl Git2DBError {
     pub fn from_git_error(err: git2::Error) -> Self {
         let class = err.class();
         let code = err.code();
-        let message = err.message().to_string();
+        let message = err.message().to_owned();
 
         let recoverable = matches!(class, ErrorClass::Net | ErrorClass::Http | ErrorClass::Ssh);
 
@@ -553,7 +553,7 @@ mod tests {
     #[test]
     fn test_error_display_formatting() {
         let err = Git2DBError::repository("/test/path", "Test message");
-        let display_str = format!("{}", err);
+        let display_str = format!("{err}");
         assert!(display_str.contains("/test/path"));
         assert!(display_str.contains("Test message"));
 
@@ -562,7 +562,7 @@ mod tests {
             ErrorClass::Repository,
             "Not found",
         ));
-        let git_display = format!("{}", git_err);
+        let git_display = format!("{git_err}");
         assert!(git_display.contains("Git operation failed"));
         assert!(git_display.contains("Not found"));
     }
@@ -668,8 +668,7 @@ mod tests {
             assert_eq!(
                 error.is_recoverable(),
                 expected_recoverable,
-                "Recoverable classification failed for: {:?}",
-                error
+                "Recoverable classification failed for: {error:?}"
             );
         }
     }

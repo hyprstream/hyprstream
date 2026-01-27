@@ -44,7 +44,7 @@ impl GitTorrentBehaviour {
 
         // Create Identify protocol
         let identify = identify::Behaviour::new(identify::Config::new(
-            "/gittorrent/1.0.0".to_string(),
+            "/gittorrent/1.0.0".to_owned(),
             keypair.public()
         ));
 

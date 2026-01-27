@@ -69,7 +69,7 @@ impl ServiceManager for StandaloneManager {
         self.processes
             .lock()
             .await
-            .insert(service.to_string(), process);
+            .insert(service.to_owned(), process);
 
         Ok(())
     }
@@ -121,7 +121,7 @@ impl ServiceManager for StandaloneManager {
         self.processes
             .lock()
             .await
-            .insert(service.name().to_string(), process.clone());
+            .insert(service.name().to_owned(), process.clone());
 
         Ok(SpawnedService::subprocess(
             process.id.clone(),

@@ -21,9 +21,9 @@ pub enum DetectionError {
 impl fmt::Display for DetectionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DetectionError::Io(msg) => write!(f, "I/O error: {}", msg),
+            DetectionError::Io(msg) => write!(f, "I/O error: {msg}"),
             DetectionError::PathNotFound(path) => write!(f, "Path not found: {}", path.display()),
-            DetectionError::InvalidStructure(msg) => write!(f, "Invalid structure: {}", msg),
+            DetectionError::InvalidStructure(msg) => write!(f, "Invalid structure: {msg}"),
         }
     }
 }

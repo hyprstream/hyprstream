@@ -18,7 +18,7 @@ pub async fn ls_remote(url: &str) -> Result<Vec<GitRef>> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(crate::Error::other(format!("git ls-remote failed: {}", stderr)));
+        return Err(crate::Error::other(format!("git ls-remote failed: {stderr}")));
     }
 
     let stdout = String::from_utf8(output.stdout)?;
@@ -37,7 +37,7 @@ fn parse_ls_remote_output(output: &str) -> Result<Vec<GitRef>> {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 2 {
             let hash = GitHash::from_hex(parts[0])?;
-            let name = parts[1].to_string();
+            let name = parts[1].to_owned();
 
             refs.push(GitRef { name, hash });
         }
@@ -58,7 +58,7 @@ pub fn list_local_refs(repo_path: &str) -> Result<Vec<GitRef>> {
             if let Some(target) = reference.target() {
                 let hash = GitHash::from_hex(&target.to_string())?;
                 refs.push(GitRef {
-                    name: name.to_string(),
+                    name: name.to_owned(),
                     hash,
                 });
             }
@@ -110,11 +110,11 @@ mod tests {
     fn test_refs_to_map() {
         let refs = vec![
             GitRef {
-                name: "refs/heads/main".to_string(),
+                name: "refs/heads/main".to_owned(),
                 hash: GitHash::from_hex("0123456789abcdef0123456789abcdef01234567").unwrap(),
             },
             GitRef {
-                name: "refs/heads/develop".to_string(),
+                name: "refs/heads/develop".to_owned(),
                 hash: GitHash::from_hex("1123456789abcdef0123456789abcdef01234567").unwrap(),
             },
         ];

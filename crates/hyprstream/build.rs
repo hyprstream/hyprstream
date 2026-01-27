@@ -31,11 +31,11 @@ fn main() {
     // Validate libtorch exists
     let libtorch_dir = Path::new(&libtorch_path);
     if !libtorch_dir.exists() {
-        panic!("libtorch directory not found at {}", libtorch_path);
+        panic!("libtorch directory not found at {libtorch_path}");
     }
 
     // Configure linking
-    println!("cargo:rustc-link-search=native={}/lib", libtorch_path);
+    println!("cargo:rustc-link-search=native={libtorch_path}/lib");
     println!("cargo:rustc-env=LIBTORCH_STATIC=0");
     println!("cargo:rustc-env=LIBTORCH_BYPASS_VERSION_CHECK=1");
 }

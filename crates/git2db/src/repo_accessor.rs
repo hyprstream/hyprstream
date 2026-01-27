@@ -49,11 +49,11 @@ pub trait RepositoryAccessor {
 
             tokio::task::spawn_blocking(move || {
                 Repository::open(&path).map_err(|e| {
-                    Git2DBError::repository(&path, format!("Failed to open repository: {}", e))
+                    Git2DBError::repository(&path, format!("Failed to open repository: {e}"))
                 })
             })
             .await
-            .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
+            .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
         }
     }
 }

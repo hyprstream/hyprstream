@@ -12,8 +12,30 @@ env:
   RUSTC_WRAPPER: "sccache"
 
 jobs:
-  build:
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
 
+    - name: Install build dependencies
+      run: sudo apt-get update && sudo apt-get install -y capnproto libsystemd-dev pkg-config libssl-dev
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+
+    - name: Setup sccache
+      uses: mozilla-actions/sccache-action@v0.0.9
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+
+    - name: Run Clippy
+      run: cargo clippy --workspace --all-targets --features download-libtorch -- -D warnings
+
+  build:
     runs-on: ubuntu-latest
 
     steps:

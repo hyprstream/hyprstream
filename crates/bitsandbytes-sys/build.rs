@@ -116,7 +116,7 @@ fn find_bitsandbytes_library(backend: Backend) -> Option<(PathBuf, String)> {
     let patterns = [
         format!("libbitsandbytes_{}.so", suffix),
         format!("libbitsandbytes_{}*.so", suffix),
-        "libbitsandbytes.so".to_string(),
+        "libbitsandbytes.so".to_owned(),
     ];
 
     for search_path in search_paths.into_iter().flatten() {
@@ -262,8 +262,8 @@ fn checkout_version(repo: &git2::Repository, version: &str) -> Result<(), git2::
 fn build_bitsandbytes_from_source(backend: Backend) -> Option<(PathBuf, String)> {
     let source_path = ensure_bitsandbytes_source()?;
 
-    let rocm_path = env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".to_string());
-    let rocm_arch = env::var("PYTORCH_ROCM_ARCH").unwrap_or_else(|_| "gfx90a".to_string());
+    let rocm_path = env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".to_owned());
+    let rocm_arch = env::var("PYTORCH_ROCM_ARCH").unwrap_or_else(|_| "gfx90a".to_owned());
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let build_dir = out_dir.join("bitsandbytes-build");
@@ -285,7 +285,7 @@ fn build_bitsandbytes_from_source(backend: Backend) -> Option<(PathBuf, String)>
         .env("ROCM_PATH", &rocm_path)
         .args([
             format!("-DCOMPUTE_BACKEND={}", backend.cmake_backend()),
-            "-DCMAKE_BUILD_TYPE=Release".to_string(),
+            "-DCMAKE_BUILD_TYPE=Release".to_owned(),
             format!("-DBNB_ROCM_ARCH={}", rocm_arch),
             source_path.to_string_lossy().to_string(),
         ])

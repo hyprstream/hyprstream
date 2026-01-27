@@ -578,10 +578,10 @@ fn parse_version_response(response: &[u8]) -> Result<VersionResponse> {
             Which::Version(v) => {
                 let v = v?;
                 Ok(VersionResponse {
-                    version: v.get_version()?.to_str()?.to_string(),
-                    runtime_name: v.get_runtime_name()?.to_str()?.to_string(),
-                    runtime_version: v.get_runtime_version()?.to_str()?.to_string(),
-                    runtime_api_version: v.get_runtime_api_version()?.to_str()?.to_string(),
+                    version: v.get_version()?.to_str()?.to_owned(),
+                    runtime_name: v.get_runtime_name()?.to_str()?.to_owned(),
+                    runtime_version: v.get_runtime_version()?.to_str()?.to_owned(),
+                    runtime_api_version: v.get_runtime_api_version()?.to_str()?.to_owned(),
                 })
             }
             _ => Err(anyhow!("Expected version response")),
@@ -599,10 +599,10 @@ fn parse_status_response(response: &[u8]) -> Result<StatusResponse> {
                 let mut result_conditions = Vec::with_capacity(conditions.len() as usize);
                 for c in conditions.iter() {
                     result_conditions.push(RuntimeCondition {
-                        condition_type: c.get_condition_type()?.to_str()?.to_string(),
+                        condition_type: c.get_condition_type()?.to_str()?.to_owned(),
                         status: c.get_status(),
-                        reason: c.get_reason()?.to_str()?.to_string(),
-                        message: c.get_message()?.to_str()?.to_string(),
+                        reason: c.get_reason()?.to_str()?.to_owned(),
+                        message: c.get_message()?.to_str()?.to_owned(),
                     });
                 }
                 Ok(StatusResponse {
@@ -639,9 +639,9 @@ fn parse_attach_response(response: &[u8]) -> Result<AttachResponse> {
                     server_pubkey.copy_from_slice(server_pubkey_data);
                 }
                 Ok(AttachResponse {
-                    container_id: attach.get_container_id()?.to_str()?.to_string(),
-                    stream_id: attach.get_stream_id()?.to_str()?.to_string(),
-                    stream_endpoint: attach.get_stream_endpoint()?.to_str()?.to_string(),
+                    container_id: attach.get_container_id()?.to_str()?.to_owned(),
+                    stream_id: attach.get_stream_id()?.to_str()?.to_owned(),
+                    stream_endpoint: attach.get_stream_endpoint()?.to_str()?.to_owned(),
                     server_pubkey,
                 })
             }
@@ -657,7 +657,7 @@ fn parse_fd_stream_auth_response(response: &[u8]) -> Result<FdStreamAuthResponse
             Which::FdStreamAuthorized(auth) => {
                 let auth = auth?;
                 Ok(FdStreamAuthResponse {
-                    stream_id: auth.get_stream_id()?.to_str()?.to_string(),
+                    stream_id: auth.get_stream_id()?.to_str()?.to_owned(),
                     authorized: auth.get_authorized(),
                 })
             }
@@ -670,7 +670,7 @@ fn parse_sandbox_id_response(response: &[u8]) -> Result<String> {
     parse_runtime_response(response, |resp| {
         use workers_capnp::runtime_response::Which;
         match resp.which()? {
-            Which::SandboxId(id) => Ok(id?.to_str()?.to_string()),
+            Which::SandboxId(id) => Ok(id?.to_str()?.to_owned()),
             _ => Err(anyhow!("Expected sandbox_id response")),
         }
     })
@@ -680,7 +680,7 @@ fn parse_container_id_response(response: &[u8]) -> Result<String> {
     parse_runtime_response(response, |resp| {
         use workers_capnp::runtime_response::Which;
         match resp.which()? {
-            Which::ContainerId(id) => Ok(id?.to_str()?.to_string()),
+            Which::ContainerId(id) => Ok(id?.to_str()?.to_owned()),
             _ => Err(anyhow!("Expected container_id response")),
         }
     })
@@ -889,7 +889,7 @@ fn parse_image_ref_response(response: &[u8]) -> Result<String> {
     parse_image_response(response, |resp| {
         use workers_capnp::image_response::Which;
         match resp.which()? {
-            Which::ImageRef(r) => Ok(r?.to_str()?.to_string()),
+            Which::ImageRef(r) => Ok(r?.to_str()?.to_owned()),
             _ => Err(anyhow!("Expected image_ref response")),
         }
     })
@@ -916,7 +916,7 @@ fn parse_fs_info_response(response: &[u8]) -> Result<Vec<hyprstream_workers::ima
                     result.push(hyprstream_workers::image::FilesystemUsage {
                         timestamp: fs.get_timestamp(),
                         fs_id: hyprstream_workers::image::FilesystemIdentifier {
-                            mountpoint: fs.get_fs_id()?.get_mountpoint()?.to_str()?.to_string(),
+                            mountpoint: fs.get_fs_id()?.get_mountpoint()?.to_str()?.to_owned(),
                         },
                         used_bytes: fs.get_used_bytes(),
                         inodes_used: fs.get_inodes_used(),
@@ -940,7 +940,7 @@ fn parse_key_values_to_map(
     for kv in kv_list.iter() {
         if let (Ok(k), Ok(v)) = (kv.get_key(), kv.get_value()) {
             if let (Ok(key), Ok(val)) = (k.to_str(), v.to_str()) {
-                map.insert(key.to_string(), val.to_string());
+                map.insert(key.to_owned(), val.to_owned());
             }
         }
     }
@@ -967,9 +967,9 @@ fn parse_pod_sandbox_metadata(
     meta: workers_capnp::pod_sandbox_metadata::Reader,
 ) -> Result<PodSandboxMetadata> {
     Ok(PodSandboxMetadata {
-        name: meta.get_name()?.to_str()?.to_string(),
-        uid: meta.get_uid()?.to_str()?.to_string(),
-        namespace: meta.get_namespace()?.to_str()?.to_string(),
+        name: meta.get_name()?.to_str()?.to_owned(),
+        uid: meta.get_uid()?.to_str()?.to_owned(),
+        namespace: meta.get_namespace()?.to_str()?.to_owned(),
         attempt: meta.get_attempt(),
     })
 }
@@ -980,20 +980,20 @@ fn parse_pod_sandbox_status(
     use chrono::{TimeZone, Utc};
 
     Ok(PodSandboxStatus {
-        id: status.get_id()?.to_str()?.to_string(),
+        id: status.get_id()?.to_str()?.to_owned(),
         metadata: parse_pod_sandbox_metadata(status.get_metadata()?)?,
         state: parse_pod_sandbox_state(status.get_state()?),
         created_at: Utc.timestamp_nanos(status.get_created_at()),
         network: if status.has_network() {
             let net = status.get_network()?;
             Some(PodSandboxNetworkStatus {
-                ip: net.get_ip()?.to_str()?.to_string(),
+                ip: net.get_ip()?.to_str()?.to_owned(),
                 additional_ips: {
                     let ips = net.get_additional_ips()?;
                     let mut result = Vec::with_capacity(ips.len() as usize);
                     for ip in ips.iter() {
                         result.push(PodIP {
-                            ip: ip.get_ip()?.to_str()?.to_string(),
+                            ip: ip.get_ip()?.to_str()?.to_owned(),
                         });
                     }
                     result
@@ -1005,7 +1005,7 @@ fn parse_pod_sandbox_status(
         linux: None,
         labels: parse_key_values_to_map(status.get_labels()?),
         annotations: parse_key_values_to_map(status.get_annotations()?),
-        runtime_handler: status.get_runtime_handler()?.to_str()?.to_string(),
+        runtime_handler: status.get_runtime_handler()?.to_str()?.to_owned(),
     })
 }
 
@@ -1015,13 +1015,13 @@ fn parse_pod_sandbox_info(
     use chrono::{TimeZone, Utc};
 
     Ok(PodSandbox::from_info(
-        info.get_id()?.to_str()?.to_string(),
+        info.get_id()?.to_str()?.to_owned(),
         parse_pod_sandbox_metadata(info.get_metadata()?)?,
         parse_pod_sandbox_state(info.get_state()?),
         Utc.timestamp_nanos(info.get_created_at()),
         parse_key_values_to_map(info.get_labels()?),
         parse_key_values_to_map(info.get_annotations()?),
-        info.get_runtime_handler()?.to_str()?.to_string(),
+        info.get_runtime_handler()?.to_str()?.to_owned(),
     ))
 }
 
@@ -1029,24 +1029,24 @@ fn parse_container_metadata(
     meta: workers_capnp::container_metadata::Reader,
 ) -> Result<ContainerMetadata> {
     Ok(ContainerMetadata {
-        name: meta.get_name()?.to_str()?.to_string(),
+        name: meta.get_name()?.to_str()?.to_owned(),
         attempt: meta.get_attempt(),
     })
 }
 
 fn parse_image_spec(spec: workers_capnp::image_spec::Reader) -> Result<ImageSpec> {
     Ok(ImageSpec {
-        image: spec.get_image()?.to_str()?.to_string(),
+        image: spec.get_image()?.to_str()?.to_owned(),
         annotations: parse_key_values_to_map(spec.get_annotations()?),
-        runtime_handler: spec.get_runtime_handler()?.to_str()?.to_string(),
+        runtime_handler: spec.get_runtime_handler()?.to_str()?.to_owned(),
     })
 }
 
 fn parse_container_image_spec(spec: workers_capnp::image_spec::Reader) -> Result<ContainerImageSpec> {
     Ok(ContainerImageSpec {
-        image: spec.get_image()?.to_str()?.to_string(),
+        image: spec.get_image()?.to_str()?.to_owned(),
         annotations: parse_key_values_to_map(spec.get_annotations()?),
-        runtime_handler: spec.get_runtime_handler()?.to_str()?.to_string(),
+        runtime_handler: spec.get_runtime_handler()?.to_str()?.to_owned(),
     })
 }
 
@@ -1059,7 +1059,7 @@ fn parse_container_status(
     let finished_at_ns = status.get_finished_at();
 
     Ok(ContainerStatus {
-        id: status.get_id()?.to_str()?.to_string(),
+        id: status.get_id()?.to_str()?.to_owned(),
         metadata: parse_container_metadata(status.get_metadata()?)?,
         state: parse_container_state(status.get_state()?),
         created_at: Utc.timestamp_nanos(status.get_created_at()),
@@ -1075,13 +1075,13 @@ fn parse_container_status(
         },
         exit_code: status.get_exit_code(),
         image: parse_container_image_spec(status.get_image()?)?,
-        image_ref: status.get_image_ref()?.to_str()?.to_string(),
-        reason: status.get_reason()?.to_str()?.to_string(),
-        message: status.get_message()?.to_str()?.to_string(),
+        image_ref: status.get_image_ref()?.to_str()?.to_owned(),
+        reason: status.get_reason()?.to_str()?.to_owned(),
+        message: status.get_message()?.to_str()?.to_owned(),
         labels: parse_key_values_to_map(status.get_labels()?),
         annotations: parse_key_values_to_map(status.get_annotations()?),
         mounts: vec![], // TODO: parse mounts if needed
-        log_path: status.get_log_path()?.to_str()?.to_string(),
+        log_path: status.get_log_path()?.to_str()?.to_owned(),
     })
 }
 
@@ -1089,8 +1089,8 @@ fn parse_container_info(info: workers_capnp::container_info::Reader) -> Result<C
     use chrono::{TimeZone, Utc};
 
     Ok(Container::from_info(
-        info.get_id()?.to_str()?.to_string(),
-        info.get_pod_sandbox_id()?.to_str()?.to_string(),
+        info.get_id()?.to_str()?.to_owned(),
+        info.get_pod_sandbox_id()?.to_str()?.to_owned(),
         parse_container_metadata(info.get_metadata()?)?,
         parse_container_image_spec(info.get_image()?)?,
         parse_container_state(info.get_state()?),
@@ -1104,7 +1104,7 @@ fn parse_pod_sandbox_stats(stats: workers_capnp::pod_sandbox_stats::Reader) -> R
     let attrs = stats.get_attributes()?;
     Ok(PodSandboxStats {
         attributes: PodSandboxAttributes {
-            id: attrs.get_id()?.to_str()?.to_string(),
+            id: attrs.get_id()?.to_str()?.to_owned(),
             metadata: parse_pod_sandbox_metadata(attrs.get_metadata()?)?,
             labels: parse_key_values_to_map(attrs.get_labels()?),
             annotations: parse_key_values_to_map(attrs.get_annotations()?),
@@ -1127,7 +1127,7 @@ fn parse_container_stats(stats: workers_capnp::container_stats::Reader) -> Resul
     let attrs = stats.get_attributes()?;
     Ok(ContainerStats {
         attributes: ContainerAttributes {
-            id: attrs.get_id()?.to_str()?.to_string(),
+            id: attrs.get_id()?.to_str()?.to_owned(),
             metadata: parse_container_metadata(attrs.get_metadata()?)?,
             labels: parse_key_values_to_map(attrs.get_labels()?),
             annotations: parse_key_values_to_map(attrs.get_annotations()?),
@@ -1177,7 +1177,7 @@ fn parse_network_interface_usage(
     iface: workers_capnp::network_interface_usage::Reader,
 ) -> Result<NetworkInterfaceUsage> {
     Ok(NetworkInterfaceUsage {
-        name: iface.get_name()?.to_str()?.to_string(),
+        name: iface.get_name()?.to_str()?.to_owned(),
         rx_bytes: iface.get_rx_bytes(),
         tx_bytes: iface.get_tx_bytes(),
         rx_errors: iface.get_rx_errors(),
@@ -1196,7 +1196,7 @@ fn parse_filesystem_usage(fs: workers_capnp::filesystem_usage::Reader) -> Result
     Ok(FilesystemUsage {
         timestamp: fs.get_timestamp(),
         fs_id: Some(FilesystemIdentifier {
-            mountpoint: fs.get_fs_id()?.get_mountpoint()?.to_str()?.to_string(),
+            mountpoint: fs.get_fs_id()?.get_mountpoint()?.to_str()?.to_owned(),
         }),
         used_bytes: fs.get_used_bytes(),
         inodes_used: fs.get_inodes_used(),
@@ -1205,12 +1205,12 @@ fn parse_filesystem_usage(fs: workers_capnp::filesystem_usage::Reader) -> Result
 
 fn parse_image_info(img: workers_capnp::image_info::Reader) -> Result<Image> {
     Ok(Image {
-        id: img.get_id()?.to_str()?.to_string(),
+        id: img.get_id()?.to_str()?.to_owned(),
         repo_tags: {
             let tags = img.get_repo_tags()?;
             let mut result = Vec::with_capacity(tags.len() as usize);
             for t in tags.iter() {
-                result.push(t?.to_str()?.to_string());
+                result.push(t?.to_str()?.to_owned());
             }
             result
         },
@@ -1218,7 +1218,7 @@ fn parse_image_info(img: workers_capnp::image_info::Reader) -> Result<Image> {
             let digests = img.get_repo_digests()?;
             let mut result = Vec::with_capacity(digests.len() as usize);
             for d in digests.iter() {
-                result.push(d?.to_str()?.to_string());
+                result.push(d?.to_str()?.to_owned());
             }
             result
         },
@@ -1228,7 +1228,7 @@ fn parse_image_info(img: workers_capnp::image_info::Reader) -> Result<Image> {
         } else {
             None
         },
-        username: img.get_username()?.to_str()?.to_string(),
+        username: img.get_username()?.to_str()?.to_owned(),
         spec: if img.has_spec() {
             Some(parse_image_spec(img.get_spec()?)?)
         } else {

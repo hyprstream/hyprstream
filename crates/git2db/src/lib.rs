@@ -150,7 +150,7 @@ pub mod ops {
     /// let options = CloneOptions::builder()
     ///     .callback_config(
     ///         CallbackConfigBuilder::new()
-    ///             .auth(AuthStrategy::SshAgent { username: Some("git".to_string()) })
+    ///             .auth(AuthStrategy::SshAgent { username: Some("git".to_owned()) })
     ///             .progress(ProgressConfig::Stdout)
     ///             .build()
     ///     )

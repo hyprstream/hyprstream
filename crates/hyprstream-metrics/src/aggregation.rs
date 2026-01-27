@@ -97,18 +97,16 @@ impl TimeWindow {
             TimeWindow::Fixed(duration) => {
                 let window_size = duration.as_secs();
                 Some(format!(
-                    "(timestamp / {}) * {} as window_start, 
-                    ((timestamp / {}) + 1) * {} as window_end",
-                    window_size, window_size, window_size, window_size
+                    "(timestamp / {window_size}) * {window_size} as window_start, 
+                    ((timestamp / {window_size}) + 1) * {window_size} as window_end"
                 ))
             }
             TimeWindow::Sliding { window, slide } => {
                 let window_size = window.as_secs();
                 let slide_size = slide.as_secs();
                 Some(format!(
-                    "(timestamp / {}) * {} as window_start,
-                    ((timestamp / {}) * {} + {}) as window_end",
-                    slide_size, slide_size, slide_size, slide_size, window_size
+                    "(timestamp / {slide_size}) * {slide_size} as window_start,
+                    ((timestamp / {slide_size}) * {slide_size} + {window_size}) as window_end"
                 ))
             }
         }
@@ -119,11 +117,11 @@ impl AggregateFunction {
     /// Generates SQL for the aggregation function
     pub fn to_sql(&self, column: &str) -> String {
         match self {
-            AggregateFunction::Sum => format!("SUM({})", column),
-            AggregateFunction::Avg => format!("AVG({})", column),
-            AggregateFunction::Min => format!("MIN({})", column),
-            AggregateFunction::Max => format!("MAX({})", column),
-            AggregateFunction::Count => format!("COUNT({})", column),
+            AggregateFunction::Sum => format!("SUM({column})"),
+            AggregateFunction::Avg => format!("AVG({column})"),
+            AggregateFunction::Min => format!("MIN({column})"),
+            AggregateFunction::Max => format!("MAX({column})"),
+            AggregateFunction::Count => format!("COUNT({column})"),
         }
     }
 }
@@ -161,7 +159,7 @@ pub fn build_aggregate_query(
 
     // Add group by columns
     if !group_by.columns.is_empty() {
-        let cols: Vec<&str> = group_by.columns.iter().map(|s| s.as_str()).collect();
+        let cols: Vec<&str> = group_by.columns.iter().map(std::string::String::as_str).collect();
         query.push_str(&cols.join(", "));
         query.push_str(", ");
     }
@@ -183,13 +181,13 @@ pub fn build_aggregate_query(
     query.push_str(&select_parts.join(", "));
 
     // Add FROM clause
-    query.push_str(&format!(" FROM {}", table_name));
+    query.push_str(&format!(" FROM {table_name}"));
 
     // Add WHERE clause for timestamp range
     if let Some(from_ts) = from_timestamp {
-        query.push_str(&format!(" WHERE timestamp >= {}", from_ts));
+        query.push_str(&format!(" WHERE timestamp >= {from_ts}"));
         if let Some(to_ts) = to_timestamp {
-            query.push_str(&format!(" AND timestamp <= {}", to_ts));
+            query.push_str(&format!(" AND timestamp <= {to_ts}"));
         }
     }
 
@@ -199,7 +197,7 @@ pub fn build_aggregate_query(
         let mut group_cols = Vec::new();
 
         if !group_by.columns.is_empty() {
-            let cols: Vec<&str> = group_by.columns.iter().map(|s| s.as_str()).collect();
+            let cols: Vec<&str> = group_by.columns.iter().map(std::string::String::as_str).collect();
             group_cols.extend(cols);
         }
 

@@ -148,7 +148,7 @@ pub async fn extract_commit_objects(repo_path: &Path, commit_hash: &str) -> Resu
 }
 
 /// Create a GitObject from a git2 Object
-fn create_git_object(repo: &Repository, obj: &git2::Object) -> Result<GitObject> {
+fn create_git_object(repo: &Repository, obj: &git2::Object<'_>) -> Result<GitObject> {
     let odb = repo.odb()?;
     let odb_obj = odb.read(obj.id())?;
 
@@ -246,9 +246,9 @@ pub fn parse_commit_object(data: &[u8]) -> Result<CommitObject> {
         } else if let Some(hash_str) = line.strip_prefix("parent ") {
             parent_hashes.push(GitHash::from_hex(hash_str.trim())?);
         } else if let Some(author_str) = line.strip_prefix("author ") {
-            author = author_str.to_string();
+            author = author_str.to_owned();
         } else if let Some(committer_str) = line.strip_prefix("committer ") {
-            committer = committer_str.to_string();
+            committer = committer_str.to_owned();
         }
     }
 
@@ -296,7 +296,7 @@ pub fn parse_tree_object(data: &[u8]) -> Result<TreeObject> {
             "100755" => TreeEntryMode::Executable,
             "120000" => TreeEntryMode::Symlink,
             "160000" => TreeEntryMode::Gitlink,
-            _ => return Err(Error::other(format!("Unknown tree entry mode: {}", mode_str))),
+            _ => return Err(Error::other(format!("Unknown tree entry mode: {mode_str}"))),
         };
 
         // Hash is either 20 bytes (SHA1) or 32 bytes (SHA256) after the null terminator
@@ -312,7 +312,7 @@ pub fn parse_tree_object(data: &[u8]) -> Result<TreeObject> {
 
         entries.push(TreeEntry {
             mode,
-            name: name.to_string(),
+            name: name.to_owned(),
             hash,
         });
 
@@ -411,7 +411,7 @@ pub fn hash_to_oid(hash: &GitHash) -> Result<Oid> {
     match hash {
         GitHash::Sha1(_) => {
             Oid::from_str(&hash.to_hex())
-                .map_err(|e| Error::other(format!("Cannot convert hash to Oid: {}", e)))
+                .map_err(|e| Error::other(format!("Cannot convert hash to Oid: {e}")))
         }
         GitHash::Sha256(_) => {
             // SHA256 git repos are not yet widely supported
@@ -435,7 +435,7 @@ pub fn oid_to_sha256(oid: Oid) -> Result<Sha256Hash> {
 // Keep legacy function for backwards compatibility during migration
 #[deprecated(note = "Use hash_to_oid instead - it supports GitHash enum")]
 pub fn sha256_to_oid(hash: &Sha256Hash) -> Result<Oid> {
-    Oid::from_str(hash.as_str()).map_err(|e| Error::other(format!("Cannot convert SHA256 to Oid (git2 limitation): {}", e)))
+    Oid::from_str(hash.as_str()).map_err(|e| Error::other(format!("Cannot convert SHA256 to Oid (git2 limitation): {e}")))
 }
 
 /// Repository publishing - extract all objects and store in DHT
@@ -450,7 +450,7 @@ pub async fn publish_repository(repo_path: &Path, dht: &crate::dht::GitTorrentDh
 
     // 2. Store each object in DHT
     for obj in &objects {
-        let key = GitObjectKey::from_sha256(obj.hash.clone());
+        let key = GitObjectKey::from_sha256(&obj.hash);
         let record = GitObjectRecord::new(key.clone(), obj.data.clone());
 
         // Store object
@@ -491,7 +491,7 @@ pub async fn clone_commit(
     tracing::info!("Cloning commit {} to {:?}", commit_hash, target_path);
 
     // 1. Fetch and parse the commit object
-    let commit_key = GitObjectKey::from_sha256(commit_hash.clone());
+    let commit_key = GitObjectKey::from_sha256(&commit_hash);
     let commit_record = dht.get_object(commit_key).await?
         .ok_or_else(|| crate::Error::not_found("Commit not found"))?;
 
@@ -626,7 +626,7 @@ pub async fn write_git_object(repo: &Repository, object_data: &[u8]) -> Result<(
 pub async fn set_head_to_commit(repo: &Repository, commit_hash: Sha256Hash) -> Result<()> {
     // Convert hash to OID
     let oid = Oid::from_str(commit_hash.as_str())
-        .map_err(|e| Error::other(format!("Cannot convert hash to Oid: {}", e)))?;
+        .map_err(|e| Error::other(format!("Cannot convert hash to Oid: {e}")))?;
 
     // Find the commit object
     let commit = repo.find_commit(oid)?;
@@ -683,14 +683,14 @@ pub async fn extract_git_refs(repo_path: &Path) -> Result<GitRefs> {
             if let Some(target) = reference.target() {
                 // Convert git2 Oid to GitHash (supports SHA1 and SHA256)
                 let hash = oid_to_hash(target)?;
-                refs_map.insert(name.to_string(), hash);
+                refs_map.insert(name.to_owned(), hash);
             }
         }
     }
 
     // Get HEAD reference
     let head = repo.head()?;
-    let head_name = head.name().unwrap_or("refs/heads/main").to_string();
+    let head_name = head.name().unwrap_or("refs/heads/main").to_owned();
 
     // Current timestamp
     let created_at = std::time::SystemTime::now()
@@ -716,9 +716,9 @@ pub async fn store_git_refs(
     let refs_data = serde_json::to_vec(refs)?;
 
     // Create a special key for references: "refs:" + commit_hash
-    let refs_key_str = format!("refs:{}", commit_hash);
+    let refs_key_str = format!("refs:{commit_hash}");
     let refs_key_hash = crate::crypto::hash::sha256_data(refs_key_str.as_bytes())?;
-    let refs_key = GitObjectKey::from_sha256(refs_key_hash);
+    let refs_key = GitObjectKey::from_sha256(&refs_key_hash);
 
     // Store in DHT
     let record = GitObjectRecord::new(refs_key.clone(), refs_data);
@@ -737,9 +737,9 @@ pub async fn retrieve_git_refs(
     use crate::dht::GitObjectKey;
 
     // Create references key
-    let refs_key_str = format!("refs:{}", commit_hash);
+    let refs_key_str = format!("refs:{commit_hash}");
     let refs_key_hash = crate::crypto::hash::sha256_data(refs_key_str.as_bytes())?;
-    let refs_key = GitObjectKey::from_sha256(refs_key_hash);
+    let refs_key = GitObjectKey::from_sha256(&refs_key_hash);
 
     // Retrieve from DHT
     if let Some(record) = dht.get_object(refs_key).await? {

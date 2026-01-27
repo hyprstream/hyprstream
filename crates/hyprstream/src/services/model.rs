@@ -230,7 +230,7 @@ impl ModelService {
 
         // Create unique endpoint for this model
         let safe_name = model_ref_str.replace([':', '/', '\\'], "-");
-        let endpoint = format!("{}/{}", INFERENCE_ENDPOINT_BASE, safe_name);
+        let endpoint = format!("{INFERENCE_ENDPOINT_BASE}/{safe_name}");
 
         info!("Loading model {} at endpoint {}", model_ref_str, endpoint);
 
@@ -263,7 +263,8 @@ impl ModelService {
             if cache.len() >= self.config.max_models {
                 if let Some((evicted_ref, mut evicted)) = cache.pop_lru() {
                     info!("Evicting model {} to load {}", evicted_ref, model_ref_str);
-                    // Stop the evicted service
+                    // Stop the evicted service in background (fire-and-forget)
+                    #[allow(clippy::let_underscore_future)]
                     let _ = tokio::spawn(async move {
                         let _ = evicted.service_handle.stop().await;
                     });
@@ -272,9 +273,9 @@ impl ModelService {
 
             // Add to cache
             cache.put(
-                model_ref_str.to_string(),
+                model_ref_str.to_owned(),
                 LoadedModel {
-                    model_ref: model_ref_str.to_string(),
+                    model_ref: model_ref_str.to_owned(),
                     endpoint: endpoint.clone(),
                     service_handle,
                     client,
@@ -634,8 +635,7 @@ impl crate::services::ZmqService for ModelService {
         let request_id = req.get_id();
 
         // Extract ephemeral pubkey for E2E streaming (needed inside async block)
-        let client_ephemeral_pubkey = ctx.ephemeral_pubkey
-            .map(|pk| pk);
+        let client_ephemeral_pubkey = ctx.ephemeral_pubkey;
 
         // Handle request in blocking context (we need async operations)
         let result = tokio::task::block_in_place(|| {
@@ -650,7 +650,7 @@ impl crate::services::ZmqService for ModelService {
                             Ok(endpoint) => Self::build_loaded_response(request_id, model_ref, &endpoint),
                             Err(e) => Self::build_error_response(
                                 request_id,
-                                &format!("Failed to load model: {}", e),
+                                &format!("Failed to load model: {e}"),
                                 "LOAD_FAILED",
                             ),
                         }
@@ -662,7 +662,7 @@ impl crate::services::ZmqService for ModelService {
                             Ok(()) => Self::build_ok_response(request_id),
                             Err(e) => Self::build_error_response(
                                 request_id,
-                                &format!("Failed to unload model: {}", e),
+                                &format!("Failed to unload model: {e}"),
                                 "UNLOAD_FAILED",
                             ),
                         }
@@ -685,7 +685,7 @@ impl crate::services::ZmqService for ModelService {
                             Ok(result_bytes) => Self::build_infer_result_response(request_id, result_bytes),
                             Err(e) => Self::build_error_response(
                                 request_id,
-                                &format!("Inference failed: {}", e),
+                                &format!("Inference failed: {e}"),
                                 "INFER_FAILED",
                             ),
                         }
@@ -703,7 +703,7 @@ impl crate::services::ZmqService for ModelService {
                             ),
                             Err(e) => Self::build_error_response(
                                 request_id,
-                                &format!("Stream start failed: {}", e),
+                                &format!("Stream start failed: {e}"),
                                 "STREAM_FAILED",
                             ),
                         }
@@ -716,7 +716,7 @@ impl crate::services::ZmqService for ModelService {
                             Ok(()) => Self::build_stream_authorized_response(request_id, stream_id),
                             Err(e) => Self::build_error_response(
                                 request_id,
-                                &format!("Stream authorization failed: {}", e),
+                                &format!("Stream authorization failed: {e}"),
                                 "STREAM_AUTH_FAILED",
                             ),
                         }
@@ -738,8 +738,8 @@ impl crate::services::ZmqService for ModelService {
                         let messages: Vec<ChatMessage> = messages_reader
                             .iter()
                             .map(|m| ChatMessage {
-                                role: m.get_role().map(|r| r.to_str().unwrap_or("user").to_string()).unwrap_or_else(|_| "user".to_string()),
-                                content: m.get_content().ok().map(|c| c.to_str().unwrap_or("").to_string()),
+                                role: m.get_role().map(|r| r.to_str().unwrap_or("user").to_owned()).unwrap_or_else(|_| "user".to_owned()),
+                                content: m.get_content().ok().map(|c| c.to_str().unwrap_or("").to_owned()),
                                 function_call: None,
                             })
                             .collect();
@@ -748,7 +748,7 @@ impl crate::services::ZmqService for ModelService {
                             Ok(templated) => Self::build_template_result_response(request_id, &templated),
                             Err(e) => Self::build_error_response(
                                 request_id,
-                                &format!("Template application failed: {}", e),
+                                &format!("Template application failed: {e}"),
                                 "TEMPLATE_FAILED",
                             ),
                         }
@@ -1073,7 +1073,7 @@ impl ModelZmqClient {
         match response.which()? {
             Which::Loaded(loaded_reader) => {
                 let loaded = loaded_reader?;
-                Ok(loaded.get_endpoint()?.to_str()?.to_string())
+                Ok(loaded.get_endpoint()?.to_str()?.to_owned())
             }
             Which::Error(error_reader) => {
                 let error = error_reader?;
@@ -1118,8 +1118,8 @@ impl ModelZmqClient {
                 let mut result = Vec::with_capacity(models.len() as usize);
                 for model in models.iter() {
                     result.push(LoadedModelInfo {
-                        model_ref: model.get_model_ref()?.to_str()?.to_string(),
-                        endpoint: model.get_endpoint()?.to_str()?.to_string(),
+                        model_ref: model.get_model_ref()?.to_str()?.to_owned(),
+                        endpoint: model.get_endpoint()?.to_str()?.to_owned(),
                         loaded_at: model.get_loaded_at(),
                         last_used: model.get_last_used(),
                     });
@@ -1149,7 +1149,7 @@ impl ModelZmqClient {
                 Ok(ModelStatusInfo {
                     loaded: status.get_loaded(),
                     endpoint: if status.has_endpoint() {
-                        Some(status.get_endpoint()?.to_str()?.to_string())
+                        Some(status.get_endpoint()?.to_str()?.to_owned())
                     } else {
                         None
                     },
@@ -1203,8 +1203,8 @@ impl ModelZmqClient {
                     server_pubkey.copy_from_slice(server_pubkey_data);
                 }
                 Ok(StreamStartedInfo {
-                    stream_id: stream.get_stream_id()?.to_str()?.to_string(),
-                    endpoint: stream.get_endpoint()?.to_str()?.to_string(),
+                    stream_id: stream.get_stream_id()?.to_str()?.to_owned(),
+                    endpoint: stream.get_endpoint()?.to_str()?.to_owned(),
                     server_pubkey,
                 })
             }
@@ -1228,7 +1228,7 @@ impl ModelZmqClient {
         match response.which()? {
             Which::StreamAuthorized(auth_reader) => {
                 let auth = auth_reader?;
-                Ok(auth.get_stream_id()?.to_str()?.to_string())
+                Ok(auth.get_stream_id()?.to_str()?.to_owned())
             }
             Which::Error(error_reader) => {
                 let error = error_reader?;
@@ -1251,7 +1251,7 @@ impl ModelZmqClient {
             Which::Health(health_reader) => {
                 let health = health_reader?;
                 Ok(ModelHealthInfo {
-                    status: health.get_status()?.to_str()?.to_string(),
+                    status: health.get_status()?.to_str()?.to_owned(),
                     loaded_model_count: health.get_loaded_model_count(),
                     max_models: health.get_max_models(),
                     total_memory_bytes: health.get_total_memory_bytes(),
@@ -1276,7 +1276,7 @@ impl ModelZmqClient {
         use model_capnp::model_response::Which;
         match response.which()? {
             Which::TemplateResult(result) => {
-                let prompt_str = result?.to_str()?.to_string();
+                let prompt_str = result?.to_str()?.to_owned();
                 Ok(TemplatedPrompt::new(prompt_str))
             }
             Which::Error(error_reader) => {
@@ -1310,7 +1310,7 @@ fn parse_generation_request(
     reader: crate::inference_capnp::generation_request::Reader,
 ) -> Result<GenerationRequest> {
     Ok(GenerationRequest {
-        prompt: TemplatedPrompt::new(reader.get_prompt()?.to_str()?.to_string()),
+        prompt: TemplatedPrompt::new(reader.get_prompt()?.to_str()?.to_owned()),
         max_tokens: reader.get_max_tokens() as usize,
         temperature: reader.get_temperature(),
         top_p: reader.get_top_p(),
@@ -1451,7 +1451,7 @@ fn parse_generation_result(bytes: &[u8]) -> Result<GenerationResult> {
     };
 
     Ok(GenerationResult {
-        text: res.get_text()?.to_str()?.to_string(),
+        text: res.get_text()?.to_str()?.to_owned(),
         tokens_generated: res.get_tokens_generated() as usize,
         finish_reason,
         generation_time_ms: res.get_generation_time_ms(),

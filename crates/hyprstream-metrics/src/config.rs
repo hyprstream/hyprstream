@@ -21,7 +21,7 @@ pub struct StorageConfig {
 }
 
 fn default_engine() -> String {
-    "duckdb".to_string()
+    "duckdb".to_owned()
 }
 
 /// Cache configuration for cached storage backends

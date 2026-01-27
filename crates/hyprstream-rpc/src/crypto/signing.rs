@@ -43,7 +43,7 @@ pub fn sign_message(
 ) -> [u8; 64] {
     // Build the message to sign using streaming hash
     let mut hasher = Sha512::new();
-    hasher.update(&request_id.to_le_bytes());
+    hasher.update(request_id.to_le_bytes());
     hasher.update(identity_bytes);
     hasher.update(payload);
     let hash = hasher.finalize();
@@ -77,7 +77,7 @@ pub fn verify_message(
 ) -> EnvelopeResult<()> {
     // Reconstruct the hash that was signed
     let mut hasher = Sha512::new();
-    hasher.update(&request_id.to_le_bytes());
+    hasher.update(request_id.to_le_bytes());
     hasher.update(identity_bytes);
     hasher.update(payload);
     let hash = hasher.finalize();
@@ -115,7 +115,7 @@ pub fn signing_key_from_bytes(bytes: &[u8; 32]) -> SigningKey {
 /// Returns `EnvelopeError::InvalidPublicKey` if the bytes are not a valid
 /// Ed25519 public key.
 pub fn verifying_key_from_bytes(bytes: &[u8; 32]) -> EnvelopeResult<VerifyingKey> {
-    VerifyingKey::from_bytes(bytes).map_err(|e| EnvelopeError::InvalidSignature(e))
+    VerifyingKey::from_bytes(bytes).map_err(EnvelopeError::InvalidSignature)
 }
 
 #[cfg(test)]

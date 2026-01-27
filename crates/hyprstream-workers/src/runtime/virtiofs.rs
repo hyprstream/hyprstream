@@ -195,13 +195,12 @@ impl SandboxVirtiofs {
             .spawn()
             .map_err(|e| {
                 WorkerError::SandboxCreationFailed(format!(
-                    "failed to spawn nydusd: {}",
-                    e
+                    "failed to spawn nydusd: {e}"
                 ))
             })?;
 
         let pid = child.id().ok_or_else(|| {
-            WorkerError::SandboxCreationFailed("nydusd process has no pid".to_string())
+            WorkerError::SandboxCreationFailed("nydusd process has no pid".to_owned())
         })?;
 
         // Wait briefly for daemon to initialize
@@ -214,7 +213,7 @@ impl SandboxVirtiofs {
 
         if !self.socket_path.exists() {
             return Err(WorkerError::SandboxCreationFailed(
-                "nydusd socket not created".to_string(),
+                "nydusd socket not created".to_owned(),
             ));
         }
 
@@ -330,11 +329,11 @@ impl SandboxVirtiofsBuilder {
     /// Build the SandboxVirtiofs instance
     pub async fn build(self, rafs_store: &RafsStore) -> Result<SandboxVirtiofs> {
         let socket_path = self.socket_path.ok_or_else(|| {
-            WorkerError::ConfigError("socket_path is required".to_string())
+            WorkerError::ConfigError("socket_path is required".to_owned())
         })?;
 
         let image_id = self.image_id.ok_or_else(|| {
-            WorkerError::ConfigError("image_id is required".to_string())
+            WorkerError::ConfigError("image_id is required".to_owned())
         })?;
 
         SandboxVirtiofs::new(self.sandbox_id, socket_path, rafs_store, image_id).await
@@ -353,6 +352,6 @@ mod tests {
 
         assert_eq!(builder.sandbox_id, "test-sandbox");
         assert_eq!(builder.socket_path, Some(PathBuf::from("/tmp/test.sock")));
-        assert_eq!(builder.image_id, Some("sha256:abc123".to_string()));
+        assert_eq!(builder.image_id, Some("sha256:abc123".to_owned()));
     }
 }

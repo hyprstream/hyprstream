@@ -53,7 +53,7 @@ impl WorkflowRunner {
         let job_order = self.resolve_job_order(workflow)?;
 
         for job_name in job_order {
-            let job = workflow.jobs.get(&job_name).unwrap();
+            let job = &workflow.jobs[&job_name];
             let job_run = self.run_job(&job_name, job, &inputs).await?;
 
             // Check if job failed
@@ -91,13 +91,13 @@ impl WorkflowRunner {
         // Create a sandbox for this job
         let sandbox_config = PodSandboxConfig {
             metadata: crate::runtime::PodSandboxMetadata {
-                name: format!("job-{}", job_name),
+                name: format!("job-{job_name}"),
                 uid: uuid::Uuid::new_v4().to_string(),
-                namespace: "default".to_string(),
+                namespace: "default".to_owned(),
                 attempt: 0,
             },
             labels: HashMap::from([
-                ("workflow.job".to_string(), job_name.to_string()),
+                ("workflow.job".to_owned(), job_name.to_owned()),
             ]),
             ..Default::default()
         };
@@ -105,14 +105,14 @@ impl WorkflowRunner {
         let sandbox_id = self.worker_service.run_pod_sandbox(&sandbox_config).await?;
 
         let mut job_run = JobRun {
-            name: job_name.to_string(),
+            name: job_name.to_owned(),
             status: RunStatus::InProgress,
             steps: Vec::new(),
         };
 
         // Execute each step
         for (idx, step) in job.steps.iter().enumerate() {
-            let step_name = step.name.clone().unwrap_or_else(|| format!("step-{}", idx));
+            let step_name = step.name.clone().unwrap_or_else(|| format!("step-{idx}"));
 
             let step_run = self.run_step(&sandbox_id, &step_name, step, inputs).await?;
 
@@ -150,7 +150,7 @@ impl WorkflowRunner {
         tracing::debug!(step = %step_name, "Running step");
 
         let mut step_run = StepRun {
-            name: step_name.to_string(),
+            name: step_name.to_owned(),
             status: RunStatus::InProgress,
             exit_code: None,
         };
@@ -181,14 +181,14 @@ impl WorkflowRunner {
         // Create container for the shell command
         let container_config = ContainerConfig {
             metadata: crate::runtime::ContainerMetadata {
-                name: format!("step-{}", step_name),
+                name: format!("step-{step_name}"),
                 attempt: 0,
             },
             command: vec![
-                step.shell.clone().unwrap_or_else(|| "/bin/sh".to_string()),
-                "-c".to_string(),
+                step.shell.clone().unwrap_or_else(|| "/bin/sh".to_owned()),
+                "-c".to_owned(),
             ],
-            args: vec![command.to_string()],
+            args: vec![command.to_owned()],
             working_dir: step.working_directory.clone().unwrap_or_default(),
             envs: step.env.iter().map(|(k, v)| {
                 KeyValue {
@@ -208,7 +208,7 @@ impl WorkflowRunner {
         // Wait for completion via exec_sync
         // In practice, we'd monitor the container state
         let result = self.worker_service
-            .exec_sync(&container_id, &["/bin/true".to_string()], 600)
+            .exec_sync(&container_id, &["/bin/true".to_owned()], 600)
             .await?;
 
         // Clean up container
@@ -216,7 +216,7 @@ impl WorkflowRunner {
         self.worker_service.remove_container(&container_id).await?;
 
         Ok(StepRun {
-            name: step_name.to_string(),
+            name: step_name.to_owned(),
             status: if result.exit_code == 0 { RunStatus::Success } else { RunStatus::Failure },
             exit_code: Some(result.exit_code),
         })
@@ -245,7 +245,7 @@ impl WorkflowRunner {
         );
 
         Ok(StepRun {
-            name: step_name.to_string(),
+            name: step_name.to_owned(),
             status: RunStatus::Success,
             exit_code: Some(0),
         })
@@ -262,8 +262,8 @@ impl WorkflowRunner {
             let mut made_progress = false;
 
             remaining.retain(|job_name| {
-                let job = workflow.jobs.get(job_name).unwrap();
-                let needs_satisfied = job.needs.as_ref().map_or(true, |needs| {
+                let job = &workflow.jobs[job_name];
+                let needs_satisfied = job.needs.as_ref().is_none_or(|needs| {
                     needs.iter().all(|n| completed.contains(n))
                 });
 
@@ -279,7 +279,7 @@ impl WorkflowRunner {
 
             if !made_progress && !remaining.is_empty() {
                 return Err(crate::error::WorkerError::WorkflowParseError(
-                    "Circular dependency in job 'needs'".to_string(),
+                    "Circular dependency in job 'needs'".to_owned(),
                 ));
             }
         }
@@ -289,11 +289,11 @@ impl WorkflowRunner {
 
     /// Expand variables in a string (e.g., ${{ inputs.model }})
     fn expand_variables(&self, template: &str, inputs: &HashMap<String, String>) -> String {
-        let mut result = template.to_string();
+        let mut result = template.to_owned();
 
         // Simple variable expansion for ${{ inputs.NAME }}
         for (key, value) in inputs {
-            let pattern = format!("${{{{ inputs.{} }}}}", key);
+            let pattern = format!("${{{{ inputs.{key} }}}}");
             result = result.replace(&pattern, value);
         }
 

@@ -128,7 +128,7 @@ impl CheckpointManager {
         let existing = client
             .get_by_name(repo_name)
             .await
-            .map_err(|e| Status::internal(format!("Failed to query registry: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Failed to query registry: {e}")))?;
 
         if let Some(tracked) = existing {
             // Repository already registered - use its path
@@ -138,7 +138,7 @@ impl CheckpointManager {
             return Ok(Self {
                 config,
                 client: Some(client),
-                repo_name: Some(repo_name.to_string()),
+                repo_name: Some(repo_name.to_owned()),
                 repo_path,
                 checkpoints: RwLock::new(Vec::new()),
             });
@@ -148,7 +148,7 @@ impl CheckpointManager {
         let manager = Self::create_internal(
             config,
             Some(client.clone()),
-            Some(repo_name.to_string()),
+            Some(repo_name.to_owned()),
         )
         .await?;
 
@@ -157,7 +157,7 @@ impl CheckpointManager {
         client
             .register(&repo_id, Some(repo_name), &manager.repo_path)
             .await
-            .map_err(|e| Status::internal(format!("Failed to register checkpoint repo: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Failed to register checkpoint repo: {e}")))?;
 
         info!("Registered checkpoint repository '{}' in registry", repo_name);
 
@@ -175,8 +175,7 @@ impl CheckpointManager {
         // Ensure base directory exists
         std::fs::create_dir_all(&config.base_dir).map_err(|e| {
             Status::internal(format!(
-                "Failed to create checkpoint directory: {}",
-                e
+                "Failed to create checkpoint directory: {e}"
             ))
         })?;
 
@@ -186,11 +185,11 @@ impl CheckpointManager {
         // Initialize git repository if it doesn't exist
         if !repo_path.join(".git").exists() {
             std::fs::create_dir_all(&repo_path).map_err(|e| {
-                Status::internal(format!("Failed to create repository directory: {}", e))
+                Status::internal(format!("Failed to create repository directory: {e}"))
             })?;
 
             git2::Repository::init(&repo_path).map_err(|e| {
-                Status::internal(format!("Failed to initialize git repository: {}", e))
+                Status::internal(format!("Failed to initialize git repository: {e}"))
             })?;
 
             info!("Created new checkpoint repository at {:?}", repo_path);
@@ -223,7 +222,7 @@ impl CheckpointManager {
         // Ensure tables directory exists
         let tables_dir = self.repo_path.join("tables");
         std::fs::create_dir_all(&tables_dir).map_err(|e| {
-            Status::internal(format!("Failed to create tables directory: {}", e))
+            Status::internal(format!("Failed to create tables directory: {e}"))
         })?;
 
         // Export each table to Parquet
@@ -234,7 +233,7 @@ impl CheckpointManager {
                 continue;
             }
 
-            let parquet_path = tables_dir.join(format!("{}.parquet", table_name));
+            let parquet_path = tables_dir.join(format!("{table_name}.parquet"));
             debug!(table = %table_name, path = ?parquet_path, "Exporting table");
 
             storage
@@ -254,7 +253,7 @@ impl CheckpointManager {
                 table_name.clone(),
                 row_count,
                 file_size,
-                format!("tables/{}.parquet", table_name),
+                format!("tables/{table_name}.parquet"),
             ));
         }
 
@@ -268,10 +267,10 @@ impl CheckpointManager {
         // Save metadata file
         let metadata_path = self.repo_path.join("checkpoint.json");
         let metadata_json = serde_json::to_string_pretty(&metadata).map_err(|e| {
-            Status::internal(format!("Failed to serialize checkpoint metadata: {}", e))
+            Status::internal(format!("Failed to serialize checkpoint metadata: {e}"))
         })?;
         std::fs::write(&metadata_path, metadata_json).map_err(|e| {
-            Status::internal(format!("Failed to write checkpoint metadata: {}", e))
+            Status::internal(format!("Failed to write checkpoint metadata: {e}"))
         })?;
 
         // Commit the checkpoint
@@ -307,26 +306,26 @@ impl CheckpointManager {
         // Use GitManager for repository access
         let repo_cache = GitManager::global()
             .get_repository(&self.repo_path)
-            .map_err(|e| Status::internal(format!("Failed to get repository: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Failed to get repository: {e}")))?;
 
         let repo = repo_cache
             .open()
-            .map_err(|e| Status::internal(format!("Failed to open repository: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Failed to open repository: {e}")))?;
 
         // Stage all files using git2 directly
         let mut index = repo.index().map_err(|e| {
-            Status::internal(format!("Failed to get index: {}", e))
+            Status::internal(format!("Failed to get index: {e}"))
         })?;
         index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None).map_err(|e| {
-            Status::internal(format!("Failed to stage files: {}", e))
+            Status::internal(format!("Failed to stage files: {e}"))
         })?;
         index.write().map_err(|e| {
-            Status::internal(format!("Failed to write index: {}", e))
+            Status::internal(format!("Failed to write index: {e}"))
         })?;
 
         let sig = GitManager::global()
             .create_signature(None, None)
-            .map_err(|e| Status::internal(format!("Failed to create signature: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Failed to create signature: {e}")))?;
 
         let message = format!(
             "Checkpoint: {}\n\nTables: {}\nTotal size: {} bytes",
@@ -337,13 +336,13 @@ impl CheckpointManager {
 
         // Get tree from index
         let mut index = repo.index().map_err(|e| {
-            Status::internal(format!("Failed to get index: {}", e))
+            Status::internal(format!("Failed to get index: {e}"))
         })?;
         let tree_id = index.write_tree().map_err(|e| {
-            Status::internal(format!("Failed to write tree: {}", e))
+            Status::internal(format!("Failed to write tree: {e}"))
         })?;
         let tree = repo.find_tree(tree_id).map_err(|e| {
-            Status::internal(format!("Failed to find tree: {}", e))
+            Status::internal(format!("Failed to find tree: {e}"))
         })?;
 
         // Get parent commit if exists
@@ -355,7 +354,7 @@ impl CheckpointManager {
         } else {
             repo.commit(Some("HEAD"), &sig, &sig, &message, &tree, &[])
         }
-        .map_err(|e| Status::internal(format!("Failed to create commit: {}", e)))?;
+        .map_err(|e| Status::internal(format!("Failed to create commit: {e}")))?;
 
         // Create tag if name provided
         if let Some(tag_name) = name {
@@ -379,31 +378,31 @@ impl CheckpointManager {
         // Use GitManager for repository access
         let repo_cache = GitManager::global()
             .get_repository(&self.repo_path)
-            .map_err(|e| Status::internal(format!("Failed to get repository: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Failed to get repository: {e}")))?;
 
         let repo = repo_cache
             .open()
-            .map_err(|e| Status::internal(format!("Failed to open repository: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Failed to open repository: {e}")))?;
 
         let oid = git2::Oid::from_str(checkpoint_id).map_err(|e| {
-            Status::invalid_argument(format!("Invalid checkpoint ID: {}", e))
+            Status::invalid_argument(format!("Invalid checkpoint ID: {e}"))
         })?;
 
         let commit = repo.find_commit(oid).map_err(|e| {
-            Status::not_found(format!("Checkpoint not found: {}", e))
+            Status::not_found(format!("Checkpoint not found: {e}"))
         })?;
 
         // Reset to the checkpoint
         repo.reset(commit.as_object(), git2::ResetType::Hard, None)
-            .map_err(|e| Status::internal(format!("Failed to reset to checkpoint: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Failed to reset to checkpoint: {e}")))?;
 
         // Read checkpoint metadata
         let metadata_path = self.repo_path.join("checkpoint.json");
         let metadata_json = std::fs::read_to_string(&metadata_path).map_err(|e| {
-            Status::internal(format!("Failed to read checkpoint metadata: {}", e))
+            Status::internal(format!("Failed to read checkpoint metadata: {e}"))
         })?;
         let metadata: CheckpointMetadata = serde_json::from_str(&metadata_json).map_err(|e| {
-            Status::internal(format!("Failed to parse checkpoint metadata: {}", e))
+            Status::internal(format!("Failed to parse checkpoint metadata: {e}"))
         })?;
 
         // Import each table from Parquet

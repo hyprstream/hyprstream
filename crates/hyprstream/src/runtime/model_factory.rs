@@ -648,7 +648,7 @@ impl ModelFactory {
                 query_pre_attn_scalar: config.query_pre_attn_scalar,
                 use_qk_norm: config.use_qk_norm,
                 scale_embeddings: config.scale_embeddings,
-                layer_types: vec!["global".to_string(); config.num_hidden_layers],
+                layer_types: vec!["global".to_owned(); config.num_hidden_layers],
                 rope_local_base_freq: None,
             }),
             vision_config: VisionEncoderConfig {

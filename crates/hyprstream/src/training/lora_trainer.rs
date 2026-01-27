@@ -95,7 +95,7 @@ impl LoRATrainer {
         if !adapter_exists {
             tracing::info!("Initializing new adapter weights...");
             let adapter_config = AdapterConfig {
-                model_ref: "current".to_string(),
+                model_ref: "current".to_owned(),
                 ..Default::default()
             };
             self.adapter_manager

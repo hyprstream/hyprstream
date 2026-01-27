@@ -323,7 +323,7 @@ impl StreamBuilder {
 
     /// Add error payload (flushes immediately).
     pub fn add_error(&mut self, message: &str) -> Result<Option<StreamFrames>> {
-        self.pending.push(StreamPayloadData::Error(message.to_string()));
+        self.pending.push(StreamPayloadData::Error(message.to_owned()));
         self.flush()
     }
 
@@ -710,7 +710,7 @@ mod tests {
     #[test]
     fn test_adaptive_batch_size() {
         let config = BatchingConfig::default();
-        let builder = StreamBuilder::new(config, [0u8; 32], "topic".to_string());
+        let builder = StreamBuilder::new(config, [0u8; 32], "topic".to_owned());
 
         // Low rate → small batch
         assert_eq!(builder.adaptive_batch_size(1.0), 1);
@@ -726,7 +726,7 @@ mod tests {
     #[test]
     fn test_hmac_chain() {
         let key = [0x42u8; 32];
-        let topic = "test_topic".to_string();
+        let topic = "test_topic".to_owned();
 
         let mut state = StreamHmacState::new(key, topic);
 

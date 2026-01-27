@@ -89,9 +89,9 @@ impl FlightClient {
         config: FlightClientConfig,
     ) -> Result<Self, FlightClientError> {
         let uri = if addr.starts_with("http://") || addr.starts_with("https://") {
-            addr.to_string()
+            addr.to_owned()
         } else {
-            format!("http://{}", addr)
+            format!("http://{addr}")
         };
 
         debug!(uri = %uri, "Connecting to Flight SQL server");
@@ -118,7 +118,7 @@ impl FlightClient {
 
         Ok(Self {
             client,
-            addr: addr.to_string(),
+            addr: addr.to_owned(),
         })
     }
 
@@ -141,7 +141,7 @@ impl FlightClient {
 
         // Create the Flight SQL command
         let cmd = CommandStatementQuery {
-            query: sql.to_string(),
+            query: sql.to_owned(),
             transaction_id: None,
         };
 
@@ -161,7 +161,7 @@ impl FlightClient {
             .endpoint
             .first()
             .and_then(|ep| ep.ticket.clone())
-            .ok_or_else(|| FlightClientError::Query("No endpoint in flight info".to_string()))?;
+            .ok_or_else(|| FlightClientError::Query("No endpoint in flight info".to_owned()))?;
 
         // Execute do_get to retrieve data
         let stream = self.client.do_get(ticket).await?.into_inner();
@@ -214,9 +214,9 @@ fn get_array_value(array: &dyn Array, row_idx: usize) -> String {
     // Try to downcast to StringArray first (most common)
     if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
         if string_array.is_null(row_idx) {
-            return "NULL".to_string();
+            return "NULL".to_owned();
         }
-        return string_array.value(row_idx).to_string();
+        return string_array.value(row_idx).to_owned();
     }
 
     // For other types, use debug format
@@ -228,7 +228,7 @@ pub fn format_batches_as_table(batches: &[RecordBatch]) -> String {
     use std::fmt::Write;
 
     if batches.is_empty() {
-        return "No results".to_string();
+        return "No results".to_owned();
     }
 
     let schema = batches[0].schema();
@@ -280,8 +280,8 @@ pub fn format_batches_as_table(batches: &[RecordBatch]) -> String {
     }
 
     // Row count
-    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    writeln!(output, "\n({} rows)", total_rows).unwrap();
+    let total_rows: usize = batches.iter().map(arrow_array::RecordBatch::num_rows).sum();
+    writeln!(output, "\n({total_rows} rows)").unwrap();
 
     output
 }

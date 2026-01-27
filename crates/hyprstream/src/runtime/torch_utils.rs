@@ -51,9 +51,9 @@ where
             let panic_msg = if let Some(s) = panic_info.downcast_ref::<String>() {
                 s.clone()
             } else if let Some(s) = panic_info.downcast_ref::<&str>() {
-                s.to_string()
+                (*s).to_owned()
             } else {
-                "Unknown panic during tensor operation".to_string()
+                "Unknown panic during tensor operation".to_owned()
             };
 
             error!("PyTorch operation panicked: {}", panic_msg);
