@@ -1,4 +1,4 @@
-# HyprStream: LLM Inference Engine with Git-based Model Management
+# HyprStream: agentic cloud operating system and orchestrator
 
 [![Rust](https://github.com/hyprstream/hyprstream/actions/workflows/rust.yml/badge.svg)](https://github.com/hyprstream/hyprstream/actions/workflows/rust.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE-AGPLV3)
