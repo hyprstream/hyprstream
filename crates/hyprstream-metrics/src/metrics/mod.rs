@@ -1,3 +1,6 @@
+// tonic::Status is the idiomatic gRPC error type - boxing would break API
+#![allow(clippy::result_large_err)]
+
 pub mod storage;
 
 use duckdb::arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};

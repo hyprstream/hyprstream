@@ -122,6 +122,7 @@ pub struct Mount {
 /// Mount propagation mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[allow(clippy::enum_variant_names)] // Wire format compatibility (PROPAGATION_PRIVATE, etc.)
 pub enum MountPropagation {
     /// Private propagation
     #[default]

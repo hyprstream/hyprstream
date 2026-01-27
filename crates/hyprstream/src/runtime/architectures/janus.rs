@@ -150,6 +150,7 @@ pub struct JanusModel {
 }
 
 /// Vision encoder implementations
+#[allow(clippy::large_enum_variant)] // Created once, used frequently - boxing adds unwanted indirection
 pub enum VisionEncoder {
     SigLIP(SigLIPVisionTower),
     CLIP(CLIPVisionTower),

@@ -2,7 +2,6 @@
 //!
 //! Combines artifact management with hyprstream's UUID-based model patterns
 
-use anyhow::Result;
 use chrono::Utc;
 use git2::{IndexAddOption, Repository};
 use serde::{Deserialize, Serialize};
@@ -34,14 +33,17 @@ impl RepoId {
         Self(uuid)
     }
 
-    /// Parse from string
-    pub fn from_str(s: &str) -> Result<Self> {
-        Ok(Self(Uuid::parse_str(s)?))
-    }
-
     /// Get the inner UUID
     pub fn uuid(&self) -> Uuid {
         self.0
+    }
+}
+
+impl std::str::FromStr for RepoId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(s)?))
     }
 }
 

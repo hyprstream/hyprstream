@@ -12,7 +12,7 @@
 //!      └── OCI manifests only         └── Dragonfly P2P for blobs    └── RAFS output
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
@@ -226,7 +226,7 @@ impl RafsStore {
         &self,
         img_ref: &ImageReference,
         digest: &str,
-        dest_path: &PathBuf,
+        dest_path: &Path,
         auth: Option<&CriAuthConfig>,
     ) -> Result<()> {
         // Extract blob ID from digest (remove "sha256:" prefix)
@@ -257,7 +257,7 @@ impl RafsStore {
             .map_err(|e| WorkerError::RafsError(format!("failed to get blob size: {e:?}")))?;
 
         // Create a buffered reader and download the blob
-        let dest_path_clone = dest_path.clone();
+        let dest_path_clone = dest_path.to_path_buf();
         tokio::task::spawn_blocking(move || -> Result<()> {
             // Use BlobBufReader for efficient buffered reading
             let mut buf_reader = BlobBufReader::new(

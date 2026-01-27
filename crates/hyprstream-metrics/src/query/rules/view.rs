@@ -105,20 +105,17 @@ impl ViewOptimizationRule {
 
     /// Check if a view can be used to answer this query
     fn can_use_view(&self, plan: &LogicalPlan, view: &ViewMetadata) -> Result<bool> {
-        match plan {
-            LogicalPlan::TableScan(scan) => {
-                // Check if the query is accessing the view's source table
-                if scan.table_name.to_string() == view.definition.source_table {
-                    // TODO: Add more sophisticated matching logic here
-                    // - Check if required columns are available
-                    // - Check if aggregations match
-                    // - Check if grouping is compatible
-                    // - Check if time windows align
-                    return Ok(true);
-                }
+        // TODO: Add support for more complex query patterns (Join, Aggregate, etc.)
+        if let LogicalPlan::TableScan(scan) = plan {
+            // Check if the query is accessing the view's source table
+            if scan.table_name.to_string() == view.definition.source_table {
+                // TODO: Add more sophisticated matching logic here
+                // - Check if required columns are available
+                // - Check if aggregations match
+                // - Check if grouping is compatible
+                // - Check if time windows align
+                return Ok(true);
             }
-            // TODO: Add support for more complex query patterns
-            _ => {}
         }
 
         Ok(false)

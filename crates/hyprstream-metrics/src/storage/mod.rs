@@ -10,6 +10,9 @@
 //! Each backend implements the `StorageBackend` trait, providing a consistent
 //! interface for SQL operations like table management, querying, and data insertion.
 
+// tonic::Status is the idiomatic gRPC error type - boxing would break API
+#![allow(clippy::result_large_err)]
+
 pub mod cache;
 pub mod cached;
 pub mod context;

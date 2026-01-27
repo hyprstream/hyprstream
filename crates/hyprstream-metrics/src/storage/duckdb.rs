@@ -1,3 +1,6 @@
+// tonic::Status is the idiomatic gRPC error type - boxing would break API
+#![allow(clippy::result_large_err)]
+
 use crate::storage::cache::{CacheEviction, CacheManager};
 use crate::storage::view::{ViewDefinition, ViewMetadata};
 use crate::storage::{Credentials, StorageBackend};

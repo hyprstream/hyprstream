@@ -1,3 +1,6 @@
+// tonic::Status is the idiomatic gRPC error type - boxing would break API
+#![allow(clippy::result_large_err)]
+
 use hyprstream_metrics::storage::{
     view::ViewDefinition,
     StorageBackend, StorageBackendType,

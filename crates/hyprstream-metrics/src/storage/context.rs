@@ -11,6 +11,9 @@
 //! - **Session-based retrieval**: For cache-augmented generation (CAG)
 //! - **Quality filtering**: Retrieve only high-quality context
 
+// tonic::Status is the idiomatic gRPC error type - boxing would break API
+#![allow(clippy::result_large_err)]
+
 use super::StorageBackend;
 use duckdb::arrow::array::{
     Array, ArrayRef, Float32Array, Float64Array, Int64Array, RecordBatch, StringArray,

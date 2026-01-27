@@ -7,7 +7,7 @@
 //! supporting multiple hypervisors: Cloud Hypervisor, QEMU, Dragonball.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 
 use kata_hypervisor::ch::CloudHypervisor;
@@ -321,9 +321,9 @@ impl SandboxPool {
     async fn create_hypervisor(
         &self,
         sandbox: &PodSandbox,
-        api_socket: &PathBuf,
-        virtiofs_socket: &PathBuf,
-        _cloud_init_iso: &PathBuf,
+        api_socket: &Path,
+        virtiofs_socket: &Path,
+        _cloud_init_iso: &Path,
     ) -> Result<Arc<dyn Hypervisor>> {
         // Build the hypervisor configuration
         let config = self.build_hypervisor_config();
@@ -424,7 +424,7 @@ impl SandboxPool {
     async fn generate_cloud_init_iso(
         &self,
         sandbox: &PodSandbox,
-        iso_path: &PathBuf,
+        iso_path: &Path,
     ) -> Result<()> {
         let sandbox_runtime_dir = iso_path.parent().unwrap();
 

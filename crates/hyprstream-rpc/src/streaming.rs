@@ -511,7 +511,7 @@ impl StreamVerifier {
 ///     &client_pubkey,
 /// )?;
 ///
-/// while let Some(payload) = handle.next()? {
+/// while let Some(payload) = handle.recv_next()? {
 ///     match payload {
 ///         StreamPayload::Data { data, .. } => process(data),
 ///         StreamPayload::Complete { .. } => break,
@@ -580,7 +580,7 @@ impl StreamHandle {
     /// Receive next payload (blocking).
     ///
     /// Returns `None` when stream is complete.
-    pub fn next(&mut self) -> Result<Option<StreamPayload>> {
+    pub fn recv_next(&mut self) -> Result<Option<StreamPayload>> {
         // Return buffered payloads first
         if let Some(payload) = self.pending.pop_front() {
             return Ok(Some(payload));
