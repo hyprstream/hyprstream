@@ -444,7 +444,7 @@ fn build_version() -> &'static str {
 /// Install hyprstream binary/AppImage to versioned directory with symlinks
 ///
 /// Structure:
-/// ```
+/// ```text
 /// ~/.local/share/hyprstream/versions/$VERSION/hyprstream[.appimage]
 /// ~/.local/bin/hyprstream.appimage -> ../share/hyprstream/versions/$VERSION/hyprstream.appimage
 /// ~/.local/bin/hyprstream -> hyprstream.appimage
