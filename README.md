@@ -30,20 +30,22 @@ Easy to get started, just down [Download](https://github.com/hyprstream/hyprstre
 
 ### Quick Install (AppImage)
 
-Download the Universal AppImage from the [v0.2.0 release](https://github.com/hyprstream/hyprstream/releases/tag/v0.2.0). We have published AppImages for each supported CPU and GPU configuration.
+Download the Universal AppImage from the [v0.2.0 release](https://github.com/hyprstream/hyprstream/releases/tag/v0.2.0). We have published AppImages for each supported CPU and GPU configuration. 
 
 ```bash
-# Download and run (Universal recommended)
+# Download and install (Universal recommended)
 chmod +x hyprstream-v0.2.0-x86_64.AppImage
-./hyprstream-v0.2.0-x86_64.AppImage --help
+./hyprstream-v0.2.0-x86_64.AppImage service install
 
 # Apply policy template - hyprstream is deny by default, the following treats local users as admins:
-./hyprstream-v0.2.0-x86_64.AppImage apply-template local
+hyprstream apply-template local
 ```
 
-#### Running in Linux Containers
+The installed files will be located in `$HOME/.local/hyprstream/` and `$HOME/.local/bin/`.
 
-Hyprstream is able to run and manage containers, and can run inside of containers.
+### Expert installation: Linux Container Engines
+
+Hyprstream is able to run and manage secure containers independently, and can run inside of containers. _A container engine is optional with Hyprstream_, but may be useful for deployment to Enterprise systems based on Docker or Kubernetes.
 
 See [README-Docker.md](README-Docker.md) for more information on running in containers.
 
