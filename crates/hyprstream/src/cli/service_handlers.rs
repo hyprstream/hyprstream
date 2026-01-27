@@ -54,7 +54,7 @@ pub async fn handle_service_install(
 
         println!("  Installing systemd units...");
         for service in &target_services {
-            print!("    {} {}... ", "\u{25CB}", service);
+            print!("    \u{25CB} {}... ", service);
             match manager.install(service).await {
                 Ok(_) => println!("\u{2713}"),
                 Err(e) => println!("\u{2717} {}", e),
@@ -95,7 +95,7 @@ pub async fn handle_service_upgrade(
     println!();
 
     for service in &target_services {
-        print!("  {} {}... ", "\u{25CB}", service);
+        print!("  \u{25CB} {}... ", service);
 
         // Reinstall unit (will update ExecStart path)
         if let Err(e) = manager.install(service).await {
@@ -150,7 +150,7 @@ pub async fn handle_service_reinstall(
     // Reinstall
     println!("  Installing unit files...");
     for service in &target_services {
-        print!("    {} {}... ", "\u{25CB}", service);
+        print!("    \u{25CB} {}... ", service);
         match manager.install(service).await {
             Ok(_) => println!("\u{2713}"),
             Err(e) => println!("\u{2717} {}", e),
@@ -160,7 +160,7 @@ pub async fn handle_service_reinstall(
     // Start all
     println!("  Starting services...");
     for service in &target_services {
-        print!("    {} {}... ", "\u{25CB}", service);
+        print!("    \u{25CB} {}... ", service);
         match manager.start(service).await {
             Ok(_) => println!("\u{2713}"),
             Err(e) => println!("\u{2717} {}", e),
@@ -188,7 +188,7 @@ pub async fn handle_service_uninstall(
     println!("Uninstalling hyprstream services...\n");
 
     for service in &target_services {
-        print!("  {} {}... ", "\u{25CB}", service);
+        print!("  \u{25CB} {}... ", service);
 
         // Stop first, then uninstall
         let _ = manager.stop(service).await;
@@ -225,7 +225,7 @@ pub async fn handle_service_start(
         println!("Starting services (systemd)...\n");
 
         for service in &target_services {
-            print!("  {} {}... ", "\u{25CB}", service);
+            print!("  \u{25CB} {}... ", service);
             match manager.start(service).await {
                 Ok(_) => println!("\u{2713}"),
                 Err(e) => println!("\u{2717} {}", e),
@@ -239,7 +239,7 @@ pub async fn handle_service_start(
         let exe = hyprstream_rpc::paths::executable_path()?;
 
         for service in &target_services {
-            print!("  {} {}... ", "\u{25CB}", service);
+            print!("  \u{25CB} {}... ", service);
 
             let config = hyprstream_rpc::ProcessConfig::new(service, &exe)
                 .args(["service", "start", service, "--foreground", "--ipc"]);
@@ -278,7 +278,7 @@ pub async fn handle_service_stop(
         let manager = hyprstream_rpc::detect_service_manager().await?;
 
         for service in &target_services {
-            print!("  {} {} (systemd)... ", "\u{25CB}", service);
+            print!("  \u{25CB} {} (systemd)... ", service);
             match manager.stop(service).await {
                 Ok(_) => println!("\u{2713}"),
                 Err(_) => println!("-"),
@@ -292,7 +292,7 @@ pub async fn handle_service_stop(
         let pid_file = runtime_dir.join(format!("{}.pid", service));
 
         if pid_file.exists() {
-            print!("  {} {} (daemon)... ", "\u{25CB}", service);
+            print!("  \u{25CB} {} (daemon)... ", service);
             if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
                 if let Ok(pid) = pid_str.trim().parse::<i32>() {
                     let nix_pid = nix::unistd::Pid::from_raw(pid);
@@ -351,7 +351,7 @@ pub async fn handle_service_status(
 
     // Service status - check both systemd and daemon PID files
     println!("\nService Status:");
-    println!("  {:<15} {:<10} {}", "SERVICE", "STATUS", "MODE");
+    println!("  {:<15} {:<10} MODE", "SERVICE", "STATUS");
     println!("  {}", "-".repeat(45));
 
     let runtime_dir = hyprstream_rpc::paths::runtime_dir();
@@ -457,7 +457,7 @@ fn install_command_alias() -> Result<(PathBuf, PathBuf, bool, Vec<String>)> {
     // Get directories using paths module
     let local_bin = hyprstream_rpc::paths::bin_dir()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine user executable directory"))?;
-    let ver_dir = hyprstream_rpc::paths::version_dir(&version)
+    let ver_dir = hyprstream_rpc::paths::version_dir(version)
         .ok_or_else(|| anyhow::anyhow!("Cannot determine version directory"))?;
 
     std::fs::create_dir_all(&local_bin)
@@ -508,7 +508,7 @@ fn install_command_alias() -> Result<(PathBuf, PathBuf, bool, Vec<String>)> {
         .join("share")
         .join("hyprstream")
         .join("versions")
-        .join(&version)
+        .join(version)
         .join(filename);
 
     // Remove old symlinks/files
@@ -589,7 +589,7 @@ fn update_shell_profiles(home: &Path, bin_dir: &Path) -> Result<Vec<String>> {
                     .open(&profile_path)
                     .with_context(|| format!("Failed to open: {}", profile_path.display()))?;
                 writeln!(file, "\n# Added by hyprstream\n{}", path_line)?;
-                updated.push(profile.to_string());
+                updated.push((*profile).to_owned());
             }
         }
     }

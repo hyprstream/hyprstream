@@ -41,7 +41,7 @@ pub fn service_unit(service: &str) -> Result<String> {
     // Prefer installed binary for systemd units (stable location)
     let exec = paths::installed_executable_path()
         .map(Ok)
-        .unwrap_or_else(|| paths::executable_path())
+        .unwrap_or_else(paths::executable_path)
         .context("Failed to get executable path")?;
 
     // Capture environment variables to forward to the service

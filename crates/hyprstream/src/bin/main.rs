@@ -165,7 +165,7 @@ enum TelemetryProvider {
 /// Initialize OpenTelemetry with the specified provider
 fn init_telemetry(provider: TelemetryProvider) -> Result<()> {
     let service_name =
-        std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "hyprstream".to_string());
+        std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "hyprstream".to_owned());
 
     // Create resource with service information
     let resource = Resource::builder()
@@ -178,7 +178,7 @@ fn init_telemetry(provider: TelemetryProvider) -> Result<()> {
     let tracer_provider = match provider {
         TelemetryProvider::Otlp => {
             let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                .unwrap_or_else(|_| "http://localhost:4317".to_string());
+                .unwrap_or_else(|_| "http://localhost:4317".to_owned());
 
             info!("Using OTLP exporter for OpenTelemetry at {}", endpoint);
 
@@ -216,7 +216,7 @@ fn init_telemetry(provider: TelemetryProvider) -> Result<()> {
     };
 
     let filter = EnvFilter::builder()
-        .parse_lossy(std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_string()));
+        .parse_lossy(std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_owned()));
 
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(true)
@@ -273,7 +273,7 @@ fn main() -> Result<()> {
 
         // Initialize OpenTelemetry based on environment
         let otel_enabled = std::env::var("HYPRSTREAM_OTEL_ENABLE")
-            .unwrap_or_else(|_| "false".to_string()) // Default to disabled
+            .unwrap_or_else(|_| "false".to_owned()) // Default to disabled
             .parse::<bool>()
             .unwrap_or(false);
 
@@ -299,7 +299,7 @@ fn main() -> Result<()> {
 
                 tracing_subscriber::fmt()
                     .with_env_filter(EnvFilter::builder().parse_lossy(
-                        std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_string()),
+                        std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_owned()),
                     ))
                     .with_target(true)
                     .with_file(true)
@@ -313,7 +313,7 @@ fn main() -> Result<()> {
                 // Console logging only
                 tracing_subscriber::fmt()
                     .with_env_filter(EnvFilter::builder().parse_lossy(
-                        std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_string()),
+                        std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_owned()),
                     ))
                     .with_target(true)
                     .with_file(true)
@@ -653,7 +653,7 @@ fn main() -> Result<()> {
                                     use std::io::Read;
                                     let mut buffer = String::new();
                                     std::io::stdin().read_to_string(&mut buffer)?;
-                                    buffer.trim().to_string()
+                                    buffer.trim().to_owned()
                                 }
                             };
                             handle_training_infer(
@@ -747,7 +747,7 @@ fn main() -> Result<()> {
                     use std::io::Read;
                     let mut buffer = String::new();
                     std::io::stdin().read_to_string(&mut buffer)?;
-                    buffer.trim().to_string()
+                    buffer.trim().to_owned()
                 }
             };
 
@@ -783,7 +783,7 @@ fn main() -> Result<()> {
             )?;
         }
 
-        Commands::List { .. } => {
+        Commands::List => {
             let ctx = ctx.clone();
             with_runtime(
                 RuntimeConfig {
@@ -1174,7 +1174,7 @@ fn main() -> Result<()> {
                 },
                 || async move {
                     // Check if worker is in the startup services list
-                    let worker_already_running = services_startup.contains(&"worker".to_string());
+                    let worker_already_running = services_startup.contains(&"worker".to_owned());
 
                     if worker_already_running {
                         info!("WorkerService is managed by systemd, connecting to existing service");
@@ -1189,7 +1189,7 @@ fn main() -> Result<()> {
                         .unwrap_or_else(|| std::path::PathBuf::from("."))
                         .join("hyprstream");
                     let runtime_dir = dirs::runtime_dir()
-                        .unwrap_or_else(|| std::env::temp_dir())
+                        .unwrap_or_else(std::env::temp_dir)
                         .join("hyprstream");
 
                     // Kata VM files location from KATA_BOOT_PATH env var
@@ -1362,7 +1362,7 @@ fn main() -> Result<()> {
 
                             // Extract instance ID from name (e.g., "inference@abc123" -> "abc123")
                             let instance_id = if let Some(id) = name.strip_prefix("inference@") {
-                                id.to_string()
+                                id.to_owned()
                             } else {
                                 return Err(anyhow::anyhow!("--callback requires inference@{{id}} format (got: {})", name));
                             };
