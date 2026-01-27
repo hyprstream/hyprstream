@@ -133,7 +133,7 @@ pub fn is_root() -> bool {
     nix::unistd::geteuid().is_root()
 }
 
-/// Get the stable executable path for spawning subprocesses or systemd units.
+/// Get the stable executable path for spawning subprocesses.
 ///
 /// When running from an AppImage, `current_exe()` returns the temporary mount path
 /// (e.g., `/tmp/.mount_hyprXXX/usr/bin/hyprstream`) which becomes invalid when the
@@ -156,6 +156,59 @@ pub fn executable_path() -> std::io::Result<PathBuf> {
 
     // Fall back to current executable
     std::env::current_exe()
+}
+
+// =============================================================================
+// Install paths
+// =============================================================================
+
+/// User's executable directory (`~/.local/bin`)
+pub fn bin_dir() -> Option<PathBuf> {
+    dirs::executable_dir()
+}
+
+/// Hyprstream data directory (`~/.local/share/hyprstream`)
+pub fn data_dir() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("hyprstream"))
+}
+
+/// Versions directory (`~/.local/share/hyprstream/versions`)
+pub fn versions_dir() -> Option<PathBuf> {
+    data_dir().map(|d| d.join("versions"))
+}
+
+/// Version-specific directory (`~/.local/share/hyprstream/versions/$VERSION`)
+pub fn version_dir(version: &str) -> Option<PathBuf> {
+    versions_dir().map(|d| d.join(version))
+}
+
+/// Path to installed binary in version directory
+///
+/// Returns path to `hyprstream` or `hyprstream.appimage` in version dir.
+/// Checks for both filenames, preferring `.appimage` if both exist.
+pub fn version_binary(version: &str) -> Option<PathBuf> {
+    let dir = version_dir(version)?;
+    let appimage = dir.join("hyprstream.appimage");
+    if appimage.is_file() {
+        return Some(appimage);
+    }
+    let binary = dir.join("hyprstream");
+    if binary.is_file() {
+        return Some(binary);
+    }
+    None
+}
+
+/// Get the path where hyprstream is installed (if installed)
+///
+/// Returns `~/.local/bin/hyprstream` if it exists (file or symlink).
+pub fn installed_executable_path() -> Option<PathBuf> {
+    let path = bin_dir()?.join("hyprstream");
+    if path.symlink_metadata().is_ok() {
+        Some(path)
+    } else {
+        None
+    }
 }
 
 /// Get the current user's UID

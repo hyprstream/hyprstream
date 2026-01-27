@@ -33,10 +33,16 @@ WantedBy=sockets.target
 /// Environment variables (LD_LIBRARY_PATH, LIBTORCH) are captured from
 /// the process environment and forwarded to the service unit.
 ///
-/// When running from an AppImage, uses the `$APPIMAGE` path instead of the
-/// extracted binary path to ensure services can restart after the AppImage exits.
+/// Executable path priority for systemd units:
+/// 1. Installed binary at `~/.local/bin/hyprstream` (stable, survives updates)
+/// 2. `$APPIMAGE` path (when running from AppImage)
+/// 3. `current_exe()` fallback
 pub fn service_unit(service: &str) -> Result<String> {
-    let exec = paths::executable_path().context("Failed to get executable path")?;
+    // Prefer installed binary for systemd units (stable location)
+    let exec = paths::installed_executable_path()
+        .map(Ok)
+        .unwrap_or_else(|| paths::executable_path())
+        .context("Failed to get executable path")?;
 
     // Capture environment variables to forward to the service
     let ld_library_path = std::env::var("LD_LIBRARY_PATH").ok();

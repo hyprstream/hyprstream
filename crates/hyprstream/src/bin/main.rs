@@ -68,7 +68,7 @@ use tracing_appender::rolling::{RollingFileAppender, Rotation};
 #[derive(Parser)]
 #[command(
     name = "hyprstream",
-    version = env!("CARGO_PKG_VERSION"),
+    version = env!("BUILD_VERSION"),
     about = "Real-time adaptive ML inference server with dynamic sparse weight adjustments",
     long_about = None
 )]

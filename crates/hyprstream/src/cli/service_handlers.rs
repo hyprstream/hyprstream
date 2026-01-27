@@ -3,7 +3,10 @@
 //! Provides lifecycle management for hyprstream services including
 //! installation, upgrade, start/stop, and status display.
 
-use anyhow::Result;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
 use tracing::info;
 
 /// Handle `service install` - Install units and start services
@@ -13,14 +16,7 @@ pub async fn handle_service_install(
 ) -> Result<()> {
     let target_services = services_filter.unwrap_or_else(|| config_services.to_vec());
 
-    if !hyprstream_rpc::has_systemd() {
-        println!("Systemd not available. Services will be spawned directly when started.");
-        return Ok(());
-    }
-
-    let manager = hyprstream_rpc::detect_service_manager().await?;
-
-    println!("Installing hyprstream services...\n");
+    println!("Installing hyprstream...\n");
 
     // Show executable path being used
     if let Ok(appimage) = std::env::var("APPIMAGE") {
@@ -30,15 +26,48 @@ pub async fn handle_service_install(
     }
     println!();
 
-    for service in &target_services {
-        print!("  {} {}... ", "\u{25CB}", service);
-        match manager.ensure(service).await {
-            Ok(_) => println!("\u{2713}"),
-            Err(e) => println!("\u{2717} {}", e),
+    // Install command alias to user's executable directory
+    println!("  Installing command...");
+    match install_command_alias() {
+        Ok((bin_dir, version_dir, is_appimage, updated_profiles)) => {
+            let type_str = if is_appimage { "AppImage" } else { "binary" };
+            println!("    {} ({})", version_dir.display(), type_str);
+            println!(
+                "    {} -> ...",
+                bin_dir.join("hyprstream.appimage").display()
+            );
+            println!(
+                "    {} -> hyprstream.appimage",
+                bin_dir.join("hyprstream").display()
+            );
+            if !updated_profiles.is_empty() {
+                println!("    PATH updated: {}", updated_profiles.join(" "));
+            }
+        }
+        Err(e) => println!("    skipped ({})", e),
+    }
+    println!();
+
+    // Install systemd units if available
+    if hyprstream_rpc::has_systemd() {
+        let manager = hyprstream_rpc::detect_service_manager().await?;
+
+        println!("  Installing systemd units...");
+        for service in &target_services {
+            print!("    {} {}... ", "\u{25CB}", service);
+            match manager.install(service).await {
+                Ok(_) => println!("\u{2713}"),
+                Err(e) => println!("\u{2717} {}", e),
+            }
         }
     }
 
     println!("\n\u{2713} Install complete");
+    println!();
+    println!("Next steps:");
+    println!("  1. Open a new shell to use the 'hyprstream' command");
+    println!("  2. Start services with: hyprstream service start");
+    println!("     Check status with:   hyprstream service status");
     Ok(())
 }
 
@@ -392,4 +421,178 @@ pub async fn handle_service_status(
     }
 
     Ok(())
+}
+
+// =============================================================================
+// Version helpers
+// =============================================================================
+
+/// Get the full build version string
+///
+/// Format: `{cargo_version}+{branch}.g{sha7}[.dirty]`
+/// Example: `0.1.0-alpha-7+main.gabc1234.dirty`
+///
+/// Uses BUILD_VERSION from build.rs, falls back to CARGO_PKG_VERSION.
+fn build_version() -> &'static str {
+    option_env!("BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
+// =============================================================================
+// Command alias installation helpers
+// =============================================================================
+
+/// Install hyprstream binary/AppImage to versioned directory with symlinks
+///
+/// Structure:
+/// ```
+/// ~/.local/share/hyprstream/versions/$VERSION/hyprstream[.appimage]
+/// ~/.local/bin/hyprstream.appimage -> ../share/hyprstream/versions/$VERSION/hyprstream.appimage
+/// ~/.local/bin/hyprstream -> hyprstream.appimage
+/// ```
+///
+/// Returns (bin_dir, version_dir, is_appimage, updated_profiles) for output.
+fn install_command_alias() -> Result<(PathBuf, PathBuf, bool, Vec<String>)> {
+    let version = build_version();
+
+    // Get directories using paths module
+    let local_bin = hyprstream_rpc::paths::bin_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine user executable directory"))?;
+    let ver_dir = hyprstream_rpc::paths::version_dir(&version)
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine version directory"))?;
+
+    std::fs::create_dir_all(&local_bin)
+        .with_context(|| format!("Failed to create directory: {}", local_bin.display()))?;
+    std::fs::create_dir_all(&ver_dir)
+        .with_context(|| format!("Failed to create directory: {}", ver_dir.display()))?;
+
+    // Get source: $APPIMAGE if available (stable path), otherwise current_exe()
+    let (source, is_appimage) = if let Ok(appimage_env) = std::env::var("APPIMAGE") {
+        (PathBuf::from(&appimage_env), true)
+    } else {
+        let exe = std::env::current_exe().context("Failed to get current executable path")?;
+        let is_appimage = is_appimage_file(&exe).unwrap_or(false);
+        (exe, is_appimage)
+    };
+
+    // Determine filenames based on type
+    let filename = if is_appimage {
+        "hyprstream.appimage"
+    } else {
+        "hyprstream"
+    };
+
+    // Copy binary to versioned directory
+    let versioned_binary = ver_dir.join(filename);
+    remove_if_exists(&versioned_binary)?;
+    std::fs::copy(&source, &versioned_binary).with_context(|| {
+        format!(
+            "Failed to copy {} -> {}",
+            source.display(),
+            versioned_binary.display()
+        )
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&versioned_binary, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    // Create symlinks in ~/.local/bin/
+    let bin_appimage = local_bin.join("hyprstream.appimage");
+    let bin_hyprstream = local_bin.join("hyprstream");
+
+    // Calculate relative path from bin to versioned binary
+    // ~/.local/bin/ -> ~/.local/share/hyprstream/versions/$VERSION/
+    let relative_path = Path::new("..")
+        .join("share")
+        .join("hyprstream")
+        .join("versions")
+        .join(&version)
+        .join(filename);
+
+    // Remove old symlinks/files
+    remove_if_exists(&bin_appimage)?;
+    remove_if_exists(&bin_hyprstream)?;
+
+    // Create symlinks
+    #[cfg(unix)]
+    {
+        // hyprstream.appimage -> ../share/hyprstream/versions/$VERSION/hyprstream[.appimage]
+        std::os::unix::fs::symlink(&relative_path, &bin_appimage)
+            .with_context(|| format!("Failed to create symlink: {}", bin_appimage.display()))?;
+
+        // hyprstream -> hyprstream.appimage
+        std::os::unix::fs::symlink(Path::new("hyprstream.appimage"), &bin_hyprstream)
+            .with_context(|| format!("Failed to create symlink: {}", bin_hyprstream.display()))?;
+    }
+
+    // Update shell profiles for PATH
+    let updated_profiles = if let Some(home) = dirs::home_dir() {
+        update_shell_profiles(&home, &local_bin).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    Ok((local_bin, ver_dir, is_appimage, updated_profiles))
+}
+
+/// Check if a file is an AppImage by reading its magic bytes
+///
+/// AppImage Type 2 has:
+/// - ELF magic at offset 0: 0x7f 'E' 'L' 'F'
+/// - AppImage magic at offset 8: 'A' 'I' 0x02
+fn is_appimage_file(path: &Path) -> Result<bool> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("Failed to open: {}", path.display()))?;
+
+    let mut header = [0u8; 11];
+    if file.read_exact(&mut header).is_err() {
+        return Ok(false);
+    }
+
+    // Check ELF magic
+    let is_elf = header[0..4] == [0x7f, b'E', b'L', b'F'];
+
+    // Check AppImage Type 2 magic at offset 8
+    let is_appimage = header[8..11] == [b'A', b'I', 0x02];
+
+    Ok(is_elf && is_appimage)
+}
+
+/// Remove a file if it exists (handles both regular files and symlinks)
+fn remove_if_exists(path: &Path) -> Result<()> {
+    if path.symlink_metadata().is_ok() {
+        std::fs::remove_file(path)
+            .with_context(|| format!("Failed to remove: {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Update shell profiles to include bin_dir in PATH
+fn update_shell_profiles(home: &Path, bin_dir: &Path) -> Result<Vec<String>> {
+    let path_line = format!(r#"export PATH="{}:$PATH""#, bin_dir.display());
+    let bin_dir_str = bin_dir.to_string_lossy();
+    let mut updated = Vec::new();
+
+    for profile in &[".bashrc", ".zshrc", ".profile"] {
+        let profile_path = home.join(profile);
+        if profile_path.exists() {
+            let content = std::fs::read_to_string(&profile_path)
+                .with_context(|| format!("Failed to read: {}", profile_path.display()))?;
+            // Check if bin_dir already in PATH
+            if !content.contains(bin_dir_str.as_ref()) {
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&profile_path)
+                    .with_context(|| format!("Failed to open: {}", profile_path.display()))?;
+                writeln!(file, "\n# Added by hyprstream\n{}", path_line)?;
+                updated.push(profile.to_string());
+            }
+        }
+    }
+
+    Ok(updated)
 }
