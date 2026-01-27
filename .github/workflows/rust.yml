@@ -56,3 +56,45 @@ jobs:
 
     - name: Run tests
       run: cargo test --release --verbose --features download-libtorch
+
+    - name: Cache libtorch
+      if: github.event_name == 'pull_request'
+      uses: actions/cache@v4
+      with:
+        path: libtorch
+        key: libtorch-cpu-2.5.1
+
+    - name: Package AppImage
+      if: github.event_name == 'pull_request'
+      run: |
+        # Extract version from binary
+        VERSION=$(target/release/hyprstream --version | awk '{print $2}')
+        echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+        # Download libtorch CPU (if not cached)
+        if [ ! -d libtorch/lib ]; then
+          curl -sSL -o libtorch.zip "https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-2.5.1%2Bcpu.zip"
+          unzip -q libtorch.zip
+        fi
+
+        # Download appimagetool
+        curl -sSL -o appimagetool "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+        chmod +x appimagetool
+
+        # Assemble AppDir
+        mkdir -p hyprstream.AppDir/usr/bin hyprstream.AppDir/usr/lib/libtorch
+        cp target/release/hyprstream hyprstream.AppDir/usr/bin/
+        cp -r libtorch/lib hyprstream.AppDir/usr/lib/libtorch/
+        cp appimage/AppRun-single hyprstream.AppDir/AppRun && chmod +x hyprstream.AppDir/AppRun
+        cp appimage/hyprstream.desktop appimage/hyprstream.svg hyprstream.AppDir/
+
+        # Build AppImage with version in filename
+        ARCH=x86_64 ./appimagetool hyprstream.AppDir "hyprstream-${VERSION}-cpu-x86_64.AppImage"
+
+    - name: Upload AppImage
+      if: github.event_name == 'pull_request'
+      uses: actions/upload-artifact@v4
+      with:
+        name: appimage-cpu
+        path: hyprstream-*-cpu-x86_64.AppImage
+        retention-days: 7

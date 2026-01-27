@@ -2,6 +2,7 @@ name: Build AppImage
 
 on:
   push:
+    branches: [ "main" ]
     tags:
       - 'v*'
 
@@ -71,11 +72,22 @@ jobs:
             cargo-${{ runner.os }}-${{ matrix.variant }}-
             cargo-${{ runner.os }}-
 
+      - name: Cache libtorch
+        uses: actions/cache@v4
+        with:
+          path: libtorch-cache
+          key: libtorch-${{ matrix.variant }}-${{ env.LIBTORCH_VERSION }}
+
       - name: Download libtorch
         run: |
-          mkdir -p libtorch-cache
-          curl -sSL -o libtorch.zip "${{ matrix.libtorch_url }}"
-          unzip -q libtorch.zip -d libtorch-cache
+          if [ ! -d libtorch-cache/libtorch/lib ]; then
+            echo "Downloading libtorch for ${{ matrix.variant }}..."
+            mkdir -p libtorch-cache
+            curl -sSL -o libtorch.zip "${{ matrix.libtorch_url }}"
+            unzip -q libtorch.zip -d libtorch-cache
+          else
+            echo "Using cached libtorch for ${{ matrix.variant }}"
+          fi
           echo "LIBTORCH=$PWD/libtorch-cache/libtorch" >> $GITHUB_ENV
           echo "LD_LIBRARY_PATH=$PWD/libtorch-cache/libtorch/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
@@ -229,9 +241,10 @@ jobs:
           path: hyprstream-*-x86_64.AppImage
           retention-days: 5
 
-  # Create GitHub Release with all AppImages
+  # Create GitHub Release with all AppImages (tags only)
   release:
     name: Create Release
+    if: startsWith(github.ref, 'refs/tags/')
     needs: [assemble-per-backend, assemble-universal]
     runs-on: ubuntu-22.04
     permissions:
