@@ -29,20 +29,15 @@ pub struct WorkerConfig {
 
 
 /// Hypervisor type for VM management
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HypervisorType {
     /// Cloud Hypervisor (recommended, requires cloud-hypervisor binary)
+    #[default]
     CloudHypervisor,
     /// Dragonball (built-in VMM, no external binary required)
     #[cfg(feature = "dragonball")]
     Dragonball,
-}
-
-impl Default for HypervisorType {
-    fn default() -> Self {
-        Self::CloudHypervisor
-    }
 }
 
 impl std::fmt::Display for HypervisorType {
