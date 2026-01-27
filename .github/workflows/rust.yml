@@ -37,6 +37,7 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
+    needs: clippy  # Only build if clippy passes
 
     steps:
     - uses: actions/checkout@v4
