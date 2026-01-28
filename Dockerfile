@@ -31,6 +31,7 @@ RUN apt-get update && apt-get install -y \
     rsync \
     ca-certificates \
     capnproto \
+    cmake \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
