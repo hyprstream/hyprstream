@@ -13,23 +13,11 @@ env:
   RUSTC_WRAPPER: "sccache"
 
 jobs:
-  # Build each backend variant in parallel
-  build-variants:
-    name: Build ${{ matrix.variant }}
+  # Build all backend variants sequentially on a single runner
+  # This maximizes sccache hits and minimizes disk usage
+  build-all-variants:
+    name: Build all variants (sequential)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        variant: [cpu, cuda128, cuda130, rocm71]
-        include:
-          - variant: cpu
-            libtorch_url: "https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-2.10.0%2Bcpu.zip"
-          - variant: cuda128
-            libtorch_url: "https://download.pytorch.org/libtorch/cu128/libtorch-shared-with-deps-2.10.0%2Bcu128.zip"
-          - variant: cuda130
-            libtorch_url: "https://download.pytorch.org/libtorch/cu130/libtorch-shared-with-deps-2.10.0%2Bcu130.zip"
-          - variant: rocm71
-            libtorch_url: "https://download.pytorch.org/libtorch/rocm7.1/libtorch-shared-with-deps-2.10.0%2Brocm7.1.zip"
 
     steps:
       - name: Checkout code
@@ -67,185 +55,85 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: cargo-${{ runner.os }}-${{ matrix.variant }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-sequential-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-${{ matrix.variant }}-
+            cargo-${{ runner.os }}-sequential-
             cargo-${{ runner.os }}-
 
-      - name: Cache libtorch
-        uses: actions/cache@v4
-        with:
-          path: libtorch-cache
-          key: libtorch-${{ matrix.variant }}-${{ env.LIBTORCH_VERSION }}
-
-      - name: Download libtorch
-        run: |
-          if [ ! -d libtorch-cache/libtorch/lib ]; then
-            echo "Downloading libtorch for ${{ matrix.variant }}..."
-            mkdir -p libtorch-cache
-            curl -sSL -o libtorch.zip "${{ matrix.libtorch_url }}"
-            unzip -q libtorch.zip -d libtorch-cache
-          else
-            echo "Using cached libtorch for ${{ matrix.variant }}"
-          fi
-          echo "LIBTORCH=$PWD/libtorch-cache/libtorch" >> $GITHUB_ENV
-          echo "LD_LIBRARY_PATH=$PWD/libtorch-cache/libtorch/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
-
-      - name: Build hyprstream
-        run: |
-          export LIBTORCH_BYPASS_VERSION_CHECK=1
-          cargo build --release --features otel
-
-      - name: Prepare artifacts
-        run: |
-          mkdir -p artifacts/${{ matrix.variant }}
-          cp target/release/hyprstream artifacts/${{ matrix.variant }}/hyprstream-${{ matrix.variant }}
-          # Package libtorch libraries (only .so files, not headers)
-          tar -czf artifacts/${{ matrix.variant }}/libtorch.tar.gz -C libtorch-cache/libtorch lib
-
-      - name: Upload variant artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: variant-${{ matrix.variant }}
-          path: artifacts/${{ matrix.variant }}/
-          retention-days: 1
-
-  # Assemble per-backend AppImages
-  assemble-per-backend:
-    name: AppImage (${{ matrix.variant }})
-    needs: build-variants
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        variant: [cpu, cuda128, cuda130, rocm71]
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download variant artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: variant-${{ matrix.variant }}
-          path: artifacts/
-
-      - name: Download appimagetool
-        run: |
-          curl -sSL -o appimagetool \
-            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
-          chmod +x appimagetool
-
-      - name: Extract version from tag
+      - name: Extract version
         id: version
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          [[ "$VERSION" == "$GITHUB_REF_NAME" ]] && VERSION="dev"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Assemble AppDir
+      - name: Build CPU AppImage
         run: |
-          APPDIR="hyprstream-${{ matrix.variant }}.AppDir"
-          mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib"
+          ./appimage/build-appimage.sh build cpu --version ${{ steps.version.outputs.version }}
+          ./appimage/build-appimage.sh clean cpu
 
-          # Copy binary
-          cp "artifacts/hyprstream-${{ matrix.variant }}" "$APPDIR/usr/bin/hyprstream"
-          chmod +x "$APPDIR/usr/bin/hyprstream"
-
-          # Extract and copy libtorch
-          mkdir -p "$APPDIR/usr/lib/libtorch"
-          tar -xzf artifacts/libtorch.tar.gz -C "$APPDIR/usr/lib/libtorch"
-
-          # Copy AppRun with variant embedded
-          sed "s/HYPRSTREAM_VARIANT:-cpu/HYPRSTREAM_VARIANT:-${{ matrix.variant }}/" \
-            appimage/AppRun-single > "$APPDIR/AppRun"
-          chmod +x "$APPDIR/AppRun"
-
-          # Copy desktop and icon
-          cp appimage/hyprstream.desktop "$APPDIR/"
-          cp appimage/hyprstream.svg "$APPDIR/"
-
-      - name: Build AppImage
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          OUTPUT="hyprstream-${VERSION}-${{ matrix.variant }}-x86_64.AppImage"
-          ARCH=x86_64 ./appimagetool "hyprstream-${{ matrix.variant }}.AppDir" "$OUTPUT"
-
-      - name: Upload AppImage
+      - name: Upload CPU AppImage
         uses: actions/upload-artifact@v4
         with:
-          name: appimage-${{ matrix.variant }}
-          path: hyprstream-*-${{ matrix.variant }}-x86_64.AppImage
+          name: appimage-cpu
+          path: appimage/output/*-cpu-*.AppImage
           retention-days: 5
 
-  # Assemble universal AppImage with all backends
-  assemble-universal:
-    name: AppImage (universal)
-    needs: build-variants
-    runs-on: ubuntu-latest
+      - name: Build CUDA 12.8 AppImage
+        run: |
+          ./appimage/build-appimage.sh build cuda128 --version ${{ steps.version.outputs.version }}
+          ./appimage/build-appimage.sh clean cuda128
 
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download all variant artifacts
-        uses: actions/download-artifact@v4
+      - name: Upload CUDA 12.8 AppImage
+        uses: actions/upload-artifact@v4
         with:
-          pattern: variant-*
-          path: artifacts/
-          merge-multiple: false
+          name: appimage-cuda128
+          path: appimage/output/*-cuda128-*.AppImage
+          retention-days: 5
 
-      - name: Download appimagetool
+      - name: Build CUDA 13.0 AppImage
         run: |
-          curl -sSL -o appimagetool \
-            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
-          chmod +x appimagetool
+          ./appimage/build-appimage.sh build cuda130 --version ${{ steps.version.outputs.version }}
+          ./appimage/build-appimage.sh clean cuda130
 
-      - name: Extract version from tag
-        id: version
+      - name: Upload CUDA 13.0 AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: appimage-cuda130
+          path: appimage/output/*-cuda130-*.AppImage
+          retention-days: 5
+
+      - name: Build ROCm 7.1 AppImage
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          ./appimage/build-appimage.sh build rocm71 --version ${{ steps.version.outputs.version }}
+          ./appimage/build-appimage.sh clean rocm71
 
-      - name: Assemble universal AppDir
+      - name: Upload ROCm 7.1 AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: appimage-rocm71
+          path: appimage/output/*-rocm71-*.AppImage
+          retention-days: 5
+
+      - name: Build Universal AppImage
         run: |
-          APPDIR="hyprstream-universal.AppDir"
-          mkdir -p "$APPDIR/usr/bin"
+          ./appimage/build-appimage.sh build universal --version ${{ steps.version.outputs.version }}
 
-          for variant in cpu cuda128 cuda130 rocm71; do
-            # Copy variant binary
-            cp "artifacts/variant-$variant/hyprstream-$variant" "$APPDIR/usr/bin/"
-            chmod +x "$APPDIR/usr/bin/hyprstream-$variant"
-
-            # Extract and copy libtorch for this variant
-            mkdir -p "$APPDIR/usr/lib/$variant/libtorch"
-            tar -xzf "artifacts/variant-$variant/libtorch.tar.gz" -C "$APPDIR/usr/lib/$variant/libtorch"
-          done
-
-          # Copy universal AppRun
-          cp appimage/AppRun "$APPDIR/"
-          chmod +x "$APPDIR/AppRun"
-
-          # Copy desktop and icon
-          cp appimage/hyprstream.desktop "$APPDIR/"
-          cp appimage/hyprstream.svg "$APPDIR/"
-
-      - name: Build universal AppImage
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          OUTPUT="hyprstream-${VERSION}-x86_64.AppImage"
-          ARCH=x86_64 ./appimagetool "hyprstream-universal.AppDir" "$OUTPUT"
-
-      - name: Upload universal AppImage
+      - name: Upload Universal AppImage
         uses: actions/upload-artifact@v4
         with:
           name: appimage-universal
-          path: hyprstream-*-x86_64.AppImage
+          path: appimage/output/hyprstream-${{ steps.version.outputs.version }}-x86_64.AppImage
           retention-days: 5
+
+      - name: Show sccache stats
+        run: sccache --show-stats
 
   # Create GitHub Release with all AppImages (tags only)
   release:
     name: Create Release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [assemble-per-backend, assemble-universal]
+    needs: build-all-variants
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -324,6 +212,4 @@ jobs:
       - name: Cleanup artifacts
         uses: geekyeggo/delete-artifact@v4
         with:
-          name: |
-            variant-*
-            appimage-*
+          name: appimage-*
