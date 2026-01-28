@@ -161,8 +161,13 @@ impl Git2DB {
         let registry_path = base_dir.join(".registry");
         let git_manager = GitManager::global();
 
+        // Check if directory exists AND is a git repository
+        // (directory might exist but not be initialized, e.g., from Docker volume mount)
+        let is_git_repo = registry_path.join(".git").exists()
+            || (registry_path.exists() && Repository::open(&registry_path).is_ok());
+
         // Create or open registry repo
-        if registry_path.exists() {
+        if is_git_repo {
             // Verify we can open it
             let _repo = git_manager.get_repository(&registry_path).map_err(|e| {
                 Git2DBError::repository(

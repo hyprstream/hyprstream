@@ -78,12 +78,13 @@ tempfile = "3.9"
 which = "7"
 
 # Optional XET large file storage support
-data = { git = "https://github.com/huggingface/xet-core", branch = "main" }
-cas_client = { git = "https://github.com/huggingface/xet-core", branch = "main" }
-cas_object = { git = "https://github.com/huggingface/xet-core", branch = "main" }
-cas_types = { git = "https://github.com/huggingface/xet-core", branch = "main" }
-chunk_cache = { git = "https://github.com/huggingface/xet-core", branch = "main" }
-merklehash = { git = "https://github.com/huggingface/xet-core", branch = "main" }
+# Pinned to git-xet-v0.2.0 for API stability (FileProvider/SeekingOutputProvider removed in main)
+data = { git = "https://github.com/huggingface/xet-core", tag = "git-xet-v0.2.0" }
+cas_client = { git = "https://github.com/huggingface/xet-core", tag = "git-xet-v0.2.0" }
+cas_object = { git = "https://github.com/huggingface/xet-core", tag = "git-xet-v0.2.0" }
+cas_types = { git = "https://github.com/huggingface/xet-core", tag = "git-xet-v0.2.0" }
+chunk_cache = { git = "https://github.com/huggingface/xet-core", tag = "git-xet-v0.2.0" }
+merklehash = { git = "https://github.com/huggingface/xet-core", tag = "git-xet-v0.2.0" }
 async-trait = "0.1"
 
 # Optional gittorrent transport support

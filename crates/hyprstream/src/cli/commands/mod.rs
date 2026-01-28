@@ -51,18 +51,18 @@ impl From<KVQuantArg> for KVQuantType {
 /// Overall execution mode for the hyprstream CLI and services
 ///
 /// This determines how services are spawned and managed:
-/// - **Inproc**: Single process, all services in-process, inproc:// ZMQ transport
-/// - **IpcStandalone**: Multiple processes spawned directly, ipc:// ZMQ transport
+/// - **Inproc**: Single process, all services in-process, inproc:// ZMQ transport (mobile/embedded)
+/// - **IpcStandalone**: Multiple processes spawned directly, ipc:// ZMQ transport (default)
 /// - **IpcSystemd**: Multiple systemd services with socket activation, ipc:// ZMQ transport
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExecutionMode {
-    /// Standalone mode with in-process services (default for development)
-    #[default]
+    /// In-process mode with all services in a single process (mobile/embedded builds)
     Inproc,
 
-    /// Standalone mode with forked processes (no systemd)
+    /// Standalone mode with forked processes (default for desktop/server/containers)
     /// Services spawned via ProcessSpawner with StandaloneBackend
+    #[default]
     IpcStandalone,
 
     /// Systemd mode with socket-activated services
@@ -72,6 +72,13 @@ pub enum ExecutionMode {
 
 impl ExecutionMode {
     /// Detect best execution mode based on system capabilities
+    ///
+    /// Returns:
+    /// - `IpcSystemd` if systemd is available
+    /// - `IpcStandalone` otherwise (default for desktop/server/containers)
+    ///
+    /// Note: `Inproc` mode is reserved for special builds (mobile/embedded)
+    /// and must be explicitly requested via CLI flag (future feature).
     pub fn detect() -> Self {
         #[cfg(feature = "systemd")]
         {
@@ -79,7 +86,8 @@ impl ExecutionMode {
                 return ExecutionMode::IpcSystemd;
             }
         }
-        ExecutionMode::Inproc
+        // Default to standalone IPC mode (services as separate processes)
+        ExecutionMode::IpcStandalone
     }
 
     /// Get the EndpointMode for this execution mode

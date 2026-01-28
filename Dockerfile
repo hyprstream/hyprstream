@@ -67,7 +67,7 @@ RUN --mount=type=cache,target=/tmp/libtorch-cache \
     unzip -q "$CACHE_FILE" -d /opt
 
 ENV LIBTORCH=/opt/libtorch
-ENV LD_LIBRARY_PATH=/opt/libtorch/lib:$LD_LIBRARY_PATH
+ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 
 #############################################
 # CUDA 13.0 Builder
@@ -97,7 +97,7 @@ RUN --mount=type=cache,target=/tmp/libtorch-cache \
     unzip -q "$CACHE_FILE" -d /opt
 
 ENV LIBTORCH=/opt/libtorch
-ENV LD_LIBRARY_PATH=/opt/libtorch/lib:$LD_LIBRARY_PATH
+ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 
 #############################################
 # ROCm 7.1 Builder
@@ -110,6 +110,7 @@ ARG LIBTORCH_VERSION
 ENV LIBTORCH_BYPASS_VERSION_CHECK=1
 
 # Download and extract LibTorch for ROCm 7.1 (cached across builds)
+# Note: libtorch ROCm build bundles HIP/ROCm libraries
 RUN --mount=type=cache,target=/tmp/libtorch-cache \
     CACHE_FILE="/tmp/libtorch-cache/libtorch-rocm71-${LIBTORCH_VERSION}.zip" && \
     if [ ! -f "$CACHE_FILE" ]; then \
@@ -118,7 +119,7 @@ RUN --mount=type=cache,target=/tmp/libtorch-cache \
     unzip -q "$CACHE_FILE" -d /opt
 
 ENV LIBTORCH=/opt/libtorch
-ENV LD_LIBRARY_PATH=/opt/libtorch/lib:$LD_LIBRARY_PATH
+ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 
 #############################################
 # CPU Builder
@@ -137,7 +138,7 @@ RUN --mount=type=cache,target=/tmp/libtorch-cache \
     unzip -q "$CACHE_FILE" -d /opt
 
 ENV LIBTORCH=/opt/libtorch
-ENV LD_LIBRARY_PATH=/opt/libtorch/lib:$LD_LIBRARY_PATH
+ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 
 #############################################
 # Select Builder Based on Variant
@@ -153,7 +154,7 @@ COPY Cargo.toml ./
 COPY crates ./crates
 
 ENV LIBTORCH=/opt/libtorch
-ENV LD_LIBRARY_PATH=/opt/libtorch/lib:$LD_LIBRARY_PATH
+ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 
 # Build the project with BuildKit cache mounts for Cargo registry
 # LIBTORCH is already set in the variant-specific builder stages
@@ -164,84 +165,70 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     cargo build --release --no-default-features --features otel,gittorrent,xet
 
 #############################################
-# Runtime Stage Selection
+# Runtime Stage Selection (Distroless)
 #############################################
-
-# Base runtime stage
-FROM debian:${DEBIAN_VERSION} AS runtime-base
-
-# Install common runtime dependencies
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    libgomp1 \
-    git \
-    git-lfs \
-    wget \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
 
 #############################################
 # CUDA 12.8 Runtime
 #############################################
 
-FROM runtime-base AS runtime-cuda128
+FROM gcr.io/distroless/cc-debian12 AS runtime-cuda128
 
-# Install CUDA repository and runtime libraries
-RUN wget https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb && \
-    dpkg -i cuda-keyring_1.1-1_all.deb && \
-    rm cuda-keyring_1.1-1_all.deb && \
-    apt-get update && \
-    apt-get install -y cuda-runtime-12-8 \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+# Copy required system libraries
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib/x86_64-linux-gnu/
 
-# Copy LibTorch libraries from builder
-COPY --from=builder /opt/libtorch /opt/libtorch
+# Copy CUDA runtime libraries from builder (toolkit includes runtime)
+COPY --from=builder /usr/local/cuda-12.8/lib64/libcudart.so* /usr/local/cuda/lib64/
+COPY --from=builder /usr/local/cuda-12.8/lib64/libcublas.so* /usr/local/cuda/lib64/
+COPY --from=builder /usr/local/cuda-12.8/lib64/libcublasLt.so* /usr/local/cuda/lib64/
+
+# Copy only LibTorch shared libraries (skip static libs, headers, cmake)
+COPY --from=builder /opt/libtorch/lib/*.so* /opt/libtorch/lib/
 
 #############################################
 # CUDA 13.0 Runtime
 #############################################
 
-FROM runtime-base AS runtime-cuda130
+FROM gcr.io/distroless/cc-debian12 AS runtime-cuda130
 
-# Install CUDA repository and runtime libraries
-RUN wget https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb && \
-    dpkg -i cuda-keyring_1.1-1_all.deb && \
-    rm cuda-keyring_1.1-1_all.deb && \
-    apt-get update && \
-    apt-get install -y cuda-runtime-13-0 \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+# Copy required system libraries
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib/x86_64-linux-gnu/
 
-# Copy LibTorch libraries from builder
-COPY --from=builder /opt/libtorch /opt/libtorch
+# Copy CUDA runtime libraries from builder (toolkit includes runtime)
+COPY --from=builder /usr/local/cuda-13.0/lib64/libcudart.so* /usr/local/cuda/lib64/
+COPY --from=builder /usr/local/cuda-13.0/lib64/libcublas.so* /usr/local/cuda/lib64/
+COPY --from=builder /usr/local/cuda-13.0/lib64/libcublasLt.so* /usr/local/cuda/lib64/
+
+# Copy only LibTorch shared libraries (skip static libs, headers, cmake)
+COPY --from=builder /opt/libtorch/lib/*.so* /opt/libtorch/lib/
 
 #############################################
 # ROCm 7.1 Runtime
 #############################################
 
-FROM runtime-base AS runtime-rocm71
+FROM gcr.io/distroless/cc-debian12 AS runtime-rocm71
 
-RUN wget https://repo.radeon.com/amdgpu-install/7.1/ubuntu/jammy/amdgpu-install_7.1.70100-1_all.deb && \
-    apt update && \
-    apt install -y ./amdgpu-install_7.1.70100-1_all.deb && \
-    apt install -y python3-setuptools python3-wheel rsync dialog && \
-    apt update && \
-    apt install -y rocm && \
-    rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+# Copy required system libraries
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib/x86_64-linux-gnu/
 
-# Copy LibTorch libraries from builder
-COPY --from=builder /opt/libtorch /opt/libtorch
+# Copy only LibTorch shared libraries (bundles HIP/ROCm libs)
+COPY --from=builder /opt/libtorch/lib/*.so* /opt/libtorch/lib/
 
 #############################################
 # CPU Runtime
 #############################################
 
-FROM runtime-base AS runtime-cpu
+FROM gcr.io/distroless/cc-debian12 AS runtime-cpu
 
-# Copy LibTorch libraries from builder
-COPY --from=builder /opt/libtorch /opt/libtorch
+# Copy required system libraries
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib/x86_64-linux-gnu/
+
+# Copy only LibTorch shared libraries (skip static libs, headers, cmake)
+COPY --from=builder /opt/libtorch/lib/*.so* /opt/libtorch/lib/
 
 #############################################
 # Final Runtime
@@ -250,18 +237,13 @@ COPY --from=builder /opt/libtorch /opt/libtorch
 FROM runtime-${VARIANT} AS runtime
 
 # Copy binary from builder
-COPY --from=builder /build/target/release/hyprstream /usr/local/bin/hyprstream
+COPY --from=builder /build/target/release/hyprstream /hyprstream
 
-# Set LD_LIBRARY_PATH for LibTorch
-ENV LD_LIBRARY_PATH=/opt/libtorch/lib:$LD_LIBRARY_PATH
-
-# Create directories for models and data
-RUN mkdir -p /var/lib/hyprstream/models /var/lib/hyprstream/data
-WORKDIR /var/lib/hyprstream
+# Set library paths
+ENV LD_LIBRARY_PATH=/opt/libtorch/lib:/usr/local/cuda/lib64
 
 # Expose default ports
 EXPOSE 8080 50051
 
-# Run hyprstream
-ENTRYPOINT ["hyprstream"]
-CMD []
+# Run hyprstream (distroless uses absolute paths)
+ENTRYPOINT ["/hyprstream"]
