@@ -8,9 +8,10 @@ use git2::cert::Cert;
 use std::sync::Arc;
 
 /// Progress reporting configuration
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum ProgressConfig {
     /// No progress reporting
+    #[default]
     None,
     /// Simple progress to stdout
     Stdout,
@@ -34,11 +35,12 @@ pub trait ProgressReporter: Send + Sync {
 }
 
 /// Certificate validation configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum CertificateConfig {
     /// Accept all certificates (insecure, for testing)
     AcceptAll,
     /// Default system validation
+    #[default]
     SystemDefault,
     /// Custom validation with pinned certificates
     Pinned(Vec<CertificatePinning>),
@@ -251,17 +253,6 @@ impl CallbackConfig {
     }
 }
 
-impl Default for ProgressConfig {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
-impl Default for CertificateConfig {
-    fn default() -> Self {
-        Self::SystemDefault
-    }
-}
 
 /// Builder for callback configuration
 pub struct CallbackConfigBuilder {
