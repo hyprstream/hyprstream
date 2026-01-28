@@ -372,6 +372,9 @@ fn main() -> Result<()> {
 
     // ========== EXECUTION MODE DETECTION ==========
     // Auto-detect execution mode based on system capabilities
+    // - IpcSystemd: if systemd is available
+    // - IpcStandalone: default for desktop/server/containers (separate processes via IPC)
+    // - Inproc: reserved for mobile/embedded builds (future)
     let execution_mode = hyprstream_core::cli::commands::ExecutionMode::detect();
 
     info!("Execution mode: {}", execution_mode);
@@ -407,6 +410,8 @@ fn main() -> Result<()> {
     // Worker config is now handled by factory - no need to clone separately
 
     // Service handles stored in a Vec for cleanup
+    // Only start all services in Inproc mode (mobile/embedded builds)
+    // For IpcStandalone and IpcSystemd, services are managed externally
     let (registry_client, mut _service_handles, _workflow_service, signing_key, verifying_key): (Arc<dyn RegistryClient>, Vec<SpawnedService>, Option<Arc<WorkflowService>>, SigningKey, VerifyingKey) = if execution_mode == ExecutionMode::Inproc {
         _registry_runtime
         .block_on(async {

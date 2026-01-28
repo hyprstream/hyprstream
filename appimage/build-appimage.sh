@@ -145,10 +145,11 @@ create_appimage() {
     log_info "Creating AppImage for $variant..."
 
     rm -rf "$appdir"
-    mkdir -p "$appdir/usr/bin" "$appdir/usr/lib"
+    mkdir -p "$appdir/usr/bin" "$appdir/usr/lib/libtorch/lib"
 
     cp "$BUILD_DIR/bin/hyprstream-$variant" "$appdir/usr/bin/hyprstream"
-    cp -r "$LIBTORCH_CACHE_DIR/$variant/libtorch" "$appdir/usr/lib/"
+    # Copy only shared libraries (skip static libs, headers, cmake)
+    cp "$LIBTORCH_CACHE_DIR/$variant/libtorch/lib/"*.so* "$appdir/usr/lib/libtorch/lib/"
 
     sed "s/HYPRSTREAM_VARIANT:-cpu/HYPRSTREAM_VARIANT:-$variant/" \
         "$SCRIPT_DIR/AppRun-single" > "$appdir/AppRun"
@@ -174,8 +175,9 @@ create_universal_appimage() {
 
     for variant in "${ALL_VARIANTS[@]}"; do
         cp "$BUILD_DIR/bin/hyprstream-$variant" "$appdir/usr/bin/"
-        mkdir -p "$appdir/usr/lib/$variant"
-        cp -r "$LIBTORCH_CACHE_DIR/$variant/libtorch" "$appdir/usr/lib/$variant/"
+        mkdir -p "$appdir/usr/lib/$variant/libtorch/lib"
+        # Copy only shared libraries (skip static libs, headers, cmake)
+        cp "$LIBTORCH_CACHE_DIR/$variant/libtorch/lib/"*.so* "$appdir/usr/lib/$variant/libtorch/lib/"
     done
 
     cp "$SCRIPT_DIR/AppRun" "$appdir/"

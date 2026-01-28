@@ -4,70 +4,128 @@
 #
 # Usage:
 #   docker compose --profile cpu up        # CPU inference
-#   docker compose --profile cuda up       # NVIDIA CUDA GPU
-#   docker compose --profile rocm up       # AMD ROCm GPU
+#   docker compose --profile cuda128 up    # NVIDIA CUDA 12.8
+#   docker compose --profile cuda130 up    # NVIDIA CUDA 13.0
+#   docker compose --profile rocm71 up     # AMD ROCm 7.1
+#   docker compose --profile cuda up       # Alias for cuda130 (latest)
+#   docker compose --profile rocm up       # Alias for rocm71
 #   docker compose run client              # Run CLI client
 #   docker compose --profile flight up     # Include Flight SQL
 #   docker compose --profile workers up    # Include worker (requires privileged)
 #
+# Build locally instead of pulling:
+#   docker compose build                   # Build all images
+#   docker compose build model             # Build specific service
+#   docker compose --profile cpu up --build  # Build and run
+#
 # You must select a model profile: cpu, cuda, or rocm
 # Note: ENTRYPOINT is "hyprstream", so command: provides arguments
+
+# Reusable environment configuration
+x-common-env: &common-env
+  HYPRSTREAM__STORAGE__MODELS_DIR: /var/lib/hyprstream/models
+  HYPRSTREAM__STORAGE__LORAS_DIR: /var/lib/hyprstream/loras
+  HYPRSTREAM__STORAGE__CACHE_DIR: /var/lib/hyprstream/cache
+  HYPRSTREAM__STORAGE__CONFIG_DIR: /var/lib/hyprstream/config
+
+# Reusable build configuration
+x-build-cpu: &build-cpu
+  context: .
+  dockerfile: Dockerfile
+  args:
+    VARIANT: cpu
+
+x-build-cuda128: &build-cuda128
+  context: .
+  dockerfile: Dockerfile
+  args:
+    VARIANT: cuda128
+
+x-build-cuda130: &build-cuda130
+  context: .
+  dockerfile: Dockerfile
+  args:
+    VARIANT: cuda130
+
+x-build-rocm71: &build-rocm71
+  context: .
+  dockerfile: Dockerfile
+  args:
+    VARIANT: rocm71
 
 services:
   event:
     image: ghcr.io/hyprstream/hyprstream:${TAG:-latest-cpu}
-    command: ["service", "event", "--ipc"]
+    build: *build-cpu
+    command: ["service", "start", "event", "--foreground", "--ipc"]
+    environment:
+      <<: *common-env
     volumes:
       - ipc:/run/hyprstream
-      - models:/var/lib/hyprstream/models
+      - data:/var/lib/hyprstream
 
   registry:
     image: ghcr.io/hyprstream/hyprstream:${TAG:-latest-cpu}
-    command: ["service", "registry", "--ipc"]
+    build: *build-cpu
+    command: ["service", "start", "registry", "--foreground", "--ipc"]
+    environment:
+      <<: *common-env
     volumes:
       - ipc:/run/hyprstream
-      - models:/var/lib/hyprstream/models
+      - data:/var/lib/hyprstream
     depends_on:
       - event
 
   policy:
     image: ghcr.io/hyprstream/hyprstream:${TAG:-latest-cpu}
-    command: ["service", "policy", "--ipc"]
+    build: *build-cpu
+    command: ["service", "start", "policy", "--foreground", "--ipc"]
+    environment:
+      <<: *common-env
     volumes:
       - ipc:/run/hyprstream
-      - models:/var/lib/hyprstream/models
+      - data:/var/lib/hyprstream
     depends_on:
       - event
 
   streams:
     image: ghcr.io/hyprstream/hyprstream:${TAG:-latest-cpu}
-    command: ["service", "streams", "--ipc"]
+    build: *build-cpu
+    command: ["service", "start", "streams", "--foreground", "--ipc"]
+    environment:
+      <<: *common-env
     volumes:
       - ipc:/run/hyprstream
-      - models:/var/lib/hyprstream/models
+      - data:/var/lib/hyprstream
     depends_on:
       - event
 
   # Model service - CPU
   model:
     image: ghcr.io/hyprstream/hyprstream:${TAG:-latest-cpu}
-    command: ["service", "model", "--ipc"]
+    build: *build-cpu
+    command: ["service", "start", "model", "--foreground", "--ipc"]
+    environment:
+      <<: *common-env
     volumes:
       - ipc:/run/hyprstream
-      - models:/var/lib/hyprstream/models
+      - data:/var/lib/hyprstream
     depends_on:
       - registry
       - policy
     profiles:
       - cpu
 
-  # Model service - NVIDIA CUDA
-  model-cuda:
+  # Model service - NVIDIA CUDA 12.8
+  model-cuda128:
     image: ghcr.io/hyprstream/hyprstream:${TAG:-latest-cuda128}
-    command: ["service", "model", "--ipc"]
+    build: *build-cuda128
+    command: ["service", "start", "model", "--foreground", "--ipc"]
+    environment:
+      <<: *common-env
     volumes:
       - ipc:/run/hyprstream
-      - models:/var/lib/hyprstream/models
+      - data:/var/lib/hyprstream
     depends_on:
       - registry
       - policy
@@ -79,15 +137,42 @@ services:
               count: 1
               capabilities: [gpu]
     profiles:
-      - cuda
+      - cuda128
+
+  # Model service - NVIDIA CUDA 13.0
+  model-cuda130:
+    image: ghcr.io/hyprstream/hyprstream:${TAG:-latest-cuda130}
+    build: *build-cuda130
+    command: ["service", "start", "model", "--foreground", "--ipc"]
+    environment:
+      <<: *common-env
+    volumes:
+      - ipc:/run/hyprstream
+      - data:/var/lib/hyprstream
+    depends_on:
+      - registry
+      - policy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    profiles:
+      - cuda130
+      - cuda  # alias points to latest CUDA version
 
   # Model service - AMD ROCm
   model-rocm:
-    image: ghcr.io/hyprstream/hyprstream:${TAG:-latest-rocm}
-    command: ["service", "model", "--ipc"]
+    image: ghcr.io/hyprstream/hyprstream:${TAG:-latest-rocm71}
+    build: *build-rocm71
+    command: ["service", "start", "model", "--foreground", "--ipc"]
+    environment:
+      <<: *common-env
     volumes:
       - ipc:/run/hyprstream
-      - models:/var/lib/hyprstream/models
+      - data:/var/lib/hyprstream
     depends_on:
       - registry
       - policy
@@ -95,16 +180,20 @@ services:
       - /dev/kfd
       - /dev/dri
     profiles:
-      - rocm
+      - rocm71
+      - rocm  # alias for backwards compatibility
 
   oai:
     image: ghcr.io/hyprstream/hyprstream:${TAG:-latest-cpu}
-    command: ["service", "oai", "--ipc"]
+    build: *build-cpu
+    command: ["service", "start", "oai", "--foreground", "--ipc"]
+    environment:
+      <<: *common-env
     ports:
       - "8010:8080"
     volumes:
       - ipc:/run/hyprstream
-      - models:/var/lib/hyprstream/models
+      - data:/var/lib/hyprstream
     depends_on:
       - policy
       # Note: Does not depend on model directly - ZMQ handles reconnection
@@ -113,12 +202,15 @@ services:
   # CLI client - connects to services via shared IPC volume
   client:
     image: ghcr.io/hyprstream/hyprstream:${TAG:-latest-cpu}
+    build: *build-cpu
     # No command: uses CMD [] default (runs hyprstream CLI)
+    environment:
+      <<: *common-env
     stdin_open: true
     tty: true
     volumes:
       - ipc:/run/hyprstream
-      - models:/var/lib/hyprstream/models
+      - data:/var/lib/hyprstream
     depends_on:
       - oai
     profiles:
@@ -127,12 +219,15 @@ services:
   # Optional: Flight SQL service
   flight:
     image: ghcr.io/hyprstream/hyprstream:${TAG:-latest-cpu}
-    command: ["service", "flight", "--ipc"]
+    build: *build-cpu
+    command: ["service", "start", "flight", "--foreground", "--ipc"]
+    environment:
+      <<: *common-env
     ports:
       - "50051:50051"
     volumes:
       - ipc:/run/hyprstream
-      - models:/var/lib/hyprstream/models
+      - data:/var/lib/hyprstream
     depends_on:
       - registry
     profiles:
@@ -141,11 +236,14 @@ services:
   # Optional: Worker service (requires privileged for Kata VM sandboxing)
   worker:
     image: ghcr.io/hyprstream/hyprstream:${TAG:-latest-cpu}
-    command: ["service", "worker", "--ipc"]
+    build: *build-cpu
+    command: ["service", "start", "worker", "--foreground", "--ipc"]
+    environment:
+      <<: *common-env
     privileged: true
     volumes:
       - ipc:/run/hyprstream
-      - models:/var/lib/hyprstream/models
+      - data:/var/lib/hyprstream
       - /dev:/dev
     depends_on:
       - event
@@ -162,5 +260,5 @@ volumes:
       device: tmpfs
       o: size=100m,mode=1777
 
-  # Persistent model storage (includes signing keys)
-  models:
+  # Persistent data storage (models, loras, cache, config)
+  data:
