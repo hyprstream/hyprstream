@@ -366,13 +366,13 @@ impl TorchEngine {
                 top_p: 0.9,
                 top_k: Some(40),
                 repeat_penalty: 1.1,
-                stop_tokens: vec!["</s>".to_string()],
+                stop_tokens: vec!["</s>".to_owned()],
                 seed: None,
                 stream: false,
             },
             model_info: Arc::new(Mutex::new(ModelInfo {
-                name: "unloaded".to_string(),
-                architecture: "unknown".to_string(),
+                name: "unloaded".to_owned(),
+                architecture: "unknown".to_owned(),
                 parameters: 0,
                 context_length: 2048,
                 vocab_size: 32000,
@@ -433,7 +433,7 @@ impl TorchEngine {
 
             // Get architecture info from the model
             // For now, use a default since we don't have a method to query this
-            let architecture = "auto".to_string();
+            let architecture = "auto".to_owned();
 
             // Update model info
             {
@@ -477,7 +477,7 @@ impl TorchEngine {
     pub fn get_tensor(&self, name: &str) -> Option<Tensor> {
         let var_store_guard = self.handle_poison(self.var_store.lock()).ok()?;
         let vs = var_store_guard.as_ref()?;
-        vs.variables().get(name).map(|var| var.shallow_clone())
+        vs.variables().get(name).map(tch::Tensor::shallow_clone)
     }
 
     /// List all available tensor names in VarStore - thread safe
@@ -755,15 +755,15 @@ impl TorchEngine {
                 // Add system message if provided
                 if let Some(system_msg) = system {
                     messages.push(ChatMessage {
-                        role: "system".to_string(),
-                        content: system_msg.to_string(),
+                        role: "system".to_owned(),
+                        content: system_msg.to_owned(),
                     });
                 }
 
                 // Add user message
                 messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: user.to_string(),
+                    role: "user".to_owned(),
+                    content: user.to_owned(),
                 });
 
                 // Apply template
@@ -1018,15 +1018,13 @@ impl RuntimeEngine for TorchEngine {
             original_path
                 .file_name()
                 .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string()
+                .unwrap_or("unknown").to_owned()
         } else {
             // Use the file stem for single files
             original_path
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string()
+                .unwrap_or("unknown").to_owned()
         };
 
         // Update model info with the correct name
@@ -1102,8 +1100,8 @@ impl RuntimeEngine for TorchEngine {
         self.handle_poison(self.model_info.lock())
             .map(|guard| guard.clone())
             .unwrap_or_else(|_| ModelInfo {
-                name: "error".to_string(),
-                architecture: "unknown".to_string(),
+                name: "error".to_owned(),
+                architecture: "unknown".to_owned(),
                 parameters: 0,
                 context_length: 2048,
                 vocab_size: 32000,
@@ -1451,7 +1449,7 @@ impl TorchEngine {
                 rank: 16,
                 alpha: 16.0,
                 dropout: 0.1,
-                target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
+                target_modules: vec!["q_proj".to_owned(), "v_proj".to_owned()],
                 ..Default::default()
             };
 
@@ -1465,10 +1463,10 @@ impl TorchEngine {
 
         // Tokenize inputs
         let tokenizer = self.handle_poison(self.tokenizer.lock())?;
-        let tokenizer = tokenizer.as_ref().ok_or(anyhow!("No tokenizer loaded"))?;
+        let tokenizer = tokenizer.as_ref().ok_or_else(|| anyhow!("No tokenizer loaded"))?;
 
         // Combine prompt and response
-        let full_text = format!("{} {}", prompt, expected_response);
+        let full_text = format!("{prompt} {expected_response}");
         let encoding = tokenizer
             .encode(full_text.as_str(), false)
             .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
@@ -1536,7 +1534,7 @@ impl TorchEngine {
                     .vs
                     .trainable_variables()
                     .iter()
-                    .map(|v| v.shallow_clone())
+                    .map(tch::Tensor::shallow_clone)
                     .collect();
 
                 // Calculate total gradient norm
@@ -1919,13 +1917,8 @@ impl TorchEngine {
     ///
     /// Save LoRA weights to SafeTensors file
     ///
-    /// Saves the current LoRA model's weights to a SafeTensors file for persistence.
-    /// This allows adapters to be saved after training or initialization.
+    /// Load LoRA adapter weights from a SafeTensors file.
     ///
-    /// # Requirements
-    /// - LoRA model must be initialized first via create_lora()
-    ///
-
     /// This is the async wrapper for load_lora_weights(), used in training contexts
     /// where adapter loading may be part of a larger async workflow. The actual
     /// loading is synchronous as PyTorch tensor operations are CPU/GPU bound.
@@ -2067,7 +2060,7 @@ impl TorchEngine {
 
             // Apply final normalization
             let normalized = model_guard.apply_final_norm(&hidden_states)
-                .unwrap_or_else(|_| hidden_states);
+                .unwrap_or(hidden_states);
 
             // Mean pool over sequence dimension: [1, seq_len, hidden_size] -> [1, hidden_size]
             let pooled = normalized.mean_dim(1, false, tch::Kind::Float);
@@ -2085,7 +2078,7 @@ impl TorchEngine {
 
             // Convert to CPU and extract values
             let cpu_tensor = normalized_embedding.to_device(tch::Device::Cpu);
-            let numel = cpu_tensor.numel() as usize;
+            let numel = cpu_tensor.numel();
             let mut embedding_vec = vec![0.0f32; numel];
             cpu_tensor.copy_data(&mut embedding_vec, numel);
 
@@ -2155,7 +2148,7 @@ mod tests {
             top_p: 0.9,
             top_k: Some(40),
             repeat_penalty: 1.1,
-            stop_tokens: vec!["</s>".to_string()],
+            stop_tokens: vec!["</s>".to_owned()],
             seed: None,
             stream: false,
         };
@@ -2678,7 +2671,7 @@ impl<'a> Stream for TextStream<'a> {
                     tracing::debug!("Generation timed out after {}ms", timeout_ms);
                     self.finished = true;
                     self.finish_reason = Some(FinishReason::Error(format!(
-                        "Generation timed out after {}ms", timeout_ms
+                        "Generation timed out after {timeout_ms}ms"
                     )));
                     return Poll::Ready(Some(Err(anyhow::anyhow!(
                         "Generation timed out after {}ms", timeout_ms
@@ -2724,7 +2717,7 @@ impl<'a> Stream for TextStream<'a> {
             if self.stop_token_ids.contains(&next_token) {
                 tracing::debug!("Stop token ID {} detected", next_token);
                 self.finished = true;
-                self.finish_reason = Some(FinishReason::StopToken(format!("{}", next_token)));
+                self.finish_reason = Some(FinishReason::StopToken(format!("{next_token}")));
                 return Poll::Ready(None);
             }
 

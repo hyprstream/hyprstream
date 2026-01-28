@@ -25,7 +25,7 @@ pub fn record_batch_to_json(batch: &RecordBatch) -> Result<Vec<JsonValue>, Box<d
                 }
                 _ => {
                     let array = col.as_any().downcast_ref::<StringArray>().unwrap();
-                    JsonValue::String(array.value(row_idx).to_string())
+                    JsonValue::String(array.value(row_idx).to_owned())
                 }
             };
             row.insert(col_name.to_string(), value);

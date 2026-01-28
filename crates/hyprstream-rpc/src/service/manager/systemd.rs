@@ -50,11 +50,11 @@ impl SystemdManager {
 
     #[allow(dead_code)]
     fn socket_unit(service: &str) -> String {
-        format!("hyprstream-{}.socket", service)
+        format!("hyprstream-{service}.socket")
     }
 
     fn service_unit(service: &str) -> String {
-        format!("hyprstream-{}.service", service)
+        format!("hyprstream-{service}.service")
     }
 
     fn units_dir() -> Result<PathBuf> {
@@ -104,7 +104,7 @@ impl ServiceManager for SystemdManager {
         match self.systemd.get_unit(Self::service_unit(service)).await {
             Ok(unit_path) => {
                 // Query the unit's ActiveState property via D-Bus
-                let unit = zbus_systemd::systemd1::UnitProxy::builder(&self.systemd.inner().connection())
+                let unit = zbus_systemd::systemd1::UnitProxy::builder(self.systemd.inner().connection())
                     .path(unit_path)?
                     .build()
                     .await?;

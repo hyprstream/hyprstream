@@ -76,22 +76,19 @@ const MAX_POLICY_COMPONENT_LEN: usize = 256;
 fn validate_policy_component(component: &str, name: &str) -> Result<(), PolicyError> {
     if component.len() > MAX_POLICY_COMPONENT_LEN {
         return Err(PolicyError::ValidationError(format!(
-            "{} exceeds maximum length of {} characters",
-            name, MAX_POLICY_COMPONENT_LEN
+            "{name} exceeds maximum length of {MAX_POLICY_COMPONENT_LEN} characters"
         )));
     }
 
     if component.contains('\0') {
         return Err(PolicyError::ValidationError(format!(
-            "{} contains null byte",
-            name
+            "{name} contains null byte"
         )));
     }
 
     if component.contains('\n') || component.contains('\r') {
         return Err(PolicyError::ValidationError(format!(
-            "{} contains line break (potential CSV injection)",
-            name
+            "{name} contains line break (potential CSV injection)"
         )));
     }
 
@@ -172,7 +169,7 @@ fn validate_policy_csv(policy_path: &Path) -> Result<(), PolicyError> {
 
         // Check policy lines (p, ...)
         if line.starts_with("p,") || line.starts_with("p ") {
-            let fields: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+            let fields: Vec<&str> = line.split(',').map(str::trim).collect();
             if fields.len() != 6 {  // "p" + 5 fields
                 return Err(PolicyError::ValidationError(format!(
                     "Invalid policy format at line {}:\n\
@@ -188,7 +185,7 @@ fn validate_policy_csv(policy_path: &Path) -> Result<(), PolicyError> {
 
         // Check role lines (g, ...)
         if line.starts_with("g,") || line.starts_with("g ") {
-            let fields: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+            let fields: Vec<&str> = line.split(',').map(str::trim).collect();
             if fields.len() != 3 {  // "g" + 2 fields
                 return Err(PolicyError::ValidationError(format!(
                     "Invalid role format at line {}:\n\
@@ -282,11 +279,11 @@ impl PolicyManager {
         // Add permissive default rule: anyone can do anything in any domain
         enforcer
             .add_policy(vec![
-                "*".to_string(),      // subject
-                "*".to_string(),      // domain
-                "*".to_string(),      // resource
-                "*".to_string(),      // action
-                "allow".to_string(),  // effect
+                "*".to_owned(),      // subject
+                "*".to_owned(),      // domain
+                "*".to_owned(),      // resource
+                "*".to_owned(),      // action
+                "allow".to_owned(),  // effect
             ])
             .await
             .map_err(PolicyError::CasbinError)?;
@@ -431,18 +428,18 @@ impl PolicyManager {
         // Validate effect is "allow" or "deny"
         if effect != "allow" && effect != "deny" {
             return Err(PolicyError::ValidationError(
-                "effect must be 'allow' or 'deny'".to_string(),
+                "effect must be 'allow' or 'deny'".to_owned(),
             ));
         }
 
         let mut enforcer = self.enforcer.write().await;
         enforcer
             .add_policy(vec![
-                user.to_string(),
-                domain.to_string(),
-                resource.to_string(),
-                operation.to_string(),
-                effect.to_string(),
+                user.to_owned(),
+                domain.to_owned(),
+                resource.to_owned(),
+                operation.to_owned(),
+                effect.to_owned(),
             ])
             .await
             .map_err(PolicyError::CasbinError)
@@ -482,11 +479,11 @@ impl PolicyManager {
         let mut enforcer = self.enforcer.write().await;
         enforcer
             .remove_policy(vec![
-                user.to_string(),
-                domain.to_string(),
-                resource.to_string(),
-                operation.to_string(),
-                effect.to_string(),
+                user.to_owned(),
+                domain.to_owned(),
+                resource.to_owned(),
+                operation.to_owned(),
+                effect.to_owned(),
             ])
             .await
             .map_err(PolicyError::CasbinError)
@@ -506,7 +503,7 @@ impl PolicyManager {
 
         let mut enforcer = self.enforcer.write().await;
         enforcer
-            .add_grouping_policy(vec![user.to_string(), role.to_string()])
+            .add_grouping_policy(vec![user.to_owned(), role.to_owned()])
             .await
             .map_err(PolicyError::CasbinError)
     }
@@ -525,7 +522,7 @@ impl PolicyManager {
 
         let mut enforcer = self.enforcer.write().await;
         enforcer
-            .remove_grouping_policy(vec![user.to_string(), role.to_string()])
+            .remove_grouping_policy(vec![user.to_owned(), role.to_owned()])
             .await
             .map_err(PolicyError::CasbinError)
     }

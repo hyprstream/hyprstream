@@ -99,8 +99,8 @@ impl ModelArchitecture {
     /// Get human-readable name
     pub fn name(&self) -> String {
         match self {
-            Self::Llama { version } => format!("Llama{}", version),
-            Self::Gemma => "Gemma".to_string(),
+            Self::Llama { version } => format!("Llama{version}"),
+            Self::Gemma => "Gemma".to_owned(),
             Self::Qwen {
                 version,
                 is_moe,
@@ -112,13 +112,13 @@ impl ModelArchitecture {
                     format!("Qwen{}-{}K", version, context_length / 1000)
                 }
             }
-            Self::Phi { version } => format!("Phi{}", version),
-            Self::Mistral => "Mistral".to_string(),
-            Self::Starcoder => "Starcoder".to_string(),
-            Self::Falcon => "Falcon".to_string(),
-            Self::GPTNeoX => "GPT-NeoX".to_string(),
-            Self::GPTOSS { total_params_b, .. } => format!("GPT-OSS-{}B", total_params_b),
-            Self::GPTJ => "GPT-J".to_string(),
+            Self::Phi { version } => format!("Phi{version}"),
+            Self::Mistral => "Mistral".to_owned(),
+            Self::Starcoder => "Starcoder".to_owned(),
+            Self::Falcon => "Falcon".to_owned(),
+            Self::GPTNeoX => "GPT-NeoX".to_owned(),
+            Self::GPTOSS { total_params_b, .. } => format!("GPT-OSS-{total_params_b}B"),
+            Self::GPTJ => "GPT-J".to_owned(),
             Self::Janus { vision_encoder, has_generation, .. } => {
                 let encoder_type = match vision_encoder {
                     VisionEncoderType::SigLIP { .. } => "SigLIP",
@@ -126,9 +126,9 @@ impl ModelArchitecture {
                     VisionEncoderType::EVA { .. } => "EVA",
                 };
                 if *has_generation {
-                    format!("Janus-{}-Gen", encoder_type)
+                    format!("Janus-{encoder_type}-Gen")
                 } else {
-                    format!("Janus-{}", encoder_type)
+                    format!("Janus-{encoder_type}")
                 }
             }
             Self::Custom(name) => name.clone(),
@@ -392,7 +392,7 @@ mod tests {
         assert_eq!(ModelArchitecture::Llama { version: 2 }.name(), "Llama2");
         assert_eq!(ModelArchitecture::Gemma.name(), "Gemma");
         assert_eq!(
-            ModelArchitecture::Custom("MyModel".to_string()).name(),
+            ModelArchitecture::Custom("MyModel".to_owned()).name(),
             "MyModel"
         );
     }

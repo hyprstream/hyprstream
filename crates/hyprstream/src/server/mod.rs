@@ -29,7 +29,7 @@ use axum::Extension;
 pub fn extract_user(auth_user: Option<&Extension<AuthenticatedUser>>) -> String {
     auth_user
         .map(|Extension(u)| u.user.clone())
-        .unwrap_or_else(|| "anonymous".to_string())
+        .unwrap_or_else(|| "anonymous".to_owned())
 }
 
 /// Create the main application router

@@ -415,7 +415,7 @@ mod tests {
         assert_eq!(cpu_sampler.device, Device::Cpu);
 
         // Operations should stay on CPU
-        let logits = Tensor::randn(&[100], (Kind::Float, Device::Cpu));
+        let logits = Tensor::randn([100], (Kind::Float, Device::Cpu));
         let _ = cpu_sampler.sample_token(&logits, 1.0, 1.0, None, 1.0, &[]);
         // No panic = success (tensor device mismatch would panic)
     }

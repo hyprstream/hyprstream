@@ -211,7 +211,7 @@ impl QuantState {
 /// Tuple of (quantized data, quantization state)
 pub fn quantize_blockwise_fp32(input: &[f32], blocksize: usize) -> Result<(Vec<u8>, QuantState)> {
     if input.is_empty() {
-        return Err(BnbError::InvalidInput("input is empty".to_string()));
+        return Err(BnbError::InvalidInput("input is empty".to_owned()));
     }
 
     let n = input.len();
@@ -240,7 +240,7 @@ pub fn quantize_blockwise_fp32(input: &[f32], blocksize: usize) -> Result<(Vec<u
 pub fn dequantize_blockwise_fp32(input: &[u8], state: &QuantState) -> Result<Vec<f32>> {
     if state.is_4bit {
         return Err(BnbError::InvalidInput(
-            "use dequantize_4bit_fp32 for 4-bit data".to_string(),
+            "use dequantize_4bit_fp32 for 4-bit data".to_owned(),
         ));
     }
 
@@ -277,7 +277,7 @@ pub fn dequantize_blockwise_fp32(input: &[u8], state: &QuantState) -> Result<Vec
 /// Tuple of (quantized data, quantization state)
 pub fn quantize_4bit_nf4_fp32(input: &[f32], blocksize: usize) -> Result<(Vec<u8>, QuantState)> {
     if input.is_empty() {
-        return Err(BnbError::InvalidInput("input is empty".to_string()));
+        return Err(BnbError::InvalidInput("input is empty".to_owned()));
     }
 
     let n = input.len();
@@ -308,7 +308,7 @@ pub fn quantize_4bit_nf4_fp32(input: &[f32], blocksize: usize) -> Result<(Vec<u8
 pub fn dequantize_4bit_nf4_fp32(input: &[u8], state: &QuantState) -> Result<Vec<f32>> {
     if !state.is_4bit || state.quant_type != Some(QuantType::Nf4) {
         return Err(BnbError::InvalidInput(
-            "state does not match NF4 quantization".to_string(),
+            "state does not match NF4 quantization".to_owned(),
         ));
     }
 
@@ -345,7 +345,7 @@ pub fn dequantize_4bit_nf4_fp32(input: &[u8], state: &QuantState) -> Result<Vec<
 /// Tuple of (quantized data, quantization state)
 pub fn quantize_4bit_fp4_fp32(input: &[f32], blocksize: usize) -> Result<(Vec<u8>, QuantState)> {
     if input.is_empty() {
-        return Err(BnbError::InvalidInput("input is empty".to_string()));
+        return Err(BnbError::InvalidInput("input is empty".to_owned()));
     }
 
     let n = input.len();
@@ -376,7 +376,7 @@ pub fn quantize_4bit_fp4_fp32(input: &[f32], blocksize: usize) -> Result<(Vec<u8
 pub fn dequantize_4bit_fp4_fp32(input: &[u8], state: &QuantState) -> Result<Vec<f32>> {
     if !state.is_4bit || state.quant_type != Some(QuantType::Fp4) {
         return Err(BnbError::InvalidInput(
-            "state does not match FP4 quantization".to_string(),
+            "state does not match FP4 quantization".to_owned(),
         ));
     }
 
@@ -419,7 +419,7 @@ pub fn dequantize_4bit_fp32(input: &[u8], state: &QuantState) -> Result<Vec<f32>
         Some(QuantType::Nf4) => dequantize_4bit_nf4_fp32(input, state),
         Some(QuantType::Fp4) => dequantize_4bit_fp4_fp32(input, state),
         None => Err(BnbError::InvalidInput(
-            "quant_type not set in state".to_string(),
+            "quant_type not set in state".to_owned(),
         )),
     }
 }
@@ -431,7 +431,7 @@ pub fn dequantize_4bit_fp32(input: &[u8], state: &QuantState) -> Result<Vec<f32>
 /// Quantize f32 data using 8-bit blockwise quantization (CPU implementation)
 pub fn quantize_blockwise_cpu_fp32(input: &[f32], blocksize: usize) -> Result<(Vec<u8>, QuantState)> {
     if input.is_empty() {
-        return Err(BnbError::InvalidInput("input is empty".to_string()));
+        return Err(BnbError::InvalidInput("input is empty".to_owned()));
     }
 
     let n = input.len();
@@ -459,7 +459,7 @@ pub fn quantize_blockwise_cpu_fp32(input: &[f32], blocksize: usize) -> Result<(V
 pub fn dequantize_blockwise_cpu_fp32(input: &[u8], state: &QuantState) -> Result<Vec<f32>> {
     if state.is_4bit {
         return Err(BnbError::InvalidInput(
-            "use dequantize_4bit_cpu_fp32 for 4-bit data".to_string(),
+            "use dequantize_4bit_cpu_fp32 for 4-bit data".to_owned(),
         ));
     }
 

@@ -29,7 +29,7 @@ fn main() {
             }
         }
         Device::Cuda(n) => {
-            println!("Result: ✅ GPU {} detected!", n);
+            println!("Result: ✅ GPU {n} detected!");
         }
         _ => {
             println!("Result: Other device type detected");

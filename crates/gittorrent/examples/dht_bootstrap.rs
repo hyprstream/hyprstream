@@ -7,13 +7,7 @@
 //!
 //! Run with: cargo run --example dht_bootstrap
 
-use gittorrent::{
-    dht::{GitTorrentDht, GitObjectKey, GitObjectRecord},
-    types::Sha256Hash,
-};
-use libp2p::{Multiaddr, PeerId};
-use std::str::FromStr;
-use tracing_subscriber;
+use gittorrent::dht::GitTorrentDht;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -57,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  3. Perform iterative lookups to discover more peers");
             }
             Err(e) => {
-                println!("✗ Bootstrap failed: {}", e);
+                println!("✗ Bootstrap failed: {e}");
                 println!("  Make sure:");
                 println!("  - The bootstrap addresses include peer IDs (/p2p/<id>)");
                 println!("  - The target peers are running and reachable");

@@ -1,3 +1,6 @@
+// tonic::Status is the idiomatic gRPC error type - boxing would break API
+#![allow(clippy::result_large_err)]
+
 pub mod storage;
 
 use duckdb::arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
@@ -54,7 +57,7 @@ impl MetricRecord {
         let mut metrics = Vec::with_capacity(batch.num_rows());
         for i in 0..batch.num_rows() {
             metrics.push(MetricRecord {
-                metric_id: metric_ids.value(i).to_string(),
+                metric_id: metric_ids.value(i).to_owned(),
                 timestamp: timestamps.value(i),
                 value_running_window_sum: sums.value(i),
                 value_running_window_avg: avgs.value(i),
@@ -108,7 +111,7 @@ pub fn create_record_batch(metrics: &[MetricRecord]) -> Result<RecordBatch, Stat
     ];
 
     RecordBatch::try_new(Arc::new(schema), arrays)
-        .map_err(|e| Status::internal(format!("Failed to create record batch: {}", e)))
+        .map_err(|e| Status::internal(format!("Failed to create record batch: {e}")))
 }
 
 /// Encodes a RecordBatch into a vector of MetricRecords.
@@ -141,7 +144,7 @@ pub fn encode_record_batch(batch: &RecordBatch) -> Result<Vec<MetricRecord>, Sta
     let mut metrics = Vec::with_capacity(batch.num_rows());
     for i in 0..batch.num_rows() {
         metrics.push(MetricRecord {
-            metric_id: metric_ids.value(i).to_string(),
+            metric_id: metric_ids.value(i).to_owned(),
             timestamp: timestamps.value(i),
             value_running_window_sum: sums.value(i),
             value_running_window_avg: avgs.value(i),

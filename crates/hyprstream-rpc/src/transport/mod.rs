@@ -186,7 +186,7 @@ impl TransportConfig {
     pub fn from_endpoint(endpoint: &str) -> Self {
         let endpoint_type = if let Some(name) = endpoint.strip_prefix("inproc://") {
             EndpointType::Inproc {
-                endpoint: name.to_string(),
+                endpoint: name.to_owned(),
             }
         } else if let Some(path) = endpoint.strip_prefix("ipc://") {
             EndpointType::Ipc {
@@ -195,7 +195,7 @@ impl TransportConfig {
         } else {
             // Default to inproc if no scheme
             EndpointType::Inproc {
-                endpoint: endpoint.to_string(),
+                endpoint: endpoint.to_owned(),
             }
         };
 
@@ -210,7 +210,7 @@ impl TransportConfig {
     /// For `SystemdFd`, returns the client IPC path.
     pub fn zmq_endpoint(&self) -> String {
         match &self.endpoint {
-            EndpointType::Inproc { endpoint } => format!("inproc://{}", endpoint),
+            EndpointType::Inproc { endpoint } => format!("inproc://{endpoint}"),
             EndpointType::Ipc { path } => format!("ipc://{}", path.display()),
             EndpointType::SystemdFd { client_path, .. } => {
                 format!("ipc://{}", client_path.display())

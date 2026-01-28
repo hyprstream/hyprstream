@@ -249,7 +249,7 @@ fn parse_meminfo_value(line: &str) -> u64 {
 ///
 /// ```ignore
 /// let checker = HealthChecker::new()
-///     .with_http_endpoint("127.0.0.1:3000".to_string());
+///     .with_http_endpoint("127.0.0.1:3000".to_owned());
 ///
 /// // Spawn as background task
 /// tokio::spawn(run_watchdog(checker));
@@ -330,10 +330,10 @@ mod tests {
 
     #[test]
     fn test_health_checker_with_http() {
-        let checker = HealthChecker::new().with_http_endpoint("127.0.0.1:3000".to_string());
+        let checker = HealthChecker::new().with_http_endpoint("127.0.0.1:3000".to_owned());
         assert_eq!(
             checker.config.http_endpoint,
-            Some("127.0.0.1:3000".to_string())
+            Some("127.0.0.1:3000".to_owned())
         );
     }
 

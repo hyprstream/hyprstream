@@ -26,8 +26,8 @@ pub fn parse_command(line: &str) -> Option<GitCommand> {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 3 {
             Some(GitCommand::Fetch {
-                commit_hash: parts[1].to_string(),
-                refname: parts[2].to_string(),
+                commit_hash: parts[1].to_owned(),
+                refname: parts[2].to_owned(),
             })
         } else {
             None
@@ -54,7 +54,7 @@ impl GitRemoteHelper {
     }
 
     /// Handle a git remote helper command and return the response
-    pub fn handle_command(&self, command: GitCommand) -> String {
+    pub fn handle_command(&self, command: &GitCommand) -> String {
         match command {
             GitCommand::Capabilities => {
                 let mut response = String::new();
@@ -68,7 +68,7 @@ impl GitRemoteHelper {
             GitCommand::List => {
                 let mut response = String::new();
                 for (refname, commit_hash) in &self.refs {
-                    response.push_str(&format!("{} {}\n", commit_hash, refname));
+                    response.push_str(&format!("{commit_hash} {refname}\n"));
                 }
                 response.push('\n');
                 response
@@ -123,11 +123,11 @@ mod tests {
         // Test with SHA1 hashes (40 hex chars) - current git format
         let refs = vec![
             GitRef {
-                name: "refs/heads/main".to_string(),
+                name: "refs/heads/main".to_owned(),
                 hash: GitHash::from_hex("0123456789abcdef0123456789abcdef01234567").unwrap(),
             },
             GitRef {
-                name: "HEAD".to_string(),
+                name: "HEAD".to_owned(),
                 hash: GitHash::from_hex("0123456789abcdef0123456789abcdef01234567").unwrap(),
             },
         ];
@@ -135,11 +135,11 @@ mod tests {
         let helper = GitRemoteHelper::new(refs);
 
         // Test capabilities
-        let caps_response = helper.handle_command(GitCommand::Capabilities);
+        let caps_response = helper.handle_command(&GitCommand::Capabilities);
         assert!(caps_response.contains("fetch"));
 
         // Test list
-        let list_response = helper.handle_command(GitCommand::List);
+        let list_response = helper.handle_command(&GitCommand::List);
         assert!(list_response.contains("0123456789abcdef0123456789abcdef01234567 refs/heads/main"));
         assert!(list_response.contains("0123456789abcdef0123456789abcdef01234567 HEAD"));
 

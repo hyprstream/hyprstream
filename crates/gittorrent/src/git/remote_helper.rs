@@ -40,11 +40,11 @@ impl GitRemoteHelper {
             remote_url: None,
             local_repo: None,
             capabilities: vec![
-                "connect".to_string(),
-                "list".to_string(),
-                "fetch".to_string(),
-                "push".to_string(),
-                "option".to_string(),
+                "connect".to_owned(),
+                "list".to_owned(),
+                "fetch".to_owned(),
+                "push".to_owned(),
+                "option".to_owned(),
             ],
         })
     }
@@ -74,7 +74,7 @@ impl GitRemoteHelper {
                             stdout.flush().map_err(Error::from)?;
                         }
                         Err(e) => {
-                            writeln!(stdout, "error {}", e).map_err(Error::from)?;
+                            writeln!(stdout, "error {e}").map_err(Error::from)?;
                             stdout.flush().map_err(Error::from)?;
                             return Err(e);
                         }
@@ -90,19 +90,19 @@ impl GitRemoteHelper {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if !parts.is_empty() && (parts[0] == "fetch" || parts[0] == "push") {
                     // Start or continue a batch
-                    batch_commands.push(line.to_string());
+                    batch_commands.push(line.to_owned());
                     in_batch = true;
                 } else {
                     // Handle single command immediately
                     match self.handle_command(line).await {
                         Ok(response) => {
                             if let Some(resp) = response {
-                                print!("{}", resp);
+                                print!("{resp}");
                                 stdout.flush().map_err(Error::from)?;
                             }
                         }
                         Err(e) => {
-                            writeln!(stdout, "error {}", e).map_err(Error::from)?;
+                            writeln!(stdout, "error {e}").map_err(Error::from)?;
                             stdout.flush().map_err(Error::from)?;
                             return Err(e);
                         }
@@ -156,7 +156,7 @@ impl GitRemoteHelper {
                 }
                 "push" => {
                     let result = self.handle_push(&parts[1..]).await?;
-                    print!("{}", result);
+                    print!("{result}");
                 }
                 _ => {
                     return Err(Error::other(format!("Invalid batch command: {}", parts[0])));
@@ -170,7 +170,7 @@ impl GitRemoteHelper {
     fn handle_capabilities(&self) -> String {
         let mut response = String::new();
         for cap in &self.capabilities {
-            response.push_str(&format!("{}\n", cap));
+            response.push_str(&format!("{cap}\n"));
         }
         response.push('\n'); // End with empty line
         response
@@ -189,7 +189,7 @@ impl GitRemoteHelper {
 
         let mut response = String::new();
         for (ref_name, commit_hash) in &refs {
-            response.push_str(&format!("{} {}\n", commit_hash, ref_name));
+            response.push_str(&format!("{commit_hash} {ref_name}\n"));
         }
 
         // Set HEAD to point to main or master if available
@@ -204,9 +204,9 @@ impl GitRemoteHelper {
         tracing::info!("Listed {} references for {}",
                       refs.len(),
                       match url {
-                          GitTorrentUrl::Commit { hash } => format!("commit {}", hash),
-                          GitTorrentUrl::CommitWithRefs { hash } => format!("commit {} (with refs)", hash),
-                          GitTorrentUrl::GitServer { server, repo } => format!("{}/{}", server, repo),
+                          GitTorrentUrl::Commit { hash } => format!("commit {hash}"),
+                          GitTorrentUrl::CommitWithRefs { hash } => format!("commit {hash} (with refs)"),
+                          GitTorrentUrl::GitServer { server, repo } => format!("{server}/{repo}"),
                           GitTorrentUrl::Username { username } => username.clone(),
                       });
 
@@ -232,7 +232,7 @@ impl GitRemoteHelper {
         // For GitTorrent, we don't support the bidirectional Git protocol directly.
         // Instead, we use the import/export capabilities through the remote helper protocol.
         // Tell Git to fall back to using the remote helper commands (list, fetch, push)
-        Ok(Some("fallback\n".to_string()))
+        Ok(Some("fallback\n".to_owned()))
     }
 
     /// Handle fetch command in batch
@@ -295,8 +295,8 @@ impl GitRemoteHelper {
         // 4. Announce updated repository metadata
 
         match self.push_repository_data(url, local_repo, src_ref, dst_ref).await {
-            Ok(()) => Ok(format!("ok {}\n", dst_ref)),
-            Err(e) => Ok(format!("error {} {}\n", dst_ref, e)),
+            Ok(()) => Ok(format!("ok {dst_ref}\n")),
+            Err(e) => Ok(format!("error {dst_ref} {e}\n")),
         }
     }
 
@@ -312,15 +312,15 @@ impl GitRemoteHelper {
         match key {
             "verbosity" => {
                 tracing::debug!("Set verbosity to {}", value);
-                Ok(Some("ok\n".to_string()))
+                Ok(Some("ok\n".to_owned()))
             }
             "progress" => {
                 tracing::debug!("Set progress to {}", value);
-                Ok(Some("ok\n".to_string()))
+                Ok(Some("ok\n".to_owned()))
             }
             _ => {
                 tracing::debug!("Unknown option: {} = {}", key, value);
-                Ok(Some("unsupported\n".to_string()))
+                Ok(Some("unsupported\n".to_owned()))
             }
         }
     }
@@ -353,7 +353,7 @@ impl GitRemoteHelper {
             _ => {
                 // Legacy behavior for other URL types
                 let repo_identifier = match url {
-                    GitTorrentUrl::GitServer { server, repo } => format!("{}/{}", server, repo),
+                    GitTorrentUrl::GitServer { server, repo } => format!("{server}/{repo}"),
                     GitTorrentUrl::Username { username } => username.clone(),
                     _ => unreachable!(),
                 };
@@ -479,7 +479,7 @@ impl GitRemoteHelper {
 
             // Add a metadata file for debugging
             let metadata_content = serde_json::to_string_pretty(metadata)
-                .map_err(|e| Error::other(format!("Failed to serialize metadata: {}", e)))?;
+                .map_err(|e| Error::other(format!("Failed to serialize metadata: {e}")))?;
             let metadata_oid = repo.blob(metadata_content.as_bytes()).map_err(Error::from)?;
             tree_builder.insert(".gittorrent-metadata.json", metadata_oid, 0o100644).map_err(Error::from)?;
 
@@ -500,9 +500,9 @@ impl GitRemoteHelper {
 
         // Update the reference to point to this commit
         let ref_name_normalized = if ref_name.starts_with("refs/") {
-            ref_name.to_string()
+            ref_name.to_owned()
         } else {
-            format!("refs/heads/{}", ref_name)
+            format!("refs/heads/{ref_name}")
         };
 
         repo.reference(&ref_name_normalized, commit_id, true, "Initial commit from P2P")
@@ -528,8 +528,7 @@ impl GitRemoteHelper {
             let mut tree_builder = repo.treebuilder(None).map_err(Error::from)?;
 
             // Add a README file to make it a non-empty repository
-            let readme_content = format!("# GitTorrent Repository\n\nThis repository is hosted via GitTorrent.\n\nURL: {}\n",
-                url);
+            let readme_content = format!("# GitTorrent Repository\n\nThis repository is hosted via GitTorrent.\n\nURL: {url}\n");
 
             let readme_oid = repo.blob(readme_content.as_bytes()).map_err(Error::from)?;
             tree_builder.insert("README.md", readme_oid, 0o100644).map_err(Error::from)?;
@@ -550,9 +549,9 @@ impl GitRemoteHelper {
 
         // Update the reference to point to this commit
         let ref_name_normalized = if ref_name.starts_with("refs/") {
-            ref_name.to_string()
+            ref_name.to_owned()
         } else {
-            format!("refs/heads/{}", ref_name)
+            format!("refs/heads/{ref_name}")
         };
 
         repo.reference(&ref_name_normalized, commit_id, true, "Initial commit")
@@ -588,8 +587,8 @@ impl GitRemoteHelper {
         // Create a default commit SHA (empty tree)
         let empty_tree_sha = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
-        refs.insert("refs/heads/main".to_string(), empty_tree_sha.to_string());
-        refs.insert("refs/heads/master".to_string(), empty_tree_sha.to_string());
+        refs.insert("refs/heads/main".to_owned(), empty_tree_sha.to_owned());
+        refs.insert("refs/heads/master".to_owned(), empty_tree_sha.to_owned());
 
         tracing::debug!("Using fallback references for {}", url.to_string());
 
@@ -618,12 +617,12 @@ impl GitRemoteHelper {
             if let Some(name) = reference.name() {
                 // Get the target OID
                 if let Some(target) = reference.target() {
-                    refs.insert(name.to_string(), target.to_string());
+                    refs.insert(name.to_owned(), target.to_string());
                 } else if let Some(symbolic_target) = reference.symbolic_target() {
                     // Handle symbolic references (like HEAD)
                     if let Ok(resolved) = repo.resolve_reference_from_short_name(symbolic_target) {
                         if let Some(target) = resolved.target() {
-                            refs.insert(name.to_string(), target.to_string());
+                            refs.insert(name.to_owned(), target.to_string());
                         }
                     }
                 }
@@ -671,8 +670,8 @@ mod tests {
     async fn test_git_remote_helper_creation() {
         let helper = GitRemoteHelper::new().await.unwrap();
         assert_eq!(helper.capabilities.len(), 5);
-        assert!(helper.capabilities.contains(&"connect".to_string()));
-        assert!(helper.capabilities.contains(&"list".to_string()));
+        assert!(helper.capabilities.contains(&"connect".to_owned()));
+        assert!(helper.capabilities.contains(&"list".to_owned()));
     }
 
     #[tokio::test]

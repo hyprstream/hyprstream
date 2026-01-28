@@ -24,8 +24,8 @@ fn main() {
         let available = torch_cuda_is_available();
         let count = torch_cuda_device_count();
 
-        println!("GPU Available (direct FFI): {}", available);
-        println!("Device Count (direct FFI): {}", count);
+        println!("GPU Available (direct FFI): {available}");
+        println!("Device Count (direct FFI): {count}");
 
         if available {
             println!("✅ ROCm GPU detected via direct FFI!");
@@ -39,7 +39,7 @@ fn main() {
     let device = tch::Device::cuda_if_available();
     match device {
         tch::Device::Cpu => println!("tch-rs: CPU (not detecting GPU)"),
-        tch::Device::Cuda(n) => println!("tch-rs: GPU {} detected", n),
+        tch::Device::Cuda(n) => println!("tch-rs: GPU {n} detected"),
         _ => println!("tch-rs: Other device"),
     }
 }

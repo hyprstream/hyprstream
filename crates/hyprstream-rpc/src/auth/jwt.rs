@@ -67,23 +67,23 @@ pub fn encode(claims: &Claims, signing_key: &SigningKey) -> String {
     let header_b64 = URL_SAFE_NO_PAD.encode(JWT_HEADER);
     let payload_json = serde_json::to_string(claims).unwrap_or_else(|e| {
         tracing::error!("JWT claims serialization failed: {}", e);
-        "{}".to_string()
+        "{}".to_owned()
     });
     let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
 
     // Create signing input
-    let signing_input = format!("{}.{}", header_b64, payload_b64);
+    let signing_input = format!("{header_b64}.{payload_b64}");
 
     // Sign with Ed25519
     let signature = signing_key.sign(signing_input.as_bytes());
     let signature_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
     // Combine into JWT
-    let jwt = format!("{}.{}", signing_input, signature_b64);
+    let jwt = format!("{signing_input}.{signature_b64}");
 
     // Add prefix
     let prefix = if claims.admin { ADMIN_TOKEN_PREFIX } else { TOKEN_PREFIX };
-    format!("{}{}", prefix, jwt)
+    format!("{prefix}{jwt}")
 }
 
 /// Decode and verify a JWT token
@@ -110,7 +110,7 @@ pub fn decode(token: &str, verifying_key: &VerifyingKey) -> Result<Claims, JwtEr
     let signature_b64 = parts[2];
 
     // Verify signature first
-    let signing_input = format!("{}.{}", header_b64, payload_b64);
+    let signing_input = format!("{header_b64}.{payload_b64}");
     let signature_bytes = URL_SAFE_NO_PAD
         .decode(signature_b64)
         .map_err(|_| JwtError::InvalidBase64)?;

@@ -93,8 +93,7 @@ impl OperatorFactory {
                 schema, children, properties,
             )?)),
             _ => Err(datafusion::error::DataFusionError::NotImplemented(format!(
-                "Operator type {} not implemented",
-                operator_type
+                "Operator type {operator_type} not implemented"
             ))),
         }
     }

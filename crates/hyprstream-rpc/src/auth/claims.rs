@@ -44,7 +44,7 @@ impl FromCapnp for Claims {
         }
 
         Ok(Self {
-            sub: reader.get_sub()?.to_str()?.to_string(),
+            sub: reader.get_sub()?.to_str()?.to_owned(),
             exp: reader.get_exp(),
             iat: reader.get_iat(),
             scopes,
@@ -101,7 +101,7 @@ mod tests {
     #[test]
     fn test_claims_has_scope_exact() {
         let claims = Claims::new(
-            "alice".to_string(),
+            "alice".to_owned(),
             1000,
             2000,
             vec![Scope::parse("infer:model:qwen-7b").unwrap()],
@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn test_claims_has_scope_wildcard() {
         let claims = Claims::new(
-            "alice".to_string(),
+            "alice".to_owned(),
             1000,
             2000,
             vec![Scope::parse("infer:model:*").unwrap()],
@@ -126,14 +126,14 @@ mod tests {
 
     #[test]
     fn test_claims_fail_secure_empty_scopes() {
-        let claims = Claims::new("alice".to_string(), 1000, 2000, vec![], false);
+        let claims = Claims::new("alice".to_owned(), 1000, 2000, vec![], false);
         let required = Scope::parse("infer:model:qwen-7b").unwrap();
         assert!(!claims.has_scope(&required));
     }
 
     #[test]
     fn test_claims_admin_override() {
-        let claims = Claims::new("admin".to_string(), 1000, 2000, vec![], true);
+        let claims = Claims::new("admin".to_owned(), 1000, 2000, vec![], true);
         let required = Scope::parse("infer:model:qwen-7b").unwrap();
         assert!(claims.has_scope(&required));
     }

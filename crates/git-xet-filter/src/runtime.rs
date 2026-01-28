@@ -31,7 +31,7 @@ impl XetRuntime {
             return Err(XetError::new(
                 XetErrorKind::RuntimeError,
                 "Cannot create XetRuntime from within existing async context. \
-                 XetRuntime creates its own runtime and cannot be nested.".to_string(),
+                 XetRuntime creates its own runtime and cannot be nested.".to_owned(),
             ));
         }
 
@@ -42,7 +42,7 @@ impl XetRuntime {
             .map_err(|e| {
                 XetError::new(
                     XetErrorKind::RuntimeError,
-                    format!("Failed to create runtime: {}", e),
+                    format!("Failed to create runtime: {e}"),
                 )
             })?;
 

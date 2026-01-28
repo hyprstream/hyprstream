@@ -83,7 +83,7 @@ pub fn pid_file() -> PathBuf {
 /// Path: `<runtime_dir>/<name>.pid`
 /// Example: `/run/user/1000/hyprstream/events.pid`
 pub fn service_pid_file(name: &str) -> PathBuf {
-    runtime_dir().join(format!("{}.pid", name))
+    runtime_dir().join(format!("{name}.pid"))
 }
 
 /// Set appropriate permissions on a directory

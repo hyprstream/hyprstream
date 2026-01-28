@@ -118,7 +118,7 @@ impl Spawnable for FlightService {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("runtime: {}", e)))?;
+            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("runtime: {e}")))?;
 
         rt.block_on(async move {
             // Build hyprstream_flight config from our config

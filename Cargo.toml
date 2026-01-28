@@ -209,3 +209,44 @@ debug = false
 [profile.release]
 lto = "thin"
 strip = true
+
+[workspace.lints.rust]
+# unsafe_code = "warn"  # Informational only, many FFI calls are necessary
+# rust_2018_idioms = { level = "warn", priority = -1 }  # Too noisy with lifetime parameters
+
+[workspace.lints.clippy]
+# Correctness
+correctness = { level = "deny", priority = -1 }
+
+# Suspicious code
+suspicious = { level = "warn", priority = -1 }
+
+# Style and complexity
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+
+# Specific useful lints
+dbg_macro = "warn"
+empty_structs_with_brackets = "warn"
+get_unwrap = "warn"
+inefficient_to_string = "warn"
+macro_use_imports = "warn"
+map_flatten = "warn"
+or_fun_call = "warn"
+redundant_closure_for_method_calls = "warn"
+str_to_string = "warn"
+trivially_copy_pass_by_ref = "warn"
+# uninlined_format_args = "warn"  # Disabled - affects generated code
+# needless_pass_by_value = "warn"  # Disabled - too many false positives with callback-based APIs
+
+# Allow these (common in async code and ML projects)
+too_many_arguments = "allow"
+type_complexity = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+unused_async = "allow"  # Often intentional for trait consistency or future use
+unnecessary_wraps = "allow"  # Often needed for trait implementations
+unused_self = "allow"  # Often needed for trait implementations
+field_reassign_with_default = "allow"  # Common pattern in test setup
+arc_with_non_send_sync = "allow"  # Sometimes needed for FFI or single-threaded use

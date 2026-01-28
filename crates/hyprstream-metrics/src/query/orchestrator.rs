@@ -117,7 +117,7 @@ impl QueryOrchestrator {
         info!("Creating QueryOrchestrator");
 
         // Create planner with storage backend
-        let planner = DataFusionPlanner::new(storage.clone()).await?;
+        let planner = DataFusionPlanner::new(Arc::clone(&storage)).await?;
         let executor = DataFusionExecutor::new(ExecutorConfig::default());
 
         debug!("QueryOrchestrator initialized with default executor config");
@@ -136,7 +136,7 @@ impl QueryOrchestrator {
         storage: Arc<dyn StorageBackend>,
         config: ExecutorConfig,
     ) -> Result<Self> {
-        let planner = DataFusionPlanner::new(storage.clone()).await?;
+        let planner = DataFusionPlanner::new(Arc::clone(&storage)).await?;
         let executor = DataFusionExecutor::new(config);
 
         Ok(Self {
@@ -164,7 +164,7 @@ impl QueryOrchestrator {
 
         // Create query and plan it
         let query = Query {
-            sql: sql.to_string(),
+            sql: sql.to_owned(),
             schema_hint: None,
             hints: vec![],
         };
@@ -177,7 +177,7 @@ impl QueryOrchestrator {
         let handle = self.next_handle.fetch_add(1, Ordering::SeqCst);
         let stmt = CachedStatement {
             handle,
-            sql: sql.to_string(),
+            sql: sql.to_owned(),
             physical_plan,
             schema,
         };
@@ -205,7 +205,7 @@ impl QueryOrchestrator {
         stmt: &CachedStatement,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
         debug!("Executing prepared statement");
-        self.executor.execute_stream(stmt.physical_plan.clone()).await
+        self.executor.execute_stream(Arc::clone(&stmt.physical_plan)).await
     }
 
     /// Execute a prepared statement and collect all results
@@ -213,7 +213,7 @@ impl QueryOrchestrator {
     pub async fn execute_collect(&self, stmt: &CachedStatement) -> Result<Vec<RecordBatch>> {
         debug!("Executing and collecting prepared statement results");
         self.executor
-            .execute_collect(stmt.physical_plan.clone())
+            .execute_collect(Arc::clone(&stmt.physical_plan))
             .await
     }
 
@@ -242,7 +242,7 @@ impl QueryOrchestrator {
             let cache = self.cache.read().await;
             if let Some(stmt) = cache.get_by_sql(sql) {
                 debug!(handle = stmt.handle, "Schema from cached statement");
-                return Ok(stmt.schema.clone());
+                return Ok(Arc::clone(&stmt.schema));
             }
         }
 
@@ -268,7 +268,7 @@ impl QueryOrchestrator {
         info!("Refreshing table registrations");
 
         // Re-create planner with updated storage
-        let new_planner = DataFusionPlanner::new(self.storage.clone()).await?;
+        let new_planner = DataFusionPlanner::new(Arc::clone(&self.storage)).await?;
 
         // Replace planner
         let mut planner = self.planner.write().await;

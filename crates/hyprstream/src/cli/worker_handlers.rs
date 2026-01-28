@@ -81,8 +81,7 @@ pub async fn handle_worker_list(
                 let image_short = truncate_id(image, 30);
                 let sandbox_short = truncate_id(&c.pod_sandbox_id, 12);
                 println!(
-                    "{:<40}{:<32}{:<16}{}",
-                    id_short, image_short, state, sandbox_short
+                    "{id_short:<40}{image_short:<32}{state:<16}{sandbox_short}"
                 );
             }
         }
@@ -118,14 +117,14 @@ pub async fn handle_worker_run(
 
     // 1. Ensure image is pulled
     let image_spec = ImageSpec {
-        image: image.to_string(),
+        image: image.to_owned(),
         annotations: Default::default(),
         runtime_handler: String::new(),
     };
 
     // Check if image exists locally, pull if not
     if client.image_status(&image_spec, false).await.is_err() {
-        println!("Pulling image {}...", image);
+        println!("Pulling image {image}...");
         client.pull_image(&image_spec, None).await?;
         println!("Image pulled");
     }
@@ -180,7 +179,7 @@ pub async fn handle_worker_run(
     client.start_container(&container_id).await?;
 
     if detach {
-        println!("{}", container_id);
+        println!("{container_id}");
     } else {
         println!("Container {} started", truncate_id(&container_id, 12));
 
@@ -223,13 +222,13 @@ pub async fn handle_worker_stop(
     if client.container_status(id, false).await.is_ok() {
         let actual_timeout = if force { 0 } else { timeout };
         client.stop_container(id, actual_timeout).await?;
-        println!("{}", id);
+        println!("{id}");
         return Ok(());
     }
 
     // Try as sandbox
     client.stop_pod_sandbox(id).await?;
-    println!("{}", id);
+    println!("{id}");
     Ok(())
 }
 
@@ -242,7 +241,7 @@ pub async fn handle_worker_start(client: &WorkerClient, container_id: &str) -> R
     info!(container_id = %container_id, "Starting container");
 
     client.start_container(container_id).await?;
-    println!("{}", container_id);
+    println!("{container_id}");
     Ok(())
 }
 
@@ -265,7 +264,7 @@ pub async fn handle_worker_restart(client: &WorkerClient, id: &str, timeout: i64
         bail!("Sandbox restart not supported - use rm + run");
     }
 
-    println!("{}", id);
+    println!("{id}");
     Ok(())
 }
 
@@ -290,7 +289,7 @@ pub async fn handle_worker_rm(
                 }
             }
             client.remove_container(&id).await?;
-            println!("{}", id);
+            println!("{id}");
             continue;
         }
 
@@ -300,7 +299,7 @@ pub async fn handle_worker_rm(
                 let _ = client.stop_pod_sandbox(&id).await;
             }
             client.remove_pod_sandbox(&id).await?;
-            println!("{}", id);
+            println!("{id}");
             continue;
         }
 
@@ -322,7 +321,7 @@ pub async fn handle_worker_status(client: &WorkerClient, id: &str, verbose: bool
         println!("ID: {}", status.status.id);
         println!("State: {:?}", status.status.state);
         let image_str = if status.status.image.image.is_empty() { "-" } else { &status.status.image.image };
-        println!("Image: {}", image_str);
+        println!("Image: {image_str}");
         println!("Created: {}", status.status.created_at);
         if status.status.state == ContainerState::ContainerExited {
             println!("Exit Code: {}", status.status.exit_code);
@@ -330,7 +329,7 @@ pub async fn handle_worker_status(client: &WorkerClient, id: &str, verbose: bool
         if verbose {
             println!("\nInfo:");
             for (k, v) in &status.info {
-                println!("  {}: {}", k, v);
+                println!("  {k}: {v}");
             }
         }
         return Ok(());
@@ -345,7 +344,7 @@ pub async fn handle_worker_status(client: &WorkerClient, id: &str, verbose: bool
     if verbose {
         println!("\nInfo:");
         for (k, v) in &status.info {
-            println!("  {}: {}", k, v);
+            println!("  {k}: {v}");
         }
     }
 
@@ -393,13 +392,13 @@ fn print_container_stats(id: &str, stats: &ContainerStats) {
         .cpu
         .as_ref()
         .map(|c| format!("{:.2}%", c.usage_nano_cores as f64 / 1e9 * 100.0))
-        .unwrap_or_else(|| "-".to_string());
+        .unwrap_or_else(|| "-".to_owned());
 
     let mem = stats
         .memory
         .as_ref()
         .map(|m| format!("{} / {}", format_size(m.usage_bytes), format_size(m.available_bytes)))
-        .unwrap_or_else(|| "-".to_string());
+        .unwrap_or_else(|| "-".to_owned());
 
     println!(
         "{:<40}{:<12}{:<24}{:<16}",
@@ -416,14 +415,14 @@ fn print_sandbox_stats(id: &str, stats: &PodSandboxStats) {
         .as_ref()
         .and_then(|l| l.cpu.as_ref())
         .map(|c| format!("{:.2}%", c.usage_nano_cores as f64 / 1e9 * 100.0))
-        .unwrap_or_else(|| "-".to_string());
+        .unwrap_or_else(|| "-".to_owned());
 
     let mem = stats
         .linux
         .as_ref()
         .and_then(|l| l.memory.as_ref())
         .map(|m| format!("{} / {}", format_size(m.usage_bytes), format_size(m.available_bytes)))
-        .unwrap_or_else(|| "-".to_string());
+        .unwrap_or_else(|| "-".to_owned());
 
     let net = stats
         .linux
@@ -431,7 +430,7 @@ fn print_sandbox_stats(id: &str, stats: &PodSandboxStats) {
         .and_then(|l| l.network.as_ref())
         .and_then(|n| n.default_interface.as_ref())
         .map(|i| format!("{} / {}", format_size(i.rx_bytes), format_size(i.tx_bytes)))
-        .unwrap_or_else(|| "-".to_string());
+        .unwrap_or_else(|| "-".to_owned());
 
     println!(
         "{:<40}{:<12}{:<24}{:<16}",
@@ -556,7 +555,7 @@ pub async fn handle_worker_terminal(
     // Parse detach key sequence
     let detach_byte = parse_detach_keys(detach_keys);
 
-    println!("\n--- Terminal attached. Press {} to detach ---\n", detach_keys);
+    println!("\n--- Terminal attached. Press {detach_keys} to detach ---\n");
 
     // 7. Main I/O loop with HMAC-verified streaming
     let topic_bytes = keys.topic.as_bytes().to_vec();
@@ -594,7 +593,7 @@ pub async fn handle_worker_terminal(
                                         return;
                                     }
                                     StreamPayload::Error(message) => {
-                                        eprintln!("\n--- Stream error: {} ---", message);
+                                        eprintln!("\n--- Stream error: {message} ---");
                                         return;
                                     }
                                 }
@@ -669,7 +668,7 @@ pub async fn handle_images_list(client: &WorkerClient, _verbose: bool) -> Result
             let (repo, tag_part) = tag.rsplit_once(':').unwrap_or((tag, "latest"));
             let id_short = truncate_id(&img.id, 12);
             let size = format_size(img.size);
-            println!("{:<48}{:<16}{:<16}{:<12}", repo, tag_part, id_short, size);
+            println!("{repo:<48}{tag_part:<16}{id_short:<16}{size:<12}");
         }
     }
 
@@ -683,10 +682,10 @@ pub async fn handle_images_pull(
     username: Option<String>,
     password: Option<String>,
 ) -> Result<()> {
-    println!("Pulling {}...", image);
+    println!("Pulling {image}...");
 
     let image_spec = ImageSpec {
-        image: image.to_string(),
+        image: image.to_owned(),
         annotations: Default::default(),
         runtime_handler: String::new(),
     };
@@ -720,7 +719,7 @@ pub async fn handle_images_rm(
         };
 
         client.remove_image(&image_spec).await?;
-        println!("Deleted: {}", image);
+        println!("Deleted: {image}");
     }
 
     Ok(())
@@ -784,7 +783,7 @@ fn format_size(bytes: u64) -> String {
     } else if bytes >= KB {
         format!("{:.1}KB", bytes as f64 / KB as f64)
     } else {
-        format!("{}B", bytes)
+        format!("{bytes}B")
     }
 }
 
@@ -811,8 +810,8 @@ fn parse_env_vars(env: &[String]) -> Vec<hyprstream_workers::runtime::KeyValue> 
             let parts: Vec<&str> = e.splitn(2, '=').collect();
             if parts.len() == 2 {
                 Some(hyprstream_workers::runtime::KeyValue {
-                    key: parts[0].to_string(),
-                    value: parts[1].to_string(),
+                    key: parts[0].to_owned(),
+                    value: parts[1].to_owned(),
                 })
             } else {
                 None

@@ -19,7 +19,8 @@ use capnp::serialize;
 use git2db::{Git2DB, RepoId, RepositoryStatus, TrackedRepository, GitRef};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -168,7 +169,7 @@ impl RegistryOps for ZmqClient {
         let payload = serialize_message(|msg| {
             let mut req = msg.init_root::<registry_capnp::registry_request::Builder>();
             req.set_id(req_id);
-            req.set_remove(&id.to_string());
+            req.set_remove(id.to_string());
         })?;
         let response = self.call(payload, CallOptions::default()).await?;
         parse_success_response(&response)
@@ -234,7 +235,7 @@ fn parse_branches_response(response: &[u8]) -> Result<Vec<String>> {
         match resp.which()? {
             Which::Branches(branches) => {
                 let branches = branches?;
-                branches.iter().map(|b| Ok(b?.to_str()?.to_string())).collect()
+                branches.iter().map(|b| Ok(b?.to_str()?.to_owned())).collect()
             }
             _ => Err(anyhow!("Expected branches response")),
         }
@@ -287,23 +288,23 @@ fn parse_tracked_repository(
     let id = RepoId::from_uuid(Uuid::parse_str(id_str)?);
 
     let name = if repo.has_name() {
-        Some(repo.get_name()?.to_str()?.to_string())
+        Some(repo.get_name()?.to_str()?.to_owned())
     } else {
         None
     };
 
-    let url = repo.get_url()?.to_str()?.to_string();
+    let url = repo.get_url()?.to_str()?.to_owned();
     let worktree_path = PathBuf::from(repo.get_worktree_path()?.to_str()?);
 
     let tracking_ref_str = repo.get_tracking_ref()?.to_str()?;
     let tracking_ref = if tracking_ref_str.is_empty() {
-        GitRef::Branch("main".to_string())
+        GitRef::Branch("main".to_owned())
     } else {
-        GitRef::Branch(tracking_ref_str.to_string())
+        GitRef::Branch(tracking_ref_str.to_owned())
     };
 
     let current_oid = if repo.has_current_oid() {
-        Some(repo.get_current_oid()?.to_str()?.to_string())
+        Some(repo.get_current_oid()?.to_str()?.to_owned())
     } else {
         None
     };
@@ -434,12 +435,12 @@ impl RegistryClient for RegistryZmq {
         let repo = RegistryOps::get_by_name(&self.client, name)
             .await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?
-            .ok_or_else(|| RegistryServiceError::transport(format!("Repository '{}' not found", name)))?;
+            .ok_or_else(|| RegistryServiceError::transport(format!("Repository '{name}' not found")))?;
 
         Ok(Arc::new(RepositoryZmqClient::new(
-            self.client.endpoint().to_string(),
+            self.client.endpoint().to_owned(),
             repo.id,
-            name.to_string(),
+            name.to_owned(),
             self.client.signing_key().clone(),
             self.client.identity().clone(),
         )))
@@ -453,12 +454,12 @@ impl RegistryClient for RegistryZmq {
         let repo = RegistryOps::get(&self.client, &id.to_string())
             .await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?
-            .ok_or_else(|| RegistryServiceError::transport(format!("Repository '{}' not found", id)))?;
+            .ok_or_else(|| RegistryServiceError::transport(format!("Repository '{id}' not found")))?;
 
         let name = repo.name.unwrap_or_else(|| id.to_string());
 
         Ok(Arc::new(RepositoryZmqClient::new(
-            self.client.endpoint().to_string(),
+            self.client.endpoint().to_owned(),
             id.clone(),
             name,
             self.client.signing_key().clone(),
@@ -576,27 +577,24 @@ impl RegistryService {
 
     /// Handle a list repositories request
     fn handle_list(&self) -> Result<Vec<TrackedRepository>> {
-        let registry = self.registry.read()
-            .map_err(|_| anyhow!("registry lock poisoned"))?;
+        let registry = self.registry.blocking_read();
         Ok(registry.list().cloned().collect())
     }
 
     /// Handle get repository by ID
     fn handle_get(&self, repo_id: &str) -> Result<Option<TrackedRepository>> {
         let id = Self::parse_repo_id(repo_id)?;
-        let registry = self.registry.read()
-            .map_err(|_| anyhow!("registry lock poisoned"))?;
+        let registry = self.registry.blocking_read();
         let result = registry.list().find(|r| r.id == id).cloned();
         Ok(result)
     }
 
     /// Handle get repository by name
     fn handle_get_by_name(&self, name: &str) -> Result<Option<TrackedRepository>> {
-        let registry = self.registry.read()
-            .map_err(|_| anyhow!("registry lock poisoned"))?;
+        let registry = self.registry.blocking_read();
         let result = registry
             .list()
-            .find(|r| r.name.as_ref() == Some(&name.to_string()))
+            .find(|r| r.name.as_ref() == Some(&name.to_owned()))
             .cloned();
         Ok(result)
     }
@@ -607,8 +605,7 @@ impl RegistryService {
 
         // Use captured runtime handle instead of creating new runtime
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read()
-                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let registry = self.registry.read().await;
             let handle = registry.repo(&id)?;
             let branches = handle.branch().list().await?;
             Ok(branches.into_iter().map(|b| b.name).collect())
@@ -626,8 +623,7 @@ impl RegistryService {
 
         // Use captured runtime handle instead of creating new runtime
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read()
-                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let registry = self.registry.read().await;
             let handle = registry.repo(&id)?;
             handle.branch().create(branch_name, start_point).await?;
             Ok(())
@@ -640,8 +636,7 @@ impl RegistryService {
 
         // Use captured runtime handle instead of creating new runtime
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read()
-                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let registry = self.registry.read().await;
             let handle = registry.repo(&id)?;
             handle.branch().checkout(ref_name).await?;
             Ok(())
@@ -654,8 +649,7 @@ impl RegistryService {
 
         // Use captured runtime handle instead of creating new runtime
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read()
-                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let registry = self.registry.read().await;
             let handle = registry.repo(&id)?;
             handle.staging().add_all().await?;
             Ok(())
@@ -668,8 +662,7 @@ impl RegistryService {
 
         // Use captured runtime handle instead of creating new runtime
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read()
-                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let registry = self.registry.read().await;
             let handle = registry.repo(&id)?;
             let oid = handle.commit(message).await?;
             Ok(oid.to_string())
@@ -679,13 +672,12 @@ impl RegistryService {
     /// Handle merge
     fn handle_merge(&self, repo_id: &str, source: &str, message: Option<&str>) -> Result<String> {
         let id = Self::parse_repo_id(repo_id)?;
-        let source = source.to_string();
-        let message = message.map(|s| s.to_string());
+        let source = source.to_owned();
+        let message = message.map(std::borrow::ToOwned::to_owned);
 
         // Use captured runtime handle instead of creating new runtime
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read()
-                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let registry = self.registry.read().await;
             let handle = registry.repo(&id)?;
             let oid = handle.merge(&source, message.as_deref()).await?;
             Ok(oid.to_string())
@@ -698,8 +690,7 @@ impl RegistryService {
 
         // Use captured runtime handle instead of creating new runtime
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read()
-                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let registry = self.registry.read().await;
             let handle = registry.repo(&id)?;
             let status = handle.status().await?;
             Ok(status)
@@ -716,14 +707,13 @@ impl RegistryService {
         branch: Option<&str>,
     ) -> Result<TrackedRepository> {
         // Clone operation needs write lock since it mutates registry
-        let url = url.to_string();
-        let name = name.map(|s| s.to_string());
-        let branch = branch.map(|s| s.to_string());
+        let url = url.to_owned();
+        let name = name.map(std::borrow::ToOwned::to_owned);
+        let branch = branch.map(std::borrow::ToOwned::to_owned);
 
         // Use captured runtime handle instead of creating new runtime
         self.runtime_handle.block_on(async {
-            let mut registry = self.registry.write()
-                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let mut registry = self.registry.write().await;
             let mut clone_builder = registry.clone(&url);
 
             if let Some(ref n) = name {
@@ -765,8 +755,7 @@ impl RegistryService {
 
         // Use captured runtime handle instead of creating new runtime
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read()
-                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let registry = self.registry.read().await;
             let handle = registry.repo(&id)?;
             let mut worktrees = handle.get_worktrees().await?;
 
@@ -777,7 +766,7 @@ impl RegistryService {
                     .path()
                     .file_name()
                     .and_then(|s| s.to_str())
-                    .map(|s| s.to_string());
+                    .map(std::borrow::ToOwned::to_owned);
 
                 // Use WorktreeHandle::status() - single source of truth for dirty status
                 let status = wt.status().await.ok();
@@ -807,12 +796,11 @@ impl RegistryService {
     ) -> Result<PathBuf> {
         let id = Self::parse_repo_id(repo_id)?;
         let path = PathBuf::from(path);
-        let branch = branch.to_string();
+        let branch = branch.to_owned();
 
         // Use captured runtime handle instead of creating new runtime
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read()
-                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let registry = self.registry.read().await;
             let handle = registry.repo(&id)?;
             let worktree = handle.create_worktree(&path, &branch).await?;
             Ok(worktree.path().to_path_buf())
@@ -828,13 +816,12 @@ impl RegistryService {
         _tracking_ref: Option<&str>,
     ) -> Result<TrackedRepository> {
         let path = PathBuf::from(path);
-        let name = name.map(|s| s.to_string());
+        let name = name.map(std::borrow::ToOwned::to_owned);
         // Note: tracking_ref is not yet used by register_repository
 
         // Register requires write lock
         self.runtime_handle.block_on(async {
-            let mut registry = self.registry.write()
-                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let mut registry = self.registry.write().await;
 
             // Generate a new repo ID
             let repo_id = RepoId::new();
@@ -862,8 +849,7 @@ impl RegistryService {
 
         // Remove requires write lock
         self.runtime_handle.block_on(async {
-            let mut registry = self.registry.write()
-                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let mut registry = self.registry.write().await;
             registry.remove_repository(&id).await?;
             Ok(())
         })
@@ -875,8 +861,7 @@ impl RegistryService {
         let worktree_path = PathBuf::from(worktree_path);
 
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read()
-                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let registry = self.registry.read().await;
             let handle = registry.repo(&id)?;
 
             // Get base repo path
@@ -899,8 +884,7 @@ impl RegistryService {
         let id = Self::parse_repo_id(repo_id)?;
 
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read()
-                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let registry = self.registry.read().await;
             let handle = registry.repo(&id)?;
 
             for file in files {
@@ -915,8 +899,7 @@ impl RegistryService {
         let id = Self::parse_repo_id(repo_id)?;
 
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read()
-                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let registry = self.registry.read().await;
             let handle = registry.repo(&id)?;
 
             // Get HEAD ref (DefaultBranch resolves to HEAD)
@@ -928,11 +911,10 @@ impl RegistryService {
     /// Handle get ref operation
     fn handle_get_ref(&self, repo_id: &str, ref_name: &str) -> Result<String> {
         let id = Self::parse_repo_id(repo_id)?;
-        let ref_name = ref_name.to_string();
+        let ref_name = ref_name.to_owned();
 
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read()
-                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let registry = self.registry.read().await;
             let handle = registry.repo(&id)?;
 
             // Try to resolve as a revspec
@@ -947,11 +929,10 @@ impl RegistryService {
     /// only that refspec is fetched; otherwise, all refs are fetched from origin.
     fn handle_update(&self, repo_id: &str, refspec: Option<&str>) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
-        let refspec = refspec.map(|s| s.to_string());
+        let refspec = refspec.map(std::borrow::ToOwned::to_owned);
 
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read()
-                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let registry = self.registry.read().await;
             let handle = registry.repo(&id)?;
 
             // Get the repository path
@@ -985,11 +966,10 @@ impl RegistryService {
 
     /// Handle health check
     fn handle_health_check(&self) -> Result<HealthStatus> {
-        let registry = self.registry.read()
-            .map_err(|_| anyhow!("registry lock poisoned"))?;
+        let registry = self.registry.blocking_read();
         let repo_count = registry.list().count() as u32;
         Ok(HealthStatus {
-            status: "healthy".to_string(),
+            status: "healthy".to_owned(),
             repository_count: repo_count,
             worktree_count: 0,
             cache_hits: 0,
@@ -1002,8 +982,7 @@ impl RegistryService {
         let id = Self::parse_repo_id(repo_id)?;
 
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read()
-                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let registry = self.registry.read().await;
             let handle = registry.repo(&id)?;
 
             let remotes = handle.remote().list().await?;
@@ -1022,12 +1001,11 @@ impl RegistryService {
     /// Handle add remote operation
     fn handle_add_remote(&self, repo_id: &str, name: &str, url: &str) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
-        let name = name.to_string();
-        let url = url.to_string();
+        let name = name.to_owned();
+        let url = url.to_owned();
 
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read()
-                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let registry = self.registry.read().await;
             let handle = registry.repo(&id)?;
             handle.remote().add(&name, &url).await?;
             Ok(())
@@ -1037,11 +1015,10 @@ impl RegistryService {
     /// Handle remove remote operation
     fn handle_remove_remote(&self, repo_id: &str, name: &str) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
-        let name = name.to_string();
+        let name = name.to_owned();
 
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read()
-                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let registry = self.registry.read().await;
             let handle = registry.repo(&id)?;
             handle.remote().remove(&name).await?;
             Ok(())
@@ -1051,12 +1028,11 @@ impl RegistryService {
     /// Handle set remote URL operation
     fn handle_set_remote_url(&self, repo_id: &str, name: &str, url: &str) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
-        let name = name.to_string();
-        let url = url.to_string();
+        let name = name.to_owned();
+        let url = url.to_owned();
 
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read()
-                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let registry = self.registry.read().await;
             let handle = registry.repo(&id)?;
             handle.remote().set_url(&name, &url).await?;
             Ok(())
@@ -1066,12 +1042,11 @@ impl RegistryService {
     /// Handle rename remote operation
     fn handle_rename_remote(&self, repo_id: &str, old_name: &str, new_name: &str) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
-        let old_name = old_name.to_string();
-        let new_name = new_name.to_string();
+        let old_name = old_name.to_owned();
+        let new_name = new_name.to_owned();
 
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read()
-                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let registry = self.registry.read().await;
             let handle = registry.repo(&id)?;
             handle.remote().rename(&old_name, &new_name).await?;
             Ok(())
@@ -1115,7 +1090,7 @@ impl ZmqService for RegistryService {
                 let id = id?;
                 let id_str = id.to_str()?;
                 // Authorization: Query on specific registry entry
-                let resource = format!("registry:{}", id_str);
+                let resource = format!("registry:{id_str}");
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
                     return Ok(resp);
                 }
@@ -1130,7 +1105,7 @@ impl ZmqService for RegistryService {
                 let name = name?;
                 let name_str = name.to_str()?;
                 // Authorization: Query on specific registry entry
-                let resource = format!("registry:{}", name_str);
+                let resource = format!("registry:{name_str}");
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
                     return Ok(resp);
                 }
@@ -1198,7 +1173,7 @@ impl ZmqService for RegistryService {
             Which::Remove(repo_id) => {
                 let repo_id = repo_id?.to_str()?;
                 // Authorization: Manage on specific registry entry (destructive)
-                let resource = format!("registry:{}", repo_id);
+                let resource = format!("registry:{repo_id}");
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Manage) {
                     return Ok(resp);
                 }
@@ -1211,7 +1186,7 @@ impl ZmqService for RegistryService {
             Which::ListBranches(repo_id) => {
                 let repo_id = repo_id?.to_str()?;
                 // Authorization: Query on specific registry entry
-                let resource = format!("registry:{}", repo_id);
+                let resource = format!("registry:{repo_id}");
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
                     return Ok(resp);
                 }
@@ -1225,7 +1200,7 @@ impl ZmqService for RegistryService {
                 let branch_req = branch_req?;
                 let repo_id = branch_req.get_repo_id()?.to_str()?;
                 // Authorization: Write on specific registry entry
-                let resource = format!("registry:{}", repo_id);
+                let resource = format!("registry:{repo_id}");
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
                     return Ok(resp);
                 }
@@ -1246,7 +1221,7 @@ impl ZmqService for RegistryService {
                 let checkout_req = checkout_req?;
                 let repo_id = checkout_req.get_repo_id()?.to_str()?;
                 // Authorization: Write on specific registry entry
-                let resource = format!("registry:{}", repo_id);
+                let resource = format!("registry:{repo_id}");
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
                     return Ok(resp);
                 }
@@ -1261,7 +1236,7 @@ impl ZmqService for RegistryService {
             Which::StageAll(repo_id) => {
                 let repo_id = repo_id?.to_str()?;
                 // Authorization: Write on specific registry entry
-                let resource = format!("registry:{}", repo_id);
+                let resource = format!("registry:{repo_id}");
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
                     return Ok(resp);
                 }
@@ -1275,7 +1250,7 @@ impl ZmqService for RegistryService {
                 let commit_req = commit_req?;
                 let repo_id = commit_req.get_repo_id()?.to_str()?;
                 // Authorization: Write on specific registry entry
-                let resource = format!("registry:{}", repo_id);
+                let resource = format!("registry:{repo_id}");
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
                     return Ok(resp);
                 }
@@ -1291,13 +1266,13 @@ impl ZmqService for RegistryService {
                 let merge_req = merge_req?;
                 let repo_id = merge_req.get_repo_id()?.to_str()?;
                 // Authorization: Write on specific registry entry
-                let resource = format!("registry:{}", repo_id);
+                let resource = format!("registry:{repo_id}");
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
                     return Ok(resp);
                 }
                 let source = merge_req.get_source()?.to_str()?;
                 let message = if merge_req.has_message() {
-                    Some(merge_req.get_message()?.to_str()?.to_string())
+                    Some(merge_req.get_message()?.to_str()?.to_owned())
                 } else {
                     None
                 };
@@ -1311,7 +1286,7 @@ impl ZmqService for RegistryService {
             Which::Status(repo_id) => {
                 let repo_id = repo_id?.to_str()?;
                 // Authorization: Query on specific registry entry
-                let resource = format!("registry:{}", repo_id);
+                let resource = format!("registry:{repo_id}");
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
                     return Ok(resp);
                 }
@@ -1333,7 +1308,7 @@ impl ZmqService for RegistryService {
             Which::ListWorktrees(repo_id) => {
                 let repo_id = repo_id?.to_str()?;
                 // Authorization: Query on specific registry entry
-                let resource = format!("registry:{}", repo_id);
+                let resource = format!("registry:{repo_id}");
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
                     return Ok(resp);
                 }
@@ -1347,7 +1322,7 @@ impl ZmqService for RegistryService {
                 let wt_req = wt_req?;
                 let repo_id = wt_req.get_repo_id()?.to_str()?;
                 // Authorization: Write on specific registry entry
-                let resource = format!("registry:{}", repo_id);
+                let resource = format!("registry:{repo_id}");
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
                     return Ok(resp);
                 }
@@ -1364,7 +1339,7 @@ impl ZmqService for RegistryService {
                 let wt_req = wt_req?;
                 let repo_id = wt_req.get_repo_id()?.to_str()?;
                 // Authorization: Manage on specific registry entry (destructive)
-                let resource = format!("registry:{}", repo_id);
+                let resource = format!("registry:{repo_id}");
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Manage) {
                     return Ok(resp);
                 }
@@ -1380,7 +1355,7 @@ impl ZmqService for RegistryService {
                 let update_req = update_req?;
                 let repo_id = update_req.get_repo_id()?.to_str()?;
                 // Authorization: Write on specific registry entry
-                let resource = format!("registry:{}", repo_id);
+                let resource = format!("registry:{repo_id}");
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
                     return Ok(resp);
                 }
@@ -1401,14 +1376,14 @@ impl ZmqService for RegistryService {
                 let stage_req = stage_req?;
                 let repo_id = stage_req.get_repo_id()?.to_str()?;
                 // Authorization: Write on specific registry entry
-                let resource = format!("registry:{}", repo_id);
+                let resource = format!("registry:{repo_id}");
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
                     return Ok(resp);
                 }
                 let files_reader = stage_req.get_files()?;
                 let mut files = Vec::new();
                 for file in files_reader.iter() {
-                    files.push(file?.to_str()?.to_string());
+                    files.push(file?.to_str()?.to_owned());
                 }
 
                 match self.handle_stage_files(repo_id, files) {
@@ -1420,7 +1395,7 @@ impl ZmqService for RegistryService {
             Which::GetHead(repo_id) => {
                 let repo_id = repo_id?.to_str()?;
                 // Authorization: Query on specific registry entry
-                let resource = format!("registry:{}", repo_id);
+                let resource = format!("registry:{repo_id}");
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
                     return Ok(resp);
                 }
@@ -1434,7 +1409,7 @@ impl ZmqService for RegistryService {
                 let ref_req = ref_req?;
                 let repo_id = ref_req.get_repo_id()?.to_str()?;
                 // Authorization: Query on specific registry entry
-                let resource = format!("registry:{}", repo_id);
+                let resource = format!("registry:{repo_id}");
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
                     return Ok(resp);
                 }
@@ -1449,7 +1424,7 @@ impl ZmqService for RegistryService {
             Which::ListRemotes(repo_id) => {
                 let repo_id = repo_id?.to_str()?;
                 // Authorization: Query on specific registry entry
-                let resource = format!("registry:{}", repo_id);
+                let resource = format!("registry:{repo_id}");
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
                     return Ok(resp);
                 }
@@ -1463,7 +1438,7 @@ impl ZmqService for RegistryService {
                 let remote_req = remote_req?;
                 let repo_id = remote_req.get_repo_id()?.to_str()?;
                 // Authorization: Write on specific registry entry
-                let resource = format!("registry:{}", repo_id);
+                let resource = format!("registry:{repo_id}");
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
                     return Ok(resp);
                 }
@@ -1480,7 +1455,7 @@ impl ZmqService for RegistryService {
                 let remote_req = remote_req?;
                 let repo_id = remote_req.get_repo_id()?.to_str()?;
                 // Authorization: Write on specific registry entry
-                let resource = format!("registry:{}", repo_id);
+                let resource = format!("registry:{repo_id}");
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
                     return Ok(resp);
                 }
@@ -1496,7 +1471,7 @@ impl ZmqService for RegistryService {
                 let remote_req = remote_req?;
                 let repo_id = remote_req.get_repo_id()?.to_str()?;
                 // Authorization: Write on specific registry entry
-                let resource = format!("registry:{}", repo_id);
+                let resource = format!("registry:{repo_id}");
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
                     return Ok(resp);
                 }
@@ -1513,7 +1488,7 @@ impl ZmqService for RegistryService {
                 let remote_req = remote_req?;
                 let repo_id = remote_req.get_repo_id()?.to_str()?;
                 // Authorization: Write on specific registry entry
-                let resource = format!("registry:{}", repo_id);
+                let resource = format!("registry:{repo_id}");
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
                     return Ok(resp);
                 }
@@ -1649,8 +1624,7 @@ impl RepositoryZmqClient {
                         Some(
                             branch_text
                                 .to_str()
-                                .map_err(|e| RegistryServiceError::transport(e.to_string()))?
-                                .to_string(),
+                                .map_err(|e| RegistryServiceError::transport(e.to_string()))?.to_owned(),
                         )
                     } else {
                         None
@@ -1659,7 +1633,7 @@ impl RepositoryZmqClient {
                     result.push(WorktreeInfo {
                         path: PathBuf::from(path_str),
                         branch,
-                        driver: "zmq".to_string(), // Default driver name for ZMQ-fetched worktrees
+                        driver: "zmq".to_owned(), // Default driver name for ZMQ-fetched worktrees
                         is_dirty: wt.get_is_dirty(),
                     });
                 }
@@ -1741,8 +1715,8 @@ impl RepositoryClient for RepositoryZmqClient {
             req.set_id(id);
 
             let mut wt_req = req.init_create_worktree();
-            wt_req.set_repo_id(&self.repo_id.to_string());
-            wt_req.set_path(&path.to_string_lossy());
+            wt_req.set_repo_id(self.repo_id.to_string());
+            wt_req.set_path(path.to_string_lossy());
             wt_req.set_branch_name(branch);
             wt_req.set_create_branch(false);
 
@@ -1790,7 +1764,7 @@ impl RepositoryClient for RepositoryZmqClient {
             let mut message = Builder::new_default();
             let mut req = message.init_root::<registry_capnp::registry_request::Builder>();
             req.set_id(id);
-            req.set_list_worktrees(&self.repo_id.to_string());
+            req.set_list_worktrees(self.repo_id.to_string());
 
             let mut bytes = Vec::new();
             serialize::write_message(&mut bytes, &message)
@@ -1826,7 +1800,7 @@ impl RepositoryClient for RepositoryZmqClient {
             req.set_id(id);
 
             let mut branch_req = req.init_create_branch();
-            branch_req.set_repo_id(&self.repo_id.to_string());
+            branch_req.set_repo_id(self.repo_id.to_string());
             branch_req.set_branch_name(name);
             if let Some(start_point) = from {
                 branch_req.set_start_point(start_point);
@@ -1873,7 +1847,7 @@ impl RepositoryClient for RepositoryZmqClient {
             req.set_id(id);
 
             let mut checkout_req = req.init_checkout();
-            checkout_req.set_repo_id(&self.repo_id.to_string());
+            checkout_req.set_repo_id(self.repo_id.to_string());
             checkout_req.set_ref_name(ref_spec);
 
             let mut bytes = Vec::new();
@@ -1908,7 +1882,7 @@ impl RepositoryClient for RepositoryZmqClient {
     async fn default_branch(&self) -> Result<String, RegistryServiceError> {
         // Default branch lookup not yet supported via ZMQ
         // Return "main" as default
-        Ok("main".to_string())
+        Ok("main".to_owned())
     }
 
     async fn list_branches(&self) -> Result<Vec<String>, RegistryServiceError> {
@@ -1928,7 +1902,7 @@ impl RepositoryClient for RepositoryZmqClient {
             let mut message = Builder::new_default();
             let mut req = message.init_root::<registry_capnp::registry_request::Builder>();
             req.set_id(id);
-            req.set_stage_all(&self.repo_id.to_string());
+            req.set_stage_all(self.repo_id.to_string());
 
             let mut bytes = Vec::new();
             serialize::write_message(&mut bytes, &message)
@@ -1971,7 +1945,7 @@ impl RepositoryClient for RepositoryZmqClient {
             req.set_id(id);
 
             let mut commit_req = req.init_commit();
-            commit_req.set_repo_id(&self.repo_id.to_string());
+            commit_req.set_repo_id(self.repo_id.to_string());
             commit_req.set_message(message);
 
             let mut bytes = Vec::new();
@@ -1994,8 +1968,7 @@ impl RepositoryClient for RepositoryZmqClient {
             Ok(Which::CommitOid(oid)) => {
                 let oid = oid.map_err(|e| RegistryServiceError::transport(e.to_string()))?;
                 Ok(oid.to_str()
-                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?
-                    .to_string())
+                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?.to_owned())
             }
             Ok(Which::Error(err)) => {
                 let err = err.map_err(|e| RegistryServiceError::transport(e.to_string()))?;
@@ -2020,8 +1993,8 @@ impl RepositoryClient for RepositoryZmqClient {
             req.set_id(id);
 
             let mut wt_req = req.init_remove_worktree();
-            wt_req.set_repo_id(&self.repo_id.to_string());
-            wt_req.set_worktree_path(&path.to_string_lossy());
+            wt_req.set_repo_id(self.repo_id.to_string());
+            wt_req.set_worktree_path(path.to_string_lossy());
 
             let mut bytes = Vec::new();
             serialize::write_message(&mut bytes, &message)
@@ -2064,7 +2037,7 @@ impl RepositoryClient for RepositoryZmqClient {
             req.set_id(id);
 
             let mut stage_req = req.init_stage_files();
-            stage_req.set_repo_id(&self.repo_id.to_string());
+            stage_req.set_repo_id(self.repo_id.to_string());
             let mut files_list = stage_req.init_files(files.len() as u32);
             for (i, file) in files.iter().enumerate() {
                 files_list.set(i as u32, file);
@@ -2109,7 +2082,7 @@ impl RepositoryClient for RepositoryZmqClient {
             let mut message = Builder::new_default();
             let mut req = message.init_root::<registry_capnp::registry_request::Builder>();
             req.set_id(id);
-            req.set_get_head(&self.repo_id.to_string());
+            req.set_get_head(self.repo_id.to_string());
 
             let mut bytes = Vec::new();
             serialize::write_message(&mut bytes, &message)
@@ -2131,8 +2104,7 @@ impl RepositoryClient for RepositoryZmqClient {
             Ok(Which::RefOid(oid)) => {
                 let oid = oid.map_err(|e| RegistryServiceError::transport(e.to_string()))?;
                 Ok(oid.to_str()
-                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?
-                    .to_string())
+                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?.to_owned())
             }
             Ok(Which::Error(err)) => {
                 let err = err.map_err(|e| RegistryServiceError::transport(e.to_string()))?;
@@ -2157,7 +2129,7 @@ impl RepositoryClient for RepositoryZmqClient {
             req.set_id(id);
 
             let mut ref_req = req.init_get_ref();
-            ref_req.set_repo_id(&self.repo_id.to_string());
+            ref_req.set_repo_id(self.repo_id.to_string());
             ref_req.set_ref_name(ref_name);
 
             let mut bytes = Vec::new();
@@ -2180,8 +2152,7 @@ impl RepositoryClient for RepositoryZmqClient {
             Ok(Which::RefOid(oid)) => {
                 let oid = oid.map_err(|e| RegistryServiceError::transport(e.to_string()))?;
                 Ok(oid.to_str()
-                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?
-                    .to_string())
+                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?.to_owned())
             }
             Ok(Which::Error(err)) => {
                 let err = err.map_err(|e| RegistryServiceError::transport(e.to_string()))?;
@@ -2206,7 +2177,7 @@ impl RepositoryClient for RepositoryZmqClient {
             req.set_id(id);
 
             let mut update_req = req.init_update();
-            update_req.set_repo_id(&self.repo_id.to_string());
+            update_req.set_repo_id(self.repo_id.to_string());
             if let Some(r) = refspec {
                 update_req.set_refspec(r);
             }
@@ -2250,7 +2221,7 @@ impl RepositoryClient for RepositoryZmqClient {
             let mut message = Builder::new_default();
             let mut req = message.init_root::<registry_capnp::registry_request::Builder>();
             req.set_id(id);
-            req.set_list_remotes(&self.repo_id.to_string());
+            req.set_list_remotes(self.repo_id.to_string());
 
             let mut bytes = Vec::new();
             serialize::write_message(&mut bytes, &message)
@@ -2275,7 +2246,7 @@ impl RepositoryClient for RepositoryZmqClient {
             req.set_id(id);
 
             let mut remote_req = req.init_add_remote();
-            remote_req.set_repo_id(&self.repo_id.to_string());
+            remote_req.set_repo_id(self.repo_id.to_string());
             remote_req.set_name(name);
             remote_req.set_url(url);
 
@@ -2320,7 +2291,7 @@ impl RepositoryClient for RepositoryZmqClient {
             req.set_id(id);
 
             let mut remote_req = req.init_remove_remote();
-            remote_req.set_repo_id(&self.repo_id.to_string());
+            remote_req.set_repo_id(self.repo_id.to_string());
             remote_req.set_name(name);
 
             let mut bytes = Vec::new();
@@ -2364,7 +2335,7 @@ impl RepositoryClient for RepositoryZmqClient {
             req.set_id(id);
 
             let mut remote_req = req.init_set_remote_url();
-            remote_req.set_repo_id(&self.repo_id.to_string());
+            remote_req.set_repo_id(self.repo_id.to_string());
             remote_req.set_name(name);
             remote_req.set_url(url);
 
@@ -2413,7 +2384,7 @@ impl RepositoryClient for RepositoryZmqClient {
             req.set_id(id);
 
             let mut remote_req = req.init_rename_remote();
-            remote_req.set_repo_id(&self.repo_id.to_string());
+            remote_req.set_repo_id(self.repo_id.to_string());
             remote_req.set_old_name(old_name);
             remote_req.set_new_name(new_name);
 
@@ -2456,7 +2427,7 @@ impl RepositoryClient for RepositoryZmqClient {
             let mut message = Builder::new_default();
             let mut req = message.init_root::<registry_capnp::registry_request::Builder>();
             req.set_id(id);
-            req.set_status(&self.repo_id.to_string());
+            req.set_status(self.repo_id.to_string());
 
             let mut bytes = Vec::new();
             serialize::write_message(&mut bytes, &message)
@@ -2483,8 +2454,7 @@ impl RepositoryClient for RepositoryZmqClient {
                     Some(status.get_branch()
                         .map_err(|e| RegistryServiceError::transport(e.to_string()))?
                         .to_str()
-                        .map_err(|e| RegistryServiceError::transport(e.to_string()))?
-                        .to_string())
+                        .map_err(|e| RegistryServiceError::transport(e.to_string()))?.to_owned())
                 } else {
                     None
                 };
@@ -2507,7 +2477,7 @@ impl RepositoryClient for RepositoryZmqClient {
                     .iter()
                     .filter_map(|text_result| {
                         text_result.map(|text| {
-                            text.to_str().ok().map(|s| PathBuf::from(s))
+                            text.to_str().ok().map(PathBuf::from)
                         }).unwrap_or(None)
                     })
                     .collect();
@@ -2544,7 +2514,7 @@ impl RepositoryClient for RepositoryZmqClient {
             req.set_id(id);
 
             let mut merge_req = req.init_merge();
-            merge_req.set_repo_id(&self.repo_id.to_string());
+            merge_req.set_repo_id(self.repo_id.to_string());
             merge_req.set_source(source);
             if let Some(msg) = message {
                 merge_req.set_message(msg);
@@ -2570,8 +2540,7 @@ impl RepositoryClient for RepositoryZmqClient {
             Ok(Which::CommitOid(oid)) => {
                 let oid = oid.map_err(|e| RegistryServiceError::transport(e.to_string()))?;
                 Ok(oid.to_str()
-                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?
-                    .to_string())
+                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?.to_owned())
             }
             Ok(Which::Error(err)) => {
                 let err = err.map_err(|e| RegistryServiceError::transport(e.to_string()))?;
@@ -2603,7 +2572,7 @@ mod tests {
         let context = crate::zmq::global_context();
 
         // Generate keypair for signing/verification
-        let (signing_key, verifying_key) = generate_signing_keypair();
+        let (signing_key, _verifying_key) = generate_signing_keypair();
 
         // Create a permissive policy manager and start PolicyService first
         let policy_manager = Arc::new(PolicyManager::permissive().await.expect("test: create policy manager"));

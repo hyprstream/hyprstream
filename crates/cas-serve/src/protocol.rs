@@ -124,7 +124,7 @@ impl Response {
 impl Request {
     /// Parse hash from hex string
     pub fn parse_hash(hash: &str) -> Result<merklehash::MerkleHash, String> {
-        merklehash::MerkleHash::from_hex(hash).map_err(|e| format!("Invalid hash: {}", e))
+        merklehash::MerkleHash::from_hex(hash).map_err(|e| format!("Invalid hash: {e}"))
     }
 }
 
@@ -135,7 +135,7 @@ mod tests {
     #[test]
     fn test_request_serialization() {
         let req = Request::GetFile {
-            hash: "abc123".to_string(),
+            hash: "abc123".to_owned(),
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("get_file"));

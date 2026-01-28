@@ -108,7 +108,7 @@ async fn get_model_info(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
-    let resource = format!("model:{}", id);
+    let resource = format!("model:{id}");
     if !state.policy_client.check(&user, &resource, Operation::Query).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
@@ -126,7 +126,7 @@ async fn get_model_info(
             let metadata = crate::storage::ModelMetadata {
                 name: model_ref.model.clone(),
                 display_name: Some(id.clone()),
-                model_type: "language_model".to_string(),
+                model_type: "language_model".to_owned(),
                 created_at: chrono::Utc::now().timestamp(),
                 updated_at: chrono::Utc::now().timestamp(),
                 size_bytes: None,
@@ -208,8 +208,7 @@ async fn download_model(
             .split('/')
             .next_back()
             .unwrap_or("")
-            .trim_end_matches(".git")
-            .to_string()
+            .trim_end_matches(".git").to_owned()
     });
 
     if model_name.is_empty() {
@@ -251,7 +250,7 @@ async fn download_model(
     Json(DownloadModelResponse {
         id: crate::storage::ModelId::new().to_string(),
         name: model_name,
-        status: "downloaded".to_string(),
+        status: "downloaded".to_owned(),
         path: model_path.to_string_lossy().to_string(),
     })
     .into_response()
@@ -264,7 +263,7 @@ async fn load_model(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
-    let resource = format!("model:{}", id);
+    let resource = format!("model:{id}");
     if !state.policy_client.check(&user, &resource, Operation::Manage).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
@@ -318,7 +317,7 @@ async fn unload_model(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
-    let resource = format!("model:{}", id);
+    let resource = format!("model:{id}");
     if !state.policy_client.check(&user, &resource, Operation::Manage).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,

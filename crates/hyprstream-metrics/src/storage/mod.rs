@@ -10,6 +10,9 @@
 //! Each backend implements the `StorageBackend` trait, providing a consistent
 //! interface for SQL operations like table management, querying, and data insertion.
 
+// tonic::Status is the idiomatic gRPC error type - boxing would break API
+#![allow(clippy::result_large_err)]
+
 pub mod cache;
 pub mod cached;
 pub mod context;
@@ -59,7 +62,7 @@ pub struct StorageUtils;
 impl StorageUtils {
     /// Generate SQL for creating a table with the given schema
     pub fn generate_create_table_sql(table_name: &str, schema: &Schema) -> Result<String, Status> {
-        let mut sql = format!("CREATE TABLE IF NOT EXISTS {} (", table_name);
+        let mut sql = format!("CREATE TABLE IF NOT EXISTS {table_name} (");
         let mut first = true;
 
         for field in schema.fields() {
@@ -83,20 +86,20 @@ impl StorageUtils {
             ));
         }
 
-        sql.push_str(")");
+        sql.push(')');
         Ok(sql)
     }
 
     /// Generate SQL for inserting data into a table
     pub fn generate_insert_sql(table_name: &str, column_count: usize) -> String {
         let placeholders = vec!["?"; column_count].join(", ");
-        format!("INSERT INTO {} VALUES ({})", table_name, placeholders)
+        format!("INSERT INTO {table_name} VALUES ({placeholders})")
     }
 
     /// Generate SQL for selecting data from a table
     pub fn generate_select_sql(table_name: &str, projection: Option<Vec<String>>) -> String {
-        let columns = projection.map(|cols| cols.join(", ")).unwrap_or_else(|| "*".to_string());
-        format!("SELECT {} FROM {}", columns, table_name)
+        let columns = projection.map(|cols| cols.join(", ")).unwrap_or_else(|| "*".to_owned());
+        format!("SELECT {columns} FROM {table_name}")
     }
 
     /// Generate SQL for creating a view

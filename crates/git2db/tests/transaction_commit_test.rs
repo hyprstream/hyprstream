@@ -23,7 +23,7 @@ async fn test_transaction_commit_clone() {
         .await
         .unwrap();
 
-    println!("Queued clone operation with ID: {}", id);
+    println!("Queued clone operation with ID: {id}");
 
     // Repository shouldn't exist yet
     assert_eq!(
@@ -48,7 +48,7 @@ async fn test_transaction_commit_clone() {
 #[tokio::test]
 async fn test_transaction_rollback() {
     let temp_dir = TempDir::new().unwrap();
-    let mut registry = Git2DB::open(temp_dir.path()).await.unwrap();
+    let registry = Git2DB::open(temp_dir.path()).await.unwrap();
 
     // Start transaction
     let tx = registry
@@ -62,7 +62,7 @@ async fn test_transaction_rollback() {
         .await
         .unwrap();
 
-    println!("Queued clone with ID: {}, now rolling back...", id);
+    println!("Queued clone with ID: {id}, now rolling back...");
 
     // Rollback instead of commit
     tx.rollback().await.unwrap();

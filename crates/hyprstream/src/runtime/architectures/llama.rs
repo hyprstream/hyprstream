@@ -137,7 +137,7 @@ impl Default for LlamaConfig {
             num_hidden_layers: 32,
             rope_theta: 10000.0,
             rope_scaling: None,
-            hidden_activation: "silu".to_string(),
+            hidden_activation: "silu".to_owned(),
             query_pre_attn_scalar: None,
             use_qk_norm: false,
             scale_embeddings: false,
@@ -165,10 +165,10 @@ impl LlamaConfig {
             num_hidden_layers: 32,
             rope_theta: 500000.0,
             rope_scaling: Some(RopeScaling {
-                scaling_type: "linear".to_string(),
+                scaling_type: "linear".to_owned(),
                 factor: 8.0,
             }),
-            hidden_activation: "silu".to_string(),
+            hidden_activation: "silu".to_owned(),
             query_pre_attn_scalar: None,
             use_qk_norm: false,
             scale_embeddings: false,
@@ -194,10 +194,10 @@ impl LlamaConfig {
             num_hidden_layers: 80,
             rope_theta: 500000.0,
             rope_scaling: Some(RopeScaling {
-                scaling_type: "linear".to_string(),
+                scaling_type: "linear".to_owned(),
                 factor: 8.0,
             }),
-            hidden_activation: "silu".to_string(),
+            hidden_activation: "silu".to_owned(),
             query_pre_attn_scalar: None,
             use_qk_norm: false,
             scale_embeddings: false,
@@ -1062,7 +1062,7 @@ impl LlamaModel {
 
                 // Detect Gemma3 by vocab size (262144) and set specific parameters
                 if config.vocab_size == 262144 {
-                    config.hidden_activation = "gelu_pytorch_tanh".to_string();
+                    config.hidden_activation = "gelu_pytorch_tanh".to_owned();
                     config.use_qk_norm = true;
                     config.scale_embeddings = true;
                     config.query_pre_attn_scalar = Some(256.0); // Common value for Gemma3
@@ -1172,11 +1172,11 @@ impl LlamaModel {
         config: &LlamaConfig,
         _device: &Device,
     ) -> Result<Option<LlamaLayer>> {
-        let prefix = format!("model.layers.{}", layer_idx);
+        let prefix = format!("model.layers.{layer_idx}");
 
         // Check if this layer exists (handle both separate and combined projections)
-        let has_separate_qkv = weights.contains_key(&format!("{}.self_attn.q_proj.weight", prefix));
-        let has_combined_qkv = weights.contains_key(&format!("{}.self_attn.c_attn.weight", prefix));
+        let has_separate_qkv = weights.contains_key(&format!("{prefix}.self_attn.q_proj.weight"));
+        let has_combined_qkv = weights.contains_key(&format!("{prefix}.self_attn.c_attn.weight"));
 
         if !has_separate_qkv && !has_combined_qkv {
             return Ok(None);
@@ -1188,12 +1188,12 @@ impl LlamaModel {
 
             // Load Q projection - remove from HashMap to free original tensor after transpose
             let q_weight = weights
-                .remove(&format!("{}.self_attn.q_proj.weight", prefix))
+                .remove(&format!("{prefix}.self_attn.q_proj.weight"))
                 .ok_or_else(|| anyhow!("Missing q_proj weight"))?
                 .transpose(0, 1)
                 .contiguous();
 
-            let q_proj = if let Some(q_bias) = weights.get(&format!("{}.self_attn.q_proj.bias", prefix)) {
+            let q_proj = if let Some(q_bias) = weights.get(&format!("{prefix}.self_attn.q_proj.bias")) {
                 tracing::debug!("Layer {}: Loading Q bias (Qwen-style)", layer_idx);
                 LinearProjection::with_bias(q_weight, q_bias.shallow_clone())
             } else {
@@ -1202,12 +1202,12 @@ impl LlamaModel {
 
             // Load K projection - remove from HashMap to free original tensor after transpose
             let k_weight = weights
-                .remove(&format!("{}.self_attn.k_proj.weight", prefix))
+                .remove(&format!("{prefix}.self_attn.k_proj.weight"))
                 .ok_or_else(|| anyhow!("Missing k_proj weight"))?
                 .transpose(0, 1)
                 .contiguous();
 
-            let k_proj = if let Some(k_bias) = weights.get(&format!("{}.self_attn.k_proj.bias", prefix)) {
+            let k_proj = if let Some(k_bias) = weights.get(&format!("{prefix}.self_attn.k_proj.bias")) {
                 tracing::debug!("Layer {}: Loading K bias (Qwen-style)", layer_idx);
                 LinearProjection::with_bias(k_weight, k_bias.shallow_clone())
             } else {
@@ -1216,12 +1216,12 @@ impl LlamaModel {
 
             // Load V projection - remove from HashMap to free original tensor after transpose
             let v_weight = weights
-                .remove(&format!("{}.self_attn.v_proj.weight", prefix))
+                .remove(&format!("{prefix}.self_attn.v_proj.weight"))
                 .ok_or_else(|| anyhow!("Missing v_proj weight"))?
                 .transpose(0, 1)
                 .contiguous();
 
-            let v_proj = if let Some(v_bias) = weights.get(&format!("{}.self_attn.v_proj.bias", prefix)) {
+            let v_proj = if let Some(v_bias) = weights.get(&format!("{prefix}.self_attn.v_proj.bias")) {
                 tracing::debug!("Layer {}: Loading V bias (Qwen-style)", layer_idx);
                 LinearProjection::with_bias(v_weight, v_bias.shallow_clone())
             } else {
@@ -1233,13 +1233,13 @@ impl LlamaModel {
             // Combined QKV projection (some Qwen models use c_attn)
             // Remove from HashMap to free original tensor after transpose
             let c_attn_weight = weights
-                .remove(&format!("{}.self_attn.c_attn.weight", prefix))
+                .remove(&format!("{prefix}.self_attn.c_attn.weight"))
                 .ok_or_else(|| anyhow!("Missing c_attn weight"))?
                 .transpose(0, 1) // Transpose from [out, in] to [in, out]
                 .contiguous();
 
             // Check for combined bias
-            let c_attn_bias = weights.get(&format!("{}.self_attn.c_attn.bias", prefix));
+            let c_attn_bias = weights.get(&format!("{prefix}.self_attn.c_attn.bias"));
 
             // Split c_attn into Q, K, V
             // c_attn has shape [hidden_size, 3 * projection_size]
@@ -1277,11 +1277,11 @@ impl LlamaModel {
 
         // Check for QK-norm weights (Gemma3)
         let q_norm = weights
-            .get(&format!("{}.self_attn.q_norm.weight", prefix))
-            .map(|t| t.shallow_clone());
+            .get(&format!("{prefix}.self_attn.q_norm.weight"))
+            .map(tch::Tensor::shallow_clone);
         let k_norm = weights
-            .get(&format!("{}.self_attn.k_norm.weight", prefix))
-            .map(|t| t.shallow_clone());
+            .get(&format!("{prefix}.self_attn.k_norm.weight"))
+            .map(tch::Tensor::shallow_clone);
 
         if q_norm.is_some() || k_norm.is_some() {
             tracing::debug!("Layer {} has QK-norm weights", layer_idx);
@@ -1293,12 +1293,12 @@ impl LlamaModel {
         } else if config.layer_types.is_empty() && config.use_qk_norm {
             // Gemma3 pattern: every 6th layer is global, others are local
             if (layer_idx + 1).is_multiple_of(6) {
-                "global".to_string()
+                "global".to_owned()
             } else {
-                "local".to_string()
+                "local".to_owned()
             }
         } else {
-            "global".to_string() // Default to global attention
+            "global".to_owned() // Default to global attention
         };
 
         // Determine sliding window size for Gemma3
@@ -1318,14 +1318,14 @@ impl LlamaModel {
         // Load output projection (typically no bias, but check anyway)
         // Remove from HashMap to free original tensor after transpose
         let o_weight = weights
-            .remove(&format!("{}.self_attn.o_proj.weight", prefix))
-            .or_else(|| weights.remove(&format!("{}.self_attn.c_proj.weight", prefix))) // Some models use c_proj for output
+            .remove(&format!("{prefix}.self_attn.o_proj.weight"))
+            .or_else(|| weights.remove(&format!("{prefix}.self_attn.c_proj.weight"))) // Some models use c_proj for output
             .ok_or_else(|| anyhow!("Missing o_proj/c_proj weight"))?
             .transpose(0, 1) // Transpose from [out, in] to [in, out]
             .contiguous();
 
-        let o_proj = if let Some(o_bias) = weights.get(&format!("{}.self_attn.o_proj.bias", prefix))
-            .or_else(|| weights.get(&format!("{}.self_attn.c_proj.bias", prefix)))
+        let o_proj = if let Some(o_bias) = weights.get(&format!("{prefix}.self_attn.o_proj.bias"))
+            .or_else(|| weights.get(&format!("{prefix}.self_attn.c_proj.bias")))
         {
             tracing::debug!("Layer {}: Loading O bias", layer_idx);
             LinearProjection::with_bias(o_weight, o_bias.shallow_clone())
@@ -1354,12 +1354,12 @@ impl LlamaModel {
         // Build MLP with optional biases
         // Remove from HashMap to free original tensors after transpose
         let gate_weight = weights
-            .remove(&format!("{}.mlp.gate_proj.weight", prefix))
+            .remove(&format!("{prefix}.mlp.gate_proj.weight"))
             .ok_or_else(|| anyhow!("Missing gate_proj weight"))?
             .transpose(0, 1) // Transpose from [out, in] to [in, out]
             .contiguous();
 
-        let gate_proj = if let Some(gate_bias) = weights.get(&format!("{}.mlp.gate_proj.bias", prefix)) {
+        let gate_proj = if let Some(gate_bias) = weights.get(&format!("{prefix}.mlp.gate_proj.bias")) {
             tracing::debug!("Layer {}: Loading gate_proj bias", layer_idx);
             LinearProjection::with_bias(gate_weight, gate_bias.shallow_clone())
         } else {
@@ -1367,12 +1367,12 @@ impl LlamaModel {
         };
 
         let up_weight = weights
-            .remove(&format!("{}.mlp.up_proj.weight", prefix))
+            .remove(&format!("{prefix}.mlp.up_proj.weight"))
             .ok_or_else(|| anyhow!("Missing up_proj weight"))?
             .transpose(0, 1) // Transpose from [out, in] to [in, out]
             .contiguous();
 
-        let up_proj = if let Some(up_bias) = weights.get(&format!("{}.mlp.up_proj.bias", prefix)) {
+        let up_proj = if let Some(up_bias) = weights.get(&format!("{prefix}.mlp.up_proj.bias")) {
             tracing::debug!("Layer {}: Loading up_proj bias", layer_idx);
             LinearProjection::with_bias(up_weight, up_bias.shallow_clone())
         } else {
@@ -1380,12 +1380,12 @@ impl LlamaModel {
         };
 
         let down_weight = weights
-            .remove(&format!("{}.mlp.down_proj.weight", prefix))
+            .remove(&format!("{prefix}.mlp.down_proj.weight"))
             .ok_or_else(|| anyhow!("Missing down_proj weight"))?
             .transpose(0, 1) // Transpose from [out, in] to [in, out]
             .contiguous();
 
-        let down_proj = if let Some(down_bias) = weights.get(&format!("{}.mlp.down_proj.bias", prefix)) {
+        let down_proj = if let Some(down_bias) = weights.get(&format!("{prefix}.mlp.down_proj.bias")) {
             tracing::debug!("Layer {}: Loading down_proj bias", layer_idx);
             LinearProjection::with_bias(down_weight, down_bias.shallow_clone())
         } else {
@@ -1402,7 +1402,7 @@ impl LlamaModel {
         // Build layer norms
         let input_layernorm = RMSNorm {
             weight: weights
-                .get(&format!("{}.input_layernorm.weight", prefix))
+                .get(&format!("{prefix}.input_layernorm.weight"))
                 .ok_or_else(|| anyhow!("Missing input_layernorm weight"))?
                 .shallow_clone(),
             eps: config.rms_norm_eps,
@@ -1410,7 +1410,7 @@ impl LlamaModel {
 
         let post_attention_layernorm = RMSNorm {
             weight: weights
-                .get(&format!("{}.post_attention_layernorm.weight", prefix))
+                .get(&format!("{prefix}.post_attention_layernorm.weight"))
                 .ok_or_else(|| anyhow!("Missing post_attention_layernorm weight"))?
                 .shallow_clone(),
             eps: config.rms_norm_eps,
@@ -1442,23 +1442,23 @@ impl LlamaModel {
             num_attention_heads: json["num_attention_heads"].as_u64().unwrap_or(32) as usize,
             num_key_value_heads: json
                 .get("num_key_value_heads")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or_else(|| json["num_attention_heads"].as_u64().unwrap_or(32))
                 as usize,
             hidden_size: json["hidden_size"].as_u64().unwrap_or(4096) as usize,
             head_dim: json
                 .get("head_dim")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .map(|v| v as usize)
                 .unwrap_or_else(|| {
                     // If head_dim not specified, calculate from hidden_size / num_attention_heads
                     let heads = json
                         .get("num_attention_heads")
-                        .and_then(|v| v.as_u64())
+                        .and_then(serde_json::Value::as_u64)
                         .unwrap_or(32) as usize;
                     let hidden = json
                         .get("hidden_size")
-                        .and_then(|v| v.as_u64())
+                        .and_then(serde_json::Value::as_u64)
                         .unwrap_or(4096) as usize;
                     // Common head_dim values are 64, 128, 256
                     if hidden.is_multiple_of(heads * 256) {
@@ -1480,17 +1480,16 @@ impl LlamaModel {
             num_hidden_layers: json["num_hidden_layers"].as_u64().unwrap_or(32) as usize,
             rope_theta: json
                 .get("rope_theta")
-                .and_then(|v| v.as_f64())
+                .and_then(serde_json::Value::as_f64)
                 .unwrap_or(10000.0) as f32,
             rope_scaling: None,
             hidden_activation: json
                 .get("hidden_activation")
                 .and_then(|v| v.as_str())
-                .unwrap_or("silu")
-                .to_string(),
+                .unwrap_or("silu").to_owned(),
             query_pre_attn_scalar: json
                 .get("query_pre_attn_scalar")
-                .and_then(|v| v.as_f64())
+                .and_then(serde_json::Value::as_f64)
                 .map(|v| v as f32),
             use_qk_norm: false, // Will be set based on vocab size or explicit config
             scale_embeddings: false, // Will be set based on vocab size or explicit config
@@ -1503,15 +1502,14 @@ impl LlamaModel {
             config.rope_scaling = Some(RopeScaling {
                 scaling_type: rope_scaling["type"]
                     .as_str()
-                    .unwrap_or("linear")
-                    .to_string(),
+                    .unwrap_or("linear").to_owned(),
                 factor: rope_scaling["factor"].as_f64().unwrap_or(8.0) as f32,
             });
         }
 
         // Check for Gemma3 specific configurations
         if config.vocab_size == 262144 {
-            config.hidden_activation = "gelu_pytorch_tanh".to_string();
+            config.hidden_activation = "gelu_pytorch_tanh".to_owned();
             config.use_qk_norm = true;
             config.scale_embeddings = true;
             if config.query_pre_attn_scalar.is_none() {
@@ -1883,7 +1881,7 @@ impl ModelOperations for LlamaModel {
 
                 if mask_count > 0 {
                     let mask_values = Tensor::full(
-                        &[mask_count],
+                        [mask_count],
                         -1e10_f64,
                         (hidden_states.kind(), hidden_states.device())
                     );

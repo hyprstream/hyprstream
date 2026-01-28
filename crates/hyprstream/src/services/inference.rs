@@ -149,12 +149,12 @@ impl InferenceService {
         endpoint: &str,
     ) -> Result<hyprstream_rpc::service::SpawnedService> {
         let model_path = model_path.as_ref().to_path_buf();
-        let endpoint_owned = endpoint.to_string();
+        let endpoint_owned = endpoint.to_owned();
         let model_id = model_path
             .file_name()
             .and_then(|n| n.to_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+            .map(std::borrow::ToOwned::to_owned)
+            .unwrap_or_else(|| "unknown".to_owned());
         let nonce_cache = Arc::new(InMemoryNonceCache::new());
 
         // Use oneshot to get initialization result
@@ -327,7 +327,7 @@ impl InferenceService {
                     match cmd.which()? {
                         Which::LoadModel(load) => {
                             let load = load?;
-                            let model_ref = load.get_model_ref()?.to_str()?.to_string();
+                            let model_ref = load.get_model_ref()?.to_str()?.to_owned();
                             let model_path = PathBuf::from(load.get_model_path()?.to_str()?);
                             return Ok((model_path, model_ref));
                         }
@@ -556,7 +556,7 @@ impl InferenceService {
         };
 
         // Create REP socket with TMQ for async I/O
-        let mut receiver = match reply(&*ctx).set_linger(0).bind(endpoint) {
+        let mut receiver = match reply(&ctx).set_linger(0).bind(endpoint) {
             Ok(r) => r,
             Err(e) => {
                 let err = anyhow!("failed to bind REP to {}: {}", endpoint, e);
@@ -745,7 +745,7 @@ impl InferenceService {
 
         // Apply TTT adaptation BEFORE generation
         let engine = self.engine.read().unwrap();
-        match ttt_trainer.adapt(&*engine, &input_tokens) {
+        match ttt_trainer.adapt(&engine, &input_tokens) {
             Ok(result) => {
                 if result.skipped {
                     trace!("TTT skipped: {:?}", result.skip_reason);
@@ -805,7 +805,7 @@ impl InferenceService {
         };
 
         let stream_id = self.next_stream_id();
-        let prompt = request.prompt.as_str().to_string();
+        let prompt = request.prompt.as_str().to_owned();
 
         // Generate server ephemeral Ristretto255 keypair for this stream
         let (server_secret, server_pubkey) = generate_ephemeral_keypair();
@@ -1069,7 +1069,7 @@ impl InferenceService {
     fn handle_release_session(&self, session_id: &str) -> Result<()> {
         self.engine
             .write().unwrap()
-            .release_session(&CacheOwner::Session(session_id.to_string()))
+            .release_session(&CacheOwner::Session(session_id.to_owned()))
     }
 
     /// Parse a generation request from capnp
@@ -1078,7 +1078,7 @@ impl InferenceService {
         reader: inference_capnp::generation_request::Reader,
     ) -> Result<GenerationRequest> {
         use crate::config::TemplatedPrompt;
-        let prompt = TemplatedPrompt::new(reader.get_prompt()?.to_str()?.to_string());
+        let prompt = TemplatedPrompt::new(reader.get_prompt()?.to_str()?.to_owned());
         let max_tokens = reader.get_max_tokens() as usize;
         let temperature = reader.get_temperature();
         let top_p = reader.get_top_p();
@@ -1093,7 +1093,7 @@ impl InferenceService {
         let stop_tokens: Vec<String> = reader
             .get_stop_tokens()?
             .iter()
-            .filter_map(|s| s.ok().and_then(|t| t.to_str().ok().map(|s| s.to_string())))
+            .filter_map(|s| s.ok().and_then(|t| t.to_str().ok().map(std::borrow::ToOwned::to_owned)))
             .collect();
 
         let seed = if reader.get_seed() == 0 {
@@ -1303,8 +1303,8 @@ impl InferenceService {
                     .iter()
                     .filter_map(|m| {
                         Some(crate::runtime::template_engine::ChatMessage {
-                            role: m.get_role().ok()?.to_str().ok()?.to_string(),
-                            content: m.get_content().ok()?.to_str().ok()?.to_string(),
+                            role: m.get_role().ok()?.to_str().ok()?.to_owned(),
+                            content: m.get_content().ok()?.to_str().ok()?.to_owned(),
                         })
                     })
                     .collect();
@@ -1330,7 +1330,7 @@ impl InferenceService {
                     target_modules: lora_config
                         .get_target_modules()?
                         .iter()
-                        .filter_map(|s| s.ok().and_then(|t| t.to_str().ok().map(|s| s.to_string())))
+                        .filter_map(|s| s.ok().and_then(|t| t.to_str().ok().map(std::borrow::ToOwned::to_owned)))
                         .collect(),
                     learning_rate: 0.0001, // Default learning rate
                 };
@@ -1390,7 +1390,7 @@ impl InferenceService {
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
                     return Ok((resp, None));
                 }
-                let session_id = session_id?.to_str()?.to_string();
+                let session_id = session_id?.to_str()?.to_owned();
                 match self.handle_set_session(session_id) {
                     Ok(()) => Ok((InferenceResponse::success(request_id), None)),
                     Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
@@ -1440,7 +1440,7 @@ impl InferenceService {
                 }
 
                 let start_req = start_req?;
-                let stream_id = start_req.get_stream_id()?.to_str()?.to_string();
+                let stream_id = start_req.get_stream_id()?.to_str()?.to_owned();
 
                 // Validate stream_id format
                 if !stream_id.starts_with("stream-") {
@@ -1467,7 +1467,7 @@ impl InferenceService {
                     );
                     if let Err(e) = push_socket.send(&register_msg, 0) {
                         error!(stream_id = %stream_id, error = %e, "Failed to send authorize message to StreamService");
-                        return Ok((InferenceResponse::error(request_id, &format!("Stream authorization failed: {}", e)), None));
+                        return Ok((InferenceResponse::error(request_id, &format!("Stream authorization failed: {e}")), None));
                     }
                     info!(stream_id = %stream_id, exp = exp, "Stream authorized for subscription (SignedEnvelope)");
                 } else {
@@ -1958,7 +1958,7 @@ impl InferenceZmqClient {
             Which::GenerationResult(result) => {
                 let result = result?;
                 Ok(GenerationResult {
-                    text: result.get_text()?.to_str()?.to_string(),
+                    text: result.get_text()?.to_str()?.to_owned(),
                     tokens_generated: result.get_tokens_generated() as usize,
                     finish_reason: self.parse_finish_reason(result.get_finish_reason()?),
                     generation_time_ms: result.get_generation_time_ms(),
@@ -2008,14 +2008,14 @@ impl InferenceZmqClient {
             Which::ModelInfo(info) => {
                 let info = info?;
                 Ok(ModelInfo {
-                    name: info.get_model_id()?.to_str()?.to_string(),
-                    architecture: info.get_architecture()?.to_str()?.to_string(),
+                    name: info.get_model_id()?.to_str()?.to_owned(),
+                    architecture: info.get_architecture()?.to_str()?.to_owned(),
                     vocab_size: info.get_vocab_size() as usize,
                     hidden_size: info.get_hidden_size() as usize,
                     num_hidden_layers: Some(info.get_num_layers() as usize),
                     num_attention_heads: Some(info.get_num_heads() as usize),
                     context_length: info.get_max_sequence_length() as usize,
-                    quantization: Some(info.get_quantization()?.to_str()?.to_string()),
+                    quantization: Some(info.get_quantization()?.to_str()?.to_owned()),
                     parameters: 0,
                     intermediate_size: None,
                 })
@@ -2075,7 +2075,7 @@ impl InferenceZmqClient {
         match resp.which()? {
             Which::StreamAuthorized(auth) => {
                 let auth = auth?;
-                let stream_id = auth.get_stream_id()?.to_str()?.to_string();
+                let stream_id = auth.get_stream_id()?.to_str()?.to_owned();
                 Ok(stream_id)
             }
             Which::Error(err) => {
@@ -2094,7 +2094,7 @@ impl InferenceZmqClient {
         use inference_capnp::inference_response::Which;
         match resp.which()? {
             Which::TemplateResult(result) => {
-                Ok(result?.to_str()?.to_string())
+                Ok(result?.to_str()?.to_owned())
             }
             Which::Error(err) => {
                 let err = err?;
@@ -2171,13 +2171,13 @@ impl StreamChunkMessage {
     pub fn from_capnp(payload: inference_capnp::inference_payload::Reader) -> Result<Self> {
         use inference_capnp::inference_payload::Which;
 
-        let stream_id = payload.get_stream_id()?.to_str()?.to_string();
+        let stream_id = payload.get_stream_id()?.to_str()?.to_owned();
         tracing::trace!(stream_id = %stream_id, "Parsing inference payload");
 
         // Parse union variant
         match payload.which()? {
             Which::Token(token) => {
-                let token = token?.to_str()?.to_string();
+                let token = token?.to_str()?.to_owned();
                 Ok(StreamChunkMessage::Chunk { text: token })
             }
             Which::Complete(complete) => {
@@ -2207,7 +2207,7 @@ impl StreamChunkMessage {
             }
             Which::Error(error) => {
                 let error = error?;
-                let error_msg = error.get_message()?.to_str()?.to_string();
+                let error_msg = error.get_message()?.to_str()?.to_owned();
                 Ok(StreamChunkMessage::Error {
                     error: error_msg,
                 })
@@ -2422,7 +2422,7 @@ impl StreamHandle {
             }
             Err(e) => {
                 // If parsing fails, return as error
-                StreamChunkMessage::Error { error: format!("Failed to parse payload: {}", e) }
+                StreamChunkMessage::Error { error: format!("Failed to parse payload: {e}") }
             }
         }
     }

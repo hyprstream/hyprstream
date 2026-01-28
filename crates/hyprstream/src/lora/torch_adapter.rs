@@ -34,7 +34,7 @@ pub fn extract_lora_components(tensor_name: &str) -> Option<(String, String)> {
                         | "up_proj"
                         | "down_proj"
                 ) {
-                    return Some((module.to_string(), part.to_string()));
+                    return Some((module.to_owned(), part.to_owned()));
                 }
             }
         }
@@ -204,7 +204,7 @@ impl LoRAModel {
             layers.insert(module_name, layer);
         }
 
-        let total_params: i64 = layers.values().map(|layer| layer.num_parameters()).sum();
+        let total_params: i64 = layers.values().map(TorchLoRALayer::num_parameters).sum();
         tracing::info!(
             "Created LoRA model with {} layers, {} total parameters",
             layers.len(),
@@ -270,7 +270,7 @@ impl LoRAModel {
         let available_tensors: Vec<String> = safetensors
             .names()
             .into_iter()
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             .collect();
         tracing::trace!(
             "Available tensors in SafeTensors file: {:?}",
@@ -290,7 +290,7 @@ impl LoRAModel {
                 // Exact match
                 available_name == *vs_name ||
                     // Match without module prefix (e.g., "lora_a" matches "q_proj_lora_a")
-                    available_name.ends_with(&format!("_{}", vs_name)) ||
+                    available_name.ends_with(&format!("_{vs_name}")) ||
                     // Match with different naming conventions
                     self.tensor_names_match(vs_name, available_name)
             });
@@ -367,7 +367,7 @@ impl LoRAModel {
             ));
         }
 
-        let temp_file = format!("{}.temp", path);
+        let temp_file = format!("{path}.temp");
         let mut tensor_vec = Vec::new();
 
         for (vs_name, tensor) in tensors_to_load {
@@ -427,7 +427,7 @@ impl LoRAModel {
         // Handle hierarchical naming like "model.layers.0.q_proj.lora_a.weight" -> "q_proj_lora_a"
         if let Some(captures) = extract_lora_components(safetensors_name) {
             let (module, matrix) = captures;
-            let expected_vs_name = format!("{}_{}", module, matrix);
+            let expected_vs_name = format!("{module}_{matrix}");
             if vs_name == expected_vs_name {
                 return true;
             }
@@ -437,20 +437,20 @@ impl LoRAModel {
         safetensors_name.contains(&vs_normalized) ||
         vs_name.contains(safetensors_name) ||
         // Handle patterns like "lora_a" matching "lora_a__2"
-        (safetensors_name.starts_with(&format!("{}_", vs_name)) || safetensors_name.starts_with(&format!("{}__", vs_name)))
+        (safetensors_name.starts_with(&format!("{vs_name}_")) || safetensors_name.starts_with(&format!("{vs_name}__")))
     }
 
     /// Get total number of trainable parameters
     pub fn num_parameters(&self) -> i64 {
         self.layers
             .values()
-            .map(|layer| layer.num_parameters())
+            .map(TorchLoRALayer::num_parameters)
             .sum()
     }
 
     /// Get configuration for layer
     pub fn get_layer_config(&self, module_name: &str) -> Option<LoRALayerConfig> {
-        self.layers.get(module_name).map(|layer| layer.get_config())
+        self.layers.get(module_name).map(TorchLoRALayer::get_config)
     }
 }
 

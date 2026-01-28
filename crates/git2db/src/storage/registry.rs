@@ -25,7 +25,7 @@ impl DriverRegistry {
         for factory in inventory::iter::<DriverFactory> {
             info!("Registering storage driver: {}", factory.name());
             drivers.insert(
-                factory.name().to_string(),
+                factory.name().to_owned(),
                 factory.get_driver()
             );
         }
@@ -55,7 +55,7 @@ impl DriverRegistry {
         self.drivers
             .get(name)
             .cloned()
-            .ok_or_else(|| DriverError::NotAvailable(format!("Driver '{}' not registered", name)))
+            .ok_or_else(|| DriverError::NotAvailable(format!("Driver '{name}' not registered")))
     }
 
     /// List all registered drivers
@@ -68,7 +68,7 @@ impl DriverRegistry {
         self.drivers
             .values()
             .filter(|d| d.is_available())
-            .map(|d| d.name().to_string())
+            .map(|d| d.name().to_owned())
             .collect()
     }
 }
@@ -89,11 +89,11 @@ mod tests {
         let drivers = registry.list_drivers();
 
         // VFS should always be registered
-        assert!(drivers.contains(&"vfs".to_string()));
+        assert!(drivers.contains(&"vfs".to_owned()));
 
         // Overlay2 only on Linux with feature
         #[cfg(all(target_os = "linux", feature = "overlayfs"))]
-        assert!(drivers.contains(&"overlay2".to_string()));
+        assert!(drivers.contains(&"overlay2".to_owned()));
     }
 
     #[test]
@@ -111,7 +111,7 @@ mod tests {
 
         println!("Available drivers:");
         for name in &available {
-            println!("  - {}", name);
+            println!("  - {name}");
         }
 
         // At least vfs should be available

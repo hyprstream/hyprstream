@@ -22,7 +22,7 @@
 //!
 //! // Register a custom transport
 //! // let factory = Arc::new(MyTransportFactory::new());
-//! // registry.register_transport("mycustom".to_string(), factory).unwrap();
+//! // registry.register_transport("mycustom".to_owned(), factory).unwrap();
 //! ```
 
 use crate::errors::Git2DBError;
@@ -77,8 +77,7 @@ impl TransportRegistry {
         // Validate scheme format
         if !Self::is_valid_scheme(&scheme) {
             return Err(Git2DBError::configuration(format!(
-                "Invalid transport scheme: '{}'. Schemes must contain only alphanumeric characters, hyphens, and underscores",
-                scheme
+                "Invalid transport scheme: '{scheme}'. Schemes must contain only alphanumeric characters, hyphens, and underscores"
             )));
         }
 
@@ -243,7 +242,7 @@ impl TransportRegistry {
     /// - git2::transport::register requires external synchronization, which we provide
     fn register_with_git2(&self, scheme: &str) -> Result<(), Git2DBError> {
         let factory = self.get_transport(scheme).ok_or_else(|| {
-            Git2DBError::configuration(format!("No factory for scheme '{}'", scheme))
+            Git2DBError::configuration(format!("No factory for scheme '{scheme}'"))
         })?;
 
         info!(
@@ -263,14 +262,14 @@ impl TransportRegistry {
 
                 // Create the transport
                 let transport = factory.create_transport(url).map_err(|e| {
-                    git2::Error::from_str(&format!("Failed to create transport: {}", e))
+                    git2::Error::from_str(&format!("Failed to create transport: {e}"))
                 })?;
 
                 // Wrap in BoxedSubtransport and create smart transport
                 Transport::smart(remote, true, BoxedSubtransport(transport))
             })
             .map_err(|e| {
-                Git2DBError::internal(format!("Failed to register transport with git2: {}", e))
+                Git2DBError::internal(format!("Failed to register transport with git2: {e}"))
             })?;
         }
 
@@ -370,10 +369,10 @@ mod tests {
 
         // Use a unique scheme name to avoid conflicts with other tests
         let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let scheme = format!("test-thread-{}", test_id);
+        let scheme = format!("test-thread-{test_id}");
 
         let registry = Arc::new(TransportRegistry::new());
-        let factory = Arc::new(MockTransportFactory);
+        let factory: Arc<dyn TransportFactory> = Arc::new(MockTransportFactory);
 
         // Test concurrent registration
         let handles: Vec<_> = (0..10)
@@ -381,7 +380,7 @@ mod tests {
                 let registry = Arc::clone(&registry);
                 let factory = Arc::clone(&factory);
                 let scheme = scheme.clone();
-                std::thread::spawn(move || registry.register_transport(scheme, factory.clone()))
+                std::thread::spawn(move || registry.register_transport(scheme, Arc::clone(&factory)))
             })
             .collect();
 
@@ -406,34 +405,34 @@ mod tests {
         let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
 
         let registry = TransportRegistry::new();
-        let factory = Arc::new(MockTransportFactory);
+        let factory: Arc<dyn TransportFactory> = Arc::new(MockTransportFactory);
 
         // Valid schemes
         assert!(registry
-            .register_transport(format!("valid1-{}", test_id), factory.clone())
+            .register_transport(format!("valid1-{test_id}"), Arc::clone(&factory))
             .is_ok());
         assert!(registry
-            .register_transport(format!("valid2-{}", test_id), factory.clone())
+            .register_transport(format!("valid2-{test_id}"), Arc::clone(&factory))
             .is_ok());
         assert!(registry
-            .register_transport(format!("my-transport-{}", test_id), factory.clone())
+            .register_transport(format!("my-transport-{test_id}"), Arc::clone(&factory))
             .is_ok());
         assert!(registry
-            .register_transport(format!("my_transport_{}", test_id), factory.clone())
+            .register_transport(format!("my_transport_{test_id}"), Arc::clone(&factory))
             .is_ok());
 
         // Invalid schemes
         assert!(registry
-            .register_transport("".to_string(), factory.clone())
+            .register_transport("".to_owned(), Arc::clone(&factory))
             .is_err());
         assert!(registry
-            .register_transport("http://".to_string(), factory.clone())
+            .register_transport("http://".to_owned(), Arc::clone(&factory))
             .is_err());
         assert!(registry
-            .register_transport("http://invalid".to_string(), factory.clone())
+            .register_transport("http://invalid".to_owned(), Arc::clone(&factory))
             .is_err());
         assert!(registry
-            .register_transport("transport with spaces".to_string(), factory.clone())
+            .register_transport("transport with spaces".to_owned(), Arc::clone(&factory))
             .is_err());
     }
 
@@ -442,7 +441,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
         let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let scheme = format!("refcount-{}", test_id);
+        let scheme = format!("refcount-{test_id}");
 
         let registry = TransportRegistry::new();
         let factory1 = Arc::new(MockTransportFactory);
@@ -473,15 +472,15 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
         let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let scheme = format!("guarded-{}", test_id);
+        let scheme = format!("guarded-{test_id}");
 
         let registry = TransportRegistry::new();
-        let factory = Arc::new(MockTransportFactory);
+        let factory: Arc<dyn TransportFactory> = Arc::new(MockTransportFactory);
 
         {
             let _guard = TransportGuard::new(registry.clone(), scheme.clone());
             registry
-                .register_transport(scheme.clone(), factory.clone())
+                .register_transport(scheme.clone(), Arc::clone(&factory))
                 .unwrap();
             assert!(registry.has_transport(&scheme));
         } // Guard goes out of scope

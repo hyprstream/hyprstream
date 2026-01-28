@@ -2,7 +2,6 @@
 //!
 //! Combines artifact management with hyprstream's UUID-based model patterns
 
-use anyhow::Result;
 use chrono::Utc;
 use git2::{IndexAddOption, Repository};
 use serde::{Deserialize, Serialize};
@@ -34,14 +33,17 @@ impl RepoId {
         Self(uuid)
     }
 
-    /// Parse from string
-    pub fn from_str(s: &str) -> Result<Self> {
-        Ok(Self(Uuid::parse_str(s)?))
-    }
-
     /// Get the inner UUID
     pub fn uuid(&self) -> Uuid {
         self.0
+    }
+}
+
+impl std::str::FromStr for RepoId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(s)?))
     }
 }
 
@@ -118,7 +120,7 @@ pub struct RegistryMetadata {
 impl Default for RegistryMetadata {
     fn default() -> Self {
         Self {
-            version: "2.0.0".to_string(),
+            version: "2.0.0".to_owned(),
             repositories: HashMap::new(),
         }
     }
@@ -165,7 +167,7 @@ impl Git2DB {
             let _repo = git_manager.get_repository(&registry_path).map_err(|e| {
                 Git2DBError::repository(
                     &registry_path,
-                    format!("Failed to open registry repository: {}", e),
+                    format!("Failed to open registry repository: {e}"),
                 )
             })?;
         } else {
@@ -175,12 +177,12 @@ impl Git2DB {
             fs::create_dir_all(&registry_path).await.map_err(|e| {
                 Git2DBError::repository(
                     &registry_path,
-                    format!("Failed to create directory: {}", e),
+                    format!("Failed to create directory: {e}"),
                 )
             })?;
 
             let repo = Repository::init(&registry_path).map_err(|e| {
-                Git2DBError::repository(&registry_path, format!("Failed to init repository: {}", e))
+                Git2DBError::repository(&registry_path, format!("Failed to init repository: {e}"))
             })?;
 
             // Create directory structure for v2
@@ -189,7 +191,7 @@ impl Git2DB {
                 .map_err(|e| {
                     Git2DBError::repository(
                         &registry_path,
-                        format!("Failed to create repos directory: {}", e),
+                        format!("Failed to create repos directory: {e}"),
                     )
                 })?;
             fs::create_dir_all(registry_path.join(".worktrees"))
@@ -197,51 +199,51 @@ impl Git2DB {
                 .map_err(|e| {
                     Git2DBError::repository(
                         &registry_path,
-                        format!("Failed to create .worktrees directory: {}", e),
+                        format!("Failed to create .worktrees directory: {e}"),
                     )
                 })?;
 
             // Create initial registry.json
             let metadata = RegistryMetadata::default();
             let json = serde_json::to_string_pretty(&metadata).map_err(|e| {
-                Git2DBError::internal(format!("Failed to serialize metadata: {}", e))
+                Git2DBError::internal(format!("Failed to serialize metadata: {e}"))
             })?;
             fs::write(registry_path.join("registry.json"), json)
                 .await
                 .map_err(|e| {
                     Git2DBError::repository(
                         &registry_path,
-                        format!("Failed to write registry.json: {}", e),
+                        format!("Failed to write registry.json: {e}"),
                     )
                 })?;
 
             // Initial commit using standardized signature
             let sig = git_manager
                 .create_signature(None, None)
-                .map_err(|e| Git2DBError::internal(format!("Failed to create signature: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to create signature: {e}")))?;
 
             let tree_id = {
                 let mut index = repo.index().map_err(|e| {
-                    Git2DBError::repository(&registry_path, format!("Failed to get index: {}", e))
+                    Git2DBError::repository(&registry_path, format!("Failed to get index: {e}"))
                 })?;
                 index
                     .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
                     .map_err(|e| {
                         Git2DBError::repository(
                             &registry_path,
-                            format!("Failed to stage files: {}", e),
+                            format!("Failed to stage files: {e}"),
                         )
                     })?;
                 index.write().map_err(|e| {
-                    Git2DBError::repository(&registry_path, format!("Failed to write index: {}", e))
+                    Git2DBError::repository(&registry_path, format!("Failed to write index: {e}"))
                 })?;
                 index.write_tree().map_err(|e| {
-                    Git2DBError::repository(&registry_path, format!("Failed to write tree: {}", e))
+                    Git2DBError::repository(&registry_path, format!("Failed to write tree: {e}"))
                 })?
             };
 
             let tree = repo.find_tree(tree_id).map_err(|e| {
-                Git2DBError::repository(&registry_path, format!("Failed to find tree: {}", e))
+                Git2DBError::repository(&registry_path, format!("Failed to find tree: {e}"))
             })?;
 
             repo.commit(
@@ -255,7 +257,7 @@ impl Git2DB {
             .map_err(|e| {
                 Git2DBError::repository(
                     &registry_path,
-                    format!("Failed to create initial commit: {}", e),
+                    format!("Failed to create initial commit: {e}"),
                 )
             })?;
         }
@@ -266,13 +268,13 @@ impl Git2DB {
             let content = fs::read_to_string(&metadata_path).await.map_err(|e| {
                 Git2DBError::repository(
                     &registry_path,
-                    format!("Failed to read registry.json: {}", e),
+                    format!("Failed to read registry.json: {e}"),
                 )
             })?;
             serde_json::from_str(&content).map_err(|e| {
                 Git2DBError::repository(
                     &registry_path,
-                    format!("Failed to parse registry.json: {}", e),
+                    format!("Failed to parse registry.json: {e}"),
                 )
             })?
         } else {
@@ -281,7 +283,7 @@ impl Git2DB {
 
         // Load storage driver once based on fresh configuration
         let config = Git2DBConfig::load()
-            .map_err(|e| Git2DBError::internal(format!("Failed to load configuration: {}", e)))?;
+            .map_err(|e| Git2DBError::internal(format!("Failed to load configuration: {e}")))?;
         // Debug logging for configuration
         info!("Worktree driver configuration loaded: '{}'", config.worktree.driver);
 
@@ -294,7 +296,7 @@ impl Git2DB {
         let storage_driver = git_manager
             .driver_registry()
             .get_driver(driver_config)
-            .map_err(|e| Git2DBError::internal(format!("Failed to load storage driver: {}", e)))?;
+            .map_err(|e| Git2DBError::internal(format!("Failed to load storage driver: {e}")))?;
 
         // Validate that the selected driver is available
         if !storage_driver.is_available() {
@@ -352,7 +354,7 @@ impl Git2DB {
             .map_err(|e| {
                 Git2DBError::repository(
                     &self.registry_path,
-                    format!("Failed to open registry repository: {}", e),
+                    format!("Failed to open registry repository: {e}"),
                 )
             })?;
         repo_cache.open()
@@ -399,7 +401,7 @@ impl Git2DB {
             .clone_repository(url, &repo_path, None)
             .await
             .map_err(|e| {
-                Git2DBError::repository(&repo_path, format!("Failed to clone repository: {}", e))
+                Git2DBError::repository(&repo_path, format!("Failed to clone repository: {e}"))
             })?;
 
         // Register the repository using the builder API
@@ -474,7 +476,7 @@ impl Git2DB {
             .map_err(|e| {
                 Git2DBError::submodule(
                     repo_id.to_string(),
-                    format!("Failed to add submodule: {}", e),
+                    format!("Failed to add submodule: {e}"),
                 )
             })?;
         }
@@ -540,7 +542,7 @@ impl Git2DB {
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| Git2DBError::internal("Invalid worktree path"))?;
-        let relative_path = format!("../{}", worktree_name);
+        let relative_path = format!("../{worktree_name}");
         let submodule_path = format!("repos/{}", repo_id.0);
 
         // Check if submodule already exists
@@ -557,7 +559,7 @@ impl Git2DB {
             .map_err(|e| {
                 Git2DBError::submodule(
                     repo_id.to_string(),
-                    format!("Failed to add submodule: {}", e),
+                    format!("Failed to add submodule: {e}"),
                 )
             })?;
         }
@@ -650,7 +652,7 @@ impl Git2DB {
             if modules_dir.exists() {
                 debug!("Removing git modules directory: {:?}", modules_dir);
                 fs::remove_dir_all(&modules_dir).await.map_err(|e| {
-                    Git2DBError::internal(format!("Failed to remove .git/modules/{}: {}", id, e))
+                    Git2DBError::internal(format!("Failed to remove .git/modules/{id}: {e}"))
                 })?;
             }
 
@@ -658,7 +660,7 @@ impl Git2DB {
             let gitmodules_path = self.registry_path.join(".gitmodules");
             if gitmodules_path.exists() {
                 let content = fs::read_to_string(&gitmodules_path).await.map_err(|e| {
-                    Git2DBError::internal(format!("Failed to read .gitmodules: {}", e))
+                    Git2DBError::internal(format!("Failed to read .gitmodules: {e}"))
                 })?;
 
                 // Filter out the entire [submodule "repos/{id}"] section
@@ -689,13 +691,13 @@ impl Git2DB {
                 if final_content.is_empty() {
                     // Remove .gitmodules file if it's now empty
                     fs::remove_file(&gitmodules_path).await.map_err(|e| {
-                        Git2DBError::internal(format!("Failed to remove empty .gitmodules: {}", e))
+                        Git2DBError::internal(format!("Failed to remove empty .gitmodules: {e}"))
                     })?;
                 } else {
                     fs::write(&gitmodules_path, final_content)
                         .await
                         .map_err(|e| {
-                            Git2DBError::internal(format!("Failed to update .gitmodules: {}", e))
+                            Git2DBError::internal(format!("Failed to update .gitmodules: {e}"))
                         })?;
                 }
             }
@@ -711,8 +713,7 @@ impl Git2DB {
                     .await
                     .map_err(|e| {
                         Git2DBError::internal(format!(
-                            "Failed to remove submodule directory: {}",
-                            e
+                            "Failed to remove submodule directory: {e}"
                         ))
                     })?;
             }
@@ -729,7 +730,7 @@ impl Git2DB {
             fs::remove_dir_all(&worktree_path).await.map_err(|e| {
                 Git2DBError::repository(
                     &worktree_path,
-                    format!("Failed to remove repository directory: {}", e),
+                    format!("Failed to remove repository directory: {e}"),
                 )
             })?;
         }
@@ -796,7 +797,7 @@ impl Git2DB {
     ///
     /// ```rust,ignore
     /// // Update the primary URL
-    /// registry.update_repository(id, Some("https://new-host.com/repo.git".to_string())).await?;
+    /// registry.update_repository(id, Some("https://new-host.com/repo.git".to_owned())).await?;
     ///
     /// // Refresh without changing URL
     /// registry.update_repository(id, None).await?;
@@ -876,7 +877,7 @@ impl Git2DB {
     /// registry.register(adapter_id)
     ///     .name("my-adapter")
     ///     .worktree_path(worktree_path)
-    ///     .tracking_ref(GitRef::Branch("adapter/uuid".to_string()))
+    ///     .tracking_ref(GitRef::Branch("adapter/uuid".to_owned()))
     ///     .metadata("type", "adapter")
     ///     .exec()
     ///     .await?;
@@ -956,12 +957,12 @@ impl Git2DB {
 
         tokio::task::spawn_blocking(move || -> Git2DBResult<()> {
             let repo = Repository::open(&registry_path).map_err(|e| {
-                Git2DBError::repository(&registry_path, format!("Failed to open registry: {}", e))
+                Git2DBError::repository(&registry_path, format!("Failed to open registry: {e}"))
             })?;
 
             // Get all submodules
             let submodules = repo.submodules().map_err(|e| {
-                Git2DBError::submodule("*", format!("Failed to list submodules: {}", e))
+                Git2DBError::submodule("*", format!("Failed to list submodules: {e}"))
             })?;
 
             if submodules.is_empty() {
@@ -972,7 +973,7 @@ impl Git2DB {
             info!("Initializing {} submodule(s)", submodules.len());
 
             for mut submodule in submodules {
-                let name = submodule.name().unwrap_or("unknown").to_string();
+                let name = submodule.name().unwrap_or("unknown").to_owned();
 
                 // Check if submodule is checked out by trying to open it
                 let needs_init = submodule.open().is_err();
@@ -1002,7 +1003,7 @@ impl Git2DB {
             Ok(())
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
     }
 
     /// Save metadata to disk
@@ -1010,11 +1011,11 @@ impl Git2DB {
         let metadata_path = self.registry_path.join("registry.json");
 
         let json = serde_json::to_string_pretty(&self.metadata)
-            .map_err(|e| Git2DBError::internal(format!("Failed to serialize metadata: {}", e)))?;
+            .map_err(|e| Git2DBError::internal(format!("Failed to serialize metadata: {e}")))?;
         fs::write(metadata_path, json).await.map_err(|e| {
             Git2DBError::repository(
                 &self.registry_path,
-                format!("Failed to write registry.json: {}", e),
+                format!("Failed to write registry.json: {e}"),
             )
         })?;
 
@@ -1031,14 +1032,13 @@ impl Git2DB {
         // Create signature early to fail fast if this is misconfigured
         let sig = self.git_manager.create_signature(None, None).map_err(|e| {
             Git2DBError::internal(format!(
-                "Failed to create git signature (check git config): {}",
-                e
+                "Failed to create git signature (check git config): {e}"
             ))
         })?;
 
         // Stage all changes
         let mut index = repo.index().map_err(|e| {
-            Git2DBError::repository(&self.registry_path, format!("Failed to get index: {}", e))
+            Git2DBError::repository(&self.registry_path, format!("Failed to get index: {e}"))
         })?;
 
         index
@@ -1046,18 +1046,18 @@ impl Git2DB {
             .map_err(|e| {
                 Git2DBError::repository(
                     &self.registry_path,
-                    format!("Failed to stage changes: {}", e),
+                    format!("Failed to stage changes: {e}"),
                 )
             })?;
         index.write().map_err(|e| {
-            Git2DBError::repository(&self.registry_path, format!("Failed to write index: {}", e))
+            Git2DBError::repository(&self.registry_path, format!("Failed to write index: {e}"))
         })?;
 
         let tree_id = index.write_tree().map_err(|e| {
-            Git2DBError::repository(&self.registry_path, format!("Failed to write tree: {}", e))
+            Git2DBError::repository(&self.registry_path, format!("Failed to write tree: {e}"))
         })?;
         let tree = repo.find_tree(tree_id).map_err(|e| {
-            Git2DBError::repository(&self.registry_path, format!("Failed to find tree: {}", e))
+            Git2DBError::repository(&self.registry_path, format!("Failed to find tree: {e}"))
         })?;
 
         // Get parent commit with proper error handling
@@ -1065,7 +1065,7 @@ impl Git2DB {
             Ok(head) => Some(head.peel_to_commit().map_err(|e| {
                 Git2DBError::repository(
                     &self.registry_path,
-                    format!("Failed to peel HEAD to commit: {}", e),
+                    format!("Failed to peel HEAD to commit: {e}"),
                 )
             })?),
             Err(e) if e.code() == git2::ErrorCode::UnbornBranch => {
@@ -1075,7 +1075,7 @@ impl Git2DB {
             Err(e) => {
                 return Err(Git2DBError::repository(
                     &self.registry_path,
-                    format!("Failed to get HEAD: {}", e),
+                    format!("Failed to get HEAD: {e}"),
                 ));
             }
         };
@@ -1092,7 +1092,7 @@ impl Git2DB {
             &tree,
             &parent_commits,
         ).map_err(|e| Git2DBError::repository(&self.registry_path,
-            format!("Failed to create commit '{}': {}. Staged changes remain in index and will be recovered on next open.", message, e)))?;
+            format!("Failed to create commit '{message}': {e}. Staged changes remain in index and will be recovered on next open.")))?;
 
         debug!("Committed to registry: {}", message);
         Ok(())
@@ -1107,7 +1107,7 @@ impl Git2DB {
 
         // Check if there are staged changes
         let statuses = repo.statuses(None).map_err(|e| {
-            Git2DBError::repository(&self.registry_path, format!("Failed to get status: {}", e))
+            Git2DBError::repository(&self.registry_path, format!("Failed to get status: {e}"))
         })?;
 
         let has_staged_changes = statuses.iter().any(|s| {
@@ -1126,23 +1126,23 @@ impl Git2DB {
 
         // Try to commit the staged changes with a recovery message
         let sig = self.git_manager.create_signature(None, None).map_err(|e| {
-            Git2DBError::internal(format!("Failed to create signature for recovery: {}", e))
+            Git2DBError::internal(format!("Failed to create signature for recovery: {e}"))
         })?;
 
         let mut index = repo.index().map_err(|e| {
-            Git2DBError::repository(&self.registry_path, format!("Failed to get index: {}", e))
+            Git2DBError::repository(&self.registry_path, format!("Failed to get index: {e}"))
         })?;
 
         let tree_id = index.write_tree().map_err(|e| {
             Git2DBError::repository(
                 &self.registry_path,
-                format!("Failed to write tree during recovery: {}", e),
+                format!("Failed to write tree during recovery: {e}"),
             )
         })?;
         let tree = repo.find_tree(tree_id).map_err(|e| {
             Git2DBError::repository(
                 &self.registry_path,
-                format!("Failed to find tree during recovery: {}", e),
+                format!("Failed to find tree during recovery: {e}"),
             )
         })?;
 
@@ -1150,7 +1150,7 @@ impl Git2DB {
             Ok(head) => Some(head.peel_to_commit().map_err(|e| {
                 Git2DBError::repository(
                     &self.registry_path,
-                    format!("Failed to peel HEAD during recovery: {}", e),
+                    format!("Failed to peel HEAD during recovery: {e}"),
                 )
             })?),
             Err(_) => None,
@@ -1171,7 +1171,7 @@ impl Git2DB {
         .map_err(|e| {
             Git2DBError::repository(
                 &self.registry_path,
-                format!("Failed to commit during recovery: {}", e),
+                format!("Failed to commit during recovery: {e}"),
             )
         })?;
 
@@ -1183,13 +1183,13 @@ impl Git2DB {
             let content = std::fs::read_to_string(&metadata_path).map_err(|e| {
                 Git2DBError::repository(
                     &self.registry_path,
-                    format!("Failed to read registry.json during recovery: {}", e),
+                    format!("Failed to read registry.json during recovery: {e}"),
                 )
             })?;
             self.metadata = serde_json::from_str(&content).map_err(|e| {
                 Git2DBError::repository(
                     &self.registry_path,
-                    format!("Failed to parse registry.json during recovery: {}", e),
+                    format!("Failed to parse registry.json during recovery: {e}"),
                 )
             })?;
         }

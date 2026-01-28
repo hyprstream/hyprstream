@@ -53,7 +53,7 @@ pub async fn auth_middleware(
                 let user = AuthenticatedUser {
                     user: claims.sub.clone(),
                     is_admin: claims.admin,
-                    scopes: claims.scopes.iter().map(|s| s.to_string()).collect(),
+                    scopes: claims.scopes.iter().map(hyprstream_rpc::auth::Scope::to_string).collect(),
                 };
                 request.extensions_mut().insert(user);
                 return next.run(request).await;
@@ -159,7 +159,7 @@ pub fn cors_layer(config: &crate::server::state::CorsConfig) -> tower_http::cors
     }
 
     // Configure allowed origins
-    if config.allowed_origins.contains(&"*".to_string()) {
+    if config.allowed_origins.contains(&"*".to_owned()) {
         // Allow all origins with Any (handles wildcard properly)
         cors = cors.allow_origin(Any);
         // Never allow credentials with wildcard

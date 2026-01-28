@@ -74,7 +74,7 @@ async fn main() -> gittorrent::Result<()> {
     } else if let Some(bootstrap_str) = cli.bootstrap {
         config.service.bootstrap_nodes = bootstrap_str
             .split(',')
-            .map(|s| s.trim().to_string())
+            .map(|s| s.trim().to_owned())
             .collect();
     }
 

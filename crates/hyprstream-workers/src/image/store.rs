@@ -12,7 +12,7 @@
 //!      └── OCI manifests only         └── Dragonfly P2P for blobs    └── RAFS output
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
@@ -64,7 +64,7 @@ impl RafsStore {
     /// Create a new RafsStore with configuration
     pub fn new(config: ImageConfig) -> Result<Self> {
         let manifest_fetcher = ManifestFetcher::new()
-            .map_err(|e| WorkerError::RafsError(format!("failed to create manifest fetcher: {}", e)))?;
+            .map_err(|e| WorkerError::RafsError(format!("failed to create manifest fetcher: {e}")))?;
 
         Ok(Self {
             blobs_dir: config.blobs_dir.clone(),
@@ -95,7 +95,7 @@ impl RafsStore {
         // 1. Parse image reference
         let img_ref = ImageReference::parse(image_ref)
             .map_err(|e| WorkerError::ImageParseFailed {
-                image: image_ref.to_string(),
+                image: image_ref.to_owned(),
                 reason: e.to_string(),
             })?;
 
@@ -112,7 +112,7 @@ impl RafsStore {
             .fetch(&img_ref, manifest_auth.as_ref())
             .await
             .map_err(|e| WorkerError::ImagePullFailed {
-                image: image_ref.to_string(),
+                image: image_ref.to_owned(),
                 reason: e.to_string(),
             })?;
 
@@ -125,14 +125,14 @@ impl RafsStore {
                     .manifests
                     .iter()
                     .find(|m| {
-                        m.platform.as_ref().map_or(false, |p| {
+                        m.platform.as_ref().is_some_and(|p| {
                             p.os == "linux" && p.architecture == "amd64"
                         })
                     })
                     .or_else(|| idx.manifests.first())
                     .ok_or_else(|| WorkerError::ImagePullFailed {
-                        image: image_ref.to_string(),
-                        reason: "no suitable platform manifest found".to_string(),
+                        image: image_ref.to_owned(),
+                        reason: "no suitable platform manifest found".to_owned(),
                     })?;
 
                 tracing::debug!(
@@ -144,7 +144,7 @@ impl RafsStore {
                     .fetch_platform_manifest(&img_ref, &platform_manifest.digest, manifest_auth.as_ref())
                     .await
                     .map_err(|e| WorkerError::ImagePullFailed {
-                        image: image_ref.to_string(),
+                        image: image_ref.to_owned(),
                         reason: e.to_string(),
                     })?
             }
@@ -186,7 +186,7 @@ impl RafsStore {
 
         // 7. Write metadata
         let metadata = ImageMetadata {
-            image_ref: image_ref.to_string(),
+            image_ref: image_ref.to_owned(),
             image_id: image_id.clone(),
             config_digest: manifest.config.digest.clone(),
             layers: manifest.layers.iter().map(|l| l.digest.clone()).collect(),
@@ -226,14 +226,13 @@ impl RafsStore {
         &self,
         img_ref: &ImageReference,
         digest: &str,
-        dest_path: &PathBuf,
+        dest_path: &Path,
         auth: Option<&CriAuthConfig>,
     ) -> Result<()> {
         // Extract blob ID from digest (remove "sha256:" prefix)
         let blob_id = digest
             .strip_prefix("sha256:")
-            .unwrap_or(digest)
-            .to_string(); // Convert to owned String for 'static lifetime
+            .unwrap_or(digest).to_owned(); // Convert to owned String for 'static lifetime
 
         // Create nydus-storage Registry backend config
         let registry_config = self.create_registry_config(img_ref, &blob_id, auth);
@@ -242,23 +241,23 @@ impl RafsStore {
         let blob_id_clone = blob_id.clone();
         let backend = tokio::task::spawn_blocking(move || {
             Registry::new(&registry_config, Some(&blob_id_clone))
-                .map_err(|e| WorkerError::RafsError(format!("failed to create registry backend: {:?}", e)))
+                .map_err(|e| WorkerError::RafsError(format!("failed to create registry backend: {e:?}")))
         })
         .await
-        .map_err(|e| WorkerError::RafsError(format!("spawn_blocking failed: {}", e)))??;
+        .map_err(|e| WorkerError::RafsError(format!("spawn_blocking failed: {e}")))??;
 
         // Get a blob reader
         let reader = backend
             .get_reader(&blob_id)
-            .map_err(|e| WorkerError::RafsError(format!("failed to get blob reader: {:?}", e)))?;
+            .map_err(|e| WorkerError::RafsError(format!("failed to get blob reader: {e:?}")))?;
 
         // Get blob size (we need to know the size for BlobBufReader)
         let blob_size = reader
             .blob_size()
-            .map_err(|e| WorkerError::RafsError(format!("failed to get blob size: {:?}", e)))?;
+            .map_err(|e| WorkerError::RafsError(format!("failed to get blob size: {e:?}")))?;
 
         // Create a buffered reader and download the blob
-        let dest_path_clone = dest_path.clone();
+        let dest_path_clone = dest_path.to_path_buf();
         tokio::task::spawn_blocking(move || -> Result<()> {
             // Use BlobBufReader for efficient buffered reading
             let mut buf_reader = BlobBufReader::new(
@@ -270,23 +269,23 @@ impl RafsStore {
 
             // Create destination file
             let mut file = std::fs::File::create(&dest_path_clone).map_err(|e| {
-                WorkerError::IoError(format!("failed to create blob file: {}", e))
+                WorkerError::IoError(format!("failed to create blob file: {e}"))
             })?;
 
             // Copy data
             std::io::copy(&mut buf_reader, &mut file).map_err(|e| {
-                WorkerError::IoError(format!("failed to write blob: {}", e))
+                WorkerError::IoError(format!("failed to write blob: {e}"))
             })?;
 
             // Sync to disk
             file.sync_all().map_err(|e| {
-                WorkerError::IoError(format!("failed to sync blob: {}", e))
+                WorkerError::IoError(format!("failed to sync blob: {e}"))
             })?;
 
             Ok(())
         })
         .await
-        .map_err(|e| WorkerError::RafsError(format!("spawn_blocking failed: {}", e)))??;
+        .map_err(|e| WorkerError::RafsError(format!("spawn_blocking failed: {e}")))??;
 
         Ok(())
     }
@@ -392,7 +391,7 @@ impl RafsStore {
             let metadata: ImageMetadata = serde_json::from_str(&metadata_str)?;
             Ok(metadata.image_id)
         } else {
-            Err(WorkerError::ImageNotFound(image_ref.to_string()))
+            Err(WorkerError::ImageNotFound(image_ref.to_owned()))
         }
     }
 
@@ -405,7 +404,7 @@ impl RafsStore {
             let metadata: ImageMetadata = serde_json::from_str(&metadata_str)?;
             Ok(metadata)
         } else {
-            Err(WorkerError::ImageNotFound(image_ref.to_string()))
+            Err(WorkerError::ImageNotFound(image_ref.to_owned()))
         }
     }
 
@@ -489,7 +488,7 @@ impl RafsStore {
         if self.bootstrap_dir.exists() {
             for entry in std::fs::read_dir(&self.bootstrap_dir)? {
                 let entry = entry?;
-                if entry.path().extension().map_or(false, |e| e == "json") {
+                if entry.path().extension().is_some_and(|e| e == "json") {
                     if let Ok(metadata_str) = std::fs::read_to_string(entry.path()) {
                         if let Ok(metadata) = serde_json::from_str::<ImageMetadata>(&metadata_str) {
                             referenced.insert(digest_to_filename(&metadata.config_digest));
@@ -607,7 +606,7 @@ impl RafsStore {
         if self.blobs_dir.exists() {
             for entry in walkdir::WalkDir::new(&self.blobs_dir)
                 .into_iter()
-                .filter_map(|e| e.ok())
+                .filter_map(std::result::Result::ok)
             {
                 if entry.file_type().is_file() {
                     if let Ok(meta) = entry.metadata() {
@@ -622,7 +621,7 @@ impl RafsStore {
         if self.bootstrap_dir.exists() {
             for entry in walkdir::WalkDir::new(&self.bootstrap_dir)
                 .into_iter()
-                .filter_map(|e| e.ok())
+                .filter_map(std::result::Result::ok)
             {
                 if entry.file_type().is_file() {
                     if let Ok(meta) = entry.metadata() {

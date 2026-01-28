@@ -71,8 +71,8 @@ impl BatchAggregation {
             Field::new("timestamp", DataType::Int64, false),
         ]));
         let group_by = GroupBy {
-            columns: vec!["metric".to_string()],
-            time_column: Some("timestamp".to_string()),
+            columns: vec!["metric".to_owned()],
+            time_column: Some("timestamp".to_owned()),
         };
         Self {
             metric_id,
@@ -83,7 +83,7 @@ impl BatchAggregation {
             min_value: f64::INFINITY,
             max_value: f64::NEG_INFINITY,
             schema,
-            value_column: "value".to_string(),
+            value_column: "value".to_owned(),
             group_by,
             window: Some(window),
         }
@@ -162,7 +162,7 @@ pub trait MetricsStorage: Send + Sync + 'static {
         for col_name in &group_by.columns {
             let col = batch
                 .column_by_name(col_name)
-                .ok_or_else(|| Status::internal(format!("Missing group by column: {}", col_name)))?;
+                .ok_or_else(|| Status::internal(format!("Missing group by column: {col_name}")))?;
             group_cols.push(col);
         }
 
@@ -171,13 +171,13 @@ pub trait MetricsStorage: Send + Sync + 'static {
             let mut group_values = HashMap::new();
             for (col_name, col) in group_by.columns.iter().zip(&group_cols) {
                 let value = if let Some(str_col) = col.as_any().downcast_ref::<StringArray>() {
-                    str_col.value(row).to_string()
+                    str_col.value(row).to_owned()
                 } else if let Some(int_col) = col.as_any().downcast_ref::<Int64Array>() {
                     int_col.value(row).to_string()
                 } else if let Some(float_col) = col.as_any().downcast_ref::<Float64Array>() {
                     float_col.value(row).to_string()
                 } else {
-                    return Err(Status::internal(format!("Unsupported group by column type: {}", col_name)));
+                    return Err(Status::internal(format!("Unsupported group by column type: {col_name}")));
                 };
                 group_values.insert(col_name.clone(), value);
             }
@@ -185,11 +185,7 @@ pub trait MetricsStorage: Send + Sync + 'static {
             // Extract timestamp if it's part of the group by
             let timestamp = if let Some(time_col) = &group_by.time_column {
                 if let Some(col) = batch.column_by_name(time_col) {
-                    if let Some(int_col) = col.as_any().downcast_ref::<Int64Array>() {
-                        Some(int_col.value(row))
-                    } else {
-                        None
-                    }
+                    col.as_any().downcast_ref::<Int64Array>().map(|int_col| int_col.value(row))
                 } else {
                     None
                 }
@@ -220,15 +216,13 @@ pub trait MetricsStorage: Send + Sync + 'static {
 
     /// Generate SQL for inserting metric records
     fn generate_metric_insert_sql() -> String {
-        "INSERT INTO metrics (metric_id, timestamp, value_running_window_sum, value_running_window_avg, value_running_window_count) VALUES (?, ?, ?, ?, ?)"
-            .to_string()
+        "INSERT INTO metrics (metric_id, timestamp, value_running_window_sum, value_running_window_avg, value_running_window_count) VALUES (?, ?, ?, ?, ?)".to_owned()
     }
 
     /// Generate SQL for querying metrics
     fn generate_metric_query_sql(from_timestamp: i64) -> String {
         format!(
-            "SELECT * FROM metrics WHERE timestamp >= {} ORDER BY timestamp ASC",
-            from_timestamp
+            "SELECT * FROM metrics WHERE timestamp >= {from_timestamp} ORDER BY timestamp ASC"
         )
     }
 
@@ -247,10 +241,10 @@ pub trait MetricsStorage: Send + Sync + 'static {
         );
 
         sql.push_str(" FROM metrics");
-        sql.push_str(&format!(" WHERE timestamp >= {}", from_timestamp));
+        sql.push_str(&format!(" WHERE timestamp >= {from_timestamp}"));
 
         if let Some(to) = to_timestamp {
-            sql.push_str(&format!(" AND timestamp <= {}", to));
+            sql.push_str(&format!(" AND timestamp <= {to}"));
         }
 
         sql.push_str(&format!(" GROUP BY {}", group_by.columns.join(", ")));

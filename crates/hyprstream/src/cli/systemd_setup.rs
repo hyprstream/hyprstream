@@ -8,7 +8,7 @@
 //! ```ignore
 //! use hyprstream::cli::systemd_setup::ensure_units;
 //!
-//! let services = &["registry".to_string(), "policy".to_string()];
+//! let services = &["registry".to_owned(), "policy".to_owned()];
 //! if ensure_units(services) {
 //!     // Systemd units are installed and ready
 //! }
@@ -34,7 +34,7 @@ pub fn ensure_units(services: &[String]) -> bool {
     }
 
     // Convert String slices to &str for ServiceManager
-    let services_list: Vec<&str> = services.iter().map(|s| s.as_str()).collect();
+    let services_list: Vec<&str> = services.iter().map(std::string::String::as_str).collect();
 
     // Create a runtime for async ServiceManager operations
     let rt = match tokio::runtime::Builder::new_current_thread()

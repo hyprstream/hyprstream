@@ -32,7 +32,7 @@ impl Default for LoRAConfig {
             rank: 8,
             alpha: 16.0,
             dropout: 0.1,
-            target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
+            target_modules: vec!["q_proj".to_owned(), "v_proj".to_owned()],
             learning_rate: 1e-4,
         }
     }

@@ -64,7 +64,7 @@ impl XetFilter<Unregistered> {
             Ok::<_, XetError>((Arc::new(runtime), Arc::new(storage) as Arc<dyn StorageBackend>))
         })
         .join()
-        .map_err(|e| XetError::new(XetErrorKind::RuntimeError, format!("Thread join error: {:?}", e)))??;
+        .map_err(|e| XetError::new(XetErrorKind::RuntimeError, format!("Thread join error: {e:?}")))??;
 
         // Create payload
         let payload = Box::new(XetFilterPayload { storage, runtime });
@@ -91,7 +91,7 @@ impl XetFilter<Unregistered> {
         Ok(Self {
             inner: filter,
             payload: Some(payload),
-            name: "xet".to_string(),
+            name: "xet".to_owned(),
             attributes_cstr: Some(attributes_cstr),
             _state: PhantomData,
         })
@@ -181,7 +181,7 @@ impl XetFilter<Unregistered> {
 
                     return Err(XetError::new(
                         XetErrorKind::RuntimeError,
-                        format!("git_filter_register failed (code {}): {:?}", result, git_error),
+                        format!("git_filter_register failed (code {result}): {git_error:?}"),
                     ));
                 }
             }

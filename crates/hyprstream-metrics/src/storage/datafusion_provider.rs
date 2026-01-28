@@ -84,7 +84,7 @@ impl TableProvider for DuckDBTableProvider {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 
     fn table_type(&self) -> TableType {
@@ -108,9 +108,9 @@ impl TableProvider for DuckDBTableProvider {
 
         // Create a DuckDBExec plan that will execute the query
         let plan = DuckDBExec::new(
-            self.backend.clone(),
+            Arc::clone(&self.backend),
             self.table_name.clone(),
-            self.schema.clone(),
+            Arc::clone(&self.schema),
             projection.cloned(),
             filters.to_vec(),
             limit,
@@ -167,12 +167,12 @@ impl DuckDBExec {
                 .collect();
             Arc::new(datafusion::arrow::datatypes::Schema::new(fields))
         } else {
-            schema.clone()
+            Arc::clone(&schema)
         };
 
         // Create properties with the correct schema
         let properties = datafusion::physical_plan::PlanProperties::new(
-            EquivalenceProperties::new(projected_schema.clone()),
+            EquivalenceProperties::new(Arc::clone(&projected_schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
@@ -200,7 +200,7 @@ impl DuckDBExec {
                 .collect::<Vec<_>>()
                 .join(", ")
         } else {
-            "*".to_string()
+            "*".to_owned()
         };
 
         let mut sql = format!("SELECT {} FROM {}", columns, self.table_name);
@@ -214,7 +214,7 @@ impl DuckDBExec {
 
         // Add limit
         if let Some(limit) = self.limit {
-            sql.push_str(&format!(" LIMIT {}", limit));
+            sql.push_str(&format!(" LIMIT {limit}"));
         }
 
         sql
@@ -251,7 +251,7 @@ impl datafusion::physical_plan::ExecutionPlan for DuckDBExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.projected_schema.clone()
+        Arc::clone(&self.projected_schema)
     }
 
     fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
@@ -279,8 +279,8 @@ impl datafusion::physical_plan::ExecutionPlan for DuckDBExec {
         use futures::StreamExt;
 
         let sql = self.build_sql();
-        let backend = self.backend.clone();
-        let schema = self.projected_schema.clone();
+        let backend = Arc::clone(&self.backend);
+        let schema = Arc::clone(&self.projected_schema);
 
         // Create a stream that executes the query
         let stream = stream::once(async move {
@@ -325,7 +325,7 @@ mod tests {
         backend.create_table("test_provider", &schema).await?;
 
         // Create provider
-        let provider = DuckDBTableProvider::new(backend, "test_provider".to_string()).await?;
+        let provider = DuckDBTableProvider::new(backend, "test_provider".to_owned()).await?;
 
         // Verify schema
         assert_eq!(provider.schema().fields().len(), 2);
@@ -349,7 +349,7 @@ mod tests {
         backend.create_table("metrics", &schema).await?;
 
         // Create provider and register with DataFusion
-        let provider = DuckDBTableProvider::new(backend, "metrics".to_string()).await?;
+        let provider = DuckDBTableProvider::new(backend, "metrics".to_owned()).await?;
         let ctx = SessionContext::new();
         ctx.register_table("metrics", Arc::new(provider))?;
 

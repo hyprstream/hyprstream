@@ -1,7 +1,6 @@
 //! Integration tests for DHT bootstrap functionality
 
-use gittorrent::dht::{GitTorrentDht, GitObjectKey, GitObjectRecord};
-use gittorrent::types::Sha256Hash;
+use gittorrent::dht::GitTorrentDht;
 use libp2p::Multiaddr;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -9,13 +8,13 @@ use tokio::time::timeout;
 #[tokio::test]
 async fn test_bootstrap_with_peer_id() {
     // Start first node
-    let node1 = GitTorrentDht::new(0, gittorrent::DhtMode::Server).await.expect("Failed to create node1");
+    let _node1 = GitTorrentDht::new(0, gittorrent::DhtMode::Server).await.expect("Failed to create node1");
 
     // Give it time to start listening
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Start second node
-    let node2 = GitTorrentDht::new(0, gittorrent::DhtMode::Server).await.expect("Failed to create node2");
+    let _node2 = GitTorrentDht::new(0, gittorrent::DhtMode::Server).await.expect("Failed to create node2");
 
     // In a real test, we would:
     // 1. Get the actual listen address and peer ID from node1
@@ -23,7 +22,7 @@ async fn test_bootstrap_with_peer_id() {
     // 3. Verify they can discover each other
 
     // For now, this test verifies that the DHT nodes can be created
-    assert!(true, "DHT nodes created successfully");
+    // (the test passes if no panic occurred above)
 }
 
 #[tokio::test]
@@ -42,7 +41,7 @@ async fn test_bootstrap_without_peer_id_fails() {
     // The important thing is it doesn't panic
     match result {
         Ok(()) => println!("Bootstrap attempted despite missing peer ID"),
-        Err(e) => println!("Bootstrap failed as expected: {}", e),
+        Err(e) => println!("Bootstrap failed as expected: {e}"),
     }
 }
 
@@ -65,7 +64,7 @@ async fn test_bootstrap_with_unreachable_peer() {
 
     match result {
         Ok(Ok(())) => println!("Bootstrap initiated (connection may fail later)"),
-        Ok(Err(e)) => println!("Bootstrap failed: {}", e),
+        Ok(Err(e)) => println!("Bootstrap failed: {e}"),
         Err(_) => println!("Bootstrap timed out"),
     }
 }
@@ -73,14 +72,13 @@ async fn test_bootstrap_with_unreachable_peer() {
 #[tokio::test]
 async fn test_mdns_discovery() {
     // Start two nodes on the same network
-    let node1 = GitTorrentDht::new(0, gittorrent::DhtMode::Server).await.expect("Failed to create node1");
-    let node2 = GitTorrentDht::new(0, gittorrent::DhtMode::Server).await.expect("Failed to create node2");
+    let _node1 = GitTorrentDht::new(0, gittorrent::DhtMode::Server).await.expect("Failed to create node1");
+    let _node2 = GitTorrentDht::new(0, gittorrent::DhtMode::Server).await.expect("Failed to create node2");
 
     // Give them time to discover each other via mDNS
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // In a real implementation, we would verify they discovered each other
     // by checking the routing table or attempting to exchange data
-
-    assert!(true, "mDNS discovery test completed");
+    // (the test passes if no panic occurred above)
 }

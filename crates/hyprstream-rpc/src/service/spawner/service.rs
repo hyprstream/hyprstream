@@ -101,14 +101,14 @@ impl<S: ZmqService> Spawnable for S {
     ) -> Result<()> {
         // Extract infrastructure before consuming self
         let transport = ZmqService::transport(&*self).clone();
-        let context = ZmqService::context(&*self).clone();
+        let context = Arc::clone(ZmqService::context(&*self));
         let signing_key = ZmqService::signing_key(&*self);
 
         // Create a single-threaded runtime for blocking execution
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("runtime: {}", e)))?;
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("runtime: {e}")))?;
 
         rt.block_on(async move {
             let runner = RequestLoop::new(transport, context, signing_key);
@@ -199,29 +199,29 @@ impl Spawnable for ProxyService {
     ) -> Result<()> {
         // Create XSUB socket (receives from publishers)
         let mut xsub = self.context.socket(zmq::XSUB)
-            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("XSUB socket: {}", e)))?;
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("XSUB socket: {e}")))?;
 
         // Create XPUB socket (sends to subscribers)
         let mut xpub = self.context.socket(zmq::XPUB)
-            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("XPUB socket: {}", e)))?;
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("XPUB socket: {e}")))?;
 
         // Create CTRL socket for shutdown (PAIR pattern)
         let mut ctrl = self.context.socket(zmq::PAIR)
-            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("CTRL socket: {}", e)))?;
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("CTRL socket: {e}")))?;
         let ctrl_endpoint = format!("inproc://proxy-ctrl-{}", self.name);
         ctrl.bind(&ctrl_endpoint)
-            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("CTRL bind: {}", e)))?;
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("CTRL bind: {e}")))?;
 
         // Bind XSUB (publishers connect here)
         // Uses TransportConfig::bind() for proper systemd FD support
         self.pub_transport.bind(&mut xsub)
-            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("XSUB bind: {}", e)))?;
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("XSUB bind: {e}")))?;
         let pub_endpoint = self.pub_transport.zmq_endpoint();
 
         // Bind XPUB (subscribers connect here)
         // Uses TransportConfig::bind() for proper systemd FD support
         self.sub_transport.bind(&mut xpub)
-            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("XPUB bind: {}", e)))?;
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("XPUB bind: {e}")))?;
         let sub_endpoint = self.sub_transport.zmq_endpoint();
 
         tracing::info!(
@@ -238,9 +238,9 @@ impl Spawnable for ProxyService {
 
         // Spawn shutdown listener
         let ctrl_sender = self.context.socket(zmq::PAIR)
-            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("CTRL sender: {}", e)))?;
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("CTRL sender: {e}")))?;
         ctrl_sender.connect(&ctrl_endpoint)
-            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("CTRL connect: {}", e)))?;
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("CTRL connect: {e}")))?;
 
         let name_clone = self.name.clone();
         std::thread::spawn(move || {
@@ -259,7 +259,7 @@ impl Spawnable for ProxyService {
         // TEST: Use original proxy_steerable to verify directory fix was the real solution
         tracing::debug!("Proxy {} calling proxy_steerable", self.name);
         zmq::proxy_steerable(&mut xsub, &mut xpub, &mut ctrl)
-            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("proxy: {}", e)))?;
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("proxy: {e}")))?;
 
         tracing::info!("Proxy {} stopped", self.name);
         Ok(())
@@ -400,7 +400,7 @@ impl ServiceSpawner {
         service: S,
         registration: Option<ServiceRegistration>,
     ) -> Result<SpawnedService> {
-        let name = service.name().to_string();
+        let name = service.name().to_owned();
         let name_for_spawn = name.clone();
         let shutdown = Arc::new(Notify::new());
         let shutdown_clone = shutdown.clone();
@@ -416,7 +416,7 @@ impl ServiceSpawner {
         let handle = crate::service::ServiceHandle::from_task(join_handle, shutdown);
 
         Ok(SpawnedService {
-            id: format!("{}-tokio", name),
+            id: format!("{name}-tokio"),
             kind: ServiceKind::TokioTask {
                 handle: Some(handle),
             },
@@ -430,7 +430,7 @@ impl ServiceSpawner {
         service: S,
         registration: Option<ServiceRegistration>,
     ) -> Result<SpawnedService> {
-        let name = service.name().to_string();
+        let name = service.name().to_owned();
         let name_for_thread = name.clone();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let shutdown = Arc::new(Notify::new());
@@ -445,17 +445,17 @@ impl ServiceSpawner {
                     tracing::error!("Service {} failed: {}", name_for_thread, e);
                 }
             })
-            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("thread spawn: {}", e)))?;
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("thread spawn: {e}")))?;
 
         // Wait for ready signal (sent by service after socket binds)
         if ready_rx.await.is_err() {
             return Err(crate::error::RpcError::SpawnFailed(
-                "service thread exited before ready".to_string(),
+                "service thread exited before ready".to_owned(),
             ));
         }
 
         Ok(SpawnedService {
-            id: format!("{}-thread", name),
+            id: format!("{name}-thread"),
             kind: ServiceKind::Thread {
                 handle: Some(thread_handle),
                 shutdown,
@@ -471,7 +471,7 @@ impl ServiceSpawner {
         binary: PathBuf,
         registration: Option<ServiceRegistration>,
     ) -> Result<SpawnedService> {
-        let name = service.name().to_string();
+        let name = service.name().to_owned();
         let spawner = self
             .process_spawner
             .as_ref()
@@ -553,7 +553,7 @@ impl SpawnedService {
     /// (e.g., systemd-managed services)
     pub fn dummy() -> Self {
         Self {
-            id: "dummy".to_string(),
+            id: "dummy".to_owned(),
             kind: ServiceKind::TokioTask { handle: None },
             _registration: None,
         }
@@ -597,7 +597,7 @@ impl SpawnedService {
     pub fn is_running(&self) -> bool {
         match &self.kind {
             ServiceKind::TokioTask { handle } => {
-                handle.as_ref().map(|h| h.is_running()).unwrap_or(false)
+                handle.as_ref().map(super::super::zmq::ServiceHandle::is_running).unwrap_or(false)
             }
             ServiceKind::Thread { handle, .. } => {
                 handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false)
@@ -731,7 +731,7 @@ impl ServiceManager for InprocManager {
     async fn spawn(&self, service: Box<dyn Spawnable>) -> anyhow::Result<SpawnedService> {
         // Can't call spawn(*service) because trait objects aren't Sized
         // Need to spawn inline instead
-        let name = service.name().to_string();
+        let name = service.name().to_owned();
         let registrations = service.registrations();
 
         // Register with EndpointRegistry
@@ -764,7 +764,7 @@ impl ServiceManager for InprocManager {
         }
 
         Ok(SpawnedService::thread(
-            format!("{}-thread", name),
+            format!("{name}-thread"),
             Some(thread_handle),
             shutdown,
             _registration,

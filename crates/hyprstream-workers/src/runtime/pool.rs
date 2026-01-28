@@ -7,7 +7,7 @@
 //! supporting multiple hypervisors: Cloud Hypervisor, QEMU, Dragonball.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 
 use kata_hypervisor::ch::CloudHypervisor;
@@ -135,7 +135,7 @@ impl SandboxPool {
 
         let sandbox = active
             .remove(sandbox_id)
-            .ok_or_else(|| WorkerError::SandboxNotFound(sandbox_id.to_string()))?;
+            .ok_or_else(|| WorkerError::SandboxNotFound(sandbox_id.to_owned()))?;
 
         // Stop the sandbox
         self.stop_sandbox(&sandbox).await?;
@@ -288,7 +288,7 @@ impl SandboxPool {
         hypervisor
             .prepare_vm(&sandbox.id, None, &annotations, None)
             .await
-            .map_err(|e| WorkerError::VmStartFailed(format!("failed to prepare VM: {}", e)))?;
+            .map_err(|e| WorkerError::VmStartFailed(format!("failed to prepare VM: {e}")))?;
 
         // 7. Start the VM
         let timeout_secs = self.config.create_timeout_secs as i32;
@@ -296,7 +296,7 @@ impl SandboxPool {
         hypervisor
             .start_vm(timeout_secs)
             .await
-            .map_err(|e| WorkerError::VmStartFailed(format!("failed to start VM: {}", e)))?;
+            .map_err(|e| WorkerError::VmStartFailed(format!("failed to start VM: {e}")))?;
 
         // 8. Store hypervisor handle and paths
         sandbox.set_hypervisor(hypervisor);
@@ -321,9 +321,9 @@ impl SandboxPool {
     async fn create_hypervisor(
         &self,
         sandbox: &PodSandbox,
-        api_socket: &PathBuf,
-        virtiofs_socket: &PathBuf,
-        _cloud_init_iso: &PathBuf,
+        api_socket: &Path,
+        virtiofs_socket: &Path,
+        _cloud_init_iso: &Path,
     ) -> Result<Arc<dyn Hypervisor>> {
         // Build the hypervisor configuration
         let config = self.build_hypervisor_config();
@@ -370,7 +370,7 @@ impl SandboxPool {
                         Err(e) => {
                             tracing::warn!("Failed to find cloud-hypervisor in PATH: {}", e);
                             // Fallback to name, will fail at Kata's canonicalize() if not found
-                            "cloud-hypervisor".to_string()
+                            "cloud-hypervisor".to_owned()
                         }
                     }
                 }
@@ -395,11 +395,11 @@ impl SandboxPool {
             // Get current user info
             let uid = nix::unistd::getuid().as_raw();
             let gid = nix::unistd::getgid().as_raw();
-            let username = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
+            let username = std::env::var("USER").unwrap_or_else(|_| "user".to_owned());
 
             // Get supplementary groups
             let groups = nix::unistd::getgroups()
-                .map(|gs| gs.into_iter().map(|g| g.as_raw()).collect())
+                .map(|gs| gs.into_iter().map(nix::unistd::Gid::as_raw).collect())
                 .unwrap_or_else(|_| vec![gid]);
 
             config.security_info.rootless = true;
@@ -424,7 +424,7 @@ impl SandboxPool {
     async fn generate_cloud_init_iso(
         &self,
         sandbox: &PodSandbox,
-        iso_path: &PathBuf,
+        iso_path: &Path,
     ) -> Result<()> {
         let sandbox_runtime_dir = iso_path.parent().unwrap();
 
@@ -478,11 +478,11 @@ local-hostname: {}
             ])
             .status()
             .await
-            .map_err(|e| WorkerError::CloudInitFailed(format!("failed to run genisoimage: {}", e)))?;
+            .map_err(|e| WorkerError::CloudInitFailed(format!("failed to run genisoimage: {e}")))?;
 
         if !status.success() {
             return Err(WorkerError::CloudInitFailed(
-                "genisoimage failed".to_string(),
+                "genisoimage failed".to_owned(),
             ));
         }
 
@@ -499,7 +499,7 @@ local-hostname: {}
             hypervisor
                 .stop_vm()
                 .await
-                .map_err(|e| WorkerError::VmStopFailed(format!("failed to stop VM: {}", e)))?;
+                .map_err(|e| WorkerError::VmStopFailed(format!("failed to stop VM: {e}")))?;
 
             tracing::debug!(
                 sandbox_id = %sandbox.id,
@@ -691,7 +691,7 @@ mod tests {
                 let stats = pool.stats().await;
                 assert_eq!(stats.active_count, 0);
             }
-            Err(e) => panic!("Unexpected error: {:?}", e),
+            Err(e) => panic!("Unexpected error: {e:?}"),
         }
     }
 

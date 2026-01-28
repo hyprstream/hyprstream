@@ -87,8 +87,7 @@ impl LocalInferenceService {
                 Ok(rt) => rt,
                 Err(e) => {
                     let _ = init_tx.send(Err(InferenceError::Internal(format!(
-                        "Failed to create runtime: {}",
-                        e
+                        "Failed to create runtime: {e}"
                     ))));
                     return;
                 }
@@ -231,7 +230,7 @@ impl LocalInferenceService {
 
             InferenceRequest::SaveLora { path, reply } => {
                 let result = path.to_str()
-                    .ok_or_else(|| InferenceError::LoRA("Invalid path".to_string()))
+                    .ok_or_else(|| InferenceError::LoRA("Invalid path".to_owned()))
                     .and_then(|p| {
                         self.engine.save_lora(p)
                             .map_err(|e| InferenceError::LoRA(e.to_string()))
@@ -481,7 +480,7 @@ impl InferenceClient for LocalInferenceClient {
         let (tx, rx) = oneshot::channel();
         self.sender
             .send(InferenceRequest::ReleaseSession {
-                session_id: session_id.to_string(),
+                session_id: session_id.to_owned(),
                 reply: tx,
             })
             .map_err(|_| InferenceError::Unavailable)?;

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use super::client::ContainerMetadata;
 
 /// Container state
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ContainerState {
     /// Container is being created
@@ -20,13 +20,8 @@ pub enum ContainerState {
     /// Container has exited
     ContainerExited,
     /// Unknown state
+    #[default]
     ContainerUnknown,
-}
-
-impl Default for ContainerState {
-    fn default() -> Self {
-        Self::ContainerUnknown
-    }
 }
 
 /// Container configuration
@@ -122,6 +117,7 @@ pub struct Mount {
 /// Mount propagation mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[allow(clippy::enum_variant_names)] // Wire format compatibility (PROPAGATION_PRIVATE, etc.)
 pub enum MountPropagation {
     /// Private propagation
     #[default]

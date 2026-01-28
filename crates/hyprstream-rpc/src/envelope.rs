@@ -148,10 +148,10 @@ impl RequestIdentity {
     /// ```
     pub fn casbin_subject(&self) -> String {
         match self {
-            Self::Local { user } => format!("local:{}", user),
-            Self::ApiToken { user, .. } => format!("token:{}", user),
-            Self::Peer { name, .. } => format!("peer:{}", name),
-            Self::Anonymous => "anonymous".to_string(),
+            Self::Local { user } => format!("local:{user}"),
+            Self::ApiToken { user, .. } => format!("token:{user}"),
+            Self::Peer { name, .. } => format!("peer:{name}"),
+            Self::Anonymous => "anonymous".to_owned(),
         }
     }
 
@@ -175,9 +175,9 @@ impl Default for RequestIdentity {
 impl std::fmt::Display for RequestIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Local { user } => write!(f, "local:{}", user),
-            Self::ApiToken { user, token_name } => write!(f, "token:{}:{}", user, token_name),
-            Self::Peer { name, .. } => write!(f, "peer:{}", name),
+            Self::Local { user } => write!(f, "local:{user}"),
+            Self::ApiToken { user, token_name } => write!(f, "token:{user}:{token_name}"),
+            Self::Peer { name, .. } => write!(f, "peer:{name}"),
             Self::Anonymous => write!(f, "anonymous"),
         }
     }
@@ -220,14 +220,14 @@ impl FromCapnp for RequestIdentity {
             Which::Local(local) => {
                 let local = local?;
                 Ok(Self::Local {
-                    user: local.get_user()?.to_str()?.to_string(),
+                    user: local.get_user()?.to_str()?.to_owned(),
                 })
             }
             Which::ApiToken(api_token) => {
                 let api_token = api_token?;
                 Ok(Self::ApiToken {
-                    user: api_token.get_user()?.to_str()?.to_string(),
-                    token_name: api_token.get_token_name()?.to_str()?.to_string(),
+                    user: api_token.get_user()?.to_str()?.to_owned(),
+                    token_name: api_token.get_token_name()?.to_str()?.to_owned(),
                 })
             }
             Which::Peer(peer) => {
@@ -242,7 +242,7 @@ impl FromCapnp for RequestIdentity {
                 let mut curve_key = [0u8; 32];
                 curve_key.copy_from_slice(key_data);
                 Ok(Self::Peer {
-                    name: peer.get_name()?.to_str()?.to_string(),
+                    name: peer.get_name()?.to_str()?.to_owned(),
                     curve_key,
                 })
             }
@@ -636,8 +636,7 @@ impl SignedEnvelope {
         let age = now - self.envelope.timestamp;
         if age > MAX_TIMESTAMP_AGE_MS {
             return Err(EnvelopeError::ReplayAttack(format!(
-                "timestamp too old: {}ms > {}ms",
-                age, MAX_TIMESTAMP_AGE_MS
+                "timestamp too old: {age}ms > {MAX_TIMESTAMP_AGE_MS}ms"
             )));
         }
         if age < -MAX_CLOCK_SKEW_MS {
@@ -650,7 +649,7 @@ impl SignedEnvelope {
         // 3. Check nonce not seen before
         if !nonce_cache.check_and_insert(&self.envelope.nonce) {
             return Err(EnvelopeError::ReplayAttack(
-                "nonce already seen".to_string(),
+                "nonce already seen".to_owned(),
             ));
         }
 

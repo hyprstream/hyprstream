@@ -41,7 +41,7 @@ pub fn service_unit(service: &str) -> Result<String> {
     // Prefer installed binary for systemd units (stable location)
     let exec = paths::installed_executable_path()
         .map(Ok)
-        .unwrap_or_else(|| paths::executable_path())
+        .unwrap_or_else(paths::executable_path)
         .context("Failed to get executable path")?;
 
     // Capture environment variables to forward to the service
@@ -50,8 +50,8 @@ pub fn service_unit(service: &str) -> Result<String> {
 
     // Build Environment= directives
     let env_directives = vec![
-        ld_library_path.map(|v| format!("Environment=LD_LIBRARY_PATH={}", v)),
-        libtorch.map(|v| format!("Environment=LIBTORCH={}", v)),
+        ld_library_path.map(|v| format!("Environment=LD_LIBRARY_PATH={v}")),
+        libtorch.map(|v| format!("Environment=LIBTORCH={v}")),
     ]
     .into_iter()
     .flatten()
@@ -61,7 +61,7 @@ pub fn service_unit(service: &str) -> Result<String> {
     let env_section = if env_directives.is_empty() {
         String::new()
     } else {
-        format!("\n{}", env_directives)
+        format!("\n{env_directives}")
     };
 
     Ok(format!(

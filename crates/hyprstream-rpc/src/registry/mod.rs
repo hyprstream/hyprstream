@@ -196,14 +196,14 @@ impl EndpointRegistry {
         description: Option<&str>,
     ) {
         let mut services = self.services.write();
-        let entry = services.entry(name.to_string()).or_insert_with(|| ServiceEntry {
-            name: name.to_string(),
+        let entry = services.entry(name.to_owned()).or_insert_with(|| ServiceEntry {
+            name: name.to_owned(),
             endpoints: HashMap::new(),
             description: description.map(String::from),
         });
         // Update description if provided
         if let Some(desc) = description {
-            entry.description = Some(desc.to_string());
+            entry.description = Some(desc.to_owned());
         }
         entry.endpoints.insert(socket_kind, endpoint);
     }
@@ -245,7 +245,7 @@ impl EndpointRegistry {
         let suffix = socket_kind.suffix();
         match self.mode {
             EndpointMode::Inproc => {
-                TransportConfig::inproc(format!("hyprstream/{}{}", name, suffix))
+                TransportConfig::inproc(format!("hyprstream/{name}{suffix}"))
             }
             EndpointMode::Ipc => {
                 // Use normal IPC binding instead of systemd socket activation for ZMQ sockets
@@ -253,8 +253,8 @@ impl EndpointRegistry {
                 let path = self
                     .runtime_dir
                     .as_ref()
-                    .map(|d| d.join(format!("{}{}.sock", name, suffix)))
-                    .unwrap_or_else(|| PathBuf::from(format!("/tmp/hyprstream/{}{}.sock", name, suffix)));
+                    .map(|d| d.join(format!("{name}{suffix}.sock")))
+                    .unwrap_or_else(|| PathBuf::from(format!("/tmp/hyprstream/{name}{suffix}.sock")));
                 TransportConfig::ipc(path)
             }
         }
@@ -422,7 +422,7 @@ impl ServiceRegistration {
         let registry = try_global().ok_or_else(|| anyhow::anyhow!("Registry not initialized"))?;
         registry.register(name, socket_kind, endpoint, description);
         Ok(Self {
-            name: name.to_string(),
+            name: name.to_owned(),
             socket_kinds: vec![socket_kind],
         })
     }
@@ -446,7 +446,7 @@ impl ServiceRegistration {
             socket_kinds.push(socket_kind);
         }
         Ok(Self {
-            name: name.to_string(),
+            name: name.to_owned(),
             socket_kinds,
         })
     }
@@ -627,8 +627,8 @@ mod tests {
         global().register("svc2", SocketKind::Router, TransportConfig::inproc("b"), None);
 
         let services = global().list_services();
-        assert!(services.contains(&"svc1".to_string()));
-        assert!(services.contains(&"svc2".to_string()));
+        assert!(services.contains(&"svc1".to_owned()));
+        assert!(services.contains(&"svc2".to_owned()));
     }
 
     #[test]

@@ -17,19 +17,14 @@ use super::client::PodSandboxMetadata;
 use super::virtiofs::SandboxVirtiofs;
 
 /// Pod sandbox state
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PodSandboxState {
     /// Sandbox is ready
     SandboxReady,
     /// Sandbox is not ready (stopped)
+    #[default]
     SandboxNotReady,
-}
-
-impl Default for PodSandboxState {
-    fn default() -> Self {
-        Self::SandboxNotReady
-    }
 }
 
 /// Pod sandbox configuration
@@ -85,18 +80,13 @@ pub struct PortMapping {
 }
 
 /// Network protocol
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Protocol {
+    #[default]
     Tcp,
     Udp,
     Sctp,
-}
-
-impl Default for Protocol {
-    fn default() -> Self {
-        Self::Tcp
-    }
 }
 
 /// Linux-specific pod sandbox configuration
@@ -382,7 +372,7 @@ impl PodSandbox {
             created_at: Utc::now(),
             labels: config.labels.clone(),
             annotations: config.annotations.clone(),
-            runtime_handler: "kata".to_string(),
+            runtime_handler: "kata".to_owned(),
             hypervisor: None,
             sandbox_path,
             api_socket: None,

@@ -115,7 +115,7 @@ impl PolicyService {
                 Err(_) => {
                     return Ok(PolicyResponse::error(
                         request_id,
-                        &format!("Invalid scope format: {}", scope_str),
+                        &format!("Invalid scope format: {scope_str}"),
                         "INVALID_SCOPE"
                     ));
                 }
@@ -240,7 +240,7 @@ impl ZmqService for PolicyService {
                     Err(_) => {
                         return Self::build_error_response(
                             request_id,
-                            &format!("Invalid operation: {}", operation_str),
+                            &format!("Invalid operation: {operation_str}"),
                             "INVALID_OPERATION"
                         );
                     }
@@ -250,7 +250,7 @@ impl ZmqService for PolicyService {
                 let allowed = tokio::task::block_in_place(|| {
                     let handle = tokio::runtime::Handle::current();
                     handle.block_on(self.policy_manager.check_with_domain(
-                        &subject,
+                        subject,
                         domain,
                         resource,
                         operation
@@ -405,8 +405,8 @@ impl PolicyZmqClient {
     /// # Example
     /// ```ignore
     /// let scopes = vec![
-    ///     "infer:model:qwen-7b".to_string(),
-    ///     "subscribe:stream:abc-123".to_string(),
+    ///     "infer:model:qwen-7b".to_owned(),
+    ///     "subscribe:stream:abc-123".to_owned(),
     /// ];
     /// let (token, expires_at) = client.issue_token(scopes, Some(300)).await?;
     /// ```
@@ -453,7 +453,7 @@ impl PolicyZmqClient {
             Which::Success(token_info_reader) => {
                 let token_info = token_info_reader?;
                 Ok((
-                    token_info.get_token()?.to_str()?.to_string(),
+                    token_info.get_token()?.to_str()?.to_owned(),
                     token_info.get_expires_at(),
                 ))
             }

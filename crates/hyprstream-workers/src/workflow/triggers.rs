@@ -158,22 +158,22 @@ impl WorkerLifecycleHandler {
 
     /// Create a handler for all sandbox events
     pub fn sandboxes(workflow_id: WorkflowId) -> Self {
-        Self::new(workflow_id, None, Some("sandbox".to_string()))
+        Self::new(workflow_id, None, Some("sandbox".to_owned()))
     }
 
     /// Create a handler for all container events
     pub fn containers(workflow_id: WorkflowId) -> Self {
-        Self::new(workflow_id, None, Some("container".to_string()))
+        Self::new(workflow_id, None, Some("container".to_owned()))
     }
 
     /// Create a handler for started events only
     pub fn on_started(workflow_id: WorkflowId) -> Self {
-        Self::new(workflow_id, Some("started".to_string()), None)
+        Self::new(workflow_id, Some("started".to_owned()), None)
     }
 
     /// Create a handler for stopped events only
     pub fn on_stopped(workflow_id: WorkflowId) -> Self {
-        Self::new(workflow_id, Some("stopped".to_string()), None)
+        Self::new(workflow_id, Some("stopped".to_owned()), None)
     }
 }
 
@@ -297,7 +297,7 @@ mod tests {
     fn test_worker_lifecycle_handler_matches() {
         // Create a handler for sandbox started events
         let handler =
-            WorkerLifecycleHandler::new("test:wf".to_string(), Some("started".to_string()), None);
+            WorkerLifecycleHandler::new("test:wf".to_owned(), Some("started".to_owned()), None);
 
         // Create test events
         let started_event = ReceivedEvent::from_message("worker.sandbox123.started", &[]);
@@ -311,7 +311,7 @@ mod tests {
 
     #[test]
     fn test_topic_pattern_handler_matches() {
-        let handler = TopicPatternHandler::new("test:wf".to_string(), "worker.".to_string());
+        let handler = TopicPatternHandler::new("test:wf".to_owned(), "worker.".to_owned());
 
         let worker_event = ReceivedEvent::from_message("worker.sandbox123.started", &[]);
         let registry_event = ReceivedEvent::from_message("registry.repo456.push", &[]);

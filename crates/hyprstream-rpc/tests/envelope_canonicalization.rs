@@ -8,7 +8,7 @@ fn test_envelope_serialization_deterministic() {
     let envelope1 = RequestEnvelope {
         request_id: 123,
         identity: RequestIdentity::Local {
-            user: "test-user".to_string(),
+            user: "test-user".to_owned(),
         },
         payload: vec![1, 2, 3, 4, 5],
         ephemeral_pubkey: None,
@@ -42,7 +42,7 @@ fn test_envelope_signature_verification_stable() {
     let envelope = RequestEnvelope {
         request_id: 456,
         identity: RequestIdentity::Local {
-            user: "signer".to_string(),
+            user: "signer".to_owned(),
         },
         payload: vec![9, 8, 7],
         ephemeral_pubkey: Some([1u8; 32]),
@@ -131,8 +131,8 @@ fn test_envelope_with_claims_deterministic() {
     let envelope = RequestEnvelope {
         request_id: 999,
         identity: RequestIdentity::ApiToken {
-            user: "api-user".to_string(),
-            token_name: "api-token".to_string(),
+            user: "api-user".to_owned(),
+            token_name: "api-token".to_owned(),
         },
         payload: vec![10, 20, 30],
         ephemeral_pubkey: Some([77u8; 32]),
@@ -155,7 +155,7 @@ fn test_envelope_different_data_different_bytes() {
     let envelope1 = RequestEnvelope {
         request_id: 100,
         identity: RequestIdentity::Local {
-            user: "user1".to_string(),
+            user: "user1".to_owned(),
         },
         payload: vec![1, 2, 3],
         ephemeral_pubkey: None,
@@ -167,7 +167,7 @@ fn test_envelope_different_data_different_bytes() {
     let envelope2 = RequestEnvelope {
         request_id: 200,
         identity: RequestIdentity::Local {
-            user: "user2".to_string(),
+            user: "user2".to_owned(),
         },
         payload: vec![4, 5, 6],
         ephemeral_pubkey: None,

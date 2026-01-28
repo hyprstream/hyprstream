@@ -63,11 +63,10 @@ impl CacheManager {
             "DELETE FROM metrics USING (
                 SELECT timestamp 
                 FROM metrics 
-                WHERE timestamp < {} 
+                WHERE timestamp < {cutoff} 
                 LIMIT 10000
             ) as expired 
-            WHERE metrics.timestamp = expired.timestamp",
-            cutoff
+            WHERE metrics.timestamp = expired.timestamp"
         )
     }
 }

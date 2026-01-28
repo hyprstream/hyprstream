@@ -129,7 +129,7 @@ impl TokenizerConfig for QwenTokenizerConfig {
             for i in 0..missing_count {
                 // Create as special tokens (special=true)
                 // They ARE special tokens in the model's vocabulary
-                let token = AddedToken::from(format!("<|extra_{}|>", i), true)
+                let token = AddedToken::from(format!("<|extra_{i}|>"), true)
                     .single_word(true)  // Treat as single word
                     .lstrip(false)
                     .rstrip(false)
@@ -177,7 +177,7 @@ impl TokenizerConfig for QwenTokenizerConfig {
         // Qwen uses <|extra_N|> convention for additional tokens
         // These include both reserved tokens and control tokens
         for i in 0..missing_count {
-            let token = AddedToken::from(format!("<|extra_{}|>", i), true)
+            let token = AddedToken::from(format!("<|extra_{i}|>"), true)
                 .single_word(false)
                 .lstrip(false)
                 .rstrip(false)
@@ -218,7 +218,7 @@ impl TokenizerConfig for QwenTokenizerConfig {
                         token_id, vocab_size
                     );
                     let extra_idx = (token_id as usize) - vocab_size;
-                    Ok(Some(format!("<|extra_{}|>", extra_idx)))
+                    Ok(Some(format!("<|extra_{extra_idx}|>")))
                 } else {
                     tracing::warn!("Failed to decode token {} within vocab", token_id);
                     Ok(None) // Skip tokens that can't be decoded

@@ -144,8 +144,8 @@ impl QueryExecutor for DataFusionExecutor {
 
         // Create task context with minimal configuration
         let task_ctx = Arc::new(TaskContext::new(
-            Some("query_execution".to_string()),
-            "task_1".to_string(),
+            Some("query_execution".to_owned()),
+            "task_1".to_owned(),
             session_config,
             HashMap::new(), // scalar functions
             HashMap::new(), // aggregate functions

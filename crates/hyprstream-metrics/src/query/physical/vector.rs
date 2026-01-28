@@ -37,8 +37,7 @@ impl std::str::FromStr for VectorOperation {
             "normalize" => Ok(VectorOperation::Normalize),
             "cosine_similarity" => Ok(VectorOperation::CosineSimilarity),
             _ => Err(DataFusionError::NotImplemented(format!(
-                "Vector operation {} not implemented",
-                s
+                "Vector operation {s} not implemented"
             ))),
         }
     }
@@ -67,20 +66,20 @@ impl VectorizedOperator {
         // Parse operation type
         let operation = properties
             .get("operation")
-            .ok_or_else(|| DataFusionError::Plan("Missing operation type".to_string()))?
+            .ok_or_else(|| DataFusionError::Plan("Missing operation type".to_owned()))?
             .parse()?;
 
         // Get input and output columns
         let input_columns = properties
             .get("input_columns")
-            .ok_or_else(|| DataFusionError::Plan("Missing input columns".to_string()))?
+            .ok_or_else(|| DataFusionError::Plan("Missing input columns".to_owned()))?
             .split(',')
-            .map(|s| s.trim().to_string())
+            .map(|s| s.trim().to_owned())
             .collect();
 
         let output_column = properties
             .get("output_column")
-            .ok_or_else(|| DataFusionError::Plan("Missing output column".to_string()))?
+            .ok_or_else(|| DataFusionError::Plan("Missing output column".to_owned()))?
             .clone();
 
         Ok(Self {
@@ -116,7 +115,7 @@ impl VectorizedOperator {
                         Ok(Arc::new(Float64Array::from(result)) as ArrayRef)
                     }
                     _ => Err(DataFusionError::NotImplemented(
-                        "Unsupported data type for vector addition".to_string(),
+                        "Unsupported data type for vector addition".to_owned(),
                     )),
                 }
             }
@@ -142,7 +141,7 @@ impl VectorizedOperator {
                         Ok(Arc::new(Float64Array::from(result)) as ArrayRef)
                     }
                     _ => Err(DataFusionError::NotImplemented(
-                        "Unsupported data type for vector multiplication".to_string(),
+                        "Unsupported data type for vector multiplication".to_owned(),
                     )),
                 }
             }
@@ -159,7 +158,7 @@ impl VectorizedOperator {
                         Ok(Arc::new(Float32Array::from(vec![sum])) as ArrayRef)
                     }
                     _ => Err(DataFusionError::NotImplemented(
-                        "Unsupported data type for dot product".to_string(),
+                        "Unsupported data type for dot product".to_owned(),
                     )),
                 }
             }
@@ -173,7 +172,7 @@ impl VectorizedOperator {
                         Ok(Arc::new(Float32Array::from_iter(normalized)) as ArrayRef)
                     }
                     _ => Err(DataFusionError::NotImplemented(
-                        "Unsupported data type for normalization".to_string(),
+                        "Unsupported data type for normalization".to_owned(),
                     )),
                 }
             }
@@ -196,7 +195,7 @@ impl VectorizedOperator {
                         Ok(Arc::new(Float32Array::from(vec![similarity])) as ArrayRef)
                     }
                     _ => Err(DataFusionError::NotImplemented(
-                        "Unsupported data type for cosine similarity".to_string(),
+                        "Unsupported data type for cosine similarity".to_owned(),
                     )),
                 }
             }
@@ -220,15 +219,15 @@ impl PhysicalOperator for VectorizedOperator {
                 .map(|col| {
                     batch
                         .column_by_name(col)
-                        .ok_or_else(|| DataFusionError::Plan(format!("Column {} not found", col)))
-                        .map(|arr| arr.clone())
+                        .ok_or_else(|| DataFusionError::Plan(format!("Column {col} not found")))
+                        .map(std::clone::Clone::clone)
                 })
                 .collect();
 
             let arrays = arrays?;
             if arrays.len() != 2 {
                 return Err(DataFusionError::Plan(
-                    "Vector operations require exactly two input arrays".to_string(),
+                    "Vector operations require exactly two input arrays".to_owned(),
                 ));
             }
 

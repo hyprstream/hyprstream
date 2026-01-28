@@ -1,0 +1,166 @@
+# Hyprstream Docker Compose Configuration
+#
+# Runs hyprstream services as separate containers with IPC over shared tmpfs volume.
+#
+# Usage:
+#   docker compose --profile cpu up        # CPU inference
+#   docker compose --profile cuda up       # NVIDIA CUDA GPU
+#   docker compose --profile rocm up       # AMD ROCm GPU
+#   docker compose run client              # Run CLI client
+#   docker compose --profile flight up     # Include Flight SQL
+#   docker compose --profile workers up    # Include worker (requires privileged)
+#
+# You must select a model profile: cpu, cuda, or rocm
+# Note: ENTRYPOINT is "hyprstream", so command: provides arguments
+
+services:
+  event:
+    image: ghcr.io/hyprstream/hyprstream:${TAG:-latest-cpu}
+    command: ["service", "event", "--ipc"]
+    volumes:
+      - ipc:/run/hyprstream
+      - models:/var/lib/hyprstream/models
+
+  registry:
+    image: ghcr.io/hyprstream/hyprstream:${TAG:-latest-cpu}
+    command: ["service", "registry", "--ipc"]
+    volumes:
+      - ipc:/run/hyprstream
+      - models:/var/lib/hyprstream/models
+    depends_on:
+      - event
+
+  policy:
+    image: ghcr.io/hyprstream/hyprstream:${TAG:-latest-cpu}
+    command: ["service", "policy", "--ipc"]
+    volumes:
+      - ipc:/run/hyprstream
+      - models:/var/lib/hyprstream/models
+    depends_on:
+      - event
+
+  streams:
+    image: ghcr.io/hyprstream/hyprstream:${TAG:-latest-cpu}
+    command: ["service", "streams", "--ipc"]
+    volumes:
+      - ipc:/run/hyprstream
+      - models:/var/lib/hyprstream/models
+    depends_on:
+      - event
+
+  # Model service - CPU
+  model:
+    image: ghcr.io/hyprstream/hyprstream:${TAG:-latest-cpu}
+    command: ["service", "model", "--ipc"]
+    volumes:
+      - ipc:/run/hyprstream
+      - models:/var/lib/hyprstream/models
+    depends_on:
+      - registry
+      - policy
+    profiles:
+      - cpu
+
+  # Model service - NVIDIA CUDA
+  model-cuda:
+    image: ghcr.io/hyprstream/hyprstream:${TAG:-latest-cuda128}
+    command: ["service", "model", "--ipc"]
+    volumes:
+      - ipc:/run/hyprstream
+      - models:/var/lib/hyprstream/models
+    depends_on:
+      - registry
+      - policy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    profiles:
+      - cuda
+
+  # Model service - AMD ROCm
+  model-rocm:
+    image: ghcr.io/hyprstream/hyprstream:${TAG:-latest-rocm}
+    command: ["service", "model", "--ipc"]
+    volumes:
+      - ipc:/run/hyprstream
+      - models:/var/lib/hyprstream/models
+    depends_on:
+      - registry
+      - policy
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    profiles:
+      - rocm
+
+  oai:
+    image: ghcr.io/hyprstream/hyprstream:${TAG:-latest-cpu}
+    command: ["service", "oai", "--ipc"]
+    ports:
+      - "8010:8080"
+    volumes:
+      - ipc:/run/hyprstream
+      - models:/var/lib/hyprstream/models
+    depends_on:
+      - policy
+      # Note: Does not depend on model directly - ZMQ handles reconnection
+      # This allows using any model profile (cpu/cuda/rocm)
+
+  # CLI client - connects to services via shared IPC volume
+  client:
+    image: ghcr.io/hyprstream/hyprstream:${TAG:-latest-cpu}
+    # No command: uses CMD [] default (runs hyprstream CLI)
+    stdin_open: true
+    tty: true
+    volumes:
+      - ipc:/run/hyprstream
+      - models:/var/lib/hyprstream/models
+    depends_on:
+      - oai
+    profiles:
+      - client
+
+  # Optional: Flight SQL service
+  flight:
+    image: ghcr.io/hyprstream/hyprstream:${TAG:-latest-cpu}
+    command: ["service", "flight", "--ipc"]
+    ports:
+      - "50051:50051"
+    volumes:
+      - ipc:/run/hyprstream
+      - models:/var/lib/hyprstream/models
+    depends_on:
+      - registry
+    profiles:
+      - flight
+
+  # Optional: Worker service (requires privileged for Kata VM sandboxing)
+  worker:
+    image: ghcr.io/hyprstream/hyprstream:${TAG:-latest-cpu}
+    command: ["service", "worker", "--ipc"]
+    privileged: true
+    volumes:
+      - ipc:/run/hyprstream
+      - models:/var/lib/hyprstream/models
+      - /dev:/dev
+    depends_on:
+      - event
+      - policy
+    profiles:
+      - workers 
+
+volumes:
+  # IPC sockets - tmpfs for fast communication
+  ipc:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=100m,mode=1777
+
+  # Persistent model storage (includes signing keys)
+  models:

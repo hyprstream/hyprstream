@@ -49,7 +49,7 @@ impl GitObjectKey {
     }
 
     /// Create from a Sha256Hash (legacy compatibility)
-    pub fn from_sha256(hash: Sha256Hash) -> Self {
+    pub fn from_sha256(hash: &Sha256Hash) -> Self {
         // Convert Sha256Hash to GitHash::Sha256
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(&hash.to_bytes());
@@ -170,7 +170,7 @@ impl GitTorrentDht {
                 GitTorrentBehaviour::new_with_keypair(key, mode)
                     .unwrap_or_else(|e| {
                         tracing::error!("Failed to create GitTorrent behaviour: {}", e);
-                        panic!("Failed to create GitTorrent behaviour: {}", e)
+                        panic!("Failed to create GitTorrent behaviour: {e}")
                     })
             })?
             .build();
@@ -179,7 +179,7 @@ impl GitTorrentDht {
         tracing::info!("Starting GitTorrent DHT with peer ID: {}", local_peer_id);
 
         // Listen on all interfaces with specified port (0 = random)
-        let listen_addr = format!("/ip4/0.0.0.0/tcp/{}", p2p_port);
+        let listen_addr = format!("/ip4/0.0.0.0/tcp/{p2p_port}");
         swarm.listen_on(listen_addr.parse()?)?;
 
         // Spawn background task
@@ -275,7 +275,7 @@ impl GitTorrentDht {
     ///
     /// Returns None if the address cannot be parsed (should never happen with valid inputs)
     pub fn create_bootstrap_addr(ip: &str, port: u16, peer_id: &PeerId) -> Option<Multiaddr> {
-        format!("/ip4/{}/tcp/{}/p2p/{}", ip, port, peer_id).parse().ok()
+        format!("/ip4/{ip}/tcp/{port}/p2p/{peer_id}").parse().ok()
     }
 
     async fn handle_swarm_event(
@@ -307,7 +307,7 @@ impl GitTorrentDht {
                                     }
                                 }
                                 (QueryResult::GetRecord(Err(e)), PendingQuery::GetObject { response, .. }) => {
-                                    let _ = response.send(Err(crate::Error::Dht(format!("Get record failed: {:?}", e))));
+                                    let _ = response.send(Err(crate::Error::Dht(format!("Get record failed: {e:?}"))));
                                 }
                                 (QueryResult::GetProviders(Ok(providers)), PendingQuery::GetProviders { response, .. }) => {
                                     // Handle GetProvidersOk enum variants
@@ -321,7 +321,7 @@ impl GitTorrentDht {
                                     }
                                 }
                                 (QueryResult::GetProviders(Err(e)), PendingQuery::GetProviders { response, .. }) => {
-                                    let _ = response.send(Err(crate::Error::Dht(format!("Get providers failed: {:?}", e))));
+                                    let _ = response.send(Err(crate::Error::Dht(format!("Get providers failed: {e:?}"))));
                                 }
                                 _ => {
                                     tracing::warn!("Mismatched query result and pending query type");
@@ -393,7 +393,7 @@ impl GitTorrentDht {
 
                 let result = match result {
                     Ok(_) => Ok(()),
-                    Err(e) => Err(crate::Error::Dht(format!("Failed to put record: {}", e))),
+                    Err(e) => Err(crate::Error::Dht(format!("Failed to put record: {e}"))),
                 };
 
                 let _ = response.send(result);
@@ -410,7 +410,7 @@ impl GitTorrentDht {
 
                 let result = match result {
                     Ok(_) => Ok(()),
-                    Err(e) => Err(crate::Error::Dht(format!("Failed to provide: {}", e))),
+                    Err(e) => Err(crate::Error::Dht(format!("Failed to provide: {e}"))),
                 };
 
                 let _ = response.send(result);
@@ -468,12 +468,12 @@ impl GitTorrentDht {
                         },
                         Err(e) => {
                             tracing::error!("Failed to bootstrap: {}", e);
-                            Err(crate::Error::Dht(format!("Failed to bootstrap: {}", e)))
+                            Err(crate::Error::Dht(format!("Failed to bootstrap: {e}")))
                         }
                     }
                 } else {
                     tracing::warn!("No valid bootstrap peers with peer IDs found");
-                    Err(crate::Error::Dht("No valid bootstrap peers found".to_string()))
+                    Err(crate::Error::Dht("No valid bootstrap peers found".to_owned()))
                 };
 
                 let _ = response.send(result);

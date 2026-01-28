@@ -324,7 +324,7 @@ async fn test_update_repository() {
     // Update URL
     let new_url = "https://new-host.com/repo.git";
     registry
-        .update_repository(&repo_id, Some(new_url.to_string()))
+        .update_repository(&repo_id, Some(new_url.to_owned()))
         .await
         .unwrap();
 
@@ -381,13 +381,13 @@ async fn test_list_repositories() {
 
     // Create test repositories
     for i in 1..=3 {
-        let test_repo = temp_dir.path().join(format!("repo{}", i));
+        let test_repo = temp_dir.path().join(format!("repo{i}"));
         fs::create_dir(&test_repo).unwrap();
         create_test_repo(&test_repo).await.unwrap();
         let url = format!("file://{}", test_repo.display());
 
         registry
-            .add_repository(&format!("repo{}", i), &url)
+            .add_repository(&format!("repo{i}"), &url)
             .await
             .unwrap();
     }
@@ -398,9 +398,9 @@ async fn test_list_repositories() {
 
     // Check display names
     let names: Vec<_> = repos.iter().map(|r| r.display_name()).collect();
-    assert!(names.contains(&"repo1".to_string()));
-    assert!(names.contains(&"repo2".to_string()));
-    assert!(names.contains(&"repo3".to_string()));
+    assert!(names.contains(&"repo1".to_owned()));
+    assert!(names.contains(&"repo2".to_owned()));
+    assert!(names.contains(&"repo3".to_owned()));
 }
 
 #[tokio::test]
@@ -457,12 +457,11 @@ async fn test_registry_clone_with_auth_callbacks() {
         .head()
         .ok()
         .and_then(|h| h.shorthand().map(String::from))
-        .unwrap_or_else(|| "main".to_string());
+        .unwrap_or_else(|| "main".to_owned());
     let default_worktree = repo_dir.join("worktrees").join(&default_branch);
     assert!(
         default_worktree.exists(),
-        "Default worktree should exist at {:?}",
-        default_worktree
+        "Default worktree should exist at {default_worktree:?}"
     );
     assert!(
         default_worktree.join("README.md").exists(),
@@ -517,7 +516,7 @@ async fn test_worktree_status_ahead_behind() {
     // Create a new branch "test-branch" for the worktree (can't use main since it's already checked out)
     let base_repo_path = handle.worktree().unwrap();
     {
-        let base_repo = Repository::open(&base_repo_path).unwrap();
+        let base_repo = Repository::open(base_repo_path).unwrap();
         let head_commit = base_repo.head().unwrap().peel_to_commit().unwrap();
         base_repo.branch("test-branch", &head_commit, false).unwrap();
     }
@@ -539,12 +538,12 @@ async fn test_worktree_status_ahead_behind() {
     // Create a remote branch reference (simulating origin/test-branch)
     let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
     let test_branch = "test-branch";
-    let remote_ref_name = format!("refs/remotes/origin/{}", test_branch);
+    let remote_ref_name = format!("refs/remotes/origin/{test_branch}");
     repo.reference(&remote_ref_name, head_commit.id(), false, "Create remote ref").unwrap();
 
     // Set upstream for the current branch (test-branch)
     let mut branch = repo.find_branch(test_branch, git2::BranchType::Local).unwrap();
-    branch.set_upstream(Some(&format!("origin/{}", test_branch))).unwrap();
+    branch.set_upstream(Some(&format!("origin/{test_branch}"))).unwrap();
 
     // Now make another local commit (we'll be ahead of the remote)
     let file3_path = repo_path.join("file3.txt");

@@ -28,7 +28,7 @@ fn read_huggingface_token_file() -> Option<String> {
 
     std::fs::read_to_string(&token_path)
         .ok()
-        .map(|s| s.trim().to_string())
+        .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
 }
 
@@ -112,7 +112,7 @@ impl XetConfig {
     /// authentication from `HF_TOKEN` or `XETHUB_TOKEN` environment variables.
     pub fn huggingface() -> Self {
         Self {
-            endpoint: HUGGINGFACE_XET_ENDPOINT.to_string(),
+            endpoint: HUGGINGFACE_XET_ENDPOINT.to_owned(),
             ..Default::default()
         }
     }
@@ -256,7 +256,7 @@ mod tests {
             .with_token("test_token");
 
         assert_eq!(config.endpoint, "https://custom.endpoint.dev");
-        assert_eq!(config.token, Some("test_token".to_string()));
+        assert_eq!(config.token, Some("test_token".to_owned()));
         assert!(config.is_enabled());
     }
 
@@ -329,7 +329,7 @@ mod tests {
         let config = XetConfig::new("https://example.com")
             .with_token("secret_token_12345");
 
-        let debug_str = format!("{:?}", config);
+        let debug_str = format!("{config:?}");
 
         // Token should be redacted
         assert!(debug_str.contains("[REDACTED]"));
@@ -343,7 +343,7 @@ mod tests {
         // No env var access, no lock needed
         let config = XetConfig::new("https://example.com");
 
-        let debug_str = format!("{:?}", config);
+        let debug_str = format!("{config:?}");
 
         // Should show None for token (no redaction needed)
         assert!(debug_str.contains("None"));

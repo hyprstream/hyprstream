@@ -94,7 +94,7 @@ impl EnvelopeContext {
 
     /// Get user subject for Casbin checks (if claims present)
     pub fn user_subject(&self) -> Option<String> {
-        self.claims.as_ref().map(|c| c.casbin_subject())
+        self.claims.as_ref().map(super::super::auth::claims::Claims::casbin_subject)
     }
 
     /// Get effective subject (user if present, otherwise service identity)
@@ -109,7 +109,7 @@ impl EnvelopeContext {
 
     /// Get user scopes (if claims present)
     pub fn user_scopes(&self) -> Option<Vec<String>> {
-        self.claims.as_ref().map(|c| c.scopes.iter().map(|s| s.to_string()).collect())
+        self.claims.as_ref().map(|c| c.scopes.iter().map(super::super::auth::scope::Scope::to_string).collect())
     }
 
     /// Check if user has specific scope (if claims present)
@@ -125,7 +125,7 @@ impl EnvelopeContext {
     /// This is used for deriving stream keys in E2E authenticated streaming.
     /// Returns None if the client didn't include an ephemeral pubkey.
     pub fn ephemeral_pubkey(&self) -> Option<&[u8]> {
-        self.ephemeral_pubkey.as_ref().map(|k| k.as_slice())
+        self.ephemeral_pubkey.as_ref().map(<[u8; 32]>::as_slice)
     }
 }
 
@@ -283,12 +283,12 @@ impl RequestLoop {
     /// Returns a handle that can be used to stop the service.
     pub async fn run<S: ZmqService>(self, service: S) -> Result<ServiceHandle> {
         let transport = self.transport.clone();
-        let context = self.context.clone();
+        let context = Arc::clone(&self.context);
         let server_pubkey = self.server_pubkey;
         let signing_key = self.signing_key.clone();
-        let nonce_cache = self.nonce_cache.clone();
+        let nonce_cache = Arc::clone(&self.nonce_cache);
         let shutdown = Arc::new(Notify::new());
-        let shutdown_clone = shutdown.clone();
+        let shutdown_clone = Arc::clone(&shutdown);
 
         // Create oneshot channel for ready signal
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -444,7 +444,7 @@ impl RequestLoop {
                     );
 
                     // Process request in spawn_blocking (handler may do blocking work)
-                    let service_clone = service.clone();
+                    let service_clone = Arc::clone(&service);
                     let response_payload = tokio::task::spawn_blocking(move || {
                         service_clone.handle_request(&ctx, &payload)
                     })
@@ -730,7 +730,7 @@ impl ZmqClient {
     ) -> Self {
         // Socket is lazily initialized on first call to allow construction without errors
         Self {
-            endpoint: endpoint.to_string(),
+            endpoint: endpoint.to_owned(),
             context,
             signing_key,
             server_verifying_key,
@@ -986,7 +986,7 @@ mod tests {
         fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<Vec<u8>> {
             // Echo back the payload, but prepend the user
             let user = ctx.user();
-            let mut response = format!("from {}:", user).into_bytes();
+            let mut response = format!("from {user}:").into_bytes();
             response.extend_from_slice(payload);
             Ok(response)
         }
@@ -1018,10 +1018,10 @@ mod tests {
         let (signing_key, verifying_key) = generate_signing_keypair();
 
         // Create service with infrastructure
-        let service = EchoService::new(context.clone(), transport.clone(), signing_key.clone());
+        let service = EchoService::new(Arc::clone(&context), transport.clone(), signing_key.clone());
 
         // Start the service (waits for socket binding)
-        let runner = RequestLoop::new(transport, context.clone(), signing_key.clone());
+        let runner = RequestLoop::new(transport, Arc::clone(&context), signing_key.clone());
         let mut handle = runner.run(service).await.expect("test: start service");
 
         // Use ZmqClient with server's verifying key for response verification
@@ -1032,8 +1032,7 @@ mod tests {
         let response_str = String::from_utf8_lossy(&response);
         assert!(
             response_str.contains("hello"),
-            "Response should contain 'hello': {}",
-            response_str
+            "Response should contain 'hello': {response_str}"
         );
 
         // Stop the service
@@ -1051,10 +1050,10 @@ mod tests {
         let (client_signing_key, _client_verifying_key) = generate_signing_keypair();
 
         // Create service with server's key
-        let service = EchoService::new(context.clone(), transport.clone(), server_signing_key.clone());
+        let service = EchoService::new(Arc::clone(&context), transport.clone(), server_signing_key.clone());
 
         // Start the service (waits for socket binding)
-        let runner = RequestLoop::new(transport, context.clone(), server_signing_key);
+        let runner = RequestLoop::new(transport, Arc::clone(&context), server_signing_key);
         let mut handle = runner.run(service).await.expect("test: start service");
 
         // Sign request with different key than service expects
@@ -1093,10 +1092,10 @@ mod tests {
         let (_different_signing_key, different_verifying_key) = generate_signing_keypair();
 
         // Create service with server's signing key
-        let service = EchoService::new(context.clone(), transport.clone(), server_signing_key.clone());
+        let service = EchoService::new(Arc::clone(&context), transport.clone(), server_signing_key.clone());
 
         // Start the service (waits for socket binding)
-        let runner = RequestLoop::new(transport, context.clone(), server_signing_key.clone());
+        let runner = RequestLoop::new(transport, Arc::clone(&context), server_signing_key.clone());
         let mut handle = runner.run(service).await.expect("test: start service");
 
         // Client expects responses signed by a DIFFERENT key than server uses
@@ -1109,8 +1108,7 @@ mod tests {
         // Response signature verification should fail
         assert!(
             result.is_err(),
-            "Response with wrong signature should be rejected: {:?}",
-            result
+            "Response with wrong signature should be rejected: {result:?}"
         );
 
         handle.stop().await;

@@ -381,7 +381,7 @@ mod tests {
         let metrics = acc.finalize();
         assert_eq!(metrics.token_count, 10);
         // perplexity = exp(-(-1.0)) = e ≈ 2.718
-        assert!((metrics.perplexity - 2.718).abs() < 0.01);
+        assert!((metrics.perplexity - std::f32::consts::E).abs() < 0.01);
         assert!((metrics.avg_entropy - 2.0).abs() < 0.01);
         // Variance should be near 0 with identical values
         assert!(metrics.entropy_variance < 0.01);

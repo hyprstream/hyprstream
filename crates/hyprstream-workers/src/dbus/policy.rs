@@ -235,8 +235,8 @@ fn pattern_matches(text: &str, pattern: &str) -> bool {
 /// Format: `container:<sandbox_id>` or `container:<sandbox_id>:<container_id>`
 pub fn container_subject(sandbox_id: &str, container_id: Option<&str>) -> String {
     match container_id {
-        Some(cid) => format!("container:{}:{}", sandbox_id, cid),
-        None => format!("container:{}", sandbox_id),
+        Some(cid) => format!("container:{sandbox_id}:{cid}"),
+        None => format!("container:{sandbox_id}"),
     }
 }
 

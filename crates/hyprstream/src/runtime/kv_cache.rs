@@ -518,7 +518,7 @@ impl LayerKVCache {
 
         // Round up to chunk boundary
         let new_capacity =
-            ((required_len + DEFAULT_CHUNK_SIZE - 1) / DEFAULT_CHUNK_SIZE) * DEFAULT_CHUNK_SIZE;
+            required_len.div_ceil(DEFAULT_CHUNK_SIZE) * DEFAULT_CHUNK_SIZE;
         let new_capacity = new_capacity.min(self.max_seq_len);
 
         let shape = template.size();

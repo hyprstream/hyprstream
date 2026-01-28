@@ -47,7 +47,7 @@ impl Default for GitTorrentConfig {
                 // or run in standalone mode for the first network node
             ],
             auto_discovery: true,
-            bind_address: "127.0.0.1".to_string(),
+            bind_address: "127.0.0.1".to_owned(),
             bind_port: 8080,
             p2p_port: 0, // 0 = random port
             dht_mode: crate::dht::DhtMode::Server, // Server mode by default
@@ -143,10 +143,10 @@ impl GitTorrentConfig {
     pub fn load() -> Result<Self> {
         let config = Self::builder()?
             .build()
-            .map_err(|e| Error::other(format!("Failed to build config: {}", e)))?;
+            .map_err(|e| Error::other(format!("Failed to build config: {e}")))?;
 
         config.try_deserialize()
-            .map_err(|e| Error::other(format!("Failed to deserialize config: {}", e)))
+            .map_err(|e| Error::other(format!("Failed to deserialize config: {e}")))
     }
 }
 
@@ -276,7 +276,7 @@ impl GitTorrentService {
         }
 
         // Try to fetch from DHT
-        let key = GitObjectKey::from_sha256(hash.clone());
+        let key = GitObjectKey::from_sha256(hash);
         if let Some(record) = self.dht.get_object(key).await? {
             // Verify the object hash
             if verify_sha256(&record.data, hash)? {
@@ -298,7 +298,7 @@ impl GitTorrentService {
         let hash = sha256_git(&data)?;
 
         // Store in DHT
-        let key = GitObjectKey::from_sha256(hash.clone());
+        let key = GitObjectKey::from_sha256(&hash);
         let record = GitObjectRecord::new(key.clone(), data.clone());
         self.dht.put_object(record).await?;
 
@@ -315,7 +315,7 @@ impl GitTorrentService {
 
     /// Find providers for a Git object
     pub async fn find_providers(&self, hash: &Sha256Hash) -> Result<Vec<libp2p::PeerId>> {
-        let key = GitObjectKey::from_sha256(hash.clone());
+        let key = GitObjectKey::from_sha256(hash);
         self.dht.get_providers(key).await
     }
 
@@ -330,7 +330,7 @@ impl GitTorrentService {
 
         for obj in objects {
             // Store object in DHT
-            let key = GitObjectKey::from_sha256(obj.hash.clone());
+            let key = GitObjectKey::from_sha256(&obj.hash);
             let record = GitObjectRecord::new(key.clone(), obj.data.clone());
             self.dht.put_object(record).await?;
 
@@ -361,7 +361,7 @@ impl GitTorrentService {
 
         for obj in objects {
             // Store object in DHT
-            let key = GitObjectKey::from_sha256(obj.hash.clone());
+            let key = GitObjectKey::from_sha256(&obj.hash);
             let record = GitObjectRecord::new(key.clone(), obj.data.clone());
             self.dht.put_object(record).await?;
 
@@ -450,7 +450,7 @@ impl GitTorrentService {
         let providers = self.find_providers(hash).await?;
 
         if providers.is_empty() {
-            return Err(Error::not_found(format!("No providers found for object {}", hash)));
+            return Err(Error::not_found(format!("No providers found for object {hash}")));
         }
 
         tracing::debug!("Found {} providers for object {}", providers.len(), hash);
@@ -462,7 +462,7 @@ impl GitTorrentService {
             return Ok(());
         }
 
-        Err(Error::not_found(format!("Failed to fetch object {} from peers", hash)))
+        Err(Error::not_found(format!("Failed to fetch object {hash} from peers")))
     }
 
     /// Get objects for a specific commit (recursive)
@@ -528,7 +528,7 @@ impl GitTorrentService {
 
                     tracing::info!("Successfully cloned repository to {:?}", local_path);
                 } else {
-                    return Err(Error::not_found(format!("Repository metadata not found for hash {}", hash)));
+                    return Err(Error::not_found(format!("Repository metadata not found for hash {hash}")));
                 }
             }
             GitTorrentUrl::GitServer { server: _, repo: _ } => {
@@ -608,11 +608,11 @@ impl GitTorrentService {
                     // Convert git2::Oid to SHA256 (this would need actual SHA256 support in git2)
                     let hash_str = format!("{:0>64}", target.to_string());
                     if let Ok(sha256) = Sha256Hash::new(hash_str) {
-                        branches.insert(name.to_string(), sha256.clone());
+                        branches.insert(name.to_owned(), sha256.clone());
 
                         // If this is a branch (not a tag), add to root commits
                         if reference.is_branch() {
-                            root_commits.insert(name.to_string(), sha256);
+                            root_commits.insert(name.to_owned(), sha256);
                         }
                     }
                 }
@@ -640,8 +640,7 @@ impl GitTorrentService {
 
         let repo_name = repo_path.file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
+            .unwrap_or("unknown").to_owned();
 
         // Collect ref names
         let ref_names: Vec<String> = branches.keys().cloned().collect();
@@ -679,7 +678,7 @@ impl GitTorrentService {
         for (branch_name, commit_hash) in &metadata.branches {
             // Convert hash back to git2::Oid
             if let Ok(oid) = git2::Oid::from_str(commit_hash.as_str()) {
-                let ref_name = format!("refs/heads/{}", branch_name);
+                let ref_name = format!("refs/heads/{branch_name}");
 
                 // Create the reference
                 if let Err(e) = repo.reference(&ref_name, oid, false, "Initial clone") {

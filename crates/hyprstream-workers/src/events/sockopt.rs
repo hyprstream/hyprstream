@@ -76,7 +76,7 @@ pub fn set_rcvtimeo(socket: &mut zmq::Socket, timeout_ms: i32) -> zmq::Result<()
 /// Get the current libzmq version as a string
 pub fn zmq_version_string() -> String {
     let (major, minor, patch) = zmq::version();
-    format!("{}.{}.{}", major, minor, patch)
+    format!("{major}.{minor}.{patch}")
 }
 
 #[cfg(test)]
@@ -87,7 +87,7 @@ mod tests {
     fn test_supports_use_fd() {
         let supported = supports_use_fd();
         let version = zmq_version_string();
-        println!("libzmq version: {}, ZMQ_USE_FD supported: {}", version, supported);
+        println!("libzmq version: {version}, ZMQ_USE_FD supported: {supported}");
     }
 
     #[test]

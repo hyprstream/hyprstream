@@ -127,12 +127,12 @@ impl Spawnable for OAIService {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("runtime: {}", e)))?;
+            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("runtime: {e}")))?;
 
         rt.block_on(async move {
             // Parse HTTP bind address
             let addr = self.http_addr().map_err(|e| {
-                hyprstream_rpc::error::RpcError::SpawnFailed(format!("Invalid HTTP address: {}", e))
+                hyprstream_rpc::error::RpcError::SpawnFailed(format!("Invalid HTTP address: {e}"))
             })?;
 
             // Create HTTP server
@@ -140,7 +140,7 @@ impl Spawnable for OAIService {
 
             // Bind HTTP listener
             let listener = TcpListener::bind(addr).await.map_err(|e| {
-                hyprstream_rpc::error::RpcError::SpawnFailed(format!("HTTP bind failed: {}", e))
+                hyprstream_rpc::error::RpcError::SpawnFailed(format!("HTTP bind failed: {e}"))
             })?;
 
             info!(

@@ -67,7 +67,7 @@ impl<'a> RepositoryHandle<'a> {
     pub fn current_oid(&self) -> Git2DBResult<Option<Oid>> {
         match &self.metadata()?.current_oid {
             Some(oid_str) => Ok(Some(Oid::from_str(oid_str).map_err(|e| {
-                Git2DBError::internal(format!("Invalid OID in metadata: {}", e))
+                Git2DBError::internal(format!("Invalid OID in metadata: {e}"))
             })?)),
             None => Ok(None),
         }
@@ -77,7 +77,7 @@ impl<'a> RepositoryHandle<'a> {
     pub fn open_repo(&self) -> Git2DBResult<Repository> {
         let path = self.worktree()?;
         Repository::open(path)
-            .map_err(|e| Git2DBError::repository(path, format!("Failed to open repository: {}", e)))
+            .map_err(|e| Git2DBError::repository(path, format!("Failed to open repository: {e}")))
     }
 
     /// Checkout a specific reference (branch, tag, or commit)
@@ -244,11 +244,11 @@ impl<'a> RepositoryHandle<'a> {
     /// - The commit cannot be created
     pub async fn commit_as(&self, signature: &Signature<'_>, message: &str) -> Git2DBResult<Oid> {
         let repo_path = self.worktree()?.to_path_buf();
-        let message = message.to_string();
+        let message = message.to_owned();
         // Clone signature data to move into the blocking task
         // Note: Signature has a lifetime, so we need to extract the data
-        let sig_name = signature.name().unwrap_or("Unknown").to_string();
-        let sig_email = signature.email().unwrap_or("unknown@example.com").to_string();
+        let sig_name = signature.name().unwrap_or("Unknown").to_owned();
+        let sig_email = signature.email().unwrap_or("unknown@example.com").to_owned();
         // Preserve the original timestamp from the signature
         let sig_time = signature.when();
         let sig_time_seconds = sig_time.seconds();
@@ -258,27 +258,27 @@ impl<'a> RepositoryHandle<'a> {
 
         tokio::task::spawn_blocking(move || -> Git2DBResult<Oid> {
             let repo = Repository::open(&repo_path).map_err(|e| {
-                Git2DBError::repository(&repo_path, format!("Failed to open repository: {}", e))
+                Git2DBError::repository(&repo_path, format!("Failed to open repository: {e}"))
             })?;
 
             // Get the current index
             let mut index = repo
                 .index()
-                .map_err(|e| Git2DBError::internal(format!("Failed to get index: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to get index: {e}")))?;
 
             // Write index to tree
             let tree_oid = index
                 .write_tree()
-                .map_err(|e| Git2DBError::internal(format!("Failed to write tree: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to write tree: {e}")))?;
 
             let tree = repo
                 .find_tree(tree_oid)
-                .map_err(|e| Git2DBError::internal(format!("Failed to find tree: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to find tree: {e}")))?;
 
             // Get parent commit (if any)
             let parent_commits = if let Ok(head) = repo.head() {
                 vec![head.peel_to_commit().map_err(|e| {
-                    Git2DBError::reference("HEAD", format!("Failed to get HEAD commit: {}", e))
+                    Git2DBError::reference("HEAD", format!("Failed to get HEAD commit: {e}"))
                 })?]
             } else {
                 vec![]
@@ -298,7 +298,7 @@ impl<'a> RepositoryHandle<'a> {
             // Recreate signature in the blocking task, preserving the original timestamp
             let time = git2::Time::new(sig_time_seconds, sig_time_offset);
             let sig = Signature::new(&sig_name, &sig_email, &time)
-                .map_err(|e| Git2DBError::internal(format!("Failed to create signature: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to create signature: {e}")))?;
 
             // Create the commit
             let commit_oid = repo
@@ -310,12 +310,12 @@ impl<'a> RepositoryHandle<'a> {
                     &tree,
                     &parent_refs,
                 )
-                .map_err(|e| Git2DBError::internal(format!("Failed to create commit: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to create commit: {e}")))?;
 
             Ok(commit_oid)
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
     }
 
     /// Get repository status (branch, dirty files, etc.)
@@ -349,26 +349,26 @@ impl<'a> RepositoryHandle<'a> {
         tokio::task::spawn_blocking(move || {
             let repo = crate::manager::GitManager::global()
                 .get_repository(&repo_path)
-                .map_err(|e| Git2DBError::repository(&repo_path, format!("Failed to get repository: {}", e)))?
+                .map_err(|e| Git2DBError::repository(&repo_path, format!("Failed to get repository: {e}")))?
                 .open()
-                .map_err(|e| Git2DBError::repository(&repo_path, format!("Failed to open repository: {}", e)))?;
+                .map_err(|e| Git2DBError::repository(&repo_path, format!("Failed to open repository: {e}")))?;
 
             // Get HEAD
             let head = repo.head().ok();
             let branch = head.as_ref().and_then(|h| h.shorthand().map(String::from));
-            let head_oid = head.as_ref().and_then(|h| h.target());
+            let head_oid = head.as_ref().and_then(git2::Reference::target);
 
             // Get statuses
             let statuses = repo
                 .statuses(None)
-                .map_err(|e| Git2DBError::internal(format!("Failed to get statuses: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to get statuses: {e}")))?;
 
             let is_clean = statuses.is_empty();
 
             // Collect modified file paths
             let modified_files: Vec<PathBuf> = statuses
                 .iter()
-                .filter_map(|entry| entry.path().map(|p| PathBuf::from(p)))
+                .filter_map(|entry| entry.path().map(PathBuf::from))
                 .collect();
 
             Ok(RepositoryStatus {
@@ -381,7 +381,7 @@ impl<'a> RepositoryHandle<'a> {
             })
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
     }
 
     /// Merge a branch or reference into the current HEAD
@@ -415,15 +415,15 @@ impl<'a> RepositoryHandle<'a> {
     /// - The merge commit cannot be created
     pub async fn merge(&self, source: &str, message: Option<&str>) -> Git2DBResult<Oid> {
         let repo_path = self.worktree()?.to_path_buf();
-        let source = source.to_string();
-        let message = message.map(|m| m.to_string());
+        let source = source.to_owned();
+        let message = message.map(std::borrow::ToOwned::to_owned);
 
         tokio::task::spawn_blocking(move || {
             let repo = crate::manager::GitManager::global()
                 .get_repository(&repo_path)
-                .map_err(|e| Git2DBError::repository(&repo_path, format!("Failed to get repository: {}", e)))?
+                .map_err(|e| Git2DBError::repository(&repo_path, format!("Failed to get repository: {e}")))?
                 .open()
-                .map_err(|e| Git2DBError::repository(&repo_path, format!("Failed to open repository: {}", e)))?;
+                .map_err(|e| Git2DBError::repository(&repo_path, format!("Failed to open repository: {e}")))?;
 
             // Get default signature from the global GitManager
             let git_manager = crate::manager::GitManager::global();
@@ -432,20 +432,20 @@ impl<'a> RepositoryHandle<'a> {
             // Find the source ref to merge
             let (obj, _src_ref) = repo
                 .revparse_ext(&source)
-                .map_err(|e| Git2DBError::reference(&source, format!("Failed to find ref: {}", e)))?;
+                .map_err(|e| Git2DBError::reference(&source, format!("Failed to find ref: {e}")))?;
 
             let source_commit = obj
                 .peel_to_commit()
-                .map_err(|e| Git2DBError::reference(&source, format!("Failed to peel to commit: {}", e)))?;
+                .map_err(|e| Git2DBError::reference(&source, format!("Failed to peel to commit: {e}")))?;
 
             // Get annotated commit for merge
             let source_annotated = repo
                 .find_annotated_commit(source_commit.id())
-                .map_err(|e| Git2DBError::internal(format!("Failed to find annotated commit: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to find annotated commit: {e}")))?;
 
             // Perform the merge analysis
             let (analysis, _preference) = repo.merge_analysis(&[&source_annotated])
-                .map_err(|e| Git2DBError::internal(format!("Failed to analyze merge: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to analyze merge: {e}")))?;
 
             // Check if up-to-date
             if analysis.contains(git2::MergeAnalysis::ANALYSIS_UP_TO_DATE) {
@@ -456,47 +456,47 @@ impl<'a> RepositoryHandle<'a> {
             if analysis.contains(git2::MergeAnalysis::ANALYSIS_FASTFORWARD) {
                 // Do fast-forward merge
                 let source_obj = source_commit.as_object();
-                repo.checkout_tree(&source_obj, None)
-                    .map_err(|e| Git2DBError::internal(format!("Failed to checkout tree: {}", e)))?;
+                repo.checkout_tree(source_obj, None)
+                    .map_err(|e| Git2DBError::internal(format!("Failed to checkout tree: {e}")))?;
 
-                repo.set_head(&format!("refs/heads/{}", source))
-                    .map_err(|e| Git2DBError::internal(format!("Failed to set HEAD: {}", e)))?;
+                repo.set_head(&format!("refs/heads/{source}"))
+                    .map_err(|e| Git2DBError::internal(format!("Failed to set HEAD: {e}")))?;
 
                 return Ok(source_commit.id());
             }
 
             // Normal merge required - commit merge
             repo.merge(&[&source_annotated], None, None)
-                .map_err(|e| Git2DBError::internal(format!("Failed to perform merge: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to perform merge: {e}")))?;
 
             // Check for conflicts again after merge
             let mut index = repo
                 .index()
-                .map_err(|e| Git2DBError::internal(format!("Failed to get index: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to get index: {e}")))?;
 
             if index.has_conflicts() {
                 repo.cleanup_state()
-                    .map_err(|e| Git2DBError::internal(format!("Failed to cleanup merge state: {}", e)))?;
+                    .map_err(|e| Git2DBError::internal(format!("Failed to cleanup merge state: {e}")))?;
                 return Err(Git2DBError::invalid_operation("Merge conflicts detected"));
             }
 
             // Write tree and create merge commit
             let tree_id = index
                 .write_tree()
-                .map_err(|e| Git2DBError::internal(format!("Failed to write tree: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to write tree: {e}")))?;
 
             let tree = repo
                 .find_tree(tree_id)
-                .map_err(|e| Git2DBError::internal(format!("Failed to find tree: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to find tree: {e}")))?;
 
             // Get parent commits
             let head = repo
                 .head()
-                .map_err(|e| Git2DBError::internal(format!("Failed to get HEAD: {}", e)))?
+                .map_err(|e| Git2DBError::internal(format!("Failed to get HEAD: {e}")))?
                 .peel_to_commit()
-                .map_err(|e| Git2DBError::internal(format!("Failed to resolve HEAD commit: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to resolve HEAD commit: {e}")))?;
 
-            let merge_msg = message.unwrap_or_else(|| format!("Merge branch '{}'", source));
+            let merge_msg = message.unwrap_or_else(|| format!("Merge branch '{source}'"));
 
             // Create merge commit
             let merge_oid = repo
@@ -508,16 +508,16 @@ impl<'a> RepositoryHandle<'a> {
                     &tree,
                     &[&head, &source_commit],
                 )
-                .map_err(|e| Git2DBError::internal(format!("Failed to create merge commit: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to create merge commit: {e}")))?;
 
             // Cleanup merge state
             repo.cleanup_state()
-                .map_err(|e| Git2DBError::internal(format!("Failed to cleanup merge state: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to cleanup merge state: {e}")))?;
 
             Ok(merge_oid)
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
     }
 
     /// List all references (branches and tags) with their OIDs
@@ -540,14 +540,14 @@ impl<'a> RepositoryHandle<'a> {
 
         for reference in repo
             .references()
-            .map_err(|e| Git2DBError::internal(format!("Failed to list references: {}", e)))?
+            .map_err(|e| Git2DBError::internal(format!("Failed to list references: {e}")))?
         {
             let r = reference
-                .map_err(|e| Git2DBError::internal(format!("Failed to read reference: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to read reference: {e}")))?;
 
             if let Some(name) = r.shorthand() {
                 if let Some(oid) = r.target() {
-                    refs.push((name.to_string(), oid));
+                    refs.push((name.to_owned(), oid));
                 }
             }
         }
@@ -576,7 +576,7 @@ impl<'a> RepositoryHandle<'a> {
             if let Some(name) = head_ref.symbolic_target() {
                 // Remove refs/heads/ prefix to get just the branch name
                 if let Some(branch_name) = name.strip_prefix("refs/heads/") {
-                    return Ok(branch_name.to_string());
+                    return Ok(branch_name.to_owned());
                 }
             }
         }
@@ -588,26 +588,26 @@ impl<'a> RepositoryHandle<'a> {
                 .find_branch(default_name, git2::BranchType::Local)
                 .is_ok()
             {
-                return Ok(default_name.to_string());
+                return Ok(default_name.to_owned());
             }
         }
 
         // Fallback: get the first branch
         let mut branches = repo
             .branches(Some(git2::BranchType::Local))
-            .map_err(|e| Git2DBError::internal(format!("Failed to list branches: {}", e)))?;
+            .map_err(|e| Git2DBError::internal(format!("Failed to list branches: {e}")))?;
 
         if let Some(Ok((branch, _))) = branches.next() {
             if let Some(name) = branch
                 .name()
-                .map_err(|e| Git2DBError::internal(format!("Failed to get branch name: {}", e)))?
+                .map_err(|e| Git2DBError::internal(format!("Failed to get branch name: {e}")))?
             {
-                return Ok(name.to_string());
+                return Ok(name.to_owned());
             }
         }
 
         // Final fallback
-        Ok("main".to_string())
+        Ok("main".to_owned())
     }
 
     /// Resolve a GitRef to an OID
@@ -638,10 +638,10 @@ impl<'a> RepositoryHandle<'a> {
         match git_ref {
             GitRef::DefaultBranch => {
                 let head = repo.head().map_err(|e| {
-                    Git2DBError::reference("HEAD", format!("Failed to get HEAD: {}", e))
+                    Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}"))
                 })?;
                 head.peel_to_commit().map(|c| c.id()).map_err(|e| {
-                    Git2DBError::reference("HEAD", format!("Failed to peel to commit: {}", e))
+                    Git2DBError::reference("HEAD", format!("Failed to peel to commit: {e}"))
                 })
             }
             GitRef::Branch(branch_name) => {
@@ -649,29 +649,29 @@ impl<'a> RepositoryHandle<'a> {
                     .find_branch(branch_name, git2::BranchType::Local)
                     .or_else(|_| repo.find_branch(branch_name, git2::BranchType::Remote))
                     .map_err(|e| {
-                        Git2DBError::reference(branch_name, format!("Branch not found: {}", e))
+                        Git2DBError::reference(branch_name, format!("Branch not found: {e}"))
                     })?;
                 branch.get().peel_to_commit().map(|c| c.id()).map_err(|e| {
-                    Git2DBError::reference(branch_name, format!("Failed to peel to commit: {}", e))
+                    Git2DBError::reference(branch_name, format!("Failed to peel to commit: {e}"))
                 })
             }
             GitRef::Tag(tag_name) => {
                 let reference = repo
-                    .find_reference(&format!("refs/tags/{}", tag_name))
+                    .find_reference(&format!("refs/tags/{tag_name}"))
                     .map_err(|e| {
-                        Git2DBError::reference(tag_name, format!("Tag not found: {}", e))
+                        Git2DBError::reference(tag_name, format!("Tag not found: {e}"))
                     })?;
                 reference.peel_to_commit().map(|c| c.id()).map_err(|e| {
-                    Git2DBError::reference(tag_name, format!("Failed to peel to commit: {}", e))
+                    Git2DBError::reference(tag_name, format!("Failed to peel to commit: {e}"))
                 })
             }
             GitRef::Commit(oid) => Ok(*oid),
             GitRef::Revspec(spec) => {
                 let obj = repo.revparse_single(spec).map_err(|e| {
-                    Git2DBError::reference(spec, format!("Failed to resolve revspec: {}", e))
+                    Git2DBError::reference(spec, format!("Failed to resolve revspec: {e}"))
                 })?;
                 obj.peel_to_commit().map(|c| c.id()).map_err(|e| {
-                    Git2DBError::reference(spec, format!("Failed to peel to commit: {}", e))
+                    Git2DBError::reference(spec, format!("Failed to peel to commit: {e}"))
                 })
             }
         }
@@ -696,22 +696,22 @@ impl<'a> RepositoryHandle<'a> {
 
         // Try as branch first
         let ref_path = if ref_name.starts_with("refs/") {
-            ref_name.to_string()
+            ref_name.to_owned()
         } else if repo.find_branch(ref_name, git2::BranchType::Local).is_ok() {
-            format!("refs/heads/{}", ref_name)
+            format!("refs/heads/{ref_name}")
         } else if repo
-            .find_reference(&format!("refs/tags/{}", ref_name))
+            .find_reference(&format!("refs/tags/{ref_name}"))
             .is_ok()
         {
-            format!("refs/tags/{}", ref_name)
+            format!("refs/tags/{ref_name}")
         } else {
-            ref_name.to_string()
+            ref_name.to_owned()
         };
 
         // Find and extract data before returning
         let result = match repo.find_reference(&ref_path) {
             Ok(reference) => {
-                let name = reference.shorthand().unwrap_or(ref_name).to_string();
+                let name = reference.shorthand().unwrap_or(ref_name).to_owned();
                 let oid_opt = reference.target();
                 (Some(name), oid_opt)
             }
@@ -741,7 +741,7 @@ impl<'a> RepositoryHandle<'a> {
     pub async fn resolve_revspec(&self, spec: &str) -> Git2DBResult<Oid> {
         let repo = self.open_repo()?;
         let obj = repo.revparse_single(spec).map_err(|e| {
-            Git2DBError::reference(spec, format!("Failed to resolve revspec: {}", e))
+            Git2DBError::reference(spec, format!("Failed to resolve revspec: {e}"))
         })?;
         Ok(obj.id())
     }
@@ -887,7 +887,7 @@ impl<'a> RepositoryHandle<'a> {
         })?;
 
         let storage = LfsStorage::new(&config).await.map_err(|e| {
-            Git2DBError::internal(format!("Failed to create LFS storage: {}", e))
+            Git2DBError::internal(format!("Failed to create LFS storage: {e}"))
         })?;
 
         storage.process_worktree(repo_path).await
@@ -922,13 +922,12 @@ impl<'a> RepositoryHandle<'a> {
             .spawn()
             .map_err(|e| {
                 Git2DBError::internal(format!(
-                    "Failed to spawn 'git lfs pull': {}. Is git-lfs installed?",
-                    e
+                    "Failed to spawn 'git lfs pull': {e}. Is git-lfs installed?"
                 ))
             })?;
 
         let status = child.wait().await.map_err(|e| {
-            Git2DBError::internal(format!("Failed to wait for 'git lfs pull': {}", e))
+            Git2DBError::internal(format!("Failed to wait for 'git lfs pull': {e}"))
         })?;
 
         if !status.success() {
@@ -936,18 +935,13 @@ impl<'a> RepositoryHandle<'a> {
             tracing::error!("git lfs pull failed with exit code: {}", exit_code);
 
             let error_msg = match exit_code {
-                128 => format!(
-                    "git lfs pull failed (exit code 128): Authentication failed.\n\
-                     Check your git credentials or LFS endpoint."
-                ),
-                1 => format!(
-                    "git lfs pull failed (exit code 1): Network error.\n\
-                     Check network connectivity and LFS endpoint."
-                ),
+                128 => "git lfs pull failed (exit code 128): Authentication failed.\n\
+                     Check your git credentials or LFS endpoint.".to_owned(),
+                1 => "git lfs pull failed (exit code 1): Network error.\n\
+                     Check network connectivity and LFS endpoint.".to_owned(),
                 _ => format!(
-                    "git lfs pull failed (exit code {}): Unknown error.\n\
-                     Check logs above for details.",
-                    exit_code
+                    "git lfs pull failed (exit code {exit_code}): Unknown error.\n\
+                     Check logs above for details."
                 ),
             };
 
@@ -976,7 +970,7 @@ impl<'a> RepositoryHandle<'a> {
         let opts = DriverOpts {
             base_repo: tracked_repo.worktree_path.clone(),
             worktree_path: worktree_path.to_path_buf(),
-            ref_spec: branch.to_string(),
+            ref_spec: branch.to_owned(),
         };
 
         // Create worktree using driver
@@ -1025,8 +1019,7 @@ impl<'a> RepositoryHandle<'a> {
                     }
 
                     return Err(Git2DBError::internal(format!(
-                        "Worktree creation failed: LFS fetch error: {}. Worktree has been rolled back.",
-                        e
+                        "Worktree creation failed: LFS fetch error: {e}. Worktree has been rolled back."
                     )));
                 }
 

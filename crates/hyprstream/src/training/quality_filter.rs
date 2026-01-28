@@ -229,16 +229,16 @@ impl std::fmt::Display for FilterReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::LowConfidence { actual, threshold } => {
-                write!(f, "Low confidence: {:.3} < {:.3}", actual, threshold)
+                write!(f, "Low confidence: {actual:.3} < {threshold:.3}")
             }
             Self::HighRepetition { actual, threshold } => {
-                write!(f, "High repetition: {:.3} > {:.3}", actual, threshold)
+                write!(f, "High repetition: {actual:.3} > {threshold:.3}")
             }
             Self::HighEntropyVariance { actual, threshold } => {
-                write!(f, "High entropy variance: {:.3} > {:.3}", actual, threshold)
+                write!(f, "High entropy variance: {actual:.3} > {threshold:.3}")
             }
             Self::HighPerplexity { actual, threshold } => {
-                write!(f, "High perplexity: {:.1} > {:.1}", actual, threshold)
+                write!(f, "High perplexity: {actual:.1} > {threshold:.1}")
             }
         }
     }

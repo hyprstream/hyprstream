@@ -251,6 +251,7 @@ impl Default for RepositoryConfig {
 /// Field naming convention: All timeout/duration fields use unit suffixes:
 /// - `*_secs` = seconds (u64)
 /// - `*_ms` = milliseconds (u64)
+///
 /// This ensures clear time unit specification in configuration files and environment variables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
@@ -345,6 +346,7 @@ impl Default for NetworkConfig {
 /// Field naming convention: All timeout/duration fields use unit suffixes:
 /// - `*_secs` = seconds (u64)
 /// - Cache sizes use `*_cache` suffix (usize)
+///
 /// This ensures clear time unit and size specification in configuration files and environment variables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerformanceConfig {
@@ -389,8 +391,8 @@ pub struct GitSignature {
 impl Default for GitSignature {
     fn default() -> Self {
         Self {
-            name: "git2db".to_string(),
-            email: "git2db@local".to_string(),
+            name: "git2db".to_owned(),
+            email: "git2db@local".to_owned(),
         }
     }
 }
@@ -527,10 +529,10 @@ mod tests {
             max_retries: 5,
             retry_base_delay_ms: 1000,
             retry_max_delay_secs: 30,
-            proxy_url: Some("http://proxy.example.com:8080".to_string()),
-            user_agent: "test-agent".to_string(),
+            proxy_url: Some("http://proxy.example.com:8080".to_owned()),
+            user_agent: "test-agent".to_owned(),
             use_credential_helper: true,
-            access_token: Some("test-token".to_string()),
+            access_token: Some("test-token".to_owned()),
         };
         assert_eq!(network_config.timeout_secs, 120);
         assert_eq!(network_config.max_retries, 5);
@@ -573,7 +575,7 @@ mod tests {
     #[test]
     fn test_git_signature_creation_variants() {
         // Test with owned strings
-        let sig1 = GitSignature::new("User1".to_string(), "user1@example.com".to_string());
+        let sig1 = GitSignature::new("User1".to_owned(), "user1@example.com".to_owned());
         assert_eq!(sig1.name, "User1");
 
         // Test with &str
@@ -581,8 +583,8 @@ mod tests {
         assert_eq!(sig2.name, "User2");
 
         // Test with String references
-        let name = "User3".to_string();
-        let email = "user3@example.com".to_string();
+        let name = "User3".to_owned();
+        let email = "user3@example.com".to_owned();
         let sig3 = GitSignature::new(&name, &email);
         assert_eq!(sig3.name, "User3");
     }
@@ -626,13 +628,13 @@ pub struct WorktreeConfig {
 }
 
 fn default_driver() -> String {
-    "vfs".to_string()
+    "vfs".to_owned()
 }
 
 impl Default for WorktreeConfig {
     fn default() -> Self {
         Self {
-            driver: "vfs".to_string(),
+            driver: "vfs".to_owned(),
         }
     }
 }

@@ -91,14 +91,14 @@ impl RecoveryManager {
                     "Recovery completed successfully"
                 );
                 RecoveryStatus::Recovered {
-                    checkpoint_id: checkpoint.id().to_string(),
+                    checkpoint_id: checkpoint.id().to_owned(),
                     tables_restored,
                 }
             }
             Err(e) => {
                 warn!(error = %e, "Recovery failed");
                 RecoveryStatus::Failed {
-                    error: e.message().to_string(),
+                    error: e.message().to_owned(),
                 }
             }
         }
@@ -123,8 +123,7 @@ impl RecoveryManager {
         match checkpoint {
             Some(cp) => Ok(self.restore_from(&cp, storage).await),
             None => Err(Status::not_found(format!(
-                "Checkpoint {} not found",
-                checkpoint_id
+                "Checkpoint {checkpoint_id} not found"
             ))),
         }
     }
@@ -171,7 +170,7 @@ impl RecoveryManager {
         } else {
             info!("No recovery needed");
             RecoveryStatus::Skipped {
-                reason: "Database appears to be in valid state".to_string(),
+                reason: "Database appears to be in valid state".to_owned(),
             }
         }
     }
@@ -192,7 +191,7 @@ mod tests {
     #[test]
     fn test_recovery_status_success_check() {
         assert!(RecoveryStatus::Recovered {
-            checkpoint_id: "abc".to_string(),
+            checkpoint_id: "abc".to_owned(),
             tables_restored: 5
         }
         .is_success());
@@ -200,12 +199,12 @@ mod tests {
         assert!(RecoveryStatus::NoCheckpointFound.is_success());
 
         assert!(RecoveryStatus::Skipped {
-            reason: "test".to_string()
+            reason: "test".to_owned()
         }
         .is_success());
 
         assert!(!RecoveryStatus::Failed {
-            error: "error".to_string()
+            error: "error".to_owned()
         }
         .is_success());
     }

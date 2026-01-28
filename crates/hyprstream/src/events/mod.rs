@@ -368,7 +368,7 @@ mod tests {
             EventSource::Inference,
             "inference.generation_complete",
             EventPayload::GenerationComplete {
-                model_id: "qwen3-small".to_string(),
+                model_id: "qwen3-small".to_owned(),
                 session_id: None,
                 metrics: GenerationMetrics::default(),
             },
@@ -385,8 +385,8 @@ mod tests {
             EventSource::Metrics,
             "metrics.threshold_breach",
             EventPayload::ThresholdBreach {
-                model_id: "qwen3-small".to_string(),
-                metric: "perplexity".to_string(),
+                model_id: "qwen3-small".to_owned(),
+                metric: "perplexity".to_owned(),
                 threshold: 50.0,
                 actual: 75.0,
                 z_score: 2.5,
@@ -405,8 +405,8 @@ mod tests {
             EventSource::Metrics,
             "metrics.threshold_breach",
             EventPayload::ThresholdBreach {
-                model_id: "qwen3-small".to_string(),
-                metric: "perplexity".to_string(),
+                model_id: "qwen3-small".to_owned(),
+                metric: "perplexity".to_owned(),
                 threshold: 50.0,
                 actual: 75.0,
                 z_score: 2.5,
@@ -417,8 +417,8 @@ mod tests {
             EventSource::Training,
             "training.started",
             EventPayload::TrainingStarted {
-                model_id: "qwen3-small".to_string(),
-                adapter_id: "auto-fix".to_string(),
+                model_id: "qwen3-small".to_owned(),
+                adapter_id: "auto-fix".to_owned(),
                 config: TrainingConfig {
                     rank: 16,
                     learning_rate: 1e-4,

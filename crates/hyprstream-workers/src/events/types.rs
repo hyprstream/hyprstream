@@ -12,8 +12,8 @@
 //!
 //! // Publishing (in WorkerService)
 //! let event = SandboxStarted {
-//!     sandbox_id: "abc123".to_string(),
-//!     metadata: "{}".to_string(),
+//!     sandbox_id: "abc123".to_owned(),
+//!     metadata: "{}".to_owned(),
 //!     vm_pid: 1234,
 //! };
 //! let payload = event.to_bytes()?;
@@ -255,14 +255,14 @@ impl ReceivedEvent {
         let parts: Vec<&str> = topic.split('.').collect();
         let (source, entity_id, event_type) = if parts.len() >= 3 {
             (
-                parts[0].to_string(),
-                parts[1].to_string(),
-                parts[2].to_string(),
+                parts[0].to_owned(),
+                parts[1].to_owned(),
+                parts[2].to_owned(),
             )
         } else if parts.len() == 2 {
-            (parts[0].to_string(), parts[1].to_string(), String::new())
+            (parts[0].to_owned(), parts[1].to_owned(), String::new())
         } else {
-            (topic.to_string(), String::new(), String::new())
+            (topic.to_owned(), String::new(), String::new())
         };
 
         // Attempt to deserialize worker events
@@ -273,7 +273,7 @@ impl ReceivedEvent {
         };
 
         Self {
-            topic: topic.to_string(),
+            topic: topic.to_owned(),
             source,
             entity_id,
             event_type,
@@ -299,34 +299,34 @@ impl ReceivedEvent {
     pub fn extract_inputs(&self) -> std::collections::HashMap<String, String> {
         let mut inputs = std::collections::HashMap::new();
 
-        inputs.insert("topic".to_string(), self.topic.clone());
-        inputs.insert("source".to_string(), self.source.clone());
-        inputs.insert("entity_id".to_string(), self.entity_id.clone());
-        inputs.insert("event_type".to_string(), self.event_type.clone());
+        inputs.insert("topic".to_owned(), self.topic.clone());
+        inputs.insert("source".to_owned(), self.source.clone());
+        inputs.insert("entity_id".to_owned(), self.entity_id.clone());
+        inputs.insert("event_type".to_owned(), self.event_type.clone());
 
         // Add event-specific fields
         if let Some(ref event) = self.worker_event {
             match event {
                 WorkerEvent::SandboxStarted(e) => {
-                    inputs.insert("sandbox_id".to_string(), e.sandbox_id.clone());
-                    inputs.insert("metadata".to_string(), e.metadata.clone());
-                    inputs.insert("vm_pid".to_string(), e.vm_pid.to_string());
+                    inputs.insert("sandbox_id".to_owned(), e.sandbox_id.clone());
+                    inputs.insert("metadata".to_owned(), e.metadata.clone());
+                    inputs.insert("vm_pid".to_owned(), e.vm_pid.to_string());
                 }
                 WorkerEvent::SandboxStopped(e) => {
-                    inputs.insert("sandbox_id".to_string(), e.sandbox_id.clone());
-                    inputs.insert("reason".to_string(), e.reason.clone());
-                    inputs.insert("exit_code".to_string(), e.exit_code.to_string());
+                    inputs.insert("sandbox_id".to_owned(), e.sandbox_id.clone());
+                    inputs.insert("reason".to_owned(), e.reason.clone());
+                    inputs.insert("exit_code".to_owned(), e.exit_code.to_string());
                 }
                 WorkerEvent::ContainerStarted(e) => {
-                    inputs.insert("container_id".to_string(), e.container_id.clone());
-                    inputs.insert("sandbox_id".to_string(), e.sandbox_id.clone());
-                    inputs.insert("image".to_string(), e.image.clone());
+                    inputs.insert("container_id".to_owned(), e.container_id.clone());
+                    inputs.insert("sandbox_id".to_owned(), e.sandbox_id.clone());
+                    inputs.insert("image".to_owned(), e.image.clone());
                 }
                 WorkerEvent::ContainerStopped(e) => {
-                    inputs.insert("container_id".to_string(), e.container_id.clone());
-                    inputs.insert("sandbox_id".to_string(), e.sandbox_id.clone());
-                    inputs.insert("exit_code".to_string(), e.exit_code.to_string());
-                    inputs.insert("reason".to_string(), e.reason.clone());
+                    inputs.insert("container_id".to_owned(), e.container_id.clone());
+                    inputs.insert("sandbox_id".to_owned(), e.sandbox_id.clone());
+                    inputs.insert("exit_code".to_owned(), e.exit_code.to_string());
+                    inputs.insert("reason".to_owned(), e.reason.clone());
                 }
             }
         }
@@ -361,8 +361,8 @@ mod tests {
     #[test]
     fn test_sandbox_started_roundtrip() {
         let original = SandboxStarted {
-            sandbox_id: "test-123".to_string(),
-            metadata: r#"{"cpu":2}"#.to_string(),
+            sandbox_id: "test-123".to_owned(),
+            metadata: r#"{"cpu":2}"#.to_owned(),
             vm_pid: 9876,
         };
 
@@ -382,10 +382,10 @@ mod tests {
     #[test]
     fn test_container_stopped_roundtrip() {
         let original = ContainerStopped {
-            container_id: "cont-456".to_string(),
-            sandbox_id: "sb-123".to_string(),
+            container_id: "cont-456".to_owned(),
+            sandbox_id: "sb-123".to_owned(),
             exit_code: 0,
-            reason: "completed".to_string(),
+            reason: "completed".to_owned(),
         };
 
         let bytes = serialize_container_stopped(&original).unwrap();
@@ -405,8 +405,8 @@ mod tests {
     #[test]
     fn test_extract_inputs() {
         let original = SandboxStarted {
-            sandbox_id: "sb-789".to_string(),
-            metadata: "{}".to_string(),
+            sandbox_id: "sb-789".to_owned(),
+            metadata: "{}".to_owned(),
             vm_pid: 1234,
         };
         let bytes = serialize_sandbox_started(&original).unwrap();
@@ -414,8 +414,8 @@ mod tests {
         let event = ReceivedEvent::from_message("worker.sb-789.started", &bytes);
         let inputs = event.extract_inputs();
 
-        assert_eq!(inputs.get("sandbox_id"), Some(&"sb-789".to_string()));
-        assert_eq!(inputs.get("vm_pid"), Some(&"1234".to_string()));
-        assert_eq!(inputs.get("event_type"), Some(&"started".to_string()));
+        assert_eq!(inputs.get("sandbox_id"), Some(&"sb-789".to_owned()));
+        assert_eq!(inputs.get("vm_pid"), Some(&"1234".to_owned()));
+        assert_eq!(inputs.get("event_type"), Some(&"started".to_owned()));
     }
 }

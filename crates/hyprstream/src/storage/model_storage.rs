@@ -163,7 +163,7 @@ impl ModelStorage {
 
         repos
             .into_iter()
-            .find(|t| t.name.as_ref() == Some(&name.to_string()))
+            .find(|t| t.name.as_ref() == Some(&name.to_owned()))
             .ok_or_else(|| anyhow::anyhow!("Model '{}' not found in registry", name))
     }
 
@@ -206,7 +206,7 @@ impl ModelStorage {
         // Resolve to branch name (avoiding unnecessary clones)
         let branch = match &model_ref.git_ref {
             GitRef::Branch(ref name) => name.as_str(),
-            GitRef::DefaultBranch | _ => {
+            _ => {
                 if !matches!(model_ref.git_ref, GitRef::DefaultBranch) {
                     tracing::warn!(
                         "Model reference specifies non-branch git ref {:?}, using default branch",
@@ -260,8 +260,8 @@ impl ModelStorage {
                             // Build metadata (size calculation removed for performance)
                             let metadata = ModelMetadata {
                                 name: name.clone(),
-                                display_name: Some(format!("{}:{}", name, branch_name)),
-                                model_type: "worktree".to_string(),
+                                display_name: Some(format!("{name}:{branch_name}")),
+                                model_type: "worktree".to_owned(),
                                 created_at: chrono::Utc::now().timestamp(),
                                 updated_at: chrono::Utc::now().timestamp(),
                                 size_bytes: None,  // Removed expensive directory size calculation
@@ -296,7 +296,7 @@ impl ModelStorage {
 
         repos
             .iter()
-            .any(|t| t.name.as_ref() == Some(&model_name.to_string()))
+            .any(|t| t.name.as_ref() == Some(&model_name.to_owned()))
     }
 
     /// Add a new model
@@ -390,9 +390,9 @@ impl ModelStorage {
 
         let ref_spec = match &model_ref.git_ref {
             GitRef::Branch(name) => name.clone(),
-            GitRef::Tag(name) => format!("refs/tags/{}", name),
+            GitRef::Tag(name) => format!("refs/tags/{name}"),
             GitRef::Commit(oid) => return Ok(*oid),
-            GitRef::DefaultBranch => "HEAD".to_string(),
+            GitRef::DefaultBranch => "HEAD".to_owned(),
             GitRef::Revspec(spec) => spec.clone(),
         };
 
@@ -452,7 +452,7 @@ impl ModelStorage {
         // Collect modified file paths
         let modified_files: Vec<PathBuf> = statuses
             .iter()
-            .filter_map(|entry| entry.path().map(|p| PathBuf::from(p)))
+            .filter_map(|entry| entry.path().map(PathBuf::from))
             .collect();
 
         Ok(git2db::RepositoryStatus {
@@ -478,14 +478,14 @@ impl ModelStorage {
         let repo_cache = GitManager::global().get_repository(&repo_path)?;
         let repo = repo_cache.open()?;
 
-        let previous_oid = repo.head().ok().and_then(|h| h.target()).unwrap_or(git2db::Oid::zero());
+        let previous_oid = repo.head().ok().and_then(|h| h.target()).unwrap_or_else(git2db::Oid::zero);
 
         // Convert GitRef to string for revparse
         let ref_spec = match &model_ref.git_ref {
             GitRef::Branch(name) => name.clone(),
-            GitRef::Tag(name) => format!("refs/tags/{}", name),
+            GitRef::Tag(name) => format!("refs/tags/{name}"),
             GitRef::Commit(oid) => oid.to_string(),
-            GitRef::DefaultBranch => "HEAD".to_string(),
+            GitRef::DefaultBranch => "HEAD".to_owned(),
             GitRef::Revspec(spec) => spec.clone(),
         };
 
@@ -499,7 +499,7 @@ impl ModelStorage {
             repo.set_head_detached(object.id())?;
         }
 
-        let new_oid = repo.head().ok().and_then(|h| h.target()).unwrap_or(git2db::Oid::zero());
+        let new_oid = repo.head().ok().and_then(|h| h.target()).unwrap_or_else(git2db::Oid::zero);
 
         Ok(super::CheckoutResult {
             previous_oid,

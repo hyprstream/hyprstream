@@ -13,7 +13,7 @@ pub async fn handle_remote_add(
 ) -> Result<()> {
     info!("Adding remote '{}' to model {}", name, model);
 
-    let model_ref = ModelRef::new(model.to_string());
+    let model_ref = ModelRef::new(model.to_owned());
     let repo_client = storage.get_repo_client(&model_ref).await?;
 
     repo_client
@@ -21,7 +21,7 @@ pub async fn handle_remote_add(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to add remote '{}': {}", name, e))?;
 
-    println!("Added remote '{}': {}", name, url);
+    println!("Added remote '{name}': {url}");
     Ok(())
 }
 
@@ -33,7 +33,7 @@ pub async fn handle_remote_list(
 ) -> Result<()> {
     info!("Listing remotes for model {}", model);
 
-    let model_ref = ModelRef::new(model.to_string());
+    let model_ref = ModelRef::new(model.to_owned());
     let repo_client = storage.get_repo_client(&model_ref).await?;
 
     let remotes = repo_client
@@ -42,13 +42,13 @@ pub async fn handle_remote_list(
         .map_err(|e| anyhow::anyhow!("Failed to list remotes: {}", e))?;
 
     if remotes.is_empty() {
-        println!("No remotes configured for {}", model);
+        println!("No remotes configured for {model}");
         println!("\nAdd a remote with:");
-        println!("  hyprstream remote add {} <name> <url>", model);
+        println!("  hyprstream remote add {model} <name> <url>");
         return Ok(());
     }
 
-    println!("Remotes for {}:\n", model);
+    println!("Remotes for {model}:\n");
     for remote in remotes {
         if verbose {
             println!("  {} (fetch): {}", remote.name, remote.url);
@@ -67,7 +67,7 @@ pub async fn handle_remote_list(
 pub async fn handle_remote_remove(storage: &ModelStorage, model: &str, name: &str) -> Result<()> {
     info!("Removing remote '{}' from model {}", name, model);
 
-    let model_ref = ModelRef::new(model.to_string());
+    let model_ref = ModelRef::new(model.to_owned());
     let repo_client = storage.get_repo_client(&model_ref).await?;
 
     repo_client
@@ -75,7 +75,7 @@ pub async fn handle_remote_remove(storage: &ModelStorage, model: &str, name: &st
         .await
         .map_err(|e| anyhow::anyhow!("Failed to remove remote '{}': {}", name, e))?;
 
-    println!("Removed remote '{}'", name);
+    println!("Removed remote '{name}'");
     Ok(())
 }
 
@@ -88,7 +88,7 @@ pub async fn handle_remote_set_url(
 ) -> Result<()> {
     info!("Setting URL for remote '{}' in model {}", name, model);
 
-    let model_ref = ModelRef::new(model.to_string());
+    let model_ref = ModelRef::new(model.to_owned());
     let repo_client = storage.get_repo_client(&model_ref).await?;
 
     repo_client
@@ -96,7 +96,7 @@ pub async fn handle_remote_set_url(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to set URL for remote '{}': {}", name, e))?;
 
-    println!("Updated remote '{}': {}", name, url);
+    println!("Updated remote '{name}': {url}");
     Ok(())
 }
 
@@ -112,7 +112,7 @@ pub async fn handle_remote_rename(
         old_name, new_name, model
     );
 
-    let model_ref = ModelRef::new(model.to_string());
+    let model_ref = ModelRef::new(model.to_owned());
     let repo_client = storage.get_repo_client(&model_ref).await?;
 
     repo_client
@@ -127,6 +127,6 @@ pub async fn handle_remote_rename(
             )
         })?;
 
-    println!("Renamed remote '{}' to '{}'", old_name, new_name);
+    println!("Renamed remote '{old_name}' to '{new_name}'");
     Ok(())
 }

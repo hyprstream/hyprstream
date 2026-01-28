@@ -145,12 +145,12 @@ impl XetStorage {
                 config.compression,
                 config.token.as_ref().map(|t| (t.clone(), u64::MAX)),
                 None,
-                "hyprstream".to_string(),
+                "hyprstream".to_owned(),
             )
             .map_err(|e| {
                 XetError::new(
                     XetErrorKind::RuntimeError,
-                    format!("Failed to create XET config: {}", e),
+                    format!("Failed to create XET config: {e}"),
                 )
             })?,
         );
@@ -160,14 +160,14 @@ impl XetStorage {
             .map_err(|e| {
                 XetError::new(
                     XetErrorKind::UploadFailed,
-                    format!("Failed to create upload session: {}", e),
+                    format!("Failed to create upload session: {e}"),
                 )
             })?;
 
         let downloader = FileDownloader::new(translator_config).await.map_err(|e| {
             XetError::new(
                 XetErrorKind::DownloadFailed,
-                format!("Failed to create downloader: {}", e),
+                format!("Failed to create downloader: {e}"),
             )
         })?;
 
@@ -190,14 +190,14 @@ impl XetStorage {
         .map_err(|e| {
             XetError::new(
                 XetErrorKind::UploadFailed,
-                format!("Clean bytes failed: {}", e),
+                format!("Clean bytes failed: {e}"),
             )
         })?;
 
         xet_info.as_pointer_file().map_err(|e| {
             XetError::new(
                 XetErrorKind::InvalidPointer,
-                format!("Failed to serialize pointer: {}", e),
+                format!("Failed to serialize pointer: {e}"),
             )
         })
     }
@@ -210,14 +210,14 @@ impl XetStorage {
         let xet_info: XetFileInfo = serde_json::from_str(pointer).map_err(|e| {
             XetError::new(
                 XetErrorKind::InvalidPointer,
-                format!("Invalid pointer JSON: {}", e),
+                format!("Invalid pointer JSON: {e}"),
             )
         })?;
 
         let merkle_hash = xet_info.merkle_hash().map_err(|e| {
             XetError::new(
                 XetErrorKind::InvalidPointer,
-                format!("Invalid merkle hash: {}", e),
+                format!("Invalid merkle hash: {e}"),
             )
         })?;
 
@@ -234,7 +234,7 @@ impl XetStorage {
             .map_err(|e| {
                 XetError::new(
                     XetErrorKind::DownloadFailed,
-                    format!("Smudge to file failed: {}", e),
+                    format!("Smudge to file failed: {e}"),
                 )
             })?;
 
@@ -248,14 +248,14 @@ impl XetStorage {
         let xet_info: XetFileInfo = serde_json::from_str(pointer).map_err(|e| {
             XetError::new(
                 XetErrorKind::InvalidPointer,
-                format!("Invalid pointer JSON: {}", e),
+                format!("Invalid pointer JSON: {e}"),
             )
         })?;
 
         let merkle_hash = xet_info.merkle_hash().map_err(|e| {
             XetError::new(
                 XetErrorKind::InvalidPointer,
-                format!("Invalid merkle hash: {}", e),
+                format!("Invalid merkle hash: {e}"),
             )
         })?;
 
@@ -263,7 +263,7 @@ impl XetStorage {
         let temp_file = tempfile::NamedTempFile::new().map_err(|e| {
             XetError::new(
                 XetErrorKind::IoError,
-                format!("Failed to create temp file: {}", e),
+                format!("Failed to create temp file: {e}"),
             )
         })?;
 
@@ -280,7 +280,7 @@ impl XetStorage {
             .map_err(|e| {
                 XetError::new(
                     XetErrorKind::DownloadFailed,
-                    format!("Smudge to bytes failed: {}", e),
+                    format!("Smudge to bytes failed: {e}"),
                 )
             })?;
 
@@ -288,7 +288,7 @@ impl XetStorage {
         tokio::fs::read(temp_file.path()).await.map_err(|e| {
             XetError::new(
                 XetErrorKind::IoError,
-                format!("Failed to read smudged file: {}", e),
+                format!("Failed to read smudged file: {e}"),
             )
         })
     }
@@ -302,7 +302,7 @@ impl XetStorage {
         let temp_file = tempfile::NamedTempFile::new().map_err(|e| {
             XetError::new(
                 XetErrorKind::IoError,
-                format!("Failed to create temp file: {}", e),
+                format!("Failed to create temp file: {e}"),
             )
         })?;
 
@@ -319,7 +319,7 @@ impl XetStorage {
             .map_err(|e| {
                 XetError::new(
                     XetErrorKind::DownloadFailed,
-                    format!("Smudge from hash failed: {}", e),
+                    format!("Smudge from hash failed: {e}"),
                 )
             })?;
 
@@ -327,7 +327,7 @@ impl XetStorage {
         tokio::fs::read(temp_file.path()).await.map_err(|e| {
             XetError::new(
                 XetErrorKind::IoError,
-                format!("Failed to read smudged file: {}", e),
+                format!("Failed to read smudged file: {e}"),
             )
         })
     }
@@ -354,7 +354,7 @@ impl XetStorage {
             .map_err(|e| {
                 XetError::new(
                     XetErrorKind::DownloadFailed,
-                    format!("Smudge from hash to file failed: {}", e),
+                    format!("Smudge from hash to file failed: {e}"),
                 )
             })?;
 
@@ -369,13 +369,13 @@ impl StorageBackend for XetStorage {
         let (xet_info, _metrics) = data::data_client::clean_file(self.upload_session.clone(), path, "")
             .await
             .map_err(|e| {
-                XetError::new(XetErrorKind::UploadFailed, format!("Clean failed: {}", e))
+                XetError::new(XetErrorKind::UploadFailed, format!("Clean failed: {e}"))
             })?;
 
         xet_info.as_pointer_file().map_err(|e| {
             XetError::new(
                 XetErrorKind::InvalidPointer,
-                format!("Failed to serialize pointer: {}", e),
+                format!("Failed to serialize pointer: {e}"),
             )
         })
     }

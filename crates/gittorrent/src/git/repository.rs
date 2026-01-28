@@ -45,7 +45,7 @@ impl Repository {
             if let Some(name) = reference.name() {
                 if let Some(target) = reference.target() {
                     refs.push(crate::types::GitRef {
-                        name: name.to_string(),
+                        name: name.to_owned(),
                         hash: GitHash::from_hex(&target.to_string())?,
                     });
                 }
@@ -130,7 +130,7 @@ impl Repository {
             parent_sha256s: commit.parent_ids()
                 .map(|oid| Sha256Hash::new(oid.to_string()))
                 .collect::<Result<Vec<_>>>()?,
-            message: commit.message().unwrap_or("").to_string(),
+            message: commit.message().unwrap_or("").to_owned(),
         })
     }
 }

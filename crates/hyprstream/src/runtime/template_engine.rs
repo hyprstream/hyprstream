@@ -148,8 +148,7 @@ impl TemplateEngine {
 
 {% elif message['role'] == 'assistant' %}### Assistant: {{ message['content'] }}
 
-{% endif %}{% endfor %}{% if add_generation_prompt %}### Assistant: {% endif %}"#
-                    .to_string()
+{% endif %}{% endfor %}{% if add_generation_prompt %}### Assistant: {% endif %}"#.to_owned()
             }
             "qwen" | "qwen2" => {
                 // Qwen2-style template with special tokens
@@ -166,16 +165,14 @@ impl TemplateEngine {
 {% endif %}
 {% endfor %}
 {% if add_generation_prompt %}<|im_start|>assistant
-{% endif %}"#
-                    .to_string()
+{% endif %}"#.to_owned()
             }
             "mistral" | "mixtral" => {
                 // Mistral/Mixtral template
                 r#"{% for message in messages %}
 {% if message['role'] == 'user' %}[INST] {{ message['content'] }} [/INST]
 {% elif message['role'] == 'assistant' %}{{ message['content'] }}</s>
-{% endif %}{% endfor %}"#
-                    .to_string()
+{% endif %}{% endfor %}"#.to_owned()
             }
             "gemma" | "gemma2" => {
                 // Gemma-style template
@@ -186,8 +183,7 @@ impl TemplateEngine {
 {{ message['content'] }}<end_of_turn>
 {% endif %}{% endfor %}
 {% if add_generation_prompt %}<start_of_turn>model
-{% endif %}"#
-                    .to_string()
+{% endif %}"#.to_owned()
             }
             "chatml" | "chatgpt" => {
                 // ChatML format (GPT-style)
@@ -196,8 +192,7 @@ impl TemplateEngine {
 {{ message['content'] }}<|im_end|>
 {% endfor %}
 {% if add_generation_prompt %}<|im_start|>assistant
-{% endif %}"#
-                    .to_string()
+{% endif %}"#.to_owned()
             }
             "janus" | "janus-1.3b" | "janus-pro" => {
                 // DeepSeek/Janus format - simple User:/Assistant: format
@@ -205,16 +200,14 @@ impl TemplateEngine {
 {% if message['role'] == 'user' %}User: {{ message['content'] }}
 {% elif message['role'] == 'assistant' %}Assistant: {{ message['content'] }}
 {% endif %}{% endfor %}
-{% if add_generation_prompt %}Assistant: {% endif %}"#
-                    .to_string()
+{% if add_generation_prompt %}Assistant: {% endif %}"#.to_owned()
             }
             _ => {
                 // Default simple template
                 r#"{% for message in messages %}
 {{ message['role'] }}: {{ message['content'] }}
 {% endfor %}
-{% if add_generation_prompt %}assistant: {% endif %}"#
-                    .to_string()
+{% if add_generation_prompt %}assistant: {% endif %}"#.to_owned()
             }
         }
     }
@@ -225,7 +218,7 @@ impl TemplateEngine {
 
         // Extract chat template
         if let Some(template) = config_json.get("chat_template").and_then(|v| v.as_str()) {
-            template_config.chat_template = Some(template.to_string());
+            template_config.chat_template = Some(template.to_owned());
         }
 
         // Extract special tokens
@@ -262,7 +255,7 @@ impl TemplateEngine {
         // Check for add_generation_prompt setting
         if let Some(add_gen) = config_json
             .get("add_generation_prompt")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
         {
             template_config.add_generation_prompt = add_gen;
         }
@@ -271,12 +264,12 @@ impl TemplateEngine {
         if let Some(ref bos) = template_config.bos_token {
             template_config
                 .special_tokens
-                .insert("bos_token".to_string(), bos.clone());
+                .insert("bos_token".to_owned(), bos.clone());
         }
         if let Some(ref eos) = template_config.eos_token {
             template_config
                 .special_tokens
-                .insert("eos_token".to_string(), eos.clone());
+                .insert("eos_token".to_owned(), eos.clone());
         }
 
         Ok(template_config)
@@ -286,11 +279,11 @@ impl TemplateEngine {
 /// Extract token value from JSON (handles both string and object formats)
 fn extract_token_value(value: &serde_json::Value) -> Option<String> {
     if let Some(s) = value.as_str() {
-        Some(s.to_string())
+        Some(s.to_owned())
     } else if let Some(obj) = value.as_object() {
         obj.get("content")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+            .map(std::borrow::ToOwned::to_owned)
     } else {
         None
     }
@@ -314,7 +307,7 @@ fn tojson_filter(value: &Value) -> Result<Value, minijinja::Error> {
     let json_str = serde_json::to_string(&value).map_err(|e| {
         minijinja::Error::new(
             minijinja::ErrorKind::InvalidOperation,
-            format!("Failed to serialize to JSON: {}", e),
+            format!("Failed to serialize to JSON: {e}"),
         )
     })?;
     Ok(Value::from(json_str))
@@ -341,16 +334,15 @@ mod tests {
                 r#"{% for message in messages %}{{'<|im_start|>' + message['role'] + '
 ' + message['content'] + '<|im_end|>' + '
 '}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant
-' }}{% endif %}"#
-                    .to_string(),
+' }}{% endif %}"#.to_owned(),
             ),
             ..Default::default()
         };
 
         let engine = TemplateEngine::new(config).expect("test: create template engine");
         let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: "Hello".to_string(),
+            role: "user".to_owned(),
+            content: "Hello".to_owned(),
         }];
 
         let result = engine.apply_chat_template(&messages, Some(true)).expect("test: apply template");
@@ -376,8 +368,7 @@ mod tests {
 {% if message['role'].startswith('sys') %}System: {{ message['content'] }}
 {% elif message['role'].endswith('er') %}User: {{ message['content'] }}
 {% elif message['role'].startswith('assist') %}Assistant: {{ message['content'] }}
-{% endif %}{% endfor %}{% if add_generation_prompt %}Assistant: {% endif %}"#
-                    .to_string(),
+{% endif %}{% endfor %}{% if add_generation_prompt %}Assistant: {% endif %}"#.to_owned(),
             ),
             ..Default::default()
         };
@@ -385,16 +376,16 @@ mod tests {
         let engine = TemplateEngine::new(config).expect("test: create template engine");
         let messages = vec![
             ChatMessage {
-                role: "system".to_string(),
-                content: "You are a helpful assistant.".to_string(),
+                role: "system".to_owned(),
+                content: "You are a helpful assistant.".to_owned(),
             },
             ChatMessage {
-                role: "user".to_string(),
-                content: "Hello!".to_string(),
+                role: "user".to_owned(),
+                content: "Hello!".to_owned(),
             },
             ChatMessage {
-                role: "assistant".to_string(),
-                content: "Hi there!".to_string(),
+                role: "assistant".to_owned(),
+                content: "Hi there!".to_owned(),
             },
         ];
 
@@ -420,8 +411,7 @@ mod tests {
 {% elif message['role'].endswith('ant') %}
 [ASSISTANT] {{ message['content'] }}
 {% endif %}
-{% endfor %}"#
-                    .to_string(),
+{% endfor %}"#.to_owned(),
             ),
             ..Default::default()
         };
@@ -429,16 +419,16 @@ mod tests {
         let engine = TemplateEngine::new(config).expect("test: create template engine");
         let messages = vec![
             ChatMessage {
-                role: "system".to_string(),
-                content: "Configure the model".to_string(),
+                role: "system".to_owned(),
+                content: "Configure the model".to_owned(),
             },
             ChatMessage {
-                role: "user".to_string(),
-                content: "What's 2+2?".to_string(),
+                role: "user".to_owned(),
+                content: "What's 2+2?".to_owned(),
             },
             ChatMessage {
-                role: "assistant".to_string(),
-                content: "4".to_string(),
+                role: "assistant".to_owned(),
+                content: "4".to_owned(),
             },
         ];
 
@@ -455,8 +445,7 @@ mod tests {
             chat_template: Some(
                 r#"{% for message in messages %}
 {{ message['content'].strip() }}
-{% endfor %}"#
-                    .to_string(),
+{% endfor %}"#.to_owned(),
             ),
             ..Default::default()
         };
@@ -464,8 +453,8 @@ mod tests {
         let engine = TemplateEngine::new(config).expect("test: create template engine");
         let messages = vec![
             ChatMessage {
-                role: "user".to_string(),
-                content: "  Hello World  ".to_string(),
+                role: "user".to_owned(),
+                content: "  Hello World  ".to_owned(),
             },
         ];
 

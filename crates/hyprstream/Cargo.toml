@@ -1,8 +1,8 @@
 [package]
 name = "hyprstream"
-version = "0.1.0-alpha-7"
+version = "0.2.0"
 edition.workspace = true
-description = "Real-time adaptive ML inference server"
+description = "Agentic Infrastructure"
 documentation = "https://docs.rs/hyprstream"
 readme = "README.md"
 license.workspace = true
@@ -157,3 +157,6 @@ capnpc.workspace = true  # Cap'n Proto schema compiler
 criterion.workspace = true
 tempfile.workspace = true
 tokio-stream.workspace = true
+
+[lints]
+workspace = true

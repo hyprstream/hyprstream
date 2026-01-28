@@ -150,7 +150,7 @@ impl WorkflowZmq {
     /// Create a new WorkflowZmq client
     pub fn new(endpoint: &str) -> Self {
         Self {
-            _endpoint: endpoint.to_string(),
+            _endpoint: endpoint.to_owned(),
         }
     }
 }

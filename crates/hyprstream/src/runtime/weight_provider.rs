@@ -46,7 +46,7 @@ impl WeightProvider for MemoryWeightProvider {
         let weights = self.weights.lock();
         weights
             .get(name)
-            .map(|t| t.shallow_clone())
+            .map(tch::Tensor::shallow_clone)
             .ok_or_else(|| anyhow!("Tensor {} not found", name))
     }
 
@@ -290,7 +290,7 @@ impl WeightProvider for StreamingWeightProvider {
         let current_weights = self.current_weights.blocking_read();
         current_weights
             .get(name)
-            .map(|t| t.shallow_clone())
+            .map(tch::Tensor::shallow_clone)
             .ok_or_else(|| anyhow!("Tensor {} not found after loading shard", name))
     }
 

@@ -1,4 +1,4 @@
-# HyprStream: LLM Inference Engine with Git-based Model Management
+# HyprStream: agentic infrastructure for continously learning applications
 
 [![Rust](https://github.com/hyprstream/hyprstream/actions/workflows/rust.yml/badge.svg)](https://github.com/hyprstream/hyprstream/actions/workflows/rust.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE-AGPLV3)
@@ -6,215 +6,65 @@
 
 ## Overview
 
-HyprStream is a LLM inference and training engine built in Rust with PyTorch, featuring integrated training capabilities and Git-based model version control. It provides a unified platform for model inference, fine-tuning through LoRA adapters, and comprehensive model lifecycle management.
+HyprStream is an agentic cloud infrastructure for applications that learn, build, and run. Integrating continous development, training, integration, and deployment of software and AI/ML models. Primary features include an LLM inference and training engine built in Rust, with PyTorch, featuring integrated training capabilities, version control, and secure tool use with microvm containers.
+
+Users may communicate with open weight and custom LLMs via Hyprstream with an OpenAI API.
+
+Easy to get started, just down [Download](https://github.com/hyprstream/hyprstream/releases/tag/v0.2.0) and it auto-detects your NVIDIA or ROCm GPU.
 
 ### Core Features
 
 - **Inference API**: Providing compatibility with OpenAI's OpenAPI specification.
-- **Management API**: Providing management APIs (WIP)
-- **High-Performance Inference**: PyTorch-based engine with KV caching and optimized memory management
-- **Hardware Acceleration**: CPU (default), NVIDIA GPU (CUDA), and AMD GPU (ROCm) support
-- **LoRA Training & Adaptation**: Create, train, and deploy LoRA adapters for model customization
-- **Git-based Model Management**: Version control for models using native Git repositories
-- **Hugging Face Compatible**: Direct cloning and usage of models from Hugging Face Hub
-- **Efficient Storage**: XET integration for lazy loading and deduplication of large model files
-- **Multi-Model Support**: Qwen models (Qwen1/2/3 dense architectures), MoE support coming soon
-- **Training Checkpoints**: Automatic checkpoint management with Git integration
+- **LLM Inference & Training**: Supporting the dense Qwen3 model architecture.
+- **Optional Hardware Acceleration**: Auto-detects your optional NVIDIA or AMD GPU, and packages the appropriate Torch dependencies.
+- **Version Controlled**: Manages source and weights with Git, compatible with HuggingFace.
+- **Systemd Integration** - Optional user-level service management for background workers, long-running services, and containers.
 - **Production Ready**: Built on stable PyTorch C++ API (libtorch) for reliability
+
+### Experimental Features
+
+- **[Workers](docs/workers-architecture.md)** - Isolated workload execution using Kata microvms with cloud-hypervisor.
+- **[Workflows]** - Git workflow file support for local continous integration, deployment, and functions-as-a-service.
 
 ## Installation
 
-### Prerequisites
+### Quick Install (AppImage)
 
-- **Operating System**: Linux (x86_64, ARM64)
-  - Windows users: Use WSL2 (Windows Subsystem for Linux)
-  - macOS: Not currently supported
-- Rust 1.75+
-- Git 2.0+
-- libtorch (PyTorch C++ library)
-- **Hardware Support:**
-  - **CPU**: Full support (x86_64, ARM64)
-  - **CUDA**: NVIDIA GPU support
-  - **ROCm**: AMD GPU support (gfx90a, gfx1100+)
-- 8GB+ RAM for inference, 16GB+ for training
-
-### PyTorch Backend Selection
-
-Hyprstream uses feature flags to select the PyTorch backend:
-
-- **`tch-cpu`** (default): CPU-only inference
-- **`tch-cuda`**: NVIDIA GPU acceleration via CUDA
-- **`tch-rocm`**: AMD GPU acceleration via ROCm/HIP
-
-### Run with Docker:
-
-0. Set the tag
-
-```
-export TAG=latest-cuda-129 # or latest-rocm-6.4, latest-cpu, etc.
-```
-
-1. Setup policies:
-
-```
-# WARNING: this allows all local systems users administrative access to hyprstream.
-$ sudo docker run --rm -it -v hyprstream-models:/root/.local/share/hyprstream hyprstreamv-rocm policy apply-template local
-```
-
-2. Pull model(s):
-
-```
-$ sudo docker run --rm -it -v hyprstream-models:/root/.local/share/hyprstream hyprstream:$TAG clone https://huggingface.co/qwen/qwen3-0.6b
-```
-
-3. Test inference and GPU initialization
-
-```
-$ sudo docker run --rm -it -v hyprstream-models:/root/.local/share/hyprstream hyprstream:$TAG infer --prompt "hello world" qwen3-0.6b:main
-```
-
-
-4. Deploy openai compatible server:
-
-```
-$ sudo docker run --rm -it -v hyprstream-models:/root/.local/share/hyprstream --device=/dev/kfd --device=/dev/dri hyprstream:$TAG server
-```
-
-### Building Docker images
-
-#### ROCm:
-
-$ docker build -t hyprstreamv-rocm --build-arg variant=rocm .
-
-#### Nvidia:
-
-$ docker build -t hyprstreamv-cuda --build-arg variant=cuda .
-
-#### CPU:
-
-$ docker build -t hyprstreamv-cpu .
-
-### Building from Source
-
-#### 1. Clone Repository
+Download the Universal AppImage from the [v0.2.0 release](https://github.com/hyprstream/hyprstream/releases/tag/v0.2.0). We have published AppImages for each supported CPU and GPU configuration. 
 
 ```bash
-git clone https://github.com/hyprstream/hyprstream.git
-cd hyprstream
+# Download and install (Universal recommended)
+chmod +x hyprstream-v0.2.0-x86_64.AppImage
+./hyprstream-v0.2.0-x86_64.AppImage service install
+
+# Apply policy template - hyprstream is deny by default, the following treats local users as admins:
+hyprstream apply-template local
 ```
 
-#### 2. Install libtorch
+The installed files will be located in `$HOME/.local/hyprstream/` and `$HOME/.local/bin/`.
 
-You have three options for obtaining libtorch:
+### Expert installation: Linux Container Engines
 
-**Option A: Automatic Download (Recommended)**
+Hyprstream is able to run and manage secure containers independently, and can run inside of containers. _A container engine is optional with Hyprstream_, but may be useful for deployment to Enterprise systems based on Docker or Kubernetes.
+
+See [README-Docker.md](README-Docker.md) for more information on running in containers.
+
+#### Building from source
+
 ```bash
-# tch-rs will automatically download libtorch during build
-# CPU version is downloaded by default
+# Set LIBTORCH= to your libtorch libraries, or set `--feature download-libtorch`
 cargo build --release
 ```
 
-**Option B: Download from PyTorch**
-```bash
-# CUDA 12.9 version
-wget https://download.pytorch.org/libtorch/cu129/libtorch-cxx11-abi-shared-with-deps-2.8.0%2Bcu129.zip
-unzip libtorch-cxx11-abi-shared-with-deps-2.8.0+cu129.zip
-
-# CUDA 13.0 Nightly
-wget https://download.pytorch.org/libtorch/nightly/cu130/libtorch-shared-with-deps-latest.zip
-unzip libtorch-shared-with-deps-latest.zip
-
-# ROCm 6.4
-wget https://download.pytorch.org/libtorch/rocm6.4/libtorch-shared-with-deps-2.8.0%2Brocm6.4.zip
-unzip libtorch-shared-with-deps-2.8.0%2Brocm6.4.zip
-```
-
-**Option C: Use Existing PyTorch Installation**
-```bash
-# If you have PyTorch installed via pip/conda
-export LIBTORCH_USE_PYTORCH=1
-```
-
-#### 3. Set Environment Variables
-
-Configure libtorch location:
-
-```bash
-# Option 1: Set LIBTORCH to the directory containing 'lib' and 'include'
-export LIBTORCH=/path/to/libtorch
-
-# Option 2: Set individual paths
-export LIBTORCH_INCLUDE=/path/to/libtorch
-export LIBTORCH_LIB=/path/to/libtorch
-
-# Option 3: Use system-wide installation
-# libtorch installed at /usr/lib/libtorch.so is detected automatically
-
-# Add to library path
-export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
-```
-
-#### 4. Build with Backend Selection
-
-**CPU Backend (Default)**
-```bash
-# Automatic download
-cargo build --release
-
-# Or with manual libtorch
-export LIBTORCH=/path/to/libtorch-cpu
-export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
-cargo build --release
-```
-
-**CUDA Backend**
-```bash
-# Set CUDA version for automatic download
-export TORCH_CUDA_VERSION=cu118  # or cu121, cu124
-cargo build --release
-```
-
-**ROCm Backend (AMD GPUs)**
-```bash
-# Set environment variables
-export ROCM_PATH=/opt/rocm
-export LIBTORCH=/path/to/libtorch-rocm
-export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
-export PYTORCH_ROCM_ARCH=gfx90a  # or gfx1100, gfx1101, etc.
-
-# Build with ROCm feature
-cargo build --release
-```
-
-#### 5. Run
-
-```bash
-# The binary will be at ./target/release/hyprstream
-./target/release/hyprstream --help
-```
-
-### Additional Build Options
-
-**Static Linking**
-```bash
-export LIBTORCH_STATIC=1
-cargo build --release
-```
-
-**Combining Features**
-```bash
-# CUDA + OpenTelemetry
-cargo build --release --no-default-features --features tch-cuda,otel
-
-# ROCm + XET support
-cargo build --release --no-default-features --features tch-rocm,xet
-```
+See [DEVELOP.md](DEVELOP.md) for more information on building from source.
 
 ## Quick Start
 
-### Model Management
+### Clone a model
 
-#### Downloading Models
+Hyprstream supports Qwen3 model inference from Git repositories.
+
+Users may also manage standard source code repositories and datasets.
 
 ```bash
 # Clone a model from Git repository (HuggingFace, GitHub, etc.)
@@ -222,20 +72,17 @@ hyprstream clone https://huggingface.co/Qwen/Qwen3-0.6B
 
 # Clone with a custom name
 hyprstream clone https://huggingface.co/Qwen/Qwen3-0.6B --name qwen3-small
-
-# Clone from any Git repository (supports all Git transports including gittorrent://)
-hyprstream clone https://github.com/user/custom-model.git --name my-custom-model
 ```
 
-#### Managing Models
+### Managing Repositories
+
+Worktrees are automatically managed by hyprstream, allowing efficient operations on multiple branches.
 
 ```bash
 # List all cached models (shows names and UUIDs)
 hyprstream list
 
-# Get detailed model information using ModelRef syntax
-# Note that git-ref branch and tag management is a work in progress.
-# Simple 'by name' models are verified.
+# Get detailed model information using Model:Ref syntax
 hyprstream inspect qwen3-small           # By name
 hyprstream inspect qwen3-small:main      # Specific branch
 hyprstream inspect qwen3-small:v1.0      # Specific tag
@@ -249,7 +96,7 @@ hyprstream pull qwen3-small main      # Update specific branch
 hyprstream push qwen3-small origin main
 ```
 
-### Running Inference
+### Run Inference
 
 ```bash
 # Basic inference using ModelRef syntax
@@ -270,37 +117,9 @@ hyprstream infer qwen3-small:main \
 
 ## Architecture
 
-### System Components
+![Architecture](architecture.png)
 
-```mermaid
-graph TD
-    CLI[CLI Interface] --> Engine[TorchEngine]
-    Engine --> Models[Model Management]
-    Engine --> Training[Training System]
-
-    Models --> Git[Git Repository]
-    Git --> Adapters[adapters/ Directory]
-    Git --> Worktrees[Training Worktrees]
-
-    Training --> Checkpoint[Checkpoint Manager]
-    Checkpoint --> GitCommit[Git Commits]
-
-    Engine --> Inference[Inference Pipeline]
-    Inference --> KVCache[KV Cache]
-    Inference --> Sampling[Sampling]
-```
-
-## Supported Models
-
-| Architecture | Status | Models |
-|-------------|--------|--------|
-| Qwen Dense | ✅ Full Support | Qwen1, Qwen2, Qwen2.5, Qwen3 |
-| Qwen MoE | 🚧 Coming Soon | Qwen2-MoE, Qwen2.5-MoE |
-| Llama | 🚧 Planned | Llama2, Llama3 |
-| Gemma | 🚧 Planned | Gemma 2B, 7B |
-| Mistral | 🚧 Planned | Mistral 7B |
-
-## API Usage
+## Integrating Hyprstream into your business or workflow
 
 ### OpenAI-Compatible REST API
 
@@ -371,7 +190,7 @@ HyprStream uses Git worktrees for model management. The `/v1/models` endpoint li
 
 This allows you to work with multiple versions of the same model simultaneously, each in its own worktree with isolated changes.
 
-### Environment Configuration
+### Advanced deployments
 
 HyprStream can be configured via environment variables with the `HYPRSTREAM_` prefix:
 
@@ -406,6 +225,7 @@ Hyprstream implements layered security-in-depth:
 | **Transport** | CURVE encryption (TCP) | End-to-end encryption for TCP connections |
 | **Application** | Ed25519 signed envelopes | Request authentication and integrity |
 | **Authorization** | Casbin policy engine | RBAC/ABAC access control |
+| **Isolation** | Kata Containers (optional) | VM-level workload isolation for workers |
 
 ### RPC Architecture
 
@@ -455,6 +275,27 @@ hyprstream policy apply-template local
 - `local` - Full access for local users (default)
 - `public-inference` - Anonymous inference access
 - `public-read` - Anonymous read-only registry access
+
+**Worker Resources** (experimental):
+| Resource | Description |
+|----------|-------------|
+| `sandbox:*`, `sandbox:{id}` | Pod sandbox (Kata VM) operations |
+| `container:*`, `container:{id}` | Container lifecycle within sandboxes |
+| `image:*`, `image:{name}` | Image pull/push/list operations |
+| `workflow:*`, `workflow:{path}` | Workflow execution (.github/workflows/*.yml) |
+| `tool:*`, `tool:{name}` | MCP tool access (tool:bash, tool:read_file) |
+
+**Policy History & Rollback:**
+```bash
+# View policy commit history
+hyprstream policy history
+
+# Compare draft vs running policy
+hyprstream policy diff
+
+# Rollback to previous version
+hyprstream policy rollback HEAD~1
+```
 
 **REST API Authentication:**
 ```bash
@@ -520,6 +361,38 @@ hyprstream server --port 8080
 - **OTLP**: Used automatically when running `server` command; sends traces to backends like Jaeger, Tempo, or Datadog
 - **Stdout**: Used for CLI commands; prints spans to console for debugging
 
+### Debugging GPU detection issues:
+
+If the Universal AppImage is not detecting your GPU, you may override the settings:
+
+```bash
+# List all available backends
+./hyprstream-v0.2.0-x86_64.AppImage --list-backends
+
+# Detect available backends
+./hyprstream-v0.2.0-x86_64.AppImage --detect-gpu
+
+# Override backend selection for Universal AppImage:
+HYPRSTREAM_BACKEND=cuda130 ./hyprstream-v0.2.0-x86_64.AppImage server
+```
+
+### System Requirements
+
+- **Operating System**:
+  - Linux: x86_64, ARM64
+  - Windows: Supporting wsl2.
+  - macOS: Not currently supported
+- **Inference Service Requirements (optional):**
+  - **CPU**: Full support (x86_64, ARM64)
+  - **CUDA**: NVIDIA host kernel modules (`nvidia-smi` works)
+  - **ROCm**: AMDGPU kernel modules and userland (`rocm-smi` works)
+- **Workers Service Requirements (optional, experimental):** 
+  - **Nested Virtualization**: The host system running hyprstream-workers must support and have enabled nested virtualization, this may require a physical machine, bare-metal VM, or proper configuration in your QEMU/KVM settings.
+- 8GB+ RAM for inference, 16GB+ for training
+- **Optional Dependencies:**
+  - `systemd` - For service management and worker process isolation
+  - `cloud-hypervisor` - For Kata container workers (experimental)
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
@@ -528,7 +401,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 This project uses a dual-licensing model:
 
-**AGPL-3.0** - The main application and crates providing APIs:
+**AGPL-3.0** - The end-user experience and crates providing public APIs:
 - `hyprstream` (main application)
 - `hyprstream-metrics`
 - `hyprstream-flight`
@@ -553,3 +426,6 @@ Built with:
 - [SafeTensors](https://github.com/huggingface/safetensors) - Efficient tensor serialization
 - [Git2](https://github.com/rust-lang/git2-rs) - Git operations in Rust
 - [Tokio](https://tokio.rs/) - Async runtime
+- [Casbin](https://casbin.org/) - Authorization library for policy engine
+- [Kata Containers](https://katacontainers.io/) - VM-based container isolation (experimental)
+- [cloud-hypervisor](https://www.cloudhypervisor.org/) - Virtual machine monitor (experimental)

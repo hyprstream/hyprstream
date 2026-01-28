@@ -8,9 +8,10 @@ use git2::cert::Cert;
 use std::sync::Arc;
 
 /// Progress reporting configuration
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum ProgressConfig {
     /// No progress reporting
+    #[default]
     None,
     /// Simple progress to stdout
     Stdout,
@@ -34,11 +35,12 @@ pub trait ProgressReporter: Send + Sync {
 }
 
 /// Certificate validation configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum CertificateConfig {
     /// Accept all certificates (insecure, for testing)
     AcceptAll,
     /// Default system validation
+    #[default]
     SystemDefault,
     /// Custom validation with pinned certificates
     Pinned(Vec<CertificatePinning>),
@@ -205,7 +207,7 @@ impl CallbackConfig {
 
     fn handle_certificate(
         config: &CertificateConfig,
-        cert: &Cert,
+        cert: &Cert<'_>,
     ) -> Result<git2::CertificateCheckStatus, git2::Error> {
         use git2::CertificateCheckStatus;
 
@@ -234,13 +236,13 @@ impl CallbackConfig {
         }
     }
 
-    fn handle_progress(config: &ProgressConfig, stats: git2::Progress) {
+    fn handle_progress(config: &ProgressConfig, stats: git2::Progress<'_>) {
         match config {
             ProgressConfig::None => {}
             ProgressConfig::Stdout => {
                 let current = stats.received_objects();
                 let total = stats.total_objects();
-                println!("Progress: {}/{} objects", current, total);
+                println!("Progress: {current}/{total} objects");
             }
             ProgressConfig::Channel(reporter) => {
                 let current = stats.received_objects();
@@ -251,17 +253,6 @@ impl CallbackConfig {
     }
 }
 
-impl Default for ProgressConfig {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
-impl Default for CertificateConfig {
-    fn default() -> Self {
-        Self::SystemDefault
-    }
-}
 
 /// Builder for callback configuration
 pub struct CallbackConfigBuilder {
@@ -332,7 +323,7 @@ mod tests {
     fn test_builder_pattern() {
         let config = CallbackConfigBuilder::new()
             .auth(AuthStrategy::SshAgent {
-                username: Some("git".to_string()),
+                username: Some("git".to_owned()),
             })
             .progress(ProgressConfig::Stdout)
             .certificates(CertificateConfig::AcceptAll)

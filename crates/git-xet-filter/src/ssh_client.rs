@@ -90,7 +90,7 @@ impl SshConfig {
         let (user, host_port) = match user_host.find('@') {
             Some(idx) => (&user_host[..idx], &user_host[idx + 1..]),
             None => {
-                let current_user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+                let current_user = std::env::var("USER").unwrap_or_else(|_| "root".to_owned());
                 (current_user.as_str(), user_host)
             }
         };
@@ -529,7 +529,7 @@ mod tests {
         assert_eq!(config.user, "user");
         assert_eq!(config.host, "host");
         assert_eq!(config.port, 2222);
-        assert_eq!(config.storage_path, Some("path/to/storage".to_string()));
+        assert_eq!(config.storage_path, Some("path/to/storage".to_owned()));
 
         // Without port
         let config = SshConfig::from_url("ssh://user@host/path").unwrap();

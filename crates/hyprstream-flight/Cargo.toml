@@ -65,3 +65,6 @@ rlimit = "0.10"
 num_cpus = "1.16"
 anyhow = "1.0.95"
 parking_lot = "0.12"
+
+[lints]
+workspace = true

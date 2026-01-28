@@ -6,10 +6,10 @@
 #[cfg(test)]
 mod tests {
     use gittorrent::{
-        types::{GitTorrentUrl, Sha256Hash},
+        types::GitTorrentUrl,
         git::objects::*,
     };
-    use std::path::PathBuf;
+    
     use tempfile::TempDir;
     use git2::Repository;
 
@@ -19,22 +19,22 @@ mod tests {
         let test_hash = "a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456";
 
         // Test simple commit URL
-        let url = GitTorrentUrl::parse(&format!("gittorrent://{}", test_hash)).unwrap();
+        let url = GitTorrentUrl::parse(&format!("gittorrent://{test_hash}")).unwrap();
         match url {
             GitTorrentUrl::Commit { ref hash } => {
                 assert_eq!(hash.as_str(), test_hash);
-                assert_eq!(url.to_string(), format!("gittorrent://{}", test_hash));
+                assert_eq!(url.to_string(), format!("gittorrent://{test_hash}"));
             }
             _ => panic!("Expected Commit variant"),
         }
 
         // Test commit with refs URL
-        let url_with_refs = GitTorrentUrl::parse(&format!("gittorrent://{}?refs", test_hash)).unwrap();
+        let url_with_refs = GitTorrentUrl::parse(&format!("gittorrent://{test_hash}?refs")).unwrap();
         match url_with_refs {
             GitTorrentUrl::CommitWithRefs { ref hash } => {
                 assert_eq!(hash.as_str(), test_hash);
                 assert!(url_with_refs.includes_refs());
-                assert_eq!(url_with_refs.to_string(), format!("gittorrent://{}?refs", test_hash));
+                assert_eq!(url_with_refs.to_string(), format!("gittorrent://{test_hash}?refs"));
             }
             _ => panic!("Expected CommitWithRefs variant"),
         }
@@ -97,7 +97,7 @@ mod tests {
         let tree = repo.find_tree(tree_id).unwrap();
         let sig = git2::Signature::now("Test Parser", "parser@example.com").unwrap();
 
-        let commit_id = repo.commit(
+        let _commit_id = repo.commit(
             Some("HEAD"),
             &sig,
             &sig,
@@ -179,7 +179,7 @@ mod tests {
 
         // 1. URL format should be gittorrent://COMMIT_SHA256
         let commit_hash = "a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456";
-        let url = format!("gittorrent://{}", commit_hash);
+        let url = format!("gittorrent://{commit_hash}");
         let parsed = GitTorrentUrl::parse(&url).unwrap();
 
         match parsed {
@@ -190,7 +190,7 @@ mod tests {
         }
 
         // 2. Optional refs parameter should work
-        let url_with_refs = format!("gittorrent://{}?refs", commit_hash);
+        let url_with_refs = format!("gittorrent://{commit_hash}?refs");
         let parsed_refs = GitTorrentUrl::parse(&url_with_refs).unwrap();
 
         assert!(parsed_refs.includes_refs());

@@ -177,7 +177,7 @@ impl LoRACheckpointManager {
 
     /// Get metadata file path for checkpoint
     fn get_metadata_path(&self, checkpoint_id: &str) -> PathBuf {
-        self.checkpoint_dir.join(format!("{}.json", checkpoint_id))
+        self.checkpoint_dir.join(format!("{checkpoint_id}.json"))
     }
 
     /// Get checkpoint directory

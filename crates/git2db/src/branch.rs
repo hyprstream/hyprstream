@@ -67,7 +67,7 @@ impl<'a> BranchManager<'a> {
 
         tokio::task::spawn_blocking(move || {
             let repo = Repository::open(&path).map_err(|e| {
-                Git2DBError::repository(&path, format!("Failed to open repository: {}", e))
+                Git2DBError::repository(&path, format!("Failed to open repository: {e}"))
             })?;
 
             let mut branches = Vec::new();
@@ -77,38 +77,38 @@ impl<'a> BranchManager<'a> {
             let head_name = head_ref
                 .as_ref()
                 .and_then(|h| h.shorthand())
-                .map(|s| s.to_string());
+                .map(std::borrow::ToOwned::to_owned);
 
             // List local branches
             for (branch, _) in (repo.branches(Some(BranchType::Local)).map_err(|e| {
-                Git2DBError::internal(format!("Failed to list local branches: {}", e))
+                Git2DBError::internal(format!("Failed to list local branches: {e}"))
             })?).flatten() {
             if let Some(name) = branch.name().ok().flatten() {
                 let is_head = head_name.as_deref() == Some(name);
                 let oid = branch.get().target();
 
                 branches.push(Branch {
-                    name: name.to_string(),
+                    name: name.to_owned(),
                     branch_type: BranchKind::Local,
                     is_head,
                     oid,
                     tracking: branch
                         .upstream()
                         .ok()
-                        .and_then(|u| u.name().ok().flatten().map(|s| s.to_string())),
+                        .and_then(|u| u.name().ok().flatten().map(std::borrow::ToOwned::to_owned)),
                 });
             }
             }
 
             // List remote branches
             for (branch, _) in (repo.branches(Some(BranchType::Remote)).map_err(|e| {
-                Git2DBError::internal(format!("Failed to list remote branches: {}", e))
+                Git2DBError::internal(format!("Failed to list remote branches: {e}"))
             })?).flatten() {
             if let Some(name) = branch.name().ok().flatten() {
                 let oid = branch.get().target();
 
                 branches.push(Branch {
-                    name: name.to_string(),
+                    name: name.to_owned(),
                     branch_type: BranchKind::Remote,
                     is_head: false,
                     oid,
@@ -120,7 +120,7 @@ impl<'a> BranchManager<'a> {
             Ok(branches)
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
     }
 
     /// Get the current branch (HEAD)
@@ -131,11 +131,11 @@ impl<'a> BranchManager<'a> {
 
         tokio::task::spawn_blocking(move || {
             let repo = Repository::open(&path).map_err(|e| {
-                Git2DBError::repository(&path, format!("Failed to open repository: {}", e))
+                Git2DBError::repository(&path, format!("Failed to open repository: {e}"))
             })?;
 
             let head = repo.head().map_err(|e| {
-                Git2DBError::reference("HEAD", format!("Failed to get HEAD: {}", e))
+                Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}"))
             })?;
 
             // Check if HEAD is a branch
@@ -145,8 +145,7 @@ impl<'a> BranchManager<'a> {
 
             let name = head
                 .shorthand()
-                .ok_or_else(|| Git2DBError::reference("HEAD", "HEAD has no name"))?
-                .to_string();
+                .ok_or_else(|| Git2DBError::reference("HEAD", "HEAD has no name"))?.to_owned();
 
             let oid = head.target();
 
@@ -155,7 +154,7 @@ impl<'a> BranchManager<'a> {
                 branch
                     .upstream()
                     .ok()
-                    .and_then(|u| u.name().ok().flatten().map(|s| s.to_string()))
+                    .and_then(|u| u.name().ok().flatten().map(std::borrow::ToOwned::to_owned))
             } else {
                 None
             };
@@ -169,7 +168,7 @@ impl<'a> BranchManager<'a> {
             }))
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
     }
 
     /// Create a new branch
@@ -197,12 +196,12 @@ impl<'a> BranchManager<'a> {
     /// ```
     pub async fn create<R: IntoGitRef>(&self, name: &str, from: Option<R>) -> Git2DBResult<()> {
         let path = self.repo_path()?;
-        let name = name.to_string();
-        let from_ref = from.map(|r| r.into_git_ref());
+        let name = name.to_owned();
+        let from_ref = from.map(super::references::IntoGitRef::into_git_ref);
 
         tokio::task::spawn_blocking(move || {
             let repo = Repository::open(&path).map_err(|e| {
-                Git2DBError::repository(&path, format!("Failed to open repository: {}", e))
+                Git2DBError::repository(&path, format!("Failed to open repository: {e}"))
             })?;
 
             // Resolve the starting point
@@ -213,13 +212,13 @@ impl<'a> BranchManager<'a> {
                 let oid = match git_ref {
                     GitRef::DefaultBranch => {
                         let head = repo.head().map_err(|e| {
-                            Git2DBError::reference("HEAD", format!("Failed to get HEAD: {}", e))
+                            Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}"))
                         })?;
                         head.peel_to_commit()
                             .map_err(|e| {
                                 Git2DBError::reference(
                                     "HEAD",
-                                    format!("HEAD is not a commit: {}", e),
+                                    format!("HEAD is not a commit: {e}"),
                                 )
                             })?
                             .id()
@@ -231,39 +230,39 @@ impl<'a> BranchManager<'a> {
                         let obj = repo.revparse_single(&branch_name).map_err(|e| {
                             Git2DBError::reference(
                                 &ref_str,
-                                format!("Failed to resolve reference: {}", e),
+                                format!("Failed to resolve reference: {e}"),
                             )
                         })?;
                         obj.peel_to_commit()
                             .map_err(|e| {
-                                Git2DBError::reference(&ref_str, format!("Not a commit: {}", e))
+                                Git2DBError::reference(&ref_str, format!("Not a commit: {e}"))
                             })?
                             .id()
                     }
                 };
 
                 repo.find_commit(oid).map_err(|e| {
-                    Git2DBError::reference(&ref_str, format!("Failed to find commit: {}", e))
+                    Git2DBError::reference(&ref_str, format!("Failed to find commit: {e}"))
                 })?
             } else {
                 // Use HEAD
                 let head = repo.head().map_err(|e| {
-                    Git2DBError::reference("HEAD", format!("Failed to get HEAD: {}", e))
+                    Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}"))
                 })?;
                 head.peel_to_commit().map_err(|e| {
-                    Git2DBError::reference("HEAD", format!("HEAD is not a commit: {}", e))
+                    Git2DBError::reference("HEAD", format!("HEAD is not a commit: {e}"))
                 })?
             };
 
             // Create the branch
             repo.branch(&name, &commit, false).map_err(|e| {
-                Git2DBError::reference(&name, format!("Failed to create branch: {}", e))
+                Git2DBError::reference(&name, format!("Failed to create branch: {e}"))
             })?;
 
             Ok(())
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
     }
 
     /// Checkout a branch
@@ -271,11 +270,11 @@ impl<'a> BranchManager<'a> {
     /// Similar to `git checkout <name>`
     pub async fn checkout(&self, name: &str) -> Git2DBResult<()> {
         let path = self.repo_path()?;
-        let name = name.to_string();
+        let name = name.to_owned();
 
         tokio::task::spawn_blocking(move || {
             let repo = Repository::open(&path).map_err(|e| {
-                Git2DBError::repository(&path, format!("Failed to open repository: {}", e))
+                Git2DBError::repository(&path, format!("Failed to open repository: {e}"))
             })?;
 
             // Find the branch
@@ -285,21 +284,21 @@ impl<'a> BranchManager<'a> {
 
             let reference = branch.into_reference();
             let commit = reference.peel_to_commit().map_err(|e| {
-                Git2DBError::reference(&name, format!("Failed to get commit: {}", e))
+                Git2DBError::reference(&name, format!("Failed to get commit: {e}"))
             })?;
 
             // Checkout the branch
             repo.checkout_tree(commit.as_object(), None)
-                .map_err(|e| Git2DBError::internal(format!("Failed to checkout tree: {}", e)))?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to checkout tree: {e}")))?;
 
             // Set HEAD to the branch
-            repo.set_head(&format!("refs/heads/{}", name))
-                .map_err(|e| Git2DBError::internal(format!("Failed to update HEAD: {}", e)))?;
+            repo.set_head(&format!("refs/heads/{name}"))
+                .map_err(|e| Git2DBError::internal(format!("Failed to update HEAD: {e}")))?;
 
             Ok(())
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
     }
 
     /// Remove a branch
@@ -310,18 +309,17 @@ impl<'a> BranchManager<'a> {
         if let Ok(Some(current)) = self.current().await {
             if current.name == name {
                 return Err(Git2DBError::configuration(format!(
-                    "Cannot delete current branch '{}'",
-                    name
+                    "Cannot delete current branch '{name}'"
                 )));
             }
         }
 
         let path = self.repo_path()?;
-        let name = name.to_string();
+        let name = name.to_owned();
 
         tokio::task::spawn_blocking(move || {
             let repo = Repository::open(&path).map_err(|e| {
-                Git2DBError::repository(&path, format!("Failed to open repository: {}", e))
+                Git2DBError::repository(&path, format!("Failed to open repository: {e}"))
             })?;
 
             // Find and delete the branch
@@ -338,7 +336,7 @@ impl<'a> BranchManager<'a> {
 
                 // Check if reachable from HEAD
                 let head = repo.head().map_err(|e| {
-                    Git2DBError::reference("HEAD", format!("Failed to get HEAD: {}", e))
+                    Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}"))
                 })?;
                 let head_oid = head
                     .target()
@@ -349,20 +347,19 @@ impl<'a> BranchManager<'a> {
                     .unwrap_or(false)
                 {
                     return Err(Git2DBError::configuration(format!(
-                        "Branch '{}' is not fully merged. Use force=true to delete anyway.",
-                        name
+                        "Branch '{name}' is not fully merged. Use force=true to delete anyway."
                     )));
                 }
             }
 
             branch.delete().map_err(|e| {
-                Git2DBError::reference(&name, format!("Failed to delete branch: {}", e))
+                Git2DBError::reference(&name, format!("Failed to delete branch: {e}"))
             })?;
 
             Ok(())
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
     }
 
     /// Rename current branch or a specific branch
@@ -370,7 +367,7 @@ impl<'a> BranchManager<'a> {
     /// Similar to `git branch -m [old] <new>`
     pub async fn rename(&self, old_name: Option<&str>, new_name: &str) -> Git2DBResult<()> {
         let branch_name = if let Some(name) = old_name {
-            name.to_string()
+            name.to_owned()
         } else {
             // Get current branch name
             self.current()
@@ -380,11 +377,11 @@ impl<'a> BranchManager<'a> {
         };
 
         let path = self.repo_path()?;
-        let new_name = new_name.to_string();
+        let new_name = new_name.to_owned();
 
         tokio::task::spawn_blocking(move || {
             let repo = Repository::open(&path).map_err(|e| {
-                Git2DBError::repository(&path, format!("Failed to open repository: {}", e))
+                Git2DBError::repository(&path, format!("Failed to open repository: {e}"))
             })?;
 
             // Find and rename the branch
@@ -393,13 +390,13 @@ impl<'a> BranchManager<'a> {
                 .map_err(|_| Git2DBError::reference(&branch_name, "Branch not found"))?;
 
             branch.rename(&new_name, false).map_err(|e| {
-                Git2DBError::reference(&new_name, format!("Failed to rename branch: {}", e))
+                Git2DBError::reference(&new_name, format!("Failed to rename branch: {e}"))
             })?;
 
             Ok(())
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
     }
 }
 
@@ -426,7 +423,7 @@ impl Branch {
 
     /// Get short commit hash (first 7 chars)
     pub fn short_oid(&self) -> Option<String> {
-        self.oid.map(|oid| format!("{:.7}", oid))
+        self.oid.map(|oid| format!("{oid:.7}"))
     }
 }
 

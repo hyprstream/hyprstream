@@ -124,31 +124,31 @@ mod tests {
     #[test]
     fn test_checkpoint_metadata_creation() {
         let tables = vec![
-            TableCheckpoint::new("metrics".to_string(), 1000, 50000, "tables/metrics.parquet".to_string()),
-            TableCheckpoint::new("events".to_string(), 500, 25000, "tables/events.parquet".to_string()),
+            TableCheckpoint::new("metrics".to_owned(), 1000, 50000, "tables/metrics.parquet".to_owned()),
+            TableCheckpoint::new("events".to_owned(), 500, 25000, "tables/events.parquet".to_owned()),
         ];
 
         let metadata = CheckpointMetadata::new(tables)
             .with_name("checkpoint-1")
             .with_metadata("version", "1.0");
 
-        assert_eq!(metadata.name, Some("checkpoint-1".to_string()));
+        assert_eq!(metadata.name, Some("checkpoint-1".to_owned()));
         assert_eq!(metadata.total_size, 75000);
         assert_eq!(metadata.tables.len(), 2);
-        assert_eq!(metadata.metadata.get("version"), Some(&"1.0".to_string()));
+        assert_eq!(metadata.metadata.get("version"), Some(&"1.0".to_owned()));
     }
 
     #[test]
     fn test_checkpoint_creation() {
         let tables = vec![TableCheckpoint::new(
-            "test".to_string(),
+            "test".to_owned(),
             100,
             5000,
-            "tables/test.parquet".to_string(),
+            "tables/test.parquet".to_owned(),
         )];
 
         let metadata = CheckpointMetadata::new(tables);
-        let checkpoint = Checkpoint::new("abc123".to_string(), metadata);
+        let checkpoint = Checkpoint::new("abc123".to_owned(), metadata);
 
         assert_eq!(checkpoint.id(), "abc123");
         assert_eq!(checkpoint.tables().len(), 1);

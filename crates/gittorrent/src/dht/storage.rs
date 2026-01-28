@@ -53,14 +53,14 @@ impl GitObjectStore {
         object_hashes: &[crate::types::Sha256Hash]
     ) {
         // Store repository -> objects mapping
-        self.repository_objects.insert(repo_name.to_string(), object_hashes.to_vec());
+        self.repository_objects.insert(repo_name.to_owned(), object_hashes.to_vec());
 
         // Store object -> repositories mapping
         for hash in object_hashes {
             self.object_repositories
                 .entry(hash.clone())
                 .or_default()
-                .push(repo_name.to_string());
+                .push(repo_name.to_owned());
         }
 
         tracing::debug!("Added repository mapping for {} with {} objects", repo_name, object_hashes.len());
@@ -101,7 +101,7 @@ impl GitObjectStore {
     pub fn stats(&self) -> GitObjectStoreStats {
         GitObjectStoreStats {
             record_count: self.records.len(),
-            provider_count: self.providers.values().map(|p| p.len()).sum(),
+            provider_count: self.providers.values().map(std::collections::HashMap::len).sum(),
             total_keys: self.records.len() + self.providers.len(),
             repository_count: self.repository_objects.len(),
             unique_objects: self.object_repositories.len(),
@@ -259,10 +259,10 @@ mod tests {
 
         // Add records up to capacity
         for i in 0..3 {
-            let key = RecordKey::new(&format!("key-{}", i).as_bytes());
+            let key = RecordKey::new(&format!("key-{i}").as_bytes());
             let record = Record {
                 key: key.clone(),
-                value: format!("value-{}", i).as_bytes().to_vec(),
+                value: format!("value-{i}").as_bytes().to_vec(),
                 publisher: None,
                 expires: None,
             };

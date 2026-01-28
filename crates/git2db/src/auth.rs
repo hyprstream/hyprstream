@@ -276,7 +276,7 @@ pub mod presets {
     /// Standard SSH configuration (agent + fallback)
     pub fn ssh_standard() -> AuthManager {
         AuthBuilder::new()
-            .ssh_agent(Some("git".to_string()))
+            .ssh_agent(Some("git".to_owned()))
             .default_fallback()
             .build()
     }
@@ -285,7 +285,7 @@ pub mod presets {
     pub fn github_token<T: Into<String>>(token: T) -> AuthManager {
         AuthBuilder::new()
             .token(token)
-            .ssh_agent(Some("git".to_string()))
+            .ssh_agent(Some("git".to_owned()))
             .default_fallback()
             .build()
     }
@@ -302,7 +302,7 @@ pub mod presets {
     {
         AuthBuilder::new()
             .ssh_key(username, None, private_key, passphrase)
-            .ssh_agent(Some("git".to_string()))
+            .ssh_agent(Some("git".to_owned()))
             .default_fallback()
             .build()
     }
@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn test_auth_builder() {
         let auth = AuthBuilder::new()
-            .ssh_agent(Some("git".to_string()))
+            .ssh_agent(Some("git".to_owned()))
             .token("ghp_test_token")
             .default_fallback()
             .build();

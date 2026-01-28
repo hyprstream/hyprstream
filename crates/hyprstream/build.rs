@@ -31,11 +31,11 @@ fn main() {
     // Validate libtorch exists
     let libtorch_dir = Path::new(&libtorch_path);
     if !libtorch_dir.exists() {
-        panic!("libtorch directory not found at {}", libtorch_path);
+        panic!("libtorch directory not found at {libtorch_path}");
     }
 
     // Configure linking
-    println!("cargo:rustc-link-search=native={}/lib", libtorch_path);
+    println!("cargo:rustc-link-search=native={libtorch_path}/lib");
     println!("cargo:rustc-env=LIBTORCH_STATIC=0");
     println!("cargo:rustc-env=LIBTORCH_BYPASS_VERSION_CHECK=1");
 }
@@ -114,7 +114,7 @@ fn capture_git_info() {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
         .unwrap_or_default();
 
     // Get branch name
@@ -123,7 +123,7 @@ fn capture_git_info() {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
         .map(|b| if b == "HEAD" { String::new() } else { b }) // Detached HEAD
         .unwrap_or_default();
 
@@ -145,7 +145,7 @@ fn capture_git_info() {
     println!("cargo:rustc-env=GIT_DIRTY={}", dirty);
 
     // Build complete version string
-    let cargo_version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_string());
+    let cargo_version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_owned());
     let build_version = if sha.is_empty() {
         cargo_version
     } else {

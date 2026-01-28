@@ -276,7 +276,7 @@ impl WorkflowService {
             }
         }
 
-        repo_workflows.insert(repo_id.to_string(), subscriptions);
+        repo_workflows.insert(repo_id.to_owned(), subscriptions);
 
         tracing::info!(repo_id = %repo_id, "Rescanned repository");
         Ok(())

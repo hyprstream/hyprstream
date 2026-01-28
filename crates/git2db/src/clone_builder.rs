@@ -199,7 +199,7 @@ impl<'a> CloneBuilder<'a> {
 
         // models/{name}/
         let repo_dir = safe_path::scoped_join(models_dir, &repo_name)
-            .map_err(|e| Git2DBError::configuration(format!("Invalid repository name: {}", e)))?;
+            .map_err(|e| Git2DBError::configuration(format!("Invalid repository name: {e}")))?;
 
         // Check if already fully registered (idempotent return)
         if let Some(tracked) = self.registry.get_by_name(&repo_name) {
@@ -223,7 +223,7 @@ impl<'a> CloneBuilder<'a> {
                     // Corrupted/incomplete - cleanup and restart
                     tracing::warn!("Removing incomplete/corrupted clone at {:?}", repo_dir);
                     std::fs::remove_dir_all(&repo_dir).map_err(|e| {
-                        Git2DBError::repository(&repo_dir, format!("Failed to cleanup incomplete clone: {}", e))
+                        Git2DBError::repository(&repo_dir, format!("Failed to cleanup incomplete clone: {e}"))
                     })?;
                     None
                 }
@@ -235,10 +235,10 @@ impl<'a> CloneBuilder<'a> {
         // Create directory structure only if fresh clone
         if existing_bare_repo.is_none() {
             std::fs::create_dir_all(&repo_dir).map_err(|e| {
-                Git2DBError::repository(&repo_dir, format!("Failed to create repo directory: {}", e))
+                Git2DBError::repository(&repo_dir, format!("Failed to create repo directory: {e}"))
             })?;
             std::fs::create_dir_all(&worktrees_dir).map_err(|e| {
-                Git2DBError::repository(&worktrees_dir, format!("Failed to create worktrees directory: {}", e))
+                Git2DBError::repository(&worktrees_dir, format!("Failed to create worktrees directory: {e}"))
             })?;
         }
 
@@ -266,25 +266,25 @@ impl<'a> CloneBuilder<'a> {
 
                 // Apply fetch options with authentication callbacks from GitManager
                 builder.fetch_options(git2_options.create_fetch_options()
-                    .map_err(|e| Git2DBError::internal(format!("Failed to create fetch options: {}", e)))?);
+                    .map_err(|e| Git2DBError::internal(format!("Failed to create fetch options: {e}")))?);
 
                 // Perform the clone
                 let repo = builder.clone(&url_clone, &bare_path_clone)
                     .map_err(|e| Git2DBError::repository(
                         &bare_path_clone,
-                        format!("Failed to clone bare repository: {}", e)
+                        format!("Failed to clone bare repository: {e}")
                     ))?;
 
                 Ok(repo)
             })
             .await
-            .map_err(|e| Git2DBError::internal(format!("Task join error: {}", e)))??
+            .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))??
         };
 
         // Add additional remotes to bare repo
         for (remote_name, remote_url) in &self.remotes {
             bare_repo.remote(remote_name, remote_url).map_err(|e| {
-                Git2DBError::configuration(format!("Failed to add remote '{}': {}", remote_name, e))
+                Git2DBError::configuration(format!("Failed to add remote '{remote_name}': {e}"))
             })?;
         }
 
@@ -299,7 +299,7 @@ impl<'a> CloneBuilder<'a> {
         if let Some(parent) = initial_worktree.parent() {
             if parent != worktrees_dir {
                 std::fs::create_dir_all(parent).map_err(|e| {
-                    Git2DBError::configuration(format!("Failed to create worktree parent directories: {}", e))
+                    Git2DBError::configuration(format!("Failed to create worktree parent directories: {e}"))
                 })?;
             }
         }
@@ -328,7 +328,7 @@ impl<'a> CloneBuilder<'a> {
             // Create parent directories for hierarchical branches
             if let Some(parent) = ref_worktree_path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
-                    Git2DBError::configuration(format!("Failed to create worktree parent directories: {}", e))
+                    Git2DBError::configuration(format!("Failed to create worktree parent directories: {e}"))
                 })?;
             }
 
@@ -341,9 +341,9 @@ impl<'a> CloneBuilder<'a> {
 
         // Build remote configs (origin + additional)
         let mut remote_configs = vec![RemoteConfig {
-            name: "origin".to_string(),
+            name: "origin".to_owned(),
             url: self.url.clone(),
-            fetch_refs: vec!["+refs/heads/*:refs/remotes/origin/*".to_string()],
+            fetch_refs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
         }];
 
         for (name, url) in self.remotes {
@@ -391,7 +391,7 @@ fn get_default_branch(repo: &git2::Repository) -> Git2DBResult<String> {
     // Try to get from HEAD
     if let Ok(head) = repo.head() {
         if let Some(name) = head.shorthand() {
-            return Ok(name.to_string());
+            return Ok(name.to_owned());
         }
     }
 
@@ -401,7 +401,7 @@ fn get_default_branch(repo: &git2::Repository) -> Git2DBResult<String> {
             if let Some(s) = buf.as_str() {
                 // Remove refs/heads/ prefix
                 let branch = s.strip_prefix("refs/heads/").unwrap_or(s);
-                return Ok(branch.to_string());
+                return Ok(branch.to_owned());
             }
         }
     }
@@ -409,12 +409,12 @@ fn get_default_branch(repo: &git2::Repository) -> Git2DBResult<String> {
     // Fallback to common defaults
     for default in &["main", "master"] {
         if repo.find_branch(default, git2::BranchType::Local).is_ok() {
-            return Ok(default.to_string());
+            return Ok((*default).to_owned());
         }
     }
 
     // Last resort
-    Ok("main".to_string())
+    Ok("main".to_owned())
 }
 
 /// Create a worktree from a bare repository using the storage driver
@@ -427,7 +427,7 @@ async fn create_worktree(
     // Ensure parent exists
     if let Some(parent) = worktree_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
-            Git2DBError::configuration(format!("Failed to create worktree parent directories: {}", e))
+            Git2DBError::configuration(format!("Failed to create worktree parent directories: {e}"))
         })?;
     }
 
@@ -435,7 +435,7 @@ async fn create_worktree(
     let opts = crate::storage::DriverOpts {
         base_repo: bare_repo_path.to_path_buf(),
         worktree_path: worktree_path.to_path_buf(),
-        ref_spec: branch.to_string(),
+        ref_spec: branch.to_owned(),
     };
 
     match driver.create_worktree(&opts).await {
@@ -453,7 +453,7 @@ async fn create_worktree(
         }
         Err(e) => Err(Git2DBError::repository(
             worktree_path,
-            format!("Failed to create worktree for branch '{}': {}", branch, e)
+            format!("Failed to create worktree for branch '{branch}': {e}")
         )),
     }
 }

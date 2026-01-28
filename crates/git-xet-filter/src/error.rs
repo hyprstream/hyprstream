@@ -78,7 +78,7 @@ impl XetError {
 
 impl From<git2::Error> for XetError {
     fn from(e: git2::Error) -> Self {
-        Self::new(XetErrorKind::IoError, format!("Git error: {}", e))
+        Self::new(XetErrorKind::IoError, format!("Git error: {e}"))
     }
 }
 

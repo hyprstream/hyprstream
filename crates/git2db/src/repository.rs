@@ -34,7 +34,7 @@ impl RepositoryCache {
         *count += 1;
 
         Repository::open(&self.path).map_err(|e| {
-            Git2DBError::repository(&self.path, format!("Failed to open repository: {}", e))
+            Git2DBError::repository(&self.path, format!("Failed to open repository: {e}"))
         })
     }
 

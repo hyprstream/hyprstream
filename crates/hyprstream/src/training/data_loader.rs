@@ -27,7 +27,7 @@ impl TrainingDataset {
     /// Load training data from JSONL file
     pub fn from_jsonl(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read training data from {:?}", path))?;
+            .with_context(|| format!("Failed to read training data from {path:?}"))?;
 
         let mut samples = Vec::new();
         for (line_num, line) in content.lines().enumerate() {
@@ -48,7 +48,7 @@ impl TrainingDataset {
     /// Expects format: [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
     pub fn from_conversations(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read conversation data from {:?}", path))?;
+            .with_context(|| format!("Failed to read conversation data from {path:?}"))?;
 
         let mut samples = Vec::new();
 
@@ -77,7 +77,7 @@ impl TrainingDataset {
                         if !current_input.is_empty() {
                             samples.push(TrainingSample {
                                 input: current_input.clone(),
-                                output: content.to_string(),
+                                output: content.to_owned(),
                                 system: None,
                                 metadata: None,
                             });
@@ -169,13 +169,13 @@ impl ChatTemplateDataLoader {
 
             if let Some(ref system) = sample.system {
                 messages.push(ChatMessage {
-                    role: "system".to_string(),
+                    role: "system".to_owned(),
                     content: system.clone(),
                 });
             }
 
             messages.push(ChatMessage {
-                role: "user".to_string(),
+                role: "user".to_owned(),
                 content: sample.input.clone(),
             });
 
@@ -184,7 +184,7 @@ impl ChatTemplateDataLoader {
 
             // Add assistant response for target
             messages.push(ChatMessage {
-                role: "assistant".to_string(),
+                role: "assistant".to_owned(),
                 content: sample.output.clone(),
             });
 
@@ -238,26 +238,26 @@ mod tests {
     fn test_train_test_split() {
         let samples = vec![
             TrainingSample {
-                input: "1".to_string(),
-                output: "a".to_string(),
+                input: "1".to_owned(),
+                output: "a".to_owned(),
                 system: None,
                 metadata: None,
             },
             TrainingSample {
-                input: "2".to_string(),
-                output: "b".to_string(),
+                input: "2".to_owned(),
+                output: "b".to_owned(),
                 system: None,
                 metadata: None,
             },
             TrainingSample {
-                input: "3".to_string(),
-                output: "c".to_string(),
+                input: "3".to_owned(),
+                output: "c".to_owned(),
                 system: None,
                 metadata: None,
             },
             TrainingSample {
-                input: "4".to_string(),
-                output: "d".to_string(),
+                input: "4".to_owned(),
+                output: "d".to_owned(),
                 system: None,
                 metadata: None,
             },

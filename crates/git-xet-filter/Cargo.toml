@@ -57,3 +57,6 @@ default = ["xet-storage"]
 xet-storage = ["data", "cas_client", "cas_object", "merklehash", "async-trait"]
 # Enable SSH transport for self-hosted CAS servers
 ssh-transport = ["xet-storage", "russh", "russh-keys", "cas-serve", "base64", "dirs"]
+
+[lints]
+workspace = true
