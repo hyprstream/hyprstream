@@ -167,6 +167,7 @@ create_appimage() {
 create_universal_appimage() {
     local appdir="$BUILD_DIR/hyprstream-universal.AppDir"
     local output="$OUTPUT_DIR/hyprstream-${VERSION}-x86_64.AppImage"
+    local staging="$BUILD_DIR/universal-staging"
 
     log_info "Creating universal AppImage..."
 
@@ -174,10 +175,16 @@ create_universal_appimage() {
     mkdir -p "$appdir/usr/bin" "$appdir/usr/lib"
 
     for variant in "${ALL_VARIANTS[@]}"; do
-        cp "$BUILD_DIR/bin/hyprstream-$variant" "$appdir/usr/bin/"
-        mkdir -p "$appdir/usr/lib/$variant/libtorch/lib"
-        # Copy only shared libraries (skip static libs, headers, cmake)
-        cp "$LIBTORCH_CACHE_DIR/$variant/libtorch/lib/"*.so* "$appdir/usr/lib/$variant/libtorch/lib/"
+        # Use staged files if available (from stage command), otherwise use build dirs
+        if [[ -f "$staging/bin/hyprstream-$variant" ]]; then
+            cp "$staging/bin/hyprstream-$variant" "$appdir/usr/bin/"
+            mkdir -p "$appdir/usr/lib/$variant/libtorch/lib"
+            cp "$staging/lib/$variant/libtorch/lib/"*.so* "$appdir/usr/lib/$variant/libtorch/lib/"
+        else
+            cp "$BUILD_DIR/bin/hyprstream-$variant" "$appdir/usr/bin/"
+            mkdir -p "$appdir/usr/lib/$variant/libtorch/lib"
+            cp "$LIBTORCH_CACHE_DIR/$variant/libtorch/lib/"*.so* "$appdir/usr/lib/$variant/libtorch/lib/"
+        fi
     done
 
     cp "$SCRIPT_DIR/AppRun" "$appdir/"
@@ -226,6 +233,30 @@ cmd_build() {
 
     log_success "Build complete!"
     ls -lh "$OUTPUT_DIR"/*.AppImage 2>/dev/null || true
+}
+
+# Command: stage - copy files needed for universal AppImage before cleaning
+cmd_stage() {
+    local variant="${1:-}"
+    if [[ -z "$variant" ]] || [[ "$variant" == "all" ]] || [[ "$variant" == "universal" ]]; then
+        log_error "stage requires a specific variant (cpu, cuda128, cuda130, rocm71)"
+        exit 1
+    fi
+    validate_variant "$variant"
+
+    local staging="$BUILD_DIR/universal-staging"
+    log_info "Staging $variant for universal AppImage..."
+
+    # Stage binary
+    mkdir -p "$staging/bin"
+    cp "$BUILD_DIR/bin/hyprstream-$variant" "$staging/bin/"
+
+    # Stage only shared libraries (much smaller than full libtorch)
+    mkdir -p "$staging/lib/$variant/libtorch/lib"
+    cp "$LIBTORCH_CACHE_DIR/$variant/libtorch/lib/"*.so* "$staging/lib/$variant/libtorch/lib/"
+
+    log_success "Staged $variant"
+    du -sh "$staging"
 }
 
 # Command: clean
@@ -280,6 +311,9 @@ main() {
     case "$cmd" in
         build)
             cmd_build "$variant"
+            ;;
+        stage)
+            cmd_stage "$variant"
             ;;
         clean)
             cmd_clean "$variant"

@@ -39,6 +39,11 @@ RUN apt-get update && apt-get install -y \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 
+# Install sccache for compilation caching (works with BuildKit cache mounts)
+RUN cargo install sccache --locked
+ENV RUSTC_WRAPPER=sccache
+ENV SCCACHE_DIR=/sccache
+
 #############################################
 # CUDA 12.8 Builder
 #############################################
@@ -156,12 +161,17 @@ COPY crates ./crates
 ENV LIBTORCH=/opt/libtorch
 ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 
-# Build the project with BuildKit cache mounts for Cargo registry
+# Build the project with BuildKit cache mounts for Cargo registry and sccache
 # LIBTORCH is already set in the variant-specific builder stages
 # We do NOT use LIBTORCH_USE_PYTORCH since we're using manual downloads
 # Note: --no-default-features excludes systemd (not needed in containers)
+# Cache mounts:
+#   - /root/.cargo/registry: Cargo crate registry
+#   - /root/.cargo/git: Git dependencies
+#   - /sccache: Compiled artifacts (sccache)
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/sccache \
     cargo build --release --no-default-features --features otel,gittorrent,xet
 
 #############################################
