@@ -16,7 +16,7 @@ jobs:
   # Build each backend variant in parallel
   build-variants:
     name: Build ${{ matrix.variant }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -114,7 +114,7 @@ jobs:
   assemble-per-backend:
     name: AppImage (${{ matrix.variant }})
     needs: build-variants
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         variant: [cpu, cuda128, cuda130, rocm71]
@@ -180,7 +180,7 @@ jobs:
   assemble-universal:
     name: AppImage (universal)
     needs: build-variants
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
@@ -246,7 +246,7 @@ jobs:
     name: Create Release
     if: startsWith(github.ref, 'refs/tags/')
     needs: [assemble-per-backend, assemble-universal]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     permissions:
       contents: write
 
