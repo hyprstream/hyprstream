@@ -70,6 +70,7 @@ jobs:
       - name: Build CPU AppImage
         run: |
           ./appimage/build-appimage.sh build cpu --version ${{ steps.version.outputs.version }}
+          ./appimage/build-appimage.sh stage cpu
           ./appimage/build-appimage.sh clean cpu
 
       - name: Upload CPU AppImage
@@ -82,6 +83,7 @@ jobs:
       - name: Build CUDA 12.8 AppImage
         run: |
           ./appimage/build-appimage.sh build cuda128 --version ${{ steps.version.outputs.version }}
+          ./appimage/build-appimage.sh stage cuda128
           ./appimage/build-appimage.sh clean cuda128
 
       - name: Upload CUDA 12.8 AppImage
@@ -94,6 +96,7 @@ jobs:
       - name: Build CUDA 13.0 AppImage
         run: |
           ./appimage/build-appimage.sh build cuda130 --version ${{ steps.version.outputs.version }}
+          ./appimage/build-appimage.sh stage cuda130
           ./appimage/build-appimage.sh clean cuda130
 
       - name: Upload CUDA 13.0 AppImage
@@ -106,6 +109,7 @@ jobs:
       - name: Build ROCm 7.1 AppImage
         run: |
           ./appimage/build-appimage.sh build rocm71 --version ${{ steps.version.outputs.version }}
+          ./appimage/build-appimage.sh stage rocm71
           ./appimage/build-appimage.sh clean rocm71
 
       - name: Upload ROCm 7.1 AppImage

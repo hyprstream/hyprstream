@@ -1,11 +1,14 @@
 name: Build Docker Images
 
 on:
-  push:
+  # Run after Rust workflow completes successfully
+  workflow_run:
+    workflows: ["Rust"]
+    types: [completed]
     branches: [ "main" ]
+  # Also run on version tags (releases)
+  push:
     tags: [ 'v*.*.*' ]
-# pull_request:
-#   branches: [ "main" ]
 
 env:
   REGISTRY: ghcr.io
@@ -13,6 +16,10 @@ env:
 
 jobs:
   build-docker:
+    # Only run if: tag push OR Rust workflow succeeded
+    if: >-
+      github.event_name == 'push' ||
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -52,18 +59,6 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Cache Cargo registry
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/registry/index
-          ~/.cargo/registry/cache
-          ~/.cargo/git/db
-        key: cargo-${{ runner.os }}-${{ matrix.variant }}-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          cargo-${{ runner.os }}-${{ matrix.variant }}-
-          cargo-${{ runner.os }}-
-
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
@@ -102,8 +97,11 @@ jobs:
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
         platforms: linux/amd64
-        cache-from: type=gha,scope=build-${{ matrix.variant }}
-        cache-to: type=gha,mode=max,scope=build-${{ matrix.variant }}
+        # Registry cache: no 10GB limit, persists across branches, faster than GHA cache
+        cache-from: |
+          type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.variant }}
+          type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-base
+        cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.variant }},mode=max
 
     - name: Generate SBOM
       if: github.event_name != 'pull_request'
