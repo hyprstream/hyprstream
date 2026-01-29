@@ -28,9 +28,13 @@ jobs:
 
     - name: Setup sccache
       uses: mozilla-actions/sccache-action@v0.0.9
+      with:
+        key: rust-sccache
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: rust-deps
 
     - name: Run Clippy
       run: cargo clippy --workspace --all-targets --features download-libtorch -- -D warnings
@@ -47,9 +51,13 @@ jobs:
 
     - name: Setup sccache
       uses: mozilla-actions/sccache-action@v0.0.9
+      with:
+        key: rust-sccache
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: rust-deps
 
     - name: Build
       run: cargo build --release --verbose --features download-libtorch
