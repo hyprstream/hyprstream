@@ -18,7 +18,9 @@ ARG LIBTORCH_CPU_URL=https://download.pytorch.org/libtorch/cpu/libtorch-shared-w
 FROM debian:${DEBIAN_VERSION} AS builder-base
 
 # Install build dependencies
-RUN apt-get update && apt-get install -y \
+# Note: binutils from backports required for OpenSSL AVX-512 assembly compatibility
+RUN echo "deb http://deb.debian.org/debian bookworm-backports main" >> /etc/apt/sources.list && \
+    apt-get update && apt-get install -y \
     curl \
     wget \
     unzip \
@@ -32,6 +34,7 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     capnproto \
     cmake \
+    && apt-get install -y -t bookworm-backports binutils \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -172,7 +175,7 @@ ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/sccache \
-    cargo build --release --no-default-features --features otel,gittorrent,xet
+    OPENSSL_NO_VENDOR=1 cargo build --release --no-default-features --features otel,gittorrent,xet
 
 #############################################
 # Runtime Stage Selection (Distroless)
@@ -187,6 +190,8 @@ FROM gcr.io/distroless/cc-debian12 AS runtime-cuda128
 # Copy required system libraries
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib/x86_64-linux-gnu/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib/x86_64-linux-gnu/
 
 # Copy CUDA runtime libraries from builder (toolkit includes runtime)
 COPY --from=builder /usr/local/cuda-12.8/lib64/libcudart.so* /usr/local/cuda/lib64/
@@ -205,6 +210,8 @@ FROM gcr.io/distroless/cc-debian12 AS runtime-cuda130
 # Copy required system libraries
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib/x86_64-linux-gnu/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib/x86_64-linux-gnu/
 
 # Copy CUDA runtime libraries from builder (toolkit includes runtime)
 COPY --from=builder /usr/local/cuda-13.0/lib64/libcudart.so* /usr/local/cuda/lib64/
@@ -223,6 +230,8 @@ FROM gcr.io/distroless/cc-debian12 AS runtime-rocm71
 # Copy required system libraries
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib/x86_64-linux-gnu/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib/x86_64-linux-gnu/
 
 # Copy only LibTorch shared libraries (bundles HIP/ROCm libs)
 COPY --from=builder /opt/libtorch/lib/*.so* /opt/libtorch/lib/
@@ -236,6 +245,8 @@ FROM gcr.io/distroless/cc-debian12 AS runtime-cpu
 # Copy required system libraries
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib/x86_64-linux-gnu/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib/x86_64-linux-gnu/
 
 # Copy only LibTorch shared libraries (skip static libs, headers, cmake)
 COPY --from=builder /opt/libtorch/lib/*.so* /opt/libtorch/lib/
