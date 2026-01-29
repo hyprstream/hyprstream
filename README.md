@@ -30,12 +30,13 @@ Easy to get started, just down [Download](https://github.com/hyprstream/hyprstre
 
 ### Quick Install (AppImage)
 
-Download the Universal AppImage from the [v0.2.0 release](https://github.com/hyprstream/hyprstream/releases/tag/v0.2.0). We have published AppImages for each supported CPU and GPU configuration. 
+Download the [Universal AppImage](https://github.com/hyprstream/hyprstream/releases/). We have published AppImages for each supported CPU and GPU configuration, but recommend the Universal image for easy-of-use and GPU auto-detection.
 
 ```bash
 # Download and install (Universal recommended)
 chmod +x hyprstream-v0.2.0-x86_64.AppImage
 ./hyprstream-v0.2.0-x86_64.AppImage service install
+./hyprstream-v0.2.0-x86_64.AppImage service start
 
 # Apply policy template - hyprstream is deny by default, the following treats local users as admins:
 hyprstream apply-template local
