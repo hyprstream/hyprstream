@@ -19,8 +19,7 @@ use capnp::serialize;
 use git2db::{Git2DB, RepoId, RepositoryStatus, TrackedRepository, GitRef};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -577,21 +576,24 @@ impl RegistryService {
 
     /// Handle a list repositories request
     fn handle_list(&self) -> Result<Vec<TrackedRepository>> {
-        let registry = self.registry.blocking_read();
+        let registry = self.registry.read()
+            .map_err(|_| anyhow!("registry lock poisoned"))?;
         Ok(registry.list().cloned().collect())
     }
 
     /// Handle get repository by ID
     fn handle_get(&self, repo_id: &str) -> Result<Option<TrackedRepository>> {
         let id = Self::parse_repo_id(repo_id)?;
-        let registry = self.registry.blocking_read();
+        let registry = self.registry.read()
+            .map_err(|_| anyhow!("registry lock poisoned"))?;
         let result = registry.list().find(|r| r.id == id).cloned();
         Ok(result)
     }
 
     /// Handle get repository by name
     fn handle_get_by_name(&self, name: &str) -> Result<Option<TrackedRepository>> {
-        let registry = self.registry.blocking_read();
+        let registry = self.registry.read()
+            .map_err(|_| anyhow!("registry lock poisoned"))?;
         let result = registry
             .list()
             .find(|r| r.name.as_ref() == Some(&name.to_owned()))
@@ -605,7 +607,8 @@ impl RegistryService {
 
         // Use captured runtime handle instead of creating new runtime
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
+            let registry = self.registry.read()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
             let handle = registry.repo(&id)?;
             let branches = handle.branch().list().await?;
             Ok(branches.into_iter().map(|b| b.name).collect())
@@ -623,7 +626,8 @@ impl RegistryService {
 
         // Use captured runtime handle instead of creating new runtime
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
+            let registry = self.registry.read()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
             let handle = registry.repo(&id)?;
             handle.branch().create(branch_name, start_point).await?;
             Ok(())
@@ -636,7 +640,8 @@ impl RegistryService {
 
         // Use captured runtime handle instead of creating new runtime
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
+            let registry = self.registry.read()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
             let handle = registry.repo(&id)?;
             handle.branch().checkout(ref_name).await?;
             Ok(())
@@ -649,7 +654,8 @@ impl RegistryService {
 
         // Use captured runtime handle instead of creating new runtime
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
+            let registry = self.registry.read()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
             let handle = registry.repo(&id)?;
             handle.staging().add_all().await?;
             Ok(())
@@ -662,7 +668,8 @@ impl RegistryService {
 
         // Use captured runtime handle instead of creating new runtime
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
+            let registry = self.registry.read()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
             let handle = registry.repo(&id)?;
             let oid = handle.commit(message).await?;
             Ok(oid.to_string())
@@ -677,7 +684,8 @@ impl RegistryService {
 
         // Use captured runtime handle instead of creating new runtime
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
+            let registry = self.registry.read()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
             let handle = registry.repo(&id)?;
             let oid = handle.merge(&source, message.as_deref()).await?;
             Ok(oid.to_string())
@@ -690,7 +698,8 @@ impl RegistryService {
 
         // Use captured runtime handle instead of creating new runtime
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
+            let registry = self.registry.read()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
             let handle = registry.repo(&id)?;
             let status = handle.status().await?;
             Ok(status)
@@ -713,7 +722,8 @@ impl RegistryService {
 
         // Use captured runtime handle instead of creating new runtime
         self.runtime_handle.block_on(async {
-            let mut registry = self.registry.write().await;
+            let mut registry = self.registry.write()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
             let mut clone_builder = registry.clone(&url);
 
             if let Some(ref n) = name {
@@ -755,7 +765,8 @@ impl RegistryService {
 
         // Use captured runtime handle instead of creating new runtime
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
+            let registry = self.registry.read()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
             let handle = registry.repo(&id)?;
             let mut worktrees = handle.get_worktrees().await?;
 
@@ -800,7 +811,8 @@ impl RegistryService {
 
         // Use captured runtime handle instead of creating new runtime
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
+            let registry = self.registry.read()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
             let handle = registry.repo(&id)?;
             let worktree = handle.create_worktree(&path, &branch).await?;
             Ok(worktree.path().to_path_buf())
@@ -821,7 +833,8 @@ impl RegistryService {
 
         // Register requires write lock
         self.runtime_handle.block_on(async {
-            let mut registry = self.registry.write().await;
+            let mut registry = self.registry.write()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
 
             // Generate a new repo ID
             let repo_id = RepoId::new();
@@ -849,7 +862,8 @@ impl RegistryService {
 
         // Remove requires write lock
         self.runtime_handle.block_on(async {
-            let mut registry = self.registry.write().await;
+            let mut registry = self.registry.write()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
             registry.remove_repository(&id).await?;
             Ok(())
         })
@@ -861,7 +875,8 @@ impl RegistryService {
         let worktree_path = PathBuf::from(worktree_path);
 
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
+            let registry = self.registry.read()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
             let handle = registry.repo(&id)?;
 
             // Get base repo path
@@ -884,7 +899,8 @@ impl RegistryService {
         let id = Self::parse_repo_id(repo_id)?;
 
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
+            let registry = self.registry.read()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
             let handle = registry.repo(&id)?;
 
             for file in files {
@@ -899,7 +915,8 @@ impl RegistryService {
         let id = Self::parse_repo_id(repo_id)?;
 
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
+            let registry = self.registry.read()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
             let handle = registry.repo(&id)?;
 
             // Get HEAD ref (DefaultBranch resolves to HEAD)
@@ -914,7 +931,8 @@ impl RegistryService {
         let ref_name = ref_name.to_owned();
 
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
+            let registry = self.registry.read()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
             let handle = registry.repo(&id)?;
 
             // Try to resolve as a revspec
@@ -932,7 +950,8 @@ impl RegistryService {
         let refspec = refspec.map(std::borrow::ToOwned::to_owned);
 
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
+            let registry = self.registry.read()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
             let handle = registry.repo(&id)?;
 
             // Get the repository path
@@ -966,7 +985,8 @@ impl RegistryService {
 
     /// Handle health check
     fn handle_health_check(&self) -> Result<HealthStatus> {
-        let registry = self.registry.blocking_read();
+        let registry = self.registry.read()
+            .map_err(|_| anyhow!("registry lock poisoned"))?;
         let repo_count = registry.list().count() as u32;
         Ok(HealthStatus {
             status: "healthy".to_owned(),
@@ -982,7 +1002,8 @@ impl RegistryService {
         let id = Self::parse_repo_id(repo_id)?;
 
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
+            let registry = self.registry.read()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
             let handle = registry.repo(&id)?;
 
             let remotes = handle.remote().list().await?;
@@ -1005,7 +1026,8 @@ impl RegistryService {
         let url = url.to_owned();
 
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
+            let registry = self.registry.read()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
             let handle = registry.repo(&id)?;
             handle.remote().add(&name, &url).await?;
             Ok(())
@@ -1018,7 +1040,8 @@ impl RegistryService {
         let name = name.to_owned();
 
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
+            let registry = self.registry.read()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
             let handle = registry.repo(&id)?;
             handle.remote().remove(&name).await?;
             Ok(())
@@ -1032,7 +1055,8 @@ impl RegistryService {
         let url = url.to_owned();
 
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
+            let registry = self.registry.read()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
             let handle = registry.repo(&id)?;
             handle.remote().set_url(&name, &url).await?;
             Ok(())
@@ -1046,7 +1070,8 @@ impl RegistryService {
         let new_name = new_name.to_owned();
 
         self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
+            let registry = self.registry.read()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
             let handle = registry.repo(&id)?;
             handle.remote().rename(&old_name, &new_name).await?;
             Ok(())
