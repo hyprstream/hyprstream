@@ -35,11 +35,17 @@ Download the [Universal AppImage](https://github.com/hyprstream/hyprstream/relea
 ```bash
 # Download and install (Universal recommended)
 chmod +x hyprstream-v0.2.0-x86_64.AppImage
-./hyprstream-v0.2.0-x86_64.AppImage service install
-./hyprstream-v0.2.0-x86_64.AppImage service start
 
-# Apply policy template - hyprstream is deny by default, the following treats local users as admins:
+# Install
+./hyprstream-v0.2.0-x86_64.AppImage service install
+
+# The following commands should use the installed copy
+export PATH="$HOME/.local/bin;$PATH"
+
+# Apply policy template - make local users admin; hyprstream is deny by default
 hyprstream apply-template local
+
+hyprstream service start
 ```
 
 The installed files will be located in `$HOME/.local/hyprstream/` and `$HOME/.local/bin/`.
