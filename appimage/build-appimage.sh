@@ -205,7 +205,6 @@ cmd_build() {
     log_info "Building hyprstream AppImage"
     log_info "Version: $VERSION"
     log_info "Variant: $variant"
-    df -h | grep -E '^/dev|Filesystem'
 
     ensure_appimagetool
 
@@ -276,7 +275,6 @@ cmd_clean() {
         rm -rf "$BUILD_DIR/hyprstream-$variant.AppDir"
         log_success "Cleaned $variant"
     fi
-    df -h | grep -E '^/dev|Filesystem'
 }
 
 # Main
