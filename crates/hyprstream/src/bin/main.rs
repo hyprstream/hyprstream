@@ -12,11 +12,11 @@ use hyprstream_core::auth::PolicyManager;
 use hyprstream_core::cli::commands::{Commands, ExecutionMode, ServiceAction, TrainingAction};
 use hyprstream_core::cli::{
     handle_branch, handle_checkout, handle_clone, handle_infer, handle_info,
-    handle_list, handle_policy_apply, handle_policy_apply_template,
+    handle_list, handle_load, handle_policy_apply, handle_policy_apply_template,
     handle_policy_check, handle_policy_diff, handle_policy_edit, handle_policy_history,
     handle_policy_list_templates, handle_policy_rollback, handle_policy_show, handle_pull,
     handle_remote_add, handle_remote_list, handle_remote_remove, handle_remote_rename,
-    handle_remote_set_url, handle_remove, handle_status, handle_token_create,
+    handle_remote_set_url, handle_remove, handle_status, handle_token_create, handle_unload,
     handle_training_batch, handle_training_checkpoint, handle_training_infer, handle_training_init,
     handle_worktree_add, handle_worktree_info, handle_worktree_list,
     handle_worktree_remove, load_or_generate_signing_key, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
@@ -516,8 +516,7 @@ fn main() -> Result<()> {
                     multi_threaded: true,
                 },
                 || async move {
-                    let storage = ctx.storage().await?;
-                    handle_branch(storage, &model, &name, from, policy).await
+                    handle_branch(ctx.registry().as_ref(), &model, &name, from, policy).await
                 },
             )?;
         }
@@ -535,8 +534,6 @@ fn main() -> Result<()> {
                     multi_threaded: true,
                 },
                 || async move {
-                    let storage = ctx.storage().await?;
-
                     // Build ModelRef from separate components
                     let git_ref_parsed = match git_ref {
                         Some(ref r) => GitRef::parse(r)?,
@@ -544,7 +541,7 @@ fn main() -> Result<()> {
                     };
                     let model_ref = ModelRef::with_ref(model, git_ref_parsed);
 
-                    handle_checkout(storage, &model_ref.to_string(), create_branch, force).await
+                    handle_checkout(ctx.registry().as_ref(), &model_ref.to_string(), create_branch, force).await
                 },
             )?;
         }
@@ -557,8 +554,7 @@ fn main() -> Result<()> {
                     multi_threaded: true,
                 },
                 || async move {
-                    let storage = ctx.storage().await?;
-                    handle_status(storage, model, verbose).await
+                    handle_status(ctx.registry().as_ref(), model, verbose).await
                 },
             )?;
         }
@@ -584,9 +580,8 @@ fn main() -> Result<()> {
                     multi_threaded: true,
                 },
                 || async move {
-                    let storage = ctx.storage().await?;
                     handle_commit(
-                        storage,
+                        ctx.registry().as_ref(),
                         &model,
                         &message,
                         all,
@@ -613,7 +608,7 @@ fn main() -> Result<()> {
                     multi_threaded: true,
                 },
                 || async move {
-                    let storage = ctx.storage().await?;
+                    let registry = ctx.registry();
                     match cmd.action {
                         TrainingAction::Init {
                             model,
@@ -626,7 +621,7 @@ fn main() -> Result<()> {
                             learning_rate,
                         } => {
                             handle_training_init(
-                                storage,
+                                registry.as_ref(),
                                 &model,
                                 branch,
                                 adapter,
@@ -662,7 +657,7 @@ fn main() -> Result<()> {
                                 }
                             };
                             handle_training_infer(
-                                storage,
+                                registry.as_ref(),
                                 &model,
                                 &prompt_text,
                                 image,
@@ -696,7 +691,7 @@ fn main() -> Result<()> {
                             kv_quant,
                         } => {
                             handle_training_batch(
-                                storage,
+                                registry.as_ref(),
                                 &model,
                                 input,
                                 input_dir,
@@ -722,7 +717,7 @@ fn main() -> Result<()> {
                             push,
                             remote,
                         } => {
-                            handle_training_checkpoint(storage, &model, message, push, &remote)
+                            handle_training_checkpoint(registry.as_ref(), &model, message, push, &remote)
                                 .await
                         }
                     }
@@ -741,9 +736,9 @@ fn main() -> Result<()> {
             repeat_penalty,
             seed,
             stream,
-            force_download,
-            max_context,
-            kv_quant,
+            force_download: _,
+            max_context: _,
+            kv_quant: _,
         } => {
             // Read prompt from stdin if not provided via --prompt
             let prompt = match prompt {
@@ -756,7 +751,6 @@ fn main() -> Result<()> {
                 }
             };
 
-            let ctx = ctx.clone();
             let signing_key = signing_key.clone();
             with_runtime(
                 RuntimeConfig {
@@ -764,9 +758,7 @@ fn main() -> Result<()> {
                     multi_threaded: true,
                 },
                 || async move {
-                    let storage = ctx.storage().await?;
                     handle_infer(
-                        storage,
                         &model,
                         &prompt,
                         image,
@@ -777,11 +769,7 @@ fn main() -> Result<()> {
                         repeat_penalty,
                         seed,
                         stream,
-                        force_download,
-                        max_context,
-                        kv_quant,
                         signing_key,
-                        verifying_key,
                     )
                     .await
                 },
@@ -796,16 +784,44 @@ fn main() -> Result<()> {
                     multi_threaded: true,
                 },
                 || async move {
-                    let storage = ctx.storage().await?;
-
                     // Load PolicyManager for permission-aware capability display
-                    let registry_path = storage.get_models_dir().join(".registry");
+                    let registry_path = ctx.models_dir().join(".registry");
                     let policies_dir = registry_path.join("policies");
                     let policy_manager = PolicyManager::new(&policies_dir)
                         .await
                         .ok(); // Gracefully fall back to None if policies don't exist
 
-                    handle_list(storage, policy_manager.as_ref()).await
+                    handle_list(ctx.registry().as_ref(), policy_manager.as_ref()).await
+                },
+            )?;
+        }
+
+        Commands::Load {
+            model,
+            max_context,
+            kv_quant,
+        } => {
+            let signing_key = signing_key.clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_gpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    handle_load(&model, max_context, kv_quant.into(), signing_key).await
+                },
+            )?;
+        }
+
+        Commands::Unload { model } => {
+            let signing_key = signing_key.clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    handle_unload(&model, signing_key).await
                 },
             )?;
         }
@@ -822,8 +838,7 @@ fn main() -> Result<()> {
                     multi_threaded: true,
                 },
                 || async move {
-                    let storage = ctx.storage().await?;
-                    match handle_info(storage, &model, verbose, adapters_only).await {
+                    match handle_info(ctx.registry().as_ref(), &model, verbose, adapters_only).await {
                         Ok(()) => Ok(()),
                         Err(e) => {
                             // Print error but continue to show what we can
@@ -852,9 +867,8 @@ fn main() -> Result<()> {
                     multi_threaded: true,
                 },
                 || async move {
-                    let storage = ctx.storage().await?;
                     handle_clone(
-                        storage,
+                        ctx.registry().as_ref(),
                         &repo_url,
                         name,
                         branch,
@@ -883,8 +897,7 @@ fn main() -> Result<()> {
                     multi_threaded: true,
                 },
                 || async move {
-                    let storage = ctx.storage().await?;
-                    handle_push(storage, &model, remote, branch, set_upstream, force).await
+                    handle_push(ctx.registry().as_ref(), &model, remote, branch, set_upstream, force).await
                 },
             )?;
         }
@@ -902,8 +915,7 @@ fn main() -> Result<()> {
                     multi_threaded: true,
                 },
                 || async move {
-                    let storage = ctx.storage().await?;
-                    handle_pull(storage, &model, remote, branch, rebase).await
+                    handle_pull(ctx.registry().as_ref(), &model, remote, branch, rebase).await
                 },
             )?;
         }
@@ -938,7 +950,6 @@ fn main() -> Result<()> {
                 || async move {
                     use hyprstream_core::cli::git_handlers::MergeOptions;
 
-                    let storage = ctx.storage().await?;
                     let options = MergeOptions {
                         ff,
                         no_ff,
@@ -957,7 +968,7 @@ fn main() -> Result<()> {
                         allow_unrelated_histories,
                         no_verify,
                     };
-                    handle_merge(storage, &target, &source, options).await
+                    handle_merge(ctx.registry().as_ref(), &target, &source, options).await
                 },
             )?;
         }
@@ -975,8 +986,7 @@ fn main() -> Result<()> {
                     multi_threaded: true,
                 },
                 || async move {
-                    let storage = ctx.storage().await?;
-                    handle_remove(storage, &model, force, registry_only, files_only).await
+                    handle_remove(ctx.registry().as_ref(), &model, force, registry_only, files_only).await
                 },
             )?;
         }
@@ -991,19 +1001,18 @@ fn main() -> Result<()> {
                     multi_threaded: true,
                 },
                 || async move {
-                    let storage = ctx.storage().await?;
                     match command {
                         WorktreeCommand::Add { model, branch, policy } => {
-                            handle_worktree_add(storage, &model, &branch, policy).await
+                            handle_worktree_add(ctx.registry().as_ref(), &model, &branch, policy).await
                         }
                         WorktreeCommand::List { model, all } => {
-                            handle_worktree_list(storage, &model, all).await
+                            handle_worktree_list(ctx.registry().as_ref(), &model, all).await
                         }
                         WorktreeCommand::Info { model, branch } => {
-                            handle_worktree_info(storage, &model, &branch).await
+                            handle_worktree_info(ctx.registry().as_ref(), &model, &branch).await
                         }
                         WorktreeCommand::Remove { model, branch, force } => {
-                            handle_worktree_remove(storage, &model, &branch, force).await
+                            handle_worktree_remove(ctx.registry().as_ref(), &model, &branch, force).await
                         }
                     }
                 },
@@ -1060,8 +1069,7 @@ fn main() -> Result<()> {
                 },
                 || async move {
                     // Get the policies directory from the registry
-                    let storage = ctx.storage().await?;
-                    let registry_path = storage.get_models_dir().join(".registry");
+                    let registry_path = ctx.models_dir().join(".registry");
                     let policies_dir = registry_path.join("policies");
 
                     // Initialize policy manager
@@ -1145,22 +1153,21 @@ fn main() -> Result<()> {
                     multi_threaded: true,
                 },
                 || async move {
-                    let storage = ctx.storage().await?;
                     match command {
                         RemoteCommand::Add { model, name, url } => {
-                            handle_remote_add(storage, &model, &name, &url).await
+                            handle_remote_add(ctx.registry().as_ref(), &model, &name, &url).await
                         }
                         RemoteCommand::List { model, verbose } => {
-                            handle_remote_list(storage, &model, verbose).await
+                            handle_remote_list(ctx.registry().as_ref(), &model, verbose).await
                         }
                         RemoteCommand::Remove { model, name } => {
-                            handle_remote_remove(storage, &model, &name).await
+                            handle_remote_remove(ctx.registry().as_ref(), &model, &name).await
                         }
                         RemoteCommand::SetUrl { model, name, url } => {
-                            handle_remote_set_url(storage, &model, &name, &url).await
+                            handle_remote_set_url(ctx.registry().as_ref(), &model, &name, &url).await
                         }
                         RemoteCommand::Rename { model, old_name, new_name } => {
-                            handle_remote_rename(storage, &model, &old_name, &new_name).await
+                            handle_remote_rename(ctx.registry().as_ref(), &model, &old_name, &new_name).await
                         }
                     }
                 },

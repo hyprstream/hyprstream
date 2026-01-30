@@ -56,6 +56,30 @@ struct RegistryRequest {
     removeRemote @22 :RemoveRemoteRequest;
     setRemoteUrl @23 :SetRemoteUrlRequest;
     renameRemote @24 :RenameRemoteRequest;
+
+    # Streaming operations
+    cloneStream @27 :CloneRequest;  # Clone with streaming progress
+
+    # Push operations
+    push @28 :PushRequest;
+
+    # Advanced commit operations
+    amendCommit @29 :AmendCommitRequest;
+    commitWithAuthor @30 :CommitWithAuthorRequest;
+    stageAllIncludingUntracked @31 :Text;  # repo_id
+
+    # Merge conflict resolution
+    abortMerge @32 :Text;    # repo_id
+    continueMerge @33 :ContinueMergeRequest;
+    quitMerge @34 :Text;     # repo_id
+
+    # Tag operations
+    listTags @35 :Text;      # repo_id
+    createTag @36 :CreateTagRequest;
+    deleteTag @37 :DeleteTagRequest;
+
+    # Detailed status
+    detailedStatus @38 :Text; # repo_id
   }
 }
 
@@ -77,7 +101,17 @@ struct RegistryResponse {
     health @10 :HealthStatus;
     remotes @11 :List(RemoteInfo);
     repositoryStatus @12 :RepositoryStatus;
+    streamStarted @13 :StreamStartedInfo;  # For streaming operations
+    tags @14 :List(Text);
+    detailedStatus @15 :DetailedStatusInfo;
   }
+}
+
+# Stream Started Info (for cloneStream)
+struct StreamStartedInfo {
+  streamId @0 :Text;
+  streamEndpoint @1 :Text;
+  serverPubkey @2 :Data;  # 32-byte DH public key for key derivation
 }
 
 # Clone Request
@@ -245,4 +279,69 @@ struct RepositoryStatus {
   behind @3 :UInt32;
   isClean @4 :Bool;
   modifiedFiles @5 :List(Text); # Paths of modified files
+}
+
+# Push Request
+
+struct PushRequest {
+  repoId @0 :Text;
+  remote @1 :Text;
+  refspec @2 :Text;
+  force @3 :Bool;
+}
+
+# Amend Commit Request
+
+struct AmendCommitRequest {
+  repoId @0 :Text;
+  message @1 :Text;
+}
+
+# Commit with Author Request
+
+struct CommitWithAuthorRequest {
+  repoId @0 :Text;
+  message @1 :Text;
+  authorName @2 :Text;
+  authorEmail @3 :Text;
+}
+
+# Continue Merge Request
+
+struct ContinueMergeRequest {
+  repoId @0 :Text;
+  message @1 :Text;  # Optional merge message
+}
+
+# Create Tag Request
+
+struct CreateTagRequest {
+  repoId @0 :Text;
+  name @1 :Text;
+  target @2 :Text;  # Optional target (defaults to HEAD)
+}
+
+# Delete Tag Request
+
+struct DeleteTagRequest {
+  repoId @0 :Text;
+  name @1 :Text;
+}
+
+# Detailed Status Info
+
+struct DetailedStatusInfo {
+  branch @0 :Text;             # Optional branch name
+  headOid @1 :Text;            # Optional HEAD commit OID
+  mergeInProgress @2 :Bool;
+  rebaseInProgress @3 :Bool;
+  ahead @4 :UInt32;
+  behind @5 :UInt32;
+  files @6 :List(FileStatusInfo);
+}
+
+struct FileStatusInfo {
+  path @0 :Text;
+  indexStatus @1 :Text;        # Single char: A, M, D, R, ?, T, U, or empty
+  worktreeStatus @2 :Text;     # Single char: A, M, D, R, ?, T, U, or empty
 }

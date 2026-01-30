@@ -90,6 +90,40 @@ impl ToCapnp for WorktreeData {
     }
 }
 
+/// File status data for detailed status.
+#[derive(Debug, Clone)]
+pub struct FileStatusData {
+    pub path: String,
+    pub index_status: Option<String>,
+    pub worktree_status: Option<String>,
+}
+
+impl ToCapnp for FileStatusData {
+    type Builder<'a> = registry_capnp::file_status_info::Builder<'a>;
+
+    fn write_to(&self, builder: &mut Self::Builder<'_>) {
+        builder.set_path(&self.path);
+        if let Some(ref status) = self.index_status {
+            builder.set_index_status(status);
+        }
+        if let Some(ref status) = self.worktree_status {
+            builder.set_worktree_status(status);
+        }
+    }
+}
+
+/// Detailed repository status data.
+#[derive(Debug, Clone)]
+pub struct DetailedStatusData {
+    pub branch: Option<String>,
+    pub head: Option<String>,
+    pub merge_in_progress: bool,
+    pub rebase_in_progress: bool,
+    pub files: Vec<FileStatusData>,
+    pub ahead: u32,
+    pub behind: u32,
+}
+
 // ============================================================================
 // Response Builder Helper
 // ============================================================================
@@ -343,6 +377,76 @@ impl RegistryResponse {
         let mut files_builder = status_builder.init_modified_files(status.modified_files.len() as u32);
         for (i, file) in status.modified_files.iter().enumerate() {
             files_builder.set(i as u32, file.to_string_lossy());
+        }
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a stream started response (for streaming clone).
+    pub fn stream_started(
+        request_id: u64,
+        stream_id: &str,
+        stream_endpoint: &str,
+        server_pubkey: &[u8; 32],
+    ) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut stream_info = response.init_stream_started();
+        stream_info.set_stream_id(stream_id);
+        stream_info.set_stream_endpoint(stream_endpoint);
+        stream_info.set_server_pubkey(server_pubkey);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a tags list response.
+    pub fn tags(request_id: u64, tags: &[String]) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut tags_builder = response.init_tags(tags.len() as u32);
+        for (i, tag) in tags.iter().enumerate() {
+            tags_builder.set(i as u32, tag);
+        }
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a detailed status response.
+    pub fn detailed_status(request_id: u64, status: &DetailedStatusData) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut status_builder = response.init_detailed_status();
+
+        // Set optional fields
+        if let Some(ref branch) = status.branch {
+            status_builder.set_branch(branch);
+        }
+        if let Some(ref head) = status.head {
+            status_builder.set_head_oid(head);
+        }
+
+        status_builder.set_merge_in_progress(status.merge_in_progress);
+        status_builder.set_rebase_in_progress(status.rebase_in_progress);
+        status_builder.set_ahead(status.ahead);
+        status_builder.set_behind(status.behind);
+
+        // Set files
+        let mut files_builder = status_builder.init_files(status.files.len() as u32);
+        for (i, file) in status.files.iter().enumerate() {
+            let mut file_builder = files_builder.reborrow().get(i as u32);
+            file.write_to(&mut file_builder);
         }
 
         let mut bytes = Vec::new();
@@ -876,6 +980,113 @@ impl StreamPayloadExt for StreamPayload {
             StreamPayload::Complete(data) => {
                 let stats = InferenceComplete::from_bytes(&data)?;
                 Ok(InferenceStreamPayload::Complete(stats))
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Clone/Registry Stream Types
+// ============================================================================
+
+/// Clone progress message (serialized as JSON in stream Data payloads).
+///
+/// Sent during streaming clone operations to report progress.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CloneProgress {
+    /// Progress message (e.g., "Cloning started", "Completed")
+    pub message: String,
+    /// Optional percentage (0-100)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent: Option<u8>,
+    /// Optional bytes transferred
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_transferred: Option<u64>,
+    /// Optional total bytes
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+}
+
+impl CloneProgress {
+    /// Create a simple message progress.
+    pub fn message(msg: impl Into<String>) -> Self {
+        Self {
+            message: msg.into(),
+            percent: None,
+            bytes_transferred: None,
+            total_bytes: None,
+        }
+    }
+
+    /// Serialize to bytes for StreamPayload.data.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+
+    /// Deserialize from StreamPayload.data bytes.
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        serde_json::from_slice(data).map_err(|e| anyhow::anyhow!("Failed to parse CloneProgress: {}", e))
+    }
+}
+
+/// Clone completion data (serialized in stream Complete payloads).
+///
+/// Sent when a streaming clone completes successfully.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CloneComplete {
+    /// Repository ID of the cloned repo
+    pub repo_id: String,
+    /// Clone duration in milliseconds
+    pub duration_ms: u64,
+}
+
+impl CloneComplete {
+    /// Serialize to bytes for StreamPayload.complete.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+
+    /// Deserialize from StreamPayload.complete bytes.
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        serde_json::from_slice(data).map_err(|e| anyhow::anyhow!("Failed to parse CloneComplete: {}", e))
+    }
+}
+
+/// Clone-specific stream payload (parsed from generic StreamPayload).
+///
+/// Provides typed access to clone stream data:
+/// - Progress: Clone progress update
+/// - Error: Error message
+/// - Complete: Clone completion info
+#[derive(Debug, Clone)]
+pub enum CloneStreamPayload {
+    /// Progress update
+    Progress(CloneProgress),
+    /// Error during cloning
+    Error(String),
+    /// Completion with repository info
+    Complete(CloneComplete),
+}
+
+/// Extension trait to convert generic StreamPayload to clone-specific payload.
+pub trait CloneStreamPayloadExt {
+    /// Convert generic payload to clone-specific payload.
+    fn to_clone(self) -> Result<CloneStreamPayload>;
+}
+
+impl CloneStreamPayloadExt for StreamPayload {
+    fn to_clone(self) -> Result<CloneStreamPayload> {
+        match self {
+            StreamPayload::Data(data) => {
+                let progress = CloneProgress::from_bytes(&data)?;
+                Ok(CloneStreamPayload::Progress(progress))
+            }
+            StreamPayload::Error(message) => {
+                Ok(CloneStreamPayload::Error(message))
+            }
+            StreamPayload::Complete(data) => {
+                let complete = CloneComplete::from_bytes(&data)?;
+                Ok(CloneStreamPayload::Complete(complete))
             }
         }
     }

@@ -1,6 +1,6 @@
 //! CLI handlers for adaptive ML inference server
 
-use crate::storage::ModelStorage;
+use crate::services::RegistryClient;
 use crate::training::{CheckpointManager, WeightFormat, WeightSnapshot};
 use ::config::{Config, File};
 use reqwest::Client;
@@ -346,24 +346,17 @@ pub async fn handle_pretrain(
 
 /// Handle checkpoint write command
 pub async fn handle_write_checkpoint(
+    registry: &dyn RegistryClient,
     model_id: String,
     _name: Option<String>,
     step: Option<usize>,
-    client: Option<std::sync::Arc<dyn crate::services::RegistryClient>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Writing checkpoint for model: {}", model_id);
 
-    // Load model storage - use shared client if provided, otherwise start internal service
-    let config = crate::config::HyprConfig::load().unwrap_or_default();
-    let storage = if let Some(client) = client {
-        ModelStorage::new(client, config.models_dir().to_path_buf())
-    } else {
-        ModelStorage::create(config.models_dir().to_path_buf()).await?
-    };
-
-    // Resolve model path
+    // Resolve model path via registry
     let model_ref = crate::storage::ModelRef::parse(&model_id)?;
-    let model_path = storage.get_model_path(&model_ref).await?;
+    let branch = model_ref.git_ref_str();
+    let model_path = registry.model_path(&model_ref.model, branch.as_deref()).await?;
 
     // Create checkpoint manager
     let checkpoint_mgr = CheckpointManager::new(model_path.clone())?;

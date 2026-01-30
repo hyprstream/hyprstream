@@ -1,10 +1,18 @@
 //! Fluent builder API for cloning repositories
 //!
-//! Provides a git-native interface for cloning with multiple configuration options
+//! Provides a git-native interface for cloning with multiple configuration options.
+//!
+//! [`CloneBuilder`] takes ownership of an `Arc<RwLock<Git2DB>>` and manages locks
+//! internally for optimal performance - releasing the lock during network I/O.
 
+use crate::callback_config::CallbackConfig;
 use crate::errors::{Git2DBError, Git2DBResult};
 use crate::references::GitRef;
 use crate::registry::{Git2DB, RemoteConfig, RepoId};
+use crate::storage::Driver;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// Automatically initialize XET for URLs that have XET support
 ///
@@ -56,57 +64,59 @@ async fn maybe_init_xet_for_url(_url: &str) -> Git2DBResult<()> {
     Ok(())
 }
 
-/// Builder for cloning repositories with fluent configuration
+/// Builder for cloning repositories with fluent configuration.
 ///
-/// Provides a chainable interface for configuring clone operations.
+/// Manages locks internally for minimal lock duration:
+/// - Brief read lock for configuration (base_dir, existing repo check)
+/// - No lock during network clone (the slow part)
+/// - Brief write lock for final registration
 ///
 /// # Examples
 ///
 /// ```rust,no_run
-/// # async fn example(registry: &mut git2db::Git2DB) -> Result<(), Box<dyn std::error::Error>> {
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// use git2db::Git2DB;
+/// use std::sync::Arc;
+/// use tokio::sync::RwLock;
+///
+/// let registry = Arc::new(RwLock::new(Git2DB::open("/models").await?));
+///
 /// // Basic clone
-/// let id = registry.clone("https://github.com/user/repo.git")
+/// let id = git2db::CloneBuilder::new(Arc::clone(&registry), "https://github.com/user/repo.git")
 ///     .exec()
 ///     .await?;
 ///
 /// // Clone with configuration
-/// let id = registry.clone("https://github.com/user/repo.git")
+/// let id = git2db::CloneBuilder::new(Arc::clone(&registry), "https://github.com/user/repo.git")
 ///     .name("my-repo")
 ///     .branch("develop")
-///     .remote("backup", "https://backup.com/repo.git")
 ///     .depth(1)
-///     .exec()
-///     .await?;
-///
-/// // Clone with multiple remotes (gittorrent support)
-/// let id = registry.clone("https://github.com/user/repo.git")
-///     .name("distributed-repo")
-///     .remote("p2p", "gittorrent://peer/repo")
-///     .remote("mirror", "https://mirror.com/repo.git")
 ///     .exec()
 ///     .await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct CloneBuilder<'a> {
-    registry: &'a mut Git2DB,
+pub struct CloneBuilder {
+    registry: Arc<RwLock<Git2DB>>,
     url: String,
     name: Option<String>,
     reference: GitRef,
     depth: Option<u32>,
     remotes: Vec<(String, String)>,
+    callback_config: Option<CallbackConfig>,
 }
 
-impl<'a> CloneBuilder<'a> {
-    /// Create a new clone builder
-    pub(crate) fn new(registry: &'a mut Git2DB, url: String) -> Self {
+impl CloneBuilder {
+    /// Create a new clone builder.
+    pub fn new(registry: Arc<RwLock<Git2DB>>, url: impl Into<String>) -> Self {
         Self {
             registry,
-            url,
+            url: url.into(),
             name: None,
             reference: GitRef::DefaultBranch,
             depth: None,
             remotes: Vec::new(),
+            callback_config: None,
         }
     }
 
@@ -156,7 +166,7 @@ impl<'a> CloneBuilder<'a> {
     /// # Examples
     ///
     /// ```rust,ignore
-    /// registry.clone("https://github.com/user/repo.git")
+    /// CloneBuilder::new(Arc::clone(&registry), "https://github.com/user/repo.git")
     ///     .remote("backup", "https://backup.com/repo.git")
     ///     .remote("p2p", "gittorrent://peer/repo")
     ///     .exec()
@@ -175,39 +185,72 @@ impl<'a> CloneBuilder<'a> {
         self
     }
 
-    /// Execute the clone operation
+    /// Set callback configuration for progress reporting and authentication
     ///
-    /// Returns the RepoId of the newly cloned repository.
-    pub async fn exec(self) -> Git2DBResult<RepoId> {
-        // Auto-initialize XET for URLs with XET support (e.g., HuggingFace)
+    /// This allows custom progress callbacks during clone operations.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use git2db::callback_config::{CallbackConfig, ProgressConfig, ProgressReporter};
+    /// use std::sync::Arc;
+    ///
+    /// struct MyReporter;
+    /// impl ProgressReporter for MyReporter {
+    ///     fn report(&self, stage: &str, current: usize, total: usize) {
+    ///         println!("{}: {}/{}", stage, current, total);
+    ///     }
+    /// }
+    ///
+    /// let config = CallbackConfig::new()
+    ///     .with_progress(ProgressConfig::Channel(Arc::new(MyReporter)));
+    ///
+    /// CloneBuilder::new(Arc::clone(&registry), "https://github.com/user/repo.git")
+    ///     .callback_config(config)
+    ///     .exec()
+    ///     .await?;
+    /// ```
+    pub fn callback_config(mut self, config: CallbackConfig) -> Self {
+        self.callback_config = Some(config);
+        self
+    }
+
+    /// Execute the clone operation with minimal lock duration.
+    ///
+    /// Lock strategy:
+    /// 1. Read lock: Get config (base_dir, check existing, storage driver)
+    /// 2. No lock: Perform network clone (the slow part)
+    /// 3. Write lock: Register repository
+    pub async fn exec(mut self) -> Git2DBResult<RepoId> {
+        // Auto-initialize XET for URLs with XET support
         maybe_init_xet_for_url(&self.url).await?;
 
         // Generate repository ID
         let repo_id = RepoId::new();
 
         // Determine repository name
-        let repo_name = self
-            .name
-            .clone()
-            .unwrap_or_else(|| repo_id.to_string());
-
-        // Validate repository name for security
+        let repo_name = self.name.clone().unwrap_or_else(|| repo_id.to_string());
         validate_repo_name(&repo_name)?;
 
-        // Build paths using safe_path to prevent traversal
-        let models_dir = self.registry.base_dir();
+        // ===== Phase 1: Read lock for configuration =====
+        let (models_dir, driver): (PathBuf, Arc<dyn Driver>) = {
+            let registry = self.registry.read().await;
 
-        // models/{name}/
-        let repo_dir = safe_path::scoped_join(models_dir, &repo_name)
+            // Check if already registered (idempotent return)
+            if let Some(tracked) = registry.get_by_name(&repo_name) {
+                tracing::info!("Repository '{}' already registered with ID {}", repo_name, tracked.id);
+                return Ok(tracked.id.clone());
+            }
+
+            (
+                registry.base_dir().to_path_buf(),
+                registry.storage_driver().clone(),
+            )
+        }; // Read lock released
+
+        // Build paths
+        let repo_dir = safe_path::scoped_join(&models_dir, &repo_name)
             .map_err(|e| Git2DBError::configuration(format!("Invalid repository name: {e}")))?;
-
-        // Check if already fully registered (idempotent return)
-        if let Some(tracked) = self.registry.get_by_name(&repo_name) {
-            tracing::info!("Repository '{}' already registered with ID {}", repo_name, tracked.id);
-            return Ok(tracked.id.clone());
-        }
-
-        // Build paths (repo_name is already validated, so simple join is safe)
         let bare_repo_name = format!("{}.git", &repo_name);
         let bare_repo_path = repo_dir.join(&bare_repo_name);
         let worktrees_dir = repo_dir.join("worktrees");
@@ -220,7 +263,6 @@ impl<'a> CloneBuilder<'a> {
                     Some(repo)
                 }
                 Err(_) => {
-                    // Corrupted/incomplete - cleanup and restart
                     tracing::warn!("Removing incomplete/corrupted clone at {:?}", repo_dir);
                     std::fs::remove_dir_all(&repo_dir).map_err(|e| {
                         Git2DBError::repository(&repo_dir, format!("Failed to cleanup incomplete clone: {e}"))
@@ -232,7 +274,7 @@ impl<'a> CloneBuilder<'a> {
             None
         };
 
-        // Create directory structure only if fresh clone
+        // Create directory structure if fresh clone
         if existing_bare_repo.is_none() {
             std::fs::create_dir_all(&repo_dir).map_err(|e| {
                 Git2DBError::repository(&repo_dir, format!("Failed to create repo directory: {e}"))
@@ -242,60 +284,51 @@ impl<'a> CloneBuilder<'a> {
             })?;
         }
 
-        // Clone or reuse existing bare repo
+        // ===== Phase 2: No lock - perform network clone =====
         let bare_repo = if let Some(repo) = existing_bare_repo {
             repo
         } else {
-            // Perform the clone using git2 directly for bare repos
             tracing::info!("Cloning repository '{}' as bare to {:?}", repo_name, bare_repo_path);
 
-            // Get default clone options from GitManager for authentication
-            let clone_options = crate::manager::GitManager::global().default_clone_options();
+            let clone_options = if let Some(config) = self.callback_config.take() {
+                crate::clone_options::CloneOptions::with_callback_config(config)
+            } else {
+                crate::manager::GitManager::global().default_clone_options()
+            };
 
             let url_clone = self.url.clone();
             let bare_path_clone = bare_repo_path.clone();
 
+            // This is the slow network operation - no lock held!
             tokio::task::spawn_blocking(move || -> Git2DBResult<git2::Repository> {
-                // Convert to git2 options inside spawn_blocking (where non-Send is acceptable)
                 let mut git2_options = clone_options.to_git2_options();
-
                 let mut builder = git2::build::RepoBuilder::new();
-
-                // Set up bare clone
                 builder.bare(true);
-
-                // Apply fetch options with authentication callbacks from GitManager
                 builder.fetch_options(git2_options.create_fetch_options()
                     .map_err(|e| Git2DBError::internal(format!("Failed to create fetch options: {e}")))?);
 
-                // Perform the clone
-                let repo = builder.clone(&url_clone, &bare_path_clone)
+                builder.clone(&url_clone, &bare_path_clone)
                     .map_err(|e| Git2DBError::repository(
                         &bare_path_clone,
                         format!("Failed to clone bare repository: {e}")
-                    ))?;
-
-                Ok(repo)
+                    ))
             })
             .await
             .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))??
         };
 
-        // Add additional remotes to bare repo
+        // Add additional remotes
         for (remote_name, remote_url) in &self.remotes {
             bare_repo.remote(remote_name, remote_url).map_err(|e| {
                 Git2DBError::configuration(format!("Failed to add remote '{remote_name}': {e}"))
             })?;
         }
 
-        // Get the default branch from bare repo
+        // Get default branch and create worktrees
         let default_branch = get_default_branch(&bare_repo)?;
         tracing::debug!("Default branch detected: {}", default_branch);
 
-        // Create initial worktree for the default branch
         let initial_worktree = worktrees_dir.join(&default_branch);
-
-        // Create parent directories if default branch has hierarchy
         if let Some(parent) = initial_worktree.parent() {
             if parent != worktrees_dir {
                 std::fs::create_dir_all(parent).map_err(|e| {
@@ -305,14 +338,9 @@ impl<'a> CloneBuilder<'a> {
         }
 
         tracing::info!("Creating default worktree '{}' at {:?}", default_branch, initial_worktree);
-
-        // Get storage driver from registry for worktree creation
-        let driver = self.registry.storage_driver().clone();
-
-        // Create worktree from bare repo
         create_worktree(&driver, &bare_repo_path, &initial_worktree, &default_branch).await?;
 
-        // If a specific reference was requested and it's different from default, create another worktree
+        // Create additional worktree if requested ref differs from default
         let checkout_ref = match &self.reference {
             GitRef::DefaultBranch => default_branch.clone(),
             GitRef::Branch(b) => b.clone(),
@@ -322,30 +350,22 @@ impl<'a> CloneBuilder<'a> {
         };
 
         if checkout_ref != default_branch && !matches!(self.reference, GitRef::DefaultBranch) {
-            // Create additional worktree for the requested reference
             let ref_worktree_path = worktrees_dir.join(&checkout_ref);
-
-            // Create parent directories for hierarchical branches
             if let Some(parent) = ref_worktree_path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
                     Git2DBError::configuration(format!("Failed to create worktree parent directories: {e}"))
                 })?;
             }
-
             tracing::info!("Creating worktree for ref '{}'", checkout_ref);
             create_worktree(&driver, &bare_repo_path, &ref_worktree_path, &checkout_ref).await?;
         }
 
-        // Note: LFS files are automatically fetched by GitManager::create_worktree()
-        // Fetch is always atomic - failures trigger automatic worktree rollback
-
-        // Build remote configs (origin + additional)
+        // Build remote configs
         let mut remote_configs = vec![RemoteConfig {
             name: "origin".to_owned(),
             url: self.url.clone(),
             fetch_refs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
         }];
-
         for (name, url) in self.remotes {
             remote_configs.push(RemoteConfig {
                 name: name.clone(),
@@ -354,18 +374,21 @@ impl<'a> CloneBuilder<'a> {
             });
         }
 
-        // Register in Git2DB with full configuration (registry tracks the bare repo)
-        self.registry
-            .register_repository_internal(
-                repo_id.clone(),
-                self.name.clone(),
-                self.url,
-                bare_repo_path, // Registry tracks bare repo, not worktree
-                self.reference,
-                remote_configs,
-                std::collections::HashMap::new(), // No metadata for cloned repos by default
-            )
-            .await?;
+        // ===== Phase 3: Write lock for registration =====
+        {
+            let mut registry = self.registry.write().await;
+            registry
+                .register_repository_internal(
+                    repo_id.clone(),
+                    self.name.clone(),
+                    self.url,
+                    bare_repo_path,
+                    self.reference,
+                    remote_configs,
+                    std::collections::HashMap::new(),
+                )
+                .await?;
+        } // Write lock released
 
         Ok(repo_id)
     }
@@ -465,9 +488,8 @@ mod tests {
     #[test]
     fn test_builder_fluent_api() {
         // This test just validates the fluent API compiles correctly
-        fn _example(registry: &mut Git2DB) {
-            let _builder = registry
-                .clone("https://github.com/user/repo.git")
+        fn _example(registry: Arc<RwLock<Git2DB>>) {
+            let _builder = CloneBuilder::new(Arc::clone(&registry), "https://github.com/user/repo.git")
                 .name("my-repo")
                 .branch("main")
                 .remote("backup", "https://backup.com/repo.git")

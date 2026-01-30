@@ -66,25 +66,20 @@ async fn list_models(
         ).into_response();
     }
 
-    match state.model_storage.list_models().await {
+    match state.registry.list_models().await {
         Ok(models) => {
             // Transform the raw model data into a cleaner response format
             let model_list: Vec<ModelListItem> = models
                 .into_iter()
-                .map(|(model_ref, metadata)| {
-                    let local_path = None; // Path is managed by registry
-
+                .map(|model_info| {
                     ModelListItem {
-                        id: model_ref.model.clone(),
-                        name: metadata
-                            .display_name
-                            .clone()
-                            .unwrap_or_else(|| metadata.name.clone()),
-                        display_name: metadata.display_name,
-                        architecture: metadata.model_type.clone(),
-                        size_bytes: metadata.size_bytes.unwrap_or(0),
+                        id: model_info.model.clone(),
+                        name: model_info.display_name.clone(),
+                        display_name: Some(model_info.display_name),
+                        architecture: "language_model".to_owned(),
+                        size_bytes: 0, // Size is managed by registry
                         is_cached: true,
-                        local_path,
+                        local_path: Some(model_info.path.to_string_lossy().to_string()),
                     }
                 })
                 .collect();
@@ -121,7 +116,7 @@ async fn get_model_info(
     // Parse model reference
     use crate::storage::model_ref::ModelRef;
     if let Ok(model_ref) = ModelRef::parse(&id) {
-        if let Ok(_path) = state.model_storage.get_model_path(&model_ref).await {
+        if let Ok(_path) = state.registry.get_model_path(&model_ref).await {
             // Create metadata for the found model
             let metadata = crate::storage::ModelMetadata {
                 name: model_ref.model.clone(),
@@ -221,8 +216,9 @@ async fn download_model(
             .into_response();
     }
 
-    // Use shared model storage (backed by registry client, no duplicate service)
-    if let Err(e) = state.model_storage.add_model(&model_name, &request.uri).await {
+    // Use registry client to clone model (no duplicate service)
+    let clone_opts = crate::services::CloneOptions::default();
+    if let Err(e) = state.registry.clone_repo(&request.uri, Some(&model_name), &clone_opts).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -234,7 +230,7 @@ async fn download_model(
 
     // Get model path for response
     let model_ref = crate::storage::ModelRef::new(model_name.clone());
-    let model_path = match state.model_storage.get_model_path(&model_ref).await {
+    let model_path = match state.registry.get_model_path(&model_ref).await {
         Ok(path) => path,
         Err(e) => {
             return (
@@ -288,7 +284,7 @@ async fn load_model(
     };
 
     // Get model path
-    let model_path = match state.model_storage.get_model_path(&model_ref).await {
+    let model_path = match state.registry.get_model_path(&model_ref).await {
         Ok(path) => path,
         Err(e) => {
             return (

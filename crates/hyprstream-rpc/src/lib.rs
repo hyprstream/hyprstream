@@ -85,6 +85,8 @@ pub mod prelude {
         EnvelopeError, EnvelopeResult, Result, RpcError,
         // Service
         EnvelopeContext, RequestLoop, ServiceHandle, ZmqClient, ZmqService,
+        // Streaming
+        StreamContext, StreamPublisher,
         // Spawner
         ProcessBackend, ProcessConfig, ProcessKind, ProcessSpawner,
         ProxyService, ServiceKind, ServiceMode, ServiceSpawner,
@@ -133,6 +135,10 @@ pub use envelope::{
 pub use error::{EnvelopeError, EnvelopeResult, Result, RpcError};
 pub use hyprstream_rpc_derive::{authorize, register_scopes, rpc_method, service_factory, FromCapnp, ToCapnp};
 pub use service::{EnvelopeContext, RequestLoop, ServiceHandle, ZmqClient, ZmqService};
+pub use streaming::{
+    ChannelProgressReporter, forward_progress_to_stream, progress_channel,
+    ProgressUpdate, ResponseStream, StreamChannel, StreamContext, StreamPublisher,
+};
 pub use service::spawner::{
     ProcessBackend, ProcessConfig, ProcessKind, ProcessSpawner,
     ProxyService, ServiceKind, ServiceMode, ServiceSpawner,

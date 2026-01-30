@@ -5486,6 +5486,7 @@ dependencies = [
  "hyprstream-rpc-derive",
  "inventory",
  "nix 0.27.1",
+ "once_cell",
  "p256",
  "parking_lot 0.12.4",
  "rand 0.8.5",

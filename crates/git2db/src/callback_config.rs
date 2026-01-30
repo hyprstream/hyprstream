@@ -237,17 +237,28 @@ impl CallbackConfig {
     }
 
     fn handle_progress(config: &ProgressConfig, stats: git2::Progress<'_>) {
+        // Determine stage and progress based on git2::Progress stats
+        // Clone phases: fetch objects → index deltas → (checkout handled separately)
+        let (stage, current, total) = if stats.indexed_deltas() > 0 && stats.total_deltas() > 0 {
+            // Indexing deltas phase
+            ("indexing", stats.indexed_deltas(), stats.total_deltas())
+        } else if stats.indexed_objects() > 0
+            && stats.indexed_objects() > stats.received_objects() / 2
+        {
+            // Indexing objects phase (when most objects received)
+            ("indexing", stats.indexed_objects(), stats.total_objects())
+        } else {
+            // Fetching objects phase
+            ("fetch", stats.received_objects(), stats.total_objects())
+        };
+
         match config {
             ProgressConfig::None => {}
             ProgressConfig::Stdout => {
-                let current = stats.received_objects();
-                let total = stats.total_objects();
-                println!("Progress: {current}/{total} objects");
+                println!("Progress [{stage}]: {current}/{total}");
             }
             ProgressConfig::Channel(reporter) => {
-                let current = stats.received_objects();
-                let total = stats.total_objects();
-                reporter.report("fetch", current, total);
+                reporter.report(stage, current, total);
             }
         }
     }

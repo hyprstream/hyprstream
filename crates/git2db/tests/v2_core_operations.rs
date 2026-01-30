@@ -3,9 +3,11 @@
 //! Tests the complete workflow of repository management with the v2 API
 
 use git2db::config::RepositoryConfig;
-use git2db::{Git2DB, Git2DBConfig, GitManager};
+use git2db::{CloneBuilder, Git2DB, Git2DBConfig, GitManager};
 use std::fs;
+use std::sync::Arc;
 use tempfile::TempDir;
+use tokio::sync::RwLock;
 
 /// Helper to setup logging for tests
 fn setup_logging() {
@@ -410,7 +412,7 @@ async fn test_registry_clone_with_auth_callbacks() {
 
     let temp_dir = TempDir::new().unwrap();
     let registry_path = temp_dir.path();
-    let mut registry = Git2DB::open(registry_path).await.unwrap();
+    let registry = Arc::new(RwLock::new(Git2DB::open(registry_path).await.unwrap()));
 
     // Create a test repository to clone
     let test_repo = temp_dir.path().join("source-repo");
@@ -418,17 +420,18 @@ async fn test_registry_clone_with_auth_callbacks() {
     create_test_repo(&test_repo).await.unwrap();
     let url = format!("file://{}", test_repo.display());
 
-    // Test that registry.clone() works (this uses bare clone with auth callbacks)
+    // Test that CloneBuilder works (this uses bare clone with auth callbacks)
     // Even though file:// URLs don't require auth, this verifies the code path
     // that sets up authentication callbacks is being exercised
-    let repo_id = registry.clone(&url)
+    let repo_id = CloneBuilder::new(Arc::clone(&registry), &url)
         .name("cloned-repo")
         .exec()
         .await
         .unwrap();
 
     // Verify the repository was cloned successfully
-    let handle = registry
+    let registry_guard = registry.read().await;
+    let handle = registry_guard
         .repo(&repo_id)
         .expect("repo handle should exist after clone");
     assert_eq!(
@@ -450,7 +453,7 @@ async fn test_registry_clone_with_auth_callbacks() {
     assert!(bare_repo.is_bare(), "Repository should be bare");
 
     // Verify the default worktree exists and has the expected files
-    // registry.clone() creates worktrees at {repo_dir}/worktrees/{branch}
+    // CloneBuilder creates worktrees at {repo_dir}/worktrees/{branch}
     // The branch name depends on git's init.defaultBranch config (main or master)
     let repo_dir = registry_path.join("cloned-repo");
     let default_branch = bare_repo

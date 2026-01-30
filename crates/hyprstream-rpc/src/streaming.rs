@@ -36,11 +36,19 @@
 //! - FIPS mode: HMAC-SHA256 (FIPS 198-1)
 
 use std::collections::VecDeque;
+use std::future::Future;
+use std::sync::Arc;
 
 use anyhow::Result;
 use capnp::message::Builder;
 use capnp::serialize;
+use futures::SinkExt;
 use serde::{Deserialize, Serialize};
+use tokio::sync::OnceCell;
+
+use crate::auth::Claims;
+use crate::prelude::SigningKey;
+use crate::registry::{global as endpoint_registry, SocketKind};
 
 use crate::crypto::{derive_stream_keys, keyed_mac_truncated};
 
@@ -203,11 +211,26 @@ pub struct StreamFrames {
 }
 
 impl StreamFrames {
-    /// Send frames via ZMQ socket.
+    /// Send frames via raw ZMQ socket (sync).
+    ///
+    /// Use this for low-level streaming code that manages its own zmq sockets.
+    /// For service-level code, prefer `StreamChannel::with_publisher()`.
     pub fn send(&self, socket: &zmq::Socket) -> Result<()> {
         socket.send(&self.topic, zmq::SNDMORE)?;
         socket.send(&self.capnp, zmq::SNDMORE)?;
         socket.send(self.mac.as_slice(), 0)?;
+        Ok(())
+    }
+
+    /// Send frames via async tmq Push socket.
+    pub async fn send_async(&self, socket: &mut tmq::push::Push) -> Result<()> {
+        let multipart = tmq::Multipart::from(vec![
+            self.topic.clone(),
+            self.capnp.clone(),
+            self.mac.to_vec(),
+        ]);
+        socket.send(multipart).await
+            .map_err(|e| anyhow::anyhow!("Failed to send stream frames: {}", e))?;
         Ok(())
     }
 
@@ -389,6 +412,365 @@ impl StreamBuilder {
     pub fn topic(&self) -> &str {
         self.hmac_state.topic()
     }
+}
+
+// ============================================================================
+// Stream Context (Encapsulates stream state for producers)
+// ============================================================================
+
+/// Encapsulates all state needed to produce a stream.
+///
+/// Created by `StreamingService::prepare_stream()` after DH key exchange.
+/// Contains everything needed to:
+/// - Return stream info to client (stream_id, server_pubkey)
+/// - Create a `StreamPublisher` for sending data
+///
+/// # Example
+///
+/// ```ignore
+/// // In service handler:
+/// let ctx = self.prepare_stream(envelope_ctx)?;
+///
+/// // Return to client:
+/// let response = Response::stream_started(ctx.stream_id(), ctx.server_pubkey());
+///
+/// // After response sent, create publisher:
+/// let mut publisher = StreamPublisher::new(&push_socket, &ctx)?;
+/// publisher.publish_data(b"hello")?;
+/// publisher.complete(b"{}")?;
+/// ```
+#[derive(Clone)]
+pub struct StreamContext {
+    /// Human-readable stream ID (for logging/display)
+    stream_id: String,
+    /// DH-derived topic (64 hex chars) - used for ZMQ routing
+    topic: String,
+    /// DH-derived HMAC key for authenticated stream blocks
+    mac_key: [u8; 32],
+    /// Server's ephemeral public key - client needs this for DH
+    server_pubkey: [u8; 32],
+}
+
+impl StreamContext {
+    /// Create a new stream context with pre-computed DH values.
+    pub fn new(
+        stream_id: String,
+        topic: String,
+        mac_key: [u8; 32],
+        server_pubkey: [u8; 32],
+    ) -> Self {
+        Self {
+            stream_id,
+            topic,
+            mac_key,
+            server_pubkey,
+        }
+    }
+
+    /// Create stream context by performing DH key exchange.
+    ///
+    /// # Arguments
+    /// * `client_ephemeral_pubkey` - Client's ephemeral public key from request
+    ///
+    /// # Returns
+    /// Stream context with DH-derived topic and mac_key
+    #[cfg(not(feature = "fips"))]
+    pub fn from_dh(client_ephemeral_pubkey: &[u8]) -> Result<Self> {
+        use crate::crypto::generate_ephemeral_keypair;
+
+        let (server_secret, server_pubkey) = generate_ephemeral_keypair();
+        let server_pubkey_bytes = server_pubkey.to_bytes();
+
+        let client_pub = DhPublic::from_slice(client_ephemeral_pubkey)
+            .ok_or_else(|| anyhow::anyhow!("Invalid client ephemeral public key"))?;
+        let shared_secret = dh_compute(&server_secret, &client_pub);
+
+        let client_pub_32 = pubkey_to_32(client_ephemeral_pubkey);
+        let server_pub_32 = pubkey_to_32(&server_pubkey_bytes);
+        let keys = derive_stream_keys(&shared_secret, &client_pub_32, &server_pub_32)?;
+
+        let stream_id = format!("stream-{}", uuid::Uuid::new_v4());
+
+        Ok(Self {
+            stream_id,
+            topic: keys.topic,
+            mac_key: *keys.mac_key,
+            server_pubkey: server_pubkey_bytes,
+        })
+    }
+
+    /// Get the stream ID (for logging/display).
+    pub fn stream_id(&self) -> &str {
+        &self.stream_id
+    }
+
+    /// Get the DH-derived topic (for ZMQ routing).
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    /// Get the MAC key (for HMAC chain).
+    pub fn mac_key(&self) -> &[u8; 32] {
+        &self.mac_key
+    }
+
+    /// Get the server's ephemeral public key (client needs this for DH).
+    pub fn server_pubkey(&self) -> &[u8; 32] {
+        &self.server_pubkey
+    }
+}
+
+// ============================================================================
+// Stream Publisher (High-level producer API)
+// ============================================================================
+
+/// High-level async stream publisher with automatic batching and MAC chain.
+///
+/// Wraps `StreamBuilder` and an async tmq Push socket to provide a simple API for
+/// publishing stream data. Handles all the complexity of batching,
+/// MAC computation, and frame sending.
+///
+/// # Example
+///
+/// ```ignore
+/// let publisher = StreamPublisher::new(socket_arc.clone(), &stream_ctx);
+///
+/// // Publish data (batched automatically)
+/// for chunk in data_source {
+///     publisher.publish_data(&chunk).await?;
+/// }
+///
+/// // Or publish progress updates
+/// publisher.publish_progress("Downloading", 50, 100).await?;
+///
+/// // Complete the stream
+/// publisher.complete(b"{\"status\":\"done\"}").await?;
+/// ```
+pub struct StreamPublisher {
+    builder: StreamBuilder,
+    socket: Arc<tokio::sync::Mutex<tmq::push::Push>>,
+}
+
+impl StreamPublisher {
+    /// Create a new publisher from a stream context.
+    pub fn new(socket: Arc<tokio::sync::Mutex<tmq::push::Push>>, ctx: &StreamContext) -> Self {
+        Self::with_config(socket, ctx, BatchingConfig::default())
+    }
+
+    /// Create a new publisher with custom batching config.
+    pub fn with_config(
+        socket: Arc<tokio::sync::Mutex<tmq::push::Push>>,
+        ctx: &StreamContext,
+        config: BatchingConfig,
+    ) -> Self {
+        let builder = StreamBuilder::new(config, ctx.mac_key, ctx.topic.clone());
+        Self { builder, socket }
+    }
+
+    /// Publish binary data with automatic batching.
+    ///
+    /// Data is batched based on the configured batch size and rate.
+    /// Use `flush()` to force immediate send.
+    pub async fn publish_data(&mut self, data: &[u8]) -> Result<()> {
+        self.publish_data_with_rate(data, 10.0).await
+    }
+
+    /// Publish binary data with explicit rate for adaptive batching.
+    ///
+    /// Higher rates result in larger batches (more efficient).
+    /// Lower rates result in smaller batches (lower latency).
+    pub async fn publish_data_with_rate(&mut self, data: &[u8], rate: f32) -> Result<()> {
+        if let Some(frames) = self.builder.add_data(data, rate)? {
+            let mut socket = self.socket.lock().await;
+            frames.send_async(&mut *socket).await?;
+        }
+        Ok(())
+    }
+
+    /// Publish a progress update.
+    ///
+    /// Convenience method that formats progress as `stage:current:total`.
+    /// Client should parse this format or use a structured payload.
+    pub async fn publish_progress(&mut self, stage: &str, current: usize, total: usize) -> Result<()> {
+        let data = format!("{}:{}:{}", stage, current, total);
+        self.publish_data(data.as_bytes()).await
+    }
+
+    /// Publish an error and flush immediately.
+    pub async fn publish_error(&mut self, message: &str) -> Result<()> {
+        if let Some(frames) = self.builder.add_error(message)? {
+            let mut socket = self.socket.lock().await;
+            frames.send_async(&mut *socket).await?;
+        }
+        Ok(())
+    }
+
+    /// Complete the stream with metadata and flush.
+    ///
+    /// This consumes the publisher - no more data can be sent after completion.
+    pub async fn complete(mut self, metadata: &[u8]) -> Result<()> {
+        self.complete_ref(metadata).await
+    }
+
+    /// Complete the stream with metadata and flush (by reference).
+    ///
+    /// Same as `complete()` but doesn't consume self, allowing use in
+    /// callback-based APIs like `StreamChannel::with_publisher()`.
+    pub async fn complete_ref(&mut self, metadata: &[u8]) -> Result<()> {
+        let mut socket = self.socket.lock().await;
+        if let Some(frames) = self.builder.add_complete(metadata)? {
+            frames.send_async(&mut *socket).await?;
+        }
+        if let Some(frames) = self.builder.flush()? {
+            frames.send_async(&mut *socket).await?;
+        }
+        Ok(())
+    }
+
+    /// Flush any pending batched data immediately.
+    pub async fn flush(&mut self) -> Result<()> {
+        if let Some(frames) = self.builder.flush()? {
+            let mut socket = self.socket.lock().await;
+            frames.send_async(&mut *socket).await?;
+        }
+        Ok(())
+    }
+
+    /// Get the topic being published to.
+    pub fn topic(&self) -> &str {
+        self.builder.topic()
+    }
+}
+
+// ============================================================================
+// Progress Streaming (Bridges progress callbacks to streams)
+// ============================================================================
+
+/// Progress update message for channel-based streaming.
+#[derive(Debug, Clone)]
+pub enum ProgressUpdate {
+    /// Progress update: stage, current, total
+    Progress { stage: String, current: usize, total: usize },
+    /// Operation completed successfully
+    Complete(Vec<u8>),
+    /// Operation failed with error
+    Error(String),
+}
+
+/// Channel-based progress sender for use with git2db or other progress-reporting operations.
+///
+/// This can be passed to operations that accept a progress callback (like git clone).
+/// Progress updates are sent through a channel and can be forwarded to a stream.
+///
+/// # Example
+///
+/// ```ignore
+/// // Create progress channel
+/// let (sender, receiver) = progress_channel();
+///
+/// // In spawn_blocking (runs the git operation):
+/// let reporter = ChannelProgressReporter::new(sender);
+/// git2db_clone_with_progress(..., reporter);
+/// reporter.complete(b"{}")?;
+///
+/// // In async context (publishes to stream):
+/// let mut publisher = StreamPublisher::new(&socket, &ctx);
+/// while let Ok(update) = receiver.recv() {
+///     match update {
+///         ProgressUpdate::Progress { stage, current, total } => {
+///             publisher.publish_progress(&stage, current, total)?;
+///         }
+///         ProgressUpdate::Complete(meta) => {
+///             publisher.complete(&meta)?;
+///             break;
+///         }
+///         ProgressUpdate::Error(msg) => {
+///             publisher.publish_error(&msg)?;
+///             break;
+///         }
+///     }
+/// }
+/// ```
+#[derive(Clone)]
+pub struct ChannelProgressReporter {
+    sender: tokio::sync::mpsc::Sender<ProgressUpdate>,
+}
+
+impl ChannelProgressReporter {
+    /// Create a new channel-based progress reporter.
+    pub fn new(sender: tokio::sync::mpsc::Sender<ProgressUpdate>) -> Self {
+        Self { sender }
+    }
+
+    /// Report progress (implements the same interface as git2db::ProgressReporter).
+    ///
+    /// Uses `blocking_send` since this is typically called from sync contexts.
+    pub fn report(&self, stage: &str, current: usize, total: usize) {
+        let _ = self.sender.blocking_send(ProgressUpdate::Progress {
+            stage: stage.to_owned(),
+            current,
+            total,
+        });
+    }
+
+    /// Signal successful completion with metadata.
+    pub fn complete(&self, metadata: Vec<u8>) -> Result<()> {
+        self.sender.blocking_send(ProgressUpdate::Complete(metadata))
+            .map_err(|_| anyhow::anyhow!("Progress channel closed"))
+    }
+
+    /// Signal an error occurred.
+    pub fn error(&self, message: &str) -> Result<()> {
+        self.sender.blocking_send(ProgressUpdate::Error(message.to_owned()))
+            .map_err(|_| anyhow::anyhow!("Progress channel closed"))
+    }
+}
+
+/// Create a progress channel for streaming operations.
+///
+/// Returns (sender, receiver) where:
+/// - sender: Pass to `ChannelProgressReporter::new()` for use in blocking operations
+/// - receiver: Poll in async context to forward updates to `StreamPublisher`
+pub fn progress_channel(buffer_size: usize) -> (
+    tokio::sync::mpsc::Sender<ProgressUpdate>,
+    tokio::sync::mpsc::Receiver<ProgressUpdate>,
+) {
+    tokio::sync::mpsc::channel(buffer_size)
+}
+
+/// Helper to forward progress updates from a tokio channel to a StreamPublisher.
+///
+/// This is a convenience function for the common pattern of receiving progress
+/// updates from a blocking operation and forwarding them to a stream.
+///
+/// # Arguments
+/// * `receiver` - Tokio channel receiving progress updates
+/// * `publisher` - StreamPublisher to forward updates to
+///
+/// # Returns
+/// Ok(()) on successful completion, Err on any error
+pub async fn forward_progress_to_stream(
+    mut receiver: tokio::sync::mpsc::Receiver<ProgressUpdate>,
+    publisher: &mut StreamPublisher,
+) -> Result<()> {
+    while let Some(update) = receiver.recv().await {
+        match update {
+            ProgressUpdate::Progress { stage, current, total } => {
+                publisher.publish_progress(&stage, current, total).await?;
+            }
+            ProgressUpdate::Complete(metadata) => {
+                publisher.complete_ref(&metadata).await?;
+                return Ok(());
+            }
+            ProgressUpdate::Error(msg) => {
+                publisher.publish_error(&msg).await?;
+                return Err(anyhow::anyhow!("Operation failed: {}", msg));
+            }
+        }
+    }
+    // Channel closed without completion - treat as error
+    publisher.publish_error("Progress channel closed unexpectedly").await?;
+    Err(anyhow::anyhow!("Progress channel closed unexpectedly"))
 }
 
 // ============================================================================
@@ -665,8 +1047,326 @@ impl StreamHandle {
 }
 
 // ============================================================================
+// StreamChannel - Service-Level Streaming Infrastructure
+// ============================================================================
+
+/// Service-level async streaming infrastructure that encapsulates socket management
+/// and stream pre-authorization.
+///
+/// `StreamChannel` handles the complexity of:
+/// - Async PUSH socket creation and lazy initialization (via tmq)
+/// - DH key exchange via `StreamContext::from_dh()`
+/// - Stream pre-authorization with StreamService
+/// - Endpoint discovery via the registry
+///
+/// # Example
+///
+/// ```ignore
+/// // In service initialization
+/// let stream_channel = StreamChannel::new(
+///     zmq_context.clone(),
+///     signing_key.clone(),
+/// );
+///
+/// // In request handler
+/// let stream_ctx = stream_channel.prepare_stream(&client_pubkey, 600).await?;
+///
+/// // In async context
+/// let mut publisher = stream_channel.publisher(&stream_ctx).await?;
+/// publisher.publish_progress("processing", 0, 100).await?;
+/// // ... do work ...
+/// publisher.complete(&metadata).await?;
+/// ```
+pub struct StreamChannel {
+    /// ZMQ context (shared)
+    context: Arc<zmq::Context>,
+    /// Signing key for stream registration
+    signing_key: SigningKey,
+    /// Lazy-initialized async PUSH socket to StreamService (wrapped in Arc for sharing)
+    push_socket: OnceCell<Arc<tokio::sync::Mutex<tmq::push::Push>>>,
+}
+
+impl StreamChannel {
+    /// Create a new stream channel.
+    pub fn new(context: Arc<zmq::Context>, signing_key: SigningKey) -> Self {
+        Self {
+            context,
+            signing_key,
+            push_socket: OnceCell::new(),
+        }
+    }
+
+    /// Prepare a stream with DH key exchange and pre-authorization.
+    ///
+    /// This method:
+    /// 1. Performs DH key exchange to derive topic and MAC key
+    /// 2. Pre-authorizes the stream with StreamService
+    ///
+    /// # Arguments
+    /// * `client_ephemeral_pubkey` - Client's ephemeral public key (32 bytes)
+    /// * `expiry_secs` - Stream expiration in seconds from now
+    ///
+    /// # Returns
+    /// `StreamContext` ready for publishing
+    pub async fn prepare_stream(
+        &self,
+        client_ephemeral_pubkey: &[u8],
+        expiry_secs: i64,
+    ) -> Result<StreamContext> {
+        self.prepare_stream_with_claims(client_ephemeral_pubkey, expiry_secs, None).await
+    }
+
+    /// Prepare a stream with DH key exchange, pre-authorization, and claims.
+    ///
+    /// Same as `prepare_stream()` but allows passing user claims for authorization.
+    /// Claims are forwarded to StreamService for subscription-time validation.
+    ///
+    /// # Arguments
+    /// * `client_ephemeral_pubkey` - Client's ephemeral public key (32 bytes)
+    /// * `expiry_secs` - Stream expiration in seconds from now
+    /// * `claims` - Optional user claims for authorization
+    ///
+    /// # Returns
+    /// `StreamContext` ready for publishing
+    pub async fn prepare_stream_with_claims(
+        &self,
+        client_ephemeral_pubkey: &[u8],
+        expiry_secs: i64,
+        claims: Option<Claims>,
+    ) -> Result<StreamContext> {
+        // 1. DH key exchange
+        let stream_ctx = StreamContext::from_dh(client_ephemeral_pubkey)?;
+
+        // 2. Pre-authorize with StreamService
+        let exp = chrono::Utc::now().timestamp() + expiry_secs;
+        self.pre_authorize(&stream_ctx, exp, claims).await?;
+
+        Ok(stream_ctx)
+    }
+
+    /// Pre-authorize a stream with StreamService.
+    ///
+    /// Sends a signed StreamRegister message to StreamService so the topic
+    /// is ready for subscriptions before the client tries to subscribe.
+    async fn pre_authorize(&self, ctx: &StreamContext, expiry: i64, claims: Option<Claims>) -> Result<()> {
+        self.register_topic(ctx.topic(), expiry, claims).await?;
+        tracing::debug!(
+            stream_id = %ctx.stream_id(),
+            topic = %ctx.topic(),
+            expiry = expiry,
+            "Stream pre-authorized with StreamService"
+        );
+        Ok(())
+    }
+
+    /// Register a topic with StreamService.
+    ///
+    /// This is a low-level method that sends a StreamRegister message.
+    /// For DH-based streams, use `prepare_stream()` instead.
+    ///
+    /// Use cases:
+    /// - Re-authorizing an existing stream by ID
+    /// - Legacy stream authorization
+    pub async fn register_topic(&self, topic: &str, expiry: i64, claims: Option<Claims>) -> Result<()> {
+        let register_msg = build_stream_register_envelope(
+            topic,
+            expiry,
+            &self.signing_key,
+            claims,
+        );
+
+        let socket_arc = self.get_or_init_socket().await?;
+        let mut socket = socket_arc.lock().await;
+
+        let multipart = tmq::Multipart::from(vec![register_msg]);
+        socket.send(multipart).await
+            .map_err(|e| anyhow::anyhow!("Failed to send stream registration: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Get or initialize the async PUSH socket to StreamService.
+    ///
+    /// Returns an Arc to the socket mutex, initializing it on first call.
+    async fn get_or_init_socket(&self) -> Result<Arc<tokio::sync::Mutex<tmq::push::Push>>> {
+        let socket_arc = self.push_socket.get_or_try_init(|| async {
+            // Connect to StreamService's PUSH endpoint
+            let endpoint = endpoint_registry()
+                .endpoint("streams", SocketKind::Push)
+                .to_zmq_string();
+
+            let socket = tmq::push::push(&self.context)
+                .set_sndtimeo(1000)
+                .connect(&endpoint)
+                .map_err(|e| anyhow::anyhow!("Failed to connect to StreamService: {}", e))?;
+
+            tracing::debug!(endpoint = %endpoint, "StreamChannel connected to StreamService (async)");
+
+            Ok::<_, anyhow::Error>(Arc::new(tokio::sync::Mutex::new(socket)))
+        }).await?;
+        Ok(Arc::clone(socket_arc))
+    }
+
+    /// Create a publisher for the given stream context.
+    ///
+    /// The publisher owns a reference to the socket and can be used in async contexts
+    /// without lifetime concerns.
+    ///
+    /// # Arguments
+    /// * `ctx` - Stream context from `prepare_stream()`
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut publisher = stream_channel.publisher(&stream_ctx).await?;
+    /// publisher.publish_progress("cloning", 0, 1).await?;
+    /// // ... perform operation ...
+    /// publisher.complete(&result_bytes).await?;
+    /// ```
+    pub async fn publisher(&self, ctx: &StreamContext) -> Result<StreamPublisher> {
+        let socket_arc = self.get_or_init_socket().await?;
+        Ok(StreamPublisher::new(socket_arc, ctx))
+    }
+
+    /// Execute streaming work with a publisher (convenience wrapper).
+    ///
+    /// This is a convenience method that creates a publisher and passes it to the callback.
+    /// The callback receives the publisher by value, so it can be used in async blocks.
+    ///
+    /// # Arguments
+    /// * `ctx` - Stream context from `prepare_stream()`
+    /// * `f` - Async callback that receives the publisher
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// stream_channel.with_publisher(&stream_ctx, |mut publisher| async move {
+    ///     publisher.publish_progress("cloning", 0, 1).await?;
+    ///     // ... perform operation ...
+    ///     publisher.complete(&result_bytes).await?;
+    ///     Ok(())
+    /// }).await?;
+    /// ```
+    pub async fn with_publisher<F, Fut, R>(&self, ctx: &StreamContext, f: F) -> Result<R>
+    where
+        F: FnOnce(StreamPublisher) -> Fut,
+        Fut: Future<Output = Result<R>>,
+    {
+        let publisher = self.publisher(ctx).await?;
+        f(publisher).await
+    }
+
+    /// Get the stream endpoint for clients to subscribe to.
+    ///
+    /// Returns the SUB endpoint URL from the registry.
+    pub fn stream_endpoint(&self) -> String {
+        endpoint_registry()
+            .endpoint("streams", SocketKind::Sub)
+            .to_zmq_string()
+    }
+}
+
+// ============================================================================
+// ResponseStream - Unified Response + Stream Coordination
+// ============================================================================
+
+/// Wrapper type for streaming responses that coordinates the REP-before-PUB pattern.
+///
+/// When a service handler needs to return a response AND start streaming,
+/// `ResponseStream` bundles:
+/// - The REP response bytes to send immediately
+/// - The `StreamContext` for later publishing
+/// - Application-specific pending work
+///
+/// This ensures consistent handling across all streaming services.
+///
+/// # Example
+///
+/// ```ignore
+/// fn handle_clone_stream(&self, ...) -> Result<ResponseStream<CloneTask>> {
+///     let stream_ctx = self.stream_channel.prepare_stream(&pubkey, 600)?;
+///
+///     let response = build_response(request_id, &stream_ctx);
+///
+///     Ok(ResponseStream::new(response, stream_ctx, CloneTask { url, name }))
+/// }
+/// ```
+pub struct ResponseStream<T> {
+    /// The REP response to send immediately
+    pub response: Vec<u8>,
+    /// Stream context for later publishing
+    pub stream_ctx: StreamContext,
+    /// Application-specific pending work
+    pub pending: T,
+}
+
+impl<T> ResponseStream<T> {
+    /// Create a new response stream.
+    pub fn new(response: Vec<u8>, stream_ctx: StreamContext, pending: T) -> Self {
+        Self {
+            response,
+            stream_ctx,
+            pending,
+        }
+    }
+
+    /// Get the stream ID.
+    pub fn stream_id(&self) -> &str {
+        self.stream_ctx.stream_id()
+    }
+
+    /// Get the server's public key for client DH.
+    pub fn server_pubkey(&self) -> &[u8; 32] {
+        self.stream_ctx.server_pubkey()
+    }
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
+
+/// Build a StreamRegister message wrapped in SignedEnvelope.
+///
+/// Used by `StreamChannel::pre_authorize()` to register streams with StreamService.
+fn build_stream_register_envelope(
+    topic: &str,
+    expiry: i64,
+    signing_key: &SigningKey,
+    claims: Option<Claims>,
+) -> Vec<u8> {
+    use crate::common_capnp;
+    use crate::envelope::{RequestEnvelope, RequestIdentity, SignedEnvelope};
+    use crate::ToCapnp;
+
+    // Build StreamRegister message
+    let mut inner_msg = Builder::new_default();
+    {
+        let mut register = inner_msg.init_root::<crate::streaming_capnp::stream_register::Builder>();
+        register.set_topic(topic);
+        register.set_exp(expiry);
+    }
+
+    let mut inner_bytes = Vec::new();
+    serialize::write_message(&mut inner_bytes, &inner_msg).expect("serialize StreamRegister");
+
+    // Wrap in SignedEnvelope
+    let mut envelope = RequestEnvelope::new(RequestIdentity::local(), inner_bytes);
+    if let Some(c) = claims {
+        envelope = envelope.with_claims(c);
+    }
+
+    let signed = SignedEnvelope::new_signed(envelope, signing_key);
+
+    let mut msg = Builder::new_default();
+    {
+        let mut builder = msg.init_root::<common_capnp::signed_envelope::Builder>();
+        signed.write_to(&mut builder);
+    }
+
+    let mut bytes = Vec::new();
+    serialize::write_message(&mut bytes, &msg).expect("serialize SignedEnvelope");
+    bytes
+}
 
 /// Convert a public key to 32 bytes for derive_stream_keys.
 ///

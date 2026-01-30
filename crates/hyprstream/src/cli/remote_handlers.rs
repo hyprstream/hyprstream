@@ -1,20 +1,20 @@
 //! Handlers for remote management commands
 
-use crate::storage::{ModelRef, ModelStorage};
+use crate::services::RegistryClient;
 use anyhow::Result;
 use tracing::info;
 
 /// Handle remote add command - add a new remote to a model
 pub async fn handle_remote_add(
-    storage: &ModelStorage,
+    registry: &dyn RegistryClient,
     model: &str,
     name: &str,
     url: &str,
 ) -> Result<()> {
     info!("Adding remote '{}' to model {}", name, model);
 
-    let model_ref = ModelRef::new(model.to_owned());
-    let repo_client = storage.get_repo_client(&model_ref).await?;
+    let repo_client = registry.repo(model).await
+        .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
 
     repo_client
         .add_remote(name, url)
@@ -27,14 +27,14 @@ pub async fn handle_remote_add(
 
 /// Handle remote list command - list all remotes for a model
 pub async fn handle_remote_list(
-    storage: &ModelStorage,
+    registry: &dyn RegistryClient,
     model: &str,
     verbose: bool,
 ) -> Result<()> {
     info!("Listing remotes for model {}", model);
 
-    let model_ref = ModelRef::new(model.to_owned());
-    let repo_client = storage.get_repo_client(&model_ref).await?;
+    let repo_client = registry.repo(model).await
+        .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
 
     let remotes = repo_client
         .list_remotes()
@@ -64,11 +64,15 @@ pub async fn handle_remote_list(
 }
 
 /// Handle remote remove command - remove a remote from a model
-pub async fn handle_remote_remove(storage: &ModelStorage, model: &str, name: &str) -> Result<()> {
+pub async fn handle_remote_remove(
+    registry: &dyn RegistryClient,
+    model: &str,
+    name: &str,
+) -> Result<()> {
     info!("Removing remote '{}' from model {}", name, model);
 
-    let model_ref = ModelRef::new(model.to_owned());
-    let repo_client = storage.get_repo_client(&model_ref).await?;
+    let repo_client = registry.repo(model).await
+        .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
 
     repo_client
         .remove_remote(name)
@@ -81,15 +85,15 @@ pub async fn handle_remote_remove(storage: &ModelStorage, model: &str, name: &st
 
 /// Handle remote set-url command - change a remote's URL
 pub async fn handle_remote_set_url(
-    storage: &ModelStorage,
+    registry: &dyn RegistryClient,
     model: &str,
     name: &str,
     url: &str,
 ) -> Result<()> {
     info!("Setting URL for remote '{}' in model {}", name, model);
 
-    let model_ref = ModelRef::new(model.to_owned());
-    let repo_client = storage.get_repo_client(&model_ref).await?;
+    let repo_client = registry.repo(model).await
+        .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
 
     repo_client
         .set_remote_url(name, url)
@@ -102,7 +106,7 @@ pub async fn handle_remote_set_url(
 
 /// Handle remote rename command - rename a remote
 pub async fn handle_remote_rename(
-    storage: &ModelStorage,
+    registry: &dyn RegistryClient,
     model: &str,
     old_name: &str,
     new_name: &str,
@@ -112,8 +116,8 @@ pub async fn handle_remote_rename(
         old_name, new_name, model
     );
 
-    let model_ref = ModelRef::new(model.to_owned());
-    let repo_client = storage.get_repo_client(&model_ref).await?;
+    let repo_client = registry.repo(model).await
+        .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
 
     repo_client
         .rename_remote(old_name, new_name)

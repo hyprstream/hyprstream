@@ -835,41 +835,6 @@ impl Git2DB {
         Ok(())
     }
 
-    /// Create a CloneBuilder for fluent repository cloning
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// # async fn example(registry: &mut git2db::Git2DB) -> Result<(), Box<dyn std::error::Error>> {
-    /// let id = registry.clone("https://github.com/user/repo.git")
-    ///     .name("my-repo")
-    ///     .branch("main")
-    ///     .remote("backup", "https://backup.com/repo.git")
-    ///     .exec()
-    ///     .await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    /// Clone a repository using fluent builder API
-    ///
-    /// Returns a builder for configuring clone operations.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,ignore
-    /// let id = registry.clone("https://github.com/user/repo.git")
-    ///     .name("my-repo")
-    ///     .branch("develop")
-    ///     .exec()
-    ///     .await?;
-    /// ```
-    pub fn clone<'a>(
-        &'a mut self,
-        url: impl Into<String>,
-    ) -> crate::clone_builder::CloneBuilder<'a> {
-        crate::clone_builder::CloneBuilder::new(self, url.into())
-    }
-
     /// Register an existing repository or worktree using fluent builder API
     ///
     /// Returns a builder for configuring registration parameters.
