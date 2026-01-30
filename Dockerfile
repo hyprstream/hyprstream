@@ -198,8 +198,8 @@ COPY --from=builder /usr/local/cuda-12.8/lib64/libcudart.so* /usr/local/cuda/lib
 COPY --from=builder /usr/local/cuda-12.8/lib64/libcublas.so* /usr/local/cuda/lib64/
 COPY --from=builder /usr/local/cuda-12.8/lib64/libcublasLt.so* /usr/local/cuda/lib64/
 
-# Copy only LibTorch shared libraries (skip static libs, headers, cmake)
-COPY --from=builder /opt/libtorch/lib/*.so* /opt/libtorch/lib/
+# Copy entire LibTorch lib directory
+COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
 
 #############################################
 # CUDA 13.0 Runtime
@@ -218,8 +218,8 @@ COPY --from=builder /usr/local/cuda-13.0/lib64/libcudart.so* /usr/local/cuda/lib
 COPY --from=builder /usr/local/cuda-13.0/lib64/libcublas.so* /usr/local/cuda/lib64/
 COPY --from=builder /usr/local/cuda-13.0/lib64/libcublasLt.so* /usr/local/cuda/lib64/
 
-# Copy only LibTorch shared libraries (skip static libs, headers, cmake)
-COPY --from=builder /opt/libtorch/lib/*.so* /opt/libtorch/lib/
+# Copy entire LibTorch lib directory
+COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
 
 #############################################
 # ROCm 7.1 Runtime
@@ -233,8 +233,8 @@ COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib/x86_64-linux-gn
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib/x86_64-linux-gnu/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib/x86_64-linux-gnu/
 
-# Copy only LibTorch shared libraries (bundles HIP/ROCm libs)
-COPY --from=builder /opt/libtorch/lib/*.so* /opt/libtorch/lib/
+# Copy entire LibTorch lib directory (includes Tensile libraries for ROCm)
+COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
 
 #############################################
 # CPU Runtime
@@ -248,8 +248,8 @@ COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib/x86_64-linux-gn
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib/x86_64-linux-gnu/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib/x86_64-linux-gnu/
 
-# Copy only LibTorch shared libraries (skip static libs, headers, cmake)
-COPY --from=builder /opt/libtorch/lib/*.so* /opt/libtorch/lib/
+# Copy entire LibTorch lib directory
+COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
 
 #############################################
 # Final Runtime
