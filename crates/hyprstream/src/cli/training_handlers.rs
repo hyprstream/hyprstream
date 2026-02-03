@@ -5,6 +5,8 @@
 //! - `training infer` - Inference with TTT (dirty writes)
 //! - `training batch` - Batch training with checkpoints
 //! - `training checkpoint` - Commit dirty adapter changes
+// CLI handlers intentionally print to stdout/stderr for user interaction
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use anyhow::{bail, Result};
 use tracing::{info, warn};

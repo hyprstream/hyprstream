@@ -1,4 +1,6 @@
 //! Handlers for remote management commands
+// CLI handlers intentionally print to stdout/stderr for user interaction
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use crate::services::RegistryClient;
 use anyhow::Result;

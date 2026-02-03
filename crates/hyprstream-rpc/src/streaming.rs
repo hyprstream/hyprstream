@@ -317,8 +317,8 @@ impl StreamBuilder {
 
     /// Compute adaptive batch size based on rate (logarithmic scaling).
     fn adaptive_batch_size(&self, rate: f32) -> usize {
-        let min = self.config.min_batch_size as f32;
-        let max = self.config.max_batch_size as f32;
+        let min = self.config.min_batch_size;
+        let max = self.config.max_batch_size;
 
         let log_min_rate = self.config.min_rate.max(1.0).ln();
         let log_max_rate = self.config.max_rate.max(1.0).ln();
@@ -326,7 +326,21 @@ impl StreamBuilder {
         let log_rate = rate.max(1.0).ln();
         let t = ((log_rate - log_min_rate) / (log_max_rate - log_min_rate)).clamp(0.0, 1.0);
 
-        (min + t * (max - min)).round() as usize
+        // Interpolate: result is in [min, max]
+        let batch_f32 = (min as f32 + t * (max - min) as f32).round();
+
+        // Return early for boundary/edge cases (no cast needed)
+        if !batch_f32.is_finite() || batch_f32 <= min as f32 {
+            return min;
+        }
+        if batch_f32 >= max as f32 {
+            return max;
+        }
+
+        // SAFETY: batch_f32 is in (min, max), both small positive integers (typically 1-64).
+        // Clippy can't verify bounds, but we've proven batch_f32 > min >= 1 and < max.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        { batch_f32 as usize }
     }
 
     /// Add data payload with adaptive batching.
@@ -371,9 +385,12 @@ impl StreamBuilder {
             let mut block = msg.init_root::<streaming_capnp::stream_block::Builder>();
             block.set_prev_mac(self.hmac_state.prev_mac_bytes());
 
-            let mut list = block.init_payloads(payloads.len() as u32);
+            // Cap'n Proto uses u32 for list lengths
+            let payloads_len = u32::try_from(payloads.len()).unwrap_or(u32::MAX);
+            let mut list = block.init_payloads(payloads_len);
             for (i, payload) in payloads.iter().enumerate() {
-                let mut p = list.reborrow().get(i as u32);
+                let idx = u32::try_from(i).unwrap_or(u32::MAX);
+                let mut p = list.reborrow().get(idx);
                 match payload {
                     StreamPayloadData::Data(data) => {
                         p.set_data(data);

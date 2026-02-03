@@ -255,7 +255,7 @@ impl CallbackConfig {
         match config {
             ProgressConfig::None => {}
             ProgressConfig::Stdout => {
-                println!("Progress [{stage}]: {current}/{total}");
+                tracing::info!("Progress [{stage}]: {current}/{total}");
             }
             ProgressConfig::Channel(reporter) => {
                 reporter.report(stage, current, total);

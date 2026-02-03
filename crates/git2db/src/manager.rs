@@ -222,7 +222,8 @@ impl GitManager {
         if self.config.repository.prefer_shallow {
             builder = builder.shallow(true);
             if let Some(depth) = self.config.repository.shallow_depth {
-                builder = builder.depth(depth as i32);
+                // Shallow depth is small (typically 1-100), safe to convert
+                builder = builder.depth(i32::try_from(depth).unwrap_or(i32::MAX));
             }
         }
 
@@ -231,8 +232,8 @@ impl GitManager {
             builder = builder.proxy_url(proxy_url.clone());
         }
 
-        // Set up timeout
-        builder = builder.timeout(self.config.network.timeout_secs as u32);
+        // Set up timeout (cap at u32::MAX seconds, ~136 years)
+        builder = builder.timeout(u32::try_from(self.config.network.timeout_secs).unwrap_or(u32::MAX));
 
         // Set up authentication
         use crate::auth::AuthStrategy;
@@ -471,7 +472,7 @@ impl GitManager {
         // Validate path - use absolute paths directly, validate relative paths
         let validated_path = if target_path.is_absolute() {
             // Already absolute - use directly after basic validation
-            target_path.to_path_buf()
+            target_path.clone()
         } else {
             // Relative path - join with current dir and validate
             let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));

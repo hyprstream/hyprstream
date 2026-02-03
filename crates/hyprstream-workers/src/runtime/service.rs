@@ -1663,9 +1663,12 @@ fn build_status_response(request_id: u64, status: &StatusResponse) -> Vec<u8> {
         resp.set_request_id(request_id);
         let stat = resp.init_status();
         let conditions = &status.status.conditions;
-        let mut cond_list = stat.init_conditions(conditions.len() as u32);
+        // Cap'n Proto uses u32 for list lengths
+        let cond_len = u32::try_from(conditions.len()).unwrap_or(u32::MAX);
+        let mut cond_list = stat.init_conditions(cond_len);
         for (i, cond) in conditions.iter().enumerate() {
-            let mut c = cond_list.reborrow().get(i as u32);
+            let idx = u32::try_from(i).unwrap_or(u32::MAX);
+            let mut c = cond_list.reborrow().get(idx);
             c.set_condition_type(&cond.condition_type);
             c.set_status(cond.status);
             c.set_reason(&cond.reason);
@@ -1701,9 +1704,11 @@ fn build_sandboxes_response(request_id: u64, sandboxes: &[PodSandbox]) -> Vec<u8
     serialize_message(|msg| {
         let mut resp = msg.init_root::<workers_capnp::runtime_response::Builder>();
         resp.set_request_id(request_id);
-        let mut list = resp.init_sandboxes(sandboxes.len() as u32);
+        let list_len = u32::try_from(sandboxes.len()).unwrap_or(u32::MAX);
+        let mut list = resp.init_sandboxes(list_len);
         for (i, sandbox) in sandboxes.iter().enumerate() {
-            let mut s = list.reborrow().get(i as u32);
+            let idx = u32::try_from(i).unwrap_or(u32::MAX);
+            let mut s = list.reborrow().get(idx);
             s.set_id(&sandbox.id);
             let mut meta = s.reborrow().init_metadata();
             meta.set_name(&sandbox.metadata.name);
@@ -1741,9 +1746,11 @@ fn build_containers_response(request_id: u64, containers: &[Container]) -> Vec<u
     serialize_message(|msg| {
         let mut resp = msg.init_root::<workers_capnp::runtime_response::Builder>();
         resp.set_request_id(request_id);
-        let mut list = resp.init_containers(containers.len() as u32);
+        let list_len = u32::try_from(containers.len()).unwrap_or(u32::MAX);
+        let mut list = resp.init_containers(list_len);
         for (i, container) in containers.iter().enumerate() {
-            let mut c = list.reborrow().get(i as u32);
+            let idx = u32::try_from(i).unwrap_or(u32::MAX);
+            let mut c = list.reborrow().get(idx);
             c.set_id(&container.id);
             c.set_pod_sandbox_id(&container.pod_sandbox_id);
             let mut meta = c.reborrow().init_metadata();
@@ -1779,9 +1786,11 @@ fn build_sandbox_stats_list_response(request_id: u64, stats_list: &[PodSandboxSt
     serialize_message(|msg| {
         let mut resp = msg.init_root::<workers_capnp::runtime_response::Builder>();
         resp.set_request_id(request_id);
-        let mut list = resp.init_sandbox_stats_list(stats_list.len() as u32);
+        let list_len = u32::try_from(stats_list.len()).unwrap_or(u32::MAX);
+        let mut list = resp.init_sandbox_stats_list(list_len);
         for (i, stats) in stats_list.iter().enumerate() {
-            let mut s = list.reborrow().get(i as u32);
+            let idx = u32::try_from(i).unwrap_or(u32::MAX);
+            let mut s = list.reborrow().get(idx);
             let mut attrs = s.reborrow().init_attributes();
             attrs.set_id(&stats.attributes.id);
         }
@@ -1802,9 +1811,11 @@ fn build_container_stats_list_response(request_id: u64, stats_list: &[ContainerS
     serialize_message(|msg| {
         let mut resp = msg.init_root::<workers_capnp::runtime_response::Builder>();
         resp.set_request_id(request_id);
-        let mut list = resp.init_container_stats_list(stats_list.len() as u32);
+        let list_len = u32::try_from(stats_list.len()).unwrap_or(u32::MAX);
+        let mut list = resp.init_container_stats_list(list_len);
         for (i, stats) in stats_list.iter().enumerate() {
-            let mut s = list.reborrow().get(i as u32);
+            let idx = u32::try_from(i).unwrap_or(u32::MAX);
+            let mut s = list.reborrow().get(idx);
             let mut attrs = s.reborrow().init_attributes();
             attrs.set_id(&stats.attributes.id);
         }
@@ -1846,18 +1857,24 @@ fn build_images_response(request_id: u64, images: &[crate::image::Image]) -> Vec
     serialize_message(|msg| {
         let mut resp = msg.init_root::<workers_capnp::image_response::Builder>();
         resp.set_request_id(request_id);
-        let mut list = resp.init_images(images.len() as u32);
+        let list_len = u32::try_from(images.len()).unwrap_or(u32::MAX);
+        let mut list = resp.init_images(list_len);
         for (i, img) in images.iter().enumerate() {
-            let mut image = list.reborrow().get(i as u32);
+            let idx = u32::try_from(i).unwrap_or(u32::MAX);
+            let mut image = list.reborrow().get(idx);
             image.set_id(&img.id);
             image.set_size(img.size);
-            let mut tags = image.reborrow().init_repo_tags(img.repo_tags.len() as u32);
+            let tags_len = u32::try_from(img.repo_tags.len()).unwrap_or(u32::MAX);
+            let mut tags = image.reborrow().init_repo_tags(tags_len);
             for (j, tag) in img.repo_tags.iter().enumerate() {
-                tags.set(j as u32, tag);
+                let tag_idx = u32::try_from(j).unwrap_or(u32::MAX);
+                tags.set(tag_idx, tag);
             }
-            let mut digests = image.reborrow().init_repo_digests(img.repo_digests.len() as u32);
+            let digests_len = u32::try_from(img.repo_digests.len()).unwrap_or(u32::MAX);
+            let mut digests = image.reborrow().init_repo_digests(digests_len);
             for (j, digest) in img.repo_digests.iter().enumerate() {
-                digests.set(j as u32, digest);
+                let digest_idx = u32::try_from(j).unwrap_or(u32::MAX);
+                digests.set(digest_idx, digest);
             }
         }
     }).unwrap_or_default()
@@ -1872,9 +1889,11 @@ fn build_image_status_response(request_id: u64, status: &crate::image::ImageStat
             let mut image = image_status.init_image();
             image.set_id(&img.id);
             image.set_size(img.size);
-            let mut tags = image.reborrow().init_repo_tags(img.repo_tags.len() as u32);
+            let tags_len = u32::try_from(img.repo_tags.len()).unwrap_or(u32::MAX);
+            let mut tags = image.reborrow().init_repo_tags(tags_len);
             for (j, tag) in img.repo_tags.iter().enumerate() {
-                tags.set(j as u32, tag);
+                let tag_idx = u32::try_from(j).unwrap_or(u32::MAX);
+                tags.set(tag_idx, tag);
             }
         }
     }).unwrap_or_default()
@@ -1884,9 +1903,11 @@ fn build_fs_info_response(request_id: u64, usage: &[crate::image::FilesystemUsag
     serialize_message(|msg| {
         let mut resp = msg.init_root::<workers_capnp::image_response::Builder>();
         resp.set_request_id(request_id);
-        let mut list = resp.init_fs_info(usage.len() as u32);
+        let list_len = u32::try_from(usage.len()).unwrap_or(u32::MAX);
+        let mut list = resp.init_fs_info(list_len);
         for (i, fs) in usage.iter().enumerate() {
-            let mut fs_usage = list.reborrow().get(i as u32);
+            let idx = u32::try_from(i).unwrap_or(u32::MAX);
+            let mut fs_usage = list.reborrow().get(idx);
             fs_usage.set_timestamp(fs.timestamp);
             let mut fs_id = fs_usage.reborrow().init_fs_id();
             fs_id.set_mountpoint(&fs.fs_id.mountpoint);

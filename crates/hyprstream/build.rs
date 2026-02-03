@@ -191,7 +191,6 @@ fn sanitize_git_ref(ref_name: &str) -> String {
         .chars()
         .map(|c| match c {
             'a'..='z' | '0'..='9' | '-' | '_' => c,
-            '/' | '.' | ' ' => '-',
             _ => '-',
         })
         .collect();

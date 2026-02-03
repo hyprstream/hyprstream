@@ -291,7 +291,8 @@ impl SandboxPool {
             .map_err(|e| WorkerError::VmStartFailed(format!("failed to prepare VM: {e}")))?;
 
         // 7. Start the VM
-        let timeout_secs = self.config.create_timeout_secs as i32;
+        // Timeout is typically small, cap at i32::MAX (~68 years)
+        let timeout_secs = i32::try_from(self.config.create_timeout_secs).unwrap_or(i32::MAX);
         tracing::debug!(sandbox_id = %sandbox.id, timeout_secs, "Starting VM");
         hypervisor
             .start_vm(timeout_secs)
@@ -388,7 +389,8 @@ impl SandboxPool {
         // Resource limits
         config.cpu_info.default_vcpus = self.config.vm_cpus as f32;
         config.cpu_info.default_maxvcpus = self.config.vm_cpus;
-        config.memory_info.default_memory = self.config.vm_memory_mb as u32;
+        // VM memory in MB is typically small, cap at u32::MAX (~4TB)
+        config.memory_info.default_memory = u32::try_from(self.config.vm_memory_mb).unwrap_or(u32::MAX);
 
         // Configure rootless user if running in rootless mode
         if rootless::is_rootless() {

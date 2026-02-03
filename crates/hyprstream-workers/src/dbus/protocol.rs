@@ -79,8 +79,7 @@ impl DbusValue {
     /// Try to get as string
     pub fn as_str(&self) -> Option<&str> {
         match self {
-            DbusValue::String(s) => Some(s),
-            DbusValue::ObjectPath(s) => Some(s),
+            DbusValue::String(s) | DbusValue::ObjectPath(s) => Some(s),
             _ => None,
         }
     }

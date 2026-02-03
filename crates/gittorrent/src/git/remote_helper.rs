@@ -97,7 +97,8 @@ impl GitRemoteHelper {
                     match self.handle_command(line).await {
                         Ok(response) => {
                             if let Some(resp) = response {
-                                print!("{resp}");
+                                // Git remote helper protocol: write response to stdout
+                                write!(stdout, "{resp}").map_err(Error::from)?;
                                 stdout.flush().map_err(Error::from)?;
                             }
                         }
@@ -156,7 +157,8 @@ impl GitRemoteHelper {
                 }
                 "push" => {
                     let result = self.handle_push(&parts[1..]).await?;
-                    print!("{result}");
+                    // Git remote helper protocol: write push result to stdout
+                    write!(io::stdout(), "{result}").map_err(Error::from)?;
                 }
                 _ => {
                     return Err(Error::other(format!("Invalid batch command: {}", parts[0])));

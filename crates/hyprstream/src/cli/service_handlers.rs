@@ -2,6 +2,8 @@
 //!
 //! Provides lifecycle management for hyprstream services including
 //! installation, upgrade, start/stop, and status display.
+// CLI handlers intentionally print to stdout/stderr for user interaction
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

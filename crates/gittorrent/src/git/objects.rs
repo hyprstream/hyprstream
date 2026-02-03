@@ -42,9 +42,9 @@ impl From<ObjectType> for GitObjectType {
         match obj_type {
             ObjectType::Commit => GitObjectType::Commit,
             ObjectType::Tree => GitObjectType::Tree,
-            ObjectType::Blob => GitObjectType::Blob,
             ObjectType::Tag => GitObjectType::Tag,
-            _ => GitObjectType::Blob, // fallback
+            // Blob and Any both map to Blob
+            ObjectType::Blob | ObjectType::Any => GitObjectType::Blob,
         }
     }
 }
@@ -71,9 +71,9 @@ pub async fn extract_objects(repo_path: &Path) -> Result<Vec<GitObject>> {
             let type_str = match obj.kind() {
                 ObjectType::Commit => "commit",
                 ObjectType::Tree => "tree",
-                ObjectType::Blob => "blob",
                 ObjectType::Tag => "tag",
-                ObjectType::Any => "blob", // Default to blob for Any
+                // Blob and Any both render as "blob"
+                ObjectType::Blob | ObjectType::Any => "blob",
             };
 
             let mut git_format = Vec::new();
@@ -158,9 +158,9 @@ fn create_git_object(repo: &Repository, obj: &git2::Object<'_>) -> Result<GitObj
     let type_str = match obj.kind() {
         Some(ObjectType::Commit) => "commit",
         Some(ObjectType::Tree) => "tree",
-        Some(ObjectType::Blob) => "blob",
         Some(ObjectType::Tag) => "tag",
-        _ => "blob",
+        // Blob, Any, or None all render as "blob"
+        Some(ObjectType::Blob | ObjectType::Any) | None => "blob",
     };
 
     let mut git_format = Vec::new();
@@ -382,8 +382,8 @@ pub async fn write_objects(repo_path: &Path, objects: &[GitObject]) -> Result<()
                     let obj_type = match parts[0] {
                         "commit" => ObjectType::Commit,
                         "tree" => ObjectType::Tree,
-                        "blob" => ObjectType::Blob,
                         "tag" => ObjectType::Tag,
+                        // "blob" or unknown types default to Blob
                         _ => ObjectType::Blob,
                     };
 
@@ -607,8 +607,8 @@ pub async fn write_git_object(repo: &Repository, object_data: &[u8]) -> Result<(
                 let obj_type = match parts[0] {
                     "commit" => ObjectType::Commit,
                     "tree" => ObjectType::Tree,
-                    "blob" => ObjectType::Blob,
                     "tag" => ObjectType::Tag,
+                    // "blob" or unknown types default to Blob
                     _ => ObjectType::Blob,
                 };
 

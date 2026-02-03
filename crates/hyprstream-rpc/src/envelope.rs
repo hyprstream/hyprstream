@@ -119,8 +119,8 @@ impl RequestIdentity {
     /// includes the namespace prefix to prevent collisions.
     pub fn user(&self) -> &str {
         match self {
-            Self::Local { user } => user,
-            Self::ApiToken { user, .. } => user,
+            // Both Local and ApiToken have a user field
+            Self::Local { user } | Self::ApiToken { user, .. } => user,
             Self::Peer { name, .. } => name,
             Self::Anonymous => "anonymous",
         }
@@ -293,9 +293,10 @@ impl RequestEnvelope {
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
 
         // SAFETY: Only fails if system time is before Unix epoch (1970)
+        // Cap at i64::MAX (won't overflow for ~292 million years)
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
             .unwrap_or(0);
 
         Self {
@@ -541,9 +542,10 @@ impl InMemoryNonceCache {
 impl NonceCache for InMemoryNonceCache {
     fn check_and_insert(&self, nonce: &[u8; 16]) -> bool {
         // SAFETY: Only fails if system time is before Unix epoch (1970)
+        // Cap at i64::MAX (won't overflow for ~292 million years)
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
             .unwrap_or(0);
 
         // Fast path: check if already seen (read lock)
@@ -628,9 +630,10 @@ impl SignedEnvelope {
 
         // 2. Check timestamp window
         // SAFETY: Only fails if system time is before Unix epoch (1970)
+        // Cap at i64::MAX (won't overflow for ~292 million years)
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
             .unwrap_or(0);
 
         let age = now - self.envelope.timestamp;

@@ -408,8 +408,8 @@ impl GitTorrentService {
                             let obj_type = match parts[0] {
                                 "commit" => GitObjectType::Commit,
                                 "tree" => GitObjectType::Tree,
-                                "blob" => GitObjectType::Blob,
                                 "tag" => GitObjectType::Tag,
+                                // "blob" or unknown types default to Blob
                                 _ => GitObjectType::Blob,
                             };
 

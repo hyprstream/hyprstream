@@ -692,7 +692,9 @@ fn calculate_timeout(
         let remaining_ms = (claims.exp - now) * 1000 - SAFETY_BUFFER_MS;
 
         if remaining_ms > 0 {
-            timeout = timeout.min(remaining_ms as i32);
+            // Cap at i32::MAX for ZMQ timeout (about 24 days, more than enough)
+            let remaining_i32 = i32::try_from(remaining_ms).unwrap_or(i32::MAX);
+            timeout = timeout.min(remaining_i32);
         } else {
             warn!("Claims have expired or will expire immediately, using minimal timeout");
             return 100; // 100ms minimal timeout
@@ -889,8 +891,10 @@ impl ZmqClient {
 
         // Receive response with timeout
         // Use tokio::time::timeout since ZMQ socket timeout may not work with TMQ async
+        // Ensure timeout is non-negative before converting to u64
+        let timeout_ms = u64::try_from(timeout.max(0)).unwrap_or(0);
         let result = tokio::time::timeout(
-            std::time::Duration::from_millis(timeout as u64),
+            std::time::Duration::from_millis(timeout_ms),
             receiver.recv()
         ).await;
 

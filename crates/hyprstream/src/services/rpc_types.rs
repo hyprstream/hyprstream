@@ -916,8 +916,7 @@ impl From<&crate::runtime::GenerationStats> for InferenceComplete {
         let finish_reason = match &stats.finish_reason {
             Some(crate::config::FinishReason::MaxTokens) => "length",
             Some(crate::config::FinishReason::EndOfSequence) => "eos",
-            Some(crate::config::FinishReason::Stop) => "stop",
-            Some(crate::config::FinishReason::StopToken(_)) => "stop",
+            Some(crate::config::FinishReason::Stop | crate::config::FinishReason::StopToken(_)) => "stop",
             Some(crate::config::FinishReason::Error(_)) => "error",
             None => "unknown",
         };

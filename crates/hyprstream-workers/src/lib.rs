@@ -83,10 +83,17 @@ pub use events::{
 };
 
 /// Generated Cap'n Proto code
-#[allow(dead_code)]
-#[allow(clippy::all)]
-#[allow(clippy::unwrap_used)]
-#[allow(clippy::expect_used)]
 pub mod workers_capnp {
+    #![allow(dead_code)]
+    #![allow(clippy::all)]
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+    #![allow(clippy::match_same_arms)]
+    #![allow(clippy::semicolon_if_nothing_returned)]
+    #![allow(clippy::doc_markdown)]
+    #![allow(clippy::indexing_slicing)]
+    #![allow(clippy::cast_possible_truncation)]
+    #![allow(clippy::cast_sign_loss)]
+    #![allow(clippy::cast_possible_wrap)]
     include!(concat!(env!("OUT_DIR"), "/workers_capnp.rs"));
 }

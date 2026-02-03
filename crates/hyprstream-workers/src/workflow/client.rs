@@ -158,15 +158,15 @@ impl WorkflowZmq {
 #[async_trait]
 impl WorkflowClient for WorkflowZmq {
     async fn scan_repo(&self, _repo_id: &str) -> Result<Vec<WorkflowDef>> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("WorkflowZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn register_workflow(&self, _workflow: WorkflowDef) -> Result<WorkflowId> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("WorkflowZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn list_workflows(&self) -> Result<Vec<WorkflowInfo>> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("WorkflowZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn dispatch(
@@ -174,7 +174,7 @@ impl WorkflowClient for WorkflowZmq {
         _workflow_id: &WorkflowId,
         _inputs: HashMap<String, String>,
     ) -> Result<RunId> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("WorkflowZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn subscribe(
@@ -182,18 +182,18 @@ impl WorkflowClient for WorkflowZmq {
         _trigger: EventTrigger,
         _workflow_id: &WorkflowId,
     ) -> Result<SubscriptionId> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("WorkflowZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn unsubscribe(&self, _sub_id: &SubscriptionId) -> Result<()> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("WorkflowZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn get_run(&self, _run_id: &RunId) -> Result<WorkflowRun> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("WorkflowZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn list_runs(&self, _workflow_id: &WorkflowId) -> Result<Vec<WorkflowRun>> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("WorkflowZmq: ZMQ transport not yet implemented").into())
     }
 }

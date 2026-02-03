@@ -41,17 +41,26 @@
 // Note: Generated code uses unwrap/expect internally - this is standard capnp-rust behavior
 // These modules are excluded from clippy checks via cargo configuration
 pub mod common_capnp {
-    #![allow(dead_code, unused_imports, clippy::unwrap_used, clippy::expect_used)]
+    #![allow(dead_code, unused_imports)]
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
     include!(concat!(env!("OUT_DIR"), "/common_capnp.rs"));
 }
 
 pub mod events_capnp {
-    #![allow(dead_code, unused_imports, clippy::unwrap_used, clippy::expect_used)]
+    #![allow(dead_code, unused_imports)]
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
     include!(concat!(env!("OUT_DIR"), "/events_capnp.rs"));
 }
 
 pub mod streaming_capnp {
-    #![allow(dead_code, unused_imports, clippy::unwrap_used, clippy::expect_used)]
+    #![allow(dead_code, unused_imports)]
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
     include!(concat!(env!("OUT_DIR"), "/streaming_capnp.rs"));
 }
 

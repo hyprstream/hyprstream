@@ -164,7 +164,7 @@ impl RecordStore for GitObjectStore {
         // Check provider limit per key
         if providers.len() >= self.max_providers_per_key && !providers.contains_key(&record.provider) {
             // Remove oldest provider (in practice, use LRU)
-            if let Some(provider_to_remove) = providers.keys().next().cloned() {
+            if let Some(provider_to_remove) = providers.keys().next().copied() {
                 providers.remove(&provider_to_remove);
                 tracing::debug!("Evicted provider to make space: {:?} for key {:?}",
                     provider_to_remove, record.key);

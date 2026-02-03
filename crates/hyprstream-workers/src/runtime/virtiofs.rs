@@ -245,19 +245,17 @@ impl SandboxVirtiofs {
 
         // Kill the daemon process if running
         if let Some(pid) = self.daemon_pid {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGTERM,
-            );
+            // PIDs are always positive and fit in i32 on Unix
+            if let Some(pid_i32) = i32::try_from(pid).ok().filter(|&p| p > 0) {
+                let nix_pid = nix::unistd::Pid::from_raw(pid_i32);
+                let _ = nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGTERM);
 
-            // Wait briefly for graceful shutdown
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                // Wait briefly for graceful shutdown
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-            // Force kill if still running
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            );
+                // Force kill if still running
+                let _ = nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGKILL);
+            }
         }
 
         // Clean up socket
@@ -301,10 +299,13 @@ impl Drop for SandboxVirtiofs {
     fn drop(&mut self) {
         // Best-effort cleanup on drop
         if let Some(pid) = self.daemon_pid {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            );
+            // PIDs are always positive and fit in i32 on Unix
+            if let Some(pid_i32) = i32::try_from(pid).ok().filter(|&p| p > 0) {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid_i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
         }
     }
 }

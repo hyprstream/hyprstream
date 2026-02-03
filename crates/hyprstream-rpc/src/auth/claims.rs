@@ -25,9 +25,12 @@ impl ToCapnp for Claims {
         builder.set_iat(self.iat);
         builder.set_admin(self.admin);
 
-        let mut scopes_builder = builder.reborrow().init_scopes(self.scopes.len() as u32);
+        // Cap'n Proto uses u32 for list lengths - cap at u32::MAX (safe: no one has 4B scopes)
+        let scopes_len = u32::try_from(self.scopes.len()).unwrap_or(u32::MAX);
+        let mut scopes_builder = builder.reborrow().init_scopes(scopes_len);
         for (i, scope) in self.scopes.iter().enumerate() {
-            let mut scope_builder = scopes_builder.reborrow().get(i as u32);
+            let idx = u32::try_from(i).unwrap_or(u32::MAX);
+            let mut scope_builder = scopes_builder.reborrow().get(idx);
             scope.write_to(&mut scope_builder);
         }
     }

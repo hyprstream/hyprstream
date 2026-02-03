@@ -160,7 +160,12 @@ impl SpawnerBackend for StandaloneBackend {
                 "Process not in map, attempting direct kill by PID"
             );
 
-            let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
+            // PIDs are always positive and fit in i32 on Unix
+            let Some(pid_i32) = i32::try_from(pid).ok().filter(|&p| p > 0) else {
+                tracing::warn!(pid = %pid, "Invalid PID, skipping kill");
+                return Ok(());
+            };
+            let nix_pid = nix::unistd::Pid::from_raw(pid_i32);
 
             // Send SIGTERM
             if let Err(e) = nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGTERM) {
@@ -206,11 +211,15 @@ impl SpawnerBackend for StandaloneBackend {
         };
 
         // Check if the process exists by sending signal 0
-        let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
+        // PIDs are always positive and fit in i32 on Unix
+        let Some(pid_i32) = i32::try_from(pid).ok().filter(|&p| p > 0) else {
+            return Ok(false); // Invalid PID means not running
+        };
+        let nix_pid = nix::unistd::Pid::from_raw(pid_i32);
         match nix::sys::signal::kill(nix_pid, None) {
-            Ok(()) => Ok(true),                         // Process exists
+            // Process exists (Ok) or exists but we can't signal it (EPERM)
+            Ok(()) | Err(nix::errno::Errno::EPERM) => Ok(true),
             Err(nix::errno::Errno::ESRCH) => Ok(false), // No such process
-            Err(nix::errno::Errno::EPERM) => Ok(true),  // Process exists but we can't signal it
             Err(e) => {
                 tracing::warn!(pid = %pid, error = %e, "Error checking process status");
                 Ok(false)

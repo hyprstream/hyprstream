@@ -67,7 +67,9 @@ pub struct ContextRecord {
 impl ContextRecord {
     /// Convert to Arrow RecordBatch for storage
     pub fn to_record_batch(&self) -> Result<RecordBatch, Status> {
-        let embedding_dim = self.embedding.len() as i32;
+        // Embedding dimension is typically small (< 10000), safe conversion
+        let embedding_dim = i32::try_from(self.embedding.len())
+            .map_err(|_| Status::invalid_argument("Embedding dimension too large"))?;
         let schema = Arc::new(context_schema(embedding_dim));
 
         // Build the fixed-size list array for embedding
@@ -103,7 +105,9 @@ impl ContextRecord {
             return Err(Status::invalid_argument("Cannot create batch from empty records"));
         }
 
-        let embedding_dim = records[0].embedding.len() as i32;
+        // Embedding dimension is typically small (< 10000), safe conversion
+        let embedding_dim = i32::try_from(records[0].embedding.len())
+            .map_err(|_| Status::invalid_argument("Embedding dimension too large"))?;
         let schema = Arc::new(context_schema(embedding_dim));
 
         // Build arrays

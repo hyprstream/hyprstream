@@ -150,7 +150,7 @@ pub fn last_error() -> Option<XetError> {
 /// This can be useful to prevent stale errors from previous operations
 /// from being mistaken for new errors.
 pub fn clear_last_error() {
-    error::clear_last_error()
+    error::clear_last_error();
 }
 
 #[cfg(all(test, feature = "xet-storage"))]

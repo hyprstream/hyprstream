@@ -9,48 +9,43 @@
 
 // Cap'n Proto generated modules (must be at crate root for path resolution)
 // Note: common_capnp is in hyprstream-rpc crate (envelope types)
-#[allow(dead_code)]
-#[allow(unused_imports)]
-#[allow(clippy::all)]
-#[allow(clippy::unwrap_used)]
-#[allow(clippy::expect_used)]
 pub mod events_capnp {
+    #![allow(dead_code, unused_imports)]
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
     include!(concat!(env!("OUT_DIR"), "/events_capnp.rs"));
 }
 
-#[allow(dead_code)]
-#[allow(unused_imports)]
-#[allow(clippy::all)]
-#[allow(clippy::unwrap_used)]
-#[allow(clippy::expect_used)]
 pub mod inference_capnp {
+    #![allow(dead_code, unused_imports)]
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
     include!(concat!(env!("OUT_DIR"), "/inference_capnp.rs"));
 }
 
-#[allow(dead_code)]
-#[allow(unused_imports)]
-#[allow(clippy::all)]
-#[allow(clippy::unwrap_used)]
-#[allow(clippy::expect_used)]
 pub mod registry_capnp {
+    #![allow(dead_code, unused_imports)]
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
     include!(concat!(env!("OUT_DIR"), "/registry_capnp.rs"));
 }
 
-#[allow(dead_code)]
-#[allow(unused_imports)]
-#[allow(clippy::all)]
-#[allow(clippy::unwrap_used)]
-#[allow(clippy::expect_used)]
 pub mod policy_capnp {
+    #![allow(dead_code, unused_imports)]
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
     include!(concat!(env!("OUT_DIR"), "/policy_capnp.rs"));
 }
 
-#[allow(dead_code)]
-#[allow(unused_imports)]
-#[allow(clippy::all)]
-#[allow(clippy::unwrap_used)]
-#[allow(clippy::expect_used)]
 pub mod model_capnp {
+    #![allow(dead_code, unused_imports)]
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
     include!(concat!(env!("OUT_DIR"), "/model_capnp.rs"));
 }
 

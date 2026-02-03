@@ -1,4 +1,6 @@
 //! Handlers for worktree management commands
+// CLI handlers intentionally print to stdout/stderr for user interaction
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use crate::cli::git_handlers::apply_policy_template_to_model;
 use crate::services::RegistryClient;

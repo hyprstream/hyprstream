@@ -374,10 +374,8 @@ async fn chat_completions(
                     finish_reason: Some(
                         match generation.finish_reason {
                             FinishReason::MaxTokens => "length",
-                            FinishReason::StopToken(_) => "stop",
-                            FinishReason::EndOfSequence => "stop",
-                            FinishReason::Stop => "stop",
-                            FinishReason::Error(_) => "stop",
+                            // All other reasons map to "stop" per OpenAI API spec
+                            _ => "stop",
                         }.to_owned(),
                     ),
                 }],

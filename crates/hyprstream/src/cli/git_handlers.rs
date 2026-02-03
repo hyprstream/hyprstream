@@ -1,4 +1,6 @@
 //! Handlers for git-style CLI commands
+// CLI handlers intentionally print to stdout/stderr for user interaction
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use crate::config::GenerationRequest;
 use crate::api::openai_compat::ChatMessage;

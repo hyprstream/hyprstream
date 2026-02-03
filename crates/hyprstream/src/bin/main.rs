@@ -1,6 +1,8 @@
 //! Hyprstream binary - ML inference server
 //!
 //! This binary provides the main entry point for the Hyprstream service.
+// CLI binary intentionally prints to stdout/stderr for user interaction
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 
 // Standard library imports
 use anyhow::{Context as _, Result};
