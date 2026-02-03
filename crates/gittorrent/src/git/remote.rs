@@ -80,7 +80,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_ls_remote_output() {
+    fn test_parse_ls_remote_output() -> crate::error::Result<()> {
         // Test with SHA1 hashes (40 hex chars) - current git format
         let output = r#"
 0123456789abcdef0123456789abcdef01234567	HEAD
@@ -89,7 +89,7 @@ mod tests {
 2123456789abcdef0123456789abcdef01234567	refs/tags/v1.0.0
 "#;
 
-        let refs = parse_ls_remote_output(output.trim()).unwrap();
+        let refs = parse_ls_remote_output(output.trim())?;
         assert_eq!(refs.len(), 4);
 
         assert_eq!(refs[0].name, "HEAD");
@@ -104,18 +104,19 @@ mod tests {
 
         assert_eq!(refs[3].name, "refs/tags/v1.0.0");
         assert_eq!(refs[3].hash.to_hex(), "2123456789abcdef0123456789abcdef01234567");
+        Ok(())
     }
 
     #[test]
-    fn test_refs_to_map() {
+    fn test_refs_to_map() -> crate::error::Result<()> {
         let refs = vec![
             GitRef {
                 name: "refs/heads/main".to_owned(),
-                hash: GitHash::from_hex("0123456789abcdef0123456789abcdef01234567").unwrap(),
+                hash: GitHash::from_hex("0123456789abcdef0123456789abcdef01234567")?,
             },
             GitRef {
                 name: "refs/heads/develop".to_owned(),
-                hash: GitHash::from_hex("1123456789abcdef0123456789abcdef01234567").unwrap(),
+                hash: GitHash::from_hex("1123456789abcdef0123456789abcdef01234567")?,
             },
         ];
 
@@ -123,5 +124,6 @@ mod tests {
         assert_eq!(map.len(), 2);
         assert!(map.contains_key("refs/heads/main"));
         assert!(map.contains_key("refs/heads/develop"));
+        Ok(())
     }
 }

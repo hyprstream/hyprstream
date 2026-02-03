@@ -241,7 +241,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_spawn_and_stop() {
+    async fn test_spawn_and_stop() -> crate::Result<()> {
         let backend = StandaloneBackend::new();
 
         // Spawn a simple process (sleep)
@@ -255,17 +255,17 @@ mod tests {
                 assert!(process.pid().is_some());
 
                 // Check it's running
-                let running = backend.is_running(&process).await.unwrap();
+                let running = backend.is_running(&process).await?;
                 assert!(running, "Process should be running");
 
                 // Stop it
-                backend.stop(&process).await.unwrap();
+                backend.stop(&process).await?;
 
                 // Give it a moment to die
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
                 // Check it's stopped
-                let running = backend.is_running(&process).await.unwrap();
+                let running = backend.is_running(&process).await?;
                 assert!(!running, "Process should be stopped");
             }
             Err(e) => {
@@ -273,6 +273,7 @@ mod tests {
                 eprintln!("Could not spawn test process: {e}");
             }
         }
+        Ok(())
     }
 
     #[test]

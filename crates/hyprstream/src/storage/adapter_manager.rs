@@ -263,39 +263,40 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn test_adapter_indexing() {
-        let temp_dir = tempdir().expect("test: create temp dir");
+    fn test_adapter_indexing() -> Result<()> {
+        let temp_dir = tempdir()?;
         let model_path = temp_dir.path().join("test_model");
-        std::fs::create_dir_all(&model_path).expect("test: create model dir");
+        std::fs::create_dir_all(&model_path)?;
 
         let manager = AdapterManager::new(&model_path);
-        manager.ensure_adapters_dir().expect("test: ensure adapters dir");
+        manager.ensure_adapters_dir()?;
 
         // Test getting next index on empty directory
-        assert_eq!(manager.get_next_index().expect("test: get next index"), 0);
+        assert_eq!(manager.get_next_index()?, 0);
 
         // Create some test adapters
         let adapters_dir = model_path.join("adapters");
-        std::fs::write(adapters_dir.join("00_base.safetensors"), b"").expect("test: write adapter");
-        std::fs::write(adapters_dir.join("01_custom.safetensors"), b"").expect("test: write adapter");
+        std::fs::write(adapters_dir.join("00_base.safetensors"), b"")?;
+        std::fs::write(adapters_dir.join("01_custom.safetensors"), b"")?;
 
         // Test getting next index with existing adapters
-        assert_eq!(manager.get_next_index().expect("test: get next index"), 2);
+        assert_eq!(manager.get_next_index()?, 2);
 
         // Test listing adapters
-        let adapters = manager.list_adapters().expect("test: list adapters");
+        let adapters = manager.list_adapters()?;
         assert_eq!(adapters.len(), 2);
         assert_eq!(adapters[0].index, 0);
         assert_eq!(adapters[0].name, "base");
         assert_eq!(adapters[1].index, 1);
         assert_eq!(adapters[1].name, "custom");
+        Ok(())
     }
 
     #[test]
-    fn test_adapter_initialization() {
-        let temp_dir = tempdir().expect("test: create temp dir");
+    fn test_adapter_initialization() -> Result<()> {
+        let temp_dir = tempdir()?;
         let model_path = temp_dir.path().join("test_model");
-        std::fs::create_dir_all(&model_path).expect("test: create model dir");
+        std::fs::create_dir_all(&model_path)?;
 
         let manager = AdapterManager::new(&model_path);
 
@@ -304,17 +305,17 @@ mod tests {
 
         // Initialize adapter with auto-index
         let adapter_path = manager
-            .initialize_adapter("test", None, config.clone())
-            .expect("test: initialize adapter");
+            .initialize_adapter("test", None, config.clone())?;
         assert!(adapter_path.exists());
-        assert!(adapter_path.to_str().expect("test: path to str").contains("00_test"));
+        let path_str = adapter_path.to_str().ok_or_else(|| anyhow::anyhow!("path not valid utf-8"))?;
+        assert!(path_str.contains("00_test"));
 
         // Initialize adapter with specific index
         let adapter_path = manager
-            .initialize_adapter("custom", Some(5), config)
-            .expect("test: initialize adapter");
+            .initialize_adapter("custom", Some(5), config)?;
         assert!(adapter_path.exists());
-        assert!(adapter_path.to_str().expect("test: path to str").contains("05_custom"));
+        let path_str = adapter_path.to_str().ok_or_else(|| anyhow::anyhow!("path not valid utf-8"))?;
+        assert!(path_str.contains("05_custom"));
 
         // Check that configs were created
         let adapters_dir = model_path.join("adapters");
@@ -324,5 +325,6 @@ mod tests {
         // Verify adapter files were created
         assert!(adapters_dir.join("00_test.safetensors").exists());
         assert!(adapters_dir.join("05_custom.safetensors").exists());
+        Ok(())
     }
 }

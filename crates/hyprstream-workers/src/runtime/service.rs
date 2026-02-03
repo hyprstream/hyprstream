@@ -1905,8 +1905,8 @@ mod tests {
     use tempfile::TempDir;
 
     /// Create a test WorkerService with temporary directories
-    async fn create_test_service() -> (WorkerService, TempDir) {
-        let temp_dir = TempDir::new().unwrap();
+    async fn create_test_service() -> std::result::Result<(WorkerService, TempDir), Box<dyn std::error::Error>> {
+        let temp_dir = TempDir::new()?;
         let base_path = temp_dir.path();
 
         let image_config = ImageConfig {
@@ -1922,7 +1922,7 @@ mod tests {
             cache_size_bytes: 1024 * 1024 * 1024, // 1GB for tests
         };
 
-        let rafs_store = Arc::new(RafsStore::new(image_config.clone()).unwrap());
+        let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
 
         let pool_config = PoolConfig {
             runtime_dir: base_path.join("sandboxes"),
@@ -1937,14 +1937,13 @@ mod tests {
         let transport = TransportConfig::inproc("test-worker-service");
         let (signing_key, _verifying_key) = generate_signing_keypair();
 
-        let service = WorkerService::new(pool_config, image_config, rafs_store, context, transport, signing_key)
-            .expect("Failed to create WorkerService");
-        (service, temp_dir)
+        let service = WorkerService::new(pool_config, image_config, rafs_store, context, transport, signing_key)?;
+        Ok((service, temp_dir))
     }
 
     #[tokio::test]
-    async fn test_sandbox_lifecycle() {
-        let (service, _temp_dir) = create_test_service().await;
+    async fn test_sandbox_lifecycle() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let (service, _temp_dir) = create_test_service().await?;
 
         // Create sandbox - this requires cloud-hypervisor and kata runtime directories
         let config = PodSandboxConfig::default();
@@ -1959,33 +1958,34 @@ mod tests {
                     || msg.contains("launch failed") =>
             {
                 eprintln!("Skipping test: cloud-hypervisor or kata runtime not available");
-                return;
+                return Ok(());
             }
             _ => {}
         }
 
-        let sandbox_id = result.unwrap();
+        let sandbox_id = result?;
 
         // Check status
-        let status = service.pod_sandbox_status(&sandbox_id, false).await.unwrap();
+        let status = service.pod_sandbox_status(&sandbox_id, false).await?;
         assert_eq!(status.status.state, PodSandboxState::SandboxReady);
 
         // List sandboxes
-        let sandboxes = service.list_pod_sandbox(None).await.unwrap();
+        let sandboxes = service.list_pod_sandbox(None).await?;
         assert_eq!(sandboxes.len(), 1);
 
         // Stop and remove
-        service.stop_pod_sandbox(&sandbox_id).await.unwrap();
-        service.remove_pod_sandbox(&sandbox_id).await.unwrap();
+        service.stop_pod_sandbox(&sandbox_id).await?;
+        service.remove_pod_sandbox(&sandbox_id).await?;
 
         // Should be empty
-        let sandboxes = service.list_pod_sandbox(None).await.unwrap();
+        let sandboxes = service.list_pod_sandbox(None).await?;
         assert_eq!(sandboxes.len(), 0);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_container_lifecycle() {
-        let (service, _temp_dir) = create_test_service().await;
+    async fn test_container_lifecycle() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let (service, _temp_dir) = create_test_service().await?;
 
         // Create sandbox first - this requires cloud-hypervisor and kata runtime directories
         let sandbox_config = PodSandboxConfig::default();
@@ -2000,58 +2000,60 @@ mod tests {
                     || msg.contains("launch failed") =>
             {
                 eprintln!("Skipping test: cloud-hypervisor or kata runtime not available");
-                return;
+                return Ok(());
             }
             _ => {}
         }
 
-        let sandbox_id = result.unwrap();
+        let sandbox_id = result?;
 
         // Create container
         let container_config = ContainerConfig::default();
         let container_id = service
             .create_container(&sandbox_id, &container_config, &sandbox_config)
-            .await
-            .unwrap();
+            .await?;
 
         // Check status
-        let status = service.container_status(&container_id, false).await.unwrap();
+        let status = service.container_status(&container_id, false).await?;
         assert_eq!(status.status.state, ContainerState::ContainerCreated);
 
         // Start container
-        service.start_container(&container_id).await.unwrap();
-        let status = service.container_status(&container_id, false).await.unwrap();
+        service.start_container(&container_id).await?;
+        let status = service.container_status(&container_id, false).await?;
         assert_eq!(status.status.state, ContainerState::ContainerRunning);
 
         // Stop container
-        service.stop_container(&container_id, 30).await.unwrap();
-        let status = service.container_status(&container_id, false).await.unwrap();
+        service.stop_container(&container_id, 30).await?;
+        let status = service.container_status(&container_id, false).await?;
         assert_eq!(status.status.state, ContainerState::ContainerExited);
 
         // Remove container
-        service.remove_container(&container_id).await.unwrap();
+        service.remove_container(&container_id).await?;
 
         // Cleanup
-        service.remove_pod_sandbox(&sandbox_id).await.unwrap();
+        service.remove_pod_sandbox(&sandbox_id).await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_service_version() {
-        let (service, _temp_dir) = create_test_service().await;
+    async fn test_service_version() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let (service, _temp_dir) = create_test_service().await?;
 
         // Version should work without cloud-hypervisor
-        let version = service.version("v1").await.unwrap();
+        let version = service.version("v1").await?;
         assert_eq!(version.runtime_name, super::super::RUNTIME_NAME);
         assert_eq!(version.runtime_api_version, "v1");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_service_status() {
-        let (service, _temp_dir) = create_test_service().await;
+    async fn test_service_status() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let (service, _temp_dir) = create_test_service().await?;
 
         // Status should work without cloud-hypervisor
-        let status = service.status(true).await.unwrap();
+        let status = service.status(true).await?;
         assert!(!status.status.conditions.is_empty());
         assert!(status.info.contains_key("warm_pool_size"));
+        Ok(())
     }
 }

@@ -119,7 +119,7 @@ mod tests {
             .restart_on_failure();
 
         assert_eq!(config.name, "test");
-        assert_eq!(config.executable.to_str().unwrap(), "/usr/bin/test");
+        assert_eq!(config.executable.to_str(), Some("/usr/bin/test"));
         assert_eq!(config.args, vec!["--foo", "bar"]);
     }
 

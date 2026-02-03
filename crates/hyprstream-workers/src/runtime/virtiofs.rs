@@ -176,18 +176,30 @@ impl SandboxVirtiofs {
         tokio::fs::write(&config_path, serde_json::to_string_pretty(&config)?).await?;
 
         // Spawn nydusd process
+        let config_path_str = config_path.to_str().ok_or_else(|| {
+            WorkerError::SandboxCreationFailed("config path contains invalid UTF-8".to_owned())
+        })?;
+        let bootstrap_path_str = bootstrap_path.to_str().ok_or_else(|| {
+            WorkerError::SandboxCreationFailed("bootstrap path contains invalid UTF-8".to_owned())
+        })?;
+        let socket_path_str = self.socket_path.to_str().ok_or_else(|| {
+            WorkerError::SandboxCreationFailed("socket path contains invalid UTF-8".to_owned())
+        })?;
+        let api_socket_str = api_socket.to_str().ok_or_else(|| {
+            WorkerError::SandboxCreationFailed("api socket path contains invalid UTF-8".to_owned())
+        })?;
         let child = tokio::process::Command::new("nydusd")
             .args([
                 "--config",
-                config_path.to_str().unwrap(),
+                config_path_str,
                 "--mountpoint",
                 "", // No mountpoint for virtiofs
                 "--bootstrap",
-                bootstrap_path.to_str().unwrap(),
+                bootstrap_path_str,
                 "--sock",
-                self.socket_path.to_str().unwrap(),
+                socket_path_str,
                 "--apisock",
-                api_socket.to_str().unwrap(),
+                api_socket_str,
                 "--log-level",
                 "info",
             ])

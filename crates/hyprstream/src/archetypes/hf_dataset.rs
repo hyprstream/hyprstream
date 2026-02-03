@@ -128,75 +128,82 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_with_dataset_infos() {
-        let temp = TempDir::new().expect("test: create temp dir");
+    fn test_detect_with_dataset_infos() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
         let marker_path = temp.path().join("dataset_infos.json");
-        fs::write(&marker_path, "{}").expect("test: write marker");
+        fs::write(&marker_path, "{}")?;
 
         let archetype = HfDatasetArchetype;
         assert!(archetype.detect(temp.path()));
+        Ok(())
     }
 
     #[test]
-    fn test_detect_with_dataset_json() {
-        let temp = TempDir::new().expect("test: create temp dir");
+    fn test_detect_with_dataset_json() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
         let marker_path = temp.path().join("dataset.json");
-        fs::write(&marker_path, "{}").expect("test: write marker");
+        fs::write(&marker_path, "{}")?;
 
         let archetype = HfDatasetArchetype;
         assert!(archetype.detect(temp.path()));
+        Ok(())
     }
 
     #[test]
-    fn test_detect_with_parquet() {
-        let temp = TempDir::new().expect("test: create temp dir");
+    fn test_detect_with_parquet() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
         let parquet_path = temp.path().join("train.parquet");
-        fs::write(&parquet_path, valid_parquet_data()).expect("test: write parquet");
+        fs::write(&parquet_path, valid_parquet_data())?;
 
         let archetype = HfDatasetArchetype;
         assert!(archetype.detect(temp.path()));
+        Ok(())
     }
 
     #[test]
-    fn test_detect_with_parquet_in_subdir() {
-        let temp = TempDir::new().expect("test: create temp dir");
+    fn test_detect_with_parquet_in_subdir() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
         let data_dir = temp.path().join("data");
-        fs::create_dir(&data_dir).expect("test: create dir");
+        fs::create_dir(&data_dir)?;
         let parquet_path = data_dir.join("train.parquet");
-        fs::write(&parquet_path, valid_parquet_data()).expect("test: write parquet");
+        fs::write(&parquet_path, valid_parquet_data())?;
 
         let archetype = HfDatasetArchetype;
         assert!(archetype.detect(temp.path()));
+        Ok(())
     }
 
     #[test]
-    fn test_no_detect_empty_dir() {
-        let temp = TempDir::new().expect("test: create temp dir");
+    fn test_no_detect_empty_dir() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
 
         let archetype = HfDatasetArchetype;
         assert!(!archetype.detect(temp.path()));
+        Ok(())
     }
 
     #[test]
-    fn test_no_detect_invalid_parquet() {
-        let temp = TempDir::new().expect("test: create temp dir");
+    fn test_no_detect_invalid_parquet() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
         // Parquet file without valid PAR1 header should not match
         let parquet_path = temp.path().join("train.parquet");
-        fs::write(&parquet_path, "dummy").expect("test: write parquet");
+        fs::write(&parquet_path, "dummy")?;
 
         let archetype = HfDatasetArchetype;
         assert!(!archetype.detect(temp.path()));
+        Ok(())
     }
 
     #[test]
-    fn test_no_detect_invalid_json() {
-        let temp = TempDir::new().expect("test: create temp dir");
+    fn test_no_detect_invalid_json() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
         // Invalid JSON should not match
         let marker_path = temp.path().join("dataset_infos.json");
-        fs::write(&marker_path, "not valid json").expect("test: write marker");
+        fs::write(&marker_path, "not valid json")?;
 
         let archetype = HfDatasetArchetype;
         assert!(!archetype.detect(temp.path()));
+        Ok(())
     }
 
     #[test]

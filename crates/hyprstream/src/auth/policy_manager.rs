@@ -691,21 +691,22 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
-    async fn test_permissive_policy_manager() {
-        let pm = PolicyManager::permissive().await.expect("test: create policy manager");
+    async fn test_permissive_policy_manager() -> Result<(), PolicyError> {
+        let pm = PolicyManager::permissive().await?;
 
         // Permissive policy allows everything
         assert!(pm.check("anyone", "anything", Operation::Infer).await);
         assert!(pm.check("user", "model:test", Operation::Train).await);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_policy_manager_from_dir() {
-        let temp = TempDir::new().expect("test: create temp dir");
+    async fn test_policy_manager_from_dir() -> Result<(), PolicyError> {
+        let temp = TempDir::new().map_err(PolicyError::IoError)?;
         let policies_dir = temp.path().join("policies");
 
         // Create policy manager (should create default files)
-        let pm = PolicyManager::new(&policies_dir).await.expect("test: create policy manager");
+        let pm = PolicyManager::new(&policies_dir).await?;
 
         // Default policy is deny-all (secure default)
         assert!(!pm.check("user", "model:test", Operation::Infer).await);
@@ -715,42 +716,44 @@ mod tests {
         assert!(policies_dir.join("policy.csv").exists());
 
         // After adding explicit policy, access should work
-        pm.add_policy("user", "model:test", "infer").await.expect("test: add policy");
+        pm.add_policy("user", "model:test", "infer").await?;
         assert!(pm.check("user", "model:test", Operation::Infer).await);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_add_and_check_policy() {
-        let pm = PolicyManager::permissive().await.expect("test: create policy manager");
+    async fn test_add_and_check_policy() -> Result<(), PolicyError> {
+        let pm = PolicyManager::permissive().await?;
 
         // Remove the default permissive rule
-        pm.remove_policy("*", "*", "*").await.expect("test: remove policy");
+        pm.remove_policy("*", "*", "*").await?;
 
         // Now access should be denied
         assert!(!pm.check("user", "model:test", Operation::Infer).await);
 
         // Add specific policy
-        pm.add_policy("user", "model:test", "infer").await.expect("test: add policy");
+        pm.add_policy("user", "model:test", "infer").await?;
 
         // Now this specific access should work
         assert!(pm.check("user", "model:test", Operation::Infer).await);
         // But not other operations
         assert!(!pm.check("user", "model:test", Operation::Train).await);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_role_based_access() {
-        let pm = PolicyManager::permissive().await.expect("test: create policy manager");
+    async fn test_role_based_access() -> Result<(), PolicyError> {
+        let pm = PolicyManager::permissive().await?;
 
         // Remove permissive rule
-        pm.remove_policy("*", "*", "*").await.expect("test: remove policy");
+        pm.remove_policy("*", "*", "*").await?;
 
         // Add role-based policies
-        pm.add_policy("trainer", "model:*", "infer").await.expect("test: add policy");
-        pm.add_policy("trainer", "model:*", "train").await.expect("test: add policy");
+        pm.add_policy("trainer", "model:*", "infer").await?;
+        pm.add_policy("trainer", "model:*", "train").await?;
 
         // Assign role to user
-        pm.add_role_for_user("alice", "trainer").await.expect("test: add role");
+        pm.add_role_for_user("alice", "trainer").await?;
 
         // Alice should have trainer permissions
         assert!(pm.check("alice", "model:test", Operation::Infer).await);
@@ -758,25 +761,27 @@ mod tests {
 
         // Bob without role should not
         assert!(!pm.check("bob", "model:test", Operation::Infer).await);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_format_policy() {
-        let pm = PolicyManager::permissive().await.expect("test: create policy manager");
+    async fn test_format_policy() -> Result<(), PolicyError> {
+        let pm = PolicyManager::permissive().await?;
 
-        pm.add_policy("admin", "*", "*").await.expect("test: add policy");
-        pm.add_role_for_user("alice", "admin").await.expect("test: add role");
+        pm.add_policy("admin", "*", "*").await?;
+        pm.add_role_for_user("alice", "admin").await?;
 
         let formatted = pm.format_policy().await;
         assert!(formatted.contains("Policy Rules"));
         assert!(formatted.contains("admin"));
         assert!(formatted.contains("Role Assignments"));
         assert!(formatted.contains("alice"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_input_validation_rejects_null_bytes() {
-        let pm = PolicyManager::permissive().await.expect("test: create policy manager");
+    async fn test_input_validation_rejects_null_bytes() -> Result<(), PolicyError> {
+        let pm = PolicyManager::permissive().await?;
 
         // Null bytes should be rejected
         let result = pm.add_policy("user\0evil", "model:test", "infer").await;
@@ -784,11 +789,12 @@ mod tests {
 
         let result = pm.add_policy("user", "model:test\0evil", "infer").await;
         assert!(matches!(result, Err(PolicyError::ValidationError(_))));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_input_validation_rejects_line_breaks() {
-        let pm = PolicyManager::permissive().await.expect("test: create policy manager");
+    async fn test_input_validation_rejects_line_breaks() -> Result<(), PolicyError> {
+        let pm = PolicyManager::permissive().await?;
 
         // Line breaks should be rejected (CSV injection)
         let result = pm.add_policy("user\np, evil, *, *", "model:test", "infer").await;
@@ -796,24 +802,27 @@ mod tests {
 
         let result = pm.add_role_for_user("user\revil", "admin").await;
         assert!(matches!(result, Err(PolicyError::ValidationError(_))));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_input_validation_rejects_long_strings() {
-        let pm = PolicyManager::permissive().await.expect("test: create policy manager");
+    async fn test_input_validation_rejects_long_strings() -> Result<(), PolicyError> {
+        let pm = PolicyManager::permissive().await?;
 
         // Strings over 256 chars should be rejected
         let long_string = "a".repeat(257);
         let result = pm.add_policy(&long_string, "model:test", "infer").await;
         assert!(matches!(result, Err(PolicyError::ValidationError(_))));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_input_validation_accepts_valid_input() {
-        let pm = PolicyManager::permissive().await.expect("test: create policy manager");
+    async fn test_input_validation_accepts_valid_input() -> Result<(), PolicyError> {
+        let pm = PolicyManager::permissive().await?;
 
         // Valid inputs should work
         assert!(pm.add_policy("user-123", "model:qwen3-*", "infer").await.is_ok());
         assert!(pm.add_role_for_user("alice_test", "trainer").await.is_ok());
+        Ok(())
     }
 }

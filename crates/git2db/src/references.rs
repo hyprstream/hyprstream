@@ -559,29 +559,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_git_ref_parse() {
-        assert_eq!(GitRef::parse("").unwrap(), GitRef::DefaultBranch);
-        assert_eq!(GitRef::parse("HEAD").unwrap(), GitRef::DefaultBranch);
+    fn test_git_ref_parse() -> crate::Git2DBResult<()> {
+        assert_eq!(GitRef::parse("")?, GitRef::DefaultBranch);
+        assert_eq!(GitRef::parse("HEAD")?, GitRef::DefaultBranch);
         assert_eq!(
-            GitRef::parse("main").unwrap(),
+            GitRef::parse("main")?,
             GitRef::Branch("main".to_owned())
         );
         assert_eq!(
-            GitRef::parse("refs/heads/main").unwrap(),
+            GitRef::parse("refs/heads/main")?,
             GitRef::Branch("main".to_owned())
         );
         assert_eq!(
-            GitRef::parse("refs/tags/v1.0").unwrap(),
+            GitRef::parse("refs/tags/v1.0")?,
             GitRef::Tag("v1.0".to_owned())
         );
         assert_eq!(
-            GitRef::parse("tags/v1.0").unwrap(),
+            GitRef::parse("tags/v1.0")?,
             GitRef::Tag("v1.0".to_owned())
         );
 
         // Test commit hash
         let full_hash = "1234567890abcdef1234567890abcdef12345678";
-        if let GitRef::Commit(oid) = GitRef::parse(full_hash).unwrap() {
+        if let GitRef::Commit(oid) = GitRef::parse(full_hash)? {
             assert_eq!(oid.to_string(), full_hash);
         } else {
             panic!("Expected commit reference");
@@ -589,9 +589,10 @@ mod tests {
 
         // Test short hash (should be revspec)
         assert_eq!(
-            GitRef::parse("1234567").unwrap(),
+            GitRef::parse("1234567")?,
             GitRef::Revspec("1234567".to_owned())
         );
+        Ok(())
     }
 
     #[test]

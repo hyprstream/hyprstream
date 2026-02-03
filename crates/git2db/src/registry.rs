@@ -1174,29 +1174,29 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
-    async fn test_recovery_from_uncommitted_changes() {
+    async fn test_recovery_from_uncommitted_changes() -> crate::Git2DBResult<()> {
         // Create a temporary directory for testing
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new()?;
         let base_dir = temp_dir.path().to_path_buf();
 
         // Create initial registry
-        let mut registry = Git2DB::open(&base_dir).await.unwrap();
+        let mut registry = Git2DB::open(&base_dir).await?;
 
         // Simulate interrupted operation by manually staging changes without committing
         {
-            let repo = registry.open_repo().unwrap();
+            let repo = registry.open_repo()?;
             let test_file = registry.registry_path().join("test_uncommitted.txt");
-            std::fs::write(&test_file, "uncommitted data").unwrap();
+            std::fs::write(&test_file, "uncommitted data")?;
 
-            let mut index = repo.index().unwrap();
-            index.add_path(Path::new("test_uncommitted.txt")).unwrap();
-            index.write().unwrap();
+            let mut index = repo.index()?;
+            index.add_path(Path::new("test_uncommitted.txt"))?;
+            index.write()?;
         }
 
         // Verify there are staged changes
         {
-            let repo = registry.open_repo().unwrap();
-            let statuses = repo.statuses(None).unwrap();
+            let repo = registry.open_repo()?;
+            let statuses = repo.statuses(None)?;
             let has_staged = statuses
                 .iter()
                 .any(|s| s.status().intersects(git2::Status::INDEX_NEW));
@@ -1204,12 +1204,12 @@ mod tests {
         }
 
         // Call recovery mechanism
-        registry.recover_uncommitted_changes().unwrap();
+        registry.recover_uncommitted_changes()?;
 
         // Verify staged changes were committed
         {
-            let repo = registry.open_repo().unwrap();
-            let statuses = repo.statuses(None).unwrap();
+            let repo = registry.open_repo()?;
+            let statuses = repo.statuses(None)?;
             let has_staged = statuses.iter().any(|s| {
                 s.status()
                     .intersects(git2::Status::INDEX_NEW | git2::Status::INDEX_MODIFIED)
@@ -1217,66 +1217,71 @@ mod tests {
             assert!(!has_staged, "Should have no staged changes after recovery");
 
             // Verify commit was created
-            let head = repo.head().unwrap();
-            let commit = head.peel_to_commit().unwrap();
+            let head = repo.head()?;
+            let commit = head.peel_to_commit()?;
+            let msg = commit.message().ok_or_else(|| crate::Git2DBError::internal("no commit message"))?;
             assert!(
-                commit.message().unwrap().contains("recovery"),
+                msg.contains("recovery"),
                 "Recovery commit should exist"
             );
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_recovery_does_nothing_when_no_staged_changes() {
-        let temp_dir = TempDir::new().unwrap();
+    async fn test_recovery_does_nothing_when_no_staged_changes() -> crate::Git2DBResult<()> {
+        let temp_dir = TempDir::new()?;
         let base_dir = temp_dir.path().to_path_buf();
 
-        let mut registry = Git2DB::open(&base_dir).await.unwrap();
+        let mut registry = Git2DB::open(&base_dir).await?;
 
         // Get initial commit count
         let initial_commit_count = {
-            let repo = registry.open_repo().unwrap();
-            repo.revwalk().unwrap().count()
+            let repo = registry.open_repo()?;
+            let count = repo.revwalk()?.count();
+            count
         };
 
         // Call recovery when there are no staged changes
-        registry.recover_uncommitted_changes().unwrap();
+        registry.recover_uncommitted_changes()?;
 
         // Verify no new commit was created
         let final_commit_count = {
-            let repo = registry.open_repo().unwrap();
-            repo.revwalk().unwrap().count()
+            let repo = registry.open_repo()?;
+            let count = repo.revwalk()?.count();
+            count
         };
 
         assert_eq!(
             initial_commit_count, final_commit_count,
             "Recovery should not create commit when no staged changes"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_automatic_recovery_on_open() {
-        let temp_dir = TempDir::new().unwrap();
+    async fn test_automatic_recovery_on_open() -> crate::Git2DBResult<()> {
+        let temp_dir = TempDir::new()?;
         let base_dir = temp_dir.path().to_path_buf();
 
         // Create registry and simulate interrupted operation
         {
-            let registry = Git2DB::open(&base_dir).await.unwrap();
-            let repo = registry.open_repo().unwrap();
+            let registry = Git2DB::open(&base_dir).await?;
+            let repo = registry.open_repo()?;
             let test_file = registry.registry_path().join("auto_recovery_test.txt");
-            std::fs::write(&test_file, "test data").unwrap();
+            std::fs::write(&test_file, "test data")?;
 
-            let mut index = repo.index().unwrap();
-            index.add_path(Path::new("auto_recovery_test.txt")).unwrap();
-            index.write().unwrap();
+            let mut index = repo.index()?;
+            index.add_path(Path::new("auto_recovery_test.txt"))?;
+            index.write()?;
         }
 
         // Reopen registry - should automatically recover
-        let registry = Git2DB::open(&base_dir).await.unwrap();
+        let registry = Git2DB::open(&base_dir).await?;
 
         // Verify recovery happened
-        let repo = registry.open_repo().unwrap();
-        let statuses = repo.statuses(None).unwrap();
+        let repo = registry.open_repo()?;
+        let statuses = repo.statuses(None)?;
         let has_staged = statuses.iter().any(|s| {
             s.status()
                 .intersects(git2::Status::INDEX_NEW | git2::Status::INDEX_MODIFIED)
@@ -1285,5 +1290,6 @@ mod tests {
             !has_staged,
             "Automatic recovery should have committed staged changes"
         );
+        Ok(())
     }
 }

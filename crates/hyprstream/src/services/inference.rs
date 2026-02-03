@@ -64,7 +64,8 @@ use hyprstream_rpc::serialize_message;
 use hyprstream_rpc::StreamChannel;
 use capnp::serialize;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use parking_lot::RwLock;
 use tmq::{reply, Multipart};
 use tokio::runtime::Handle;
 use tokenizers::Tokenizer;
@@ -696,7 +697,7 @@ impl InferenceService {
         let input_tokens: Vec<u32> = encoding.get_ids().to_vec();
 
         // Apply TTT adaptation BEFORE generation
-        let engine = self.engine.read().unwrap();
+        let engine = self.engine.read();
         match ttt_trainer.adapt(&engine, &input_tokens) {
             Ok(result) => {
                 if result.skipped {
@@ -722,7 +723,7 @@ impl InferenceService {
         // Use futures::executor::block_on because we're already inside a tokio runtime
         // (run_service_loop runs in rt.block_on), and tokio's block_on can't be nested.
         // futures::executor::block_on works because it's a simple single-threaded executor.
-        let engine = self.engine.read().unwrap();
+        let engine = self.engine.read();
         futures::executor::block_on(async {
             RuntimeEngine::generate_with_params(&*engine, request).await
         })
@@ -797,6 +798,10 @@ impl InferenceService {
     /// 5. Client subscribes to DH-derived topic (unpredictable, non-colliding)
     /// 6. Service publishes chunks with HMAC chain (verified by client, not StreamService)
     /// 7. StreamService is blind forwarder (no HMAC verification)
+    ///
+    /// Note: The read lock must be held across await because TextStream<'_> borrows from the engine.
+    /// This triggers clippy::await_holding_lock, but is necessary for the streaming API.
+    #[allow(clippy::await_holding_lock)]
     async fn execute_stream(&self, pending: PendingStream) {
         use futures::StreamExt;
 
@@ -823,7 +828,7 @@ impl InferenceService {
         );
 
         // Run the stream with StreamChannel's async publisher callback
-        let engine = self.engine.read().unwrap();
+        let engine = self.engine.read();
         let stream_result = engine.generate(request);
 
         let result = stream_channel.with_publisher(stream_ctx, |mut publisher| async move {
@@ -881,12 +886,12 @@ impl InferenceService {
 
     /// Handle model info request
     fn handle_model_info(&self) -> ModelInfo {
-        RuntimeEngine::model_info(&*self.engine.read().unwrap())
+        RuntimeEngine::model_info(&*self.engine.read())
     }
 
     /// Handle is ready request
     fn handle_is_ready(&self) -> bool {
-        self.engine.read().unwrap().is_loaded()
+        self.engine.read().is_loaded()
     }
 
     /// Handle apply chat template
@@ -896,56 +901,56 @@ impl InferenceService {
         add_generation_prompt: bool,
     ) -> Result<String> {
         self.engine
-            .read().unwrap()
+            .read()
             .apply_chat_template(&messages, add_generation_prompt)
     }
 
     /// Handle create LoRA
     fn handle_create_lora(&self, config: LoRAConfig) -> Result<()> {
-        self.engine.write().unwrap().create_lora(config)
+        self.engine.write().create_lora(config)
     }
 
     /// Handle load LoRA
     fn handle_load_lora(&self, path: &Path) -> Result<()> {
         // Use futures::executor::block_on to avoid nesting tokio runtimes
-        let mut engine = self.engine.write().unwrap();
+        let mut engine = self.engine.write();
         futures::executor::block_on(async { engine.load_lora_from_file(path).await })
     }
 
     /// Handle save LoRA
     fn handle_save_lora(&self, path: &str) -> Result<()> {
-        self.engine.read().unwrap().save_lora(path)
+        self.engine.read().save_lora(path)
     }
 
     /// Handle unload LoRA
     fn handle_unload_lora(&self) -> Result<()> {
-        self.engine.write().unwrap().unload_lora()
+        self.engine.write().unload_lora()
     }
 
     /// Handle has LoRA
     fn handle_has_lora(&self) -> bool {
-        self.engine.read().unwrap().has_lora_model()
+        self.engine.read().has_lora_model()
     }
 
     /// Handle set session
     fn handle_set_session(&self, session_id: String) -> Result<()> {
         // Track session ID for events
-        *self.session_id.write().unwrap() = Some(session_id.clone());
+        *self.session_id.write() = Some(session_id.clone());
         self.engine
-            .write().unwrap()
+            .write()
             .set_session(CacheOwner::Session(session_id))
     }
 
     /// Handle clear session
     fn handle_clear_session(&self) {
-        *self.session_id.write().unwrap() = None;
-        self.engine.write().unwrap().clear_kv_cache();
+        *self.session_id.write() = None;
+        self.engine.write().clear_kv_cache();
     }
 
     /// Handle release session
     fn handle_release_session(&self, session_id: &str) -> Result<()> {
         self.engine
-            .write().unwrap()
+            .write()
             .release_session(&CacheOwner::Session(session_id.to_owned()))
     }
 
@@ -1128,7 +1133,7 @@ impl InferenceService {
                     return Ok((resp, None));
                 }
                 let info = self.handle_model_info();
-                let has_lora = self.engine.read().unwrap().has_lora_model();
+                let has_lora = self.engine.read().has_lora_model();
                 Ok((InferenceResponse::model_info(request_id, &info, has_lora), None))
             }
 
@@ -1269,7 +1274,7 @@ impl InferenceService {
 
             Which::HealthCheck(()) => {
                 // Health check is public (no authorization required)
-                let model_loaded = self.engine.read().unwrap().is_loaded();
+                let model_loaded = self.engine.read().is_loaded();
                 Ok((InferenceResponse::health(request_id, model_loaded), None))
             }
 

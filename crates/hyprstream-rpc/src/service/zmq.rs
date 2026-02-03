@@ -1009,7 +1009,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_request_loop() {
+    async fn test_request_loop() -> Result<(), Box<dyn std::error::Error>> {
         let context = Arc::new(zmq::Context::new());
         let transport = TransportConfig::inproc("test-echo-service-rpc");
         let endpoint = transport.zmq_endpoint();
@@ -1022,11 +1022,11 @@ mod tests {
 
         // Start the service (waits for socket binding)
         let runner = RequestLoop::new(transport, Arc::clone(&context), signing_key.clone());
-        let mut handle = runner.run(service).await.expect("test: start service");
+        let mut handle = runner.run(service).await?;
 
         // Use ZmqClient with server's verifying key for response verification
         let client = ZmqClient::new(&endpoint, context, signing_key, verifying_key, RequestIdentity::local());
-        let response = client.call(b"hello".to_vec(), CallOptions::default()).await.expect("test: call");
+        let response = client.call(b"hello".to_vec(), CallOptions::default()).await?;
 
         // Response should start with "from <user>:"
         let response_str = String::from_utf8_lossy(&response);
@@ -1037,10 +1037,11 @@ mod tests {
 
         // Stop the service
         handle.stop().await;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_invalid_request_signature_rejected() {
+    async fn test_invalid_request_signature_rejected() -> Result<(), Box<dyn std::error::Error>> {
         let context = Arc::new(zmq::Context::new());
         let transport = TransportConfig::inproc("test-invalid-req-sig-rpc");
         let endpoint = transport.zmq_endpoint();
@@ -1054,7 +1055,7 @@ mod tests {
 
         // Start the service (waits for socket binding)
         let runner = RequestLoop::new(transport, Arc::clone(&context), server_signing_key);
-        let mut handle = runner.run(service).await.expect("test: start service");
+        let mut handle = runner.run(service).await?;
 
         // Sign request with different key than service expects
         // But verify responses with server's key
@@ -1079,10 +1080,11 @@ mod tests {
         }
 
         handle.stop().await;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_invalid_response_signature_rejected() {
+    async fn test_invalid_response_signature_rejected() -> Result<(), Box<dyn std::error::Error>> {
         let context = Arc::new(zmq::Context::new());
         let transport = TransportConfig::inproc("test-invalid-resp-sig-rpc");
         let endpoint = transport.zmq_endpoint();
@@ -1096,7 +1098,7 @@ mod tests {
 
         // Start the service (waits for socket binding)
         let runner = RequestLoop::new(transport, Arc::clone(&context), server_signing_key.clone());
-        let mut handle = runner.run(service).await.expect("test: start service");
+        let mut handle = runner.run(service).await?;
 
         // Client expects responses signed by a DIFFERENT key than server uses
         // This simulates a MITM attack or misconfigured client
@@ -1112,5 +1114,6 @@ mod tests {
         );
 
         handle.stop().await;
+        Ok(())
     }
 }

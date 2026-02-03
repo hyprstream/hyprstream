@@ -4587,6 +4587,7 @@ dependencies = [
  "libgit2-sys",
  "merklehash",
  "once_cell",
+ "parking_lot 0.12.4",
  "russh",
  "russh-keys",
  "serde",

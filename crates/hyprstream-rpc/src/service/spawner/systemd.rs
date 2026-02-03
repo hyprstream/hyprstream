@@ -327,33 +327,34 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires systemd"]
-    async fn test_spawn_and_stop() {
+    async fn test_spawn_and_stop() -> crate::Result<()> {
         if !SystemdBackend::is_available() {
             println!("Systemd not available, skipping test");
-            return;
+            return Ok(());
         }
 
         let backend = SystemdBackend::new();
 
         let config = ProcessConfig::new("test-sleep", "sleep").args(["60"]);
 
-        let process = backend.spawn(config).await.unwrap();
+        let process = backend.spawn(config).await?;
 
         assert!(process.is_systemd());
         assert!(process.unit_name().is_some());
 
         // Check it's running
-        let running = backend.is_running(&process).await.unwrap();
+        let running = backend.is_running(&process).await?;
         assert!(running);
 
         // Stop it
-        backend.stop(&process).await.unwrap();
+        backend.stop(&process).await?;
 
         // Give systemd a moment
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         // Check it's stopped
-        let running = backend.is_running(&process).await.unwrap();
+        let running = backend.is_running(&process).await?;
         assert!(!running);
+        Ok(())
     }
 }

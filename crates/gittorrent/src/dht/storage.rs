@@ -209,7 +209,7 @@ mod tests {
     use libp2p::kad::RecordKey;
 
     #[test]
-    fn test_record_store_basic_operations() {
+    fn test_record_store_basic_operations() -> Result<(), libp2p::kad::store::Error> {
         let mut store = GitObjectStore::new();
 
         // Test put and get
@@ -221,16 +221,21 @@ mod tests {
             expires: None,
         };
 
-        store.put(record.clone()).unwrap();
-        assert_eq!(store.get(&key).unwrap().value, b"test-value");
+        store.put(record.clone())?;
+        if let Some(stored) = store.get(&key) {
+            assert_eq!(stored.value, b"test-value");
+        } else {
+            panic!("Expected record not found");
+        }
 
         // Test remove
         store.remove(&key);
         assert!(store.get(&key).is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_provider_operations() {
+    fn test_provider_operations() -> Result<(), libp2p::kad::store::Error> {
         let mut store = GitObjectStore::new();
         let key = RecordKey::new(b"test-key");
         let peer_id = PeerId::random();
@@ -243,7 +248,7 @@ mod tests {
         };
 
         // Add provider
-        store.add_provider(provider_record.clone()).unwrap();
+        store.add_provider(provider_record.clone())?;
         let providers = store.providers(&key);
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].provider, peer_id);
@@ -251,10 +256,11 @@ mod tests {
         // Remove provider
         store.remove_provider(&key, &peer_id);
         assert!(store.providers(&key).is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_capacity_limits() {
+    fn test_capacity_limits() -> Result<(), libp2p::kad::store::Error> {
         let mut store = GitObjectStore::with_limits(2, 2);
 
         // Add records up to capacity
@@ -266,10 +272,11 @@ mod tests {
                 publisher: None,
                 expires: None,
             };
-            store.put(record).unwrap();
+            store.put(record)?;
         }
 
         // Should only have 2 records due to capacity limit
         assert_eq!(store.records.len(), 2);
+        Ok(())
     }
 }

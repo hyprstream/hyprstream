@@ -586,7 +586,6 @@ impl RegistryClient for RegistryZmq {
 /// 2. Pre-authorizes the stream with StreamService (so client can subscribe)
 /// 3. Queues the clone task to a background worker thread
 /// 4. The worker publishes progress via PUSH to StreamService
-/// of creating new runtimes.
 ///
 /// The registry is wrapped in RwLock for interior mutability since some operations
 /// (like clone) require mutable access but ZmqService::handle_request takes &self.
@@ -802,13 +801,10 @@ impl RegistryService {
             drop(progress_tx);
 
             // Stream progress updates in real-time as they arrive
+            // (Ignore Complete/Error from channel - we'll send our own based on clone_result)
             while let Some(update) = progress_rx.recv().await {
-                match update {
-                    ProgressUpdate::Progress { stage, current, total } => {
-                        publisher.publish_progress(&stage, current, total).await?;
-                    }
-                    // Ignore Complete/Error from channel - we'll send our own based on clone_result
-                    _ => {}
+                if let ProgressUpdate::Progress { stage, current, total } = update {
+                    publisher.publish_progress(&stage, current, total).await?;
                 }
             }
 

@@ -158,7 +158,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_initialize_idempotent() {
+    async fn test_initialize_idempotent() -> std::result::Result<(), XetError> {
         let config = XetConfig {
             endpoint: "https://cas.xet.dev".to_owned(),
             token: Some("test".to_owned()),
@@ -166,10 +166,11 @@ mod tests {
         };
 
         // First call
-        initialize(config.clone()).await.unwrap();
+        initialize(config.clone()).await?;
         assert!(is_initialized());
 
         // Second call (should succeed)
-        initialize(config).await.unwrap();
+        initialize(config).await?;
+        Ok(())
     }
 }

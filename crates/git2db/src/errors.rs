@@ -583,7 +583,11 @@ mod tests {
 
     #[test]
     fn test_error_from_serde_json_error() {
-        let json_err = serde_json::from_str::<serde_json::Value>("invalid json").unwrap_err();
+        let json_result = serde_json::from_str::<serde_json::Value>("invalid json");
+        let json_err = match json_result {
+            Err(e) => e,
+            Ok(_) => panic!("Expected JSON parsing to fail"),
+        };
         let err: Git2DBError = json_err.into();
 
         if let Git2DBError::Json(_) = err {

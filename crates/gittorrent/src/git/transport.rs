@@ -248,25 +248,26 @@ mod tests {
     use crate::service::GitTorrentConfig;
 
     #[tokio::test]
-    async fn test_transport_factory_creation() {
+    async fn test_transport_factory_creation() -> crate::error::Result<()> {
         let config = GitTorrentConfig::default();
-        let service = Arc::new(GitTorrentService::new(config).await.unwrap());
+        let service = Arc::new(GitTorrentService::new(config).await?);
         let factory = GittorrentTransportFactory::new(service);
 
         assert!(factory.supports_url("gittorrent://abc123def456"));
         assert!(!factory.supports_url("https://github.com/user/repo"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_transport_creation() {
+    async fn test_transport_creation() -> crate::error::Result<()> {
         let config = GitTorrentConfig::default();
-        let service = Arc::new(GitTorrentService::new(config).await.unwrap());
+        let service = Arc::new(GitTorrentService::new(config).await?);
 
         // Test with a short string (not a valid hash) - should parse as Username
         let transport = GittorrentTransport::new(
             "gittorrent://abc123def456",
             service.clone()
-        ).unwrap();
+        )?;
         assert!(matches!(transport.url, GitTorrentUrl::Username { .. }));
 
         // Test with a valid 40-char SHA1 - should parse as Commit
@@ -275,14 +276,15 @@ mod tests {
         // let transport = GittorrentTransport::new(
         //     "gittorrent://0123456789abcdef0123456789abcdef01234567",
         //     service.clone()
-        // ).unwrap();
+        // )?;
         // assert!(matches!(transport.url, GitTorrentUrl::Commit { .. }));
 
         // For now, test with a 64-char SHA256
         let transport = GittorrentTransport::new(
             "gittorrent://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             service
-        ).unwrap();
+        )?;
         assert!(matches!(transport.url, GitTorrentUrl::Commit { .. }));
+        Ok(())
     }
 }

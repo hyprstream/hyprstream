@@ -63,12 +63,15 @@ impl StreamKeys {
     /// Get the first 16 bytes of topic as bytes (for first block's prevMac).
     ///
     /// In the MAC chain, block 0 uses topic[..16] as prevMac.
-    pub fn topic_prefix_bytes(&self) -> [u8; 16] {
+    ///
+    /// # Errors
+    /// Returns error if topic is not valid hex (should never happen with properly derived keys).
+    pub fn topic_prefix_bytes(&self) -> EnvelopeResult<[u8; 16]> {
         // Decode first 32 hex chars (= 16 bytes)
         let mut prefix = [0u8; 16];
         hex::decode_to_slice(&self.topic[..32], &mut prefix)
-            .expect("topic is valid hex");
-        prefix
+            .map_err(|_| EnvelopeError::InvalidTopicFormat)?;
+        Ok(prefix)
     }
 }
 
@@ -517,57 +520,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_key_exchange_roundtrip() {
+    fn test_key_exchange_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
         // Generate two keypairs
         let (secret_a, public_a) = DefaultKeyExchange::generate_keypair();
         let (secret_b, public_b) = DefaultKeyExchange::generate_keypair();
 
         // Both sides derive the same shared secret
-        let shared_a = DefaultKeyExchange::derive_shared(&secret_a, &public_b).unwrap();
-        let shared_b = DefaultKeyExchange::derive_shared(&secret_b, &public_a).unwrap();
+        let shared_a = DefaultKeyExchange::derive_shared(&secret_a, &public_b)?;
+        let shared_b = DefaultKeyExchange::derive_shared(&secret_b, &public_a)?;
 
         assert_eq!(shared_a.as_bytes(), shared_b.as_bytes());
+        Ok(())
     }
 
     #[test]
-    fn test_hmac_key_derivation() {
+    fn test_hmac_key_derivation() -> Result<(), Box<dyn std::error::Error>> {
         let (secret_a, public_a) = DefaultKeyExchange::generate_keypair();
         let (secret_b, public_b) = DefaultKeyExchange::generate_keypair();
 
-        let shared_a = DefaultKeyExchange::derive_shared(&secret_a, &public_b).unwrap();
-        let shared_b = DefaultKeyExchange::derive_shared(&secret_b, &public_a).unwrap();
+        let shared_a = DefaultKeyExchange::derive_shared(&secret_a, &public_b)?;
+        let shared_b = DefaultKeyExchange::derive_shared(&secret_b, &public_a)?;
 
         let request_id = 12345u64;
         let hmac_key_a = shared_a.derive_hmac_key(request_id, b"stream-hmac");
         let hmac_key_b = shared_b.derive_hmac_key(request_id, b"stream-hmac");
 
         assert_eq!(hmac_key_a, hmac_key_b);
+        Ok(())
     }
 
     #[test]
-    fn test_different_request_ids_different_keys() {
+    fn test_different_request_ids_different_keys() -> Result<(), Box<dyn std::error::Error>> {
         let (_secret_a, public_a) = DefaultKeyExchange::generate_keypair();
         let (secret_b, _public_b) = DefaultKeyExchange::generate_keypair();
 
-        let shared = DefaultKeyExchange::derive_shared(&secret_b, &public_a).unwrap();
+        let shared = DefaultKeyExchange::derive_shared(&secret_b, &public_a)?;
 
         let key1 = shared.derive_hmac_key(1, b"stream-hmac");
         let key2 = shared.derive_hmac_key(2, b"stream-hmac");
 
         assert_ne!(key1, key2);
+        Ok(())
     }
 
     #[test]
-    fn test_pubkey_serialization_roundtrip() {
+    fn test_pubkey_serialization_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
         let (_secret, public) = DefaultKeyExchange::generate_keypair();
 
         let bytes = DefaultKeyExchange::pubkey_to_bytes(&public);
-        let restored = DefaultKeyExchange::pubkey_from_bytes(&bytes).unwrap();
+        let restored = DefaultKeyExchange::pubkey_from_bytes(&bytes)?;
 
         assert_eq!(
             DefaultKeyExchange::pubkey_to_bytes(&public),
             DefaultKeyExchange::pubkey_to_bytes(&restored)
         );
+        Ok(())
     }
 
     #[cfg(not(feature = "fips"))]
@@ -606,85 +613,91 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_derive_stream_keys_deterministic() {
+    fn test_derive_stream_keys_deterministic() -> Result<(), Box<dyn std::error::Error>> {
         // Same inputs should produce same outputs
         let shared_secret = [0x42u8; 32];
         let client_pub = [0x01u8; 32];
         let server_pub = [0x02u8; 32];
 
-        let keys1 = derive_stream_keys(&shared_secret, &client_pub, &server_pub).unwrap();
-        let keys2 = derive_stream_keys(&shared_secret, &client_pub, &server_pub).unwrap();
+        let keys1 = derive_stream_keys(&shared_secret, &client_pub, &server_pub)?;
+        let keys2 = derive_stream_keys(&shared_secret, &client_pub, &server_pub)?;
 
         assert_eq!(keys1.topic, keys2.topic);
         assert_eq!(*keys1.mac_key, *keys2.mac_key);
+        Ok(())
     }
 
     #[test]
-    fn test_derive_stream_keys_symmetric() {
+    fn test_derive_stream_keys_symmetric() -> Result<(), Box<dyn std::error::Error>> {
         // Order of pubkeys shouldn't matter (XOR is commutative)
         let shared_secret = [0x42u8; 32];
         let client_pub = [0x01u8; 32];
         let server_pub = [0x02u8; 32];
 
-        let keys1 = derive_stream_keys(&shared_secret, &client_pub, &server_pub).unwrap();
-        let keys2 = derive_stream_keys(&shared_secret, &server_pub, &client_pub).unwrap();
+        let keys1 = derive_stream_keys(&shared_secret, &client_pub, &server_pub)?;
+        let keys2 = derive_stream_keys(&shared_secret, &server_pub, &client_pub)?;
 
         // Both should produce identical keys (XOR is commutative)
         assert_eq!(keys1.topic, keys2.topic);
         assert_eq!(*keys1.mac_key, *keys2.mac_key);
+        Ok(())
     }
 
     #[test]
-    fn test_derive_stream_keys_different_secrets() {
+    fn test_derive_stream_keys_different_secrets() -> Result<(), Box<dyn std::error::Error>> {
         let client_pub = [0x01u8; 32];
         let server_pub = [0x02u8; 32];
 
-        let keys1 = derive_stream_keys(&[0x11u8; 32], &client_pub, &server_pub).unwrap();
-        let keys2 = derive_stream_keys(&[0x22u8; 32], &client_pub, &server_pub).unwrap();
+        let keys1 = derive_stream_keys(&[0x11u8; 32], &client_pub, &server_pub)?;
+        let keys2 = derive_stream_keys(&[0x22u8; 32], &client_pub, &server_pub)?;
 
         assert_ne!(keys1.topic, keys2.topic);
         assert_ne!(*keys1.mac_key, *keys2.mac_key);
+        Ok(())
     }
 
     #[test]
-    fn test_derive_stream_keys_different_pubkeys() {
+    fn test_derive_stream_keys_different_pubkeys() -> Result<(), Box<dyn std::error::Error>> {
         let shared_secret = [0x42u8; 32];
 
-        let keys1 = derive_stream_keys(&shared_secret, &[0x01u8; 32], &[0x02u8; 32]).unwrap();
-        let keys2 = derive_stream_keys(&shared_secret, &[0x03u8; 32], &[0x04u8; 32]).unwrap();
+        let keys1 = derive_stream_keys(&shared_secret, &[0x01u8; 32], &[0x02u8; 32])?;
+        let keys2 = derive_stream_keys(&shared_secret, &[0x03u8; 32], &[0x04u8; 32])?;
 
         assert_ne!(keys1.topic, keys2.topic);
         assert_ne!(*keys1.mac_key, *keys2.mac_key);
+        Ok(())
     }
 
     #[test]
-    fn test_derive_stream_keys_topic_is_hex() {
+    fn test_derive_stream_keys_topic_is_hex() -> Result<(), Box<dyn std::error::Error>> {
         let shared_secret = [0x42u8; 32];
         let client_pub = [0x01u8; 32];
         let server_pub = [0x02u8; 32];
 
-        let keys = derive_stream_keys(&shared_secret, &client_pub, &server_pub).unwrap();
+        let keys = derive_stream_keys(&shared_secret, &client_pub, &server_pub)?;
 
         // Topic should be 64 hex chars
         assert_eq!(keys.topic.len(), 64);
         assert!(keys.topic.chars().all(|c| c.is_ascii_hexdigit()));
+        Ok(())
     }
 
     #[test]
-    fn test_derive_stream_keys_topic_prefix() {
+    fn test_derive_stream_keys_topic_prefix() -> Result<(), Box<dyn std::error::Error>> {
         let shared_secret = [0x42u8; 32];
         let client_pub = [0x01u8; 32];
         let server_pub = [0x02u8; 32];
 
-        let keys = derive_stream_keys(&shared_secret, &client_pub, &server_pub).unwrap();
-        let prefix = keys.topic_prefix_bytes();
+        let keys = derive_stream_keys(&shared_secret, &client_pub, &server_pub)?;
+        let prefix = keys.topic_prefix_bytes()?;
 
         // Prefix should be first 16 bytes of topic
         assert_eq!(prefix.len(), 16);
 
         // Verify it matches the topic
-        let expected_prefix = hex::decode(&keys.topic[..32]).unwrap();
+        let expected_prefix = hex::decode(&keys.topic[..32])?;
         assert_eq!(&prefix[..], &expected_prefix[..]);
+        Ok(())
     }
 
     #[test]
@@ -701,7 +714,7 @@ mod tests {
 
     #[cfg(not(feature = "fips"))]
     #[test]
-    fn test_derive_stream_keys_with_real_dh() {
+    fn test_derive_stream_keys_with_real_dh() -> Result<(), Box<dyn std::error::Error>> {
         // Full integration test with actual DH key exchange
         let (client_secret, client_pubkey) = generate_ephemeral_keypair();
         let (server_secret, server_pubkey) = generate_ephemeral_keypair();
@@ -715,24 +728,23 @@ mod tests {
             &client_shared,
             &client_pubkey.to_bytes(),
             &server_pubkey.to_bytes(),
-        )
-        .unwrap();
+        )?;
 
         let server_keys = derive_stream_keys(
             &server_shared,
             &client_pubkey.to_bytes(),
             &server_pubkey.to_bytes(),
-        )
-        .unwrap();
+        )?;
 
         // Keys should be identical
         assert_eq!(client_keys.topic, server_keys.topic);
         assert_eq!(*client_keys.mac_key, *server_keys.mac_key);
+        Ok(())
     }
 
     #[cfg(not(feature = "fips"))]
     #[test]
-    fn test_stream_keys_e2e_mac_verification() {
+    fn test_stream_keys_e2e_mac_verification() -> Result<(), Box<dyn std::error::Error>> {
         use crate::crypto::hmac::ChainedStreamHmac;
 
         // Full E2E test: DH → stream keys → MAC chain
@@ -746,20 +758,18 @@ mod tests {
             &client_shared,
             &client_pubkey.to_bytes(),
             &server_pubkey.to_bytes(),
-        )
-        .unwrap();
+        )?;
 
         let server_keys = derive_stream_keys(
             &server_shared,
             &client_pubkey.to_bytes(),
             &server_pubkey.to_bytes(),
-        )
-        .unwrap();
+        )?;
 
         // Server produces MAC chain
         // Use topic prefix as initial prev_mac (converted to u64 for request_id)
-        let prefix = server_keys.topic_prefix_bytes();
-        let request_id = u64::from_le_bytes(prefix[..8].try_into().unwrap());
+        let prefix = server_keys.topic_prefix_bytes()?;
+        let request_id = u64::from_le_bytes(prefix[..8].try_into()?);
 
         let mut producer = ChainedStreamHmac::from_bytes(*server_keys.mac_key, request_id);
         let mac1 = producer.compute_next(b"token 1");
@@ -768,8 +778,9 @@ mod tests {
 
         // Client verifies MAC chain
         let mut verifier = ChainedStreamHmac::from_bytes(*client_keys.mac_key, request_id);
-        verifier.verify_next(b"token 1", &mac1).unwrap();
-        verifier.verify_next(b"token 2", &mac2).unwrap();
-        verifier.verify_next(b"[DONE]", &mac3).unwrap();
+        verifier.verify_next(b"token 1", &mac1)?;
+        verifier.verify_next(b"token 2", &mac2)?;
+        verifier.verify_next(b"[DONE]", &mac3)?;
+        Ok(())
     }
 }

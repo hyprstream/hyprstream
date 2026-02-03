@@ -582,7 +582,7 @@ impl StreamPublisher {
     pub async fn publish_data_with_rate(&mut self, data: &[u8], rate: f32) -> Result<()> {
         if let Some(frames) = self.builder.add_data(data, rate)? {
             let mut socket = self.socket.lock().await;
-            frames.send_async(&mut *socket).await?;
+            frames.send_async(&mut socket).await?;
         }
         Ok(())
     }
@@ -600,7 +600,7 @@ impl StreamPublisher {
     pub async fn publish_error(&mut self, message: &str) -> Result<()> {
         if let Some(frames) = self.builder.add_error(message)? {
             let mut socket = self.socket.lock().await;
-            frames.send_async(&mut *socket).await?;
+            frames.send_async(&mut socket).await?;
         }
         Ok(())
     }
@@ -619,10 +619,10 @@ impl StreamPublisher {
     pub async fn complete_ref(&mut self, metadata: &[u8]) -> Result<()> {
         let mut socket = self.socket.lock().await;
         if let Some(frames) = self.builder.add_complete(metadata)? {
-            frames.send_async(&mut *socket).await?;
+            frames.send_async(&mut socket).await?;
         }
         if let Some(frames) = self.builder.flush()? {
-            frames.send_async(&mut *socket).await?;
+            frames.send_async(&mut socket).await?;
         }
         Ok(())
     }
@@ -631,7 +631,7 @@ impl StreamPublisher {
     pub async fn flush(&mut self) -> Result<()> {
         if let Some(frames) = self.builder.flush()? {
             let mut socket = self.socket.lock().await;
-            frames.send_async(&mut *socket).await?;
+            frames.send_async(&mut socket).await?;
         }
         Ok(())
     }
@@ -1347,7 +1347,11 @@ fn build_stream_register_envelope(
     }
 
     let mut inner_bytes = Vec::new();
-    serialize::write_message(&mut inner_bytes, &inner_msg).expect("serialize StreamRegister");
+    // Vec write cannot fail for memory, and the capnp message is well-formed
+    if let Err(e) = serialize::write_message(&mut inner_bytes, &inner_msg) {
+        tracing::error!("Failed to serialize StreamRegister: {e}");
+        return Vec::new();
+    }
 
     // Wrap in SignedEnvelope
     let mut envelope = RequestEnvelope::new(RequestIdentity::local(), inner_bytes);
@@ -1364,7 +1368,11 @@ fn build_stream_register_envelope(
     }
 
     let mut bytes = Vec::new();
-    serialize::write_message(&mut bytes, &msg).expect("serialize SignedEnvelope");
+    // Vec write cannot fail for memory, and the capnp message is well-formed
+    if let Err(e) = serialize::write_message(&mut bytes, &msg) {
+        tracing::error!("Failed to serialize SignedEnvelope: {e}");
+        return Vec::new();
+    }
     bytes
 }
 

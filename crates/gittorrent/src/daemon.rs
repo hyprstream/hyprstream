@@ -301,28 +301,29 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
-    async fn test_daemon_creation() {
-        let temp_dir = TempDir::new().unwrap();
+    async fn test_daemon_creation() -> crate::error::Result<()> {
+        let temp_dir = TempDir::new()?;
         let config = DaemonConfig {
             repositories_dir: temp_dir.path().to_path_buf(),
             enable_git_server: false, // Disable for testing
             ..Default::default()
         };
 
-        let daemon = GitTorrentDaemon::new(config).await.unwrap();
+        let daemon = GitTorrentDaemon::new(config).await?;
         let stats = daemon.get_stats().await;
         assert_eq!(stats.repository_count, 0);
+        Ok(())
     }
 
 
     #[tokio::test]
-    async fn test_repository_management() {
-        let temp_dir = TempDir::new().unwrap();
+    async fn test_repository_management() -> crate::error::Result<()> {
+        let temp_dir = TempDir::new()?;
         let repo_dir = temp_dir.path().join("test-repo");
 
         // Create a proper Git repository using git2
-        git2::Repository::init(&repo_dir).unwrap();
-        tokio::fs::write(repo_dir.join("README.md"), "# Test Repository").await.unwrap();
+        git2::Repository::init(&repo_dir)?;
+        tokio::fs::write(repo_dir.join("README.md"), "# Test Repository").await?;
 
         let config = DaemonConfig {
             repositories_dir: temp_dir.path().to_path_buf(),
@@ -330,14 +331,15 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = GitTorrentDaemon::new(config).await.unwrap();
+        let daemon = GitTorrentDaemon::new(config).await?;
 
         // Add repository
-        daemon.add_repository("test-repo".to_owned(), repo_dir).await.unwrap();
+        daemon.add_repository("test-repo".to_owned(), repo_dir).await?;
 
         // Check it was added
         let repos = daemon.list_repositories().await;
         assert_eq!(repos.len(), 1);
         assert!(repos.contains_key("test-repo"));
+        Ok(())
     }
 }

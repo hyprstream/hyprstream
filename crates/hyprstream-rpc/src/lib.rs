@@ -38,21 +38,20 @@
 //! ```
 
 // Cap'n Proto generated modules
-#[allow(dead_code)]
-#[allow(unused_imports)]
+// Note: Generated code uses unwrap/expect internally - this is standard capnp-rust behavior
+// These modules are excluded from clippy checks via cargo configuration
 pub mod common_capnp {
+    #![allow(dead_code, unused_imports, clippy::unwrap_used, clippy::expect_used)]
     include!(concat!(env!("OUT_DIR"), "/common_capnp.rs"));
 }
 
-#[allow(dead_code)]
-#[allow(unused_imports)]
 pub mod events_capnp {
+    #![allow(dead_code, unused_imports, clippy::unwrap_used, clippy::expect_used)]
     include!(concat!(env!("OUT_DIR"), "/events_capnp.rs"));
 }
 
-#[allow(dead_code)]
-#[allow(unused_imports)]
 pub mod streaming_capnp {
+    #![allow(dead_code, unused_imports, clippy::unwrap_used, clippy::expect_used)]
     include!(concat!(env!("OUT_DIR"), "/streaming_capnp.rs"));
 }
 

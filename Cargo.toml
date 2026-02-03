@@ -227,6 +227,11 @@ style = { level = "warn", priority = -1 }
 complexity = { level = "warn", priority = -1 }
 perf = { level = "warn", priority = -1 }
 
+# Panic prevention - use proper error handling
+unwrap_used = "deny"
+expect_used = "deny"
+disallowed_types = "deny"  # See clippy.toml for disallowed types
+
 # Specific useful lints
 dbg_macro = "warn"
 empty_structs_with_brackets = "warn"

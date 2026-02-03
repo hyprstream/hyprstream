@@ -85,6 +85,8 @@ pub use events::{
 /// Generated Cap'n Proto code
 #[allow(dead_code)]
 #[allow(clippy::all)]
+#[allow(clippy::unwrap_used)]
+#[allow(clippy::expect_used)]
 pub mod workers_capnp {
     include!(concat!(env!("OUT_DIR"), "/workers_capnp.rs"));
 }

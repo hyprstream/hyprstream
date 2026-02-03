@@ -160,15 +160,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_mock_transport_factory() {
+    fn test_mock_transport_factory() -> crate::Git2DBResult<()> {
         let factory = MockTransportFactory;
         assert!(factory.supports_url("mock://test/repo"));
         assert!(!factory.supports_url("https://example.com/repo"));
 
-        let transport = factory.create_transport("mock://test/repo").unwrap();
+        let transport = factory.create_transport("mock://test/repo")?;
         assert!(transport
             .action("mock://test/repo", git2::transport::Service::UploadPackLs)
             .is_err());
+        Ok(())
     }
 
     #[test]

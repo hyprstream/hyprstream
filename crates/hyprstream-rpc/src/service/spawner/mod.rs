@@ -257,9 +257,13 @@ mod tests {
             .restart_on_failure();
 
         assert_eq!(config.name, "test");
-        assert_eq!(config.executable.to_str().unwrap(), "/usr/bin/test");
+        assert_eq!(config.executable.to_str(), Some("/usr/bin/test"));
         assert_eq!(config.args, vec!["--foo", "bar"]);
-        assert_eq!(config.working_dir.unwrap().to_str().unwrap(), "/tmp");
+        if let Some(ref wd) = config.working_dir {
+            assert_eq!(wd.to_str(), Some("/tmp"));
+        } else {
+            panic!("working_dir should be set");
+        }
         assert_eq!(config.env, vec![("KEY".to_owned(), "VALUE".to_owned())]);
         assert_eq!(config.memory_limit, Some("1G".to_owned()));
         assert_eq!(config.cpu_quota, Some(200));

@@ -28,7 +28,13 @@ impl GitTorrentBehaviour {
         // Configure Kademlia
         let mut kad_config = kad::Config::default();
         kad_config.set_query_timeout(std::time::Duration::from_secs(60));
-        kad_config.set_replication_factor(std::num::NonZeroUsize::new(3).unwrap());
+        // SAFETY: 3 is a compile-time constant, always non-zero
+        const REPLICATION_FACTOR: std::num::NonZeroUsize =
+            match std::num::NonZeroUsize::new(3) {
+                Some(v) => v,
+                None => unreachable!(),
+            };
+        kad_config.set_replication_factor(REPLICATION_FACTOR);
 
         // Create Kademlia DHT
         let mut kademlia = kad::Behaviour::with_config(local_peer_id, store, kad_config);

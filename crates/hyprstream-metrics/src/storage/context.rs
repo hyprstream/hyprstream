@@ -388,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn test_context_record_to_batch() {
+    fn test_context_record_to_batch() -> Result<(), Status> {
         let record = ContextRecord {
             id: "test-id".to_owned(),
             conversation_id: "conv-123".to_owned(),
@@ -400,13 +400,14 @@ mod tests {
             token_count: Some(100),
         };
 
-        let batch = record.to_record_batch().unwrap();
+        let batch = record.to_record_batch()?;
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(batch.num_columns(), 8);
+        Ok(())
     }
 
     #[test]
-    fn test_batch_records() {
+    fn test_batch_records() -> Result<(), Status> {
         let records = vec![
             ContextRecord {
                 id: "id-1".to_owned(),
@@ -430,7 +431,8 @@ mod tests {
             },
         ];
 
-        let batch = ContextRecord::batch_to_record_batch(&records).unwrap();
+        let batch = ContextRecord::batch_to_record_batch(&records)?;
         assert_eq!(batch.num_rows(), 2);
+        Ok(())
     }
 }

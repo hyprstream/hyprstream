@@ -99,42 +99,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_claims_has_scope_exact() {
+    fn test_claims_has_scope_exact() -> Result<()> {
         let claims = Claims::new(
             "alice".to_owned(),
             1000,
             2000,
-            vec![Scope::parse("infer:model:qwen-7b").unwrap()],
+            vec![Scope::parse("infer:model:qwen-7b")?],
             false,
         );
-        let required = Scope::parse("infer:model:qwen-7b").unwrap();
+        let required = Scope::parse("infer:model:qwen-7b")?;
         assert!(claims.has_scope(&required));
+        Ok(())
     }
 
     #[test]
-    fn test_claims_has_scope_wildcard() {
+    fn test_claims_has_scope_wildcard() -> Result<()> {
         let claims = Claims::new(
             "alice".to_owned(),
             1000,
             2000,
-            vec![Scope::parse("infer:model:*").unwrap()],
+            vec![Scope::parse("infer:model:*")?],
             false,
         );
-        let required = Scope::parse("infer:model:qwen-7b").unwrap();
+        let required = Scope::parse("infer:model:qwen-7b")?;
         assert!(claims.has_scope(&required));
+        Ok(())
     }
 
     #[test]
-    fn test_claims_fail_secure_empty_scopes() {
+    fn test_claims_fail_secure_empty_scopes() -> Result<()> {
         let claims = Claims::new("alice".to_owned(), 1000, 2000, vec![], false);
-        let required = Scope::parse("infer:model:qwen-7b").unwrap();
+        let required = Scope::parse("infer:model:qwen-7b")?;
         assert!(!claims.has_scope(&required));
+        Ok(())
     }
 
     #[test]
-    fn test_claims_admin_override() {
+    fn test_claims_admin_override() -> Result<()> {
         let claims = Claims::new("admin".to_owned(), 1000, 2000, vec![], true);
-        let required = Scope::parse("infer:model:qwen-7b").unwrap();
+        let required = Scope::parse("infer:model:qwen-7b")?;
         assert!(claims.has_scope(&required));
+        Ok(())
     }
 }

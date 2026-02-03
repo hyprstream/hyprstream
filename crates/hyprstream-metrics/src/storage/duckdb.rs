@@ -179,15 +179,18 @@ impl StorageBackend for DuckDbBackend {
                 let col = batch.column(col_idx);
                 match col.data_type() {
                     DataType::Int64 => {
-                        let array = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                        let array = col.as_any().downcast_ref::<Int64Array>()
+                            .ok_or_else(|| Status::internal("Failed to downcast to Int64Array"))?;
                         params.push(Box::new(array.value(row_idx)));
                     }
                     DataType::Float64 => {
-                        let array = col.as_any().downcast_ref::<Float64Array>().unwrap();
+                        let array = col.as_any().downcast_ref::<Float64Array>()
+                            .ok_or_else(|| Status::internal("Failed to downcast to Float64Array"))?;
                         params.push(Box::new(array.value(row_idx)));
                     }
                     DataType::Utf8 => {
-                        let array = col.as_any().downcast_ref::<StringArray>().unwrap();
+                        let array = col.as_any().downcast_ref::<StringArray>()
+                            .ok_or_else(|| Status::internal("Failed to downcast to StringArray"))?;
                         params.push(Box::new(array.value(row_idx).to_owned()));
                     }
                     _ => return Err(Status::invalid_argument("Unsupported data type")),
@@ -225,13 +228,18 @@ impl StorageBackend for DuckDbBackend {
         let definition_json = serde_json::to_string(&definition)
             .map_err(|e| Status::internal(format!("Failed to serialize view definition: {e}")))?;
 
+        let created_at_secs = metadata.created_at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|e| Status::internal(format!("Failed to get timestamp: {e}")))?
+            .as_secs() as i64;
+
         tx.execute(
             "INSERT INTO view_metadata (view_name, source_table, view_definition, created_at) VALUES (?, ?, ?, ?)",
             params![
                 name,
                 definition.source_table,
                 definition_json,
-                metadata.created_at.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64
+                created_at_secs
             ],
         )
         .map_err(|e| Status::internal(format!("Failed to store view metadata: {e}")))?;
