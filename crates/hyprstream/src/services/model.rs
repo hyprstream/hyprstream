@@ -741,6 +741,8 @@ impl crate::services::ZmqService for ModelService {
                                 role: m.get_role().map(|r| r.to_str().unwrap_or("user").to_owned()).unwrap_or_else(|_| "user".to_owned()),
                                 content: m.get_content().ok().map(|c| c.to_str().unwrap_or("").to_owned()),
                                 function_call: None,
+                                tool_calls: None,
+                                tool_call_id: None,
                             })
                             .collect();
 
