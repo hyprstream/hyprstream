@@ -1156,6 +1156,8 @@ pub async fn handle_infer(
         role: "user".to_owned(),
         content: Some(prompt.to_owned()),
         function_call: None,
+        tool_calls: None,
+        tool_call_id: None,
     }];
 
     let formatted_prompt = match model_client.apply_chat_template(model_ref_str, &messages, true).await {

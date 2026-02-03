@@ -755,6 +755,8 @@ impl InferHandler for ModelService {
             role: m.role.clone(),
             content: Some(m.content.clone()),
             function_call: None,
+            tool_calls: None,
+            tool_call_id: None,
         }).collect();
         let templated = self.apply_chat_template(model_ref, chat_messages, data.add_generation_prompt).await?;
         Ok(templated.as_str().to_owned())

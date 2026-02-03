@@ -14,10 +14,13 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, trace};
 
 use crate::{
-    api::openai_compat::{
-        ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, CompletionChoice,
-        CompletionRequest, CompletionResponse, EmbeddingRequest, ListModelsResponse, Model,
-        OnlineTrainingDetails, Usage,
+    api::{
+        openai_compat::{
+            ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, CompletionChoice,
+            CompletionRequest, CompletionResponse, EmbeddingRequest, ListModelsResponse, Model,
+            OnlineTrainingDetails, Usage,
+        },
+        tools,
     },
     archetypes::capabilities::Infer,
     auth::Operation,
@@ -316,9 +319,36 @@ async fn chat_completions(
 
     // Apply chat template via ZMQ ModelService
     info!("Applying chat template via ModelService...");
+    
+    // Prepare messages with tool definitions if tools are provided
+    let mut messages_to_template = request.messages.clone();
+    let has_tools = request.tools.is_some();
+    
+    // If tools are provided, inject them into the system message or add a new system message
+    if let Some(ref tools) = request.tools {
+        let tools_xml = tools::tools_to_qwen3_xml(tools);
+        info!("Adding {} tools to prompt", tools.len());
+        
+        // Find or create system message
+        if let Some(system_msg) = messages_to_template.iter_mut().find(|m| m.role == "system") {
+            // Append tools to existing system message
+            let existing_content = system_msg.content.as_deref().unwrap_or("");
+            system_msg.content = Some(format!("{}\n\n{}", existing_content, tools_xml));
+        } else {
+            // Insert new system message at the beginning
+            messages_to_template.insert(0, ChatMessage {
+                role: "system".to_string(),
+                content: Some(tools_xml),
+                function_call: None,
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+    }
+    
     let templated_prompt = match state
         .model_client
-        .apply_chat_template(&request.model, &request.messages, true)
+        .apply_chat_template(&request.model, &messages_to_template, true)
         .await
     {
         Ok(prompt) => prompt,
@@ -374,6 +404,39 @@ async fn chat_completions(
             let mut avg_latency = state.metrics.avg_latency_ms.write().await;
             *avg_latency = (*avg_latency * 0.9) + (latency_ms * 0.1);
 
+            // Parse tool calls from response if tools were provided
+            let (content, tool_calls, finish_reason) = if has_tools && tools::has_tool_calls(&generation.text) {
+                info!("Detected tool calls in response");
+                match tools::parse_qwen3_tool_calls(&generation.text) {
+                    Ok(parsed_tool_calls) => {
+                        let content_text = tools::extract_text_content(&generation.text);
+                        let content = if content_text.is_empty() { None } else { Some(content_text) };
+                        info!("Parsed {} tool calls", parsed_tool_calls.len());
+                        (content, Some(parsed_tool_calls), "tool_calls")
+                    }
+                    Err(e) => {
+                        error!("Failed to parse tool calls: {}", e);
+                        // Fall back to treating as normal content
+                        (Some(generation.text), None, match generation.finish_reason {
+                            FinishReason::MaxTokens => "length",
+                            FinishReason::StopToken(_) => "stop",
+                            FinishReason::EndOfSequence => "stop",
+                            FinishReason::Stop => "stop",
+                            FinishReason::Error(_) => "stop",
+                        })
+                    }
+                }
+            } else {
+                // No tool calls, return content as-is
+                (Some(generation.text), None, match generation.finish_reason {
+                    FinishReason::MaxTokens => "length",
+                    FinishReason::StopToken(_) => "stop",
+                    FinishReason::EndOfSequence => "stop",
+                    FinishReason::Stop => "stop",
+                    FinishReason::Error(_) => "stop",
+                })
+            };
+
             let response = ChatCompletionResponse {
                 id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
                 object: "chat.completion".to_owned(),
@@ -383,16 +446,12 @@ async fn chat_completions(
                     index: 0,
                     message: ChatMessage {
                         role: "assistant".to_owned(),
-                        content: Some(generation.text),
+                        content,
                         function_call: None,
+                        tool_calls,
+                        tool_call_id: None,
                     },
-                    finish_reason: Some(
-                        match generation.finish_reason {
-                            FinishReason::MaxTokens => "length",
-                            // All other reasons map to "stop" per OpenAI API spec
-                            _ => "stop",
-                        }.to_owned(),
-                    ),
+                    finish_reason: Some(finish_reason.to_owned()),
                 }],
                 usage: Some(Usage {
                     prompt_tokens: 0,
@@ -436,6 +495,8 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
     let model_name = request.model.clone();
     let messages = request.messages.clone();
     let stop_sequences = request.stop.clone().unwrap_or_default();
+    let tools = request.tools.clone();
+    let has_tools = tools.is_some();
 
     // Track active request for proper cleanup
     state_clone
@@ -476,10 +537,35 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
             }
         };
 
+        // Prepare messages with tool definitions if tools are provided
+        let mut messages_to_template = messages.clone();
+        
+        // If tools are provided, inject them into the system message or add a new system message
+        if let Some(ref tools) = tools {
+            let tools_xml = tools::tools_to_qwen3_xml(tools);
+            info!("Adding {} tools to streaming prompt", tools.len());
+            
+            // Find or create system message
+            if let Some(system_msg) = messages_to_template.iter_mut().find(|m| m.role == "system") {
+                // Append tools to existing system message
+                let existing_content = system_msg.content.as_deref().unwrap_or("");
+                system_msg.content = Some(format!("{}\n\n{}", existing_content, tools_xml));
+            } else {
+                // Insert new system message at the beginning
+                messages_to_template.insert(0, ChatMessage {
+                    role: "system".to_string(),
+                    content: Some(tools_xml),
+                    function_call: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
+        }
+        
         // Apply chat template via ZMQ ModelService
         info!("Applying chat template for streaming...");
         let templated_prompt = match state.model_client
-            .apply_chat_template(&model_name, &messages, true)
+            .apply_chat_template(&model_name, &messages_to_template, true)
             .await
         {
             Ok(prompt) => {
@@ -563,6 +649,9 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
 
         // ZMQ receive loop - forward StreamBlock payloads to SSE
         info!("Starting ZMQ streaming receive loop (StreamBlock format)...");
+        
+        // Accumulate full response text for tool call parsing
+        let mut accumulated_text = String::new();
 
         'outer: loop {
             // Check if client disconnected (channel closed)
@@ -577,6 +666,8 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                     use crate::services::rpc_types::{InferenceStreamPayload, StreamPayloadExt};
                     match payload.to_inference() {
                         Ok(InferenceStreamPayload::Token(text)) => {
+                            // Accumulate text for tool call parsing
+                            accumulated_text.push_str(&text);
                             let sse_chunk = serde_json::json!({
                                 "id": sse_stream_id,
                                 "object": "chat.completion.chunk",
@@ -621,6 +712,38 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                                 total_tokens: stats.prefill_tokens + stats.tokens_generated,
                                 online_training_details: stats.ttt_metrics.as_ref()
                                     .map(OnlineTrainingDetails::from),
+                            };
+
+                            // Check if response contains tool calls
+                            let oai_finish_reason = if has_tools && tools::has_tool_calls(&accumulated_text) {
+                                info!("Detected tool calls in streaming response");
+                                match tools::parse_qwen3_tool_calls(&accumulated_text) {
+                                    Ok(parsed_tool_calls) => {
+                                        info!("Parsed {} tool calls", parsed_tool_calls.len());
+                                        // Send tool calls in a delta
+                                        let tool_calls_chunk = serde_json::json!({
+                                            "id": sse_stream_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": chrono::Utc::now().timestamp(),
+                                            "model": model_name,
+                                            "choices": [{
+                                                "index": 0,
+                                                "delta": {
+                                                    "tool_calls": parsed_tool_calls
+                                                },
+                                                "finish_reason": null
+                                            }]
+                                        });
+                                        let _ = tx.send(Ok(tool_calls_chunk)).await;
+                                        "tool_calls"
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to parse tool calls in streaming: {}", e);
+                                        oai_finish_reason
+                                    }
+                                }
+                            } else {
+                                oai_finish_reason
                             };
 
                             let completion_msg = serde_json::json!({
@@ -774,6 +897,8 @@ async fn completions(
         role: "user".to_owned(),
         content: Some(request.prompt.clone()),
         function_call: None,
+        tool_calls: None,
+        tool_call_id: None,
     }];
 
     let templated_prompt = match state
@@ -920,3 +1045,11 @@ async fn list_models(State(state): State<ServerState>) -> impl IntoResponse {
 }
 
 // REMOVED: format_messages_with_template - replaced by model_client.apply_chat_template()
+
+
+
+
+
+
+
+

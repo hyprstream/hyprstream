@@ -2,6 +2,7 @@
 
 use anyhow::{anyhow, Result};
 use minijinja::{context, Environment, Value};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -69,6 +70,10 @@ impl TemplateEngine {
         env.add_filter("length", length_filter);
         env.add_filter("tojson", tojson_filter);
         env.add_filter("strip", strip_filter);
+        env.add_filter("rstrip", rstrip_filter);
+        env.add_filter("lstrip", lstrip_filter);
+        env.add_filter("split_first", split_first_filter);
+        env.add_filter("split_last", split_last_filter);
 
         // Add custom tests for string operations
         // These can be used as: {% if value is startswith("prefix") %}
@@ -110,8 +115,14 @@ impl TemplateEngine {
         // HuggingFace templates use Python/Jinja2 syntax but minijinja uses test syntax
         let transformed = template_str
             .replace(".startswith(", " is startswith(")
-            .replace(".endswith(", " is endswith(")
-            .replace(".strip()", "|strip");
+            .replace(".endswith(", " is endswith(");
+
+        // Transform .split('sep')[0] → |split_first('sep') and .split('sep')[-1] → |split_last('sep')
+        // Must use regex because the pattern includes a subscript index after the call.
+        let transformed = transform_split_calls(&transformed);
+        // Transform .strip(...), .rstrip(...), .lstrip(...) → filter syntax
+        // Must do .strip( before .rstrip(/.lstrip( since the latter contain "strip("
+        let transformed = transform_strip_calls(&transformed);
 
         // Compile the template
         let tmpl = self.env.template_from_str(&transformed)
@@ -313,13 +324,96 @@ fn tojson_filter(value: &Value) -> Result<Value, minijinja::Error> {
     Ok(Value::from(json_str))
 }
 
-/// Custom filter for stripping whitespace (like Python's .strip())
-fn strip_filter(value: &Value) -> Result<Value, minijinja::Error> {
+/// Custom filter for Python's .strip() / .strip(chars)
+fn strip_filter(value: &Value, chars: Option<&str>) -> Result<Value, minijinja::Error> {
     if let Some(s) = value.as_str() {
-        Ok(Value::from(s.trim()))
+        match chars {
+            Some(c) => {
+                let char_list: Vec<char> = c.chars().collect();
+                Ok(Value::from(s.trim_matches(char_list.as_slice())))
+            }
+            None => Ok(Value::from(s.trim())),
+        }
     } else {
-        // If not a string, return as-is
         Ok(value.clone())
+    }
+}
+
+/// Custom filter for Python's .rstrip(chars)
+fn rstrip_filter(value: &Value, chars: &str) -> Result<Value, minijinja::Error> {
+    if let Some(s) = value.as_str() {
+        let char_list: Vec<char> = chars.chars().collect();
+        Ok(Value::from(s.trim_end_matches(char_list.as_slice())))
+    } else {
+        Ok(value.clone())
+    }
+}
+
+/// Custom filter for Python's .lstrip(chars)
+fn lstrip_filter(value: &Value, chars: &str) -> Result<Value, minijinja::Error> {
+    if let Some(s) = value.as_str() {
+        let char_list: Vec<char> = chars.chars().collect();
+        Ok(Value::from(s.trim_start_matches(char_list.as_slice())))
+    } else {
+        Ok(value.clone())
+    }
+}
+
+/// Custom filter: equivalent to Python's .split(sep)[0]
+fn split_first_filter(value: &Value, sep: &str) -> Result<Value, minijinja::Error> {
+    if let Some(s) = value.as_str() {
+        Ok(Value::from(s.split(sep).next().unwrap_or("")))
+    } else {
+        Ok(value.clone())
+    }
+}
+
+/// Custom filter: equivalent to Python's .split(sep)[-1]
+fn split_last_filter(value: &Value, sep: &str) -> Result<Value, minijinja::Error> {
+    if let Some(s) = value.as_str() {
+        Ok(Value::from(s.rsplit(sep).next().unwrap_or("")))
+    } else {
+        Ok(value.clone())
+    }
+}
+
+/// Transform Python `.split('sep')[idx]` calls to minijinja filter syntax.
+///
+/// - `.split('sep')[0]`  → `|split_first('sep')`
+/// - `.split('sep')[-1]` → `|split_last('sep')`
+fn transform_split_calls(template: &str) -> String {
+    // Rust regex doesn't support backreferences, so handle single and double quotes separately
+    let re_single = Regex::new(r"\.split\('([^']*)'\)\[(-?\d+)\]").unwrap();
+    let re_double = Regex::new(r#"\.split\("([^"]*)"\)\[(-?\d+)\]"#).unwrap();
+
+    let result = re_single.replace_all(template, |caps: &regex::Captures| {
+        split_replacement(&caps[1], &caps[2])
+    });
+    let result = re_double.replace_all(&result, |caps: &regex::Captures| {
+        split_replacement(&caps[1], &caps[2])
+    });
+    result.into_owned()
+}
+
+/// Transform Python `.strip(...)`, `.rstrip(...)`, `.lstrip(...)` calls to filter syntax.
+///
+/// Handles both no-arg (`.strip()`) and parameterized (`.strip('\n')`) forms.
+/// Must be applied carefully: `.rstrip(` and `.lstrip(` are handled first to avoid
+/// the `.strip(` replacement matching the suffix of `.rstrip(` / `.lstrip(`.
+fn transform_strip_calls(template: &str) -> String {
+    // Order matters: replace .rstrip/.lstrip before .strip to avoid partial matches
+    template
+        .replace(".rstrip(", "|rstrip(")
+        .replace(".lstrip(", "|lstrip(")
+        .replace(".strip(", "|strip(")
+}
+
+fn split_replacement(sep: &str, idx_str: &str) -> String {
+    let idx: i64 = idx_str.parse().unwrap_or(0);
+    match idx {
+        0 => format!("|split_first('{sep}')"),
+        -1 => format!("|split_last('{sep}')"),
+        _ => format!(".split('{sep}')[{idx}]"), // leave unsupported indices unchanged
     }
 }
 
@@ -465,5 +559,65 @@ mod tests {
         assert!(result.contains("Hello World"));
         assert!(!result.contains("  Hello World  "));
         Ok(())
+    }
+
+    #[test]
+    fn test_split_and_strip_transforms() {
+        // Simulates the Qwen3 template's <think> tag extraction:
+        //   content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n')
+        //   content.split('</think>')[-1].lstrip('\n')
+        let config = TemplateConfig {
+            chat_template: Some(
+                r#"{%- for message in messages -%}
+{%- set content = message['content'] -%}
+{%- if '</think>' in content -%}
+{%- set reasoning = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') -%}
+{%- set content = content.split('</think>')[-1].lstrip('\n') -%}
+THINK:{{ reasoning }}
+CONTENT:{{ content }}
+{%- else -%}
+CONTENT:{{ content }}
+{%- endif -%}
+{%- endfor -%}"#.to_owned(),
+            ),
+            ..Default::default()
+        };
+
+        let engine = TemplateEngine::new(config).expect("test: create template engine");
+
+        // Message with think tags
+        let messages = vec![ChatMessage {
+            role: "assistant".to_owned(),
+            content: "<think>\nI should search.\n</think>\nHere is the answer.".to_owned(),
+        }];
+
+        let result = engine.apply_chat_template(&messages, Some(false)).expect("test: apply template");
+        assert!(result.contains("THINK:I should search."));
+        assert!(result.contains("CONTENT:Here is the answer."));
+
+        // Message without think tags
+        let messages_no_think = vec![ChatMessage {
+            role: "user".to_owned(),
+            content: "Hello".to_owned(),
+        }];
+
+        let result = engine.apply_chat_template(&messages_no_think, Some(false)).expect("test: apply no-think");
+        assert!(result.contains("CONTENT:Hello"));
+    }
+
+    #[test]
+    fn test_transform_split_calls() {
+        assert_eq!(
+            transform_split_calls("x.split('</think>')[0]"),
+            "x|split_first('</think>')"
+        );
+        assert_eq!(
+            transform_split_calls("x.split('<think>')[-1]"),
+            "x|split_last('<think>')"
+        );
+        assert_eq!(
+            transform_split_calls(r#"x.split("sep")[0]"#),
+            "x|split_first('sep')"
+        );
     }
 }
