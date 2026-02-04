@@ -80,6 +80,7 @@ pub fn zmq_version_string() -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::print_stdout)]
 mod tests {
     use super::*;
 

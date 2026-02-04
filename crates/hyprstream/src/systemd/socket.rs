@@ -232,6 +232,7 @@ pub fn get_all_tcp_listeners() -> Result<Vec<TcpListener>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::print_stdout)]
 mod tests {
     use super::*;
 

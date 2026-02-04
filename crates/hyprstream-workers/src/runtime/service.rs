@@ -1918,6 +1918,7 @@ fn build_fs_info_response(request_id: u64, usage: &[crate::image::FilesystemUsag
 }
 
 #[cfg(test)]
+#[allow(clippy::print_stderr)]
 mod tests {
     use super::*;
     use crate::runtime::PodSandboxState;

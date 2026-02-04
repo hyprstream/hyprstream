@@ -108,6 +108,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::print_stdout)]
     fn test_list_available() {
         let registry = DriverRegistry::new();
         let available = registry.list_available_drivers();

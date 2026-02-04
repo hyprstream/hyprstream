@@ -161,6 +161,7 @@ impl Clone for ProcessSpawner {
 }
 
 #[cfg(test)]
+#[allow(clippy::print_stdout, clippy::print_stderr)]
 mod tests {
     use super::*;
 
@@ -173,7 +174,7 @@ mod tests {
         match backend_type {
             ProcessBackend::Standalone => println!("Using standalone backend"),
             ProcessBackend::Systemd { user_mode } => {
-                println!("Using systemd backend (user_mode: {user_mode})")
+                println!("Using systemd backend (user_mode: {user_mode})");
             }
         }
     }

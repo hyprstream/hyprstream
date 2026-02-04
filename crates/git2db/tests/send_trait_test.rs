@@ -1,3 +1,4 @@
+#![allow(clippy::print_stdout)]
 //! Tests demonstrating the Send-safe clone API
 //!
 //! This test file verifies that our API properly handles the Send trait

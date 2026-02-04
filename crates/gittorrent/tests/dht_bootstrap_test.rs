@@ -1,3 +1,4 @@
+#![allow(clippy::print_stdout)]
 //! Integration tests for DHT bootstrap functionality
 
 use gittorrent::dht::GitTorrentDht;
