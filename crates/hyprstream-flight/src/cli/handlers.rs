@@ -44,7 +44,7 @@ pub async fn handle_server(
 
     let backend = match config.get_string("storage.type")?.as_str() {
         "duckdb" => {
-            let conn_str = config.get_string("storage.connection")?.to_string();
+            let conn_str = config.get_string("storage.connection")?.clone();
             let backend = DuckDbBackend::new(conn_str, HashMap::new(), None)?;
             StorageBackendType::DuckDb(backend)
         }
