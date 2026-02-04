@@ -33,7 +33,7 @@ pub fn record_batch_to_json(batch: &RecordBatch) -> Result<Vec<JsonValue>, Box<d
                     JsonValue::String(array.value(row_idx).to_owned())
                 }
             };
-            row.insert(col_name.to_string(), value);
+            row.insert(col_name.clone(), value);
         }
         json_rows.push(JsonValue::Object(row));
     }
