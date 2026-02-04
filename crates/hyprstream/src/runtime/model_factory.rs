@@ -480,7 +480,7 @@ impl ModelFactory {
                 }
             };
 
-            weights.insert(name.to_string(), tensor);
+            weights.insert(name.clone(), tensor);
         }
 
         info!(

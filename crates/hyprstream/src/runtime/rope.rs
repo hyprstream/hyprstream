@@ -340,6 +340,7 @@ impl RoPEManager {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::print_stdout)]
 mod tests {
     use super::*;
 

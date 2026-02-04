@@ -277,6 +277,7 @@ mod tests {
                 let running = backend.is_running(&process).await?;
                 assert!(!running, "Process should be stopped");
             }
+            #[allow(clippy::print_stderr)]
             Err(e) => {
                 // sleep might not be available in some test environments
                 eprintln!("Could not spawn test process: {e}");

@@ -1,3 +1,4 @@
+#![allow(clippy::print_stdout)]
 //! Integration tests for transaction commit logic
 
 use git2db::{Git2DB, IsolationMode};

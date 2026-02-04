@@ -61,6 +61,7 @@ pub fn supports_use_fd() -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::print_stdout)]
 mod tests {
     use super::*;
 

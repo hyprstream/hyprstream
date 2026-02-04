@@ -191,7 +191,7 @@ impl LoRATrainer {
             // Simulate forward pass - in reality this would generate logits
             // and compute cross-entropy loss against target tokens
             let request = GenerationRequest {
-                prompt: TemplatedPrompt::new(input.to_string()),
+                prompt: TemplatedPrompt::new(input.clone()),
                 max_tokens: 50,
                 temperature: 0.7,
                 top_p: 0.9,
@@ -258,7 +258,7 @@ impl LoRATrainer {
         for (input, _target) in batch {
             // Generate without updating weights
             let request = GenerationRequest {
-                prompt: TemplatedPrompt::new(input.to_string()),
+                prompt: TemplatedPrompt::new(input.clone()),
                 max_tokens: 50,
                 temperature: 0.7,
                 top_p: 0.9,
