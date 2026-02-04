@@ -176,18 +176,30 @@ impl SandboxVirtiofs {
         tokio::fs::write(&config_path, serde_json::to_string_pretty(&config)?).await?;
 
         // Spawn nydusd process
+        let config_path_str = config_path.to_str().ok_or_else(|| {
+            WorkerError::SandboxCreationFailed("config path contains invalid UTF-8".to_owned())
+        })?;
+        let bootstrap_path_str = bootstrap_path.to_str().ok_or_else(|| {
+            WorkerError::SandboxCreationFailed("bootstrap path contains invalid UTF-8".to_owned())
+        })?;
+        let socket_path_str = self.socket_path.to_str().ok_or_else(|| {
+            WorkerError::SandboxCreationFailed("socket path contains invalid UTF-8".to_owned())
+        })?;
+        let api_socket_str = api_socket.to_str().ok_or_else(|| {
+            WorkerError::SandboxCreationFailed("api socket path contains invalid UTF-8".to_owned())
+        })?;
         let child = tokio::process::Command::new("nydusd")
             .args([
                 "--config",
-                config_path.to_str().unwrap(),
+                config_path_str,
                 "--mountpoint",
                 "", // No mountpoint for virtiofs
                 "--bootstrap",
-                bootstrap_path.to_str().unwrap(),
+                bootstrap_path_str,
                 "--sock",
-                self.socket_path.to_str().unwrap(),
+                socket_path_str,
                 "--apisock",
-                api_socket.to_str().unwrap(),
+                api_socket_str,
                 "--log-level",
                 "info",
             ])
@@ -233,19 +245,17 @@ impl SandboxVirtiofs {
 
         // Kill the daemon process if running
         if let Some(pid) = self.daemon_pid {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGTERM,
-            );
+            // PIDs are always positive and fit in i32 on Unix
+            if let Some(pid_i32) = i32::try_from(pid).ok().filter(|&p| p > 0) {
+                let nix_pid = nix::unistd::Pid::from_raw(pid_i32);
+                let _ = nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGTERM);
 
-            // Wait briefly for graceful shutdown
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                // Wait briefly for graceful shutdown
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-            // Force kill if still running
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            );
+                // Force kill if still running
+                let _ = nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGKILL);
+            }
         }
 
         // Clean up socket
@@ -289,10 +299,13 @@ impl Drop for SandboxVirtiofs {
     fn drop(&mut self) {
         // Best-effort cleanup on drop
         if let Some(pid) = self.daemon_pid {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            );
+            // PIDs are always positive and fit in i32 on Unix
+            if let Some(pid_i32) = i32::try_from(pid).ok().filter(|&p| p > 0) {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid_i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
         }
     }
 }

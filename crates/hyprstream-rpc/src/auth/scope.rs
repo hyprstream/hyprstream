@@ -109,11 +109,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_scope_parse() {
-        let scope = Scope::parse("infer:model:qwen-7b").unwrap();
+    fn test_scope_parse() -> Result<()> {
+        let scope = Scope::parse("infer:model:qwen-7b")?;
         assert_eq!(scope.action, "infer");
         assert_eq!(scope.resource, "model");
         assert_eq!(scope.identifier, "qwen-7b");
+        Ok(())
     }
 
     #[test]
@@ -123,30 +124,34 @@ mod tests {
     }
 
     #[test]
-    fn test_scope_grants_exact_match() {
-        let granted = Scope::parse("infer:model:qwen-7b").unwrap();
-        let required = Scope::parse("infer:model:qwen-7b").unwrap();
+    fn test_scope_grants_exact_match() -> Result<()> {
+        let granted = Scope::parse("infer:model:qwen-7b")?;
+        let required = Scope::parse("infer:model:qwen-7b")?;
         assert!(granted.grants(&required));
+        Ok(())
     }
 
     #[test]
-    fn test_scope_grants_wildcard() {
-        let granted = Scope::parse("infer:model:*").unwrap();
-        let required = Scope::parse("infer:model:qwen-7b").unwrap();
+    fn test_scope_grants_wildcard() -> Result<()> {
+        let granted = Scope::parse("infer:model:*")?;
+        let required = Scope::parse("infer:model:qwen-7b")?;
         assert!(granted.grants(&required));
+        Ok(())
     }
 
     #[test]
-    fn test_scope_action_isolation() {
-        let granted = Scope::parse("read:model:*").unwrap();
-        let required = Scope::parse("write:model:qwen-7b").unwrap();
+    fn test_scope_action_isolation() -> Result<()> {
+        let granted = Scope::parse("read:model:*")?;
+        let required = Scope::parse("write:model:qwen-7b")?;
         assert!(!granted.grants(&required));
+        Ok(())
     }
 
     #[test]
-    fn test_scope_resource_isolation() {
-        let granted = Scope::parse("infer:model:*").unwrap();
-        let required = Scope::parse("infer:stream:abc").unwrap();
+    fn test_scope_resource_isolation() -> Result<()> {
+        let granted = Scope::parse("infer:model:*")?;
+        let required = Scope::parse("infer:stream:abc")?;
         assert!(!granted.grants(&required));
+        Ok(())
     }
 }

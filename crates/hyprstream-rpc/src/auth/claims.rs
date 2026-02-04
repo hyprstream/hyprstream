@@ -25,9 +25,12 @@ impl ToCapnp for Claims {
         builder.set_iat(self.iat);
         builder.set_admin(self.admin);
 
-        let mut scopes_builder = builder.reborrow().init_scopes(self.scopes.len() as u32);
+        // Cap'n Proto uses u32 for list lengths - cap at u32::MAX (safe: no one has 4B scopes)
+        let scopes_len = u32::try_from(self.scopes.len()).unwrap_or(u32::MAX);
+        let mut scopes_builder = builder.reborrow().init_scopes(scopes_len);
         for (i, scope) in self.scopes.iter().enumerate() {
-            let mut scope_builder = scopes_builder.reborrow().get(i as u32);
+            let idx = u32::try_from(i).unwrap_or(u32::MAX);
+            let mut scope_builder = scopes_builder.reborrow().get(idx);
             scope.write_to(&mut scope_builder);
         }
     }
@@ -99,42 +102,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_claims_has_scope_exact() {
+    fn test_claims_has_scope_exact() -> Result<()> {
         let claims = Claims::new(
             "alice".to_owned(),
             1000,
             2000,
-            vec![Scope::parse("infer:model:qwen-7b").unwrap()],
+            vec![Scope::parse("infer:model:qwen-7b")?],
             false,
         );
-        let required = Scope::parse("infer:model:qwen-7b").unwrap();
+        let required = Scope::parse("infer:model:qwen-7b")?;
         assert!(claims.has_scope(&required));
+        Ok(())
     }
 
     #[test]
-    fn test_claims_has_scope_wildcard() {
+    fn test_claims_has_scope_wildcard() -> Result<()> {
         let claims = Claims::new(
             "alice".to_owned(),
             1000,
             2000,
-            vec![Scope::parse("infer:model:*").unwrap()],
+            vec![Scope::parse("infer:model:*")?],
             false,
         );
-        let required = Scope::parse("infer:model:qwen-7b").unwrap();
+        let required = Scope::parse("infer:model:qwen-7b")?;
         assert!(claims.has_scope(&required));
+        Ok(())
     }
 
     #[test]
-    fn test_claims_fail_secure_empty_scopes() {
+    fn test_claims_fail_secure_empty_scopes() -> Result<()> {
         let claims = Claims::new("alice".to_owned(), 1000, 2000, vec![], false);
-        let required = Scope::parse("infer:model:qwen-7b").unwrap();
+        let required = Scope::parse("infer:model:qwen-7b")?;
         assert!(!claims.has_scope(&required));
+        Ok(())
     }
 
     #[test]
-    fn test_claims_admin_override() {
+    fn test_claims_admin_override() -> Result<()> {
         let claims = Claims::new("admin".to_owned(), 1000, 2000, vec![], true);
-        let required = Scope::parse("infer:model:qwen-7b").unwrap();
+        let required = Scope::parse("infer:model:qwen-7b")?;
         assert!(claims.has_scope(&required));
+        Ok(())
     }
 }

@@ -33,6 +33,7 @@ whoami = { workspace = true }
 hex = { workspace = true }
 parking_lot = { workspace = true }
 chrono = { workspace = true }
+once_cell = { workspace = true }
 inventory = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }

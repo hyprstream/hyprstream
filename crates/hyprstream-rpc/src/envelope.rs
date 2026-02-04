@@ -119,8 +119,8 @@ impl RequestIdentity {
     /// includes the namespace prefix to prevent collisions.
     pub fn user(&self) -> &str {
         match self {
-            Self::Local { user } => user,
-            Self::ApiToken { user, .. } => user,
+            // Both Local and ApiToken have a user field
+            Self::Local { user } | Self::ApiToken { user, .. } => user,
             Self::Peer { name, .. } => name,
             Self::Anonymous => "anonymous",
         }
@@ -293,9 +293,10 @@ impl RequestEnvelope {
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
 
         // SAFETY: Only fails if system time is before Unix epoch (1970)
+        // Cap at i64::MAX (won't overflow for ~292 million years)
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
             .unwrap_or(0);
 
         Self {
@@ -541,9 +542,10 @@ impl InMemoryNonceCache {
 impl NonceCache for InMemoryNonceCache {
     fn check_and_insert(&self, nonce: &[u8; 16]) -> bool {
         // SAFETY: Only fails if system time is before Unix epoch (1970)
+        // Cap at i64::MAX (won't overflow for ~292 million years)
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
             .unwrap_or(0);
 
         // Fast path: check if already seen (read lock)
@@ -628,9 +630,10 @@ impl SignedEnvelope {
 
         // 2. Check timestamp window
         // SAFETY: Only fails if system time is before Unix epoch (1970)
+        // Cap at i64::MAX (won't overflow for ~292 million years)
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
             .unwrap_or(0);
 
         let age = now - self.envelope.timestamp;
@@ -1168,7 +1171,7 @@ mod tests {
     }
 
     #[test]
-    fn test_signed_envelope_sign_verify() {
+    fn test_signed_envelope_sign_verify() -> crate::EnvelopeResult<()> {
         let (signing_key, verifying_key) = generate_signing_keypair();
         let nonce_cache = TestNonceCache::new();
 
@@ -1176,7 +1179,8 @@ mod tests {
         let signed = SignedEnvelope::new_signed(envelope, &signing_key);
 
         // Verify should succeed
-        signed.verify(&verifying_key, &nonce_cache).unwrap();
+        signed.verify(&verifying_key, &nonce_cache)?;
+        Ok(())
     }
 
     #[test]
@@ -1194,7 +1198,7 @@ mod tests {
     }
 
     #[test]
-    fn test_signed_envelope_replay_fails() {
+    fn test_signed_envelope_replay_fails() -> crate::EnvelopeResult<()> {
         let (signing_key, verifying_key) = generate_signing_keypair();
         let nonce_cache = TestNonceCache::new();
 
@@ -1202,11 +1206,12 @@ mod tests {
         let signed = SignedEnvelope::new_signed(envelope, &signing_key);
 
         // First verify succeeds
-        signed.verify(&verifying_key, &nonce_cache).unwrap();
+        signed.verify(&verifying_key, &nonce_cache)?;
 
         // Replay (same nonce) should fail
         let result = signed.verify(&verifying_key, &nonce_cache);
         assert!(matches!(result, Err(EnvelopeError::ReplayAttack(_))));
+        Ok(())
     }
 
     #[test]
@@ -1225,7 +1230,7 @@ mod tests {
     }
 
     #[test]
-    fn test_capnp_roundtrip_local() {
+    fn test_capnp_roundtrip_local() -> anyhow::Result<()> {
         use capnp::message::Builder;
 
         let identity = RequestIdentity::local();
@@ -1237,13 +1242,14 @@ mod tests {
 
         // Deserialize
         let reader = builder.into_reader();
-        let decoded = RequestIdentity::read_from(reader).unwrap();
+        let decoded = RequestIdentity::read_from(reader)?;
 
         assert_eq!(identity, decoded);
+        Ok(())
     }
 
     #[test]
-    fn test_capnp_roundtrip_api_token() {
+    fn test_capnp_roundtrip_api_token() -> anyhow::Result<()> {
         use capnp::message::Builder;
 
         let identity = RequestIdentity::api_token("alice", "prod-key");
@@ -1253,13 +1259,14 @@ mod tests {
         identity.write_to(&mut builder);
 
         let reader = builder.into_reader();
-        let decoded = RequestIdentity::read_from(reader).unwrap();
+        let decoded = RequestIdentity::read_from(reader)?;
 
         assert_eq!(identity, decoded);
+        Ok(())
     }
 
     #[test]
-    fn test_capnp_roundtrip_peer() {
+    fn test_capnp_roundtrip_peer() -> anyhow::Result<()> {
         use capnp::message::Builder;
 
         let curve_key = [42u8; 32];
@@ -1270,13 +1277,14 @@ mod tests {
         identity.write_to(&mut builder);
 
         let reader = builder.into_reader();
-        let decoded = RequestIdentity::read_from(reader).unwrap();
+        let decoded = RequestIdentity::read_from(reader)?;
 
         assert_eq!(identity, decoded);
+        Ok(())
     }
 
     #[test]
-    fn test_capnp_roundtrip_anonymous() {
+    fn test_capnp_roundtrip_anonymous() -> anyhow::Result<()> {
         use capnp::message::Builder;
 
         let identity = RequestIdentity::anonymous();
@@ -1286,13 +1294,14 @@ mod tests {
         identity.write_to(&mut builder);
 
         let reader = builder.into_reader();
-        let decoded = RequestIdentity::read_from(reader).unwrap();
+        let decoded = RequestIdentity::read_from(reader)?;
 
         assert_eq!(identity, decoded);
+        Ok(())
     }
 
     #[test]
-    fn test_capnp_roundtrip_envelope() {
+    fn test_capnp_roundtrip_envelope() -> anyhow::Result<()> {
         use capnp::message::Builder;
 
         let envelope = RequestEnvelope::with_token("bob", "ci-pipeline", vec![1, 2, 3, 4])
@@ -1303,7 +1312,7 @@ mod tests {
         envelope.write_to(&mut builder);
 
         let reader = builder.into_reader();
-        let decoded = RequestEnvelope::read_from(reader).unwrap();
+        let decoded = RequestEnvelope::read_from(reader)?;
 
         assert_eq!(envelope.request_id, decoded.request_id);
         assert_eq!(envelope.identity, decoded.identity);
@@ -1311,10 +1320,11 @@ mod tests {
         assert_eq!(envelope.nonce, decoded.nonce);
         assert_eq!(envelope.timestamp, decoded.timestamp);
         assert_eq!(envelope.ephemeral_pubkey, decoded.ephemeral_pubkey);
+        Ok(())
     }
 
     #[test]
-    fn test_capnp_roundtrip_signed_envelope() {
+    fn test_capnp_roundtrip_signed_envelope() -> Result<(), Box<dyn std::error::Error>> {
         use capnp::message::Builder;
 
         let (signing_key, verifying_key) = generate_signing_keypair();
@@ -1326,7 +1336,7 @@ mod tests {
         signed.write_to(&mut builder);
 
         let reader = builder.into_reader();
-        let decoded = SignedEnvelope::read_from(reader).unwrap();
+        let decoded = SignedEnvelope::read_from(reader)?;
 
         assert_eq!(signed.envelope.request_id, decoded.envelope.request_id);
         assert_eq!(signed.envelope.payload, decoded.envelope.payload);
@@ -1334,6 +1344,7 @@ mod tests {
         assert_eq!(signed.signer_pubkey, decoded.signer_pubkey);
 
         // Verify the decoded envelope still has valid signature
-        decoded.verify_signature_only(&verifying_key).unwrap();
+        decoded.verify_signature_only(&verifying_key)?;
+        Ok(())
     }
 }

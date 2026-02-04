@@ -617,8 +617,7 @@ impl CheckpointManager {
             timestamp: request.timestamp,
             metrics: request.metrics,
             format: match &request.weights {
-                WeightSnapshot::Memory { format, .. } => *format,
-                WeightSnapshot::FilePath { format, .. } => *format,
+                WeightSnapshot::Memory { format, .. } | WeightSnapshot::FilePath { format, .. } => *format,
                 WeightSnapshot::Diff { .. } => WeightFormat::SafeTensors,
             },
             parent_checkpoint: None,

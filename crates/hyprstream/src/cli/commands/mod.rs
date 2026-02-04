@@ -281,6 +281,34 @@ pub enum Commands {
     /// List available models
     List,
 
+    /// Load a model into memory with optional runtime configuration
+    ///
+    /// Pre-loads a model into the ModelService cache. This allows you to configure
+    /// runtime parameters like context length and KV cache quantization before
+    /// running inference.
+    Load {
+        /// Model reference (e.g., "Qwen3-4B", "qwen/qwen-2b", "model:branch")
+        model: String,
+
+        /// Maximum context length for KV cache allocation.
+        /// Overrides model's max_position_embeddings to reduce GPU memory.
+        #[arg(long, env = "HYPRSTREAM_MAX_CONTEXT")]
+        max_context: Option<usize>,
+
+        /// KV cache quantization type for reduced GPU memory usage.
+        /// Reduces GPU memory by 50-75% at slight quality cost.
+        #[arg(long, value_enum, default_value = "none", env = "HYPRSTREAM_KV_QUANT")]
+        kv_quant: KVQuantArg,
+    },
+
+    /// Unload a model from memory
+    ///
+    /// Removes a model from the ModelService cache to free GPU/CPU memory.
+    Unload {
+        /// Model reference (e.g., "Qwen3-4B", "qwen/qwen-2b", "model:branch")
+        model: String,
+    },
+
     /// Get detailed information about a model
     Inspect {
         /// Model name or reference

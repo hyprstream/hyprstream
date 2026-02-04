@@ -257,11 +257,11 @@ pub fn format_batches_as_table(batches: &[RecordBatch]) -> String {
         .zip(&widths)
         .map(|(f, w)| format!("{:width$}", f.name(), width = *w))
         .collect();
-    writeln!(output, "| {} |", header.join(" | ")).unwrap();
+    let _ = writeln!(output, "| {} |", header.join(" | "));
 
     // Separator
     let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
-    writeln!(output, "|-{}-|", sep.join("-|-")).unwrap();
+    let _ = writeln!(output, "|-{}-|", sep.join("-|-"));
 
     // Rows
     for batch in batches {
@@ -275,13 +275,13 @@ pub fn format_batches_as_table(batches: &[RecordBatch]) -> String {
                     format!("{:width$}", value, width = *w)
                 })
                 .collect();
-            writeln!(output, "| {} |", row.join(" | ")).unwrap();
+            let _ = writeln!(output, "| {} |", row.join(" | "));
         }
     }
 
     // Row count
     let total_rows: usize = batches.iter().map(arrow_array::RecordBatch::num_rows).sum();
-    writeln!(output, "\n({total_rows} rows)").unwrap();
+    let _ = writeln!(output, "\n({total_rows} rows)");
 
     output
 }
@@ -299,7 +299,7 @@ pub fn format_batches_as_csv(batches: &[RecordBatch]) -> String {
 
     // Header
     let header: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-    writeln!(output, "{}", header.join(",")).unwrap();
+    let _ = writeln!(output, "{}", header.join(","));
 
     // Rows
     for batch in batches {
@@ -316,7 +316,7 @@ pub fn format_batches_as_csv(batches: &[RecordBatch]) -> String {
                     }
                 })
                 .collect();
-            writeln!(output, "{}", row.join(",")).unwrap();
+            let _ = writeln!(output, "{}", row.join(","));
         }
     }
 

@@ -115,8 +115,8 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_detect_with_context_json() {
-        let temp = TempDir::new().expect("test: create temp dir");
+    fn test_detect_with_context_json() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
         let manifest_path = temp.path().join("context.json");
         fs::write(
             &manifest_path,
@@ -131,39 +131,42 @@ mod tests {
                     "model": "sentence-transformers/all-MiniLM-L6-v2"
                 }
             }"#,
-        )
-        .expect("test: write manifest");
+        )?;
 
         let archetype = CagContextArchetype;
         assert!(archetype.detect(temp.path()));
+        Ok(())
     }
 
     #[test]
-    fn test_no_detect_empty_dir() {
-        let temp = TempDir::new().expect("test: create temp dir");
+    fn test_no_detect_empty_dir() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
 
         let archetype = CagContextArchetype;
         assert!(!archetype.detect(temp.path()));
+        Ok(())
     }
 
     #[test]
-    fn test_no_detect_invalid_json() {
-        let temp = TempDir::new().expect("test: create temp dir");
+    fn test_no_detect_invalid_json() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
         let manifest_path = temp.path().join("context.json");
-        fs::write(&manifest_path, "not valid json").expect("test: write invalid json");
+        fs::write(&manifest_path, "not valid json")?;
 
         let archetype = CagContextArchetype;
         assert!(!archetype.detect(temp.path()));
+        Ok(())
     }
 
     #[test]
-    fn test_no_detect_missing_version() {
-        let temp = TempDir::new().expect("test: create temp dir");
+    fn test_no_detect_missing_version() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
         let manifest_path = temp.path().join("context.json");
-        fs::write(&manifest_path, r#"{"store": {}}"#).expect("test: write manifest");
+        fs::write(&manifest_path, r#"{"store": {}}"#)?;
 
         let archetype = CagContextArchetype;
         assert!(!archetype.detect(temp.path()));
+        Ok(())
     }
 
     #[test]
@@ -179,8 +182,8 @@ mod tests {
     }
 
     #[test]
-    fn test_load_manifest() {
-        let temp = TempDir::new().expect("test: create temp dir");
+    fn test_load_manifest() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
         let manifest_path = temp.path().join("context.json");
         fs::write(
             &manifest_path,
@@ -195,13 +198,13 @@ mod tests {
                     "model": "sentence-transformers/all-MiniLM-L6-v2"
                 }
             }"#,
-        )
-        .expect("test: write manifest");
+        )?;
 
-        let manifest = ContextManifest::load(temp.path()).expect("test: load manifest");
+        let manifest = ContextManifest::load(temp.path())?;
         assert_eq!(manifest.version, 1);
         assert_eq!(manifest.store.store_type, "duckdb");
         assert_eq!(manifest.store.path, "context.duckdb");
         assert_eq!(manifest.embedding.dimension, 384);
+        Ok(())
     }
 }

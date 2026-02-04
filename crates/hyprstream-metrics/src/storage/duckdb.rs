@@ -110,8 +110,8 @@ impl StorageBackend for DuckDbBackend {
                                 match col.to_uppercase().as_str() {
                                     "INTEGER" | "BIGINT" => DataType::Int64,
                                     "DOUBLE" | "REAL" | "FLOAT" => DataType::Float64,
-                                    "VARCHAR" | "TEXT" => DataType::Utf8,
-                                    _ => DataType::Utf8, // Fallback but log warning
+                                    // VARCHAR, TEXT, and all other types fallback to string
+                                    _ => DataType::Utf8,
                                 },
                                 true,
                             )
@@ -179,15 +179,18 @@ impl StorageBackend for DuckDbBackend {
                 let col = batch.column(col_idx);
                 match col.data_type() {
                     DataType::Int64 => {
-                        let array = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                        let array = col.as_any().downcast_ref::<Int64Array>()
+                            .ok_or_else(|| Status::internal("Failed to downcast to Int64Array"))?;
                         params.push(Box::new(array.value(row_idx)));
                     }
                     DataType::Float64 => {
-                        let array = col.as_any().downcast_ref::<Float64Array>().unwrap();
+                        let array = col.as_any().downcast_ref::<Float64Array>()
+                            .ok_or_else(|| Status::internal("Failed to downcast to Float64Array"))?;
                         params.push(Box::new(array.value(row_idx)));
                     }
                     DataType::Utf8 => {
-                        let array = col.as_any().downcast_ref::<StringArray>().unwrap();
+                        let array = col.as_any().downcast_ref::<StringArray>()
+                            .ok_or_else(|| Status::internal("Failed to downcast to StringArray"))?;
                         params.push(Box::new(array.value(row_idx).to_owned()));
                     }
                     _ => return Err(Status::invalid_argument("Unsupported data type")),
@@ -225,13 +228,20 @@ impl StorageBackend for DuckDbBackend {
         let definition_json = serde_json::to_string(&definition)
             .map_err(|e| Status::internal(format!("Failed to serialize view definition: {e}")))?;
 
+        let created_at_secs = i64::try_from(
+            metadata.created_at
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_err(|e| Status::internal(format!("Failed to get timestamp: {e}")))?
+                .as_secs()
+        ).unwrap_or(i64::MAX);
+
         tx.execute(
             "INSERT INTO view_metadata (view_name, source_table, view_definition, created_at) VALUES (?, ?, ?, ?)",
             params![
                 name,
                 definition.source_table,
                 definition_json,
-                metadata.created_at.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64
+                created_at_secs
             ],
         )
         .map_err(|e| Status::internal(format!("Failed to store view metadata: {e}")))?;
@@ -254,7 +264,8 @@ impl StorageBackend for DuckDbBackend {
                 let definition: ViewDefinition = serde_json::from_str(&definition_json)
                     .map_err(|e| duckdb::Error::InvalidParameterName(format!("Invalid view definition: {e}")))?;
 
-                let created_at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(row.get::<_, i64>(3)? as u64);
+                let secs = row.get::<_, i64>(3)?;
+                let created_at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(u64::try_from(secs).unwrap_or(0));
 
                 Ok(ViewMetadata {
                     name: row.get(0)?,

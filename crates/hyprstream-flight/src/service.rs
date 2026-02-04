@@ -24,7 +24,8 @@ use std::pin::Pin;
 use arrow_schema::Schema;
 use serde::Deserialize;
 use serde_json;
-use std::sync::{atomic::AtomicU64, Arc, Mutex};
+use std::sync::{atomic::AtomicU64, Arc};
+use parking_lot::Mutex;
 use tonic::{Request, Response, Status, Streaming};
 
 #[derive(Debug, Deserialize)]
@@ -187,8 +188,7 @@ impl FlightSqlService for FlightSqlServer {
 
         // Store SQL with handle for do_get (for compatibility with Flight SQL protocol)
         {
-            let mut statements = self.prepared_statements.lock()
-                .map_err(|e| Status::internal(format!("Lock error: {e}")))?;
+            let mut statements = self.prepared_statements.lock();
             statements.push((handle, query.query));
         }
 
@@ -353,8 +353,7 @@ impl FlightSqlServer {
 
                 // Store SQL with handle for do_get compatibility
                 {
-                    let mut statements = self.prepared_statements.lock()
-                        .map_err(|e| Status::internal(format!("Lock error: {e}")))?;
+                    let mut statements = self.prepared_statements.lock();
                     statements.push((handle, sql.clone()));
                 }
 

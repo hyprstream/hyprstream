@@ -96,11 +96,12 @@ mod tests {
     }
 
     #[test]
-    fn test_set_rcvtimeo() {
+    fn test_set_rcvtimeo() -> zmq::Result<()> {
         let ctx = zmq::Context::new();
-        let mut socket = ctx.socket(zmq::SUB).unwrap();
-        set_rcvtimeo(&mut socket, 1000).unwrap();
-        set_rcvtimeo(&mut socket, -1).unwrap();
-        set_rcvtimeo(&mut socket, 0).unwrap();
+        let mut socket = ctx.socket(zmq::SUB)?;
+        set_rcvtimeo(&mut socket, 1000)?;
+        set_rcvtimeo(&mut socket, -1)?;
+        set_rcvtimeo(&mut socket, 0)?;
+        Ok(())
     }
 }

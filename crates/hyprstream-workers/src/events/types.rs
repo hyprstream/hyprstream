@@ -359,15 +359,15 @@ mod tests {
     }
 
     #[test]
-    fn test_sandbox_started_roundtrip() {
+    fn test_sandbox_started_roundtrip() -> Result<()> {
         let original = SandboxStarted {
             sandbox_id: "test-123".to_owned(),
             metadata: r#"{"cpu":2}"#.to_owned(),
             vm_pid: 9876,
         };
 
-        let bytes = serialize_sandbox_started(&original).unwrap();
-        let event = WorkerEvent::from_bytes(&bytes).unwrap();
+        let bytes = serialize_sandbox_started(&original)?;
+        let event = WorkerEvent::from_bytes(&bytes)?;
 
         match event {
             WorkerEvent::SandboxStarted(ss) => {
@@ -377,10 +377,11 @@ mod tests {
             }
             _ => panic!("Expected SandboxStarted"),
         }
+        Ok(())
     }
 
     #[test]
-    fn test_container_stopped_roundtrip() {
+    fn test_container_stopped_roundtrip() -> Result<()> {
         let original = ContainerStopped {
             container_id: "cont-456".to_owned(),
             sandbox_id: "sb-123".to_owned(),
@@ -388,8 +389,8 @@ mod tests {
             reason: "completed".to_owned(),
         };
 
-        let bytes = serialize_container_stopped(&original).unwrap();
-        let event = WorkerEvent::from_bytes(&bytes).unwrap();
+        let bytes = serialize_container_stopped(&original)?;
+        let event = WorkerEvent::from_bytes(&bytes)?;
 
         match event {
             WorkerEvent::ContainerStopped(cs) => {
@@ -400,16 +401,17 @@ mod tests {
             }
             _ => panic!("Expected ContainerStopped"),
         }
+        Ok(())
     }
 
     #[test]
-    fn test_extract_inputs() {
+    fn test_extract_inputs() -> Result<()> {
         let original = SandboxStarted {
             sandbox_id: "sb-789".to_owned(),
             metadata: "{}".to_owned(),
             vm_pid: 1234,
         };
-        let bytes = serialize_sandbox_started(&original).unwrap();
+        let bytes = serialize_sandbox_started(&original)?;
 
         let event = ReceivedEvent::from_message("worker.sb-789.started", &bytes);
         let inputs = event.extract_inputs();
@@ -417,5 +419,6 @@ mod tests {
         assert_eq!(inputs.get("sandbox_id"), Some(&"sb-789".to_owned()));
         assert_eq!(inputs.get("vm_pid"), Some(&"1234".to_owned()));
         assert_eq!(inputs.get("event_type"), Some(&"started".to_owned()));
+        Ok(())
     }
 }

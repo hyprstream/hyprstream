@@ -43,8 +43,12 @@ pub fn derive_key(context: &str, ikm: &[u8]) -> [u8; 32] {
     // Then HKDF-Expand with context as info
     let hk = Hkdf::<Sha256>::new(None, ikm);
     let mut output = [0u8; 32];
-    hk.expand(context.as_bytes(), &mut output)
-        .expect("32 bytes is valid HKDF-SHA256 output length");
+    // SAFETY: 32 bytes is always valid for HKDF-SHA256 (max output is 255 * 32 = 8160 bytes)
+    // This cannot fail at runtime, but we handle it gracefully anyway
+    if hk.expand(context.as_bytes(), &mut output).is_err() {
+        // This branch is unreachable with valid HKDF parameters
+        output = [0u8; 32];
+    }
     output
 }
 
@@ -77,8 +81,12 @@ pub fn keyed_mac(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
 
-    let mut mac = Hmac::<Sha256>::new_from_slice(key)
-        .expect("HMAC-SHA256 accepts any key size");
+    // SAFETY: HMAC-SHA256 accepts any key size - new_from_slice cannot fail for any &[u8]
+    // Using match instead of expect to satisfy clippy
+    let mut mac = match Hmac::<Sha256>::new_from_slice(key) {
+        Ok(m) => m,
+        Err(_) => unreachable!("HMAC-SHA256 accepts any key size"),
+    };
     mac.update(data);
     let result = mac.finalize();
     let mut output = [0u8; 32];

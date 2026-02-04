@@ -227,6 +227,33 @@ style = { level = "warn", priority = -1 }
 complexity = { level = "warn", priority = -1 }
 perf = { level = "warn", priority = -1 }
 
+# Panic prevention - use proper error handling
+unwrap_used = "deny"
+expect_used = "deny"
+disallowed_types = "deny"  # See clippy.toml for disallowed types
+
+# Cast safety - allow (64-bit target, ML domain where PyTorch validates dimensions)
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+
+# Memory safety
+mem_forget = "deny"
+
+# Code quality - cleaner code
+cloned_instead_of_copied = "deny"
+implicit_clone = "deny"
+match_same_arms = "deny"
+needless_for_each = "deny"
+flat_map_option = "deny"
+async_yields_async = "deny"
+
+# Shipping quality - don't ship debug code
+todo = "deny"
+unimplemented = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+
 # Specific useful lints
 dbg_macro = "warn"
 empty_structs_with_brackets = "warn"
@@ -238,6 +265,11 @@ or_fun_call = "warn"
 redundant_closure_for_method_calls = "warn"
 str_to_string = "warn"
 trivially_copy_pass_by_ref = "warn"
+semicolon_if_nothing_returned = "warn"
+# doc_markdown - allow (cosmetic, docs still readable without backticks)
+doc_markdown = "allow"
+# indexing_slicing - allow (tensor code bounds checked by PyTorch)
+indexing_slicing = "allow"
 # uninlined_format_args = "warn"  # Disabled - affects generated code
 # needless_pass_by_value = "warn"  # Disabled - too many false positives with callback-based APIs
 

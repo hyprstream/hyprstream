@@ -195,12 +195,13 @@ impl EventHandler for WorkerLifecycleHandler {
         // Check entity type filter
         if let Some(ref entity_type) = self.entity_type {
             if let Some(ref worker_event) = event.worker_event {
-                match (entity_type.as_str(), worker_event) {
-                    ("sandbox", WorkerEvent::SandboxStarted(_))
-                    | ("sandbox", WorkerEvent::SandboxStopped(_)) => {}
-                    ("container", WorkerEvent::ContainerStarted(_))
-                    | ("container", WorkerEvent::ContainerStopped(_)) => {}
-                    _ => return false,
+                let entity_matches = matches!(
+                    (entity_type.as_str(), worker_event),
+                    ("sandbox", WorkerEvent::SandboxStarted(_) | WorkerEvent::SandboxStopped(_))
+                    | ("container", WorkerEvent::ContainerStarted(_) | WorkerEvent::ContainerStopped(_))
+                );
+                if !entity_matches {
+                    return false;
                 }
             } else {
                 return false;

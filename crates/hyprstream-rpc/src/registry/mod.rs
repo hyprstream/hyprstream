@@ -343,7 +343,10 @@ pub fn shutdown() {
 /// Clone needed data before awaiting.
 pub fn global() -> impl std::ops::Deref<Target = EndpointRegistry> + 'static {
     parking_lot::RwLockReadGuard::map(REGISTRY.read(), |r| {
-        r.as_ref().expect("EndpointRegistry not initialized - call init() first")
+        match r.as_ref() {
+            Some(registry) => registry,
+            None => panic!("EndpointRegistry not initialized - call init() first"),
+        }
     })
 }
 
@@ -354,7 +357,11 @@ pub fn try_global() -> Option<impl std::ops::Deref<Target = EndpointRegistry> + 
     let guard = REGISTRY.read();
     if guard.is_some() {
         Some(parking_lot::RwLockReadGuard::map(guard, |r| {
-            r.as_ref().unwrap()
+            // SAFETY: We checked is_some() above, so this is guaranteed to succeed
+            match r.as_ref() {
+                Some(registry) => registry,
+                None => unreachable!("checked is_some() above"),
+            }
         }))
     } else {
         None
@@ -488,7 +495,7 @@ impl Drop for ServiceRegistration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     // Serialize tests that use the global registry
     static TEST_MUTEX: Mutex<()> = Mutex::new(());
@@ -499,7 +506,7 @@ mod tests {
 
     #[test]
     fn test_inproc_defaults() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = TEST_MUTEX.lock();
         reset_registry();
         init(EndpointMode::Inproc, None);
 
@@ -518,7 +525,7 @@ mod tests {
 
     #[test]
     fn test_ipc_defaults() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = TEST_MUTEX.lock();
         reset_registry();
         init(EndpointMode::Ipc, Some(PathBuf::from("/run/hyprstream")));
 
@@ -532,8 +539,8 @@ mod tests {
     }
 
     #[test]
-    fn test_single_registration() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+    fn test_single_registration() -> anyhow::Result<()> {
+        let _lock = TEST_MUTEX.lock();
         reset_registry();
         init(EndpointMode::Inproc, None);
 
@@ -542,8 +549,7 @@ mod tests {
                 "test-service",
                 TransportConfig::inproc("custom/endpoint"),
                 Some("Test service"),
-            )
-            .unwrap();
+            )?;
 
             let endpoint = global().endpoint("test-service", SocketKind::Rep);
             assert_eq!(endpoint.to_zmq_string(), "inproc://custom/endpoint");
@@ -552,11 +558,12 @@ mod tests {
         // After drop, falls back to default
         let endpoint = global().endpoint("test-service", SocketKind::Rep);
         assert_eq!(endpoint.to_zmq_string(), "inproc://hyprstream/test-service");
+        Ok(())
     }
 
     #[test]
-    fn test_multi_registration() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+    fn test_multi_registration() -> anyhow::Result<()> {
+        let _lock = TEST_MUTEX.lock();
         reset_registry();
         init(EndpointMode::Inproc, None);
 
@@ -568,8 +575,7 @@ mod tests {
                     (SocketKind::Router, TransportConfig::inproc("model/router")),
                 ],
                 Some("Model service"),
-            )
-            .unwrap();
+            )?;
 
             // Both endpoints registered
             let rep_ep = global().endpoint("model", SocketKind::Rep);
@@ -585,11 +591,12 @@ mod tests {
 
         let router_ep = global().endpoint("model", SocketKind::Router);
         assert_eq!(router_ep.to_zmq_string(), "inproc://hyprstream/model-router");
+        Ok(())
     }
 
     #[test]
     fn test_backward_compat() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = TEST_MUTEX.lock();
         reset_registry();
         init(EndpointMode::Inproc, None);
 
@@ -612,14 +619,14 @@ mod tests {
 
     #[test]
     fn test_try_global_uninitialized() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = TEST_MUTEX.lock();
         reset_registry();
         assert!(try_global().is_none());
     }
 
     #[test]
     fn test_list_services() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = TEST_MUTEX.lock();
         reset_registry();
         init(EndpointMode::Inproc, None);
 

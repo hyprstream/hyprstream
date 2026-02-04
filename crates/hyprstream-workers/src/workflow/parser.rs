@@ -185,7 +185,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_simple_workflow() {
+    fn test_parse_simple_workflow() -> Result<()> {
         let yaml = r#"
 name: Test Workflow
 on: push
@@ -199,13 +199,14 @@ jobs:
         run: cargo build
 "#;
 
-        let workflow = Workflow::parse(yaml).unwrap();
+        let workflow = Workflow::parse(yaml)?;
         assert_eq!(workflow.name, "Test Workflow");
         assert!(workflow.jobs.contains_key("build"));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_complex_trigger() {
+    fn test_parse_complex_trigger() -> Result<()> {
         let yaml = r#"
 name: Complex Workflow
 on:
@@ -227,7 +228,8 @@ jobs:
           model: ${{ inputs.model }}
 "#;
 
-        let workflow = Workflow::parse(yaml).unwrap();
+        let workflow = Workflow::parse(yaml)?;
         assert_eq!(workflow.name, "Complex Workflow");
+        Ok(())
     }
 }

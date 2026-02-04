@@ -133,29 +133,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_request_serialization() {
+    fn test_request_serialization() -> Result<(), serde_json::Error> {
         let req = Request::GetFile {
             hash: "abc123".to_owned(),
         };
-        let json = serde_json::to_string(&req).unwrap();
+        let json = serde_json::to_string(&req)?;
         assert!(json.contains("get_file"));
         assert!(json.contains("abc123"));
 
-        let parsed: Request = serde_json::from_str(&json).unwrap();
+        let parsed: Request = serde_json::from_str(&json)?;
         match parsed {
             Request::GetFile { hash } => assert_eq!(hash, "abc123"),
             _ => panic!("Wrong variant"),
         }
+        Ok(())
     }
 
     #[test]
-    fn test_response_serialization() {
+    fn test_response_serialization() -> Result<(), serde_json::Error> {
         let resp = Response::error(ErrorCode::NotFound, "File not found");
-        let json = serde_json::to_string(&resp).unwrap();
+        let json = serde_json::to_string(&resp)?;
         assert!(json.contains("error"));
         assert!(json.contains("not_found"));
 
-        let parsed: Response = serde_json::from_str(&json).unwrap();
+        let parsed: Response = serde_json::from_str(&json)?;
         match parsed {
             Response::Error { code, message } => {
                 assert_eq!(code, ErrorCode::NotFound);
@@ -163,5 +164,6 @@ mod tests {
             }
             _ => panic!("Wrong variant"),
         }
+        Ok(())
     }
 }

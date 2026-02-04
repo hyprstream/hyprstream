@@ -203,7 +203,9 @@ mod tests {
     #[tokio::test]
     async fn test_view_optimization() -> Result<()> {
         // Create test backend
-        let backend = Arc::new(DuckDbBackend::new_in_memory().unwrap());
+        let backend = Arc::new(DuckDbBackend::new_in_memory().map_err(|e|
+            datafusion::error::DataFusionError::Internal(format!("Failed to create backend: {e}"))
+        )?);
         backend.init().await.map_err(|e|
             datafusion::error::DataFusionError::Internal(format!("Failed to init backend: {e}"))
         )?;

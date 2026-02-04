@@ -451,23 +451,23 @@ impl RuntimeZmq {
 #[async_trait]
 impl RuntimeClient for RuntimeZmq {
     async fn version(&self, _version: &str) -> Result<VersionResponse> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn status(&self, _verbose: bool) -> Result<StatusResponse> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn run_pod_sandbox(&self, _config: &PodSandboxConfig) -> Result<String> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn stop_pod_sandbox(&self, _pod_sandbox_id: &str) -> Result<()> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn remove_pod_sandbox(&self, _pod_sandbox_id: &str) -> Result<()> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn pod_sandbox_status(
@@ -475,14 +475,14 @@ impl RuntimeClient for RuntimeZmq {
         _pod_sandbox_id: &str,
         _verbose: bool,
     ) -> Result<PodSandboxStatusResponse> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn list_pod_sandbox(
         &self,
         _filter: Option<&PodSandboxFilter>,
     ) -> Result<Vec<PodSandbox>> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn create_container(
@@ -491,19 +491,19 @@ impl RuntimeClient for RuntimeZmq {
         _config: &ContainerConfig,
         _sandbox_config: &PodSandboxConfig,
     ) -> Result<String> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn start_container(&self, _container_id: &str) -> Result<()> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn stop_container(&self, _container_id: &str, _timeout: i64) -> Result<()> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn remove_container(&self, _container_id: &str) -> Result<()> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn container_status(
@@ -511,14 +511,14 @@ impl RuntimeClient for RuntimeZmq {
         _container_id: &str,
         _verbose: bool,
     ) -> Result<ContainerStatusResponse> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn list_containers(
         &self,
         _filter: Option<&ContainerFilter>,
     ) -> Result<Vec<Container>> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn exec_sync(
@@ -527,28 +527,28 @@ impl RuntimeClient for RuntimeZmq {
         _cmd: &[String],
         _timeout: i64,
     ) -> Result<ExecSyncResponse> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn pod_sandbox_stats(&self, _pod_sandbox_id: &str) -> Result<PodSandboxStats> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn list_pod_sandbox_stats(
         &self,
         _filter: Option<&PodSandboxStatsFilter>,
     ) -> Result<Vec<PodSandboxStats>> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn container_stats(&self, _container_id: &str) -> Result<ContainerStats> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn list_container_stats(
         &self,
         _filter: Option<&ContainerStatsFilter>,
     ) -> Result<Vec<ContainerStats>> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
     }
 }

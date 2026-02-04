@@ -319,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn test_temperature_scaling() {
+    fn test_temperature_scaling() -> Result<()> {
         let sampler = TensorSampler::new(Device::Cpu);
         let logits = create_test_logits();
 
@@ -331,19 +331,20 @@ mod tests {
             None,
             1.0,
             &[],
-        ).expect("test: sample token");
+        )?;
 
         // Should select token 4 (highest logit = 5.0)
         assert_eq!(token, 4);
+        Ok(())
     }
 
     #[test]
-    fn test_top_k_masking() {
+    fn test_top_k_masking() -> Result<()> {
         let sampler = TensorSampler::new(Device::Cpu);
         let logits = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 2.5, 1.5]);
 
-        let filtered = sampler.apply_top_k_to_logits(&logits, 2).expect("test: apply top-k");
-        let filtered_vec: Vec<f32> = Vec::try_from(filtered).expect("test: convert to vec");
+        let filtered = sampler.apply_top_k_to_logits(&logits, 2)?;
+        let filtered_vec: Vec<f32> = Vec::try_from(filtered)?;
 
         // Only top 2 logits should be kept (rest should be -inf)
         // Index 2 (3.0) and 3 (2.5) are highest
@@ -352,11 +353,12 @@ mod tests {
         assert!(filtered_vec[0].is_infinite() && filtered_vec[0] < 0.0); // -inf
         assert!(filtered_vec[1].is_infinite() && filtered_vec[1] < 0.0); // -inf
         assert!(filtered_vec[4].is_infinite() && filtered_vec[4] < 0.0); // -inf
+        Ok(())
     }
 
 
     #[test]
-    fn test_repetition_penalty() {
+    fn test_repetition_penalty() -> Result<()> {
         let sampler = TensorSampler::new(Device::Cpu);
         let logits = create_test_logits();
 
@@ -368,29 +370,30 @@ mod tests {
             None,
             10.0,  // High penalty
             &[4],  // Previous token was 4
-        ).expect("test: sample token with penalty");
+        )?;
 
         // Should NOT select token 4 despite it having highest logit
         assert_ne!(token, 4, "Repetition penalty not applied");
+        Ok(())
     }
 
     #[test]
-    fn test_repetition_penalty_values() {
+    fn test_repetition_penalty_values() -> Result<()> {
         // Verify that penalty actually modifies logit values
         let sampler = TensorSampler::new(Device::Cpu);
         let logits = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0]);
 
         // Save original values before penalty (shallow_clone shares storage, so save first)
-        let original_vec: Vec<f32> = Vec::try_from(&logits).expect("test: convert to vec");
+        let original_vec: Vec<f32> = Vec::try_from(&logits)?;
 
         // Apply penalty to token 4 (highest logit = 5.0)
         let penalized = sampler.apply_repetition_penalty(
             logits,  // Pass ownership directly
             2.0,  // 2x penalty
             &[4, 4, 4],  // Token 4 appeared 3 times (but penalty is uniform, not exponential)
-        ).expect("test: apply repetition penalty");
+        )?;
 
-        let penalized_vec: Vec<f32> = Vec::try_from(penalized).expect("test: convert to vec");
+        let penalized_vec: Vec<f32> = Vec::try_from(penalized)?;
 
         // Token 4 should be penalized with UNIFORM penalty (frequency ignored)
         // Original: 5.0, Penalized: 5.0 / 2.0 = 2.5
@@ -406,6 +409,7 @@ mod tests {
             assert_eq!(penalized_vec[i], original_vec[i],
                 "Token {} should be unchanged", i);
         }
+        Ok(())
     }
 
     #[test]

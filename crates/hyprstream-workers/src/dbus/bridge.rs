@@ -374,10 +374,10 @@ impl DbusBridgeService {
         // Call org.freedesktop.DBus.Properties.Get
         let properties_interface: InterfaceName = "org.freedesktop.DBus.Properties"
             .try_into()
-            .expect("valid interface name");
+            .map_err(|e| WorkerError::Internal(format!("Invalid interface name: {e}")))?;
         let get_method: MemberName = "Get"
             .try_into()
-            .expect("valid method name");
+            .map_err(|e| WorkerError::Internal(format!("Invalid method name: {e}")))?;
 
         let reply = conn
             .call_method(
@@ -474,10 +474,10 @@ impl DbusBridgeService {
         // Call org.freedesktop.DBus.Properties.Set
         let properties_interface: InterfaceName = "org.freedesktop.DBus.Properties"
             .try_into()
-            .expect("valid interface name");
+            .map_err(|e| WorkerError::Internal(format!("Invalid interface name: {e}")))?;
         let set_method: MemberName = "Set"
             .try_into()
-            .expect("valid method name");
+            .map_err(|e| WorkerError::Internal(format!("Invalid method name: {e}")))?;
 
         conn.call_method(
             Some(destination),
@@ -625,27 +625,26 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_bridge_creation() {
+    async fn test_bridge_creation() -> Result<()> {
         let config = DbusBridgeConfig::default();
         let bridge = DbusBridgeService::with_policy(
             config,
             Arc::new(AllowAllPolicy),
         )
-        .await
-        .unwrap();
+        .await?;
 
         assert_eq!(bridge.subscription_count(), 0);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_policy_denied() {
+    async fn test_policy_denied() -> Result<()> {
         let config = DbusBridgeConfig::default();
         let bridge = DbusBridgeService::with_policy(
             config,
             Arc::new(DenyAllPolicy),
         )
-        .await
-        .unwrap();
+        .await?;
 
         let request = DbusRequest::Call(DbusCallRequest::new(
             "org.freedesktop.Notifications",
@@ -662,17 +661,17 @@ mod tests {
             }
             _ => panic!("Expected error response"),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_subscribe_unsubscribe() {
+    async fn test_subscribe_unsubscribe() -> Result<()> {
         let config = DbusBridgeConfig::default();
         let bridge = DbusBridgeService::with_policy(
             config,
             Arc::new(AllowAllPolicy),
         )
-        .await
-        .unwrap();
+        .await?;
 
         // Subscribe
         let request = DbusRequest::Subscribe(DbusSubscribeRequest {
@@ -702,17 +701,17 @@ mod tests {
         }
 
         assert_eq!(bridge.subscription_count(), 0);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_cleanup_container() {
+    async fn test_cleanup_container() -> Result<()> {
         let config = DbusBridgeConfig::default();
         let bridge = DbusBridgeService::with_policy(
             config,
             Arc::new(AllowAllPolicy),
         )
-        .await
-        .unwrap();
+        .await?;
 
         // Create subscriptions for two containers
         for container in ["container-1", "container-2"] {
@@ -732,6 +731,7 @@ mod tests {
         bridge.cleanup_container("container-1");
 
         assert_eq!(bridge.subscription_count(), 1);
+        Ok(())
     }
 }
 

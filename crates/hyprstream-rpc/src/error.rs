@@ -40,6 +40,10 @@ pub enum EnvelopeError {
     /// Replay attack detected (duplicate nonce or old timestamp).
     #[error("replay attack detected: {0}")]
     ReplayAttack(String),
+
+    /// Invalid topic format (not valid hex).
+    #[error("invalid topic format: expected valid hex string")]
+    InvalidTopicFormat,
 }
 
 /// Result type alias for envelope operations.

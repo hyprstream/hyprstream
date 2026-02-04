@@ -105,44 +105,48 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_with_duckdb_file() {
-        let temp = TempDir::new().expect("test: create temp dir");
+    fn test_detect_with_duckdb_file() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
         let db_path = temp.path().join("metrics.duckdb");
-        fs::write(&db_path, valid_duckdb_data()).expect("test: write duckdb");
+        fs::write(&db_path, valid_duckdb_data())?;
 
         let archetype = DuckDbArchetype;
         assert!(archetype.detect(temp.path()));
+        Ok(())
     }
 
     #[test]
-    fn test_detect_with_duckdb_in_subdir() {
-        let temp = TempDir::new().expect("test: create temp dir");
+    fn test_detect_with_duckdb_in_subdir() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
         let db_dir = temp.path().join("db");
-        fs::create_dir(&db_dir).expect("test: create subdir");
+        fs::create_dir(&db_dir)?;
         let db_path = db_dir.join("metrics.duckdb");
-        fs::write(&db_path, valid_duckdb_data()).expect("test: write duckdb");
+        fs::write(&db_path, valid_duckdb_data())?;
 
         let archetype = DuckDbArchetype;
         assert!(archetype.detect(temp.path()));
+        Ok(())
     }
 
     #[test]
-    fn test_no_detect_empty_dir() {
-        let temp = TempDir::new().expect("test: create temp dir");
+    fn test_no_detect_empty_dir() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
 
         let archetype = DuckDbArchetype;
         assert!(!archetype.detect(temp.path()));
+        Ok(())
     }
 
     #[test]
-    fn test_no_detect_small_file() {
-        let temp = TempDir::new().expect("test: create temp dir");
+    fn test_no_detect_small_file() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
         // Small file should not be detected (potential spoof)
         let db_path = temp.path().join("metrics.duckdb");
-        fs::write(&db_path, "dummy").expect("test: write small file");
+        fs::write(&db_path, "dummy")?;
 
         let archetype = DuckDbArchetype;
         assert!(!archetype.detect(temp.path()));
+        Ok(())
     }
 
     #[test]

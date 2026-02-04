@@ -5,6 +5,8 @@
 //! - `training infer` - Inference with TTT (dirty writes)
 //! - `training batch` - Batch training with checkpoints
 //! - `training checkpoint` - Commit dirty adapter changes
+// CLI handlers intentionally print to stdout/stderr for user interaction
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use anyhow::{bail, Result};
 use tracing::{info, warn};
@@ -13,8 +15,8 @@ use crate::cli::commands::KVQuantArg;
 use crate::config::{HyprstreamTrainingConfig, TrainingMode, TTTTrainingConfig};
 use crate::runtime::model_config::ModelConfig;
 use crate::runtime::template_engine::ChatMessage;
-use crate::services::{InferenceZmqClient, PolicyZmqClient, INFERENCE_ENDPOINT};
-use crate::storage::{ModelRef, ModelStorage};
+use crate::services::{InferenceZmqClient, PolicyZmqClient, RegistryClient, INFERENCE_ENDPOINT};
+use crate::storage::ModelRef;
 use hyprstream_rpc::{RequestIdentity, SigningKey, VerifyingKey};
 use std::path::PathBuf;
 
@@ -22,7 +24,7 @@ use std::path::PathBuf;
 ///
 /// Initializes a LoRA adapter for training. Optionally creates a new branch/worktree.
 pub async fn handle_training_init(
-    storage: &ModelStorage,
+    registry: &dyn RegistryClient,
     model_ref_str: &str,
     branch_name: Option<String>,
     adapter_name: Option<String>,
@@ -33,6 +35,8 @@ pub async fn handle_training_init(
     learning_rate: f32,
 ) -> Result<()> {
     let model_ref = ModelRef::parse(model_ref_str)?;
+    let repo_client = registry.repo(&model_ref.model).await
+        .map_err(|e| anyhow::anyhow!("Model '{}' not found: {}", model_ref.model, e))?;
 
     // If branch specified, create isolated training environment
     if let Some(new_branch) = branch_name {
@@ -44,17 +48,19 @@ pub async fn handle_training_init(
 
         // Create branch from model_ref's git_ref
         let from_ref = model_ref.git_ref.to_ref_string();
-        storage
-            .create_branch(&model_ref, &new_branch, from_ref.as_deref())
-            .await?;
+        repo_client
+            .create_branch(&new_branch, from_ref.as_deref())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to create branch: {}", e))?;
         println!(
             "✓ Created branch {} from {}",
             new_branch,
             model_ref.git_ref.display_name()
         );
 
-        // Create worktree for new branch
-        let worktree_path = storage.create_worktree(&model_ref, &new_branch).await?;
+        // Create worktree for new branch (server determines path)
+        let worktree_path = repo_client.ensure_worktree(&new_branch).await
+            .map_err(|e| anyhow::anyhow!("Failed to create worktree: {}", e))?;
         println!("✓ Created worktree at {}", worktree_path.display());
 
         // Initialize adapter in worktree
@@ -88,8 +94,8 @@ pub async fn handle_training_init(
     let branch_name = match &model_ref.git_ref {
         git2db::GitRef::Branch(name) => name.clone(),
         git2db::GitRef::DefaultBranch => {
-            let base_ref = ModelRef::new(model_ref.model.clone());
-            storage.get_default_branch(&base_ref).await?
+            repo_client.default_branch().await
+                .map_err(|e| anyhow::anyhow!("Failed to get default branch: {}", e))?
         }
         _ => {
             bail!(
@@ -99,18 +105,18 @@ pub async fn handle_training_init(
         }
     };
 
-    let model_path = storage
-        .get_worktree_path(&model_ref, &branch_name)
+    let model_path = repo_client
+        .worktree_path(&branch_name)
         .await
-        .map_err(|e| {
+        .map_err(|e| anyhow::anyhow!("Failed to get worktree path: {}", e))?
+        .ok_or_else(|| {
             anyhow::anyhow!(
                 "Worktree '{}' does not exist for model '{}'. Create with:\n  \
-                 hyprstream training init {} --branch {}\nError: {}",
+                 hyprstream training init {} --branch {}",
                 branch_name,
                 model_ref.model,
                 model_ref.model,
-                branch_name,
-                e
+                branch_name
             )
         })?;
 
@@ -276,7 +282,7 @@ fn save_training_config(
 ///
 /// Runs inference with TTT enabled, making dirty writes to adapter weights.
 pub async fn handle_training_infer(
-    storage: &ModelStorage,
+    registry: &dyn RegistryClient,
     model_ref_str: &str,
     prompt: &str,
     image_path: Option<String>,
@@ -302,12 +308,12 @@ pub async fn handle_training_infer(
 
     // Parse model reference and get path
     let model_ref = ModelRef::parse(model_ref_str)?;
-    let storage_paths = crate::storage::StoragePaths::new()?;
-    let models_dir = storage_paths.models_dir()?;
-    let model_path = match storage.get_model_path(&model_ref).await {
-        Ok(path) => path,
-        Err(_) => models_dir.join(&model_ref.model),
+    let branch = match &model_ref.git_ref {
+        git2db::GitRef::Branch(name) => Some(name.as_str()),
+        _ => None,
     };
+    let model_path = registry.model_path(&model_ref.model, branch).await
+        .map_err(|e| anyhow::anyhow!("Model '{}' not found: {}", model_ref, e))?;
 
     if !model_path.exists() {
         bail!("Model '{}' not found. Use 'hyprstream list' to see available models", model_ref.model);
@@ -427,7 +433,7 @@ fn ensure_ttt_enabled(model_path: &std::path::Path) -> Result<()> {
 /// Batch training: starts InferenceService once and processes all files with TTT.
 /// Each file's content is sent as a generation request, triggering TTT adaptation.
 pub async fn handle_training_batch(
-    storage: &ModelStorage,
+    registry: &dyn RegistryClient,
     model_ref_str: &str,
     input_files: Vec<String>,
     input_dir: Option<PathBuf>,
@@ -456,27 +462,23 @@ pub async fn handle_training_batch(
     );
 
     let model_ref = ModelRef::parse(model_ref_str)?;
-    let storage_paths = crate::storage::StoragePaths::new()?;
-    let models_dir = storage_paths.models_dir()?;
-
-    let model_path = match storage.get_model_path(&model_ref).await {
-        Ok(path) => path,
-        Err(_) => {
-            let base_path = models_dir.join(&model_ref.model);
-            if !base_path.exists() {
-                bail!("Model '{}' not found", model_ref.model);
-            }
+    let branch = match &model_ref.git_ref {
+        git2db::GitRef::Branch(name) => Some(name.as_str()),
+        _ => None,
+    };
+    let model_path = registry.model_path(&model_ref.model, branch).await
+        .map_err(|e| {
             let branch_name = model_ref.git_ref.to_string();
-            bail!(
+            anyhow::anyhow!(
                 "Worktree '{}' not found for model {}.\n\
-                 Run: hyprstream training init {} --branch {}",
+                 Run: hyprstream training init {} --branch {}\nError: {}",
                 branch_name,
                 model_ref.model,
                 model_ref.model,
-                branch_name
-            );
-        }
-    };
+                branch_name,
+                e
+            )
+        })?;
 
     // Collect input files
     let mut files: Vec<PathBuf> = Vec::new();
@@ -652,7 +654,7 @@ pub async fn handle_training_batch(
 ///
 /// Commits dirty adapter changes to git.
 pub async fn handle_training_checkpoint(
-    storage: &ModelStorage,
+    registry: &dyn RegistryClient,
     model_ref_str: &str,
     message: Option<String>,
     push: bool,
@@ -661,7 +663,12 @@ pub async fn handle_training_checkpoint(
     use crate::storage::AdapterManager;
 
     let model_ref = ModelRef::parse(model_ref_str)?;
-    let model_path = storage.get_model_path(&model_ref).await?;
+    let branch = match &model_ref.git_ref {
+        git2db::GitRef::Branch(name) => Some(name.as_str()),
+        _ => None,
+    };
+    let model_path = registry.model_path(&model_ref.model, branch).await
+        .map_err(|e| anyhow::anyhow!("Model '{}' not found: {}", model_ref, e))?;
 
     let adapter_manager = AdapterManager::new(&model_path);
     let adapters = adapter_manager.list_adapters()?;
@@ -671,7 +678,7 @@ pub async fn handle_training_checkpoint(
     }
 
     // Check for dirty files using service layer
-    let repo_client = storage.registry().repo(&model_ref.model).await
+    let repo_client = registry.repo(&model_ref.model).await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
 
     let status = repo_client.status().await

@@ -856,13 +856,13 @@ mod tests {
     }
 
     #[test]
-    fn test_lfs_pointer_parsing() {
+    fn test_lfs_pointer_parsing() -> crate::Git2DBResult<()> {
         let content = r#"version https://git-lfs.github.com/spec/v1
 oid sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890
 size 1024
 "#;
 
-        let pointer = LfsPointer::parse(content).unwrap();
+        let pointer = LfsPointer::parse(content)?;
 
         assert_eq!(pointer.version(), "https://git-lfs.github.com/spec/v1");
         assert_eq!(pointer.hash_method(), "sha256");
@@ -871,10 +871,11 @@ size 1024
             "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
         );
         assert_eq!(pointer.size(), 1024);
+        Ok(())
     }
 
     #[test]
-    fn test_lfs_pointer_extensions() {
+    fn test_lfs_pointer_extensions() -> crate::Git2DBResult<()> {
         let content = r#"version https://git-lfs.github.com/spec/v1
 oid sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890
 size 1024
@@ -882,10 +883,11 @@ ext-0-custom value1
 ext-1-another value2
 "#;
 
-        let pointer = LfsPointer::parse(content).unwrap();
+        let pointer = LfsPointer::parse(content)?;
 
         assert_eq!(pointer.extensions().get("ext-0-custom"), Some(&"value1".to_owned()));
         assert_eq!(pointer.extensions().get("ext-1-another"), Some(&"value2".to_owned()));
+        Ok(())
     }
 
     #[test]
@@ -922,17 +924,18 @@ size 1024
     }
 
     #[test]
-    fn test_lfs_pointer_display() {
+    fn test_lfs_pointer_display() -> crate::Git2DBResult<()> {
         let content = r#"version https://git-lfs.github.com/spec/v1
 oid sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890
 size 1024
 "#;
 
-        let pointer = LfsPointer::parse(content).unwrap();
+        let pointer = LfsPointer::parse(content)?;
         let display = pointer.to_string();
 
         assert!(display.contains("version https://git-lfs.github.com/spec/v1"));
         assert!(display.contains("oid sha256:"));
         assert!(display.contains("size 1024"));
+        Ok(())
     }
 }

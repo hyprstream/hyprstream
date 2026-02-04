@@ -228,7 +228,7 @@ impl XetConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     // Mutex to serialize tests that modify environment variables
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
@@ -241,7 +241,7 @@ mod tests {
 
     #[test]
     fn test_default_config_disabled_without_env() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         clear_xet_env_vars();
 
         let config = XetConfig::default();
@@ -272,23 +272,27 @@ mod tests {
 
     #[test]
     fn test_for_url_huggingface() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         clear_xet_env_vars();
 
         // HuggingFace URLs should return huggingface config
         let config = XetConfig::for_url("https://huggingface.co/Qwen/Qwen3-0.6B");
         assert!(config.is_some());
-        assert!(config.unwrap().is_huggingface());
+        if let Some(cfg) = config {
+            assert!(cfg.is_huggingface());
+        }
 
         // Short hf.co URLs should also work
         let config = XetConfig::for_url("https://hf.co/Qwen/Qwen3-0.6B");
         assert!(config.is_some());
-        assert!(config.unwrap().is_huggingface());
+        if let Some(cfg) = config {
+            assert!(cfg.is_huggingface());
+        }
     }
 
     #[test]
     fn test_for_url_unknown() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         clear_xet_env_vars();
 
         // Unknown URLs should return None
@@ -298,7 +302,7 @@ mod tests {
 
     #[test]
     fn test_for_url_env_override() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         clear_xet_env_vars();
 
         // Set env var - should take priority over URL pattern
@@ -306,7 +310,9 @@ mod tests {
 
         let config = XetConfig::for_url("https://github.com/any/repo");
         assert!(config.is_some());
-        assert_eq!(config.unwrap().endpoint, "https://custom.xet.server");
+        if let Some(cfg) = config {
+            assert_eq!(cfg.endpoint, "https://custom.xet.server");
+        }
 
         // Clean up
         std::env::remove_var("XETHUB_ENDPOINT");
@@ -314,13 +320,15 @@ mod tests {
 
     #[test]
     fn test_for_url_with_trailing_slash() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.lock();
         clear_xet_env_vars();
 
         // URLs with trailing slash should still match
         let config = XetConfig::for_url("https://huggingface.co/Qwen/Model/");
         assert!(config.is_some());
-        assert!(config.unwrap().is_huggingface());
+        if let Some(cfg) = config {
+            assert!(cfg.is_huggingface());
+        }
     }
 
     #[test]

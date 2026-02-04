@@ -77,9 +77,19 @@ struct StreamInfo {
   serverPubkey @2 :Data;  # Server's ephemeral Ristretto255 public key (32 bytes) for DH
 }
 
-# Load model request
+# KV cache quantization type
+enum KVQuantType {
+  none @0;      # No quantization (full precision)
+  int8 @1;      # 8-bit integer quantization
+  nf4 @2;       # 4-bit NormalFloat quantization
+  fp4 @3;       # 4-bit FloatingPoint quantization
+}
+
+# Load model request with optional runtime configuration
 struct LoadModelRequest {
-  modelRef @0 :Text;  # e.g., "qwen3-small:main"
+  modelRef @0 :Text;       # e.g., "qwen3-small:main"
+  maxContext @1 :UInt32;   # Maximum context length (0 = use default)
+  kvQuant @2 :KVQuantType; # KV cache quantization type
 }
 
 # Unload model request

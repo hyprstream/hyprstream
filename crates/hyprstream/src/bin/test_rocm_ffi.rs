@@ -1,4 +1,7 @@
 // Direct FFI test bypassing tch-rs wrappers
+// Test binary intentionally prints diagnostic output
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use std::os::raw::c_int;
 
 #[link(name = "torch")]

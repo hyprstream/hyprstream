@@ -97,7 +97,8 @@ impl GitRemoteHelper {
                     match self.handle_command(line).await {
                         Ok(response) => {
                             if let Some(resp) = response {
-                                print!("{resp}");
+                                // Git remote helper protocol: write response to stdout
+                                write!(stdout, "{resp}").map_err(Error::from)?;
                                 stdout.flush().map_err(Error::from)?;
                             }
                         }
@@ -156,7 +157,8 @@ impl GitRemoteHelper {
                 }
                 "push" => {
                     let result = self.handle_push(&parts[1..]).await?;
-                    print!("{result}");
+                    // Git remote helper protocol: write push result to stdout
+                    write!(io::stdout(), "{result}").map_err(Error::from)?;
                 }
                 _ => {
                     return Err(Error::other(format!("Invalid batch command: {}", parts[0])));
@@ -667,16 +669,17 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
-    async fn test_git_remote_helper_creation() {
-        let helper = GitRemoteHelper::new().await.unwrap();
+    async fn test_git_remote_helper_creation() -> crate::error::Result<()> {
+        let helper = GitRemoteHelper::new().await?;
         assert_eq!(helper.capabilities.len(), 5);
         assert!(helper.capabilities.contains(&"connect".to_owned()));
         assert!(helper.capabilities.contains(&"list".to_owned()));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_capabilities_command() {
-        let helper = GitRemoteHelper::new().await.unwrap();
+    async fn test_capabilities_command() -> crate::error::Result<()> {
+        let helper = GitRemoteHelper::new().await?;
         let response = helper.handle_capabilities();
 
         assert!(response.contains("connect"));
@@ -684,26 +687,29 @@ mod tests {
         assert!(response.contains("fetch"));
         assert!(response.contains("push"));
         assert!(response.ends_with("\n\n"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_connect_command() {
-        let mut helper = GitRemoteHelper::new().await.unwrap();
+    async fn test_connect_command() -> crate::error::Result<()> {
+        let mut helper = GitRemoteHelper::new().await?;
 
         // Set remote URL first (as would be done during argument parsing)
-        helper.remote_url = Some(GitTorrentUrl::parse("gittorrent://example.com/user/repo").unwrap());
+        helper.remote_url = Some(GitTorrentUrl::parse("gittorrent://example.com/user/repo")?);
 
         let result = helper.handle_connect(&["git-upload-pack"]).await;
         assert!(result.is_ok());
         assert!(helper.remote_url.is_some());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_local_repo_setup() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut helper = GitRemoteHelper::new().await.unwrap();
+    async fn test_local_repo_setup() -> crate::error::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let mut helper = GitRemoteHelper::new().await?;
 
-        helper.set_local_repo(temp_dir.path().to_path_buf()).unwrap();
+        helper.set_local_repo(temp_dir.path().to_path_buf())?;
         assert!(helper.local_repo.is_some());
+        Ok(())
     }
 }

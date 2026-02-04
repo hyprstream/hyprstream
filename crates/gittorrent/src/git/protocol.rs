@@ -119,16 +119,16 @@ mod tests {
     }
 
     #[test]
-    fn test_git_remote_helper() {
+    fn test_git_remote_helper() -> crate::error::Result<()> {
         // Test with SHA1 hashes (40 hex chars) - current git format
         let refs = vec![
             GitRef {
                 name: "refs/heads/main".to_owned(),
-                hash: GitHash::from_hex("0123456789abcdef0123456789abcdef01234567").unwrap(),
+                hash: GitHash::from_hex("0123456789abcdef0123456789abcdef01234567")?,
             },
             GitRef {
                 name: "HEAD".to_owned(),
-                hash: GitHash::from_hex("0123456789abcdef0123456789abcdef01234567").unwrap(),
+                hash: GitHash::from_hex("0123456789abcdef0123456789abcdef01234567")?,
             },
         ];
 
@@ -146,5 +146,6 @@ mod tests {
         // Test get_ref
         assert!(helper.get_ref("refs/heads/main").is_some());
         assert!(helper.get_ref("nonexistent").is_none());
+        Ok(())
     }
 }

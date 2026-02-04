@@ -36,16 +36,17 @@ mod tests {
     use crate::events::endpoints;
 
     #[tokio::test]
-    async fn test_proxy_service() {
+    async fn test_proxy_service() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let ctx = Arc::new(zmq::Context::new());
         let (pub_t, sub_t) = endpoints::inproc_transports();
 
         let proxy = ProxyService::new("events-test", ctx, pub_t, sub_t);
         let spawner = ServiceSpawner::threaded();
-        let mut service = spawner.spawn(proxy).await.expect("Failed to spawn proxy");
+        let mut service = spawner.spawn(proxy).await?;
 
         assert!(service.is_running());
 
-        service.stop().await.expect("Failed to stop proxy");
+        service.stop().await?;
+        Ok(())
     }
 }

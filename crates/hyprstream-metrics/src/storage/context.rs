@@ -67,7 +67,9 @@ pub struct ContextRecord {
 impl ContextRecord {
     /// Convert to Arrow RecordBatch for storage
     pub fn to_record_batch(&self) -> Result<RecordBatch, Status> {
-        let embedding_dim = self.embedding.len() as i32;
+        // Embedding dimension is typically small (< 10000), safe conversion
+        let embedding_dim = i32::try_from(self.embedding.len())
+            .map_err(|_| Status::invalid_argument("Embedding dimension too large"))?;
         let schema = Arc::new(context_schema(embedding_dim));
 
         // Build the fixed-size list array for embedding
@@ -103,7 +105,9 @@ impl ContextRecord {
             return Err(Status::invalid_argument("Cannot create batch from empty records"));
         }
 
-        let embedding_dim = records[0].embedding.len() as i32;
+        // Embedding dimension is typically small (< 10000), safe conversion
+        let embedding_dim = i32::try_from(records[0].embedding.len())
+            .map_err(|_| Status::invalid_argument("Embedding dimension too large"))?;
         let schema = Arc::new(context_schema(embedding_dim));
 
         // Build arrays
@@ -388,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn test_context_record_to_batch() {
+    fn test_context_record_to_batch() -> Result<(), Status> {
         let record = ContextRecord {
             id: "test-id".to_owned(),
             conversation_id: "conv-123".to_owned(),
@@ -400,13 +404,14 @@ mod tests {
             token_count: Some(100),
         };
 
-        let batch = record.to_record_batch().unwrap();
+        let batch = record.to_record_batch()?;
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(batch.num_columns(), 8);
+        Ok(())
     }
 
     #[test]
-    fn test_batch_records() {
+    fn test_batch_records() -> Result<(), Status> {
         let records = vec![
             ContextRecord {
                 id: "id-1".to_owned(),
@@ -430,7 +435,8 @@ mod tests {
             },
         ];
 
-        let batch = ContextRecord::batch_to_record_batch(&records).unwrap();
+        let batch = ContextRecord::batch_to_record_batch(&records)?;
         assert_eq!(batch.num_rows(), 2);
+        Ok(())
     }
 }

@@ -906,7 +906,7 @@ impl GemmaModel {
                 arr.iter()
                     .map(|v| match v.as_str().unwrap_or("") {
                         "sliding_attention" => "local".to_owned(),
-                        "full_attention" => "global".to_owned(),
+                        // "full_attention" and other values default to global
                         _ => "global".to_owned(),
                     })
                     .collect()

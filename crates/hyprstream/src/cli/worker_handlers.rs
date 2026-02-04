@@ -1,6 +1,8 @@
 //! CLI handlers for worker management commands
 //!
 //! Provides handler functions for sandbox (Kata VM), container, and image operations.
+// CLI handlers intentionally print to stdout/stderr for user interaction
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use anyhow::{bail, Result};
 use std::io::{self, Write};
@@ -639,14 +641,17 @@ pub async fn handle_worker_terminal(
 
 /// Parse detach key sequence string to byte
 fn parse_detach_keys(keys: &str) -> u8 {
+    // Default detach key is Ctrl-] (0x1D, ASCII GS)
+    const DEFAULT_DETACH_KEY: u8 = 0x1D;
+
     match keys.to_lowercase().as_str() {
-        "ctrl-]" | "ctrl+]" => 0x1D, // ASCII GS (Group Separator)
         "ctrl-a" | "ctrl+a" => 0x01,
         "ctrl-b" | "ctrl+b" => 0x02,
         "ctrl-c" | "ctrl+c" => 0x03,
         "ctrl-d" | "ctrl+d" => 0x04,
         "ctrl-q" | "ctrl+q" => 0x11,
-        _ => 0x1D, // Default to Ctrl-]
+        // "ctrl-]", "ctrl+]", and unrecognized keys default to Ctrl-]
+        _ => DEFAULT_DETACH_KEY,
     }
 }
 

@@ -91,14 +91,11 @@ pub fn safe_zeros(shape: &[i64], kind_device: (tch::Kind, Device)) -> Result<Ten
 pub fn estimate_tensor_size_mb(shape: &[i64], dtype: tch::Kind) -> f64 {
     let num_elements: i64 = shape.iter().product();
     let bytes_per_element = match dtype {
-        tch::Kind::Float => 4,
-        tch::Kind::Double => 8,
-        tch::Kind::Half | tch::Kind::BFloat16 => 2,
+        tch::Kind::Double | tch::Kind::Int64 => 8,
+        tch::Kind::Half | tch::Kind::BFloat16 | tch::Kind::Int16 => 2,
         tch::Kind::Int8 | tch::Kind::Uint8 => 1,
-        tch::Kind::Int16 => 2,
-        tch::Kind::Int => 4,
-        tch::Kind::Int64 => 8,
-        _ => 4, // Default to 4 bytes
+        // Float, Int, and all other types default to 4 bytes
+        _ => 4,
     };
 
     (num_elements * bytes_per_element) as f64 / (1024.0 * 1024.0)

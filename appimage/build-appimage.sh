@@ -148,8 +148,8 @@ create_appimage() {
     mkdir -p "$appdir/usr/bin" "$appdir/usr/lib/libtorch/lib"
 
     cp "$BUILD_DIR/bin/hyprstream-$variant" "$appdir/usr/bin/hyprstream"
-    # Copy only shared libraries (skip static libs, headers, cmake)
-    cp "$LIBTORCH_CACHE_DIR/$variant/libtorch/lib/"*.so* "$appdir/usr/lib/libtorch/lib/"
+    # Copy entire lib directory (includes subdirs with Tensile libraries for ROCm)
+    cp -r "$LIBTORCH_CACHE_DIR/$variant/libtorch/lib/"* "$appdir/usr/lib/libtorch/lib/"
 
     sed "s/HYPRSTREAM_VARIANT:-cpu/HYPRSTREAM_VARIANT:-$variant/" \
         "$SCRIPT_DIR/AppRun-single" > "$appdir/AppRun"
@@ -179,11 +179,11 @@ create_universal_appimage() {
         if [[ -f "$staging/bin/hyprstream-$variant" ]]; then
             cp "$staging/bin/hyprstream-$variant" "$appdir/usr/bin/"
             mkdir -p "$appdir/usr/lib/$variant/libtorch/lib"
-            cp "$staging/lib/$variant/libtorch/lib/"*.so* "$appdir/usr/lib/$variant/libtorch/lib/"
+            cp -r "$staging/lib/$variant/libtorch/lib/"* "$appdir/usr/lib/$variant/libtorch/lib/"
         else
             cp "$BUILD_DIR/bin/hyprstream-$variant" "$appdir/usr/bin/"
             mkdir -p "$appdir/usr/lib/$variant/libtorch/lib"
-            cp "$LIBTORCH_CACHE_DIR/$variant/libtorch/lib/"*.so* "$appdir/usr/lib/$variant/libtorch/lib/"
+            cp -r "$LIBTORCH_CACHE_DIR/$variant/libtorch/lib/"* "$appdir/usr/lib/$variant/libtorch/lib/"
         fi
     done
 
@@ -205,7 +205,6 @@ cmd_build() {
     log_info "Building hyprstream AppImage"
     log_info "Version: $VERSION"
     log_info "Variant: $variant"
-    df -h | grep -E '^/dev|Filesystem'
 
     ensure_appimagetool
 
@@ -251,9 +250,9 @@ cmd_stage() {
     mkdir -p "$staging/bin"
     cp "$BUILD_DIR/bin/hyprstream-$variant" "$staging/bin/"
 
-    # Stage only shared libraries (much smaller than full libtorch)
+    # Stage entire lib directory (includes subdirs with Tensile libraries for ROCm)
     mkdir -p "$staging/lib/$variant/libtorch/lib"
-    cp "$LIBTORCH_CACHE_DIR/$variant/libtorch/lib/"*.so* "$staging/lib/$variant/libtorch/lib/"
+    cp -r "$LIBTORCH_CACHE_DIR/$variant/libtorch/lib/"* "$staging/lib/$variant/libtorch/lib/"
 
     log_success "Staged $variant"
     du -sh "$staging"
@@ -276,7 +275,6 @@ cmd_clean() {
         rm -rf "$BUILD_DIR/hyprstream-$variant.AppDir"
         log_success "Cleaned $variant"
     fi
-    df -h | grep -E '^/dev|Filesystem'
 }
 
 # Main

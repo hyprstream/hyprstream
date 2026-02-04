@@ -1,0 +1,10 @@
+# Clippy configuration for hyprstream workspace
+
+# Disallow std::sync locks - use parking_lot instead for:
+# - No poison (more resilient)
+# - Cleaner API (no Result wrapper)
+# - Better performance
+disallowed-types = [
+    { path = "std::sync::Mutex", reason = "Use parking_lot::Mutex instead - no poison, cleaner API" },
+    { path = "std::sync::RwLock", reason = "Use parking_lot::RwLock instead - no poison, cleaner API" },
+]

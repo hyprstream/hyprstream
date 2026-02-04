@@ -1003,3 +1003,4 @@ pub fn service_factory(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     expanded.into()
 }
+

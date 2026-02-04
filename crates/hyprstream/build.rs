@@ -26,7 +26,10 @@ fn main() {
         return;
     }
 
-    let libtorch_path = env::var("LIBTORCH").unwrap();
+    let libtorch_path = match env::var("LIBTORCH") {
+        Ok(path) => path,
+        Err(_) => return, // Early return, should not happen due to check above
+    };
 
     // Validate libtorch exists
     let libtorch_dir = Path::new(&libtorch_path);
@@ -53,51 +56,61 @@ fn compile_capnp_schemas() {
     // Compile events schema
     let events_schema = schema_dir.join("events.capnp");
     if events_schema.exists() {
-        capnpc::CompilerCommand::new()
+        if let Err(e) = capnpc::CompilerCommand::new()
             .src_prefix("schema")
             .file(&events_schema)
             .run()
-            .expect("failed to compile events.capnp");
+        {
+            panic!("failed to compile events.capnp: {e}");
+        }
     }
 
     // Compile inference schema
     let inference_schema = schema_dir.join("inference.capnp");
     if inference_schema.exists() {
-        capnpc::CompilerCommand::new()
+        if let Err(e) = capnpc::CompilerCommand::new()
             .src_prefix("schema")
             .file(&inference_schema)
             .run()
-            .expect("failed to compile inference.capnp");
+        {
+            panic!("failed to compile inference.capnp: {e}");
+        }
     }
 
     // Compile registry schema
     let registry_schema = schema_dir.join("registry.capnp");
     if registry_schema.exists() {
-        capnpc::CompilerCommand::new()
+        if let Err(e) = capnpc::CompilerCommand::new()
             .src_prefix("schema")
             .file(&registry_schema)
             .run()
-            .expect("failed to compile registry.capnp");
+        {
+            panic!("failed to compile registry.capnp: {e}");
+        }
     }
 
     // Compile policy schema
     let policy_schema = schema_dir.join("policy.capnp");
     if policy_schema.exists() {
-        capnpc::CompilerCommand::new()
+        if let Err(e) = capnpc::CompilerCommand::new()
             .src_prefix("schema")
             .file(&policy_schema)
             .run()
-            .expect("failed to compile policy.capnp");
+        {
+            panic!("failed to compile policy.capnp: {e}");
+        }
     }
 
     // Compile model schema
     let model_schema = schema_dir.join("model.capnp");
     if model_schema.exists() {
-        capnpc::CompilerCommand::new()
+        if let Err(e) = capnpc::CompilerCommand::new()
             .src_prefix("schema")
             .file(&model_schema)
             .run()
-            .expect("failed to compile model.capnp");
+        {
+            panic!("failed to compile model.capnp: {e}");
+        }
     }
 }
 
@@ -178,7 +191,6 @@ fn sanitize_git_ref(ref_name: &str) -> String {
         .chars()
         .map(|c| match c {
             'a'..='z' | '0'..='9' | '-' | '_' => c,
-            '/' | '.' | ' ' => '-',
             _ => '-',
         })
         .collect();

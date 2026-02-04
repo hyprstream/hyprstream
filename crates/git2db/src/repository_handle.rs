@@ -911,8 +911,7 @@ impl<'a> RepositoryHandle<'a> {
             ));
         }
 
-        tracing::info!("Fetching LFS files via git-lfs (this may take a while for large files)...");
-        println!("📥 Downloading LFS files... (this may take a while for large models)");
+        tracing::info!("📥 Downloading LFS files... (this may take a while for large models)");
 
         let mut child = Command::new("git")
             .args(["lfs", "pull"])

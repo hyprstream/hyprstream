@@ -76,14 +76,11 @@ impl TableManager {
         // Verify source table exists
         {
             let tables = self.tables.read().await;
-            if !tables.contains_key(&source_table) {
-                return Err(Status::not_found(format!(
-                    "Source table {source_table} not found"
-                )));
-            }
+            let schema = tables.get(&source_table).ok_or_else(|| {
+                Status::not_found(format!("Source table {source_table} not found"))
+            })?;
 
             // Verify aggregate columns exist in source table
-            let schema = tables.get(&source_table).unwrap();
             for col in &aggregate_columns {
                 if !schema.fields().iter().any(|f| f.name() == col) {
                     return Err(Status::invalid_argument(format!(

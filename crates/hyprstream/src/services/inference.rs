@@ -46,7 +46,7 @@
 
 use crate::auth::Operation;
 use crate::services::PolicyZmqClient;
-use crate::config::{FinishReason, GenerationRequest, GenerationResult, ModelInfo, StreamingConfig, TrainingMode};
+use crate::config::{FinishReason, GenerationRequest, GenerationResult, ModelInfo, TrainingMode};
 use crate::inference_capnp;
 use anyhow::bail;
 use crate::lora::LoRAConfig;
@@ -61,9 +61,11 @@ use anyhow::{anyhow, Result};
 use capnp::message::{Builder, ReaderOptions};
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::serialize_message;
+use hyprstream_rpc::StreamChannel;
 use capnp::serialize;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use parking_lot::RwLock;
 use tmq::{reply, Multipart};
 use tokio::runtime::Handle;
 use tokenizers::Tokenizer;
@@ -74,14 +76,15 @@ use tracing::{debug, error, info, trace, warn};
 /// This solves the streaming deadlock where the service waits for subscription
 /// before returning the response, but the client can't subscribe without
 /// the stream_id from the response.
+///
+/// Wraps `StreamContext` from hyprstream-rpc with inference-specific data.
 struct PendingStream {
+    /// Stream context with DH-derived keys (from hyprstream-rpc)
+    stream_ctx: hyprstream_rpc::StreamContext,
+    /// Generation request to execute
     request: GenerationRequest,
-    stream_id: String,
-    prompt: String, // For training collection (stored as String for simplicity)
-    /// DH-derived topic for ZMQ routing (64 hex chars)
-    topic: String,
-    /// DH-derived HMAC key for authenticated stream chunks
-    mac_key: [u8; 32],
+    /// Prompt text for TTT training collection
+    prompt: String,
 }
 
 /// Default endpoint for the inference service
@@ -120,10 +123,9 @@ pub struct InferenceService {
     /// Runtime handle for async operations (reused instead of creating new runtimes)
     #[allow(dead_code)] // Reserved for future async operations
     runtime_handle: Handle,
-    /// Single PUSH socket for streaming (connects to StreamService's PULL, initialized in run_service_loop)
-    /// PUSH buffers at HWM instead of dropping - solves the subscriber race condition.
-    /// Note: Field name retained as xpub_socket for compatibility with execute_stream
-    xpub_socket: RwLock<Option<zmq::Socket>>,
+    /// Stream channel for streaming generation (connects to StreamService)
+    /// Handles DH key exchange, pre-authorization, and publishing.
+    stream_channel: Option<StreamChannel>,
     /// Server's Ed25519 verifying key for signature verification
     server_pubkey: VerifyingKey,
     /// Service signing key for stream registration (generated at init)
@@ -250,26 +252,7 @@ impl InferenceService {
         dealer.connect(&callback_endpoint)?;
         info!("Connected DEALER to {}", callback_endpoint);
 
-        // Create PUSH socket for streaming (connects to StreamService's PULL)
-        // PUSH buffers at HWM instead of dropping, solving the race condition
-        // where messages are published before client subscribes
-        let push_socket = ctx.socket(zmq::PUSH)?;
-
-        // Set socket options for reliability
-        // HWM of 100K messages provides ~10 seconds buffer at 10K msg/s
-        if let Err(e) = push_socket.set_sndhwm(100_000) {
-            warn!("Failed to set send HWM on PUSH socket: {}", e);
-        }
-        // 1 second timeout prevents infinite blocking if StreamService is down
-        if let Err(e) = push_socket.set_sndtimeo(1000) {
-            warn!("Failed to set send timeout on PUSH socket: {}", e);
-        }
-
-        let stream_push_endpoint = hyprstream_rpc::registry::global()
-            .endpoint("streams", hyprstream_rpc::registry::SocketKind::Push)
-            .to_zmq_string();
-        push_socket.connect(&stream_push_endpoint)?;
-        info!("PUSH connected to StreamService at {}", stream_push_endpoint);
+        // StreamChannel will be created after we have a signing key
 
         // Get StreamService's Sub endpoint for client subscriptions
         let stream_sub_endpoint = hyprstream_rpc::registry::global()
@@ -289,19 +272,23 @@ impl InferenceService {
         // Generate signing key for callback mode (separate process, no shared key access)
         let signing_key = hyprstream_rpc::crypto::signing::generate_signing_keypair().0;
         let nonce_cache = Arc::new(InMemoryNonceCache::new());
-        let service = Self::initialize(
+        let mut service = Self::initialize(
             model_path.clone(),
             config,
             model_ref.clone(),
             server_pubkey,
-            signing_key,
+            signing_key.clone(),
             nonce_cache,
             policy_client,
         )
         .await?;
 
-        // Set the PUSH socket (xpub_socket field name kept for compatibility)
-        *service.xpub_socket.write().unwrap() = Some(push_socket);
+        // Create StreamChannel for streaming operations
+        let stream_channel = StreamChannel::new(
+            Arc::clone(&ctx),
+            signing_key,
+        );
+        service.stream_channel = Some(stream_channel);
 
         // Send LoadModelResponse
         let response = Self::build_load_model_response(true, "")?;
@@ -527,7 +514,7 @@ impl InferenceService {
             model_path,
             session_id: RwLock::new(None),
             runtime_handle,
-            xpub_socket: RwLock::new(None), // Initialized in run_service_loop
+            stream_channel: None, // Initialized in run_service_loop
             server_pubkey,
             signing_key,
             nonce_cache,
@@ -542,7 +529,7 @@ impl InferenceService {
     /// The `ready_tx` channel signals when sockets are bound and the service is ready.
     /// This ensures callers wait for actual readiness, not just initialization.
     async fn run_service_loop(
-        service: Self,
+        mut service: Self,
         endpoint: &str,
         ready_tx: Option<tokio::sync::oneshot::Sender<Result<()>>>,
     ) {
@@ -566,46 +553,18 @@ impl InferenceService {
             }
         };
 
-        // Create PUSH socket for streaming (connects to StreamService's PULL)
-        // PUSH buffers at HWM instead of dropping, solving the race condition
-        // where messages are published before client subscribes
-        let push_socket = match ctx.socket(zmq::PUSH) {
-            Ok(s) => s,
-            Err(e) => {
-                let err = anyhow!("failed to create PUSH socket: {}", e);
-                error!("{}", err);
-                signal_error(ready_tx, err);
-                return;
-            }
-        };
+        // Create StreamChannel for streaming generation
+        // Uses lazy socket initialization - socket is created on first use
+        let stream_channel = StreamChannel::new(
+            Arc::clone(&ctx),
+            service.signing_key.clone(),
+        );
+        service.stream_channel = Some(stream_channel);
 
-        // Set socket options for reliability
-        // HWM of 100K messages provides ~10 seconds buffer at 10K msg/s
-        if let Err(e) = push_socket.set_sndhwm(100_000) {
-            warn!("Failed to set send HWM on PUSH socket: {}", e);
-        }
-        // 1 second timeout prevents infinite blocking if StreamService is down
-        if let Err(e) = push_socket.set_sndtimeo(1000) {
-            warn!("Failed to set send timeout on PUSH socket: {}", e);
-        }
-
-        // Connect to StreamService's Push endpoint (PULL backend)
-        let stream_push_endpoint = hyprstream_rpc::registry::global()
+        let stream_endpoint = hyprstream_rpc::registry::global()
             .endpoint("streams", hyprstream_rpc::registry::SocketKind::Push)
             .to_zmq_string();
-
-        if let Err(e) = push_socket.connect(&stream_push_endpoint) {
-            let err = anyhow!("failed to connect PUSH to {}: {}", stream_push_endpoint, e);
-            error!("{}", err);
-            signal_error(ready_tx, err);
-            return;
-        }
-
-        // Store PUSH socket in service for use by execute_stream
-        // Note: Field name still xpub_socket for compatibility, but now holds PUSH socket
-        *service.xpub_socket.write().unwrap() = Some(push_socket);
-
-        info!("inference service bound to {} (RPC) and connected to {} (streaming)", endpoint, stream_push_endpoint);
+        info!("inference service bound to {} (RPC), streaming via {}", endpoint, stream_endpoint);
 
         // Signal ready - ZMQ connection will establish asynchronously
         // With immediate=false, messages queue until connection is ready
@@ -706,15 +665,9 @@ impl InferenceService {
             // This solves the streaming deadlock - client can subscribe after
             // receiving the stream_id in the response
             if let Some(pending) = pending_stream {
-                service.execute_stream(pending);
+                service.execute_stream(pending).await;
             }
         }
-    }
-
-    /// Generate next stream ID
-    fn next_stream_id(&self) -> String {
-        use uuid::Uuid;
-        format!("stream-{}", Uuid::new_v4())
     }
 
     /// Apply TTT adaptation if enabled (adapts model to input BEFORE generation)
@@ -744,7 +697,7 @@ impl InferenceService {
         let input_tokens: Vec<u32> = encoding.get_ids().to_vec();
 
         // Apply TTT adaptation BEFORE generation
-        let engine = self.engine.read().unwrap();
+        let engine = self.engine.read();
         match ttt_trainer.adapt(&engine, &input_tokens) {
             Ok(result) => {
                 if result.skipped {
@@ -770,7 +723,7 @@ impl InferenceService {
         // Use futures::executor::block_on because we're already inside a tokio runtime
         // (run_service_loop runs in rt.block_on), and tokio's block_on can't be nested.
         // futures::executor::block_on works because it's a simple single-threaded executor.
-        let engine = self.engine.read().unwrap();
+        let engine = self.engine.read();
         futures::executor::block_on(async {
             RuntimeEngine::generate_with_params(&*engine, request).await
         })
@@ -781,87 +734,59 @@ impl InferenceService {
     /// This is the first phase of streaming that runs BEFORE the REP response is sent.
     /// The actual streaming happens in `execute_stream` which runs AFTER the response.
     ///
-    /// # DH Key Exchange
-    ///
+    /// Uses `StreamContext::from_dh()` from hyprstream-rpc for DH key exchange:
     /// 1. Server generates ephemeral Ristretto255 keypair
     /// 2. Server computes shared secret: DH(server_secret, client_ephemeral_pubkey)
     /// 3. Both parties derive topic and mac_key from shared secret using HKDF
-    /// 4. Topic is used for ZMQ routing (replaces stream_id prefix)
-    /// 5. mac_key is used for HMAC chain (E2E authentication)
     ///
     /// # Returns
     ///
     /// (stream_id, server_pubkey, pending) where:
     /// - stream_id: For client display/logging (not used for routing)
     /// - server_pubkey: 32-byte Ristretto255 public key for client to derive same keys
-    /// - pending: Stream state including DH-derived topic and mac_key
-    fn prepare_stream(
+    /// - pending: Stream state including StreamContext with DH-derived keys
+    async fn prepare_stream(
         &self,
         request: GenerationRequest,
         client_ephemeral_pubkey: Option<&[u8]>,
+        claims: Option<hyprstream_rpc::auth::Claims>,
+        expiry_secs: i64,
     ) -> Result<(String, [u8; 32], PendingStream)> {
-        use hyprstream_rpc::crypto::{
-            derive_stream_keys, generate_ephemeral_keypair, ristretto_dh, RistrettoPublic,
-        };
-
-        let stream_id = self.next_stream_id();
         let prompt = request.prompt.as_str().to_owned();
-
-        // Generate server ephemeral Ristretto255 keypair for this stream
-        let (server_secret, server_pubkey) = generate_ephemeral_keypair();
-        let server_pubkey_bytes: [u8; 32] = server_pubkey.to_bytes();
 
         // DH key derivation is required - no legacy fallback
         let client_pub_bytes = client_ephemeral_pubkey
             .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
 
-        if client_pub_bytes.len() != 32 {
-            bail!(
-                "Invalid client ephemeral pubkey length: expected 32, got {}",
-                client_pub_bytes.len()
-            );
-        }
+        // Use StreamChannel for DH key exchange and pre-authorization
+        let stream_channel = self.stream_channel.as_ref()
+            .ok_or_else(|| anyhow!("StreamChannel not initialized"))?;
 
-        // Convert to fixed-size array
-        let mut client_pub: [u8; 32] = [0u8; 32];
-        client_pub.copy_from_slice(client_pub_bytes);
-
-        // Parse and validate client Ristretto public key
-        let client_ristretto_pubkey = RistrettoPublic::from_bytes(&client_pub)
-            .ok_or_else(|| anyhow!("Invalid client Ristretto public key encoding"))?;
-
-        // Compute Ristretto255 DH shared secret
-        let shared_secret = ristretto_dh(&server_secret, &client_ristretto_pubkey);
-
-        // Derive topic and mac_key using HKDF
-        let keys = derive_stream_keys(
-            &shared_secret,
-            &client_pub,
-            &server_pubkey_bytes,
-        )?;
+        let stream_ctx = stream_channel
+            .prepare_stream_with_claims(client_pub_bytes, expiry_secs, claims)
+            .await?;
 
         debug!(
-            stream_id = %stream_id,
-            topic = %keys.topic,
-            "DH-derived stream keys"
+            stream_id = %stream_ctx.stream_id(),
+            topic = %stream_ctx.topic(),
+            "Stream prepared via StreamChannel (DH + pre-authorization)"
         );
 
-        let (topic, mac_key) = (keys.topic, *keys.mac_key);
+        let stream_id = stream_ctx.stream_id().to_owned();
+        let server_pubkey = *stream_ctx.server_pubkey();
 
         let pending = PendingStream {
+            stream_ctx,
             request,
-            stream_id: stream_id.clone(),
             prompt,
-            topic,
-            mac_key,
         };
 
-        Ok((stream_id, server_pubkey_bytes, pending))
+        Ok((stream_id, server_pubkey, pending))
     }
 
     /// Execute streaming generation - called AFTER REP response is sent.
     ///
-    /// Uses a PUSH socket connected to StreamService with DH-derived topic.
+    /// Uses StreamChannel for publishing with DH-derived topic.
     /// The topic is derived from DH shared secret, not guessable from stream_id.
     ///
     /// # Protocol (E2E Authenticated via DH)
@@ -873,143 +798,100 @@ impl InferenceService {
     /// 5. Client subscribes to DH-derived topic (unpredictable, non-colliding)
     /// 6. Service publishes chunks with HMAC chain (verified by client, not StreamService)
     /// 7. StreamService is blind forwarder (no HMAC verification)
-    fn execute_stream(&self, pending: PendingStream) {
-        use crate::services::rpc_types::StreamBuilder;
+    ///
+    /// Note: The read lock must be held across await because TextStream<'_> borrows from the engine.
+    /// This triggers clippy::await_holding_lock, but is necessary for the streaming API.
+    #[allow(clippy::await_holding_lock)]
+    async fn execute_stream(&self, pending: PendingStream) {
         use futures::StreamExt;
 
-        let stream_id = pending.stream_id;
+        let stream_ctx = &pending.stream_ctx;
         let request = pending.request;
         let prompt = pending.prompt;
-
-        // Use StreamBuilder with adaptive batching for StreamBlock format
-        let streaming_config = StreamingConfig::default();
-        let mut builder = StreamBuilder::new(streaming_config.batching.clone(), pending.mac_key, pending.topic.clone());
 
         // Apply TTT adaptation BEFORE streaming generation (if enabled)
         self.apply_ttt_adaptation(&prompt);
 
-        // Get PUSH socket (created in run_service_loop, connects to StreamService's PULL)
-        let pub_guard = self.xpub_socket.read().unwrap();
-        let push_socket = match pub_guard.as_ref() {
-            Some(socket) => socket,
+        // Get StreamChannel
+        let stream_channel = match &self.stream_channel {
+            Some(sc) => sc,
             None => {
-                error!("PUSH socket not initialized for streaming");
+                error!("StreamChannel not initialized for streaming");
                 return;
             }
         };
 
-        // StreamService handles subscription forwarding (blind - no HMAC verification)
-        // We push StreamBlocks - StreamService queues until subscriber arrives, then delivers
         trace!(
-            stream_id = %stream_id,
-            topic = %pending.topic,
-            "Starting E2E authenticated stream with adaptive batching"
+            stream_id = %stream_ctx.stream_id(),
+            topic = %stream_ctx.topic(),
+            "Starting E2E authenticated stream via StreamChannel"
         );
 
-        // Run the stream
-        let engine = self.engine.read().unwrap();
+        // Run the stream with StreamChannel's async publisher callback
+        let engine = self.engine.read();
         let stream_result = engine.generate(request);
 
-        match stream_result {
-            Ok(mut stream) => {
-                // Use futures::executor::block_on because we're already inside a tokio runtime
-                // (run_service_loop runs in rt.block_on), and tokio's block_on can't be nested.
-                futures::executor::block_on(async {
+        let result = stream_channel.with_publisher(stream_ctx, |mut publisher| async move {
+            match stream_result {
+                Ok(mut stream) => {
+                    let mut had_error = false;
                     while let Some(chunk_result) = stream.next().await {
                         match chunk_result {
                             Ok(text) => {
                                 // Get live generation rate from stream stats (EMA for smooth batching)
                                 let rate = stream.stats().inference_tokens_per_sec_ema;
 
-                                // Add token with adaptive batching
-                                match builder.add_data(text.as_bytes(), rate) {
-                                    Ok(Some(frames)) => {
-                                        if let Err(e) = frames.send(push_socket) {
-                                            warn!("failed to send StreamBlock: {}", e);
-                                            break;
-                                        }
-                                    }
-                                    Ok(None) => {
-                                        // Batching - not ready to send yet
-                                    }
-                                    Err(e) => {
-                                        warn!("failed to build StreamBlock: {}", e);
-                                        break;
-                                    }
+                                // Publish with adaptive batching
+                                if let Err(e) = publisher.publish_data_with_rate(text.as_bytes(), rate).await {
+                                    warn!("Failed to publish stream data: {}", e);
+                                    had_error = true;
+                                    break;
                                 }
                             }
                             Err(e) => {
-                                // Errors flush immediately
-                                match builder.add_error(&e.to_string()) {
-                                    Ok(Some(frames)) => {
-                                        if let Err(send_err) = frames.send(push_socket) {
-                                            tracing::error!("Failed to send stream error: {}", send_err);
-                                        }
-                                    }
-                                    Ok(None) => {}
-                                    Err(build_err) => {
-                                        tracing::error!("Failed to build error block: {}", build_err);
-                                    }
+                                // Publish error and stop
+                                if let Err(send_err) = publisher.publish_error(&e.to_string()).await {
+                                    error!("Failed to publish stream error: {}", send_err);
                                 }
+                                had_error = true;
                                 break;
                             }
                         }
                     }
 
-                    // Send completion (flushes immediately)
-                    let stats = stream.stats();
-                    let complete = crate::services::rpc_types::InferenceComplete::from(&stats);
-                    match builder.add_complete(&complete.to_bytes()) {
-                        Ok(Some(frames)) => {
-                            if let Err(e) = frames.send(push_socket) {
-                                tracing::error!("Failed to send stream completion: {}", e);
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::error!("Failed to build completion block: {}", e);
-                        }
+                    // Complete the stream if no errors occurred
+                    if !had_error {
+                        let stats = stream.stats();
+                        let complete = crate::services::rpc_types::InferenceComplete::from(&stats);
+                        publisher.complete_ref(&complete.to_bytes()).await?;
                     }
-
-                    // Flush any remaining batched payloads
-                    match builder.finish() {
-                        Ok(Some(frames)) => {
-                            if let Err(e) = frames.send(push_socket) {
-                                tracing::error!("Failed to send final block: {}", e);
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::error!("Failed to build final block: {}", e);
-                        }
-                    }
-                });
-            }
-            Err(e) => {
-                // Initial error - flush immediately
-                match builder.add_error(&e.to_string()) {
-                    Ok(Some(frames)) => {
-                        if let Err(send_err) = frames.send(push_socket) {
-                            tracing::error!("Failed to send initial stream error: {}", send_err);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(build_err) => {
-                        tracing::error!("Failed to build initial error block: {}", build_err);
-                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    // Initial error - publish and return
+                    publisher.publish_error(&e.to_string()).await?;
+                    Err(e)
                 }
             }
+        }).await;
+
+        if let Err(e) = result {
+            error!(
+                stream_id = %stream_ctx.stream_id(),
+                error = %e,
+                "Stream execution failed"
+            );
         }
     }
 
     /// Handle model info request
     fn handle_model_info(&self) -> ModelInfo {
-        RuntimeEngine::model_info(&*self.engine.read().unwrap())
+        RuntimeEngine::model_info(&*self.engine.read())
     }
 
     /// Handle is ready request
     fn handle_is_ready(&self) -> bool {
-        self.engine.read().unwrap().is_loaded()
+        self.engine.read().is_loaded()
     }
 
     /// Handle apply chat template
@@ -1019,56 +901,56 @@ impl InferenceService {
         add_generation_prompt: bool,
     ) -> Result<String> {
         self.engine
-            .read().unwrap()
+            .read()
             .apply_chat_template(&messages, add_generation_prompt)
     }
 
     /// Handle create LoRA
     fn handle_create_lora(&self, config: LoRAConfig) -> Result<()> {
-        self.engine.write().unwrap().create_lora(config)
+        self.engine.write().create_lora(config)
     }
 
     /// Handle load LoRA
     fn handle_load_lora(&self, path: &Path) -> Result<()> {
         // Use futures::executor::block_on to avoid nesting tokio runtimes
-        let mut engine = self.engine.write().unwrap();
+        let mut engine = self.engine.write();
         futures::executor::block_on(async { engine.load_lora_from_file(path).await })
     }
 
     /// Handle save LoRA
     fn handle_save_lora(&self, path: &str) -> Result<()> {
-        self.engine.read().unwrap().save_lora(path)
+        self.engine.read().save_lora(path)
     }
 
     /// Handle unload LoRA
     fn handle_unload_lora(&self) -> Result<()> {
-        self.engine.write().unwrap().unload_lora()
+        self.engine.write().unload_lora()
     }
 
     /// Handle has LoRA
     fn handle_has_lora(&self) -> bool {
-        self.engine.read().unwrap().has_lora_model()
+        self.engine.read().has_lora_model()
     }
 
     /// Handle set session
     fn handle_set_session(&self, session_id: String) -> Result<()> {
         // Track session ID for events
-        *self.session_id.write().unwrap() = Some(session_id.clone());
+        *self.session_id.write() = Some(session_id.clone());
         self.engine
-            .write().unwrap()
+            .write()
             .set_session(CacheOwner::Session(session_id))
     }
 
     /// Handle clear session
     fn handle_clear_session(&self) {
-        *self.session_id.write().unwrap() = None;
-        self.engine.write().unwrap().clear_kv_cache();
+        *self.session_id.write() = None;
+        self.engine.write().clear_kv_cache();
     }
 
     /// Handle release session
     fn handle_release_session(&self, session_id: &str) -> Result<()> {
         self.engine
-            .write().unwrap()
+            .write()
             .release_session(&CacheOwner::Session(session_id.to_owned()))
     }
 
@@ -1214,49 +1096,21 @@ impl InferenceService {
                 let gen_req = gen_req?;
                 let request = self.parse_generation_request(gen_req)?;
 
-                // Prepare stream with DH key derivation
-                // Extract client ephemeral pubkey from envelope for DH
+                // Calculate expiry from claims (for stream pre-authorization)
+                let expiry_secs = ctx.claims()
+                    .map(|c| c.exp - chrono::Utc::now().timestamp())
+                    .unwrap_or(300) // Default: 5 minutes
+                    .max(60); // At least 60 seconds
+
+                // Prepare stream with DH key exchange and pre-authorization via StreamChannel
                 let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
-                let (stream_id, server_pubkey, pending) = self.prepare_stream(request, client_ephemeral_pubkey)?;
-
-                // Pre-authorize the stream subscription BEFORE returning response
-                // This way client can subscribe immediately without calling start_stream
-                // Include expiry from claims so StreamService can GC expired entries
-                let exp = ctx.claims().map(|c| c.exp).unwrap_or_else(|| {
-                    // Default: 5 minutes from now if no claims
-                    chrono::Utc::now().timestamp() + 300
-                });
-
-                // Register using DH-derived topic (not stream_id)
-                // StreamService uses this topic for subscription prefix matching
-                let push_guard = self.xpub_socket.read().unwrap();
-                if let Some(ref push_socket) = *push_guard {
-                    // Build SignedEnvelope(StreamRegister) with DH-derived topic
-                    let claims = ctx.claims().cloned();
-                    let register_msg = crate::services::rpc_types::build_stream_register_envelope(
-                        &pending.topic, // Use DH-derived topic for registration
-                        exp,
-                        &self.signing_key,
-                        claims,
-                    );
-                    if let Err(e) = push_socket.send(&register_msg, 0) {
-                        error!(
-                            stream_id = %stream_id,
-                            topic = %pending.topic,
-                            error = %e,
-                            "Failed to pre-authorize stream"
-                        );
-                        // Continue anyway - client can retry with start_stream
-                    } else {
-                        info!(
-                            stream_id = %stream_id,
-                            topic = %pending.topic,
-                            exp = exp,
-                            "Stream pre-authorized for subscription (DH-derived topic)"
-                        );
-                    }
-                }
-                drop(push_guard);
+                let claims = ctx.claims().cloned();
+                let (stream_id, server_pubkey, pending) = self.prepare_stream(
+                    request,
+                    client_ephemeral_pubkey,
+                    claims,
+                    expiry_secs,
+                ).await?;
 
                 // Get StreamService's Sub endpoint (where clients subscribe)
                 let stream_sub_endpoint = hyprstream_rpc::registry::global()
@@ -1279,7 +1133,7 @@ impl InferenceService {
                     return Ok((resp, None));
                 }
                 let info = self.handle_model_info();
-                let has_lora = self.engine.read().unwrap().has_lora_model();
+                let has_lora = self.engine.read().has_lora_model();
                 Ok((InferenceResponse::model_info(request_id, &info, has_lora), None))
             }
 
@@ -1420,7 +1274,7 @@ impl InferenceService {
 
             Which::HealthCheck(()) => {
                 // Health check is public (no authorization required)
-                let model_loaded = self.engine.read().unwrap().is_loaded();
+                let model_loaded = self.engine.read().is_loaded();
                 Ok((InferenceResponse::health(request_id, model_loaded), None))
             }
 
@@ -1447,34 +1301,28 @@ impl InferenceService {
                     return Ok((InferenceResponse::error(request_id, "Invalid stream_id format"), None));
                 }
 
-                // Send AUTHORIZE message to StreamService via PUSH socket
-                // This tells StreamService this stream is authorized for subscription
+                // Get StreamChannel
+                let stream_channel = match &self.stream_channel {
+                    Some(sc) => sc,
+                    None => {
+                        error!(stream_id = %stream_id, "StreamChannel not available for stream authorization");
+                        return Ok((InferenceResponse::error(request_id, "Stream service not available"), None));
+                    }
+                };
+
+                // Send AUTHORIZE message to StreamService via StreamChannel
                 // Include expiry from claims so StreamService can GC expired entries
                 let exp = ctx.claims().map(|c| c.exp).unwrap_or_else(|| {
                     // Default: 5 minutes from now if no claims
                     chrono::Utc::now().timestamp() + 300
                 });
+                let claims = ctx.claims().cloned();
 
-                let push_guard = self.xpub_socket.read().unwrap();
-                if let Some(ref push_socket) = *push_guard {
-                    // Build SignedEnvelope(StreamRegister) - secure registration
-                    let claims = ctx.claims().cloned();
-                    let register_msg = crate::services::rpc_types::build_stream_register_envelope(
-                        &stream_id,
-                        exp,
-                        &self.signing_key,
-                        claims,
-                    );
-                    if let Err(e) = push_socket.send(&register_msg, 0) {
-                        error!(stream_id = %stream_id, error = %e, "Failed to send authorize message to StreamService");
-                        return Ok((InferenceResponse::error(request_id, &format!("Stream authorization failed: {e}")), None));
-                    }
-                    info!(stream_id = %stream_id, exp = exp, "Stream authorized for subscription (SignedEnvelope)");
-                } else {
-                    error!(stream_id = %stream_id, "No PUSH socket available for stream authorization");
-                    return Ok((InferenceResponse::error(request_id, "Stream service not available"), None));
+                if let Err(e) = stream_channel.register_topic(&stream_id, exp, claims).await {
+                    error!(stream_id = %stream_id, error = %e, "Failed to send authorize message to StreamService");
+                    return Ok((InferenceResponse::error(request_id, &format!("Stream authorization failed: {e}")), None));
                 }
-                drop(push_guard);
+                info!(stream_id = %stream_id, exp = exp, "Stream authorized for subscription");
 
                 Ok((InferenceResponse::stream_authorized(request_id, &stream_id), None))
             }

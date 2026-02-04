@@ -328,7 +328,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_qwen_template() {
+    fn test_qwen_template() -> Result<()> {
         let config = TemplateConfig {
             chat_template: Some(
                 r#"{% for message in messages %}{{'<|im_start|>' + message['role'] + '
@@ -339,16 +339,17 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = TemplateEngine::new(config).expect("test: create template engine");
+        let engine = TemplateEngine::new(config)?;
         let messages = vec![ChatMessage {
             role: "user".to_owned(),
             content: "Hello".to_owned(),
         }];
 
-        let result = engine.apply_chat_template(&messages, Some(true)).expect("test: apply template");
+        let result = engine.apply_chat_template(&messages, Some(true))?;
         assert!(result.contains("<|im_start|>user"));
         assert!(result.contains("Hello"));
         assert!(result.contains("<|im_start|>assistant"));
+        Ok(())
     }
 
     #[test]
@@ -360,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn test_huggingface_template_with_python_methods() {
+    fn test_huggingface_template_with_python_methods() -> Result<()> {
         // Real HuggingFace template that uses Python-style .startswith() method
         let config = TemplateConfig {
             chat_template: Some(
@@ -373,7 +374,7 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = TemplateEngine::new(config).expect("test: create template engine");
+        let engine = TemplateEngine::new(config)?;
         let messages = vec![
             ChatMessage {
                 role: "system".to_owned(),
@@ -389,17 +390,18 @@ mod tests {
             },
         ];
 
-        let result = engine.apply_chat_template(&messages, Some(true)).expect("test: apply template");
+        let result = engine.apply_chat_template(&messages, Some(true))?;
 
         // Verify the template was processed correctly
         assert!(result.contains("System: You are a helpful assistant."));
         assert!(result.contains("User: Hello!"));
         assert!(result.contains("Assistant: Hi there!"));
         assert!(result.ends_with("Assistant: "));
+        Ok(())
     }
 
     #[test]
-    fn test_complex_template_with_conditions() {
+    fn test_complex_template_with_conditions() -> Result<()> {
         // Complex template with nested conditions and multiple Python methods
         let config = TemplateConfig {
             chat_template: Some(
@@ -416,7 +418,7 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = TemplateEngine::new(config).expect("test: create template engine");
+        let engine = TemplateEngine::new(config)?;
         let messages = vec![
             ChatMessage {
                 role: "system".to_owned(),
@@ -432,14 +434,15 @@ mod tests {
             },
         ];
 
-        let result = engine.apply_chat_template(&messages, Some(false)).expect("test: apply template");
+        let result = engine.apply_chat_template(&messages, Some(false))?;
         assert!(result.contains("[SYSTEM] Configure the model"));
         assert!(result.contains("[USER] What's 2+2?"));
         assert!(result.contains("[ASSISTANT] 4"));
+        Ok(())
     }
 
     #[test]
-    fn test_strip_filter() {
+    fn test_strip_filter() -> Result<()> {
         // Test template with .strip() method (Python-style)
         let config = TemplateConfig {
             chat_template: Some(
@@ -450,7 +453,7 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = TemplateEngine::new(config).expect("test: create template engine");
+        let engine = TemplateEngine::new(config)?;
         let messages = vec![
             ChatMessage {
                 role: "user".to_owned(),
@@ -458,8 +461,9 @@ mod tests {
             },
         ];
 
-        let result = engine.apply_chat_template(&messages, Some(false)).expect("test: apply template");
+        let result = engine.apply_chat_template(&messages, Some(false))?;
         assert!(result.contains("Hello World"));
         assert!(!result.contains("  Hello World  "));
+        Ok(())
     }
 }

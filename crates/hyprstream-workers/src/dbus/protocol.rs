@@ -79,8 +79,7 @@ impl DbusValue {
     /// Try to get as string
     pub fn as_str(&self) -> Option<&str> {
         match self {
-            DbusValue::String(s) => Some(s),
-            DbusValue::ObjectPath(s) => Some(s),
+            DbusValue::String(s) | DbusValue::ObjectPath(s) => Some(s),
             _ => None,
         }
     }
@@ -398,14 +397,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_dbus_value_serialization() {
+    fn test_dbus_value_serialization() -> serde_json::Result<()> {
         let value = DbusValue::Dict(HashMap::from([
             ("app_name".to_owned(), DbusValue::String("test".to_owned())),
             ("urgency".to_owned(), DbusValue::Uint32(1)),
         ]));
 
-        let json = serde_json::to_string(&value).unwrap();
-        let parsed: DbusValue = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&value)?;
+        let parsed: DbusValue = serde_json::from_str(&json)?;
 
         match parsed {
             DbusValue::Dict(map) => {
@@ -414,6 +413,7 @@ mod tests {
             }
             _ => panic!("Expected Dict"),
         }
+        Ok(())
     }
 
     #[test]
@@ -435,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn test_request_serialization() {
+    fn test_request_serialization() -> serde_json::Result<()> {
         let request = DbusRequest::Call(DbusCallRequest::new(
             "org.example.Service",
             "/org/example/Object",
@@ -443,24 +443,26 @@ mod tests {
             "Method",
         ));
 
-        let json = serde_json::to_string(&request).unwrap();
+        let json = serde_json::to_string(&request)?;
         assert!(json.contains("\"type\":\"call\""));
 
-        let parsed: DbusRequest = serde_json::from_str(&json).unwrap();
+        let parsed: DbusRequest = serde_json::from_str(&json)?;
         match parsed {
             DbusRequest::Call(call) => {
                 assert_eq!(call.destination, "org.example.Service");
             }
             _ => panic!("Expected Call"),
         }
+        Ok(())
     }
 
     #[test]
-    fn test_response_serialization() {
+    fn test_response_serialization() -> serde_json::Result<()> {
         let response = DbusResponse::return_values(vec![DbusValue::Uint32(42)]);
 
-        let json = serde_json::to_string(&response).unwrap();
+        let json = serde_json::to_string(&response)?;
         assert!(json.contains("\"type\":\"return\""));
+        Ok(())
     }
 
     #[test]

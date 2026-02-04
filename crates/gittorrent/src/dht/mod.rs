@@ -60,8 +60,16 @@ impl GitObjectKey {
     pub fn to_record_key(&self) -> RecordKey {
         // Create multihash from SHA2-256 (code 0x12) using the derived DHT key
         // SAFETY: SHA2-256 (0x12) expects exactly 32 bytes, which dht_key provides
-        let multihash: Multihash<64> = Multihash::wrap(0x12, &self.dht_key)
-            .unwrap_or_else(|_| Multihash::wrap(0x12, &[0u8; 32]).unwrap());
+        let multihash: Multihash<64> = match Multihash::wrap(0x12, &self.dht_key) {
+            Ok(mh) => mh,
+            Err(_) => {
+                // Fallback: this should never fail as we're using a valid 32-byte array
+                Multihash::wrap(0x12, &[0u8; 32]).unwrap_or_else(|_| {
+                    // If even the fallback fails, create an empty multihash
+                    Multihash::default()
+                })
+            }
+        };
         RecordKey::new(&multihash.to_bytes())
     }
 

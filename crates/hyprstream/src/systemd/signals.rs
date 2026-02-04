@@ -226,15 +226,35 @@ impl Default for SignalCoordinator {
 pub async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
 
-    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM");
-    let mut sigint = signal(SignalKind::interrupt()).expect("Failed to register SIGINT");
+    let sigterm = signal(SignalKind::terminate());
+    let sigint = signal(SignalKind::interrupt());
 
-    tokio::select! {
-        _ = sigterm.recv() => {
-            info!("Received SIGTERM");
+    match (sigterm, sigint) {
+        (Ok(mut sigterm), Ok(mut sigint)) => {
+            tokio::select! {
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM");
+                }
+                _ = sigint.recv() => {
+                    info!("Received SIGINT");
+                }
+            }
         }
-        _ = sigint.recv() => {
-            info!("Received SIGINT");
+        (Err(e), _) => {
+            tracing::error!("Failed to register SIGTERM: {}, falling back to ctrl_c", e);
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                tracing::error!("Failed to listen for Ctrl+C: {}", e);
+            } else {
+                info!("Received Ctrl+C");
+            }
+        }
+        (_, Err(e)) => {
+            tracing::error!("Failed to register SIGINT: {}, falling back to ctrl_c", e);
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                tracing::error!("Failed to listen for Ctrl+C: {}", e);
+            } else {
+                info!("Received Ctrl+C");
+            }
         }
     }
 }
@@ -242,10 +262,11 @@ pub async fn shutdown_signal() {
 /// Fallback for non-Unix systems
 #[cfg(not(unix))]
 pub async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to listen for Ctrl+C");
-    info!("Received Ctrl+C");
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        tracing::error!("Failed to listen for Ctrl+C: {}", e);
+    } else {
+        info!("Received Ctrl+C");
+    }
 }
 
 #[cfg(test)]

@@ -185,7 +185,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_spawn_and_stop() {
+    async fn test_spawn_and_stop() -> crate::Result<()> {
         let spawner = ProcessSpawner::new();
 
         let config = ProcessConfig::new("test-sleep", "sleep").args(["100"]);
@@ -193,22 +193,23 @@ mod tests {
         match spawner.spawn(config).await {
             Ok(process) => {
                 // Check it's running
-                let running = spawner.is_running(&process).await.unwrap();
+                let running = spawner.is_running(&process).await?;
                 assert!(running, "Process should be running");
 
                 // Stop it
-                spawner.stop(&process).await.unwrap();
+                spawner.stop(&process).await?;
 
                 // Give it a moment
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
                 // Check it's stopped
-                let running = spawner.is_running(&process).await.unwrap();
+                let running = spawner.is_running(&process).await?;
                 assert!(!running, "Process should be stopped");
             }
             Err(e) => {
                 eprintln!("Could not spawn test process: {e}");
             }
         }
+        Ok(())
     }
 }

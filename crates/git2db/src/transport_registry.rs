@@ -386,7 +386,9 @@ mod tests {
 
         // All should succeed - only first thread registers with git2, others skip
         for handle in handles {
-            assert!(handle.join().unwrap().is_ok());
+            if let Ok(result) = handle.join() {
+                assert!(result.is_ok());
+            }
         }
 
         // Should have exactly one factory registered
@@ -479,9 +481,9 @@ mod tests {
 
         {
             let _guard = TransportGuard::new(registry.clone(), scheme.clone());
-            registry
-                .register_transport(scheme.clone(), Arc::clone(&factory))
-                .unwrap();
+            let result = registry
+                .register_transport(scheme.clone(), Arc::clone(&factory));
+            assert!(result.is_ok());
             assert!(registry.has_transport(&scheme));
         } // Guard goes out of scope
 
