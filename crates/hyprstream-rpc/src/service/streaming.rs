@@ -406,10 +406,16 @@ impl StreamService {
         let name_clone = self.name.clone();
         std::thread::spawn(move || {
             // Block until shutdown is signaled
-            let rt = tokio::runtime::Builder::new_current_thread()
+            let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("shutdown listener runtime");
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!("Failed to create shutdown listener runtime: {e}");
+                    return;
+                }
+            };
             rt.block_on(shutdown.notified());
 
             // Send termination message

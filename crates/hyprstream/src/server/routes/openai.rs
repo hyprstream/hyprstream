@@ -154,7 +154,7 @@ async fn resolve_model_path(
         }
     };
 
-    match state.model_storage.get_model_path(&model_ref).await {
+    match state.registry.get_model_path(&model_ref).await {
         Ok(path) => {
             // Check if model has INFERENCE capability
             let archetype_registry = crate::archetypes::global_registry();
@@ -374,10 +374,8 @@ async fn chat_completions(
                     finish_reason: Some(
                         match generation.finish_reason {
                             FinishReason::MaxTokens => "length",
-                            FinishReason::StopToken(_) => "stop",
-                            FinishReason::EndOfSequence => "stop",
-                            FinishReason::Stop => "stop",
-                            FinishReason::Error(_) => "stop",
+                            // All other reasons map to "stop" per OpenAI API spec
+                            _ => "stop",
                         }.to_owned(),
                     ),
                 }],
@@ -442,7 +440,7 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
             }
         };
 
-        let model_path = match state.model_storage.get_model_path(&model_ref).await {
+        let model_path = match state.registry.get_model_path(&model_ref).await {
             Ok(path) => path,
             Err(e) => {
                 let _ = tx.send(Err(anyhow::anyhow!("Could not get model path: {}", e))).await;
@@ -902,19 +900,16 @@ async fn embeddings(
 async fn list_models(State(state): State<ServerState>) -> impl IntoResponse {
     let mut models = vec![];
 
-    // Get all worktrees from storage (formatted as model:branch)
-    match state.model_storage.list_models().await {
+    // Get all worktrees from registry (formatted as model:branch)
+    match state.registry.list_models().await {
         Ok(model_list) => {
-            for (model_ref, metadata) in model_list {
-                // Use ModelRef's Display impl for consistent model:branch format
-                let model_id = model_ref.to_string();
-
+            for model_info in model_list {
                 // Build owned_by field with worktree metadata
                 let mut owned_by_parts = vec!["system".to_owned()];
 
-                // Add worktree metadata tags (driver, space saved, age)
-                if !metadata.tags.is_empty() {
-                    owned_by_parts.push(metadata.tags.join(", "));
+                // Add driver info
+                if !model_info.driver.is_empty() {
+                    owned_by_parts.push(format!("driver:{}", model_info.driver));
                 }
 
                 // Note: Model caching is now handled by ModelService internally
@@ -923,9 +918,9 @@ async fn list_models(State(state): State<ServerState>) -> impl IntoResponse {
                 let owned_by = owned_by_parts.join(" ");
 
                 models.push(Model {
-                    id: model_id,
+                    id: model_info.display_name,
                     object: "model".to_owned(),
-                    created: metadata.created_at,
+                    created: chrono::Utc::now().timestamp(),
                     owned_by,
                 });
             }

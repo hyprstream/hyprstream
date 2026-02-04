@@ -6,8 +6,6 @@
 
 use crate::config::HyprConfig;
 use crate::services::RegistryClient;
-use crate::storage::ModelStorage;
-use anyhow::Result;
 use std::sync::Arc;
 
 /// Application context passed to all command handlers
@@ -36,9 +34,6 @@ pub struct AppContext {
 
     /// Shared registry client for all git operations
     registry: Arc<dyn RegistryClient>,
-
-    /// Cached ModelStorage instance (lazily initialized)
-    storage: Arc<tokio::sync::OnceCell<ModelStorage>>,
 }
 
 impl AppContext {
@@ -50,7 +45,6 @@ impl AppContext {
         Self {
             config: Arc::new(config),
             registry,
-            storage: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -72,20 +66,5 @@ impl AppContext {
     /// Get the models directory path
     pub fn models_dir(&self) -> &std::path::Path {
         self.config.models_dir()
-    }
-
-    /// Get ModelStorage instance (uses shared registry, never starts a new service).
-    ///
-    /// This provides backward compatibility for handlers that still use ModelStorage.
-    /// The storage uses the shared registry client, ensuring no duplicate services.
-    pub async fn storage(&self) -> Result<&ModelStorage> {
-        self.storage
-            .get_or_try_init(|| async {
-                Ok(ModelStorage::new(
-                    self.registry.clone(),
-                    self.config.models_dir().to_path_buf(),
-                ))
-            })
-            .await
     }
 }

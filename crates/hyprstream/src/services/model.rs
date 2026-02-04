@@ -36,7 +36,8 @@ use crate::services::{
     rpc_types::StreamStartedInfo, CallOptions, EnvelopeContext, InferenceService, InferenceZmqClient,
     PolicyZmqClient, ZmqClient,
 };
-use crate::storage::{ModelRef, ModelStorage};
+use crate::services::RegistryClient;
+use crate::storage::ModelRef;
 use anyhow::{anyhow, Result};
 use capnp::message::{Builder, ReaderOptions};
 use capnp::serialize;
@@ -60,6 +61,15 @@ const INFERENCE_ENDPOINT_BASE: &str = "inproc://hyprstream/inference";
 // ============================================================================
 // ModelService (server-side)
 // ============================================================================
+
+/// Per-model runtime configuration for loading
+#[derive(Debug, Clone, Default)]
+pub struct ModelLoadConfig {
+    /// Maximum context length (None = use service default)
+    pub max_context: Option<usize>,
+    /// KV cache quantization type (None = use service default)
+    pub kv_quant: Option<KVQuantType>,
+}
 
 /// Information about a loaded model
 pub struct LoadedModel {
@@ -131,8 +141,8 @@ pub struct ModelService {
     signing_key: SigningKey,
     /// Policy client for authorization checks in InferenceService
     policy_client: PolicyZmqClient,
-    /// Model storage for resolving model paths
-    model_storage: Arc<ModelStorage>,
+    /// Registry client for resolving model paths
+    registry: Arc<dyn RegistryClient>,
     /// Callback router for spawned mode (None for in-process)
     #[allow(dead_code)]
     callback_router: Option<crate::services::callback::CallbackRouter>,
@@ -150,7 +160,7 @@ impl ModelService {
         config: ModelServiceConfig,
         signing_key: SigningKey,
         policy_client: PolicyZmqClient,
-        model_storage: Arc<ModelStorage>,
+        registry: Arc<dyn RegistryClient>,
         context: Arc<zmq::Context>,
         transport: TransportConfig,
     ) -> Self {
@@ -166,7 +176,7 @@ impl ModelService {
             config,
             signing_key,
             policy_client,
-            model_storage,
+            registry,
             callback_router: None,
             spawned_instances: RwLock::new(HashMap::new()),
             context,
@@ -179,7 +189,7 @@ impl ModelService {
         config: ModelServiceConfig,
         signing_key: SigningKey,
         policy_client: PolicyZmqClient,
-        model_storage: Arc<ModelStorage>,
+        registry: Arc<dyn RegistryClient>,
         callback_router: crate::services::callback::CallbackRouter,
         context: Arc<zmq::Context>,
         transport: TransportConfig,
@@ -195,7 +205,7 @@ impl ModelService {
             config,
             signing_key,
             policy_client,
-            model_storage,
+            registry,
             callback_router: Some(callback_router),
             spawned_instances: RwLock::new(HashMap::new()),
             context,
@@ -203,8 +213,8 @@ impl ModelService {
         }
     }
 
-    /// Load a model by reference, returns the inference endpoint
-    async fn load_model(&self, model_ref_str: &str) -> Result<String> {
+    /// Load a model by reference with optional per-model config, returns the inference endpoint
+    async fn load_model(&self, model_ref_str: &str, config: Option<ModelLoadConfig>) -> Result<String> {
         // Check if already loaded
         {
             let mut cache = self.loaded_models.write().await;
@@ -218,8 +228,8 @@ impl ModelService {
         // Parse model reference
         let model_ref = ModelRef::parse(model_ref_str)?;
 
-        // Get model path from storage
-        let model_path = self.model_storage.get_model_path(&model_ref).await?;
+        // Get model path from registry
+        let model_path = self.registry.get_model_path(&model_ref).await?;
 
         if !model_path.exists() {
             return Err(anyhow!(
@@ -234,10 +244,11 @@ impl ModelService {
 
         info!("Loading model {} at endpoint {}", model_ref_str, endpoint);
 
-        // Create runtime config
+        // Create runtime config - use per-model config if provided, otherwise service defaults
+        let load_config = config.unwrap_or_default();
         let mut runtime_config = RuntimeConfig::default();
-        runtime_config.max_context = self.config.max_context;
-        runtime_config.kv_quant_type = self.config.kv_quant;
+        runtime_config.max_context = load_config.max_context.or(self.config.max_context);
+        runtime_config.kv_quant_type = load_config.kv_quant.unwrap_or(self.config.kv_quant);
 
         // Start InferenceService for this model
         let service_handle = InferenceService::start_at(
@@ -333,8 +344,8 @@ impl ModelService {
 
     /// Route inference request to the appropriate InferenceService
     async fn infer(&self, model_ref_str: &str, request_bytes: &[u8]) -> Result<Vec<u8>> {
-        // Ensure model is loaded
-        let _endpoint = self.load_model(model_ref_str).await?;
+        // Ensure model is loaded (use service defaults)
+        let _endpoint = self.load_model(model_ref_str, None).await?;
 
         // Get client
         let client = {
@@ -372,8 +383,8 @@ impl ModelService {
         request_bytes: &[u8],
         client_ephemeral_pubkey: Option<[u8; 32]>,
     ) -> Result<StreamStartedInfo> {
-        // Ensure model is loaded
-        let _endpoint = self.load_model(model_ref_str).await?;
+        // Ensure model is loaded (use service defaults)
+        let _endpoint = self.load_model(model_ref_str, None).await?;
 
         // Get client
         let client = {
@@ -404,8 +415,8 @@ impl ModelService {
     /// Client must call this after infer_stream() to authorize the SUB subscription.
     /// This sends an AUTHORIZE message to StreamService via InferenceService.
     async fn start_stream(&self, model_ref_str: &str, stream_id: &str) -> Result<()> {
-        // Ensure model is loaded
-        let _endpoint = self.load_model(model_ref_str).await?;
+        // Ensure model is loaded (use service defaults)
+        let _endpoint = self.load_model(model_ref_str, None).await?;
 
         // Get client
         let client = {
@@ -428,8 +439,8 @@ impl ModelService {
         messages: Vec<ChatMessage>,
         add_generation_prompt: bool,
     ) -> Result<TemplatedPrompt> {
-        // Ensure model is loaded
-        let _endpoint = self.load_model(model_ref_str).await?;
+        // Ensure model is loaded (use service defaults)
+        let _endpoint = self.load_model(model_ref_str, None).await?;
 
         // Get client
         let client = {
@@ -646,7 +657,25 @@ impl crate::services::ZmqService for ModelService {
                     Which::Load(load_req) => {
                         let load = load_req?;
                         let model_ref = load.get_model_ref()?.to_str()?;
-                        match self.load_model(model_ref).await {
+
+                        // Extract optional runtime config
+                        let max_context = match load.get_max_context() {
+                            0 => None,
+                            n => Some(n as usize),
+                        };
+                        let kv_quant = match load.get_kv_quant()? {
+                            model_capnp::KVQuantType::None => None,
+                            model_capnp::KVQuantType::Int8 => Some(KVQuantType::Int8),
+                            model_capnp::KVQuantType::Nf4 => Some(KVQuantType::Nf4),
+                            model_capnp::KVQuantType::Fp4 => Some(KVQuantType::Fp4),
+                        };
+                        let config = if max_context.is_some() || kv_quant.is_some() {
+                            Some(ModelLoadConfig { max_context, kv_quant })
+                        } else {
+                            None
+                        };
+
+                        match self.load_model(model_ref, config).await {
                             Ok(endpoint) => Self::build_loaded_response(request_id, model_ref, &endpoint),
                             Err(e) => Self::build_error_response(
                                 request_id,
@@ -832,8 +861,8 @@ impl ModelZmqClient {
         }
     }
 
-    /// Load a model by reference, returns the inference endpoint
-    pub async fn load(&self, model_ref: &str) -> Result<String> {
+    /// Load a model by reference with optional runtime config, returns the inference endpoint
+    pub async fn load(&self, model_ref: &str, config: Option<&ModelLoadConfig>) -> Result<String> {
         let request_id = self.client.next_id();
 
         let mut message = Builder::new_default();
@@ -842,6 +871,22 @@ impl ModelZmqClient {
             req.set_id(request_id);
             let mut load = req.init_load();
             load.set_model_ref(model_ref);
+
+            // Set optional runtime config
+            if let Some(cfg) = config {
+                if let Some(max_ctx) = cfg.max_context {
+                    load.set_max_context(max_ctx as u32);
+                }
+                if let Some(kv_quant) = cfg.kv_quant {
+                    let capnp_kv_quant = match kv_quant {
+                        KVQuantType::None => model_capnp::KVQuantType::None,
+                        KVQuantType::Int8 => model_capnp::KVQuantType::Int8,
+                        KVQuantType::Nf4 => model_capnp::KVQuantType::Nf4,
+                        KVQuantType::Fp4 => model_capnp::KVQuantType::Fp4,
+                    };
+                    load.set_kv_quant(capnp_kv_quant);
+                }
+            }
         }
 
         let mut request_bytes = Vec::new();

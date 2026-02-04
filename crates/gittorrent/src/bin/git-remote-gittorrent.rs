@@ -1,11 +1,12 @@
 //! Git remote helper for gittorrent:// URLs
 //!
 //! This binary implements the Git remote helper protocol for gittorrent:// URLs,
-//! allowing standard Git commands to work with GitTorrent repositories.
+//! allowing standard Git commands to work with `GitTorrent` repositories.
 //!
 //! Git invokes this automatically when encountering gittorrent:// URLs.
 //! Configuration is read from environment variables and config files.
 
+use std::io::Write;
 use gittorrent::{Result, git::remote_helper::run_git_remote_helper, service::GitTorrentConfig};
 
 #[tokio::main]
@@ -14,7 +15,8 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 3 {
-        eprintln!("Usage: git-remote-gittorrent <remote-name> <url>");
+        // Write errors to stderr (git remote helper protocol)
+        let _ = writeln!(std::io::stderr(), "Usage: git-remote-gittorrent <remote-name> <url>");
         std::process::exit(1);
     }
 
@@ -34,7 +36,8 @@ async fn main() -> Result<()> {
     match run_git_remote_helper(Some(config), Some(url)).await {
         Ok(()) => {}
         Err(e) => {
-            eprintln!("error {e}");
+            // Write errors to stderr (git remote helper protocol)
+            let _ = writeln!(std::io::stderr(), "error {e}");
             std::process::exit(1);
         }
     }

@@ -34,7 +34,6 @@ use tracing::info;
 use crate::auth::PolicyManager;
 use crate::config::TokenConfig;
 use crate::services::{PolicyService, PolicyZmqClient, RegistryClient, RegistryService, RegistryZmqClient};
-use crate::storage::ModelStorage;
 use crate::zmq::global_context;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -159,15 +158,9 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     let policy_client = PolicyZmqClient::new(ctx.signing_key().clone(), RequestIdentity::local());
 
     // Create registry client
-    let registry_client = Arc::new(RegistryZmqClient::new(
+    let registry_client: Arc<dyn RegistryClient> = Arc::new(RegistryZmqClient::new(
         ctx.signing_key().clone(),
         RequestIdentity::local(),
-    )) as Arc<dyn RegistryClient>;
-
-    // Create model storage
-    let model_storage = Arc::new(ModelStorage::new(
-        registry_client,
-        ctx.models_dir().to_path_buf(),
     ));
 
     // Service includes infrastructure - directly Spawnable via blanket impl
@@ -175,7 +168,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         ModelServiceConfig::default(),
         ctx.signing_key().clone(),
         policy_client,
-        model_storage,
+        registry_client,
         global_context(),
         ctx.transport("model", SocketKind::Rep),
     );
@@ -268,15 +261,9 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let policy_client = PolicyZmqClient::new(ctx.signing_key().clone(), RequestIdentity::local());
 
     // Create registry client
-    let registry_client = Arc::new(RegistryZmqClient::new(
+    let registry_client: Arc<dyn RegistryClient> = Arc::new(RegistryZmqClient::new(
         ctx.signing_key().clone(),
         RequestIdentity::local(),
-    )) as Arc<dyn RegistryClient>;
-
-    // Create model storage
-    let model_storage = Arc::new(ModelStorage::new(
-        registry_client,
-        ctx.models_dir().to_path_buf(),
     ));
 
     // Create server state (blocking since we're in sync context)
@@ -286,7 +273,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
             config.server.clone(),
             model_client,
             policy_client,
-            model_storage,
+            registry_client,
             ctx.signing_key().clone(),
         ))
     })

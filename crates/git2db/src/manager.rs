@@ -222,7 +222,8 @@ impl GitManager {
         if self.config.repository.prefer_shallow {
             builder = builder.shallow(true);
             if let Some(depth) = self.config.repository.shallow_depth {
-                builder = builder.depth(depth as i32);
+                // Shallow depth is small (typically 1-100), safe to convert
+                builder = builder.depth(i32::try_from(depth).unwrap_or(i32::MAX));
             }
         }
 
@@ -231,8 +232,8 @@ impl GitManager {
             builder = builder.proxy_url(proxy_url.clone());
         }
 
-        // Set up timeout
-        builder = builder.timeout(self.config.network.timeout_secs as u32);
+        // Set up timeout (cap at u32::MAX seconds, ~136 years)
+        builder = builder.timeout(u32::try_from(self.config.network.timeout_secs).unwrap_or(u32::MAX));
 
         // Set up authentication
         use crate::auth::AuthStrategy;
@@ -471,7 +472,7 @@ impl GitManager {
         // Validate path - use absolute paths directly, validate relative paths
         let validated_path = if target_path.is_absolute() {
             // Already absolute - use directly after basic validation
-            target_path.to_path_buf()
+            target_path.clone()
         } else {
             // Relative path - join with current dir and validate
             let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -717,7 +718,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_functionality() {
+    fn test_cache_functionality() -> crate::Git2DBResult<()> {
         let config = test_config();
         let manager = GitManager::new(config);
 
@@ -726,11 +727,11 @@ mod tests {
         assert_eq!(stats.total_entries, 0);
 
         // Create a temp dir with an actual git repository
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new()?;
         let test_path = temp_dir.path();
-        git2::Repository::init(test_path).expect("test: init git repo");
-        let cache1 = manager.get_repository(test_path).unwrap();
-        let cache2 = manager.get_repository(test_path).unwrap();
+        git2::Repository::init(test_path)?;
+        let cache1 = manager.get_repository(test_path)?;
+        let cache2 = manager.get_repository(test_path)?;
 
         // Should have one entry
         let stats = manager.cache_stats();
@@ -741,15 +742,16 @@ mod tests {
 
         // Cleanup
         manager.clear_cache();
+        Ok(())
     }
 
     #[test]
-    fn test_path_validation() {
+    fn test_path_validation() -> crate::Git2DBResult<()> {
         let config = test_config();
         let manager = GitManager::new(config);
 
         // Use an actual temp directory for base_dir
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new()?;
         let base_dir = temp_dir.path();
 
         // Valid relative path
@@ -764,21 +766,22 @@ mod tests {
         // Absolute path outside base should fail
         let result = manager.validate_path(base_dir, Path::new("/etc/passwd"));
         assert!(result.is_err());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_concurrent_operations() {
+    async fn test_concurrent_operations() -> crate::Git2DBResult<()> {
         let config = test_config();
         let manager = Arc::new(GitManager::new(config));
 
         let mut handles = Vec::new();
-        let temp_dirs: Vec<TempDir> = (0..5)
-            .map(|_| {
-                let dir = TempDir::new().unwrap();
-                git2::Repository::init(dir.path()).expect("test: init git repo");
-                dir
-            })
-            .collect();
+        let mut temp_dirs = Vec::new();
+
+        for _ in 0..5 {
+            let dir = TempDir::new()?;
+            git2::Repository::init(dir.path())?;
+            temp_dirs.push(dir);
+        }
 
         // Create concurrent repository operations
         // Iterate by reference to keep temp_dirs alive
@@ -795,15 +798,16 @@ mod tests {
 
         // All should succeed without conflicts
         for handle in handles {
-            let result = handle.await.unwrap();
+            let result = handle.await.map_err(|e| crate::Git2DBError::internal(format!("Task join error: {e}")))?;
             assert!(result.is_ok());
         }
 
         // temp_dirs dropped here, after all operations complete
+        Ok(())
     }
 
     #[test]
-    fn test_cache_operations() {
+    fn test_cache_operations() -> crate::Git2DBResult<()> {
         let manager = GitManager::new(test_config());
 
         // Initially empty
@@ -811,9 +815,9 @@ mod tests {
         assert_eq!(stats.total_entries, 0);
 
         // Access some paths (this would happen through get_repository in practice)
-        let temp_dir = TempDir::new().unwrap();
-        Repository::init(temp_dir.path()).unwrap();
-        manager.get_repository(temp_dir.path()).unwrap();
+        let temp_dir = TempDir::new()?;
+        Repository::init(temp_dir.path())?;
+        manager.get_repository(temp_dir.path())?;
 
         // Cache should have one entry
         let stats = manager.cache_stats();
@@ -823,22 +827,23 @@ mod tests {
         manager.clear_cache();
         let stats = manager.cache_stats();
         assert_eq!(stats.total_entries, 0);
+        Ok(())
     }
 
     #[test]
-    fn test_signature_creation() {
+    fn test_signature_creation() -> crate::Git2DBResult<()> {
         let manager = GitManager::new(test_config());
 
         // Default signature
-        let sig = manager.create_signature(None, None).unwrap();
-        assert_eq!(sig.name().unwrap(), "git2db");
-        assert_eq!(sig.email().unwrap(), "git2db@local");
+        let sig = manager.create_signature(None, None)?;
+        assert_eq!(sig.name().ok_or_else(|| crate::Git2DBError::internal("no name"))?, "git2db");
+        assert_eq!(sig.email().ok_or_else(|| crate::Git2DBError::internal("no email"))?, "git2db@local");
 
         // Custom signature
         let custom_sig = manager
-            .create_signature(Some("Test User"), Some("test@example.com"))
-            .unwrap();
-        assert_eq!(custom_sig.name().unwrap(), "Test User");
-        assert_eq!(custom_sig.email().unwrap(), "test@example.com");
+            .create_signature(Some("Test User"), Some("test@example.com"))?;
+        assert_eq!(custom_sig.name().ok_or_else(|| crate::Git2DBError::internal("no name"))?, "Test User");
+        assert_eq!(custom_sig.email().ok_or_else(|| crate::Git2DBError::internal("no email"))?, "test@example.com");
+        Ok(())
     }
 }

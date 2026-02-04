@@ -112,22 +112,22 @@ impl Git2DBError {
     /// Get the error message regardless of variant
     pub fn message(&self) -> String {
         match self {
-            Self::GitOperation { message, .. } => message.clone(),
-            Self::Repository { message, .. } => message.clone(),
-            Self::Submodule { message, .. } => message.clone(),
-            Self::Reference { message, .. } => message.clone(),
-            Self::Authentication { message, .. } => message.clone(),
-            Self::Network { message, .. } => message.clone(),
-            Self::Configuration { message, .. } => message.clone(),
-            Self::InvalidPath { message, .. } => message.clone(),
-            Self::InvalidRepository { message, .. } => message.clone(),
+            Self::GitOperation { message, .. }
+            | Self::Repository { message, .. }
+            | Self::Submodule { message, .. }
+            | Self::Reference { message, .. }
+            | Self::Authentication { message, .. }
+            | Self::Network { message, .. }
+            | Self::Configuration { message, .. }
+            | Self::InvalidPath { message, .. }
+            | Self::InvalidRepository { message, .. }
+            | Self::InvalidOperation { message }
+            | Self::Internal { message }
+            | Self::Lfs { message, .. } => message.clone(),
             Self::WorktreeExists { path } => {
                 format!("Worktree already exists at {}", path.display())
             }
             Self::Cancelled { operation } => format!("Operation cancelled: {operation}"),
-            Self::InvalidOperation { message } => message.clone(),
-            Self::Internal { message } => message.clone(),
-            Self::Lfs { message, .. } => message.clone(),
             Self::Io(e) => e.to_string(),
             Self::Json(e) => e.to_string(),
             Self::External(e) => e.to_string(),
@@ -289,14 +289,7 @@ impl Git2DBError {
     pub fn is_recoverable(&self) -> bool {
         match self {
             Self::GitOperation { recoverable, .. } => *recoverable,
-            Self::Network { .. } => true,
-            Self::Authentication { .. } => true,
-            Self::Cancelled { .. } => false,
-            Self::Configuration { .. } => false,
-            Self::InvalidPath { .. } => false,
-            Self::InvalidRepository { .. } => false,
-            Self::WorktreeExists { .. } => false,
-            Self::InvalidOperation { .. } => false,
+            Self::Network { .. } | Self::Authentication { .. } => true,
             _ => false,
         }
     }
@@ -583,7 +576,11 @@ mod tests {
 
     #[test]
     fn test_error_from_serde_json_error() {
-        let json_err = serde_json::from_str::<serde_json::Value>("invalid json").unwrap_err();
+        let json_result = serde_json::from_str::<serde_json::Value>("invalid json");
+        let json_err = match json_result {
+            Err(e) => e,
+            Ok(_) => panic!("Expected JSON parsing to fail"),
+        };
         let err: Git2DBError = json_err.into();
 
         if let Git2DBError::Json(_) = err {

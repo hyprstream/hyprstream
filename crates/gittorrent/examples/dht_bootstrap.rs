@@ -1,3 +1,4 @@
+#![allow(clippy::print_stdout)]
 //! Example demonstrating proper Kademlia DHT bootstrap in libp2p
 //!
 //! This example shows how to correctly bootstrap a Kademlia DHT node by:

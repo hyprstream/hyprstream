@@ -43,11 +43,13 @@ impl CacheManager {
                 }
 
                 // Calculate cutoff timestamp
-                let cutoff = now
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(|e| Status::internal(e.to_string()))?
-                    .as_secs() as i64
-                    - ttl as i64;
+                let now_secs = i64::try_from(
+                    now.duration_since(UNIX_EPOCH)
+                        .map_err(|e| Status::internal(e.to_string()))?
+                        .as_secs()
+                ).unwrap_or(i64::MAX);
+                let ttl_secs = i64::try_from(ttl).unwrap_or(i64::MAX);
+                let cutoff = now_secs.saturating_sub(ttl_secs);
 
                 // Update last eviction time
                 *self.last_eviction.write().await = now;

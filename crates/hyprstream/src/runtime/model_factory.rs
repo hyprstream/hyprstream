@@ -325,9 +325,9 @@ impl ModelFactory {
             let tensor_kind = match tensor_view.dtype() {
                 safetensors::Dtype::BF16 => tch::Kind::BFloat16,
                 safetensors::Dtype::F16 => tch::Kind::Half,
-                safetensors::Dtype::F32 => tch::Kind::Float,
                 safetensors::Dtype::F64 => tch::Kind::Double,
-                _ => tch::Kind::Float, // Default fallback
+                // F32 and other types default to Float
+                _ => tch::Kind::Float,
             };
 
             // Calculate tensor size for progress reporting
@@ -480,7 +480,7 @@ impl ModelFactory {
                 }
             };
 
-            weights.insert(name.to_string(), tensor);
+            weights.insert(name.clone(), tensor);
         }
 
         info!(

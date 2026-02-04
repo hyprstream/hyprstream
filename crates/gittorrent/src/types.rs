@@ -305,9 +305,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_sha256_creation() {
-        let sha256 = Sha256Hash::new("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap();
+    fn test_sha256_creation() -> crate::error::Result<()> {
+        let sha256 = Sha256Hash::new("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")?;
         assert_eq!(sha256.as_str(), "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        Ok(())
     }
 
     #[test]
@@ -318,9 +319,9 @@ mod tests {
     }
 
     #[test]
-    fn test_gittorrent_url_parsing() {
+    fn test_gittorrent_url_parsing() -> crate::error::Result<()> {
         // Test commit hash URL (new format)
-        let url = GitTorrentUrl::parse("gittorrent://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap();
+        let url = GitTorrentUrl::parse("gittorrent://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")?;
         match url {
             GitTorrentUrl::Commit { hash } => {
                 assert_eq!(hash.as_str(), "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
@@ -329,7 +330,7 @@ mod tests {
         }
 
         // Test commit hash with refs URL
-        let url = GitTorrentUrl::parse("gittorrent://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef?refs").unwrap();
+        let url = GitTorrentUrl::parse("gittorrent://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef?refs")?;
         match url {
             GitTorrentUrl::CommitWithRefs { hash } => {
                 assert_eq!(hash.as_str(), "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
@@ -338,7 +339,7 @@ mod tests {
         }
 
         // Test git server URL (legacy)
-        let url = GitTorrentUrl::parse("gittorrent://github.com/user/repo").unwrap();
+        let url = GitTorrentUrl::parse("gittorrent://github.com/user/repo")?;
         match url {
             GitTorrentUrl::GitServer { server, repo } => {
                 assert_eq!(server, "github.com");
@@ -348,50 +349,54 @@ mod tests {
         }
 
         // Test username URL
-        let url = GitTorrentUrl::parse("gittorrent://username").unwrap();
+        let url = GitTorrentUrl::parse("gittorrent://username")?;
         match url {
             GitTorrentUrl::Username { username } => {
                 assert_eq!(username, "username");
             }
             _ => panic!("Expected Username variant"),
         }
+        Ok(())
     }
 
     #[test]
-    fn test_gittorrent_url_roundtrip() {
+    fn test_gittorrent_url_roundtrip() -> crate::error::Result<()> {
         let test_hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
         // Test commit URL
-        let url1 = GitTorrentUrl::parse(&format!("gittorrent://{test_hash}")).unwrap();
+        let url1 = GitTorrentUrl::parse(&format!("gittorrent://{test_hash}"))?;
         assert_eq!(url1.to_string(), format!("gittorrent://{test_hash}"));
 
         // Test commit with refs URL
-        let url2 = GitTorrentUrl::parse(&format!("gittorrent://{test_hash}?refs")).unwrap();
+        let url2 = GitTorrentUrl::parse(&format!("gittorrent://{test_hash}?refs"))?;
         assert_eq!(url2.to_string(), format!("gittorrent://{test_hash}?refs"));
+        Ok(())
     }
 
     #[test]
-    fn test_git_hash_sha1() {
+    fn test_git_hash_sha1() -> crate::error::Result<()> {
         // 40 hex chars = SHA1
         let sha1_hex = "0123456789abcdef0123456789abcdef01234567";
-        let hash = GitHash::from_hex(sha1_hex).unwrap();
+        let hash = GitHash::from_hex(sha1_hex)?;
 
         assert!(hash.is_sha1());
         assert!(!hash.is_sha256());
         assert_eq!(hash.to_hex(), sha1_hex);
         assert_eq!(hash.as_bytes().len(), 20);
+        Ok(())
     }
 
     #[test]
-    fn test_git_hash_sha256() {
+    fn test_git_hash_sha256() -> crate::error::Result<()> {
         // 64 hex chars = SHA256
         let sha256_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let hash = GitHash::from_hex(sha256_hex).unwrap();
+        let hash = GitHash::from_hex(sha256_hex)?;
 
         assert!(hash.is_sha256());
         assert!(!hash.is_sha1());
         assert_eq!(hash.to_hex(), sha256_hex);
         assert_eq!(hash.as_bytes().len(), 32);
+        Ok(())
     }
 
     #[test]
@@ -407,14 +412,14 @@ mod tests {
     }
 
     #[test]
-    fn test_git_hash_dht_key_domain_separation() {
+    fn test_git_hash_dht_key_domain_separation() -> crate::error::Result<()> {
         // Same first 20 bytes, different algorithm -> different DHT keys
         // SHA1: 40 hex chars, SHA256: 64 hex chars (same prefix + 24 zero chars)
         let sha1_hex = "0123456789abcdef0123456789abcdef01234567";
         let sha256_hex = "0123456789abcdef0123456789abcdef01234567000000000000000000000000";
 
-        let sha1_hash = GitHash::from_hex(sha1_hex).unwrap();
-        let sha256_hash = GitHash::from_hex(sha256_hex).unwrap();
+        let sha1_hash = GitHash::from_hex(sha1_hex)?;
+        let sha256_hash = GitHash::from_hex(sha256_hex)?;
 
         let sha1_dht_key = sha1_hash.to_dht_key();
         let sha256_dht_key = sha256_hash.to_dht_key();
@@ -425,23 +430,26 @@ mod tests {
         // Both DHT keys should be 32 bytes (256-bit)
         assert_eq!(sha1_dht_key.len(), 32);
         assert_eq!(sha256_dht_key.len(), 32);
+        Ok(())
     }
 
     #[test]
-    fn test_git_hash_dht_key_deterministic() {
+    fn test_git_hash_dht_key_deterministic() -> crate::error::Result<()> {
         let sha1_hex = "0123456789abcdef0123456789abcdef01234567";
-        let hash1 = GitHash::from_hex(sha1_hex).unwrap();
-        let hash2 = GitHash::from_hex(sha1_hex).unwrap();
+        let hash1 = GitHash::from_hex(sha1_hex)?;
+        let hash2 = GitHash::from_hex(sha1_hex)?;
 
         // Same input -> same DHT key
         assert_eq!(hash1.to_dht_key(), hash2.to_dht_key());
+        Ok(())
     }
 
     #[test]
-    fn test_git_hash_display() {
+    fn test_git_hash_display() -> crate::error::Result<()> {
         let sha1_hex = "0123456789abcdef0123456789abcdef01234567";
-        let hash = GitHash::from_hex(sha1_hex).unwrap();
+        let hash = GitHash::from_hex(sha1_hex)?;
         assert_eq!(format!("{hash}"), sha1_hex);
+        Ok(())
     }
 
     #[test]

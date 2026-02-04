@@ -86,7 +86,8 @@ pub use core::{
 };
 
 pub use traits::{
-    RegistryClient, RegistryServiceError, RemoteInfo, RepositoryClient, WorktreeInfo,
+    CloneOptions, DetailedStatus, FileChangeType, FileStatus, ModelInfo, RegistryClient,
+    RegistryServiceError, RemoteInfo, RepositoryClient, WorktreeInfo,
 };
 
 pub use inference::{InferenceService, InferenceZmqClient, INFERENCE_ENDPOINT};

@@ -145,7 +145,7 @@ impl ImageZmq {
 #[async_trait]
 impl ImageClient for ImageZmq {
     async fn list_images(&self, _filter: Option<&ImageFilter>) -> Result<Vec<Image>> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("ImageZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn image_status(
@@ -153,7 +153,7 @@ impl ImageClient for ImageZmq {
         _image: &ImageSpec,
         _verbose: bool,
     ) -> Result<ImageStatusResponse> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("ImageZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn pull_image(
@@ -161,14 +161,14 @@ impl ImageClient for ImageZmq {
         _image: &ImageSpec,
         _auth: Option<&AuthConfig>,
     ) -> Result<String> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("ImageZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn remove_image(&self, _image: &ImageSpec) -> Result<()> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("ImageZmq: ZMQ transport not yet implemented").into())
     }
 
     async fn image_fs_info(&self) -> Result<Vec<FilesystemUsage>> {
-        todo!("Implement ZMQ call")
+        Err(anyhow::anyhow!("ImageZmq: ZMQ transport not yet implemented").into())
     }
 }

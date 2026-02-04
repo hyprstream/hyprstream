@@ -232,7 +232,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_chained_hmac_compute_verify() {
+    fn test_chained_hmac_compute_verify() -> crate::EnvelopeResult<()> {
         let key = [0x42u8; 32];
         let request_id = 12345u64;
 
@@ -244,9 +244,10 @@ mod tests {
 
         // Verifier side
         let mut verifier = ChainedStreamHmac::from_bytes(key, request_id);
-        verifier.verify_next(b"chunk 1", &mac1).unwrap();
-        verifier.verify_next(b"chunk 2", &mac2).unwrap();
-        verifier.verify_next(b"chunk 3", &mac3).unwrap();
+        verifier.verify_next(b"chunk 1", &mac1)?;
+        verifier.verify_next(b"chunk 2", &mac2)?;
+        verifier.verify_next(b"chunk 3", &mac3)?;
+        Ok(())
     }
 
     #[test]
@@ -263,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn test_chained_hmac_reordering_fails() {
+    fn test_chained_hmac_reordering_fails() -> crate::EnvelopeResult<()> {
         let key = [0x42u8; 32];
         let request_id = 12345u64;
 
@@ -280,10 +281,11 @@ mod tests {
         assert!(matches!(result, Err(EnvelopeError::InvalidHmac)));
 
         // Now verify chunk 1 (should work)
-        verifier.verify_next(b"chunk 1", &mac1).unwrap();
+        verifier.verify_next(b"chunk 1", &mac1)?;
 
         // Now chunk 2 should work
-        verifier.verify_next(b"chunk 2", &mac2).unwrap();
+        verifier.verify_next(b"chunk 2", &mac2)?;
+        Ok(())
     }
 
     #[test]
@@ -341,7 +343,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_legacy_hmac_compute_verify() {
+    fn test_legacy_hmac_compute_verify() -> crate::EnvelopeResult<()> {
         let key = [0x42u8; 32];
         let hmac = StreamHmac::from_bytes(key);
 
@@ -350,7 +352,8 @@ mod tests {
         let data = b"test chunk data";
 
         let mac = hmac.compute(request_id, sequence, data);
-        hmac.verify(request_id, sequence, data, &mac).unwrap();
+        hmac.verify(request_id, sequence, data, &mac)?;
+        Ok(())
     }
 
     #[test]

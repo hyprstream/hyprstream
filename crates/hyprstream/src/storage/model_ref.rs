@@ -165,81 +165,75 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_model_ref() {
+    fn test_parse_model_ref() -> Result<()> {
         // Model only (default branch)
-        let ref1 = ModelRef::parse("llama3").expect("test: parse model ref");
+        let ref1 = ModelRef::parse("llama3")?;
         assert_eq!(ref1.model, "llama3");
         assert_eq!(ref1.git_ref, GitRef::DefaultBranch);
 
         // Model with branch
-        let ref2 = ModelRef::parse("llama3:main").expect("test: parse model ref");
+        let ref2 = ModelRef::parse("llama3:main")?;
         assert_eq!(ref2.model, "llama3");
         assert_eq!(ref2.git_ref, GitRef::Branch("main".to_owned()));
 
         // Model with tag (must use explicit tag syntax)
-        let ref3 = ModelRef::parse("llama3:tags/v2.0").expect("test: parse model ref");
+        let ref3 = ModelRef::parse("llama3:tags/v2.0")?;
         assert_eq!(ref3.model, "llama3");
         assert_eq!(ref3.git_ref, GitRef::Tag("v2.0".to_owned()));
 
         // Model with commit SHA
-        let ref4 = ModelRef::parse("llama3:1234567890abcdef1234567890abcdef12345678").expect("test: parse model ref");
+        let ref4 = ModelRef::parse("llama3:1234567890abcdef1234567890abcdef12345678")?;
         assert_eq!(ref4.model, "llama3");
-        if let GitRef::Commit(oid) = ref4.git_ref {
-            assert_eq!(oid.to_string(), "1234567890abcdef1234567890abcdef12345678");
-        } else {
-            panic!("Expected GitRef::Commit");
-        }
+        assert!(matches!(ref4.git_ref, GitRef::Commit(oid) if oid.to_string() == "1234567890abcdef1234567890abcdef12345678"));
 
         // Model with revspec
-        let ref5 = ModelRef::parse("llama3:HEAD~1").expect("test: parse model ref");
+        let ref5 = ModelRef::parse("llama3:HEAD~1")?;
         assert_eq!(ref5.model, "llama3");
         assert_eq!(ref5.git_ref, GitRef::Revspec("HEAD~1".to_owned()));
 
         // UUID backwards compatibility
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
-        let ref6 = ModelRef::parse(uuid).expect("test: parse model ref");
+        let ref6 = ModelRef::parse(uuid)?;
         assert_eq!(ref6.model, uuid);
         assert_eq!(ref6.git_ref, GitRef::DefaultBranch);
+        Ok(())
     }
 
     #[test]
-    fn test_git_ref_parsing() {
+    fn test_git_ref_parsing() -> Result<()> {
         // Test GitRef parsing (now using git2db's GitRef::parse)
         assert_eq!(
-            GitRef::parse("main").expect("test: parse git ref"),
+            GitRef::parse("main")?,
             GitRef::Branch("main".to_owned())
         );
         // Explicit tag syntax required
         assert!(matches!(
-            GitRef::parse("tags/v1.0.0").expect("test: parse git ref"),
+            GitRef::parse("tags/v1.0.0")?,
             GitRef::Tag(_)
         ));
         assert!(matches!(
-            GitRef::parse("HEAD~1").expect("test: parse git ref"),
+            GitRef::parse("HEAD~1")?,
             GitRef::Revspec(_) | GitRef::DefaultBranch
         ));
         assert!(matches!(
-            GitRef::parse("main^2").expect("test: parse git ref"),
+            GitRef::parse("main^2")?,
             GitRef::Revspec(_)
         ));
 
         // Full SHA
         let sha = "1234567890abcdef1234567890abcdef12345678";
-        if let GitRef::Commit(oid) = GitRef::parse(sha).expect("test: parse git ref") {
-            assert_eq!(oid.to_string(), sha);
-        } else {
-            panic!("Expected GitRef::Commit for full SHA");
-        }
+        assert!(matches!(GitRef::parse(sha)?, GitRef::Commit(oid) if oid.to_string() == sha));
 
         // Abbreviated SHA (should be treated as revspec)
         assert!(matches!(
-            GitRef::parse("1234567").expect("test: parse git ref"),
+            GitRef::parse("1234567")?,
             GitRef::Revspec(_)
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_git_ref_display() {
+    fn test_git_ref_display() -> Result<()> {
         // Test display_name (git2db's API)
         assert_eq!(GitRef::DefaultBranch.display_name(), "HEAD");
         assert_eq!(
@@ -253,15 +247,16 @@ mod tests {
             "HEAD~1"
         );
 
-        let oid = git2db::Oid::from_str("1234567890abcdef1234567890abcdef12345678").expect("test: parse oid");
+        let oid = git2db::Oid::from_str("1234567890abcdef1234567890abcdef12345678")?;
         // display_name shows abbreviated SHA
         assert!(GitRef::Commit(oid).display_name().contains("12345678"));
+        Ok(())
     }
 
     #[test]
-    fn test_model_ref_compatibility() {
+    fn test_model_ref_compatibility() -> Result<()> {
         // Test that the new API provides backward compatibility
-        let model_ref = ModelRef::parse("llama3:main").expect("test: parse model ref");
+        let model_ref = ModelRef::parse("llama3:main")?;
 
         // Should have compatible git_ref_str method
         assert_eq!(model_ref.git_ref_str(), Some("main".to_owned()));
@@ -270,9 +265,10 @@ mod tests {
         assert_eq!(model_ref.to_string(), "llama3:main");
 
         // Default branch should show just the model name
-        let default_ref = ModelRef::parse("llama3").expect("test: parse model ref");
+        let default_ref = ModelRef::parse("llama3")?;
         assert_eq!(default_ref.to_string(), "llama3");
         assert_eq!(default_ref.git_ref_str(), None);
+        Ok(())
     }
 
     #[test]
@@ -312,55 +308,55 @@ mod tests {
     }
 
     #[test]
-    fn test_git_ref_validation() {
+    fn test_git_ref_validation() -> Result<()> {
         // Test that git2db's GitRef parsing handles various git reference formats
 
         // Simple branch names
         assert!(matches!(
-            GitRef::parse("main").expect("test: parse git ref"),
+            GitRef::parse("main")?,
             GitRef::Branch(_)
         ));
         assert!(matches!(
-            GitRef::parse("feature/new-model").expect("test: parse git ref"),
+            GitRef::parse("feature/new-model")?,
             GitRef::Branch(_)
         ));
 
         // Tags (explicit tag syntax required)
         assert!(matches!(
-            GitRef::parse("tags/v1.0.0").expect("test: parse git ref"),
+            GitRef::parse("tags/v1.0.0")?,
             GitRef::Tag(_)
         ));
         assert!(matches!(
-            GitRef::parse("refs/tags/v2.1").expect("test: parse git ref"),
+            GitRef::parse("refs/tags/v2.1")?,
             GitRef::Tag(_)
         ));
 
         // Revspecs or DefaultBranch
         // Note: git2db treats "HEAD" as DefaultBranch, not Revspec
         assert!(matches!(
-            GitRef::parse("HEAD").expect("test: parse git ref"),
+            GitRef::parse("HEAD")?,
             GitRef::DefaultBranch
         ));
         assert!(matches!(
-            GitRef::parse("main~1").expect("test: parse git ref"),
+            GitRef::parse("main~1")?,
             GitRef::Revspec(_)
         ));
         assert!(matches!(
-            GitRef::parse("HEAD^").expect("test: parse git ref"),
+            GitRef::parse("HEAD^")?,
             GitRef::Revspec(_)
         ));
         assert!(matches!(
-            GitRef::parse("branch..other").expect("test: parse git ref"),
+            GitRef::parse("branch..other")?,
             GitRef::Revspec(_)
         ));
         assert!(matches!(
-            GitRef::parse("branch@{HEAD}").expect("test: parse git ref"),
+            GitRef::parse("branch@{HEAD}")?,
             GitRef::Revspec(_)
         ));
 
         // Commits
         assert!(matches!(
-            GitRef::parse("1234567890abcdef1234567890abcdef12345678").expect("test: parse git ref"),
+            GitRef::parse("1234567890abcdef1234567890abcdef12345678")?,
             GitRef::Commit(_)
         ));
 
@@ -371,5 +367,6 @@ mod tests {
             "refs/heads/feature/new-model"
         ));
         assert!(git2::Reference::is_valid_name("HEAD"));
+        Ok(())
     }
 }

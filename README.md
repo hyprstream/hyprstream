@@ -30,18 +30,27 @@ Easy to get started, just down [Download](https://github.com/hyprstream/hyprstre
 
 ### Quick Install (AppImage)
 
-Download the Universal AppImage from the [v0.2.0 release](https://github.com/hyprstream/hyprstream/releases/tag/v0.2.0). We have published AppImages for each supported CPU and GPU configuration. Hyprstream requires the `git-lfs` package, which is available in all major distros.
+*NOTE:* Hyprstream requires the `git` and `git-lfs` packages, which are available in all major distros.
+
+Download the [Universal AppImage](https://github.com/hyprstream/hyprstream/releases/). We have published AppImages for each supported CPU and GPU configuration, but recommend the Universal image for easy-of-use and GPU auto-detection.
 
 ```bash
 # Download and install (Universal recommended)
 chmod +x hyprstream-v0.2.0-x86_64.AppImage
+
+# Install
 ./hyprstream-v0.2.0-x86_64.AppImage service install
 
-# Apply policy template - hyprstream is deny by default, the following treats local users as admins:
+# The following commands should use the installed copy
+export PATH="$HOME/.local/bin;$PATH"
+
+# Apply policy template - make local users admin; hyprstream is deny by default
 hyprstream policy apply-template local
+
+hyprstream service start
 ```
 
-For CUDA systems, make sure you have installed [CUDA Toolkit](https://developer.nvidia.com/cuda/toolkit) and set `LD_PRELOAD`:
+*Note*: For CUDA systems, make sure you have installed [CUDA Toolkit](https://developer.nvidia.com/cuda/toolkit) and set `LD_PRELOAD`:
 
 ```bash
 systemctl --user set-environment LD_PRELOAD=libtorch_cuda.so && systemctl --user restart hyprstream-model

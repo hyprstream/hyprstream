@@ -1,3 +1,4 @@
+#![allow(clippy::print_stdout)]
 //! Tests demonstrating the Send-safe clone API
 //!
 //! This test file verifies that our API properly handles the Send trait
@@ -50,8 +51,8 @@ impl git2db::callback_config::ProgressReporter for TestProgressReporter {
 
 /// This test demonstrates using the API with a custom progress reporter
 #[tokio::test]
-async fn test_clone_with_send_safe_progress() {
-    let temp_dir = TempDir::new().unwrap();
+async fn test_clone_with_send_safe_progress() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = TempDir::new()?;
     let target_path = temp_dir.path().join("test_repo");
 
     // Create a custom progress reporter (Send + Sync)
@@ -87,15 +88,16 @@ async fn test_clone_with_send_safe_progress() {
     // Verify progress was reported
     let count = *counter.lock();
     assert!(count > 0, "Progress should have been reported");
+    Ok(())
 }
 
 /// This test verifies that the async future from clone_repository is Send
 #[tokio::test]
-async fn test_clone_future_is_send() {
+async fn test_clone_future_is_send() -> Result<(), Box<dyn std::error::Error>> {
     fn assert_future_send<F: std::future::Future + Send>(_f: F) {}
 
     let manager = GitManager::global();
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new()?;
     let target_path = temp_dir.path().join("test_repo");
 
     let options = CloneOptionsBuilder::new()
@@ -115,6 +117,7 @@ async fn test_clone_future_is_send() {
 
     // This should compile - the future is Send
     assert_future_send(future);
+    Ok(())
 }
 
 /// Test that we can use the API from multiple async tasks
@@ -126,7 +129,10 @@ async fn test_concurrent_clones_with_send() {
     let handles: Vec<_> = (0..3)
         .map(|i| {
             tokio::spawn(async move {
-                let temp_dir = TempDir::new().unwrap();
+                let temp_dir = match TempDir::new() {
+                    Ok(dir) => dir,
+                    Err(_) => return false,
+                };
                 let target_path = temp_dir.path().join(format!("repo_{i}"));
 
                 let options = CloneOptionsBuilder::new()
@@ -155,7 +161,10 @@ async fn test_concurrent_clones_with_send() {
 
     // All tasks should complete successfully
     for handle in handles {
-        let success = handle.await.unwrap();
+        let success = match handle.await {
+            Ok(s) => s,
+            Err(e) => panic!("Task join error: {e}"),
+        };
         assert!(success, "Clone should succeed in async task");
     }
 }

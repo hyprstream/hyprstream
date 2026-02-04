@@ -364,8 +364,8 @@ impl ModelConfig {
         // Note: DO NOT use rope_theta or other config values to detect version
         // as these are not reliable indicators
         match architecture {
-            ModelArchitecture::Qwen => 2,  // Default to Qwen2 if unknown
-            ModelArchitecture::Llama => 2, // Default to Llama2 if unknown
+            // Default to version 2 for Qwen/Llama if unknown
+            ModelArchitecture::Qwen | ModelArchitecture::Llama => 2,
             _ => 1,
         }
     }

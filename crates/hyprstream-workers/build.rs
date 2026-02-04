@@ -1,9 +1,11 @@
 //! Build script for Cap'n Proto schema compilation
 
 fn main() {
-    capnpc::CompilerCommand::new()
+    if let Err(e) = capnpc::CompilerCommand::new()
         .src_prefix("schema")
         .file("schema/workers.capnp")
         .run()
-        .expect("Failed to compile Cap'n Proto schema");
+    {
+        panic!("Failed to compile Cap'n Proto schema: {e}");
+    }
 }

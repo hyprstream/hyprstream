@@ -97,8 +97,10 @@ impl VectorizedOperator {
                 // Element-wise addition
                 match (left.data_type(), right.data_type()) {
                     (DataType::Float32, DataType::Float32) => {
-                        let l = left.as_any().downcast_ref::<Float32Array>().unwrap();
-                        let r = right.as_any().downcast_ref::<Float32Array>().unwrap();
+                        let l = left.as_any().downcast_ref::<Float32Array>()
+                            .ok_or_else(|| DataFusionError::Internal("Failed to downcast to Float32Array".to_owned()))?;
+                        let r = right.as_any().downcast_ref::<Float32Array>()
+                            .ok_or_else(|| DataFusionError::Internal("Failed to downcast to Float32Array".to_owned()))?;
                         let mut result = Vec::with_capacity(l.len());
                         for i in 0..l.len() {
                             result.push(l.value(i) + r.value(i));
@@ -106,8 +108,10 @@ impl VectorizedOperator {
                         Ok(Arc::new(Float32Array::from(result)) as ArrayRef)
                     }
                     (DataType::Float64, DataType::Float64) => {
-                        let l = left.as_any().downcast_ref::<Float64Array>().unwrap();
-                        let r = right.as_any().downcast_ref::<Float64Array>().unwrap();
+                        let l = left.as_any().downcast_ref::<Float64Array>()
+                            .ok_or_else(|| DataFusionError::Internal("Failed to downcast to Float64Array".to_owned()))?;
+                        let r = right.as_any().downcast_ref::<Float64Array>()
+                            .ok_or_else(|| DataFusionError::Internal("Failed to downcast to Float64Array".to_owned()))?;
                         let mut result = Vec::with_capacity(l.len());
                         for i in 0..l.len() {
                             result.push(l.value(i) + r.value(i));
@@ -123,8 +127,10 @@ impl VectorizedOperator {
                 // Element-wise multiplication
                 match (left.data_type(), right.data_type()) {
                     (DataType::Float32, DataType::Float32) => {
-                        let l = left.as_any().downcast_ref::<Float32Array>().unwrap();
-                        let r = right.as_any().downcast_ref::<Float32Array>().unwrap();
+                        let l = left.as_any().downcast_ref::<Float32Array>()
+                            .ok_or_else(|| DataFusionError::Internal("Failed to downcast to Float32Array".to_owned()))?;
+                        let r = right.as_any().downcast_ref::<Float32Array>()
+                            .ok_or_else(|| DataFusionError::Internal("Failed to downcast to Float32Array".to_owned()))?;
                         let mut result = Vec::with_capacity(l.len());
                         for i in 0..l.len() {
                             result.push(l.value(i) * r.value(i));
@@ -132,8 +138,10 @@ impl VectorizedOperator {
                         Ok(Arc::new(Float32Array::from(result)) as ArrayRef)
                     }
                     (DataType::Float64, DataType::Float64) => {
-                        let l = left.as_any().downcast_ref::<Float64Array>().unwrap();
-                        let r = right.as_any().downcast_ref::<Float64Array>().unwrap();
+                        let l = left.as_any().downcast_ref::<Float64Array>()
+                            .ok_or_else(|| DataFusionError::Internal("Failed to downcast to Float64Array".to_owned()))?;
+                        let r = right.as_any().downcast_ref::<Float64Array>()
+                            .ok_or_else(|| DataFusionError::Internal("Failed to downcast to Float64Array".to_owned()))?;
                         let mut result = Vec::with_capacity(l.len());
                         for i in 0..l.len() {
                             result.push(l.value(i) * r.value(i));
@@ -149,8 +157,10 @@ impl VectorizedOperator {
                 // Dot product using element-wise multiply and sum
                 match (left.data_type(), right.data_type()) {
                     (DataType::Float32, DataType::Float32) => {
-                        let l = left.as_any().downcast_ref::<Float32Array>().unwrap();
-                        let r = right.as_any().downcast_ref::<Float32Array>().unwrap();
+                        let l = left.as_any().downcast_ref::<Float32Array>()
+                            .ok_or_else(|| DataFusionError::Internal("Failed to downcast to Float32Array".to_owned()))?;
+                        let r = right.as_any().downcast_ref::<Float32Array>()
+                            .ok_or_else(|| DataFusionError::Internal("Failed to downcast to Float32Array".to_owned()))?;
                         let mut sum = 0.0;
                         for i in 0..l.len() {
                             sum += l.value(i) * r.value(i);
@@ -166,7 +176,8 @@ impl VectorizedOperator {
                 // L2 normalization
                 match left.data_type() {
                     DataType::Float32 => {
-                        let arr = left.as_any().downcast_ref::<Float32Array>().unwrap();
+                        let arr = left.as_any().downcast_ref::<Float32Array>()
+                            .ok_or_else(|| DataFusionError::Internal("Failed to downcast to Float32Array".to_owned()))?;
                         let norm = (arr.iter().flatten().map(|x| x * x).sum::<f32>()).sqrt();
                         let normalized = arr.iter().map(|x| x.map(|v| v / norm));
                         Ok(Arc::new(Float32Array::from_iter(normalized)) as ArrayRef)
@@ -180,8 +191,10 @@ impl VectorizedOperator {
                 // Cosine similarity using dot product and norms
                 match (left.data_type(), right.data_type()) {
                     (DataType::Float32, DataType::Float32) => {
-                        let l = left.as_any().downcast_ref::<Float32Array>().unwrap();
-                        let r = right.as_any().downcast_ref::<Float32Array>().unwrap();
+                        let l = left.as_any().downcast_ref::<Float32Array>()
+                            .ok_or_else(|| DataFusionError::Internal("Failed to downcast to Float32Array".to_owned()))?;
+                        let r = right.as_any().downcast_ref::<Float32Array>()
+                            .ok_or_else(|| DataFusionError::Internal("Failed to downcast to Float32Array".to_owned()))?;
 
                         let mut dot_product = 0.0;
                         for i in 0..l.len() {

@@ -2,8 +2,7 @@
 
 use crate::{
     api::training_service::TrainingService,
-    services::{ModelZmqClient, PolicyZmqClient},
-    storage::ModelStorage,
+    services::{ModelZmqClient, PolicyZmqClient, RegistryClient},
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::sync::Arc;
@@ -24,8 +23,8 @@ pub struct ServerState {
     /// Policy client for authorization checks via ZMQ
     pub policy_client: PolicyZmqClient,
 
-    /// Model storage for managing downloaded models
-    pub model_storage: Arc<ModelStorage>,
+    /// Registry client for model operations
+    pub registry: Arc<dyn RegistryClient>,
 
     /// Training service for supervised learning
     pub training_service: Arc<TrainingService>,
@@ -82,7 +81,7 @@ impl ServerState {
         config: ServerConfig,
         model_client: ModelZmqClient,
         policy_client: PolicyZmqClient,
-        model_storage: Arc<ModelStorage>,
+        registry: Arc<dyn RegistryClient>,
         signing_key: SigningKey,
     ) -> Result<Self, anyhow::Error> {
         let verifying_key = signing_key.verifying_key();
@@ -97,7 +96,7 @@ impl ServerState {
             tracing::info!("Preloading {} models", config.preload_models.len());
             for model_name in &config.preload_models {
                 tracing::info!("Preloading model: {}", model_name);
-                match model_client.load(model_name).await {
+                match model_client.load(model_name, None).await {
                     Ok(_) => tracing::info!("Preloaded: {}", model_name),
                     Err(e) => tracing::warn!("Failed to preload model '{}': {}", model_name, e),
                 }
@@ -110,7 +109,7 @@ impl ServerState {
         Ok(Self {
             model_client,
             policy_client,
-            model_storage,
+            registry,
             training_service,
             config: Arc::new(config),
             metrics,

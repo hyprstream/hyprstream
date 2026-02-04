@@ -160,7 +160,12 @@ impl SpawnerBackend for StandaloneBackend {
                 "Process not in map, attempting direct kill by PID"
             );
 
-            let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
+            // PIDs are always positive and fit in i32 on Unix
+            let Some(pid_i32) = i32::try_from(pid).ok().filter(|&p| p > 0) else {
+                tracing::warn!(pid = %pid, "Invalid PID, skipping kill");
+                return Ok(());
+            };
+            let nix_pid = nix::unistd::Pid::from_raw(pid_i32);
 
             // Send SIGTERM
             if let Err(e) = nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGTERM) {
@@ -206,11 +211,15 @@ impl SpawnerBackend for StandaloneBackend {
         };
 
         // Check if the process exists by sending signal 0
-        let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
+        // PIDs are always positive and fit in i32 on Unix
+        let Some(pid_i32) = i32::try_from(pid).ok().filter(|&p| p > 0) else {
+            return Ok(false); // Invalid PID means not running
+        };
+        let nix_pid = nix::unistd::Pid::from_raw(pid_i32);
         match nix::sys::signal::kill(nix_pid, None) {
-            Ok(()) => Ok(true),                         // Process exists
+            // Process exists (Ok) or exists but we can't signal it (EPERM)
+            Ok(()) | Err(nix::errno::Errno::EPERM) => Ok(true),
             Err(nix::errno::Errno::ESRCH) => Ok(false), // No such process
-            Err(nix::errno::Errno::EPERM) => Ok(true),  // Process exists but we can't signal it
             Err(e) => {
                 tracing::warn!(pid = %pid, error = %e, "Error checking process status");
                 Ok(false)
@@ -241,7 +250,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_spawn_and_stop() {
+    async fn test_spawn_and_stop() -> crate::Result<()> {
         let backend = StandaloneBackend::new();
 
         // Spawn a simple process (sleep)
@@ -255,24 +264,26 @@ mod tests {
                 assert!(process.pid().is_some());
 
                 // Check it's running
-                let running = backend.is_running(&process).await.unwrap();
+                let running = backend.is_running(&process).await?;
                 assert!(running, "Process should be running");
 
                 // Stop it
-                backend.stop(&process).await.unwrap();
+                backend.stop(&process).await?;
 
                 // Give it a moment to die
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
                 // Check it's stopped
-                let running = backend.is_running(&process).await.unwrap();
+                let running = backend.is_running(&process).await?;
                 assert!(!running, "Process should be stopped");
             }
+            #[allow(clippy::print_stderr)]
             Err(e) => {
                 // sleep might not be available in some test environments
                 eprintln!("Could not spawn test process: {e}");
             }
         }
+        Ok(())
     }
 
     #[test]

@@ -1,12 +1,13 @@
+#![allow(clippy::print_stdout)]
 //! Integration tests for transaction commit logic
 
 use git2db::{Git2DB, IsolationMode};
 use tempfile::TempDir;
 
 #[tokio::test]
-async fn test_transaction_commit_clone() {
-    let temp_dir = TempDir::new().unwrap();
-    let mut registry = Git2DB::open(temp_dir.path()).await.unwrap();
+async fn test_transaction_commit_clone() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = TempDir::new()?;
+    let mut registry = Git2DB::open(temp_dir.path()).await?;
 
     // Verify empty registry
     assert_eq!(registry.list().count(), 0);
@@ -14,14 +15,12 @@ async fn test_transaction_commit_clone() {
     // Start transaction with optimistic mode (fastest for testing)
     let tx = registry
         .start_transaction_with_mode(IsolationMode::Optimistic)
-        .await
-        .unwrap();
+        .await?;
 
     // Queue a clone operation
     let id = tx
         .clone_repo("git", "https://github.com/git/git.git")
-        .await
-        .unwrap();
+        .await?;
 
     println!("Queued clone operation with ID: {id}");
 
@@ -34,7 +33,7 @@ async fn test_transaction_commit_clone() {
 
     // Commit the transaction
     println!("Committing transaction...");
-    tx.commit_to(&mut registry).await.unwrap();
+    tx.commit_to(&mut registry).await?;
 
     // Now repository should exist
     let repos: Vec<_> = registry.list().collect();
@@ -43,29 +42,28 @@ async fn test_transaction_commit_clone() {
     assert_eq!(repos[0].name.as_deref(), Some("git"), "Name should match");
 
     println!("✓ Transaction committed successfully");
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_transaction_rollback() {
-    let temp_dir = TempDir::new().unwrap();
-    let registry = Git2DB::open(temp_dir.path()).await.unwrap();
+async fn test_transaction_rollback() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = TempDir::new()?;
+    let registry = Git2DB::open(temp_dir.path()).await?;
 
     // Start transaction
     let tx = registry
         .start_transaction_with_mode(IsolationMode::Optimistic)
-        .await
-        .unwrap();
+        .await?;
 
     // Queue operation
     let id = tx
         .clone_repo("git", "https://github.com/git/git.git")
-        .await
-        .unwrap();
+        .await?;
 
     println!("Queued clone with ID: {id}, now rolling back...");
 
     // Rollback instead of commit
-    tx.rollback().await.unwrap();
+    tx.rollback().await?;
 
     // Repository should NOT exist
     assert_eq!(
@@ -75,35 +73,33 @@ async fn test_transaction_rollback() {
     );
 
     println!("✓ Transaction rolled back successfully");
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_transaction_multiple_operations() {
-    let temp_dir = TempDir::new().unwrap();
-    let mut registry = Git2DB::open(temp_dir.path()).await.unwrap();
+async fn test_transaction_multiple_operations() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = TempDir::new()?;
+    let mut registry = Git2DB::open(temp_dir.path()).await?;
 
     // Start transaction
     let tx = registry
         .start_transaction_with_mode(IsolationMode::Optimistic)
-        .await
-        .unwrap();
+        .await?;
 
     // Queue multiple operations
     let id1 = tx
         .clone_repo("git", "https://github.com/git/git.git")
-        .await
-        .unwrap();
+        .await?;
 
     let id2 = tx
         .clone_repo("git2-rs", "https://github.com/rust-lang/git2-rs.git")
-        .await
-        .unwrap();
+        .await?;
 
     println!("Queued 2 clone operations");
     println!("Operations: {:?}", tx.operations().await);
 
     // Commit
-    tx.commit_to(&mut registry).await.unwrap();
+    tx.commit_to(&mut registry).await?;
 
     // Both should exist
     let repos: Vec<_> = registry.list().collect();
@@ -116,42 +112,39 @@ async fn test_transaction_multiple_operations() {
     );
 
     println!("✓ Multiple operations committed successfully");
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_transaction_ensure_idempotent() {
-    let temp_dir = TempDir::new().unwrap();
-    let mut registry = Git2DB::open(temp_dir.path()).await.unwrap();
+async fn test_transaction_ensure_idempotent() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = TempDir::new()?;
+    let mut registry = Git2DB::open(temp_dir.path()).await?;
 
     // First transaction: add repository
     let tx1 = registry
         .start_transaction_with_mode(IsolationMode::Optimistic)
-        .await
-        .unwrap();
+        .await?;
 
     let id1 = tx1
         .ensure("git", "https://github.com/git/git.git")
-        .await
-        .unwrap();
+        .await?;
 
-    tx1.commit_to(&mut registry).await.unwrap();
+    tx1.commit_to(&mut registry).await?;
 
     // Second transaction: ensure same repository (should return existing)
     let tx2 = registry
         .start_transaction_with_mode(IsolationMode::Optimistic)
-        .await
-        .unwrap();
+        .await?;
 
     let id2 = tx2
         .ensure("git", "https://github.com/git/git.git")
-        .await
-        .unwrap();
+        .await?;
 
     // Should return the existing ID without cloning again
     assert_eq!(id1, id2, "ensure() should return existing repository ID");
 
     // Commit should be no-op
-    tx2.commit_to(&mut registry).await.unwrap();
+    tx2.commit_to(&mut registry).await?;
 
     // Still only one repository
     assert_eq!(
@@ -161,29 +154,28 @@ async fn test_transaction_ensure_idempotent() {
     );
 
     println!("✓ ensure() is idempotent");
+    Ok(())
 }
 
 #[tokio::test]
 #[ignore] // Requires network access
-async fn test_transaction_worktree_mode() {
-    let temp_dir = TempDir::new().unwrap();
-    let mut registry = Git2DB::open(temp_dir.path()).await.unwrap();
+async fn test_transaction_worktree_mode() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = TempDir::new()?;
+    let mut registry = Git2DB::open(temp_dir.path()).await?;
 
     // Start transaction with full worktree isolation
     let tx = registry
         .start_transaction_with_mode(IsolationMode::Worktree)
-        .await
-        .unwrap();
+        .await?;
 
     let id = tx
         .clone_repo("git", "https://github.com/git/git.git")
-        .await
-        .unwrap();
+        .await?;
 
     println!("Queued clone in worktree mode");
 
     // Commit (this will create and then prune a git worktree)
-    tx.commit_to(&mut registry).await.unwrap();
+    tx.commit_to(&mut registry).await?;
 
     // Verify repository exists
     assert!(registry.get_by_id(&id).is_some(), "Repository should exist");
@@ -191,7 +183,7 @@ async fn test_transaction_worktree_mode() {
     // Verify worktree was cleaned up
     let worktrees_dir = temp_dir.path().join(".registry/.worktrees");
     if worktrees_dir.exists() {
-        let entries = std::fs::read_dir(&worktrees_dir).unwrap();
+        let entries = std::fs::read_dir(&worktrees_dir)?;
         assert_eq!(
             entries.count(),
             0,
@@ -200,20 +192,22 @@ async fn test_transaction_worktree_mode() {
     }
 
     println!("✓ Worktree mode works correctly");
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_registry_version_accessor() {
-    let temp_dir = TempDir::new().unwrap();
-    let registry = Git2DB::open(temp_dir.path()).await.unwrap();
+async fn test_registry_version_accessor() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = TempDir::new()?;
+    let registry = Git2DB::open(temp_dir.path()).await?;
 
     // Verify registry exposes a non-empty version from metadata
     let version = registry.version();
     assert!(!version.is_empty(), "Registry should have a version");
 
     // Version should be a valid semver-like string
+    let first_char = version.chars().next().ok_or("Version string is empty")?;
     assert!(
-        version.chars().next().unwrap().is_ascii_digit(),
+        first_char.is_ascii_digit(),
         "Version should start with a digit"
     );
 
@@ -224,11 +218,11 @@ async fn test_registry_version_accessor() {
     // (transaction snapshots use registry.version() internally)
     let _tx = registry
         .start_transaction_with_mode(IsolationMode::Optimistic)
-        .await
-        .unwrap();
+        .await?;
 
     // Version should still be accessible and unchanged
     assert_eq!(registry.version(), version);
 
     println!("✓ Registry version accessor works correctly");
+    Ok(())
 }

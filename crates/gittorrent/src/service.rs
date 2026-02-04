@@ -408,8 +408,8 @@ impl GitTorrentService {
                             let obj_type = match parts[0] {
                                 "commit" => GitObjectType::Commit,
                                 "tree" => GitObjectType::Tree,
-                                "blob" => GitObjectType::Blob,
                                 "tag" => GitObjectType::Tag,
+                                // "blob" or unknown types default to Blob
                                 _ => GitObjectType::Blob,
                             };
 
@@ -708,36 +708,39 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
-    async fn test_service_creation() {
-        let temp_dir = TempDir::new().unwrap();
+    async fn test_service_creation() -> crate::error::Result<()> {
+        let temp_dir = TempDir::new()?;
         let config = GitTorrentConfig {
             storage_dir: temp_dir.path().to_path_buf(),
             bootstrap_nodes: vec![],
             ..Default::default()
         };
 
-        let service = GitTorrentService::new(config).await.unwrap();
+        let service = GitTorrentService::new(config).await?;
         let stats = service.stats().await;
 
         assert_eq!(stats.repository_count, 0);
         assert_eq!(stats.object_count, 0);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_object_storage() {
-        let temp_dir = TempDir::new().unwrap();
+    async fn test_object_storage() -> crate::error::Result<()> {
+        let temp_dir = TempDir::new()?;
         let config = GitTorrentConfig {
             storage_dir: temp_dir.path().to_path_buf(),
             bootstrap_nodes: vec![],
             ..Default::default()
         };
 
-        let service = GitTorrentService::new(config).await.unwrap();
+        let service = GitTorrentService::new(config).await?;
 
         let test_data = b"hello world".to_vec();
-        let hash = service.put_object(test_data.clone()).await.unwrap();
+        let hash = service.put_object(test_data.clone()).await?;
 
-        let retrieved = service.get_object(&hash).await.unwrap().unwrap();
+        let retrieved = service.get_object(&hash).await?;
+        let retrieved = retrieved.ok_or_else(|| crate::Error::not_found("Object not found"))?;
         assert_eq!(retrieved, test_data);
+        Ok(())
     }
 }

@@ -10,7 +10,8 @@ use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use inventory;
 
 
@@ -272,13 +273,7 @@ impl WorktreeHandle {
     /// Async cleanup method
     pub async fn cleanup(&mut self) -> Git2DBResult<()> {
         if let Some(cleanup_arc) = self.cleanup.take() {
-            let cleanup_fn = {
-                if let Ok(mut cleanup_guard) = cleanup_arc.lock() {
-                    cleanup_guard.take()
-                } else {
-                    None
-                }
-            };
+            let cleanup_fn = cleanup_arc.lock().take();
 
             if let Some(cleanup_fn) = cleanup_fn {
                 cleanup_fn().await?;

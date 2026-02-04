@@ -46,9 +46,9 @@ impl From<SerializableSchema> for Schema {
                     match f.data_type.as_str() {
                         "Int64" => DataType::Int64,
                         "Float64" => DataType::Float64,
-                        "Utf8" => DataType::Utf8,
                         "Timestamp(Nanosecond, None)" => DataType::Timestamp(TimeUnit::Nanosecond, None),
-                        _ => DataType::Utf8, // Default to string for unknown types
+                        // "Utf8" and all other types default to string
+                        _ => DataType::Utf8,
                     },
                     f.nullable,
                 )

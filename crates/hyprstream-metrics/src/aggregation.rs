@@ -77,13 +77,14 @@ impl TimeWindow {
         match *self {
             TimeWindow::None => (i64::MIN, i64::MAX),
             TimeWindow::Fixed(duration) => {
-                let window_size = duration.as_secs() as i64;
+                // Duration in seconds is always positive, cap at i64::MAX (~292 billion years)
+                let window_size = i64::try_from(duration.as_secs()).unwrap_or(i64::MAX);
                 let window_start = (timestamp / window_size) * window_size;
                 (window_start, window_start + window_size)
             }
             TimeWindow::Sliding { window, slide } => {
-                let window_size = window.as_secs() as i64;
-                let slide_size = slide.as_secs() as i64;
+                let window_size = i64::try_from(window.as_secs()).unwrap_or(i64::MAX);
+                let slide_size = i64::try_from(slide.as_secs()).unwrap_or(i64::MAX);
                 let current_slide = (timestamp / slide_size) * slide_size;
                 (current_slide, current_slide + window_size)
             }

@@ -16,8 +16,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicU32, AtomicUsize, Ordering},
-    Arc, Mutex, PoisonError,
+    Arc,
 };
+use parking_lot::Mutex;
 use tch::{nn::VarStore, Device, Tensor};
 use tokenizers::Tokenizer;
 use tracing::{info, instrument, warn};
@@ -87,17 +88,6 @@ pub struct TorchEngine {
 
 /// Helper functions for tensor operations
 impl TorchEngine {
-    /// Handle mutex poisoning with recovery
-    fn handle_poison<T>(&self, result: Result<T, PoisonError<T>>) -> Result<T, anyhow::Error> {
-        match result {
-            Ok(guard) => Ok(guard),
-            Err(poisoned) => {
-                tracing::warn!("Mutex poisoned, recovering by taking inner value");
-                Ok(poisoned.into_inner())
-            }
-        }
-    }
-
     // ============================================================================
     // Lock Ordering for Thread Safety
     // ============================================================================
@@ -132,8 +122,8 @@ impl TorchEngine {
         ) -> Result<T>,
     {
         // IMPORTANT: Always acquire lora_model FIRST, then lora_trainer
-        let mut model_guard = self.handle_poison(self.lora_model.lock())?;
-        let mut trainer_guard = self.handle_poison(self.lora_trainer.lock())?;
+        let mut model_guard = self.lora_model.lock();
+        let mut trainer_guard = self.lora_trainer.lock();
 
         let model = model_guard
             .as_mut()
@@ -152,7 +142,7 @@ impl TorchEngine {
     where
         F: FnOnce(&crate::lora::torch_adapter::LoRAModel) -> Result<T>,
     {
-        let model_guard = self.handle_poison(self.lora_model.lock())?;
+        let model_guard = self.lora_model.lock();
         let model = model_guard
             .as_ref()
             .ok_or_else(|| anyhow!("LoRA model not initialized"))?;
@@ -164,7 +154,7 @@ impl TorchEngine {
     where
         F: FnOnce(&mut crate::lora::torch_adapter::LoRAModel) -> Result<T>,
     {
-        let mut model_guard = self.handle_poison(self.lora_model.lock())?;
+        let mut model_guard = self.lora_model.lock();
         let model = model_guard
             .as_mut()
             .ok_or_else(|| anyhow!("LoRA model not initialized"))?;
@@ -184,9 +174,9 @@ impl TorchEngine {
             size
         } else {
             // Fallback: try to get from tokenizer (shouldn't happen after load_tokenizer)
-            self.handle_poison(self.tokenizer.lock())
-                .ok()
-                .and_then(|guard| guard.as_ref().map(|t| t.get_vocab_size(true)))
+            self.tokenizer.lock()
+                .as_ref()
+                .map(|t| t.get_vocab_size(true))
                 .unwrap_or(0)  // Return 0 if tokenizer not loaded (caller should error)
         }
     }
@@ -247,7 +237,7 @@ impl TorchEngine {
             return Err(anyhow!("KV cache registry not initialized. Call initialize_kv_registry first."));
         }
 
-        let mut active_owner = self.handle_poison(self.active_cache_owner.lock())?;
+        let mut active_owner = self.active_cache_owner.lock();
 
         tracing::debug!("Setting active session to: {:?}", owner);
         *active_owner = Some(owner);
@@ -257,14 +247,12 @@ impl TorchEngine {
 
     /// Get the current active session owner
     pub fn get_session(&self) -> Option<crate::runtime::kv_cache::CacheOwner> {
-        self.handle_poison(self.active_cache_owner.lock())
-            .ok()
-            .and_then(|guard| guard.clone())
+        self.active_cache_owner.lock().clone()
     }
 
     /// Clear the active session (subsequent generations will use the model's internal cache)
     pub fn clear_session(&self) -> Result<()> {
-        let mut active_owner = self.handle_poison(self.active_cache_owner.lock())?;
+        let mut active_owner = self.active_cache_owner.lock();
         *active_owner = None;
         Ok(())
     }
@@ -429,7 +417,7 @@ impl TorchEngine {
 
         // Extract model info from the loaded model
         if let Some(model) = &self.persistent_model {
-            let _model_guard = self.handle_poison(model.lock())?;
+            let _model_guard = model.lock();
 
             // Get architecture info from the model
             // For now, use a default since we don't have a method to query this
@@ -437,23 +425,23 @@ impl TorchEngine {
 
             // Update model info
             {
-                let mut model_info_guard = self.handle_poison(self.model_info.lock())?;
+                let mut model_info_guard = self.model_info.lock();
                 model_info_guard.architecture = architecture.clone();
             }
 
             // Set architecture
             {
-                let mut arch_guard = self.handle_poison(self.model_architecture.lock())?;
+                let mut arch_guard = self.model_architecture.lock();
                 *arch_guard = Some(architecture.clone());
             }
         }
 
         // Get context window from model info that was populated from config
-        let context_window = self.handle_poison(self.model_info.lock())?.context_length;
+        let context_window = self.model_info.lock().context_length;
 
         // Initialize context state
         {
-            let mut context_guard = self.handle_poison(self.context_state.lock())?;
+            let mut context_guard = self.context_state.lock();
             *context_guard = Some(ContextState {
                 sequence_length: 0,
                 context_window,
@@ -464,7 +452,7 @@ impl TorchEngine {
         // Create dummy VarStore for backward compatibility
         {
             let vs = VarStore::new(self.device);
-            let mut var_store_guard = self.handle_poison(self.var_store.lock())?;
+            let mut var_store_guard = self.var_store.lock();
             *var_store_guard = Some(vs);
         }
 
@@ -475,19 +463,16 @@ impl TorchEngine {
 
     /// Get tensor from VarStore by name (for inference) - thread safe
     pub fn get_tensor(&self, name: &str) -> Option<Tensor> {
-        let var_store_guard = self.handle_poison(self.var_store.lock()).ok()?;
+        let var_store_guard = self.var_store.lock();
         let vs = var_store_guard.as_ref()?;
         vs.variables().get(name).map(tch::Tensor::shallow_clone)
     }
 
     /// List all available tensor names in VarStore - thread safe
     pub fn list_tensor_names(&self) -> Vec<String> {
-        if let Ok(var_store_guard) = self.handle_poison(self.var_store.lock()) {
-            if let Some(vs) = var_store_guard.as_ref() {
-                vs.variables().keys().cloned().collect()
-            } else {
-                Vec::new()
-            }
+        let var_store_guard = self.var_store.lock();
+        if let Some(vs) = var_store_guard.as_ref() {
+            vs.variables().keys().cloned().collect()
         } else {
             Vec::new()
         }
@@ -495,9 +480,7 @@ impl TorchEngine {
 
     /// Check if model is loaded via VarStore - thread safe
     pub fn has_varstore(&self) -> bool {
-        self.handle_poison(self.var_store.lock())
-            .map(|guard| guard.is_some())
-            .unwrap_or(false)
+        self.var_store.lock().is_some()
     }
 
     /// Initialize XET storage with default configuration
@@ -565,7 +548,7 @@ impl TorchEngine {
 
         // Update ModelInfo with actual values from config
         {
-            let mut model_info = self.handle_poison(self.model_info.lock())?;
+            let mut model_info = self.model_info.lock();
             model_info.hidden_size = config.hidden_size;
             model_info.intermediate_size = Some(config.intermediate_size);
             model_info.num_attention_heads = Some(config.num_attention_heads);
@@ -616,13 +599,13 @@ impl TorchEngine {
 
             // Get model's configured vocab size
             let model_vocab_size = {
-                let model_info = self.handle_poison(self.model_info.lock())?;
+                let model_info = self.model_info.lock();
                 model_info.vocab_size
             };
 
             // Apply model-specific tokenizer configuration if model is loaded
             if let Some(model) = &self.persistent_model {
-                let model_guard = self.handle_poison(model.lock())?;
+                let model_guard = model.lock();
                 let tokenizer_config = model_guard.get_tokenizer_config();
 
                 // Configure the tokenizer based on the model architecture
@@ -646,7 +629,7 @@ impl TorchEngine {
             info!("Final tokenizer vocabulary size: {}", final_vocab_size);
 
             // Thread safe assignment
-            let mut tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
+            let mut tokenizer_guard = self.tokenizer.lock();
             *tokenizer_guard = Some(tokenizer);
         } else {
             return Err(anyhow!(
@@ -677,7 +660,7 @@ impl TorchEngine {
 
             // Cache EOS token ID for lock-free access during generation
             if let Some(ref eos_str) = template_config.eos_token {
-                let tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
+                let tokenizer_guard = self.tokenizer.lock();
                 if let Some(ref tokenizer) = *tokenizer_guard {
                     if let Some(eos_id) = tokenizer.token_to_id(eos_str) {
                         self.eos_token_id.store(eos_id, Ordering::Relaxed);
@@ -692,7 +675,7 @@ impl TorchEngine {
             let template_engine = TemplateEngine::new(template_config)?;
 
             // Store template engine
-            let mut template_guard = self.handle_poison(self.template_engine.lock())?;
+            let mut template_guard = self.template_engine.lock();
             *template_guard = Some(template_engine);
 
             info!("✅ Template engine initialized");
@@ -705,7 +688,7 @@ impl TorchEngine {
 
     /// Tokenize text to input IDs - thread safe
     fn tokenize(&self, text: &str) -> Result<Vec<i64>> {
-        let tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
+        let tokenizer_guard = self.tokenizer.lock();
         let tokenizer = tokenizer_guard
             .as_ref()
             .ok_or_else(|| anyhow!("Tokenizer not loaded. Call load_tokenizer() first."))?;
@@ -748,7 +731,8 @@ impl TorchEngine {
     /// Format text with dynamic chat template
     fn format_chat_message(&self, system: Option<&str>, user: &str) -> String {
         // Try to use template engine if available
-        if let Ok(template_guard) = self.template_engine.lock() {
+        {
+            let template_guard = self.template_engine.lock();
             if let Some(ref engine) = *template_guard {
                 let mut messages = Vec::new();
 
@@ -802,7 +786,7 @@ impl TorchEngine {
     ///
     /// Returns a cloned tokenizer (cheap due to copy-on-write)
     pub fn get_tokenizer(&self) -> Result<Tokenizer> {
-        let tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
+        let tokenizer_guard = self.tokenizer.lock();
         tokenizer_guard
             .as_ref()
             .cloned() // Cheap clone due to CoW
@@ -829,7 +813,7 @@ impl TorchEngine {
 
         // Verify context state with thread safety
         {
-            let context_guard = self.handle_poison(self.context_state.lock())?;
+            let context_guard = self.context_state.lock();
             let _context_state = context_guard
                 .as_ref()
                 .ok_or_else(|| anyhow!("Context state not initialized"))?;
@@ -846,7 +830,7 @@ impl TorchEngine {
             .unsqueeze(0); // Add batch dimension: [1, seq_len]
 
         // Lock the model and run forward pass (efficient!) with poison recovery
-        let model = self.handle_poison(model_arc.lock())?;
+        let model = model_arc.lock();
         // Wrap in no_grad to prevent gradient tracking during inference
         let logits = tch::no_grad(|| model.forward(&input_tensor, None))?;
 
@@ -894,7 +878,7 @@ impl TorchEngine {
             .unsqueeze(0); // [1, seq_len]
 
         // Run forward pass with position info for proper KV cache usage
-        let model = self.handle_poison(model_arc.lock())?;
+        let model = model_arc.lock();
 
         // Use the new forward_with_cache method that properly tracks position
         // CRITICAL: Wrap in no_grad to prevent gradient tracking during inference
@@ -914,13 +898,7 @@ impl TorchEngine {
     /// Clear KV cache before new generation to prevent context pollution
     pub fn clear_kv_cache(&self) {
         if let Some(model_arc) = &self.persistent_model {
-            let model = match model_arc.lock() {
-                Ok(m) => m,
-                Err(poisoned) => {
-                    tracing::warn!("Model lock poisoned during cache clear, recovering");
-                    poisoned.into_inner()
-                }
-            };
+            let model = model_arc.lock();
 
             // Use downcasting to call clear_kv_cache on LlamaModel
             // This is safe because we know the model type at runtime
@@ -1029,7 +1007,7 @@ impl RuntimeEngine for TorchEngine {
 
         // Update model info with the correct name
         {
-            let mut model_info_guard = self.handle_poison(self.model_info.lock())?;
+            let mut model_info_guard = self.model_info.lock();
             model_info_guard.name = model_name;
         }
 
@@ -1097,20 +1075,7 @@ impl RuntimeEngine for TorchEngine {
     }
 
     fn model_info(&self) -> ModelInfo {
-        self.handle_poison(self.model_info.lock())
-            .map(|guard| guard.clone())
-            .unwrap_or_else(|_| ModelInfo {
-                name: "error".to_owned(),
-                architecture: "unknown".to_owned(),
-                parameters: 0,
-                context_length: 2048,
-                vocab_size: 32000,
-                hidden_size: 768,
-                intermediate_size: None,
-                num_attention_heads: None,
-                num_hidden_layers: None,
-                quantization: None,
-            })
+        self.model_info.lock().clone()
     }
 
     fn is_loaded(&self) -> bool {
@@ -1126,7 +1091,7 @@ impl RuntimeEngine for TorchEngine {
         add_generation_prompt: bool,
     ) -> Result<String> {
         // Use our template engine if available
-        let template_guard = self.handle_poison(self.template_engine.lock())?;
+        let template_guard = self.template_engine.lock();
 
         if let Some(ref engine) = *template_guard {
             // Use the template engine
@@ -1192,7 +1157,7 @@ impl TorchEngine {
             .persistent_model
             .as_ref()
             .ok_or_else(|| anyhow!("Persistent model not available"))?;
-        let model_guard = self.handle_poison(model.lock())?;
+        let model_guard = model.lock();
 
         // Forward pass - gradients tracked if tensors have requires_grad
         if track_gradients {
@@ -1252,10 +1217,9 @@ impl TorchEngine {
     /// Check if persistent model is initialized - thread safe
     pub fn is_persistent_model_ready(&self) -> bool {
         let persistent_ready = self.persistent_model.is_some();
-        let context_ready = self
-            .handle_poison(self.context_state.lock())
-            .map(|guard| guard.as_ref().is_some_and(|c| c.initialized))
-            .unwrap_or(false);
+        let context_ready = self.context_state.lock()
+            .as_ref()
+            .is_some_and(|c| c.initialized);
 
         persistent_ready && context_ready
     }
@@ -1314,7 +1278,7 @@ impl TorchEngine {
         let mut module_configs = HashMap::new();
 
         // Get model dimensions from model_info
-        let model_info = self.handle_poison(self.model_info.lock())?;
+        let model_info = self.model_info.lock();
         let hidden_size = model_info.hidden_size as i64;
 
         // Calculate intermediate size based on model architecture
@@ -1375,8 +1339,8 @@ impl TorchEngine {
             crate::lora::trainer::LoRATrainer::new(&lora_model.vs, self.device, training_config)?;
 
         // Store the single model and trainer
-        *self.handle_poison(self.lora_model.lock())? = Some(lora_model);
-        *self.handle_poison(self.lora_trainer.lock())? = Some(trainer);
+        *self.lora_model.lock() = Some(lora_model);
+        *self.lora_trainer.lock() = Some(trainer);
 
         // Gradient computation enabled by default in training mode
 
@@ -1391,7 +1355,7 @@ impl TorchEngine {
         training: bool,
     ) -> Result<Tensor> {
         // Check if LoRA is enabled
-        let lora_model = self.handle_poison(self.lora_model.lock())?;
+        let lora_model = self.lora_model.lock();
         if lora_model.is_none() {
             // No LoRA, use standard forward pass
             let ids: Vec<i64> = Vec::<i64>::try_from(input_ids.flatten(0, -1))?;
@@ -1403,7 +1367,7 @@ impl TorchEngine {
             .persistent_model
             .as_ref()
             .ok_or_else(|| anyhow!("Model not loaded"))?;
-        let model_guard = self.handle_poison(model.lock())?;
+        let model_guard = model.lock();
 
         // Use input_ids tensor directly
         let input = input_ids.to(self.device);
@@ -1444,7 +1408,7 @@ impl TorchEngine {
         learning_rate: f32,
     ) -> Result<()> {
         // Initialize LoRA if not already done
-        if self.handle_poison(self.lora_model.lock())?.is_none() {
+        if self.lora_model.lock().is_none() {
             let lora_config = crate::lora::LoRAConfig {
                 rank: 16,
                 alpha: 16.0,
@@ -1462,7 +1426,7 @@ impl TorchEngine {
         }
 
         // Tokenize inputs
-        let tokenizer = self.handle_poison(self.tokenizer.lock())?;
+        let tokenizer = self.tokenizer.lock();
         let tokenizer = tokenizer.as_ref().ok_or_else(|| anyhow!("No tokenizer loaded"))?;
 
         // Combine prompt and response
@@ -1716,7 +1680,7 @@ impl TorchEngine {
 
     /// Save LoRA weights
     pub fn save_lora(&self, path: &str) -> Result<()> {
-        if let Some(lora_model) = &*self.handle_poison(self.lora_model.lock())? {
+        if let Some(lora_model) = &*self.lora_model.lock() {
             lora_model.save(path)?;
             tracing::info!("Saved LoRA weights to {}", path);
         } else {
@@ -1727,7 +1691,7 @@ impl TorchEngine {
 
     /// Load LoRA weights
     pub fn load_lora(&mut self, path: &str) -> Result<()> {
-        if let Some(lora_model) = &mut *self.handle_poison(self.lora_model.lock())? {
+        if let Some(lora_model) = &mut *self.lora_model.lock() {
             lora_model.load(path)?;
             tracing::info!("Loaded LoRA weights from {}", path);
         } else {
@@ -1738,7 +1702,7 @@ impl TorchEngine {
 
     /// Save LoRA weights in SafeTensor format
     pub fn save_lora_weights(&self, path: &str) -> Result<()> {
-        if let Some(lora_model) = &*self.handle_poison(self.lora_model.lock())? {
+        if let Some(lora_model) = &*self.lora_model.lock() {
             lora_model.save(path)?;
             tracing::info!("Saved LoRA weights to SafeTensor format: {}", path);
         } else {
@@ -1761,7 +1725,7 @@ impl TorchEngine {
     /// # Arguments
     /// - `path` - Path to SafeTensors file containing LoRA weights
     pub fn load_lora_weights(&mut self, path: &str) -> Result<()> {
-        if let Some(lora_model) = &mut *self.handle_poison(self.lora_model.lock())? {
+        if let Some(lora_model) = &mut *self.lora_model.lock() {
             tracing::debug!(
                 safetensors_path = path,
                 "Loading LoRA weights from SafeTensors format"
@@ -1792,9 +1756,7 @@ impl TorchEngine {
     /// the engine is ready to load adapter weights. This is a prerequisite for
     /// calling load_lora_weights().
     pub fn has_lora_model(&self) -> bool {
-        self.handle_poison(self.lora_model.lock())
-            .map(|guard| guard.is_some())
-            .unwrap_or(false)
+        self.lora_model.lock().is_some()
     }
 
     /// Initialize LoRA model structure for low-rank adaptation.
@@ -1826,7 +1788,7 @@ impl TorchEngine {
         let mut module_configs = std::collections::HashMap::new();
 
         // Get model dimensions from model_info
-        let model_info = self.handle_poison(self.model_info.lock())?;
+        let model_info = self.model_info.lock();
         let hidden_size = model_info.hidden_size as i64;
 
         // Calculate intermediate size based on model architecture
@@ -1897,11 +1859,11 @@ impl TorchEngine {
         // Install the LoRA model and trainer into the engine's shared state.
         // This replaces any previously loaded LoRA model/trainer.
         {
-            let mut lora_guard = self.handle_poison(self.lora_model.lock())?;
+            let mut lora_guard = self.lora_model.lock();
             *lora_guard = Some(lora_model);
         }
         {
-            let mut trainer_guard = self.handle_poison(self.lora_trainer.lock())?;
+            let mut trainer_guard = self.lora_trainer.lock();
             *trainer_guard = Some(trainer);
         }
 
@@ -1950,7 +1912,7 @@ impl TorchEngine {
         input: &Tensor,
         base_output: &Tensor,
     ) -> Result<Tensor> {
-        let lora_guard = self.handle_poison(self.lora_model.lock())?;
+        let lora_guard = self.lora_model.lock();
 
         if let Some(lora_model) = lora_guard.as_ref() {
             // Apply LoRA if available for this module
@@ -1966,19 +1928,19 @@ impl TorchEngine {
 
     /// Get active LoRA adapter name
     pub fn get_active_lora(&self) -> Result<Option<String>> {
-        let active_guard = self.handle_poison(self.active_lora.lock())?;
+        let active_guard = self.active_lora.lock();
         Ok(active_guard.clone())
     }
 
     /// Unload current LoRA adapter
     pub fn unload_lora(&mut self) -> Result<()> {
         {
-            let mut lora_guard = self.handle_poison(self.lora_model.lock())?;
+            let mut lora_guard = self.lora_model.lock();
             *lora_guard = None;
         }
 
         {
-            let mut active_guard = self.handle_poison(self.active_lora.lock())?;
+            let mut active_guard = self.active_lora.lock();
             *active_guard = None;
         }
 
@@ -2009,7 +1971,7 @@ impl TorchEngine {
     /// ```
     pub fn extract_embedding(&self, text: &str) -> Result<Vec<f32>> {
         // Tokenize input
-        let tokenizer_guard = self.handle_poison(self.tokenizer.lock())?;
+        let tokenizer_guard = self.tokenizer.lock();
         let tokenizer = tokenizer_guard
             .as_ref()
             .ok_or_else(|| anyhow!("No tokenizer loaded"))?;
@@ -2047,8 +2009,7 @@ impl TorchEngine {
             .persistent_model
             .as_ref()
             .ok_or_else(|| anyhow!("No model loaded"))?
-            .lock()
-            .map_err(|_| anyhow!("Model lock poisoned"))?;
+            .lock();
 
         tch::no_grad(|| {
             // Get token embeddings

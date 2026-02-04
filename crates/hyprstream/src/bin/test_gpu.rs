@@ -1,3 +1,6 @@
+// Test binary intentionally prints diagnostic output
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use tch::Device;
 
 fn main() {

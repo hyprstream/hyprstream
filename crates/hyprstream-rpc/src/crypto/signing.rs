@@ -123,7 +123,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_sign_verify_roundtrip() {
+    fn test_sign_verify_roundtrip() -> crate::EnvelopeResult<()> {
         let (signing_key, verifying_key) = generate_signing_keypair();
 
         let request_id = 12345u64;
@@ -133,7 +133,8 @@ mod tests {
         let signature = sign_message(&signing_key, request_id, identity_bytes, payload);
 
         // Should verify successfully
-        verify_message(&verifying_key, &signature, request_id, identity_bytes, payload).unwrap();
+        verify_message(&verifying_key, &signature, request_id, identity_bytes, payload)?;
+        Ok(())
     }
 
     #[test]
@@ -184,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn test_key_serialization_roundtrip() {
+    fn test_key_serialization_roundtrip() -> crate::EnvelopeResult<()> {
         let (signing_key, verifying_key) = generate_signing_keypair();
 
         // Serialize and deserialize signing key
@@ -194,7 +195,8 @@ mod tests {
 
         // Serialize and deserialize verifying key
         let verifying_bytes = verifying_key.to_bytes();
-        let restored_verifying = verifying_key_from_bytes(&verifying_bytes).unwrap();
+        let restored_verifying = verifying_key_from_bytes(&verifying_bytes)?;
         assert_eq!(verifying_key.to_bytes(), restored_verifying.to_bytes());
+        Ok(())
     }
 }

@@ -6,6 +6,8 @@
 //! - **Running** = Current active (HEAD of .registry/policies/)
 //! - **Draft** = Uncommitted changes
 //! - **History** = Previous versions (HEAD~n)
+// CLI handlers intentionally print to stdout/stderr for user interaction
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use crate::auth::{jwt, Claims, Operation, PolicyManager};
 use anyhow::{Context, Result};

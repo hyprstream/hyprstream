@@ -6,22 +6,26 @@
 use crate::auth::Operation;
 use crate::services::PolicyZmqClient;
 use crate::registry_capnp;
-use crate::services::rpc_types::{HealthStatus, RemoteInfo, RegistryResponse, WorktreeData};
+use crate::services::rpc_types::{
+    DetailedStatusData, FileStatusData, HealthStatus, RemoteInfo, RegistryResponse, WorktreeData,
+};
+use crate::services::traits::{CloneOptions, DetailedStatus, FileChangeType, FileStatus};
 use crate::services::{CallOptions, EnvelopeContext, ZmqClient, ZmqService};
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::prelude::*;
-use hyprstream_rpc::registry::{global as registry, SocketKind};
+use hyprstream_rpc::registry::{global as endpoint_registry, SocketKind};
 use hyprstream_rpc::{serialize_message, FromCapnp};
+use hyprstream_rpc::{StreamChannel, StreamContext};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use capnp::message::{Builder, ReaderOptions};
 use capnp::serialize;
-use git2db::{Git2DB, RepoId, RepositoryStatus, TrackedRepository, GitRef};
+use git2db::{CloneBuilder, Git2DB, GitRef, RepoId, RepositoryStatus, TrackedRepository};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Service name for endpoint registry
@@ -62,7 +66,27 @@ pub trait RegistryOps {
     async fn health_check(&self) -> Result<HealthStatus>;
 
     /// Clone a repository.
-    async fn clone_repo(&self, url: &str, name: Option<&str>) -> Result<RepoId>;
+    async fn clone_repo(&self, url: &str, name: Option<&str>, options: &CloneOptions) -> Result<RepoId>;
+
+    /// Clone a repository with streaming progress.
+    ///
+    /// Returns StreamStartedInfo containing:
+    /// - stream_id: For client display/logging
+    /// - endpoint: StreamService SUB endpoint
+    /// - server_pubkey: Server's ephemeral Ristretto255 public key for DH
+    ///
+    /// # Arguments
+    /// * `url` - Repository URL to clone
+    /// * `name` - Optional name for the repository
+    /// * `options` - Clone options (shallow, depth, branch)
+    /// * `ephemeral_pubkey` - Client's ephemeral Ristretto255 public key for DH (enables E2E auth)
+    async fn clone_stream(
+        &self,
+        url: &str,
+        name: Option<&str>,
+        options: &CloneOptions,
+        ephemeral_pubkey: Option<[u8; 32]>,
+    ) -> Result<crate::services::rpc_types::StreamStartedInfo>;
 
     /// Register an existing repository.
     async fn register_repo(&self, name: Option<&str>, path: &Path) -> Result<()>;
@@ -128,7 +152,7 @@ impl RegistryOps for ZmqClient {
         parse_health_response(&response)
     }
 
-    async fn clone_repo(&self, url: &str, name: Option<&str>) -> Result<RepoId> {
+    async fn clone_repo(&self, url: &str, name: Option<&str>, options: &CloneOptions) -> Result<RepoId> {
         let id = self.next_id();
         let payload = serialize_message(|msg| {
             let mut req = msg.init_root::<registry_capnp::registry_request::Builder>();
@@ -138,11 +162,47 @@ impl RegistryOps for ZmqClient {
             if let Some(n) = name {
                 clone_req.set_name(n);
             }
-            clone_req.set_shallow(false);
-            clone_req.set_depth(0);
+            clone_req.set_shallow(options.shallow);
+            clone_req.set_depth(options.depth);
+            if let Some(ref branch) = options.branch {
+                clone_req.set_branch(branch);
+            }
         })?;
         let response = self.call(payload, CallOptions::default()).await?;
         parse_repo_id_response(&response)
+    }
+
+    async fn clone_stream(
+        &self,
+        url: &str,
+        name: Option<&str>,
+        options: &CloneOptions,
+        ephemeral_pubkey: Option<[u8; 32]>,
+    ) -> Result<crate::services::rpc_types::StreamStartedInfo> {
+        let id = self.next_id();
+        let payload = serialize_message(|msg| {
+            let mut req = msg.init_root::<registry_capnp::registry_request::Builder>();
+            req.set_id(id);
+            let mut clone_req = req.init_clone_stream();
+            clone_req.set_url(url);
+            if let Some(n) = name {
+                clone_req.set_name(n);
+            }
+            clone_req.set_shallow(options.shallow);
+            clone_req.set_depth(options.depth);
+            if let Some(ref branch) = options.branch {
+                clone_req.set_branch(branch);
+            }
+        })?;
+
+        // Include ephemeral pubkey for DH key exchange
+        let opts = match ephemeral_pubkey {
+            Some(pk) => CallOptions::default().ephemeral_pubkey(pk),
+            None => CallOptions::default(),
+        };
+
+        let response = self.call(payload, opts).await?;
+        parse_stream_started_response(&response)
     }
 
     async fn register_repo(&self, name: Option<&str>, path: &Path) -> Result<()> {
@@ -280,6 +340,33 @@ fn parse_success_response(response: &[u8]) -> Result<()> {
     })
 }
 
+/// Parse a stream started response (for streaming clone).
+fn parse_stream_started_response(response: &[u8]) -> Result<crate::services::rpc_types::StreamStartedInfo> {
+    parse_response(response, |resp| {
+        use registry_capnp::registry_response::Which;
+        match resp.which()? {
+            Which::StreamStarted(info) => {
+                let info = info?;
+                let stream_id = info.get_stream_id()?.to_str()?.to_owned();
+                let endpoint = info.get_stream_endpoint()?.to_str()?.to_owned();
+                let pubkey_data = info.get_server_pubkey()?;
+
+                let mut server_pubkey = [0u8; 32];
+                if pubkey_data.len() >= 32 {
+                    server_pubkey.copy_from_slice(&pubkey_data[..32]);
+                }
+
+                Ok(crate::services::rpc_types::StreamStartedInfo {
+                    stream_id,
+                    endpoint,
+                    server_pubkey,
+                })
+            }
+            _ => Err(anyhow!("Expected stream_started response")),
+        }
+    })
+}
+
 /// Parse a TrackedRepository from capnp reader.
 fn parse_tracked_repository(
     repo: registry_capnp::tracked_repository::Reader,
@@ -343,7 +430,7 @@ impl RegistryZmq {
     /// Uses the same signing key for both request signing and response verification.
     /// This is appropriate for internal communication where client and server share keys.
     pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
-        let endpoint = registry().endpoint(SERVICE_NAME, SocketKind::Rep).to_zmq_string();
+        let endpoint = endpoint_registry().endpoint(SERVICE_NAME, SocketKind::Rep).to_zmq_string();
         Self::with_endpoint(&endpoint, signing_key, identity)
     }
 
@@ -390,8 +477,21 @@ impl RegistryClient for RegistryZmq {
         &self,
         url: &str,
         name: Option<&str>,
+        options: &CloneOptions,
     ) -> Result<RepoId, RegistryServiceError> {
-        RegistryOps::clone_repo(&self.client, url, name)
+        RegistryOps::clone_repo(&self.client, url, name, options)
+            .await
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))
+    }
+
+    async fn clone_stream(
+        &self,
+        url: &str,
+        name: Option<&str>,
+        options: &CloneOptions,
+        ephemeral_pubkey: Option<[u8; 32]>,
+    ) -> Result<crate::services::rpc_types::StreamStartedInfo, RegistryServiceError> {
+        RegistryOps::clone_stream(&self.client, url, name, options, ephemeral_pubkey)
             .await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))
     }
@@ -478,13 +578,20 @@ impl RegistryClient for RegistryZmq {
 ///
 /// Note: The runtime handle is captured on creation to avoid the nested runtime
 /// anti-pattern. Handler methods use this handle for async operations instead
-/// of creating new runtimes.
+///
+/// ## Streaming Support
+///
+/// For streaming clone operations, the service:
+/// 1. Performs DH key exchange with the client
+/// 2. Pre-authorizes the stream with StreamService (so client can subscribe)
+/// 3. Queues the clone task to a background worker thread
+/// 4. The worker publishes progress via PUSH to StreamService
 ///
 /// The registry is wrapped in RwLock for interior mutability since some operations
 /// (like clone) require mutable access but ZmqService::handle_request takes &self.
 pub struct RegistryService {
     // Business logic
-    registry: RwLock<Git2DB>,
+    registry: Arc<RwLock<Git2DB>>,
     #[allow(dead_code)] // Future: base directory for relative path operations
     base_dir: PathBuf,
     /// Captured runtime handle for async operations in sync handlers
@@ -495,6 +602,54 @@ pub struct RegistryService {
     context: Arc<zmq::Context>,
     transport: TransportConfig,
     signing_key: SigningKey,
+    /// Channel to send pending clone streams to the background worker
+    pending_clone_tx: std::sync::mpsc::Sender<PendingCloneStreamTask>,
+}
+
+/// Progress reporter that sends updates via a tokio mpsc channel.
+///
+/// Implements `git2db::callback_config::ProgressReporter` to bridge git2db's
+/// progress callbacks to hyprstream's stream publishing system.
+///
+/// Uses `blocking_send` since this is called from a sync context (spawn_blocking).
+struct CloneProgressReporter {
+    sender: tokio::sync::mpsc::Sender<hyprstream_rpc::streaming::ProgressUpdate>,
+}
+
+impl CloneProgressReporter {
+    fn new(sender: tokio::sync::mpsc::Sender<hyprstream_rpc::streaming::ProgressUpdate>) -> Self {
+        Self { sender }
+    }
+}
+
+impl git2db::callback_config::ProgressReporter for CloneProgressReporter {
+    fn report(&self, stage: &str, current: usize, total: usize) {
+        // Use blocking_send since we're in a sync context (spawn_blocking)
+        // Log if channel is full instead of silently dropping
+        if let Err(e) = self.sender.blocking_send(hyprstream_rpc::streaming::ProgressUpdate::Progress {
+            stage: stage.to_owned(),
+            current,
+            total,
+        }) {
+            tracing::trace!("Progress channel full, dropping update: {}", e);
+        }
+    }
+}
+
+/// Task sent to the background streaming worker
+struct PendingCloneStreamTask {
+    /// Stream context with DH-derived keys
+    stream_ctx: StreamContext,
+    /// Clone URL
+    url: String,
+    /// Optional name for the repository
+    name: Option<String>,
+    /// Shallow clone flag
+    shallow: bool,
+    /// Clone depth
+    depth: Option<u32>,
+    /// Branch to clone
+    branch: Option<String>,
 }
 
 impl RegistryService {
@@ -513,15 +668,176 @@ impl RegistryService {
         // Capture the runtime handle to avoid nested runtime anti-pattern
         let runtime_handle = tokio::runtime::Handle::current();
 
-        Ok(Self {
-            registry: RwLock::new(registry),
+        // Create channel for pending clone streams
+        let (pending_clone_tx, pending_clone_rx) = std::sync::mpsc::channel::<PendingCloneStreamTask>();
+
+        // Spawn background worker for streaming clone operations
+        // Worker creates its own StreamChannel and tokio runtime
+        let worker_registry = Arc::new(RwLock::new(registry));
+        let worker_registry_clone = Arc::clone(&worker_registry);
+        let worker_context = Arc::clone(&context);
+        let worker_signing_key = signing_key.clone();
+
+        std::thread::spawn(move || {
+            // Create worker's own StreamChannel
+            let worker_stream_channel = StreamChannel::new(worker_context, worker_signing_key);
+            Self::streaming_worker(
+                worker_stream_channel,
+                worker_registry_clone,
+                pending_clone_rx,
+            );
+        });
+
+        let service = Self {
+            registry: worker_registry,
             base_dir,
             runtime_handle,
             policy_client,
             context,
             transport,
             signing_key,
-        })
+            pending_clone_tx,
+        };
+
+        Ok(service)
+    }
+
+    /// Background worker thread for streaming clone operations.
+    ///
+    /// Creates its own tokio runtime for async operations and uses
+    /// StreamChannel for publishing progress updates.
+    fn streaming_worker(
+        stream_channel: StreamChannel,
+        registry: Arc<RwLock<Git2DB>>,
+        receiver: std::sync::mpsc::Receiver<PendingCloneStreamTask>,
+    ) {
+        info!("Registry streaming worker started");
+
+        // Create a dedicated tokio runtime for this worker thread
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                error!("Failed to create tokio runtime for streaming worker: {}", e);
+                return;
+            }
+        };
+
+        // Process pending streams
+        loop {
+            match receiver.recv() {
+                Ok(task) => {
+                    rt.block_on(Self::execute_clone_stream_task(
+                        &stream_channel,
+                        &registry,
+                        task,
+                    ));
+                }
+                Err(_) => {
+                    // Channel closed, shutdown
+                    debug!("Registry streaming worker shutting down");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Execute a single streaming clone task with real-time progress.
+    ///
+    /// Uses git2db's callback_config to receive progress updates during clone,
+    /// which are forwarded to the client via StreamChannel in real-time.
+    async fn execute_clone_stream_task(
+        stream_channel: &StreamChannel,
+        registry: &Arc<RwLock<Git2DB>>,
+        task: PendingCloneStreamTask,
+    ) {
+        use hyprstream_rpc::streaming::ProgressUpdate;
+
+        let stream_ctx = &task.stream_ctx;
+
+        debug!(
+            stream_id = %stream_ctx.stream_id(),
+            url = %task.url,
+            "Starting streaming clone with progress reporting"
+        );
+
+        // Create tokio channel for receiving updates from git2db
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<ProgressUpdate>(100);
+
+        // Create reporter that implements git2db::ProgressReporter
+        let reporter = Arc::new(CloneProgressReporter::new(progress_tx.clone()));
+
+        // Build callback config with progress reporter
+        let callback_config = git2db::callback_config::CallbackConfig::new()
+            .with_progress(git2db::callback_config::ProgressConfig::Channel(reporter));
+
+        // Execute clone and stream progress concurrently
+        let result = stream_channel.with_publisher(stream_ctx, |mut publisher| async move {
+            // Spawn clone task - runs concurrently with progress streaming
+            let registry_clone = Arc::clone(registry);
+            let url = task.url.clone();
+            let name = task.name.clone();
+            let shallow = task.shallow;
+            let depth = task.depth;
+            let branch = task.branch.clone();
+
+            let clone_handle = tokio::spawn(async move {
+                // CloneBuilder manages locks internally for optimal performance
+                // (read lock for config, no lock during network I/O, write lock for registration)
+                Self::clone_repo_inner(
+                    registry_clone,
+                    &url,
+                    name.as_deref(),
+                    shallow,
+                    depth,
+                    branch.as_deref(),
+                    Some(callback_config),
+                ).await
+            });
+
+            // Drop sender after spawning so receiver knows when clone finishes
+            drop(progress_tx);
+
+            // Stream progress updates in real-time as they arrive
+            // (Ignore Complete/Error from channel - we'll send our own based on clone_result)
+            while let Some(update) = progress_rx.recv().await {
+                if let ProgressUpdate::Progress { stage, current, total } = update {
+                    publisher.publish_progress(&stage, current, total).await?;
+                }
+            }
+
+            // Wait for clone to complete and send final status
+            match clone_handle.await {
+                Ok(Ok(repo)) => {
+                    let metadata = serde_json::json!({
+                        "repo_id": repo.id.to_string(),
+                        "name": repo.name,
+                        "url": repo.url,
+                    });
+                    publisher.complete_ref(metadata.to_string().as_bytes()).await?;
+                    Ok(())
+                }
+                Ok(Err(e)) => {
+                    publisher.publish_error(&e.to_string()).await?;
+                    Err(e)
+                }
+                Err(e) => {
+                    let err = anyhow!("Clone task panicked: {}", e);
+                    publisher.publish_error(&err.to_string()).await?;
+                    Err(err)
+                }
+            }
+        }).await;
+
+        if let Err(e) = result {
+            error!(
+                stream_id = %stream_ctx.stream_id(),
+                error = %e,
+                "Clone stream failed"
+            );
+        }
     }
 
     /// Check authorization for an operation.
@@ -573,6 +889,58 @@ impl RegistryService {
         let uuid = Uuid::parse_str(id_str)
             .map_err(|e| anyhow!("invalid repo id '{}': {}", id_str, e))?;
         Ok(RepoId::from_uuid(uuid))
+    }
+
+    /// Internal clone logic shared by sync and streaming clone operations.
+    ///
+    /// Builds clone request, executes it, and returns the cloned repository.
+    /// CloneBuilder manages locks internally for optimal performance.
+    ///
+    /// # Arguments
+    /// * `callback_config` - Optional callback configuration for progress reporting
+    async fn clone_repo_inner(
+        registry: Arc<RwLock<Git2DB>>,
+        url: &str,
+        name: Option<&str>,
+        shallow: bool,
+        depth: Option<u32>,
+        branch: Option<&str>,
+        callback_config: Option<git2db::callback_config::CallbackConfig>,
+    ) -> Result<TrackedRepository> {
+        let mut clone_builder = CloneBuilder::new(Arc::clone(&registry), url);
+
+        if let Some(n) = name {
+            clone_builder = clone_builder.name(n);
+        }
+
+        // depth > 0 implies shallow clone
+        // if shallow is explicitly set but depth is 0, use depth=1
+        if let Some(d) = depth.filter(|&d| d > 0) {
+            clone_builder = clone_builder.depth(d);
+        } else if shallow {
+            clone_builder = clone_builder.depth(1);
+        }
+
+        if let Some(b) = branch.filter(|b| !b.is_empty()) {
+            clone_builder = clone_builder.branch(b);
+        }
+
+        // Add callback config for progress reporting if provided
+        if let Some(config) = callback_config {
+            clone_builder = clone_builder.callback_config(config);
+        }
+
+        let repo_id = clone_builder.exec().await?;
+
+        // Get the tracked repository to return
+        let registry_guard = registry.read().await;
+        let result = registry_guard
+            .list()
+            .find(|r| r.id == repo_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Failed to find cloned repository"));
+        drop(registry_guard);
+        result
     }
 
     /// Handle a list repositories request
@@ -706,47 +1074,77 @@ impl RegistryService {
         depth: Option<u32>,
         branch: Option<&str>,
     ) -> Result<TrackedRepository> {
-        // Clone operation needs write lock since it mutates registry
-        let url = url.to_owned();
-        let name = name.map(std::borrow::ToOwned::to_owned);
-        let branch = branch.map(std::borrow::ToOwned::to_owned);
-
         // Use captured runtime handle instead of creating new runtime
+        // CloneBuilder manages locks internally for optimal performance
         self.runtime_handle.block_on(async {
-            let mut registry = self.registry.write().await;
-            let mut clone_builder = registry.clone(&url);
-
-            if let Some(ref n) = name {
-                clone_builder = clone_builder.name(n);
-            }
-
-            // depth > 0 implies shallow clone
-            // if shallow is explicitly set but depth is 0, use depth=1
-            if let Some(d) = depth {
-                if d > 0 {
-                    clone_builder = clone_builder.depth(d);
-                }
-            } else if shallow {
-                clone_builder = clone_builder.depth(1);
-            }
-
-            if let Some(ref b) = branch {
-                if !b.is_empty() {
-                    clone_builder = clone_builder.branch(b);
-                }
-            }
-
-            let repo_id = clone_builder.exec().await?;
-
-            // Get the tracked repository to return
-            let repo = registry
-                .list()
-                .find(|r| r.id == repo_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("Failed to find cloned repository"))?;
-
-            Ok(repo)
+            Self::clone_repo_inner(
+                Arc::clone(&self.registry),
+                url,
+                name,
+                shallow,
+                depth,
+                branch,
+                None,
+            ).await
         })
+    }
+
+    // ========================================================================
+    // Streaming Clone Support
+    // ========================================================================
+
+    /// Prepare a streaming clone operation and queue it for background execution.
+    ///
+    /// Creates a temporary StreamChannel to perform DH key exchange and pre-authorization,
+    /// then queues the clone task. Returns stream info for the client.
+    fn prepare_clone_stream(
+        &self,
+        url: &str,
+        name: Option<&str>,
+        shallow: bool,
+        depth: Option<u32>,
+        branch: Option<&str>,
+        client_ephemeral_pubkey: Option<&[u8]>,
+    ) -> Result<(String, [u8; 32])> {
+        // DH key derivation is required
+        let client_pub_bytes = client_ephemeral_pubkey
+            .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
+
+        // Create temporary StreamChannel for DH key exchange and pre-authorization
+        let stream_channel = StreamChannel::new(
+            Arc::clone(&self.context),
+            self.signing_key.clone(),
+        );
+
+        // 10 minutes expiry for clone operations
+        // Use block_on since we're in a sync context
+        let stream_ctx = self.runtime_handle.block_on(
+            stream_channel.prepare_stream(client_pub_bytes, 600)
+        )?;
+
+        debug!(
+            stream_id = %stream_ctx.stream_id(),
+            topic = %stream_ctx.topic(),
+            "Clone stream prepared (DH + pre-authorization via StreamChannel)"
+        );
+
+        let stream_id = stream_ctx.stream_id().to_owned();
+        let server_pubkey = *stream_ctx.server_pubkey();
+
+        // Create task and send to worker
+        let task = PendingCloneStreamTask {
+            stream_ctx,
+            url: url.to_owned(),
+            name: name.map(std::borrow::ToOwned::to_owned),
+            shallow,
+            depth,
+            branch: branch.map(std::borrow::ToOwned::to_owned),
+        };
+
+        self.pending_clone_tx.send(task)
+            .map_err(|_| anyhow!("Streaming worker channel closed"))?;
+
+        Ok((stream_id, server_pubkey))
     }
 
     /// Handle list worktrees
@@ -1053,6 +1451,525 @@ impl RegistryService {
         })
     }
 
+    // ========================================================================
+    // Push Operations
+    // ========================================================================
+
+    /// Handle push operation
+    fn handle_push(&self, repo_id: &str, remote: &str, refspec: &str, force: bool) -> Result<()> {
+        let id = Self::parse_repo_id(repo_id)?;
+        let remote = remote.to_owned();
+        let refspec = refspec.to_owned();
+
+        self.runtime_handle.block_on(async {
+            let registry = self.registry.read().await;
+            let handle = registry.repo(&id)?;
+
+            // Get the repository path
+            let repo_path = handle.worktree()?.to_path_buf();
+
+            // Perform push in blocking task (git2 is not async)
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let repo = git2::Repository::open(&repo_path)
+                    .map_err(|e| anyhow!("Failed to open repository: {}", e))?;
+
+                let mut git_remote = repo.find_remote(&remote)
+                    .map_err(|e| anyhow!("Failed to find remote '{}': {}", remote, e))?;
+
+                let mut push_options = git2::PushOptions::new();
+
+                // Set force push via refspec if needed
+                let push_refspec = if force {
+                    format!("+{}", refspec)
+                } else {
+                    refspec
+                };
+
+                git_remote.push(&[&push_refspec], Some(&mut push_options))
+                    .map_err(|e| anyhow!("Failed to push to {}: {}", remote, e))?;
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| anyhow!("Task join error: {}", e))??;
+
+            Ok(())
+        })
+    }
+
+    // ========================================================================
+    // Advanced Commit Operations
+    // ========================================================================
+
+    /// Handle amend commit operation
+    fn handle_amend_commit(&self, repo_id: &str, message: &str) -> Result<String> {
+        let id = Self::parse_repo_id(repo_id)?;
+        let message = message.to_owned();
+
+        self.runtime_handle.block_on(async {
+            let registry = self.registry.read().await;
+            let handle = registry.repo(&id)?;
+
+            // Get the repository path
+            let repo_path = handle.worktree()?.to_path_buf();
+
+            // Perform amend in blocking task (git2 is not async)
+            tokio::task::spawn_blocking(move || -> Result<String> {
+                let repo = git2::Repository::open(&repo_path)
+                    .map_err(|e| anyhow!("Failed to open repository: {}", e))?;
+
+                let mut index = repo.index()?;
+                let tree_id = index.write_tree()?;
+                let tree = repo.find_tree(tree_id)?;
+
+                let head = repo.head()?;
+                let commit_to_amend = head.peel_to_commit()?;
+
+                let new_oid = commit_to_amend.amend(
+                    Some("HEAD"),
+                    None,  // Keep author
+                    None,  // Keep committer
+                    None,  // Keep encoding
+                    Some(&message),
+                    Some(&tree),
+                )?;
+
+                Ok(new_oid.to_string())
+            })
+            .await
+            .map_err(|e| anyhow!("Task join error: {}", e))?
+        })
+    }
+
+    /// Handle commit with author operation
+    fn handle_commit_with_author(
+        &self,
+        repo_id: &str,
+        message: &str,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<String> {
+        let id = Self::parse_repo_id(repo_id)?;
+        let message = message.to_owned();
+        let author_name = author_name.to_owned();
+        let author_email = author_email.to_owned();
+
+        self.runtime_handle.block_on(async {
+            let registry = self.registry.read().await;
+            let handle = registry.repo(&id)?;
+
+            // Get the repository path
+            let repo_path = handle.worktree()?.to_path_buf();
+
+            // Perform commit in blocking task (git2 is not async)
+            tokio::task::spawn_blocking(move || -> Result<String> {
+                let repo = git2::Repository::open(&repo_path)
+                    .map_err(|e| anyhow!("Failed to open repository: {}", e))?;
+
+                let mut index = repo.index()?;
+                let tree_id = index.write_tree()?;
+                let tree = repo.find_tree(tree_id)?;
+
+                let head = repo.head()?;
+                let parent_commit = head.peel_to_commit()?;
+
+                let author = git2::Signature::now(&author_name, &author_email)?;
+                let committer = git2::Signature::now(&author_name, &author_email)?;
+
+                let oid = repo.commit(
+                    Some("HEAD"),
+                    &author,
+                    &committer,
+                    &message,
+                    &tree,
+                    &[&parent_commit],
+                )?;
+
+                Ok(oid.to_string())
+            })
+            .await
+            .map_err(|e| anyhow!("Task join error: {}", e))?
+        })
+    }
+
+    /// Handle stage all including untracked operation
+    fn handle_stage_all_including_untracked(&self, repo_id: &str) -> Result<()> {
+        let id = Self::parse_repo_id(repo_id)?;
+
+        self.runtime_handle.block_on(async {
+            let registry = self.registry.read().await;
+            let handle = registry.repo(&id)?;
+
+            // Get the repository path
+            let repo_path = handle.worktree()?.to_path_buf();
+
+            // Perform staging in blocking task (git2 is not async)
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let repo = git2::Repository::open(&repo_path)
+                    .map_err(|e| anyhow!("Failed to open repository: {}", e))?;
+
+                let mut index = repo.index()?;
+                // add_all with DEFAULT includes untracked files (like git add -A)
+                index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)?;
+                index.write()?;
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| anyhow!("Task join error: {}", e))??;
+
+            Ok(())
+        })
+    }
+
+    // ========================================================================
+    // Merge Conflict Resolution
+    // ========================================================================
+
+    /// Handle abort merge operation
+    fn handle_abort_merge(&self, repo_id: &str) -> Result<()> {
+        let id = Self::parse_repo_id(repo_id)?;
+
+        self.runtime_handle.block_on(async {
+            let registry = self.registry.read().await;
+            let handle = registry.repo(&id)?;
+
+            // Get the repository path
+            let repo_path = handle.worktree()?.to_path_buf();
+
+            // Perform abort in blocking task (git2 is not async)
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let repo = git2::Repository::open(&repo_path)
+                    .map_err(|e| anyhow!("Failed to open repository: {}", e))?;
+
+                // Check if ORIG_HEAD exists (indicates a merge/rebase in progress)
+                let orig_head = repo.refname_to_id("ORIG_HEAD")
+                    .map_err(|_| anyhow!("No merge in progress (ORIG_HEAD not found)"))?;
+
+                // Reset to ORIG_HEAD
+                let commit = repo.find_commit(orig_head)?;
+                repo.reset(commit.as_object(), git2::ResetType::Hard, None)?;
+
+                // Cleanup merge state
+                repo.cleanup_state()?;
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| anyhow!("Task join error: {}", e))??;
+
+            Ok(())
+        })
+    }
+
+    /// Handle continue merge operation
+    fn handle_continue_merge(&self, repo_id: &str, message: Option<&str>) -> Result<String> {
+        let id = Self::parse_repo_id(repo_id)?;
+        let message = message.map(std::borrow::ToOwned::to_owned);
+
+        self.runtime_handle.block_on(async {
+            let registry = self.registry.read().await;
+            let handle = registry.repo(&id)?;
+
+            // Get the repository path
+            let repo_path = handle.worktree()?.to_path_buf();
+
+            // Perform continue in blocking task (git2 is not async)
+            tokio::task::spawn_blocking(move || -> Result<String> {
+                let repo = git2::Repository::open(&repo_path)
+                    .map_err(|e| anyhow!("Failed to open repository: {}", e))?;
+
+                let mut index = repo.index()?;
+
+                // Check for conflicts
+                if index.has_conflicts() {
+                    return Err(anyhow!("Conflicts still present. Resolve all conflicts before continuing."));
+                }
+
+                // Write tree
+                let tree_id = index.write_tree()?;
+                let tree = repo.find_tree(tree_id)?;
+
+                let sig = repo.signature()?;
+
+                // Get parent commits
+                let head = repo.head()?.peel_to_commit()?;
+                let merge_head = repo.find_reference("MERGE_HEAD")
+                    .map_err(|_| anyhow!("No merge in progress (MERGE_HEAD not found)"))?
+                    .peel_to_commit()?;
+
+                let commit_message = message.unwrap_or_else(|| {
+                    format!("Merge branch '{}'", merge_head.summary().unwrap_or("unknown"))
+                });
+
+                let oid = repo.commit(
+                    Some("HEAD"),
+                    &sig,
+                    &sig,
+                    &commit_message,
+                    &tree,
+                    &[&head, &merge_head],
+                )?;
+
+                // Cleanup merge state
+                repo.cleanup_state()?;
+
+                Ok(oid.to_string())
+            })
+            .await
+            .map_err(|e| anyhow!("Task join error: {}", e))?
+        })
+    }
+
+    /// Handle quit merge operation
+    fn handle_quit_merge(&self, repo_id: &str) -> Result<()> {
+        let id = Self::parse_repo_id(repo_id)?;
+
+        self.runtime_handle.block_on(async {
+            let registry = self.registry.read().await;
+            let handle = registry.repo(&id)?;
+
+            // Get the repository path
+            let repo_path = handle.worktree()?.to_path_buf();
+
+            // Perform quit in blocking task (git2 is not async)
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let repo = git2::Repository::open(&repo_path)
+                    .map_err(|e| anyhow!("Failed to open repository: {}", e))?;
+
+                // Just cleanup state without resetting
+                repo.cleanup_state()?;
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| anyhow!("Task join error: {}", e))??;
+
+            Ok(())
+        })
+    }
+
+    // ========================================================================
+    // Tag Operations
+    // ========================================================================
+
+    /// Handle list tags operation
+    fn handle_list_tags(&self, repo_id: &str) -> Result<Vec<String>> {
+        let id = Self::parse_repo_id(repo_id)?;
+
+        self.runtime_handle.block_on(async {
+            let registry = self.registry.read().await;
+            let handle = registry.repo(&id)?;
+
+            // Get the repository path
+            let repo_path = handle.worktree()?.to_path_buf();
+
+            // List tags in blocking task (git2 is not async)
+            tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+                let repo = git2::Repository::open(&repo_path)
+                    .map_err(|e| anyhow!("Failed to open repository: {}", e))?;
+
+                let tags = repo.tag_names(None)?;
+                let result: Vec<String> = tags.iter()
+                    .filter_map(|t| t.map(std::borrow::ToOwned::to_owned))
+                    .collect();
+
+                Ok(result)
+            })
+            .await
+            .map_err(|e| anyhow!("Task join error: {}", e))?
+        })
+    }
+
+    /// Handle create tag operation
+    fn handle_create_tag(&self, repo_id: &str, name: &str, target: Option<&str>) -> Result<()> {
+        let id = Self::parse_repo_id(repo_id)?;
+        let name = name.to_owned();
+        let target = target.map(std::borrow::ToOwned::to_owned);
+
+        self.runtime_handle.block_on(async {
+            let registry = self.registry.read().await;
+            let handle = registry.repo(&id)?;
+
+            // Get the repository path
+            let repo_path = handle.worktree()?.to_path_buf();
+
+            // Create tag in blocking task (git2 is not async)
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let repo = git2::Repository::open(&repo_path)
+                    .map_err(|e| anyhow!("Failed to open repository: {}", e))?;
+
+                // Resolve target (default to HEAD)
+                let target_oid = if let Some(ref target_spec) = target {
+                    repo.revparse_single(target_spec)?.id()
+                } else {
+                    repo.head()?.target()
+                        .ok_or_else(|| anyhow!("HEAD has no target"))?
+                };
+
+                let commit = repo.find_commit(target_oid)?;
+
+                // Create lightweight tag
+                repo.tag_lightweight(&name, commit.as_object(), false)?;
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| anyhow!("Task join error: {}", e))??;
+
+            Ok(())
+        })
+    }
+
+    /// Handle delete tag operation
+    fn handle_delete_tag(&self, repo_id: &str, name: &str) -> Result<()> {
+        let id = Self::parse_repo_id(repo_id)?;
+        let name = name.to_owned();
+
+        self.runtime_handle.block_on(async {
+            let registry = self.registry.read().await;
+            let handle = registry.repo(&id)?;
+
+            // Get the repository path
+            let repo_path = handle.worktree()?.to_path_buf();
+
+            // Delete tag in blocking task (git2 is not async)
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let repo = git2::Repository::open(&repo_path)
+                    .map_err(|e| anyhow!("Failed to open repository: {}", e))?;
+
+                repo.tag_delete(&name)
+                    .map_err(|e| anyhow!("Failed to delete tag '{}': {}", name, e))?;
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| anyhow!("Task join error: {}", e))??;
+
+            Ok(())
+        })
+    }
+
+    // ========================================================================
+    // Detailed Status
+    // ========================================================================
+
+    /// Handle detailed status operation
+    fn handle_detailed_status(&self, repo_id: &str) -> Result<DetailedStatusData> {
+        let id = Self::parse_repo_id(repo_id)?;
+
+        self.runtime_handle.block_on(async {
+            let registry = self.registry.read().await;
+            let handle = registry.repo(&id)?;
+
+            // Get the repository path
+            let repo_path = handle.worktree()?.to_path_buf();
+
+            // Get detailed status in blocking task (git2 is not async)
+            tokio::task::spawn_blocking(move || -> Result<DetailedStatusData> {
+                let repo = git2::Repository::open(&repo_path)
+                    .map_err(|e| anyhow!("Failed to open repository: {}", e))?;
+
+                // Get branch name
+                let branch = repo.head().ok()
+                    .and_then(|h| h.shorthand().map(std::borrow::ToOwned::to_owned));
+
+                // Get HEAD OID
+                let head = repo.head().ok()
+                    .and_then(|h| h.target().map(|o| o.to_string()));
+
+                // Check for merge/rebase in progress
+                let merge_in_progress = repo.find_reference("MERGE_HEAD").is_ok();
+                let rebase_in_progress = repo_path.join(".git/rebase-merge").exists()
+                    || repo_path.join(".git/rebase-apply").exists();
+
+                // Get statuses
+                let statuses = repo.statuses(None)?;
+
+                let mut files = Vec::new();
+                for entry in statuses.iter() {
+                    if let Some(path) = entry.path() {
+                        let status = entry.status();
+
+                        // Index status
+                        let index_status = if status.contains(git2::Status::INDEX_NEW) {
+                            Some("A".to_owned())
+                        } else if status.contains(git2::Status::INDEX_MODIFIED) {
+                            Some("M".to_owned())
+                        } else if status.contains(git2::Status::INDEX_DELETED) {
+                            Some("D".to_owned())
+                        } else if status.contains(git2::Status::INDEX_RENAMED) {
+                            Some("R".to_owned())
+                        } else if status.contains(git2::Status::INDEX_TYPECHANGE) {
+                            Some("T".to_owned())
+                        } else {
+                            None
+                        };
+
+                        // Worktree status
+                        let worktree_status = if status.contains(git2::Status::WT_NEW) {
+                            Some("?".to_owned())
+                        } else if status.contains(git2::Status::WT_MODIFIED) {
+                            Some("M".to_owned())
+                        } else if status.contains(git2::Status::WT_DELETED) {
+                            Some("D".to_owned())
+                        } else if status.contains(git2::Status::WT_RENAMED) {
+                            Some("R".to_owned())
+                        } else if status.contains(git2::Status::WT_TYPECHANGE) {
+                            Some("T".to_owned())
+                        } else if status.contains(git2::Status::CONFLICTED) {
+                            Some("U".to_owned())
+                        } else {
+                            None
+                        };
+
+                        files.push(FileStatusData {
+                            path: path.to_owned(),
+                            index_status,
+                            worktree_status,
+                        });
+                    }
+                }
+
+                // Get ahead/behind (simplified - assume origin/main)
+                let (ahead, behind) = if let Ok(head_ref) = repo.head() {
+                    if let Some(branch_name) = head_ref.shorthand() {
+                        let upstream_name = format!("origin/{}", branch_name);
+                        if let Ok(upstream) = repo.revparse_single(&upstream_name) {
+                            if let (Ok(local), Ok(remote)) = (
+                                head_ref.peel_to_commit(),
+                                upstream.peel_to_commit(),
+                            ) {
+                                repo.graph_ahead_behind(local.id(), remote.id())
+                                    .unwrap_or((0, 0))
+                            } else {
+                                (0, 0)
+                            }
+                        } else {
+                            (0, 0)
+                        }
+                    } else {
+                        (0, 0)
+                    }
+                } else {
+                    (0, 0)
+                };
+
+                Ok(DetailedStatusData {
+                    branch,
+                    head,
+                    merge_in_progress,
+                    rebase_in_progress,
+                    files,
+                    ahead: ahead as u32,
+                    behind: behind as u32,
+                })
+            })
+            .await
+            .map_err(|e| anyhow!("Task join error: {}", e))?
+        })
+    }
+
 }
 
 impl ZmqService for RegistryService {
@@ -1140,6 +2057,49 @@ impl ZmqService for RegistryService {
 
                 match self.handle_clone(url, name, shallow, Some(depth), branch) {
                     Ok(repo) => Ok(RegistryResponse::repository(request_id, &repo)),
+                    Err(e) => Ok(RegistryResponse::error(request_id, &e.to_string())),
+                }
+            }
+
+            Which::CloneStream(clone_req) => {
+                // Authorization: Write on registry (creating new entry)
+                if let Some(resp) = self.check_auth(ctx, request_id, "registry", Operation::Write) {
+                    return Ok(resp);
+                }
+                let clone_req = clone_req?;
+                let url = clone_req.get_url()?.to_str()?;
+                let name = if clone_req.has_name() {
+                    let n = clone_req.get_name()?.to_str()?;
+                    if n.is_empty() { None } else { Some(n) }
+                } else {
+                    None
+                };
+                let shallow = clone_req.get_shallow();
+                let depth = clone_req.get_depth();
+                let branch = if clone_req.has_branch() {
+                    let b = clone_req.get_branch()?.to_str()?;
+                    if b.is_empty() { None } else { Some(b) }
+                } else {
+                    None
+                };
+
+                // Get client ephemeral pubkey from envelope context
+                let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
+
+                match self.prepare_clone_stream(url, name, shallow, Some(depth), branch, client_ephemeral_pubkey) {
+                    Ok((stream_id, server_pubkey)) => {
+                        // Get stream endpoint
+                        let stream_endpoint = endpoint_registry()
+                            .endpoint("streams", SocketKind::Sub)
+                            .to_zmq_string();
+
+                        Ok(RegistryResponse::stream_started(
+                            request_id,
+                            &stream_id,
+                            &stream_endpoint,
+                            &server_pubkey,
+                        ))
+                    }
                     Err(e) => Ok(RegistryResponse::error(request_id, &e.to_string())),
                 }
             }
@@ -1500,6 +2460,192 @@ impl ZmqService for RegistryService {
                     Err(e) => Ok(RegistryResponse::error(request_id, &e.to_string())),
                 }
             }
+
+            // Push operations
+            Which::Push(push_req) => {
+                let push_req = push_req?;
+                let repo_id = push_req.get_repo_id()?.to_str()?;
+                // Authorization: Write on specific registry entry
+                let resource = format!("registry:{repo_id}");
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                    return Ok(resp);
+                }
+                let remote = push_req.get_remote()?.to_str()?;
+                let refspec = push_req.get_refspec()?.to_str()?;
+                let force = push_req.get_force();
+
+                match self.handle_push(repo_id, remote, refspec, force) {
+                    Ok(()) => Ok(RegistryResponse::success(request_id)),
+                    Err(e) => Ok(RegistryResponse::error(request_id, &e.to_string())),
+                }
+            }
+
+            // Advanced commit operations
+            Which::AmendCommit(amend_req) => {
+                let amend_req = amend_req?;
+                let repo_id = amend_req.get_repo_id()?.to_str()?;
+                // Authorization: Write on specific registry entry
+                let resource = format!("registry:{repo_id}");
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                    return Ok(resp);
+                }
+                let message = amend_req.get_message()?.to_str()?;
+
+                match self.handle_amend_commit(repo_id, message) {
+                    Ok(oid) => Ok(RegistryResponse::commit_oid(request_id, &oid)),
+                    Err(e) => Ok(RegistryResponse::error(request_id, &e.to_string())),
+                }
+            }
+
+            Which::CommitWithAuthor(commit_req) => {
+                let commit_req = commit_req?;
+                let repo_id = commit_req.get_repo_id()?.to_str()?;
+                // Authorization: Write on specific registry entry
+                let resource = format!("registry:{repo_id}");
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                    return Ok(resp);
+                }
+                let message = commit_req.get_message()?.to_str()?;
+                let author_name = commit_req.get_author_name()?.to_str()?;
+                let author_email = commit_req.get_author_email()?.to_str()?;
+
+                match self.handle_commit_with_author(repo_id, message, author_name, author_email) {
+                    Ok(oid) => Ok(RegistryResponse::commit_oid(request_id, &oid)),
+                    Err(e) => Ok(RegistryResponse::error(request_id, &e.to_string())),
+                }
+            }
+
+            Which::StageAllIncludingUntracked(repo_id) => {
+                let repo_id = repo_id?.to_str()?;
+                // Authorization: Write on specific registry entry
+                let resource = format!("registry:{repo_id}");
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                    return Ok(resp);
+                }
+
+                match self.handle_stage_all_including_untracked(repo_id) {
+                    Ok(()) => Ok(RegistryResponse::success(request_id)),
+                    Err(e) => Ok(RegistryResponse::error(request_id, &e.to_string())),
+                }
+            }
+
+            // Merge conflict resolution
+            Which::AbortMerge(repo_id) => {
+                let repo_id = repo_id?.to_str()?;
+                // Authorization: Write on specific registry entry
+                let resource = format!("registry:{repo_id}");
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                    return Ok(resp);
+                }
+
+                match self.handle_abort_merge(repo_id) {
+                    Ok(()) => Ok(RegistryResponse::success(request_id)),
+                    Err(e) => Ok(RegistryResponse::error(request_id, &e.to_string())),
+                }
+            }
+
+            Which::ContinueMerge(merge_req) => {
+                let merge_req = merge_req?;
+                let repo_id = merge_req.get_repo_id()?.to_str()?;
+                // Authorization: Write on specific registry entry
+                let resource = format!("registry:{repo_id}");
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                    return Ok(resp);
+                }
+                let message = if merge_req.has_message() {
+                    let m = merge_req.get_message()?.to_str()?;
+                    if m.is_empty() { None } else { Some(m) }
+                } else {
+                    None
+                };
+
+                match self.handle_continue_merge(repo_id, message) {
+                    Ok(oid) => Ok(RegistryResponse::commit_oid(request_id, &oid)),
+                    Err(e) => Ok(RegistryResponse::error(request_id, &e.to_string())),
+                }
+            }
+
+            Which::QuitMerge(repo_id) => {
+                let repo_id = repo_id?.to_str()?;
+                // Authorization: Write on specific registry entry
+                let resource = format!("registry:{repo_id}");
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                    return Ok(resp);
+                }
+
+                match self.handle_quit_merge(repo_id) {
+                    Ok(()) => Ok(RegistryResponse::success(request_id)),
+                    Err(e) => Ok(RegistryResponse::error(request_id, &e.to_string())),
+                }
+            }
+
+            // Tag operations
+            Which::ListTags(repo_id) => {
+                let repo_id = repo_id?.to_str()?;
+                // Authorization: Query on specific registry entry
+                let resource = format!("registry:{repo_id}");
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
+                    return Ok(resp);
+                }
+
+                match self.handle_list_tags(repo_id) {
+                    Ok(tags) => Ok(RegistryResponse::tags(request_id, &tags)),
+                    Err(e) => Ok(RegistryResponse::error(request_id, &e.to_string())),
+                }
+            }
+
+            Which::CreateTag(tag_req) => {
+                let tag_req = tag_req?;
+                let repo_id = tag_req.get_repo_id()?.to_str()?;
+                // Authorization: Write on specific registry entry
+                let resource = format!("registry:{repo_id}");
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                    return Ok(resp);
+                }
+                let name = tag_req.get_name()?.to_str()?;
+                let target = if tag_req.has_target() {
+                    let t = tag_req.get_target()?.to_str()?;
+                    if t.is_empty() { None } else { Some(t) }
+                } else {
+                    None
+                };
+
+                match self.handle_create_tag(repo_id, name, target) {
+                    Ok(()) => Ok(RegistryResponse::success(request_id)),
+                    Err(e) => Ok(RegistryResponse::error(request_id, &e.to_string())),
+                }
+            }
+
+            Which::DeleteTag(tag_req) => {
+                let tag_req = tag_req?;
+                let repo_id = tag_req.get_repo_id()?.to_str()?;
+                // Authorization: Write on specific registry entry
+                let resource = format!("registry:{repo_id}");
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
+                    return Ok(resp);
+                }
+                let name = tag_req.get_name()?.to_str()?;
+
+                match self.handle_delete_tag(repo_id, name) {
+                    Ok(()) => Ok(RegistryResponse::success(request_id)),
+                    Err(e) => Ok(RegistryResponse::error(request_id, &e.to_string())),
+                }
+            }
+
+            // Detailed status
+            Which::DetailedStatus(repo_id) => {
+                let repo_id = repo_id?.to_str()?;
+                // Authorization: Query on specific registry entry
+                let resource = format!("registry:{repo_id}");
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
+                    return Ok(resp);
+                }
+
+                match self.handle_detailed_status(repo_id) {
+                    Ok(status) => Ok(RegistryResponse::detailed_status(request_id, &status)),
+                    Err(e) => Ok(RegistryResponse::error(request_id, &e.to_string())),
+                }
+            }
         }
     }
 
@@ -1688,6 +2834,219 @@ impl RepositoryZmqClient {
             _ => Err(RegistryServiceError::transport("Unexpected response type")),
         }
     }
+
+    /// Parse a success response (void)
+    fn parse_success_response(&self, response: &[u8]) -> Result<(), RegistryServiceError> {
+        let reader = serialize::read_message(response, ReaderOptions::new())
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+        let resp = reader
+            .get_root::<registry_capnp::registry_response::Reader>()
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+
+        use registry_capnp::registry_response::Which;
+        match resp.which() {
+            Ok(Which::Success(())) => Ok(()),
+            Ok(Which::Error(err)) => {
+                let err = err.map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+                let msg = err
+                    .get_message()
+                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?
+                    .to_str()
+                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+                Err(RegistryServiceError::transport(msg))
+            }
+            _ => Err(RegistryServiceError::transport("Unexpected response type")),
+        }
+    }
+
+    /// Parse a commit OID response
+    fn parse_commit_oid_response(&self, response: &[u8]) -> Result<String, RegistryServiceError> {
+        let reader = serialize::read_message(response, ReaderOptions::new())
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+        let resp = reader
+            .get_root::<registry_capnp::registry_response::Reader>()
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+
+        use registry_capnp::registry_response::Which;
+        match resp.which() {
+            Ok(Which::CommitOid(oid)) => {
+                let oid = oid.map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+                Ok(oid
+                    .to_str()
+                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?
+                    .to_owned())
+            }
+            Ok(Which::Error(err)) => {
+                let err = err.map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+                let msg = err
+                    .get_message()
+                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?
+                    .to_str()
+                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+                Err(RegistryServiceError::transport(msg))
+            }
+            _ => Err(RegistryServiceError::transport("Unexpected response type")),
+        }
+    }
+
+    /// Parse a tags list response
+    fn parse_tags_response(&self, response: &[u8]) -> Result<Vec<String>, RegistryServiceError> {
+        let reader = serialize::read_message(response, ReaderOptions::new())
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+        let resp = reader
+            .get_root::<registry_capnp::registry_response::Reader>()
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+
+        use registry_capnp::registry_response::Which;
+        match resp.which() {
+            Ok(Which::Tags(tags)) => {
+                let tags = tags.map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+                let mut result = Vec::new();
+                for tag in tags.iter() {
+                    let tag = tag.map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+                    result.push(
+                        tag.to_str()
+                            .map_err(|e| RegistryServiceError::transport(e.to_string()))?
+                            .to_owned(),
+                    );
+                }
+                Ok(result)
+            }
+            Ok(Which::Error(err)) => {
+                let err = err.map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+                let msg = err
+                    .get_message()
+                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?
+                    .to_str()
+                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+                Err(RegistryServiceError::transport(msg))
+            }
+            _ => Err(RegistryServiceError::transport("Unexpected response type")),
+        }
+    }
+
+    /// Parse a detailed status response
+    fn parse_detailed_status_response(
+        &self,
+        response: &[u8],
+    ) -> Result<DetailedStatus, RegistryServiceError> {
+        let reader = serialize::read_message(response, ReaderOptions::new())
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+        let resp = reader
+            .get_root::<registry_capnp::registry_response::Reader>()
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+
+        use registry_capnp::registry_response::Which;
+        match resp.which() {
+            Ok(Which::DetailedStatus(status)) => {
+                let status = status.map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+
+                // Parse branch (optional)
+                let branch = if status.has_branch() {
+                    Some(
+                        status
+                            .get_branch()
+                            .map_err(|e| RegistryServiceError::transport(e.to_string()))?
+                            .to_str()
+                            .map_err(|e| RegistryServiceError::transport(e.to_string()))?
+                            .to_owned(),
+                    )
+                } else {
+                    None
+                };
+
+                // Parse HEAD (optional)
+                let head = if status.has_head_oid() {
+                    Some(
+                        status
+                            .get_head_oid()
+                            .map_err(|e| RegistryServiceError::transport(e.to_string()))?
+                            .to_str()
+                            .map_err(|e| RegistryServiceError::transport(e.to_string()))?
+                            .to_owned(),
+                    )
+                } else {
+                    None
+                };
+
+                // Parse files
+                let files_reader = status
+                    .get_files()
+                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+                let mut files = Vec::new();
+                for file in files_reader.iter() {
+                    let path = file
+                        .get_path()
+                        .map_err(|e| RegistryServiceError::transport(e.to_string()))?
+                        .to_str()
+                        .map_err(|e| RegistryServiceError::transport(e.to_string()))?
+                        .to_owned();
+
+                    let index_status = if file.has_index_status() {
+                        let s = file
+                            .get_index_status()
+                            .map_err(|e| RegistryServiceError::transport(e.to_string()))?
+                            .to_str()
+                            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+                        parse_file_change_type(s)
+                    } else {
+                        None
+                    };
+
+                    let worktree_status = if file.has_worktree_status() {
+                        let s = file
+                            .get_worktree_status()
+                            .map_err(|e| RegistryServiceError::transport(e.to_string()))?
+                            .to_str()
+                            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+                        parse_file_change_type(s)
+                    } else {
+                        None
+                    };
+
+                    files.push(FileStatus {
+                        path,
+                        index_status,
+                        worktree_status,
+                    });
+                }
+
+                Ok(DetailedStatus {
+                    branch,
+                    head,
+                    merge_in_progress: status.get_merge_in_progress(),
+                    rebase_in_progress: status.get_rebase_in_progress(),
+                    files,
+                    ahead: status.get_ahead() as usize,
+                    behind: status.get_behind() as usize,
+                })
+            }
+            Ok(Which::Error(err)) => {
+                let err = err.map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+                let msg = err
+                    .get_message()
+                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?
+                    .to_str()
+                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+                Err(RegistryServiceError::transport(msg))
+            }
+            _ => Err(RegistryServiceError::transport("Unexpected response type")),
+        }
+    }
+}
+
+/// Parse a single-character file change type.
+fn parse_file_change_type(s: &str) -> Option<FileChangeType> {
+    match s.chars().next()? {
+        'A' => Some(FileChangeType::Added),
+        'M' => Some(FileChangeType::Modified),
+        'D' => Some(FileChangeType::Deleted),
+        'R' => Some(FileChangeType::Renamed),
+        '?' => Some(FileChangeType::Untracked),
+        'T' => Some(FileChangeType::TypeChanged),
+        'U' => Some(FileChangeType::Conflicted),
+        _ => None,
+    }
 }
 
 #[async_trait]
@@ -1778,11 +3137,19 @@ impl RepositoryClient for RepositoryZmqClient {
         self.parse_worktrees_response(&response)
     }
 
-    async fn worktree_path(&self, _branch: &str) -> Result<Option<PathBuf>, RegistryServiceError> {
-        // Worktree path lookup not yet supported via ZMQ
-        Err(RegistryServiceError::transport(
-            "Worktree path lookup not yet supported via ZMQ",
-        ))
+    async fn worktree_path(&self, branch: &str) -> Result<Option<PathBuf>, RegistryServiceError> {
+        // Get all worktrees and find the one matching this branch
+        let worktrees = self.list_worktrees().await?;
+
+        for wt in worktrees {
+            if let Some(ref wt_branch) = wt.branch {
+                if wt_branch == branch {
+                    return Ok(Some(wt.path));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     async fn create_branch(
@@ -2553,9 +3920,309 @@ impl RepositoryClient for RepositoryZmqClient {
             _ => Err(RegistryServiceError::transport("Unexpected response type")),
         }
     }
+
+    // ========================================================================
+    // Push Operations
+    // ========================================================================
+
+    async fn push(
+        &self,
+        remote: &str,
+        refspec: &str,
+        force: bool,
+    ) -> Result<(), RegistryServiceError> {
+        let client = self.create_inner_client();
+
+        let bytes = {
+            let id = client.next_id();
+            let mut message = Builder::new_default();
+            let mut req = message.init_root::<registry_capnp::registry_request::Builder>();
+            req.set_id(id);
+
+            let mut push_req = req.init_push();
+            push_req.set_repo_id(self.repo_id.to_string());
+            push_req.set_remote(remote);
+            push_req.set_refspec(refspec);
+            push_req.set_force(force);
+
+            let mut bytes = Vec::new();
+            serialize::write_message(&mut bytes, &message)
+                .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+            bytes
+        };
+
+        let response = client.call(bytes, CallOptions::default()).await
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+
+        self.parse_success_response(&response)
+    }
+
+    // ========================================================================
+    // Advanced Commit Operations
+    // ========================================================================
+
+    async fn amend_commit(&self, message: &str) -> Result<String, RegistryServiceError> {
+        let client = self.create_inner_client();
+
+        let bytes = {
+            let id = client.next_id();
+            let mut msg_builder = Builder::new_default();
+            let mut req = msg_builder.init_root::<registry_capnp::registry_request::Builder>();
+            req.set_id(id);
+
+            let mut amend_req = req.init_amend_commit();
+            amend_req.set_repo_id(self.repo_id.to_string());
+            amend_req.set_message(message);
+
+            let mut bytes = Vec::new();
+            serialize::write_message(&mut bytes, &msg_builder)
+                .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+            bytes
+        };
+
+        let response = client.call(bytes, CallOptions::default()).await
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+
+        self.parse_commit_oid_response(&response)
+    }
+
+    async fn commit_with_author(
+        &self,
+        message: &str,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<String, RegistryServiceError> {
+        let client = self.create_inner_client();
+
+        let bytes = {
+            let id = client.next_id();
+            let mut msg_builder = Builder::new_default();
+            let mut req = msg_builder.init_root::<registry_capnp::registry_request::Builder>();
+            req.set_id(id);
+
+            let mut commit_req = req.init_commit_with_author();
+            commit_req.set_repo_id(self.repo_id.to_string());
+            commit_req.set_message(message);
+            commit_req.set_author_name(author_name);
+            commit_req.set_author_email(author_email);
+
+            let mut bytes = Vec::new();
+            serialize::write_message(&mut bytes, &msg_builder)
+                .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+            bytes
+        };
+
+        let response = client.call(bytes, CallOptions::default()).await
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+
+        self.parse_commit_oid_response(&response)
+    }
+
+    async fn stage_all_including_untracked(&self) -> Result<(), RegistryServiceError> {
+        let client = self.create_inner_client();
+
+        let bytes = {
+            let id = client.next_id();
+            let mut message = Builder::new_default();
+            let mut req = message.init_root::<registry_capnp::registry_request::Builder>();
+            req.set_id(id);
+            req.set_stage_all_including_untracked(self.repo_id.to_string());
+
+            let mut bytes = Vec::new();
+            serialize::write_message(&mut bytes, &message)
+                .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+            bytes
+        };
+
+        let response = client.call(bytes, CallOptions::default()).await
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+
+        self.parse_success_response(&response)
+    }
+
+    // ========================================================================
+    // Merge Conflict Resolution
+    // ========================================================================
+
+    async fn abort_merge(&self) -> Result<(), RegistryServiceError> {
+        let client = self.create_inner_client();
+
+        let bytes = {
+            let id = client.next_id();
+            let mut message = Builder::new_default();
+            let mut req = message.init_root::<registry_capnp::registry_request::Builder>();
+            req.set_id(id);
+            req.set_abort_merge(self.repo_id.to_string());
+
+            let mut bytes = Vec::new();
+            serialize::write_message(&mut bytes, &message)
+                .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+            bytes
+        };
+
+        let response = client.call(bytes, CallOptions::default()).await
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+
+        self.parse_success_response(&response)
+    }
+
+    async fn continue_merge(&self, message: Option<&str>) -> Result<String, RegistryServiceError> {
+        let client = self.create_inner_client();
+
+        let bytes = {
+            let id = client.next_id();
+            let mut msg_builder = Builder::new_default();
+            let mut req = msg_builder.init_root::<registry_capnp::registry_request::Builder>();
+            req.set_id(id);
+
+            let mut merge_req = req.init_continue_merge();
+            merge_req.set_repo_id(self.repo_id.to_string());
+            if let Some(msg) = message {
+                merge_req.set_message(msg);
+            }
+
+            let mut bytes = Vec::new();
+            serialize::write_message(&mut bytes, &msg_builder)
+                .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+            bytes
+        };
+
+        let response = client.call(bytes, CallOptions::default()).await
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+
+        self.parse_commit_oid_response(&response)
+    }
+
+    async fn quit_merge(&self) -> Result<(), RegistryServiceError> {
+        let client = self.create_inner_client();
+
+        let bytes = {
+            let id = client.next_id();
+            let mut message = Builder::new_default();
+            let mut req = message.init_root::<registry_capnp::registry_request::Builder>();
+            req.set_id(id);
+            req.set_quit_merge(self.repo_id.to_string());
+
+            let mut bytes = Vec::new();
+            serialize::write_message(&mut bytes, &message)
+                .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+            bytes
+        };
+
+        let response = client.call(bytes, CallOptions::default()).await
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+
+        self.parse_success_response(&response)
+    }
+
+    // ========================================================================
+    // Tag Operations
+    // ========================================================================
+
+    async fn list_tags(&self) -> Result<Vec<String>, RegistryServiceError> {
+        let client = self.create_inner_client();
+
+        let bytes = {
+            let id = client.next_id();
+            let mut message = Builder::new_default();
+            let mut req = message.init_root::<registry_capnp::registry_request::Builder>();
+            req.set_id(id);
+            req.set_list_tags(self.repo_id.to_string());
+
+            let mut bytes = Vec::new();
+            serialize::write_message(&mut bytes, &message)
+                .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+            bytes
+        };
+
+        let response = client.call(bytes, CallOptions::default()).await
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+
+        self.parse_tags_response(&response)
+    }
+
+    async fn create_tag(&self, name: &str, target: Option<&str>) -> Result<(), RegistryServiceError> {
+        let client = self.create_inner_client();
+
+        let bytes = {
+            let id = client.next_id();
+            let mut message = Builder::new_default();
+            let mut req = message.init_root::<registry_capnp::registry_request::Builder>();
+            req.set_id(id);
+
+            let mut tag_req = req.init_create_tag();
+            tag_req.set_repo_id(self.repo_id.to_string());
+            tag_req.set_name(name);
+            if let Some(t) = target {
+                tag_req.set_target(t);
+            }
+
+            let mut bytes = Vec::new();
+            serialize::write_message(&mut bytes, &message)
+                .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+            bytes
+        };
+
+        let response = client.call(bytes, CallOptions::default()).await
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+
+        self.parse_success_response(&response)
+    }
+
+    async fn delete_tag(&self, name: &str) -> Result<(), RegistryServiceError> {
+        let client = self.create_inner_client();
+
+        let bytes = {
+            let id = client.next_id();
+            let mut message = Builder::new_default();
+            let mut req = message.init_root::<registry_capnp::registry_request::Builder>();
+            req.set_id(id);
+
+            let mut tag_req = req.init_delete_tag();
+            tag_req.set_repo_id(self.repo_id.to_string());
+            tag_req.set_name(name);
+
+            let mut bytes = Vec::new();
+            serialize::write_message(&mut bytes, &message)
+                .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+            bytes
+        };
+
+        let response = client.call(bytes, CallOptions::default()).await
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+
+        self.parse_success_response(&response)
+    }
+
+    // ========================================================================
+    // Detailed Status
+    // ========================================================================
+
+    async fn detailed_status(&self) -> Result<DetailedStatus, RegistryServiceError> {
+        let client = self.create_inner_client();
+
+        let bytes = {
+            let id = client.next_id();
+            let mut message = Builder::new_default();
+            let mut req = message.init_root::<registry_capnp::registry_request::Builder>();
+            req.set_id(id);
+            req.set_detailed_status(self.repo_id.to_string());
+
+            let mut bytes = Vec::new();
+            serialize::write_message(&mut bytes, &message)
+                .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+            bytes
+        };
+
+        let response = client.call(bytes, CallOptions::default()).await
+            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
+
+        self.parse_detailed_status_response(&response)
+    }
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::print_stdout)]
 mod tests {
     use super::*;
     use crate::auth::PolicyManager;

@@ -245,10 +245,16 @@ impl Spawnable for ProxyService {
         let name_clone = self.name.clone();
         std::thread::spawn(move || {
             // Block until shutdown is signaled
-            let rt = tokio::runtime::Builder::new_current_thread()
+            let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("shutdown listener runtime");
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!("Failed to create shutdown listener runtime: {e}");
+                    return;
+                }
+            };
             rt.block_on(shutdown.notified());
 
             // Send termination message to proxy
@@ -472,10 +478,14 @@ impl ServiceSpawner {
         registration: Option<ServiceRegistration>,
     ) -> Result<SpawnedService> {
         let name = service.name().to_owned();
-        let spawner = self
-            .process_spawner
-            .as_ref()
-            .expect("subprocess mode requires process_spawner");
+        let spawner = match self.process_spawner.as_ref() {
+            Some(s) => s,
+            None => {
+                return Err(crate::error::RpcError::SpawnFailed(
+                    "subprocess mode requires process_spawner".to_owned(),
+                ));
+            }
+        };
 
         let process_config =
             ProcessConfig::new(&name, binary).args(["service", &name]);
@@ -820,7 +830,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tokio_spawner() {
+    async fn test_tokio_spawner() -> crate::Result<()> {
         let context = Arc::new(zmq::Context::new());
         let (signing_key, _verifying_key) = generate_signing_keypair();
         let transport = TransportConfig::inproc("test-spawner-tokio");
@@ -829,15 +839,16 @@ mod tests {
         let service = EchoService::new(context, transport, signing_key);
 
         let spawner = ServiceSpawner::tokio();
-        let mut spawned = spawner.spawn(service).await.unwrap();
+        let mut spawned = spawner.spawn(service).await?;
 
         assert!(spawned.is_running());
 
-        spawned.stop().await.unwrap();
+        spawned.stop().await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_thread_spawner() {
+    async fn test_thread_spawner() -> crate::Result<()> {
         let context = Arc::new(zmq::Context::new());
         let (signing_key, _verifying_key) = generate_signing_keypair();
         let transport = TransportConfig::inproc("test-spawner-thread");
@@ -846,10 +857,11 @@ mod tests {
         let service = EchoService::new(context, transport, signing_key);
 
         let spawner = ServiceSpawner::threaded();
-        let mut spawned = spawner.spawn(service).await.unwrap();
+        let mut spawned = spawner.spawn(service).await?;
 
         assert!(spawned.is_running());
 
-        spawned.stop().await.unwrap();
+        spawned.stop().await?;
+        Ok(())
     }
 }

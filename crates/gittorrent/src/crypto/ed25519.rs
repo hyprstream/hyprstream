@@ -154,42 +154,45 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
-    fn test_keypair_generation() {
-        let keypair = Ed25519KeyPair::generate().unwrap();
+    fn test_keypair_generation() -> crate::error::Result<()> {
+        let keypair = Ed25519KeyPair::generate()?;
         assert_eq!(keypair.public_key_bytes().len(), 32);
         assert_eq!(keypair.secret_key_bytes().len(), 32);
+        Ok(())
     }
 
     #[test]
-    fn test_sign_verify() {
-        let keypair = Ed25519KeyPair::generate().unwrap();
+    fn test_sign_verify() -> crate::error::Result<()> {
+        let keypair = Ed25519KeyPair::generate()?;
         let data = b"hello world";
 
         let signature = keypair.sign(data);
-        assert!(keypair.verify(data, &signature).unwrap());
+        assert!(keypair.verify(data, &signature)?);
 
         // Test with different data
         let bad_data = b"goodbye world";
-        assert!(!keypair.verify(bad_data, &signature).unwrap());
+        assert!(!keypair.verify(bad_data, &signature)?);
+        Ok(())
     }
 
     #[test]
-    fn test_mutable_key() {
-        let keypair = Ed25519KeyPair::generate().unwrap();
-        let mutable_key = keypair.mutable_key().unwrap();
+    fn test_mutable_key() -> crate::error::Result<()> {
+        let keypair = Ed25519KeyPair::generate()?;
+        let mutable_key = keypair.mutable_key()?;
         assert_eq!(mutable_key.as_str().len(), 64); // SHA256 hex string
+        Ok(())
     }
 
     #[test]
-    fn test_save_load() {
-        let keypair1 = Ed25519KeyPair::generate().unwrap();
-        let temp_file = NamedTempFile::new().unwrap();
+    fn test_save_load() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let keypair1 = Ed25519KeyPair::generate()?;
+        let temp_file = NamedTempFile::new()?;
 
         // Save keypair
-        keypair1.save_to_file(temp_file.path()).unwrap();
+        keypair1.save_to_file(temp_file.path())?;
 
         // Load keypair
-        let keypair2 = Ed25519KeyPair::load_from_file(temp_file.path()).unwrap();
+        let keypair2 = Ed25519KeyPair::load_from_file(temp_file.path())?;
 
         // Should have same keys
         assert_eq!(keypair1.public_key_bytes(), keypair2.public_key_bytes());
@@ -200,21 +203,23 @@ mod tests {
         let sig1 = keypair1.sign(data);
         let sig2 = keypair2.sign(data);
 
-        assert!(keypair1.verify(data, &sig2).unwrap());
-        assert!(keypair2.verify(data, &sig1).unwrap());
+        assert!(keypair1.verify(data, &sig2)?);
+        assert!(keypair2.verify(data, &sig1)?);
+        Ok(())
     }
 
     #[test]
-    fn test_load_or_create() {
-        let temp_dir = tempfile::tempdir().unwrap();
+    fn test_load_or_create() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
         let key_path = temp_dir.path().join("test_key.json");
 
         // Should create new keypair since file doesn't exist
-        let keypair1 = Ed25519KeyPair::load_or_create(&key_path).unwrap();
+        let keypair1 = Ed25519KeyPair::load_or_create(&key_path)?;
 
         // Should load existing keypair since file now exists
-        let keypair2 = Ed25519KeyPair::load_or_create(&key_path).unwrap();
+        let keypair2 = Ed25519KeyPair::load_or_create(&key_path)?;
 
         assert_eq!(keypair1.public_key_bytes(), keypair2.public_key_bytes());
+        Ok(())
     }
 }

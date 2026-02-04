@@ -235,30 +235,32 @@ mod tests {
     }
 
     #[test]
-    fn test_config_serialization() {
+    fn test_config_serialization() -> Result<(), Box<dyn std::error::Error>> {
         let config = WorkerConfig::default();
-        let yaml = serde_yaml::to_string(&config).expect("serialize config");
-        let parsed: WorkerConfig = serde_yaml::from_str(&yaml).expect("parse config");
+        let yaml = serde_yaml::to_string(&config)?;
+        let parsed: WorkerConfig = serde_yaml::from_str(&yaml)?;
         assert_eq!(parsed.pool.max_sandboxes, config.pool.max_sandboxes);
+        Ok(())
     }
 
     #[test]
-    fn test_hypervisor_type_serialization() {
+    fn test_hypervisor_type_serialization() -> Result<(), Box<dyn std::error::Error>> {
         // Test default (cloud-hypervisor)
         let config = PoolConfig::default();
         assert_eq!(config.hypervisor, HypervisorType::CloudHypervisor);
 
         // Test serialization roundtrip
-        let yaml = serde_yaml::to_string(&config).expect("serialize");
+        let yaml = serde_yaml::to_string(&config)?;
         assert!(yaml.contains("cloud-hypervisor"), "YAML should contain kebab-case hypervisor");
-        let parsed: PoolConfig = serde_yaml::from_str(&yaml).expect("parse");
+        let parsed: PoolConfig = serde_yaml::from_str(&yaml)?;
         assert_eq!(parsed.hypervisor, HypervisorType::CloudHypervisor);
 
         // Test parsing from string
         let yaml_str = "hypervisor: cloud-hypervisor\nmax_sandboxes: 5";
-        let parsed: PoolConfig = serde_yaml::from_str(yaml_str).expect("parse from str");
+        let parsed: PoolConfig = serde_yaml::from_str(yaml_str)?;
         assert_eq!(parsed.hypervisor, HypervisorType::CloudHypervisor);
         assert_eq!(parsed.max_sandboxes, 5);
+        Ok(())
     }
 
     #[test]

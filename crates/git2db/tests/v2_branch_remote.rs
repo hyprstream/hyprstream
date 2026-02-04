@@ -64,25 +64,25 @@ async fn create_test_repo_with_branches(
 }
 
 #[tokio::test]
-async fn test_branch_list() {
+async fn test_branch_list() -> Result<(), Box<dyn std::error::Error>> {
     setup_logging();
     init_git_manager_no_shallow();
 
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new()?;
     let registry_path = temp_dir.path();
-    let mut registry = Git2DB::open(registry_path).await.unwrap();
+    let mut registry = Git2DB::open(registry_path).await?;
 
     // Create test repo with branches
     let test_repo = temp_dir.path().join("repo");
-    fs::create_dir(&test_repo).unwrap();
-    create_test_repo_with_branches(&test_repo).await.unwrap();
+    fs::create_dir(&test_repo)?;
+    create_test_repo_with_branches(&test_repo).await?;
 
     let url = format!("file://{}", test_repo.display());
-    let repo_id = registry.add_repository("test-repo", &url).await.unwrap();
+    let repo_id = registry.add_repository("test-repo", &url).await?;
 
     // Get branch manager
-    let repo = registry.repo(&repo_id).unwrap();
-    let branches = repo.branch().list().await.unwrap();
+    let repo = registry.repo(&repo_id)?;
+    let branches = repo.branch().list().await?;
 
     // Should have at least one local branch (the default branch, whatever it's named)
     let local_branches: Vec<_> = branches.iter().filter(|b| b.is_local()).collect();
@@ -96,358 +96,368 @@ async fn test_branch_list() {
         local_branches.iter().any(|b| b.is_head),
         "One branch should be HEAD"
     );
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_branch_current() {
+async fn test_branch_current() -> Result<(), Box<dyn std::error::Error>> {
     setup_logging();
     init_git_manager_no_shallow();
 
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new()?;
     let registry_path = temp_dir.path();
-    let mut registry = Git2DB::open(registry_path).await.unwrap();
+    let mut registry = Git2DB::open(registry_path).await?;
 
     let test_repo = temp_dir.path().join("repo");
-    fs::create_dir(&test_repo).unwrap();
-    create_test_repo_with_branches(&test_repo).await.unwrap();
+    fs::create_dir(&test_repo)?;
+    create_test_repo_with_branches(&test_repo).await?;
 
     let url = format!("file://{}", test_repo.display());
-    let repo_id = registry.add_repository("test-repo", &url).await.unwrap();
+    let repo_id = registry.add_repository("test-repo", &url).await?;
 
-    let repo = registry.repo(&repo_id).unwrap();
-    let current = repo.branch().current().await.unwrap();
+    let repo = registry.repo(&repo_id)?;
+    let current = repo.branch().current().await?;
 
     assert!(current.is_some(), "Should have a current branch");
-    let current_branch = current.unwrap();
-    assert!(current_branch.is_head, "Current branch should be HEAD");
-    assert!(
-        !current_branch.name.is_empty(),
-        "Current branch should have a name"
-    );
+    if let Some(current_branch) = current {
+        assert!(current_branch.is_head, "Current branch should be HEAD");
+        assert!(
+            !current_branch.name.is_empty(),
+            "Current branch should have a name"
+        );
+    }
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_branch_create_and_checkout() {
+async fn test_branch_create_and_checkout() -> Result<(), Box<dyn std::error::Error>> {
     setup_logging();
     init_git_manager_no_shallow();
 
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new()?;
     let registry_path = temp_dir.path();
-    let mut registry = Git2DB::open(registry_path).await.unwrap();
+    let mut registry = Git2DB::open(registry_path).await?;
 
     let test_repo = temp_dir.path().join("repo");
-    fs::create_dir(&test_repo).unwrap();
-    create_test_repo_with_branches(&test_repo).await.unwrap();
+    fs::create_dir(&test_repo)?;
+    create_test_repo_with_branches(&test_repo).await?;
 
     let url = format!("file://{}", test_repo.display());
-    let repo_id = registry.add_repository("test-repo", &url).await.unwrap();
+    let repo_id = registry.add_repository("test-repo", &url).await?;
 
-    let repo = registry.repo(&repo_id).unwrap();
+    let repo = registry.repo(&repo_id)?;
     let mgr = repo.branch();
 
     // Create new branch from current HEAD (None = HEAD)
-    mgr.create::<&str>("new-feature", None).await.unwrap();
+    mgr.create::<&str>("new-feature", None).await?;
 
     // List branches - should include new branch
-    let branches = mgr.list().await.unwrap();
+    let branches = mgr.list().await?;
     let has_new_branch = branches
         .iter()
         .any(|b| b.name == "new-feature" && b.is_local());
     assert!(has_new_branch);
 
     // Checkout the new branch
-    mgr.checkout("new-feature").await.unwrap();
+    mgr.checkout("new-feature").await?;
 
     // Current branch should be new-feature
-    let current = mgr.current().await.unwrap().unwrap();
+    let current = mgr.current().await?.ok_or("No current branch")?;
     assert_eq!(current.name, "new-feature");
     assert!(current.is_head);
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_branch_delete() {
+async fn test_branch_delete() -> Result<(), Box<dyn std::error::Error>> {
     setup_logging();
     init_git_manager_no_shallow();
 
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new()?;
     let registry_path = temp_dir.path();
-    let mut registry = Git2DB::open(registry_path).await.unwrap();
+    let mut registry = Git2DB::open(registry_path).await?;
 
     let test_repo = temp_dir.path().join("repo");
-    fs::create_dir(&test_repo).unwrap();
-    create_test_repo_with_branches(&test_repo).await.unwrap();
+    fs::create_dir(&test_repo)?;
+    create_test_repo_with_branches(&test_repo).await?;
 
     let url = format!("file://{}", test_repo.display());
-    let repo_id = registry.add_repository("test-repo", &url).await.unwrap();
+    let repo_id = registry.add_repository("test-repo", &url).await?;
 
-    let repo = registry.repo(&repo_id).unwrap();
+    let repo = registry.repo(&repo_id)?;
     let mgr = repo.branch();
 
     // Get the current branch name (could be main or master)
-    let default_branch = mgr.current().await.unwrap().unwrap().name.clone();
+    let default_branch = mgr.current().await?.ok_or("No current branch")?.name.clone();
 
     // Create and checkout a temporary branch from HEAD
-    mgr.create::<&str>("temp-branch", None).await.unwrap();
+    mgr.create::<&str>("temp-branch", None).await?;
 
     // Switch back to default branch
-    mgr.checkout(&default_branch).await.unwrap();
+    mgr.checkout(&default_branch).await?;
 
     // Remove the temporary branch (force=true since no divergent commits)
-    mgr.remove("temp-branch", true).await.unwrap();
+    mgr.remove("temp-branch", true).await?;
 
     // Verify it's gone
-    let branches = mgr.list().await.unwrap();
+    let branches = mgr.list().await?;
     let has_temp = branches.iter().any(|b| b.name == "temp-branch");
     assert!(!has_temp);
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_branch_delete_current_fails() {
+async fn test_branch_delete_current_fails() -> Result<(), Box<dyn std::error::Error>> {
     setup_logging();
     init_git_manager_no_shallow();
 
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new()?;
     let registry_path = temp_dir.path();
-    let mut registry = Git2DB::open(registry_path).await.unwrap();
+    let mut registry = Git2DB::open(registry_path).await?;
 
     let test_repo = temp_dir.path().join("repo");
-    fs::create_dir(&test_repo).unwrap();
-    create_test_repo_with_branches(&test_repo).await.unwrap();
+    fs::create_dir(&test_repo)?;
+    create_test_repo_with_branches(&test_repo).await?;
 
     let url = format!("file://{}", test_repo.display());
-    let repo_id = registry.add_repository("test-repo", &url).await.unwrap();
+    let repo_id = registry.add_repository("test-repo", &url).await?;
 
-    let repo = registry.repo(&repo_id).unwrap();
+    let repo = registry.repo(&repo_id)?;
     let mgr = repo.branch();
 
     // Get current branch name
-    let current = mgr.current().await.unwrap().unwrap();
+    let current = mgr.current().await?.ok_or("No current branch")?;
     let current_name = current.name.clone();
 
     // Try to remove current branch - should fail
     let result = mgr.remove(&current_name, false).await;
     assert!(result.is_err());
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_branch_rename() {
+async fn test_branch_rename() -> Result<(), Box<dyn std::error::Error>> {
     setup_logging();
     init_git_manager_no_shallow();
 
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new()?;
     let registry_path = temp_dir.path();
-    let mut registry = Git2DB::open(registry_path).await.unwrap();
+    let mut registry = Git2DB::open(registry_path).await?;
 
     let test_repo = temp_dir.path().join("repo");
-    fs::create_dir(&test_repo).unwrap();
-    create_test_repo_with_branches(&test_repo).await.unwrap();
+    fs::create_dir(&test_repo)?;
+    create_test_repo_with_branches(&test_repo).await?;
 
     let url = format!("file://{}", test_repo.display());
-    let repo_id = registry.add_repository("test-repo", &url).await.unwrap();
+    let repo_id = registry.add_repository("test-repo", &url).await?;
 
-    let repo = registry.repo(&repo_id).unwrap();
+    let repo = registry.repo(&repo_id)?;
     let mgr = repo.branch();
 
     // Create a test branch from HEAD
-    mgr.create::<&str>("old-name", None).await.unwrap();
+    mgr.create::<&str>("old-name", None).await?;
 
     // Rename it
-    mgr.rename(Some("old-name"), "new-name").await.unwrap();
+    mgr.rename(Some("old-name"), "new-name").await?;
 
     // Verify old name is gone and new name exists
-    let branches = mgr.list().await.unwrap();
+    let branches = mgr.list().await?;
     let has_old = branches.iter().any(|b| b.name == "old-name");
     let has_new = branches.iter().any(|b| b.name == "new-name");
 
     assert!(!has_old);
     assert!(has_new);
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_remote_add_and_list() {
+async fn test_remote_add_and_list() -> Result<(), Box<dyn std::error::Error>> {
     setup_logging();
     init_git_manager_no_shallow();
 
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new()?;
     let registry_path = temp_dir.path();
-    let mut registry = Git2DB::open(registry_path).await.unwrap();
+    let mut registry = Git2DB::open(registry_path).await?;
 
     let test_repo = temp_dir.path().join("repo");
-    fs::create_dir(&test_repo).unwrap();
-    create_test_repo_with_branches(&test_repo).await.unwrap();
+    fs::create_dir(&test_repo)?;
+    create_test_repo_with_branches(&test_repo).await?;
 
     let url = format!("file://{}", test_repo.display());
-    let repo_id = registry.add_repository("test-repo", &url).await.unwrap();
+    let repo_id = registry.add_repository("test-repo", &url).await?;
 
-    let repo = registry.repo(&repo_id).unwrap();
+    let repo = registry.repo(&repo_id)?;
     let mgr = repo.remote();
 
     // Should have origin remote
-    let remotes = mgr.list().await.unwrap();
+    let remotes = mgr.list().await?;
     assert!(remotes.iter().any(|r| r.name == "origin"));
 
     // Add backup remote
     mgr.add("backup", "https://backup.com/repo.git")
-        .await
-        .unwrap();
+        .await?;
 
     // Should now have both
-    let remotes = mgr.list().await.unwrap();
+    let remotes = mgr.list().await?;
     assert!(remotes.iter().any(|r| r.name == "origin"));
     assert!(remotes.iter().any(|r| r.name == "backup"));
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_remote_set_url() {
+async fn test_remote_set_url() -> Result<(), Box<dyn std::error::Error>> {
     setup_logging();
     init_git_manager_no_shallow();
 
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new()?;
     let registry_path = temp_dir.path();
-    let mut registry = Git2DB::open(registry_path).await.unwrap();
+    let mut registry = Git2DB::open(registry_path).await?;
 
     let test_repo = temp_dir.path().join("repo");
-    fs::create_dir(&test_repo).unwrap();
-    create_test_repo_with_branches(&test_repo).await.unwrap();
+    fs::create_dir(&test_repo)?;
+    create_test_repo_with_branches(&test_repo).await?;
 
     let url = format!("file://{}", test_repo.display());
-    let repo_id = registry.add_repository("test-repo", &url).await.unwrap();
+    let repo_id = registry.add_repository("test-repo", &url).await?;
 
-    let repo = registry.repo(&repo_id).unwrap();
+    let repo = registry.repo(&repo_id)?;
     let mgr = repo.remote();
 
     // Change origin URL
     let new_url = "https://new-host.com/repo.git";
-    mgr.set_url("origin", new_url).await.unwrap();
+    mgr.set_url("origin", new_url).await?;
 
     // Verify URL changed
-    let remotes = mgr.list().await.unwrap();
-    let origin = remotes.iter().find(|r| r.name == "origin").unwrap();
+    let remotes = mgr.list().await?;
+    let origin = remotes.iter().find(|r| r.name == "origin").ok_or("origin remote not found")?;
     assert_eq!(origin.url, new_url);
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_remote_rename() {
+async fn test_remote_rename() -> Result<(), Box<dyn std::error::Error>> {
     setup_logging();
     init_git_manager_no_shallow();
 
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new()?;
     let registry_path = temp_dir.path();
-    let mut registry = Git2DB::open(registry_path).await.unwrap();
+    let mut registry = Git2DB::open(registry_path).await?;
 
     let test_repo = temp_dir.path().join("repo");
-    fs::create_dir(&test_repo).unwrap();
-    create_test_repo_with_branches(&test_repo).await.unwrap();
+    fs::create_dir(&test_repo)?;
+    create_test_repo_with_branches(&test_repo).await?;
 
     let url = format!("file://{}", test_repo.display());
-    let repo_id = registry.add_repository("test-repo", &url).await.unwrap();
+    let repo_id = registry.add_repository("test-repo", &url).await?;
 
-    let repo = registry.repo(&repo_id).unwrap();
+    let repo = registry.repo(&repo_id)?;
     let mgr = repo.remote();
 
     // Add a remote
     mgr.add("backup", "https://backup.com/repo.git")
-        .await
-        .unwrap();
+        .await?;
 
     // Rename it
-    mgr.rename("backup", "mirror").await.unwrap();
+    mgr.rename("backup", "mirror").await?;
 
     // Verify rename
-    let remotes = mgr.list().await.unwrap();
+    let remotes = mgr.list().await?;
     assert!(!remotes.iter().any(|r| r.name == "backup"));
     assert!(remotes.iter().any(|r| r.name == "mirror"));
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_remote_remove() {
+async fn test_remote_remove() -> Result<(), Box<dyn std::error::Error>> {
     setup_logging();
     init_git_manager_no_shallow();
 
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new()?;
     let registry_path = temp_dir.path();
-    let mut registry = Git2DB::open(registry_path).await.unwrap();
+    let mut registry = Git2DB::open(registry_path).await?;
 
     let test_repo = temp_dir.path().join("repo");
-    fs::create_dir(&test_repo).unwrap();
-    create_test_repo_with_branches(&test_repo).await.unwrap();
+    fs::create_dir(&test_repo)?;
+    create_test_repo_with_branches(&test_repo).await?;
 
     let url = format!("file://{}", test_repo.display());
-    let repo_id = registry.add_repository("test-repo", &url).await.unwrap();
+    let repo_id = registry.add_repository("test-repo", &url).await?;
 
-    let repo = registry.repo(&repo_id).unwrap();
+    let repo = registry.repo(&repo_id)?;
     let mgr = repo.remote();
 
     // Add a remote
-    mgr.add("temp", "https://temp.com/repo.git").await.unwrap();
+    mgr.add("temp", "https://temp.com/repo.git").await?;
 
     // Verify it exists
-    let remotes = mgr.list().await.unwrap();
+    let remotes = mgr.list().await?;
     assert!(remotes.iter().any(|r| r.name == "temp"));
 
     // Remove it
-    mgr.remove("temp").await.unwrap();
+    mgr.remove("temp").await?;
 
     // Verify it's gone
-    let remotes = mgr.list().await.unwrap();
+    let remotes = mgr.list().await?;
     assert!(!remotes.iter().any(|r| r.name == "temp"));
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_remote_default() {
+async fn test_remote_default() -> Result<(), Box<dyn std::error::Error>> {
     setup_logging();
     init_git_manager_no_shallow();
 
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new()?;
     let registry_path = temp_dir.path();
-    let mut registry = Git2DB::open(registry_path).await.unwrap();
+    let mut registry = Git2DB::open(registry_path).await?;
 
     let test_repo = temp_dir.path().join("repo");
-    fs::create_dir(&test_repo).unwrap();
-    create_test_repo_with_branches(&test_repo).await.unwrap();
+    fs::create_dir(&test_repo)?;
+    create_test_repo_with_branches(&test_repo).await?;
 
     let url = format!("file://{}", test_repo.display());
-    let repo_id = registry.add_repository("test-repo", &url).await.unwrap();
+    let repo_id = registry.add_repository("test-repo", &url).await?;
 
-    let repo = registry.repo(&repo_id).unwrap();
+    let repo = registry.repo(&repo_id)?;
     let mgr = repo.remote();
 
     // Default should be origin
-    let default = mgr.default().await.unwrap();
+    let default = mgr.default().await?;
     assert!(default.is_some());
-    assert_eq!(default.unwrap().name, "origin");
+    if let Some(default_remote) = default {
+        assert_eq!(default_remote.name, "origin");
+    }
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_multi_remote_setup() {
+async fn test_multi_remote_setup() -> Result<(), Box<dyn std::error::Error>> {
     setup_logging();
     init_git_manager_no_shallow();
 
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new()?;
     let registry_path = temp_dir.path();
-    let mut registry = Git2DB::open(registry_path).await.unwrap();
+    let mut registry = Git2DB::open(registry_path).await?;
 
     let test_repo = temp_dir.path().join("repo");
-    fs::create_dir(&test_repo).unwrap();
-    create_test_repo_with_branches(&test_repo).await.unwrap();
+    fs::create_dir(&test_repo)?;
+    create_test_repo_with_branches(&test_repo).await?;
 
     let url = format!("file://{}", test_repo.display());
-    let repo_id = registry.add_repository("test-repo", &url).await.unwrap();
+    let repo_id = registry.add_repository("test-repo", &url).await?;
 
-    let repo = registry.repo(&repo_id).unwrap();
+    let repo = registry.repo(&repo_id)?;
     let mgr = repo.remote();
 
     // Setup multiple remotes (simulating distributed setup)
-    mgr.add("p2p", "gittorrent://peer/repo").await.unwrap();
+    mgr.add("p2p", "gittorrent://peer/repo").await?;
     mgr.add("backup", "https://backup.com/repo.git")
-        .await
-        .unwrap();
+        .await?;
     mgr.add("mirror", "https://mirror.org/repo.git")
-        .await
-        .unwrap();
+        .await?;
 
     // List all remotes
-    let remotes = mgr.list().await.unwrap();
+    let remotes = mgr.list().await?;
     assert_eq!(remotes.len(), 4); // origin + 3 new ones
 
     let names: Vec<_> = remotes.iter().map(|r| r.name.as_str()).collect();
@@ -455,4 +465,5 @@ async fn test_multi_remote_setup() {
     assert!(names.contains(&"p2p"));
     assert!(names.contains(&"backup"));
     assert!(names.contains(&"mirror"));
+    Ok(())
 }

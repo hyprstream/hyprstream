@@ -426,14 +426,15 @@ mod tests {
     }
 
     #[test]
-    fn test_git_signature() {
+    fn test_git_signature() -> Result<(), git2::Error> {
         let sig = GitSignature::new("Test User", "test@example.com");
         assert_eq!(sig.name, "Test User");
         assert_eq!(sig.email, "test@example.com");
 
-        let git2_sig = sig.to_git2_signature().unwrap();
-        assert_eq!(git2_sig.name().unwrap(), "Test User");
-        assert_eq!(git2_sig.email().unwrap(), "test@example.com");
+        let git2_sig = sig.to_git2_signature()?;
+        assert_eq!(git2_sig.name(), Some("Test User"));
+        assert_eq!(git2_sig.email(), Some("test@example.com"));
+        Ok(())
     }
 
     #[test]
@@ -473,16 +474,16 @@ mod tests {
     }
 
     #[test]
-    fn test_config_serialization() {
+    fn test_config_serialization() -> Result<(), serde_json::Error> {
         let config = Git2DBConfig::default();
 
         // Test JSON serialization
-        let json = serde_json::to_string(&config).unwrap();
+        let json = serde_json::to_string(&config)?;
         assert!(json.contains("\"prefer_shallow\":true"));
         assert!(json.contains("\"max_repo_cache\":100"));
 
         // Test deserialization
-        let deserialized: Git2DBConfig = serde_json::from_str(&json).unwrap();
+        let deserialized: Git2DBConfig = serde_json::from_str(&json)?;
         assert_eq!(
             config.repository.prefer_shallow,
             deserialized.repository.prefer_shallow
@@ -491,18 +492,20 @@ mod tests {
             config.performance.max_repo_cache,
             deserialized.performance.max_repo_cache
         );
+        Ok(())
     }
 
     #[test]
-    fn test_git_signature_with_special_characters() {
+    fn test_git_signature_with_special_characters() -> Result<(), git2::Error> {
         let sig = GitSignature::new("Test User with Ünicöde", "test+tag@example.com");
         assert_eq!(sig.name, "Test User with Ünicöde");
         assert_eq!(sig.email, "test+tag@example.com");
 
         // Should be able to create git2 signature
-        let git2_sig = sig.to_git2_signature().unwrap();
-        assert_eq!(git2_sig.name().unwrap(), "Test User with Ünicöde");
-        assert_eq!(git2_sig.email().unwrap(), "test+tag@example.com");
+        let git2_sig = sig.to_git2_signature()?;
+        assert_eq!(git2_sig.name(), Some("Test User with Ünicöde"));
+        assert_eq!(git2_sig.email(), Some("test+tag@example.com"));
+        Ok(())
     }
 
     #[test]

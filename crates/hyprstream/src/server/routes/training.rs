@@ -239,10 +239,7 @@ async fn write_checkpoint(
         ).into_response();
     }
 
-    // Use the shared model storage from server state
-    let storage = &state.model_storage;
-
-    // Resolve model path
+    // Resolve model path via registry
     let model_ref = match ModelRef::parse(&req.model_id) {
         Ok(r) => r,
         Err(e) => {
@@ -256,7 +253,7 @@ async fn write_checkpoint(
         }
     };
 
-    let model_path = match storage.get_model_path(&model_ref).await {
+    let model_path = match state.registry.get_model_path(&model_ref).await {
         Ok(p) => p,
         Err(e) => {
             return (

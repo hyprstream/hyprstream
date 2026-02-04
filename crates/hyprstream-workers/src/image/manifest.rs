@@ -68,8 +68,7 @@ impl ImageReference {
         };
 
         // Parse host and repository
-        let (host, repository) = if image_part.contains('/') {
-            let first_slash = image_part.find('/').unwrap();
+        let (host, repository) = if let Some(first_slash) = image_part.find('/') {
             let potential_host = &image_part[..first_slash];
 
             // Check if this is a hostname (contains . or : or is "localhost")
@@ -454,11 +453,6 @@ impl ManifestFetcher {
     }
 }
 
-impl Default for ManifestFetcher {
-    fn default() -> Self {
-        Self::new().expect("failed to create default ManifestFetcher")
-    }
-}
 
 /// Token response from registry auth server.
 #[derive(Debug, Deserialize)]
@@ -500,65 +494,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_simple_image() {
-        let ref_ = ImageReference::parse("alpine").unwrap();
+    fn test_parse_simple_image() -> Result<()> {
+        let ref_ = ImageReference::parse("alpine")?;
         assert_eq!(ref_.host, "registry-1.docker.io");
         assert_eq!(ref_.repository, "library/alpine");
         assert_eq!(ref_.reference, "latest");
         assert!(!ref_.is_digest);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_tagged_image() {
-        let ref_ = ImageReference::parse("alpine:3.18").unwrap();
+    fn test_parse_tagged_image() -> Result<()> {
+        let ref_ = ImageReference::parse("alpine:3.18")?;
         assert_eq!(ref_.host, "registry-1.docker.io");
         assert_eq!(ref_.repository, "library/alpine");
         assert_eq!(ref_.reference, "3.18");
+        Ok(())
     }
 
     #[test]
-    fn test_parse_user_repo() {
-        let ref_ = ImageReference::parse("myuser/myimage:v1").unwrap();
+    fn test_parse_user_repo() -> Result<()> {
+        let ref_ = ImageReference::parse("myuser/myimage:v1")?;
         assert_eq!(ref_.host, "registry-1.docker.io");
         assert_eq!(ref_.repository, "myuser/myimage");
         assert_eq!(ref_.reference, "v1");
+        Ok(())
     }
 
     #[test]
-    fn test_parse_custom_registry() {
-        let ref_ = ImageReference::parse("ghcr.io/owner/repo:tag").unwrap();
+    fn test_parse_custom_registry() -> Result<()> {
+        let ref_ = ImageReference::parse("ghcr.io/owner/repo:tag")?;
         assert_eq!(ref_.host, "ghcr.io");
         assert_eq!(ref_.repository, "owner/repo");
         assert_eq!(ref_.reference, "tag");
+        Ok(())
     }
 
     #[test]
-    fn test_parse_digest() {
-        let ref_ = ImageReference::parse("alpine@sha256:abc123").unwrap();
+    fn test_parse_digest() -> Result<()> {
+        let ref_ = ImageReference::parse("alpine@sha256:abc123")?;
         assert_eq!(ref_.host, "registry-1.docker.io");
         assert_eq!(ref_.repository, "library/alpine");
         assert_eq!(ref_.reference, "sha256:abc123");
         assert!(ref_.is_digest);
+        Ok(())
     }
 
     #[test]
-    fn test_manifest_url() {
-        let ref_ = ImageReference::parse("alpine:latest").unwrap();
+    fn test_manifest_url() -> Result<()> {
+        let ref_ = ImageReference::parse("alpine:latest")?;
         assert_eq!(
             ref_.manifest_url(),
             "https://registry-1.docker.io/v2/library/alpine/manifests/latest"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_parse_www_authenticate() {
+    fn test_parse_www_authenticate() -> Result<()> {
         let header = r#"Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/alpine:pull""#;
-        let params = parse_www_authenticate(header).unwrap();
+        let params = parse_www_authenticate(header)?;
         assert_eq!(&params["realm"], "https://auth.docker.io/token");
         assert_eq!(&params["service"], "registry.docker.io");
         assert_eq!(
             &params["scope"],
             "repository:library/alpine:pull"
         );
+        Ok(())
     }
 }

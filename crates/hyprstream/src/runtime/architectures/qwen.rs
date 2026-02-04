@@ -43,27 +43,10 @@ impl QwenAdapter {
             config.hidden_size
         );
 
-        // Apply Qwen-specific overrides based on version
-        // Note: max_position_embeddings is already correctly set from config.json
-        // We only validate and log, not override
-        match version {
-            3 => {
-                // Qwen3 specific configurations
-                // rope_theta is already correctly set from config.json
-                // max_position_embeddings is already set from config.json (e.g., 40,960 for Qwen3-4B)
-
-                // Ensure GQA settings match what's in the weights
-                // The config.json should already have the correct values
-            }
-            2 => {
-                // Qwen2 configurations
-                // All values already loaded from config.json
-            }
-            _ => {
-                // Qwen1 configurations
-                // All values already loaded from config.json
-            }
-        }
+        // Version-specific notes (all configurations loaded from config.json):
+        // - Qwen3: rope_theta, max_position_embeddings (e.g., 40,960 for Qwen3-4B), GQA settings
+        // - Qwen2/Qwen1: All values from config.json
+        // No runtime overrides needed - config.json values are authoritative
 
         // Handle MoE configurations - currently not implemented
         if is_moe {
@@ -104,6 +87,7 @@ impl QwenAdapter {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::print_stdout)]
 mod tests {
     use crate::runtime::architectures::llama::LlamaConfig;
 

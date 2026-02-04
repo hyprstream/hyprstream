@@ -54,20 +54,22 @@ mod tests {
     }
 
     #[test]
-    fn test_sha256_git() {
+    fn test_sha256_git() -> crate::error::Result<()> {
         let data = b"test data";
-        let sha256 = sha256_git(data).unwrap();
+        let sha256 = sha256_git(data)?;
         assert_eq!(sha256.as_str().len(), 64);
+        Ok(())
     }
 
     #[test]
-    fn test_verify_sha256() {
+    fn test_verify_sha256() -> crate::error::Result<()> {
         let data = b"verify me";
-        let sha256 = sha256_git(data).unwrap();
-        assert!(verify_sha256(data, &sha256).unwrap());
+        let sha256 = sha256_git(data)?;
+        assert!(verify_sha256(data, &sha256)?);
 
         let bad_data = b"different data";
-        assert!(!verify_sha256(bad_data, &sha256).unwrap());
+        assert!(!verify_sha256(bad_data, &sha256)?);
+        Ok(())
     }
 
     #[test]

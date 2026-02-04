@@ -268,28 +268,30 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_detect_model() {
-        let temp = TempDir::new().expect("test: create temp dir");
+    fn test_detect_model() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
         // Valid model config requires model_type or architectures field
-        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#).expect("test: write config");
+        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#)?;
 
         let registry = ArchetypeRegistry::new();
         let detected = registry.detect(temp.path());
 
         assert!(detected.archetypes.contains(&"hf-model"));
         assert!(detected.has::<Infer>());
+        Ok(())
     }
 
     #[test]
-    fn test_detect_dataset() {
-        let temp = TempDir::new().expect("test: create temp dir");
-        fs::write(temp.path().join("dataset_infos.json"), "{}").expect("test: write marker");
+    fn test_detect_dataset() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
+        fs::write(temp.path().join("dataset_infos.json"), "{}")?;
 
         let registry = ArchetypeRegistry::new();
         let detected = registry.detect(temp.path());
 
         assert!(detected.archetypes.contains(&"hf-dataset"));
         assert!(detected.has::<Query>());
+        Ok(())
     }
 
     /// Create valid-sized DuckDB data (minimum 4KB)
@@ -298,23 +300,24 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_duckdb() {
-        let temp = TempDir::new().expect("test: create temp dir");
-        fs::write(temp.path().join("metrics.duckdb"), valid_duckdb_data()).expect("test: write duckdb");
+    fn test_detect_duckdb() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
+        fs::write(temp.path().join("metrics.duckdb"), valid_duckdb_data())?;
 
         let registry = ArchetypeRegistry::new();
         let detected = registry.detect(temp.path());
 
         assert!(detected.archetypes.contains(&"duckdb"));
         assert!(detected.has::<Query>());
+        Ok(())
     }
 
     #[test]
-    fn test_detect_multiple() {
-        let temp = TempDir::new().expect("test: create temp dir");
+    fn test_detect_multiple() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
         // Both model and database
-        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#).expect("test: write config");
-        fs::write(temp.path().join("metrics.duckdb"), valid_duckdb_data()).expect("test: write duckdb");
+        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#)?;
+        fs::write(temp.path().join("metrics.duckdb"), valid_duckdb_data())?;
 
         let registry = ArchetypeRegistry::new();
         let detected = registry.detect(temp.path());
@@ -323,11 +326,12 @@ mod tests {
         assert!(detected.archetypes.contains(&"duckdb"));
         assert!(detected.has::<Infer>());
         assert!(detected.has::<Query>());
+        Ok(())
     }
 
     #[test]
-    fn test_cache_invalidation() {
-        let temp = TempDir::new().expect("test: create temp dir");
+    fn test_cache_invalidation() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
 
         let registry = ArchetypeRegistry::new();
 
@@ -336,7 +340,7 @@ mod tests {
         assert!(detected.is_empty());
 
         // Add a valid model config
-        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#).expect("test: write config");
+        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#)?;
 
         // Still cached as empty
         let detected = registry.detect(temp.path());
@@ -347,34 +351,34 @@ mod tests {
         let detected = registry.detect(temp.path());
         assert!(!detected.is_empty());
         assert!(detected.archetypes.contains(&"hf-model"));
+        Ok(())
     }
 
     #[test]
-    fn test_detect_cag_context() {
-        let temp = TempDir::new().expect("test: create temp dir");
+    fn test_detect_cag_context() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
         fs::write(
             temp.path().join("context.json"),
             r#"{"version": 1, "store": {"type": "duckdb", "path": "ctx.db"}, "embedding": {"dimension": 384, "model": "test"}}"#,
-        )
-        .expect("test: write context");
+        )?;
 
         let registry = ArchetypeRegistry::new();
         let detected = registry.detect(temp.path());
 
         assert!(detected.archetypes.contains(&"cag-context"));
         assert!(detected.has::<Context>());
+        Ok(())
     }
 
     #[test]
-    fn test_detect_model_with_cag() {
-        let temp = TempDir::new().expect("test: create temp dir");
+    fn test_detect_model_with_cag() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
         // Model + CAG context - model requires valid config
-        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#).expect("test: write config");
+        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#)?;
         fs::write(
             temp.path().join("context.json"),
             r#"{"version": 1, "store": {"type": "duckdb", "path": "ctx.db"}, "embedding": {"dimension": 384, "model": "test"}}"#,
-        )
-        .expect("test: write context");
+        )?;
 
         let registry = ArchetypeRegistry::new();
         let detected = registry.detect(temp.path());
@@ -386,6 +390,7 @@ mod tests {
         // Should show detected archetypes
         assert!(detected.archetypes_display().contains("hf-model"));
         assert!(detected.archetypes_display().contains("cag-context"));
+        Ok(())
     }
 
     // ========================================================================
@@ -393,9 +398,9 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_detected_domains_type_safe_has() {
-        let temp = TempDir::new().expect("test: create temp dir");
-        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#).expect("test: write config");
+    fn test_detected_domains_type_safe_has() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
+        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#)?;
 
         let registry = ArchetypeRegistry::new();
         let detected = registry.detect(temp.path());
@@ -408,12 +413,13 @@ mod tests {
         assert!(domains.has::<Train>());
         assert!(domains.has::<Serve>());
         assert!(!domains.has::<Query>());
+        Ok(())
     }
 
     #[test]
-    fn test_detected_domains_string_has() {
-        let temp = TempDir::new().expect("test: create temp dir");
-        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#).expect("test: write config");
+    fn test_detected_domains_string_has() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
+        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#)?;
 
         let registry = ArchetypeRegistry::new();
         let detected = registry.detect(temp.path()).to_detected_domains();
@@ -423,17 +429,17 @@ mod tests {
         assert!(detected.has_str("train"));
         assert!(!detected.has_str("query"));
         assert!(!detected.has_str("unknown"));
+        Ok(())
     }
 
     #[test]
-    fn test_detected_domains_display() {
-        let temp = TempDir::new().expect("test: create temp dir");
-        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#).expect("test: write config");
+    fn test_detected_domains_display() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
+        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#)?;
         fs::write(
             temp.path().join("context.json"),
             r#"{"version": 1, "store": {"type": "duckdb", "path": "ctx.db"}, "embedding": {"dimension": 384, "model": "test"}}"#,
-        )
-        .expect("test: write context");
+        )?;
 
         let registry = ArchetypeRegistry::new();
         let domains = registry.detect(temp.path()).to_detected_domains();
@@ -441,6 +447,7 @@ mod tests {
         // Display shows domain names
         assert!(domains.domains_display().contains("hf-model"));
         assert!(domains.domains_display().contains("cag-context"));
+        Ok(())
     }
 
     #[test]

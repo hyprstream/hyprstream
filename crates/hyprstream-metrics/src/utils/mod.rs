@@ -16,19 +16,24 @@ pub fn record_batch_to_json(batch: &RecordBatch) -> Result<Vec<JsonValue>, Box<d
             let col_name = field.name();
             let value = match col.data_type() {
                 DataType::Int64 => {
-                    let array = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                    let array = col.as_any().downcast_ref::<Int64Array>()
+                        .ok_or("Failed to downcast to Int64Array")?;
                     JsonValue::Number(array.value(row_idx).into())
                 }
                 DataType::Float64 => {
-                    let array = col.as_any().downcast_ref::<Float64Array>().unwrap();
-                    JsonValue::Number(serde_json::Number::from_f64(array.value(row_idx)).unwrap())
+                    let array = col.as_any().downcast_ref::<Float64Array>()
+                        .ok_or("Failed to downcast to Float64Array")?;
+                    let num = serde_json::Number::from_f64(array.value(row_idx))
+                        .ok_or("Failed to convert f64 to JSON number")?;
+                    JsonValue::Number(num)
                 }
                 _ => {
-                    let array = col.as_any().downcast_ref::<StringArray>().unwrap();
+                    let array = col.as_any().downcast_ref::<StringArray>()
+                        .ok_or("Failed to downcast to StringArray")?;
                     JsonValue::String(array.value(row_idx).to_owned())
                 }
             };
-            row.insert(col_name.to_string(), value);
+            row.insert(col_name.clone(), value);
         }
         json_rows.push(JsonValue::Object(row));
     }

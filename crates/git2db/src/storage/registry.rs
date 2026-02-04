@@ -99,12 +99,16 @@ mod tests {
     #[test]
     fn test_vfs_always_available() {
         let registry = DriverRegistry::new();
-        let driver = registry.get_driver(StorageDriver::Vfs).unwrap();
+        let driver = match registry.get_driver(StorageDriver::Vfs) {
+            Ok(d) => d,
+            Err(e) => panic!("Failed to get VFS driver: {e}"),
+        };
         assert_eq!(driver.name(), "vfs");
         assert!(driver.is_available());
     }
 
     #[test]
+    #[allow(clippy::print_stdout)]
     fn test_list_available() {
         let registry = DriverRegistry::new();
         let available = registry.list_available_drivers();

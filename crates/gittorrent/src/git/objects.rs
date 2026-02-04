@@ -42,9 +42,9 @@ impl From<ObjectType> for GitObjectType {
         match obj_type {
             ObjectType::Commit => GitObjectType::Commit,
             ObjectType::Tree => GitObjectType::Tree,
-            ObjectType::Blob => GitObjectType::Blob,
             ObjectType::Tag => GitObjectType::Tag,
-            _ => GitObjectType::Blob, // fallback
+            // Blob and Any both map to Blob
+            ObjectType::Blob | ObjectType::Any => GitObjectType::Blob,
         }
     }
 }
@@ -71,9 +71,9 @@ pub async fn extract_objects(repo_path: &Path) -> Result<Vec<GitObject>> {
             let type_str = match obj.kind() {
                 ObjectType::Commit => "commit",
                 ObjectType::Tree => "tree",
-                ObjectType::Blob => "blob",
                 ObjectType::Tag => "tag",
-                ObjectType::Any => "blob", // Default to blob for Any
+                // Blob and Any both render as "blob"
+                ObjectType::Blob | ObjectType::Any => "blob",
             };
 
             let mut git_format = Vec::new();
@@ -121,21 +121,23 @@ pub async fn extract_commit_objects(repo_path: &Path, commit_hash: &str) -> Resu
             let git_object = create_git_object(&repo, &obj)?;
             objects.push(git_object);
 
-            // Add referenced objects
+            // Add referenced objects based on type
             match obj.kind() {
                 Some(ObjectType::Commit) => {
-                    let commit = obj.as_commit().unwrap();
-                    // Add tree
-                    to_process.push(commit.tree_id());
-                    // Add parents
-                    for parent in commit.parent_ids() {
-                        to_process.push(parent);
+                    if let Some(commit) = obj.as_commit() {
+                        // Add tree
+                        to_process.push(commit.tree_id());
+                        // Add parents
+                        for parent in commit.parent_ids() {
+                            to_process.push(parent);
+                        }
                     }
                 }
                 Some(ObjectType::Tree) => {
-                    let tree = obj.as_tree().unwrap();
-                    for entry in tree.iter() {
-                        to_process.push(entry.id());
+                    if let Some(tree) = obj.as_tree() {
+                        for entry in tree.iter() {
+                            to_process.push(entry.id());
+                        }
                     }
                 }
                 _ => {} // Blobs and tags don't reference other objects
@@ -156,9 +158,9 @@ fn create_git_object(repo: &Repository, obj: &git2::Object<'_>) -> Result<GitObj
     let type_str = match obj.kind() {
         Some(ObjectType::Commit) => "commit",
         Some(ObjectType::Tree) => "tree",
-        Some(ObjectType::Blob) => "blob",
         Some(ObjectType::Tag) => "tag",
-        _ => "blob",
+        // Blob, Any, or None all render as "blob"
+        Some(ObjectType::Blob | ObjectType::Any) | None => "blob",
     };
 
     let mut git_format = Vec::new();
@@ -380,8 +382,8 @@ pub async fn write_objects(repo_path: &Path, objects: &[GitObject]) -> Result<()
                     let obj_type = match parts[0] {
                         "commit" => ObjectType::Commit,
                         "tree" => ObjectType::Tree,
-                        "blob" => ObjectType::Blob,
                         "tag" => ObjectType::Tag,
+                        // "blob" or unknown types default to Blob
                         _ => ObjectType::Blob,
                     };
 
@@ -605,8 +607,8 @@ pub async fn write_git_object(repo: &Repository, object_data: &[u8]) -> Result<(
                 let obj_type = match parts[0] {
                     "commit" => ObjectType::Commit,
                     "tree" => ObjectType::Tree,
-                    "blob" => ObjectType::Blob,
                     "tag" => ObjectType::Tag,
+                    // "blob" or unknown types default to Blob
                     _ => ObjectType::Blob,
                 };
 
@@ -820,24 +822,24 @@ mod tests {
     use std::fs;
 
     #[tokio::test]
-    async fn test_extract_objects() {
-        let temp_dir = TempDir::new().unwrap();
+    async fn test_extract_objects() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = TempDir::new()?;
 
         // Initialize repository and create a commit
-        let repo = Repository::init(temp_dir.path()).unwrap();
+        let repo = Repository::init(temp_dir.path())?;
 
         // Create a test file
         let file_path = temp_dir.path().join("test.txt");
-        fs::write(&file_path, "Hello World").unwrap();
+        fs::write(&file_path, "Hello World")?;
 
         // Add and commit
-        let mut index = repo.index().unwrap();
-        index.add_path(Path::new("test.txt")).unwrap();
-        index.write().unwrap();
+        let mut index = repo.index()?;
+        index.add_path(Path::new("test.txt"))?;
+        index.write()?;
 
-        let tree_id = index.write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
-        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree_id = index.write_tree()?;
+        let tree = repo.find_tree(tree_id)?;
+        let sig = git2::Signature::now("Test", "test@example.com")?;
 
         repo.commit(
             Some("HEAD"),
@@ -846,10 +848,10 @@ mod tests {
             "Initial commit",
             &tree,
             &[],
-        ).unwrap();
+        )?;
 
         // Extract objects
-        let objects = extract_objects(temp_dir.path()).await.unwrap();
+        let objects = extract_objects(temp_dir.path()).await?;
 
         // Should have at least: blob (file), tree, commit
         assert!(objects.len() >= 3);
@@ -859,14 +861,15 @@ mod tests {
         assert!(types.contains(&GitObjectType::Blob));
         assert!(types.contains(&GitObjectType::Tree));
         assert!(types.contains(&GitObjectType::Commit));
+        Ok(())
     }
 
     #[test]
-    fn test_is_exportable() {
-        let temp_dir = TempDir::new().unwrap();
+    fn test_is_exportable() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = TempDir::new()?;
 
         // Initialize a new repository
-        let repo = Repository::init(temp_dir.path()).unwrap();
+        let repo = Repository::init(temp_dir.path())?;
         drop(repo);
 
         // Should not be exportable initially
@@ -874,9 +877,10 @@ mod tests {
 
         // Create the export file
         let export_file = temp_dir.path().join(".git/git-daemon-export-ok");
-        fs::write(export_file, "").unwrap();
+        fs::write(export_file, "")?;
 
         // Should now be exportable
         assert!(is_exportable(temp_dir.path()));
+        Ok(())
     }
 }

@@ -906,7 +906,7 @@ impl GemmaModel {
                 arr.iter()
                     .map(|v| match v.as_str().unwrap_or("") {
                         "sliding_attention" => "local".to_owned(),
-                        "full_attention" => "global".to_owned(),
+                        // "full_attention" and other values default to global
                         _ => "global".to_owned(),
                     })
                     .collect()
@@ -1223,6 +1223,7 @@ impl GemmaModel {
 
 // Temporarily disabled - needs updating for new Tensor API
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::print_stdout)]
 mod tests {
     use super::*;
 

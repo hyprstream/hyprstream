@@ -28,7 +28,8 @@ use capnp::message::{Builder, ReaderOptions};
 use capnp::serialize;
 use hyprstream_rpc::registry::{try_global as try_registry, SocketKind};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, trace, warn};
@@ -117,7 +118,7 @@ impl CallbackRouter {
     /// Blocks until the instance registers or timeout expires.
     pub fn wait_for_register(&self, expected_id: &str) -> Result<Instance> {
         let start = Instant::now();
-        let router = self.router.lock().map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let router = self.router.lock();
 
         while start.elapsed() < CALLBACK_TIMEOUT {
             // Try to receive a message
@@ -188,7 +189,7 @@ impl CallbackRouter {
     pub fn send_load_model(&self, instance: &Instance, model_ref: &str, model_path: &str) -> Result<()> {
         let payload = self.build_load_model(model_ref, model_path)?;
         let empty: Vec<u8> = Vec::new();
-        let router = self.router.lock().map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let router = self.router.lock();
 
         // ROUTER format: [identity, empty, payload]
         router.send_multipart([&instance.identity, &empty, &payload], 0)?;
@@ -202,7 +203,7 @@ impl CallbackRouter {
         // Wait for response with timeout
         let start = Instant::now();
         let timeout = Duration::from_secs(60); // Model loading can take time
-        let router = self.router.lock().map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let router = self.router.lock();
 
         while start.elapsed() < timeout {
             match router.recv_multipart(0) {
@@ -236,7 +237,7 @@ impl CallbackRouter {
     pub fn send_shutdown(&self, instance: &Instance) -> Result<()> {
         let payload = self.build_shutdown()?;
         let empty: Vec<u8> = Vec::new();
-        let router = self.router.lock().map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let router = self.router.lock();
         router.send_multipart([&instance.identity, &empty, &payload], 0)?;
         trace!("Sent Shutdown to {}", instance.id);
         Ok(())
@@ -246,7 +247,7 @@ impl CallbackRouter {
     pub fn send_infer(&self, instance: &Instance, request_bytes: &[u8]) -> Result<()> {
         let payload = self.build_infer(request_bytes)?;
         let empty: Vec<u8> = Vec::new();
-        let router = self.router.lock().map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let router = self.router.lock();
         router.send_multipart([&instance.identity, &empty, &payload], 0)?;
         trace!("Sent Infer to {}", instance.id);
         Ok(())
@@ -255,7 +256,7 @@ impl CallbackRouter {
     /// Receive inference response
     pub fn recv_infer_response(&self, instance: &Instance, timeout: Duration) -> Result<Vec<u8>> {
         let start = Instant::now();
-        let router = self.router.lock().map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let router = self.router.lock();
 
         while start.elapsed() < timeout {
             match router.recv_multipart(0) {

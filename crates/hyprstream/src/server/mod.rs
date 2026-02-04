@@ -16,7 +16,6 @@ use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 use tracing::info;
 
 pub mod middleware;
-pub mod model_cache;
 pub mod routes;
 pub mod state;
 

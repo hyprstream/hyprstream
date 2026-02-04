@@ -291,7 +291,8 @@ impl SandboxPool {
             .map_err(|e| WorkerError::VmStartFailed(format!("failed to prepare VM: {e}")))?;
 
         // 7. Start the VM
-        let timeout_secs = self.config.create_timeout_secs as i32;
+        // Timeout is typically small, cap at i32::MAX (~68 years)
+        let timeout_secs = i32::try_from(self.config.create_timeout_secs).unwrap_or(i32::MAX);
         tracing::debug!(sandbox_id = %sandbox.id, timeout_secs, "Starting VM");
         hypervisor
             .start_vm(timeout_secs)
@@ -388,7 +389,8 @@ impl SandboxPool {
         // Resource limits
         config.cpu_info.default_vcpus = self.config.vm_cpus as f32;
         config.cpu_info.default_maxvcpus = self.config.vm_cpus;
-        config.memory_info.default_memory = self.config.vm_memory_mb as u32;
+        // VM memory in MB is typically small, cap at u32::MAX (~4TB)
+        config.memory_info.default_memory = u32::try_from(self.config.vm_memory_mb).unwrap_or(u32::MAX);
 
         // Configure rootless user if running in rootless mode
         if rootless::is_rootless() {
@@ -426,7 +428,7 @@ impl SandboxPool {
         sandbox: &PodSandbox,
         iso_path: &Path,
     ) -> Result<()> {
-        let sandbox_runtime_dir = iso_path.parent().unwrap();
+        let sandbox_runtime_dir = iso_path.parent().ok_or_else(|| anyhow::anyhow!("ISO path has no parent directory"))?;
 
         // Create user-data
         let hostname = if sandbox.metadata.name.is_empty() {
@@ -465,16 +467,23 @@ local-hostname: {}
         tokio::fs::write(&meta_data_path, meta_data).await?;
 
         // Generate ISO using genisoimage
+        let iso_path_str = iso_path.to_str()
+            .ok_or_else(|| WorkerError::CloudInitFailed("ISO path contains invalid UTF-8".to_owned()))?;
+        let user_data_str = user_data_path.to_str()
+            .ok_or_else(|| WorkerError::CloudInitFailed("User data path contains invalid UTF-8".to_owned()))?;
+        let meta_data_str = meta_data_path.to_str()
+            .ok_or_else(|| WorkerError::CloudInitFailed("Meta data path contains invalid UTF-8".to_owned()))?;
+
         let status = tokio::process::Command::new("genisoimage")
             .args([
                 "-output",
-                iso_path.to_str().unwrap(),
+                iso_path_str,
                 "-volid",
                 "cidata",
                 "-joliet",
                 "-rock",
-                user_data_path.to_str().unwrap(),
-                meta_data_path.to_str().unwrap(),
+                user_data_str,
+                meta_data_str,
             ])
             .status()
             .await
@@ -631,8 +640,8 @@ mod tests {
     use tempfile::TempDir;
 
     /// Create a test pool with minimal configuration
-    async fn create_test_pool(max_sandboxes: usize, warm_pool_size: usize) -> (SandboxPool, TempDir) {
-        let temp_dir = TempDir::new().unwrap();
+    async fn create_test_pool(max_sandboxes: usize, warm_pool_size: usize) -> Result<(SandboxPool, TempDir)> {
+        let temp_dir = TempDir::new()?;
         let base_path = temp_dir.path();
 
         let pool_config = PoolConfig {
@@ -652,21 +661,21 @@ mod tests {
         };
 
         // Create the required directories
-        std::fs::create_dir_all(&image_config.blobs_dir).unwrap();
-        std::fs::create_dir_all(&image_config.bootstrap_dir).unwrap();
-        std::fs::create_dir_all(&image_config.refs_dir).unwrap();
-        std::fs::create_dir_all(&image_config.cache_dir).unwrap();
-        std::fs::create_dir_all(&pool_config.runtime_dir).unwrap();
+        std::fs::create_dir_all(&image_config.blobs_dir)?;
+        std::fs::create_dir_all(&image_config.bootstrap_dir)?;
+        std::fs::create_dir_all(&image_config.refs_dir)?;
+        std::fs::create_dir_all(&image_config.cache_dir)?;
+        std::fs::create_dir_all(&pool_config.runtime_dir)?;
 
-        let rafs_store = Arc::new(RafsStore::new(image_config.clone()).unwrap());
+        let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
         let pool = SandboxPool::new(pool_config, image_config, rafs_store);
 
-        (pool, temp_dir)
+        Ok((pool, temp_dir))
     }
 
     #[tokio::test]
-    async fn test_pool_acquire_release() {
-        let (pool, _temp_dir) = create_test_pool(5, 0).await;
+    async fn test_pool_acquire_release() -> Result<()> {
+        let (pool, _temp_dir) = create_test_pool(5, 0).await?;
 
         // Acquire a sandbox (will fail to start VM since cloud-hypervisor isn't installed,
         // but we can test the pool logic by checking stats)
@@ -683,7 +692,7 @@ mod tests {
                 let stats = pool.stats().await;
                 assert_eq!(stats.active_count, 1);
 
-                pool.release(&sandbox_id).await.unwrap();
+                pool.release(&sandbox_id).await?;
                 assert!(pool.get(&sandbox_id).await.is_none());
             }
             Err(WorkerError::VmStartFailed(_)) => {
@@ -693,28 +702,31 @@ mod tests {
             }
             Err(e) => panic!("Unexpected error: {e:?}"),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_pool_stats() {
-        let (pool, _temp_dir) = create_test_pool(10, 2).await;
+    async fn test_pool_stats() -> Result<()> {
+        let (pool, _temp_dir) = create_test_pool(10, 2).await?;
 
         let stats = pool.stats().await;
         assert_eq!(stats.max_sandboxes, 10);
         assert_eq!(stats.warm_pool_target, 2);
         assert_eq!(stats.active_count, 0);
         assert_eq!(stats.warm_count, 0);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_pool_shutdown() {
-        let (pool, _temp_dir) = create_test_pool(5, 0).await;
+    async fn test_pool_shutdown() -> Result<()> {
+        let (pool, _temp_dir) = create_test_pool(5, 0).await?;
 
         // Shutdown should succeed even with no sandboxes
-        pool.shutdown().await.unwrap();
+        pool.shutdown().await?;
 
         let stats = pool.stats().await;
         assert_eq!(stats.active_count, 0);
         assert_eq!(stats.warm_count, 0);
+        Ok(())
     }
 }
