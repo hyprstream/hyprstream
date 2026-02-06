@@ -227,7 +227,7 @@ async fn chat_completions(
     let resource = format!("model:{}", request.model);
     match state
         .policy_client
-        .check(&user, &resource, Operation::Infer)
+        .check_policy(&user, &resource, Operation::Infer)
         .await
     {
         Ok(allowed) if !allowed => {
@@ -745,7 +745,7 @@ async fn completions(
     let resource = format!("model:{}", request.model);
     match state
         .policy_client
-        .check(&user, &resource, Operation::Infer)
+        .check_policy(&user, &resource, Operation::Infer)
         .await
     {
         Ok(allowed) if !allowed => {

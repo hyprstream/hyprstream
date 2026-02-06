@@ -46,6 +46,7 @@ serde_yaml.workspace = true
 git2.workspace = true  # Still needed by git2db internally
 git2db = { path = "../git2db", features = ["overlayfs"] }  # High-level git library with overlayfs
 hyprstream-rpc = { path = "../hyprstream-rpc" }  # RPC infrastructure (Cap'n Proto + ZMQ)
+hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }  # RPC code generation proc macros
 hyprstream-flight = { path = "../hyprstream-flight" }  # Flight SQL server and client
 hyprstream-metrics = { path = "../hyprstream-metrics" }  # Metrics storage (for RegistryClient trait)
 hyprstream-workers = { path = "../hyprstream-workers" }  # Worker runtime (Kata containers)
@@ -63,6 +64,9 @@ parking_lot.workspace = true
 num_cpus.workspace = true
 once_cell.workspace = true  # For global GitService singleton
 dirs = "5"  # User directory paths for CLI
+
+rmcp = { version = "0.14", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+schemars = "1.2"
 
 tracing-log.workspace = true
 tracing-appender.workspace = true

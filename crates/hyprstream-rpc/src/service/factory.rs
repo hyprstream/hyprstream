@@ -27,8 +27,10 @@ use std::sync::Arc;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
+use crate::envelope::RequestIdentity;
 use crate::registry::{global as global_registry, SocketKind};
 use crate::service::spawner::Spawnable;
+use crate::service::ZmqClient;
 use crate::transport::TransportConfig;
 
 /// Context for service creation.
@@ -117,6 +119,46 @@ impl ServiceContext {
             global_registry().endpoint(service, kind)
         }
     }
+
+    /// Create a generic ZMQ client for any named service (runtime resolution).
+    ///
+    /// Uses the REP endpoint from the registry. For compile-time-safe clients,
+    /// use `typed_client::<T>()` instead.
+    pub fn client(&self, service: &str) -> ZmqClient {
+        let endpoint = self.endpoint(service, SocketKind::Rep).to_zmq_string();
+        ZmqClient::new(
+            &endpoint,
+            self.zmq_context.clone(),
+            self.signing_key.clone(),
+            self.verifying_key,
+            RequestIdentity::local(),
+        )
+    }
+
+    /// Create a typed client for a compile-time-known service.
+    ///
+    /// The service type must implement `ServiceClient`, which provides
+    /// the service name and construction from a `ZmqClient`.
+    pub fn typed_client<T: ServiceClient>(&self) -> T {
+        T::from_zmq(self.client(T::SERVICE_NAME))
+    }
+
+    /// Get schema bytes for a service (if registered with a schema).
+    pub fn schema(&self, service: &str) -> Option<&'static [u8]> {
+        global_registry().service_schema(service)
+    }
+}
+
+/// Trait for compile-time-safe service client construction.
+///
+/// Implement this trait to enable `ServiceContext::typed_client::<T>()`.
+/// Generated clients implement this automatically.
+pub trait ServiceClient: Sized {
+    /// The service name as registered in the endpoint registry.
+    const SERVICE_NAME: &'static str;
+
+    /// Construct this client from a base `ZmqClient`.
+    fn from_zmq(client: ZmqClient) -> Self;
 }
 
 /// Factory function signature for creating services.
@@ -140,14 +182,24 @@ pub struct ServiceFactory {
 
     /// Factory function that creates the service
     pub factory: ServiceFactoryFn,
+
+    /// Raw `.capnp` schema bytes (compile-time embedded via `include_bytes!`)
+    pub schema: Option<&'static [u8]>,
 }
 
 impl ServiceFactory {
-    /// Create a new service factory.
+    /// Create a new service factory (without schema).
     ///
     /// Called by the `#[service_factory]` macro-generated code.
     pub const fn new(name: &'static str, factory: ServiceFactoryFn) -> Self {
-        Self { name, factory }
+        Self { name, factory, schema: None }
+    }
+
+    /// Create a new service factory with schema bytes.
+    ///
+    /// Called by the `#[service_factory("name", schema = "...")]` macro-generated code.
+    pub const fn with_schema(name: &'static str, factory: ServiceFactoryFn, schema: &'static [u8]) -> Self {
+        Self { name, factory, schema: Some(schema) }
     }
 }
 

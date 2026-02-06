@@ -52,64 +52,14 @@ fn compile_capnp_schemas() {
     }
 
     // Note: common.capnp (identity, envelope) is in hyprstream-rpc crate
-
-    // Compile events schema
-    let events_schema = schema_dir.join("events.capnp");
-    if events_schema.exists() {
-        if let Err(e) = capnpc::CompilerCommand::new()
-            .src_prefix("schema")
-            .file(&events_schema)
-            .run()
-        {
-            panic!("failed to compile events.capnp: {e}");
-        }
-    }
-
-    // Compile inference schema
-    let inference_schema = schema_dir.join("inference.capnp");
-    if inference_schema.exists() {
-        if let Err(e) = capnpc::CompilerCommand::new()
-            .src_prefix("schema")
-            .file(&inference_schema)
-            .run()
-        {
-            panic!("failed to compile inference.capnp: {e}");
-        }
-    }
-
-    // Compile registry schema
-    let registry_schema = schema_dir.join("registry.capnp");
-    if registry_schema.exists() {
-        if let Err(e) = capnpc::CompilerCommand::new()
-            .src_prefix("schema")
-            .file(&registry_schema)
-            .run()
-        {
-            panic!("failed to compile registry.capnp: {e}");
-        }
-    }
-
-    // Compile policy schema
-    let policy_schema = schema_dir.join("policy.capnp");
-    if policy_schema.exists() {
-        if let Err(e) = capnpc::CompilerCommand::new()
-            .src_prefix("schema")
-            .file(&policy_schema)
-            .run()
-        {
-            panic!("failed to compile policy.capnp: {e}");
-        }
-    }
-
-    // Compile model schema
-    let model_schema = schema_dir.join("model.capnp");
-    if model_schema.exists() {
-        if let Err(e) = capnpc::CompilerCommand::new()
-            .src_prefix("schema")
-            .file(&model_schema)
-            .run()
-        {
-            panic!("failed to compile model.capnp: {e}");
+    for name in ["events", "inference", "registry", "policy", "model", "mcp"] {
+        let path = schema_dir.join(format!("{name}.capnp"));
+        if path.exists() {
+            capnpc::CompilerCommand::new()
+                .src_prefix("schema")
+                .file(&path)
+                .run()
+                .unwrap_or_else(|e| panic!("failed to compile {name}.capnp: {e}"));
         }
     }
 }

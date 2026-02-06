@@ -72,7 +72,9 @@ mod traits;
 pub mod callback;
 pub mod factories;
 pub mod flight;
+pub mod generated;
 pub mod inference;
+pub mod mcp_service;
 pub mod model;
 pub mod oai;
 pub mod policy;
@@ -92,9 +94,10 @@ pub use traits::{
 
 pub use inference::{InferenceService, InferenceZmqClient, INFERENCE_ENDPOINT};
 pub use registry::{
-    RegistryOps, RegistryService, RegistryZmq, RegistryZmqClient, RepositoryZmqClient,
+    RegistryService, RegistryZmq, RegistryZmqClient, RepositoryZmqClient,
 };
-pub use policy::{PolicyService, PolicyZmqClient};
+pub use policy::PolicyService;
+pub use generated::policy_client::PolicyClient;
 pub use model::{
     LoadedModelInfo, ModelHealthInfo, ModelService, ModelServiceConfig, ModelStatusInfo,
     ModelZmqClient, MODEL_ENDPOINT,
@@ -104,3 +107,4 @@ pub use worker::WorkerClient;
 pub use oai::OAIService;
 pub use flight::FlightService;
 pub use callback::{CallbackRouter, Instance};
+pub use mcp_service::{McpConfig, McpService};

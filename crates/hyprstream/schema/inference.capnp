@@ -50,27 +50,27 @@ struct InferenceResponse {
   requestId @0 :UInt64;
 
   # Response payload (union of response types)
+  # Convention: response variant name = request variant name + "Result"
   union {
     success @1 :Void;
     error @2 :ErrorInfo;
-    generationResult @3 :GenerationResult;
-    streamStarted @4 :StreamInfo;
-    modelInfo @5 :ModelInfo;
-    ready @6 :Bool;
-    templateResult @7 :Text;
-    loraCreated @8 :Void;
-    loraLoaded @9 :Void;
-    loraSaved @10 :Void;
-    loraUnloaded @11 :Void;
+    generateResult @3 :GenerationResult;
+    generateStreamResult @4 :StreamInfo;
+    modelInfoResult @5 :ModelInfo;
+    isReadyResult @6 :Bool;
+    applyChatTemplateResult @7 :Text;
+    createLoraResult @8 :Void;
+    loadLoraResult @9 :Void;
+    saveLoraResult @10 :Void;
+    unloadLoraResult @11 :Void;
     hasLoraResult @12 :Bool;
-    sessionSet @13 :Void;
-    sessionCleared @14 :Void;
-    sessionReleased @15 :Void;
-    health @16 :HealthStatus;
+    setSessionResult @13 :Void;
+    clearSessionResult @14 :Void;
+    releaseSessionResult @15 :Void;
+    healthCheckResult @16 :HealthStatus;
 
     # Stream authorization response
-    # Future: will include server public key for DH key exchange
-    streamAuthorized @17 :StreamAuthResponse;
+    startStreamResult @17 :StreamAuthResponse;
   }
 }
 
@@ -134,7 +134,7 @@ struct StreamInfo {
 }
 
 # Stream authorization handshake
-# Note: Matches streaming.capnp::StreamStartRequest/StreamAuthResponse
+# Note: Matches streaming.capnp::StartStreamRequest/StreamAuthResponse
 
 struct StartStreamRequest {
   streamId @0 :Text;

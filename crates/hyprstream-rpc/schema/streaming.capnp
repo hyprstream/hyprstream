@@ -44,7 +44,7 @@ struct StreamRegister {
 #
 # Client calls this after receiving StreamInfo to authorize subscription.
 # Future: may include client ephemeral pubkey for late DH exchange.
-struct StreamStartRequest {
+struct StartStreamRequest {
   streamId @0 :Text;        # Stream ID from StreamInfo
   clientPubkey @1 :Data;    # Client's ephemeral Ristretto255 public key (32 bytes)
 }

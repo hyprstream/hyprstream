@@ -92,7 +92,7 @@ pub mod prelude {
         // Error
         EnvelopeError, EnvelopeResult, Result, RpcError,
         // Service
-        EnvelopeContext, RequestLoop, ServiceHandle, ZmqClient, ZmqService,
+        EnvelopeContext, RequestLoop, ServiceClient, ServiceHandle, ZmqClient, ZmqService,
         // Streaming
         StreamContext, StreamPublisher,
         // Spawner
@@ -102,8 +102,6 @@ pub mod prelude {
         SystemdBackend,
         // Service manager
         detect_service_manager, ServiceManager, StandaloneManager,
-        // Derive macros (FromCapnp, ToCapnp already imported above as traits)
-        rpc_method,
     };
 
     #[cfg(not(feature = "fips"))]
@@ -141,11 +139,12 @@ pub use envelope::{
     ResponseEnvelope, SignedEnvelope, MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
 };
 pub use error::{EnvelopeError, EnvelopeResult, Result, RpcError};
-pub use hyprstream_rpc_derive::{authorize, register_scopes, rpc_method, service_factory, FromCapnp, ToCapnp};
-pub use service::{EnvelopeContext, RequestLoop, ServiceHandle, ZmqClient, ZmqService};
+pub use hyprstream_rpc_derive::{authorize, register_scopes, service_factory, FromCapnp, ToCapnp};
+pub use service::{EnvelopeContext, RequestLoop, ServiceClient, ServiceHandle, ZmqClient, ZmqService};
 pub use streaming::{
     ChannelProgressReporter, forward_progress_to_stream, progress_channel,
-    ProgressUpdate, ResponseStream, StreamChannel, StreamContext, StreamPublisher,
+    ProgressUpdate, ResponseStream, StreamChannel, StreamContext, StreamHandle,
+    StreamPayload, StreamPublisher, StreamVerifier,
 };
 pub use service::spawner::{
     ProcessBackend, ProcessConfig, ProcessKind, ProcessSpawner,

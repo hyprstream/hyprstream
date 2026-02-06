@@ -27,6 +27,10 @@ use proc_macro::TokenStream;
 use quote::{quote, format_ident};
 use syn::{parse_macro_input, DeriveInput, Data, Fields, Attribute, Meta, Expr, ExprPath};
 
+mod schema;
+mod codegen;
+mod util;
+
 /// Derive macro for serializing Rust types to Cap'n Proto.
 ///
 /// Generates an implementation of `ToCapnp` trait that writes struct fields
@@ -434,268 +438,6 @@ fn is_vec_string_type(ty: &syn::Type) -> bool {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// RPC Method Macro - Generates client method implementations
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Attribute macro that generates RPC client method implementations.
-///
-/// This macro reduces boilerplate by auto-generating the serialize→call→parse pattern
-/// used in ZMQ RPC clients.
-///
-/// # Attributes
-///
-/// - `request` - Path to the Cap'n Proto request schema (e.g., `workers_capnp::runtime_request`)
-/// - `response` - Path to the Cap'n Proto response schema (e.g., `workers_capnp::runtime_response`)
-/// - `variant` - Name of the request union variant to set (e.g., `"version"`)
-/// - `returns` - Name of the response union variant to match (e.g., `"Version"`)
-///
-/// # Simple Variants (no nested builder)
-///
-/// For variants that take a simple value (Text, Void, primitive):
-/// ```ignore
-/// #[rpc_method(
-///     request = workers_capnp::runtime_request,
-///     response = workers_capnp::runtime_response,
-///     variant = "version",         // Maps to set_version(arg)
-///     returns = "Version"          // Maps to Which::Version(v)
-/// )]
-/// async fn worker_version(&self, version: &str) -> Result<VersionResponse>;
-/// ```
-///
-/// For Void variants (no arguments beyond &self):
-/// ```ignore
-/// #[rpc_method(
-///     request = workers_capnp::image_request,
-///     response = workers_capnp::image_response,
-///     variant = "image_fs_info",   // Maps to set_image_fs_info(())
-///     returns = "FsInfo"
-/// )]
-/// async fn image_fs_info(&self) -> Result<Vec<FilesystemUsage>>;
-/// ```
-///
-/// # Complex Variants (nested builder with ToCapnp)
-///
-/// For variants that take a struct (uses `init_*` and ToCapnp::write_to):
-/// ```ignore
-/// #[rpc_method(
-///     request = workers_capnp::runtime_request,
-///     response = workers_capnp::runtime_response,
-///     variant = "run_pod_sandbox", // Maps to init_run_pod_sandbox()
-///     returns = "SandboxId",
-///     complex = true               // Uses init_* instead of set_*
-/// )]
-/// async fn run_pod_sandbox(&self, config: &PodSandboxConfig) -> Result<String>;
-/// ```
-#[proc_macro_attribute]
-pub fn rpc_method(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let args = parse_macro_input!(attr as RpcMethodArgs);
-    let input = parse_macro_input!(item as syn::TraitItemFn);
-
-    let method_name = &input.sig.ident;
-    let return_type = &input.sig.output;
-    let inputs = &input.sig.inputs;
-
-    // Extract request/response schema paths
-    let request_schema = &args.request;
-    let response_schema = &args.response;
-    let variant_name = &args.variant;
-    let returns_variant = &args.returns;
-    let is_complex = args.complex;
-
-    // Generate setter name (snake_case)
-    let setter_name = if is_complex {
-        format_ident!("init_{}", variant_name)
-    } else {
-        format_ident!("set_{}", variant_name)
-    };
-
-    // Generate response variant (PascalCase)
-    let response_variant = format_ident!("{}", returns_variant);
-
-    // Collect non-self arguments
-    let args_list: Vec<_> = inputs.iter().filter_map(|arg| {
-        if let syn::FnArg::Typed(pat_type) = arg {
-            Some(pat_type)
-        } else {
-            None
-        }
-    }).collect();
-
-    // Generate request building code based on argument count and complexity
-    let request_builder = if args_list.is_empty() {
-        // Void variant - no arguments
-        quote! {
-            req.#setter_name(());
-        }
-    } else if is_complex && args_list.len() == 1 {
-        // Complex variant with single struct argument - use ToCapnp
-        let arg_name = &args_list[0].pat;
-        quote! {
-            {
-                let mut builder = req.#setter_name();
-                hyprstream_rpc::capnp::ToCapnp::write_to(#arg_name, &mut builder);
-            }
-        }
-    } else if args_list.len() == 1 {
-        // Simple variant with single argument
-        let arg_name = &args_list[0].pat;
-        let _arg_type = &args_list[0].ty;
-
-        // Set the argument on the request builder
-        quote! {
-            req.#setter_name(#arg_name);
-        }
-    } else {
-        // Multiple arguments - need custom handling or init_* with multiple setters
-        // For now, generate a compile error asking for manual implementation
-        return syn::Error::new_spanned(
-            &input.sig,
-            "rpc_method with multiple arguments requires manual implementation or complex=true with a single struct"
-        ).to_compile_error().into();
-    };
-
-    // Generate response parsing
-    let response_parser = generate_response_parser(response_schema, &response_variant, return_type);
-
-    // Generate the full method implementation
-    let expanded = quote! {
-        async fn #method_name(#inputs) #return_type {
-            let id = self.next_id();
-            let payload = hyprstream_rpc::serialize_message(|msg| {
-                let mut req = msg.init_root::<#request_schema::Builder>();
-                req.set_id(id);
-                #request_builder
-            })?;
-            let response = self.call(payload).await?;
-            #response_parser
-        }
-    };
-
-    expanded.into()
-}
-
-/// Arguments for the rpc_method attribute
-struct RpcMethodArgs {
-    request: syn::Path,
-    response: syn::Path,
-    variant: String,
-    returns: String,
-    complex: bool,
-}
-
-impl syn::parse::Parse for RpcMethodArgs {
-    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
-        let mut request = None;
-        let mut response = None;
-        let mut variant = None;
-        let mut returns = None;
-        let mut complex = false;
-
-        while !input.is_empty() {
-            let ident: syn::Ident = input.parse()?;
-            input.parse::<syn::Token![=]>()?;
-
-            match ident.to_string().as_str() {
-                "request" => {
-                    request = Some(input.parse::<syn::Path>()?);
-                }
-                "response" => {
-                    response = Some(input.parse::<syn::Path>()?);
-                }
-                "variant" => {
-                    let lit: syn::LitStr = input.parse()?;
-                    variant = Some(lit.value());
-                }
-                "returns" => {
-                    let lit: syn::LitStr = input.parse()?;
-                    returns = Some(lit.value());
-                }
-                "complex" => {
-                    let lit: syn::LitBool = input.parse()?;
-                    complex = lit.value();
-                }
-                other => {
-                    return Err(syn::Error::new(ident.span(), format!("unknown attribute: {other}")));
-                }
-            }
-
-            // Consume optional comma
-            if input.peek(syn::Token![,]) {
-                input.parse::<syn::Token![,]>()?;
-            }
-        }
-
-        Ok(RpcMethodArgs {
-            request: request.ok_or_else(|| syn::Error::new(input.span(), "missing 'request' attribute"))?,
-            response: response.ok_or_else(|| syn::Error::new(input.span(), "missing 'response' attribute"))?,
-            variant: variant.ok_or_else(|| syn::Error::new(input.span(), "missing 'variant' attribute"))?,
-            returns: returns.ok_or_else(|| syn::Error::new(input.span(), "missing 'returns' attribute"))?,
-            complex,
-        })
-    }
-}
-
-/// Generate response parsing code based on return type
-fn generate_response_parser(
-    response_schema: &syn::Path,
-    variant: &syn::Ident,
-    return_type: &syn::ReturnType,
-) -> proc_macro2::TokenStream {
-    // Extract the inner type from Result<T> (reserved for future use with typed responses)
-    let _inner_type = match return_type {
-        syn::ReturnType::Type(_, ty) => {
-            if let syn::Type::Path(type_path) = ty.as_ref() {
-                if let Some(segment) = type_path.path.segments.last() {
-                    if segment.ident == "Result" {
-                        if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
-                            if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
-                                Some(inner.clone())
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        }
-        _ => None,
-    };
-
-    // Generate parsing code
-    quote! {
-        {
-            let reader = capnp::serialize::read_message(
-                &mut std::io::Cursor::new(&response),
-                capnp::message::ReaderOptions::new()
-            )?;
-            let resp = reader.get_root::<#response_schema::Reader>()?;
-
-            // Check for error first
-            match resp.which()? {
-                #response_schema::Which::Error(err) => {
-                    let err = err?;
-                    let msg = err.get_message()?.to_str()?;
-                    return Err(anyhow::anyhow!("{}", msg));
-                }
-                #response_schema::Which::#variant(v) => {
-                    let v = v?;
-                    hyprstream_rpc::capnp::FromCapnp::read_from(v)
-                }
-                _ => Err(anyhow::anyhow!(concat!("Expected ", stringify!(#variant), " response"))),
-            }
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
 // Authorization Macros - #[authorize] and #[register_scopes]
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -984,23 +726,165 @@ pub fn register_scopes(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - ✅ Matches existing patterns: Same as `#[register_scopes]` and `DriverFactory`
 #[proc_macro_attribute]
 pub fn service_factory(attr: TokenStream, item: TokenStream) -> TokenStream {
-    use syn::LitStr;
-
-    let name = parse_macro_input!(attr as LitStr);
+    let args = parse_macro_input!(attr as ServiceFactoryArgs);
     let func = parse_macro_input!(item as syn::ItemFn);
     let func_name = &func.sig.ident;
+    let name = &args.name;
 
-    let expanded = quote! {
-        #func
+    let expanded = if let Some(schema_path) = &args.schema {
+        quote! {
+            #func
 
-        inventory::submit! {
-            hyprstream_rpc::service::factory::ServiceFactory::new(
-                #name,
-                #func_name
-            )
+            inventory::submit! {
+                hyprstream_rpc::service::factory::ServiceFactory::with_schema(
+                    #name,
+                    #func_name,
+                    include_bytes!(#schema_path)
+                )
+            }
+        }
+    } else {
+        quote! {
+            #func
+
+            inventory::submit! {
+                hyprstream_rpc::service::factory::ServiceFactory::new(
+                    #name,
+                    #func_name
+                )
+            }
         }
     };
 
     expanded.into()
 }
 
+/// Arguments for the #[service_factory] attribute.
+///
+/// Supports:
+/// - `#[service_factory("name")]` — no schema
+/// - `#[service_factory("name", schema = "path/to/schema.capnp")]` — with schema
+struct ServiceFactoryArgs {
+    name: syn::LitStr,
+    schema: Option<syn::LitStr>,
+}
+
+impl syn::parse::Parse for ServiceFactoryArgs {
+    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+        let name: syn::LitStr = input.parse()?;
+        let mut schema = None;
+
+        while input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
+            if input.is_empty() {
+                break;
+            }
+            let ident: syn::Ident = input.parse()?;
+            input.parse::<syn::Token![=]>()?;
+            match ident.to_string().as_str() {
+                "schema" => {
+                    schema = Some(input.parse::<syn::LitStr>()?);
+                }
+                other => {
+                    return Err(syn::Error::new(ident.span(), format!("unknown attribute: {other}")));
+                }
+            }
+        }
+
+        Ok(ServiceFactoryArgs { name, schema })
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RPC Service Code Generation Macro
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Proc macro that generates a complete RPC client + handler + metadata from a Cap'n Proto schema.
+///
+/// Reads the schema file from `$CARGO_MANIFEST_DIR/schema/{name}.capnp`, parses it,
+/// and generates all client code using `quote!` AST generation.
+///
+/// # Usage
+///
+/// ```ignore
+/// pub mod policy_client {
+///     #![allow(dead_code, unused_imports, unused_variables)]
+///     #![allow(clippy::all)]
+///     hyprstream_rpc_derive::generate_rpc_service!("policy");
+/// }
+/// ```
+#[proc_macro]
+pub fn generate_rpc_service(input: TokenStream) -> TokenStream {
+    let service_name: syn::LitStr = match syn::parse(input) {
+        Ok(n) => n,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let name = service_name.value();
+
+    let manifest_dir = match std::env::var("CARGO_MANIFEST_DIR") {
+        Ok(d) => d,
+        Err(_) => {
+            return syn::Error::new(service_name.span(), "CARGO_MANIFEST_DIR not set")
+                .to_compile_error()
+                .into()
+        }
+    };
+
+    // Scope filesystem access to the schema/ directory within the build environment.
+    // Canonicalize both paths to defeat traversal (../) and symlink escapes.
+    let schema_dir = match std::fs::canonicalize(format!("{manifest_dir}/schema")) {
+        Ok(d) => d,
+        Err(e) => {
+            return syn::Error::new(
+                service_name.span(),
+                format!("Cannot resolve schema directory: {e}"),
+            )
+            .to_compile_error()
+            .into()
+        }
+    };
+    let schema_path = match std::fs::canonicalize(schema_dir.join(format!("{name}.capnp"))) {
+        Ok(p) if p.starts_with(&schema_dir) => p,
+        Ok(p) => {
+            return syn::Error::new(
+                service_name.span(),
+                format!("Schema path escapes build environment: {}", p.display()),
+            )
+            .to_compile_error()
+            .into()
+        }
+        Err(e) => {
+            return syn::Error::new(
+                service_name.span(),
+                format!("Cannot resolve schema '{name}.capnp': {e}"),
+            )
+            .to_compile_error()
+            .into()
+        }
+    };
+    let schema_text = match std::fs::read_to_string(&schema_path) {
+        Ok(t) => t,
+        Err(e) => {
+            return syn::Error::new(
+                service_name.span(),
+                format!("Cannot read {}: {e}", schema_path.display()),
+            )
+            .to_compile_error()
+            .into()
+        }
+    };
+
+    let parsed = match schema::parse_capnp_schema(&schema_text, &name) {
+        Some(p) => p,
+        None => {
+            return syn::Error::new(
+                service_name.span(),
+                format!("Failed to parse schema for '{name}'"),
+            )
+            .to_compile_error()
+            .into()
+        }
+    };
+
+    codegen::generate_service(&name, &parsed).into()
+}

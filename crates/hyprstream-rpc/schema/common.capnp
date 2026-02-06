@@ -83,7 +83,7 @@ struct ResponseEnvelope {
 # =============================================================================
 #
 # The following types are now defined in streaming.capnp:
-#   - StreamInfo, StreamRegister, StreamStartRequest, StreamAuthResponse
+#   - StreamInfo, StreamRegister, StartStreamRequest, StreamAuthResponse
 #   - StreamBlock, StreamPayload, StreamStats, StreamError, StreamResume
 #
 # Import with: using Streaming = import "streaming.capnp";

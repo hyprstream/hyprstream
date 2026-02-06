@@ -8,7 +8,7 @@
 //! ```text
 //! InferenceService (single-threaded)
 //!       │
-//!       │ PolicyZmqClient.check() [async ZMQ I/O]
+//!       │ PolicyClient.check_policy() [async ZMQ I/O]
 //!       ▼
 //! PolicyService (multi-threaded)
 //!       │
@@ -22,13 +22,16 @@
 //! PolicyManager needs block_in_place() which requires multi-threaded.
 
 use crate::auth::{Operation, PolicyManager};
-use crate::policy_capnp;
-use crate::services::{CallOptions, EnvelopeContext, ZmqClient, ZmqService};
+use crate::services::{EnvelopeContext, ZmqService};
+use crate::services::generated::policy_client::{
+    PolicyClient, PolicyHandler, PolicyResponseVariant, dispatch_policy,
+};
+use crate::zmq::global_context;
 use anyhow::{anyhow, Result};
-use capnp::message::{Builder, ReaderOptions};
-use capnp::serialize;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::{global as registry, SocketKind};
+use hyprstream_rpc::service::ZmqClient as ZmqClientBase;
+use hyprstream_rpc::service::factory::ServiceClient;
 use hyprstream_rpc::transport::TransportConfig;
 use std::sync::Arc;
 use tracing::{debug, trace};
@@ -86,38 +89,76 @@ impl PolicyService {
         }
     }
 
-    /// Handle JWT token issuance request
+}
+
+// ============================================================================
+// PolicyHandler implementation (generated trait)
+// ============================================================================
+
+impl PolicyHandler for PolicyService {
+    fn handle_check(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        subject: &str,
+        domain: &str,
+        resource: &str,
+        operation: &str,
+    ) -> Result<PolicyResponseVariant> {
+        trace!(
+            "Policy check: subject={}, domain={}, resource={}, operation={}",
+            subject, domain, resource, operation
+        );
+
+        // Parse operation
+        let operation = match Self::parse_operation(operation) {
+            Ok(op) => op,
+            Err(_) => {
+                return Ok(PolicyResponseVariant::Error {
+                    message: format!("Invalid operation: {operation}"),
+                    code: "INVALID_OPERATION".to_string(),
+                    details: String::new(),
+                });
+            }
+        };
+
+        // Check authorization
+        let allowed = tokio::task::block_in_place(|| {
+            let handle = tokio::runtime::Handle::current();
+            handle.block_on(self.policy_manager.check_with_domain(
+                subject,
+                domain,
+                resource,
+                operation,
+            ))
+        });
+
+        debug!("Policy check result: allowed={}", allowed);
+        Ok(PolicyResponseVariant::Allowed(allowed))
+    }
+
     fn handle_issue_token(
         &self,
         ctx: &EnvelopeContext,
-        request_id: u64,
-        request: policy_capnp::issue_token::Reader,
-    ) -> Result<Vec<u8>> {
-        use crate::services::rpc_types::PolicyResponse;
+        _request_id: u64,
+        requested_scopes: &[String],
+        ttl: u32,
+    ) -> Result<PolicyResponseVariant> {
         use hyprstream_rpc::auth::Scope;
 
+        trace!("Issuing JWT token");
         let subject = ctx.casbin_subject();
 
-        // Parse scopes
-        let requested_scopes: Result<Vec<String>> = request
-            .get_requested_scopes()?
-            .iter()
-            .map(|s| s?.to_str().map(String::from).map_err(Into::into))
-            .collect();
-        let requested_scopes = requested_scopes?;
-
         // Authorize each scope via Casbin
-        // Scopes are used directly as resources (no domain mapping needed)
-        for scope_str in &requested_scopes {
-            // Parse scope to validate format
+        for scope_str in requested_scopes {
             let scope = match Scope::parse(scope_str) {
                 Ok(s) => s,
                 Err(_) => {
-                    return Ok(PolicyResponse::error(
-                        request_id,
-                        &format!("Invalid scope format: {scope_str}"),
-                        "INVALID_SCOPE"
-                    ));
+                    return Ok(PolicyResponseVariant::Error {
+                        message: format!("Invalid scope format: {scope_str}"),
+                        code: "INVALID_SCOPE".to_string(),
+                        details: String::new(),
+                    });
                 }
             };
 
@@ -125,31 +166,33 @@ impl PolicyService {
                 let handle = tokio::runtime::Handle::current();
                 handle.block_on(self.policy_manager.check(
                     &subject,
-                    &scope.to_string(),  // Use scope directly as resource
+                    &scope.to_string(),
                     Operation::Infer,
                 ))
             });
 
             if !allowed {
-                // Use PolicyResponse helper (eliminates boilerplate)
-                return Ok(PolicyResponse::unauthorized(request_id, &scope.to_string()));
+                return Ok(PolicyResponseVariant::Error {
+                    message: format!("Access denied for scope: {}", scope),
+                    code: "UNAUTHORIZED".to_string(),
+                    details: String::new(),
+                });
             }
         }
 
         // Validate TTL
-        let requested_ttl = if request.get_ttl() == 0 {
+        let requested_ttl = if ttl == 0 {
             self.token_config.default_ttl_seconds
         } else {
-            request.get_ttl()
+            ttl
         };
 
         if requested_ttl > self.token_config.max_ttl_seconds {
-            // Use PolicyResponse helper
-            return Ok(PolicyResponse::ttl_exceeded(
-                request_id,
-                requested_ttl,
-                self.token_config.max_ttl_seconds
-            ));
+            return Ok(PolicyResponseVariant::Error {
+                message: format!("TTL exceeds maximum: {} > {}", requested_ttl, self.token_config.max_ttl_seconds),
+                code: "TTL_EXCEEDED".to_string(),
+                details: String::new(),
+            });
         }
 
         // Parse scopes into Scope objects
@@ -171,36 +214,10 @@ impl PolicyService {
 
         let token = crate::auth::jwt::encode(&claims, &self.signing_key);
 
-        // Use PolicyResponse helper (eliminates boilerplate)
-        Ok(PolicyResponse::token_success(request_id, &token, claims.exp))
-    }
-
-    /// Build an allowed response
-    fn build_response(request_id: u64, allowed: bool) -> Result<Vec<u8>> {
-        let mut message = Builder::new_default();
-        {
-            let mut response = message.init_root::<policy_capnp::policy_response::Builder>();
-            response.set_request_id(request_id);
-            response.set_allowed(allowed);
-        }
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-        Ok(bytes)
-    }
-
-    /// Build an error response
-    fn build_error_response(request_id: u64, message_text: &str, code: &str) -> Result<Vec<u8>> {
-        let mut message = Builder::new_default();
-        {
-            let mut response = message.init_root::<policy_capnp::policy_response::Builder>();
-            response.set_request_id(request_id);
-            let mut error = response.init_error();
-            error.set_message(message_text);
-            error.set_code(code);
-        }
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-        Ok(bytes)
+        Ok(PolicyResponseVariant::TokenSuccess {
+            token,
+            expires_at: claims.exp,
+        })
     }
 }
 
@@ -211,64 +228,7 @@ impl ZmqService for PolicyService {
             ctx.casbin_subject(),
             ctx.request_id
         );
-
-        // Deserialize request
-        let reader = serialize::read_message(&mut std::io::Cursor::new(payload), ReaderOptions::new())?;
-        let req = reader.get_root::<policy_capnp::policy_request::Reader>()?;
-
-        let request_id = req.get_id();
-
-        // Handle based on request type using union discriminator
-        use policy_capnp::policy_request::Which;
-
-        match req.which()? {
-            Which::Check(check) => {
-                let check = check?;
-                let subject = check.get_subject()?.to_str()?;
-                let domain = check.get_domain()?.to_str()?;
-                let resource = check.get_resource()?.to_str()?;
-                let operation_str = check.get_operation()?.to_str()?;
-
-                trace!(
-                    "Policy check: subject={}, domain={}, resource={}, operation={}",
-                    subject, domain, resource, operation_str
-                );
-
-                // Parse operation
-                let operation = match Self::parse_operation(operation_str) {
-                    Ok(op) => op,
-                    Err(_) => {
-                        return Self::build_error_response(
-                            request_id,
-                            &format!("Invalid operation: {operation_str}"),
-                            "INVALID_OPERATION"
-                        );
-                    }
-                };
-
-                // Check authorization
-                let allowed = tokio::task::block_in_place(|| {
-                    let handle = tokio::runtime::Handle::current();
-                    handle.block_on(self.policy_manager.check_with_domain(
-                        subject,
-                        domain,
-                        resource,
-                        operation
-                    ))
-                });
-
-                debug!("Policy check result: allowed={}", allowed);
-
-                // Build response
-                Self::build_response(request_id, allowed)
-            }
-
-            Which::IssueToken(token_req) => {
-                let token_req = token_req?;
-                trace!("Issuing JWT token");
-                self.handle_issue_token(ctx, request_id, token_req)
-            }
-        }
+        dispatch_policy(self, ctx, payload)
     }
 
     fn name(&self) -> &str {
@@ -289,182 +249,64 @@ impl ZmqService for PolicyService {
 }
 
 // ============================================================================
-// PolicyZmqClient (client-side)
+// PolicyClient convenience methods (extends generated client)
 // ============================================================================
 
-/// Client for policy checks over ZMQ
-///
-/// This client uses async ZMQ I/O which does NOT require block_in_place.
-/// Safe to call from single-threaded runtimes like InferenceService.
-#[derive(Clone)]
-pub struct PolicyZmqClient {
-    /// Underlying ZMQ client
-    client: Arc<ZmqClient>,
-}
-
-impl PolicyZmqClient {
+impl PolicyClient {
     /// Create a new policy client (endpoint from registry)
-    ///
-    /// # Arguments
-    /// * `signing_key` - Ed25519 signing key for request authentication
-    /// * `identity` - Identity to include in requests (for authorization)
-    ///
-    /// # Note
-    /// Uses the same signing key for both request signing and response verification.
-    /// This is appropriate for internal communication where client and server share keys.
     pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
         let endpoint = registry().endpoint(SERVICE_NAME, SocketKind::Rep).to_zmq_string();
-        let server_verifying_key = signing_key.verifying_key();
-        Self {
-            client: Arc::new(ZmqClient::new(&endpoint, signing_key, server_verifying_key, identity)),
-        }
+        Self::with_endpoint(&endpoint, signing_key, identity)
     }
 
     /// Create a new policy client at a specific endpoint
     pub fn with_endpoint(endpoint: &str, signing_key: SigningKey, identity: RequestIdentity) -> Self {
         let server_verifying_key = signing_key.verifying_key();
-        Self {
-            client: Arc::new(ZmqClient::new(endpoint, signing_key, server_verifying_key, identity)),
-        }
+        let zmq_client = ZmqClientBase::new(endpoint, global_context(), signing_key, server_verifying_key, identity);
+        Self::from_zmq(zmq_client)
     }
 
     /// Check if subject is allowed to perform operation on resource
-    ///
-    /// This is async and does NOT use block_in_place.
-    /// Safe to call from single-threaded runtime.
-    pub async fn check(
+    pub async fn check_policy(
         &self,
         subject: &str,
         resource: &str,
         operation: Operation,
     ) -> Result<bool> {
-        self.check_with_domain(subject, "*", resource, operation).await
+        self.check_with_domain_policy(subject, "*", resource, operation).await
     }
 
     /// Check with explicit domain
-    pub async fn check_with_domain(
+    pub async fn check_with_domain_policy(
         &self,
         subject: &str,
         domain: &str,
         resource: &str,
         operation: Operation,
     ) -> Result<bool> {
-        let request_id = self.client.next_id();
-
-        // Build request with union discriminator
-        let mut message = Builder::new_default();
-        {
-            let mut req = message.init_root::<policy_capnp::policy_request::Builder>();
-            req.set_id(request_id);
-
-            // Initialize check union variant
-            let mut check = req.init_check();
-            check.set_subject(subject);
-            check.set_domain(domain);
-            check.set_resource(resource);
-            check.set_operation(operation.as_str());
-        }
-
-        let mut request_bytes = Vec::new();
-        serialize::write_message(&mut request_bytes, &message)?;
-
-        // Send request via ZMQ (async I/O - doesn't block runtime)
-        let response_bytes = self.client.call(request_bytes, CallOptions::default()).await?;
-
-        // Parse response
-        let reader = serialize::read_message(
-            &mut std::io::Cursor::new(&response_bytes),
-            ReaderOptions::new(),
-        )?;
-        let response = reader.get_root::<policy_capnp::policy_response::Reader>()?;
-
-        // Use which() to match the union variant
-        use crate::policy_capnp::policy_response::Which;
-        match response.which()? {
-            Which::Allowed(allowed) => Ok(allowed),
-            Which::Error(error_reader) => {
-                let error = error_reader?;
-                Err(anyhow!(
-                    "Policy check failed: {} ({})",
-                    error.get_message()?.to_str()?,
-                    error.get_code()?.to_str()?
-                ))
+        match self.check(subject, domain, resource, operation.as_str()).await? {
+            PolicyResponseVariant::Allowed(allowed) => Ok(allowed),
+            PolicyResponseVariant::Error { message, code, .. } => {
+                Err(anyhow!("Policy check failed: {} ({})", message, code))
             }
+            _ => Err(anyhow!("Unexpected response type for policy check")),
         }
     }
 
     /// Issue a JWT token with requested scopes
-    ///
-    /// # Arguments
-    /// * `scopes` - Structured scopes in "action:resource:identifier" format
-    /// * `ttl` - Optional TTL in seconds (None = use server default)
-    ///
-    /// # Returns
-    /// * `(token, expires_at)` - JWT token string and expiration timestamp
-    ///
-    /// # Example
-    /// ```ignore
-    /// let scopes = vec![
-    ///     "infer:model:qwen-7b".to_owned(),
-    ///     "subscribe:stream:abc-123".to_owned(),
-    /// ];
-    /// let (token, expires_at) = client.issue_token(scopes, Some(300)).await?;
-    /// ```
-    pub async fn issue_token(
+    pub async fn issue_jwt_token(
         &self,
         scopes: Vec<String>,
         ttl: Option<u32>,
     ) -> Result<(String, i64)> {
-        let request_id = self.client.next_id();
-
-        // Build request with union discriminator
-        let mut message = Builder::new_default();
-        {
-            let mut req = message.init_root::<policy_capnp::policy_request::Builder>();
-            req.set_id(request_id);
-
-            // Initialize issueToken union variant
-            let mut issue_token = req.init_issue_token();
-            issue_token.set_ttl(ttl.unwrap_or(0));
-
-            // Set scopes list
-            let mut scopes_list = issue_token.init_requested_scopes(scopes.len() as u32);
-            for (i, scope) in scopes.iter().enumerate() {
-                scopes_list.set(i as u32, scope);
+        match self.issue_token(&scopes, ttl.unwrap_or(0)).await? {
+            PolicyResponseVariant::TokenSuccess { token, expires_at } => {
+                Ok((token, expires_at))
             }
-        }
-
-        let mut request_bytes = Vec::new();
-        serialize::write_message(&mut request_bytes, &message)?;
-
-        // Send request via ZMQ (async I/O)
-        let response_bytes = self.client.call(request_bytes, CallOptions::default()).await?;
-
-        // Parse response
-        let reader = serialize::read_message(
-            &mut std::io::Cursor::new(&response_bytes),
-            ReaderOptions::new(),
-        )?;
-        let response = reader.get_root::<policy_capnp::issue_token_response::Reader>()?;
-
-        // Match union variant
-        use crate::policy_capnp::issue_token_response::Which;
-        match response.which()? {
-            Which::Success(token_info_reader) => {
-                let token_info = token_info_reader?;
-                Ok((
-                    token_info.get_token()?.to_str()?.to_owned(),
-                    token_info.get_expires_at(),
-                ))
+            PolicyResponseVariant::Error { message, code, .. } => {
+                Err(anyhow!("Token issuance failed: {} ({})", message, code))
             }
-            Which::Error(error_reader) => {
-                let error = error_reader?;
-                Err(anyhow!(
-                    "Token issuance failed: {} ({})",
-                    error.get_message()?.to_str()?,
-                    error.get_code()?.to_str()?
-                ))
-            }
+            _ => Err(anyhow!("Unexpected response type for issue_token")),
         }
     }
 }

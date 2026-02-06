@@ -151,6 +151,10 @@ pub struct DetailedStatusData {
 pub struct RegistryResponse;
 
 impl RegistryResponse {
+    // ====================================================================
+    // Top-level (outer) response builders
+    // ====================================================================
+
     /// Build an error response.
     pub fn error(request_id: u64, message: &str) -> Vec<u8> {
         let mut msg = Builder::new_default();
@@ -168,8 +172,6 @@ impl RegistryResponse {
     }
 
     /// Build an unauthorized error response.
-    ///
-    /// Used when a policy check fails for the requested operation.
     pub fn unauthorized(request_id: u64, subject: &str, resource: &str, operation: &str) -> Vec<u8> {
         let mut msg = Builder::new_default();
         let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
@@ -187,125 +189,8 @@ impl RegistryResponse {
         bytes
     }
 
-    /// Build a success response (void).
-    pub fn success(request_id: u64) -> Vec<u8> {
-        let mut msg = Builder::new_default();
-        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
-        response.set_request_id(request_id);
-        response.set_success(());
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
-        bytes
-    }
-
-    /// Build a health status response.
-    pub fn health(request_id: u64, status: &HealthStatus) -> Vec<u8> {
-        let mut msg = Builder::new_default();
-        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
-        response.set_request_id(request_id);
-
-        let mut health = response.init_health();
-        status.write_to(&mut health);
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
-        bytes
-    }
-
-    /// Build a remotes list response.
-    pub fn remotes(request_id: u64, remotes: &[RemoteInfo]) -> Vec<u8> {
-        let mut msg = Builder::new_default();
-        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
-        response.set_request_id(request_id);
-
-        let mut remotes_list = response.init_remotes(remotes.len() as u32);
-        for (i, remote) in remotes.iter().enumerate() {
-            let mut r = remotes_list.reborrow().get(i as u32);
-            remote.write_to(&mut r);
-        }
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
-        bytes
-    }
-
-    /// Build a worktrees list response.
-    pub fn worktrees(request_id: u64, worktrees: &[WorktreeData]) -> Vec<u8> {
-        let mut msg = Builder::new_default();
-        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
-        response.set_request_id(request_id);
-
-        let mut wt_builder = response.init_worktrees(worktrees.len() as u32);
-        for (i, wt) in worktrees.iter().enumerate() {
-            let mut wt_entry = wt_builder.reborrow().get(i as u32);
-            wt.write_to(&mut wt_entry);
-        }
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
-        bytes
-    }
-
-    /// Build a branches list response.
-    pub fn branches(request_id: u64, branches: &[String]) -> Vec<u8> {
-        let mut msg = Builder::new_default();
-        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
-        response.set_request_id(request_id);
-
-        let mut branches_builder = response.init_branches(branches.len() as u32);
-        for (i, branch) in branches.iter().enumerate() {
-            branches_builder.set(i as u32, branch);
-        }
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
-        bytes
-    }
-
-    /// Build a commit OID response.
-    pub fn commit_oid(request_id: u64, oid: &str) -> Vec<u8> {
-        let mut msg = Builder::new_default();
-        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
-        response.set_request_id(request_id);
-        response.set_commit_oid(oid);
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
-        bytes
-    }
-
-    /// Build a ref OID response (for getHead, getRef).
-    pub fn ref_oid(request_id: u64, oid: &str) -> Vec<u8> {
-        let mut msg = Builder::new_default();
-        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
-        response.set_request_id(request_id);
-        response.set_ref_oid(oid);
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
-        bytes
-    }
-
-    /// Build a path response.
-    pub fn path(request_id: u64, path: &std::path::Path) -> Vec<u8> {
-        let mut msg = Builder::new_default();
-        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
-        response.set_request_id(request_id);
-        response.set_path(path.to_string_lossy());
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
-        bytes
-    }
-
-    /// Build a repository response.
-    pub fn repository(request_id: u64, repo: &git2db::TrackedRepository) -> Vec<u8> {
-        let mut msg = Builder::new_default();
-        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
-        response.set_request_id(request_id);
-
-        let mut repo_builder = response.init_repository();
+    /// Helper to write a TrackedRepository into a capnp builder.
+    fn write_tracked_repo(repo_builder: &mut registry_capnp::tracked_repository::Builder, repo: &git2db::TrackedRepository) {
         repo_builder.set_id(repo.id.to_string());
         if let Some(ref name) = repo.name {
             repo_builder.set_name(name);
@@ -317,32 +202,18 @@ impl RegistryResponse {
             repo_builder.set_current_oid(oid);
         }
         repo_builder.set_registered_at(repo.registered_at);
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
-        bytes
     }
 
-    /// Build a repositories list response.
-    pub fn repositories(request_id: u64, repos: &[git2db::TrackedRepository]) -> Vec<u8> {
+    /// Build a list result response (listResult).
+    pub fn list_result(request_id: u64, repos: &[git2db::TrackedRepository]) -> Vec<u8> {
         let mut msg = Builder::new_default();
         let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
         response.set_request_id(request_id);
 
-        let mut repos_builder = response.init_repositories(repos.len() as u32);
+        let mut repos_builder = response.init_list_result(repos.len() as u32);
         for (i, repo) in repos.iter().enumerate() {
             let mut repo_builder = repos_builder.reborrow().get(i as u32);
-            repo_builder.set_id(repo.id.to_string());
-            if let Some(ref name) = repo.name {
-                repo_builder.set_name(name);
-            }
-            repo_builder.set_url(&repo.url);
-            repo_builder.set_worktree_path(repo.worktree_path.to_string_lossy());
-            repo_builder.set_tracking_ref(repo.tracking_ref.to_string());
-            if let Some(ref oid) = repo.current_oid {
-                repo_builder.set_current_oid(oid);
-            }
-            repo_builder.set_registered_at(repo.registered_at);
+            Self::write_tracked_repo(&mut repo_builder, repo);
         }
 
         let mut bytes = Vec::new();
@@ -350,30 +221,277 @@ impl RegistryResponse {
         bytes
     }
 
-    /// Build a repository status response.
-    pub fn repository_status(request_id: u64, status: &git2db::RepositoryStatus) -> Vec<u8> {
+    /// Build a get result response (getResult).
+    pub fn get_result(request_id: u64, repo: &git2db::TrackedRepository) -> Vec<u8> {
         let mut msg = Builder::new_default();
         let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
         response.set_request_id(request_id);
 
-        let mut status_builder = response.init_repository_status();
+        let mut repo_builder = response.init_get_result();
+        Self::write_tracked_repo(&mut repo_builder, repo);
 
-        // Set branch (optional)
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a get-by-name result response (getByNameResult).
+    pub fn get_by_name_result(request_id: u64, repo: &git2db::TrackedRepository) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut repo_builder = response.init_get_by_name_result();
+        Self::write_tracked_repo(&mut repo_builder, repo);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a clone result response (cloneResult).
+    pub fn clone_result(request_id: u64, repo: &git2db::TrackedRepository) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut repo_builder = response.init_clone_result();
+        Self::write_tracked_repo(&mut repo_builder, repo);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a register result response (registerResult).
+    pub fn register_result(request_id: u64, repo: &git2db::TrackedRepository) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut repo_builder = response.init_register_result();
+        Self::write_tracked_repo(&mut repo_builder, repo);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a remove result response (removeResult).
+    pub fn remove_result(request_id: u64) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+        response.set_remove_result(());
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a health check result response (healthCheckResult).
+    pub fn health_check_result(request_id: u64, status: &HealthStatus) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut health = response.init_health_check_result();
+        status.write_to(&mut health);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a stream started response (cloneStreamResult).
+    pub fn clone_stream_result(
+        request_id: u64,
+        stream_id: &str,
+        stream_endpoint: &str,
+        server_pubkey: &[u8; 32],
+    ) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut stream_info = response.init_clone_stream_result();
+        stream_info.set_stream_id(stream_id);
+        stream_info.set_stream_endpoint(stream_endpoint);
+        stream_info.set_server_pubkey(server_pubkey);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    // ====================================================================
+    // Repository-scoped (inner) response builders — nested inside repoResult
+    // ====================================================================
+
+    /// Build a repo error response (repoResult → error).
+    pub fn repo_error(request_id: u64, message: &str) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let repo_resp = response.init_repo_result();
+        let mut error_info = repo_resp.init_error();
+        error_info.set_message(message);
+        error_info.set_code("ERROR");
+        error_info.set_details("");
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a repo create-worktree response (repoResult → createWorktree).
+    pub fn repo_create_worktree(request_id: u64, path: &std::path::Path) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut repo_resp = response.init_repo_result();
+        repo_resp.set_create_worktree(path.to_string_lossy());
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a repo list-worktrees response (repoResult → listWorktrees).
+    pub fn repo_list_worktrees(request_id: u64, worktrees: &[WorktreeData]) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let repo_resp = response.init_repo_result();
+        let mut wt_builder = repo_resp.init_list_worktrees(worktrees.len() as u32);
+        for (i, wt) in worktrees.iter().enumerate() {
+            let mut wt_entry = wt_builder.reborrow().get(i as u32);
+            wt.write_to(&mut wt_entry);
+        }
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a repo void response for a named variant (repoResult → <void variant>).
+    /// Used for: removeWorktree, createBranch, checkout, stageAll, stageFiles,
+    /// merge, abortMerge, continueMerge, quitMerge, addRemote, removeRemote,
+    /// setRemoteUrl, renameRemote, push, stageAllIncludingUntracked, createTag,
+    /// deleteTag, update
+    pub fn repo_void(request_id: u64, variant: RepoVoidVariant) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut repo_resp = response.init_repo_result();
+        match variant {
+            RepoVoidVariant::RemoveWorktree => repo_resp.set_remove_worktree(()),
+            RepoVoidVariant::CreateBranch => repo_resp.set_create_branch(()),
+            RepoVoidVariant::Checkout => repo_resp.set_checkout(()),
+            RepoVoidVariant::StageAll => repo_resp.set_stage_all(()),
+            RepoVoidVariant::StageFiles => repo_resp.set_stage_files(()),
+            RepoVoidVariant::Merge => repo_resp.set_merge(()),
+            RepoVoidVariant::AbortMerge => repo_resp.set_abort_merge(()),
+            RepoVoidVariant::ContinueMerge => repo_resp.set_continue_merge(()),
+            RepoVoidVariant::QuitMerge => repo_resp.set_quit_merge(()),
+            RepoVoidVariant::AddRemote => repo_resp.set_add_remote(()),
+            RepoVoidVariant::RemoveRemote => repo_resp.set_remove_remote(()),
+            RepoVoidVariant::SetRemoteUrl => repo_resp.set_set_remote_url(()),
+            RepoVoidVariant::RenameRemote => repo_resp.set_rename_remote(()),
+            RepoVoidVariant::Push => repo_resp.set_push(()),
+            RepoVoidVariant::StageAllIncludingUntracked => repo_resp.set_stage_all_including_untracked(()),
+            RepoVoidVariant::CreateTag => repo_resp.set_create_tag(()),
+            RepoVoidVariant::DeleteTag => repo_resp.set_delete_tag(()),
+            RepoVoidVariant::Update => repo_resp.set_update(()),
+        }
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a repo list-branches response (repoResult → listBranches).
+    pub fn repo_list_branches(request_id: u64, branches: &[String]) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let repo_resp = response.init_repo_result();
+        let mut branches_builder = repo_resp.init_list_branches(branches.len() as u32);
+        for (i, branch) in branches.iter().enumerate() {
+            branches_builder.set(i as u32, branch);
+        }
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a repo commit response (repoResult → commit). Returns OID text.
+    pub fn repo_commit(request_id: u64, oid: &str) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut repo_resp = response.init_repo_result();
+        repo_resp.set_commit(oid);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a repo get-head response (repoResult → getHead). Returns OID text.
+    pub fn repo_get_head(request_id: u64, oid: &str) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut repo_resp = response.init_repo_result();
+        repo_resp.set_get_head(oid);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a repo get-ref response (repoResult → getRef). Returns OID text.
+    pub fn repo_get_ref(request_id: u64, oid: &str) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut repo_resp = response.init_repo_result();
+        repo_resp.set_get_ref(oid);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a repo status response (repoResult → status).
+    pub fn repo_status(request_id: u64, status: &git2db::RepositoryStatus) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let repo_resp = response.init_repo_result();
+        let mut status_builder = repo_resp.init_status();
+
         if let Some(ref branch) = status.branch {
             status_builder.set_branch(branch);
         }
-
-        // Set head OID (optional)
         if let Some(ref oid) = status.head {
             status_builder.set_head_oid(oid.to_string());
         }
-
-        // Set other fields
         status_builder.set_ahead(status.ahead as u32);
         status_builder.set_behind(status.behind as u32);
         status_builder.set_is_clean(status.is_clean);
 
-        // Set modified files
         let mut files_builder = status_builder.init_modified_files(status.modified_files.len() as u32);
         for (i, file) in status.modified_files.iter().enumerate() {
             files_builder.set(i as u32, file.to_string_lossy());
@@ -384,65 +502,26 @@ impl RegistryResponse {
         bytes
     }
 
-    /// Build a stream started response (for streaming clone).
-    pub fn stream_started(
-        request_id: u64,
-        stream_id: &str,
-        stream_endpoint: &str,
-        server_pubkey: &[u8; 32],
-    ) -> Vec<u8> {
+    /// Build a repo detailed-status response (repoResult → detailedStatus).
+    pub fn repo_detailed_status(request_id: u64, status: &DetailedStatusData) -> Vec<u8> {
         let mut msg = Builder::new_default();
         let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
         response.set_request_id(request_id);
 
-        let mut stream_info = response.init_stream_started();
-        stream_info.set_stream_id(stream_id);
-        stream_info.set_stream_endpoint(stream_endpoint);
-        stream_info.set_server_pubkey(server_pubkey);
+        let repo_resp = response.init_repo_result();
+        let mut status_builder = repo_resp.init_detailed_status();
 
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
-        bytes
-    }
-
-    /// Build a tags list response.
-    pub fn tags(request_id: u64, tags: &[String]) -> Vec<u8> {
-        let mut msg = Builder::new_default();
-        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
-        response.set_request_id(request_id);
-
-        let mut tags_builder = response.init_tags(tags.len() as u32);
-        for (i, tag) in tags.iter().enumerate() {
-            tags_builder.set(i as u32, tag);
-        }
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
-        bytes
-    }
-
-    /// Build a detailed status response.
-    pub fn detailed_status(request_id: u64, status: &DetailedStatusData) -> Vec<u8> {
-        let mut msg = Builder::new_default();
-        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
-        response.set_request_id(request_id);
-
-        let mut status_builder = response.init_detailed_status();
-
-        // Set optional fields
         if let Some(ref branch) = status.branch {
             status_builder.set_branch(branch);
         }
         if let Some(ref head) = status.head {
             status_builder.set_head_oid(head);
         }
-
         status_builder.set_merge_in_progress(status.merge_in_progress);
         status_builder.set_rebase_in_progress(status.rebase_in_progress);
         status_builder.set_ahead(status.ahead);
         status_builder.set_behind(status.behind);
 
-        // Set files
         let mut files_builder = status_builder.init_files(status.files.len() as u32);
         for (i, file) in status.files.iter().enumerate() {
             let mut file_builder = files_builder.reborrow().get(i as u32);
@@ -453,6 +532,92 @@ impl RegistryResponse {
         serialize::write_message(&mut bytes, &msg).unwrap_or_default();
         bytes
     }
+
+    /// Build a repo list-remotes response (repoResult → listRemotes).
+    pub fn repo_list_remotes(request_id: u64, remotes: &[RemoteInfo]) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let repo_resp = response.init_repo_result();
+        let mut remotes_list = repo_resp.init_list_remotes(remotes.len() as u32);
+        for (i, remote) in remotes.iter().enumerate() {
+            let mut r = remotes_list.reborrow().get(i as u32);
+            remote.write_to(&mut r);
+        }
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a repo amend-commit response (repoResult → amendCommit). Returns OID text.
+    pub fn repo_amend_commit(request_id: u64, oid: &str) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut repo_resp = response.init_repo_result();
+        repo_resp.set_amend_commit(oid);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a repo commit-with-author response (repoResult → commitWithAuthor). Returns OID text.
+    pub fn repo_commit_with_author(request_id: u64, oid: &str) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut repo_resp = response.init_repo_result();
+        repo_resp.set_commit_with_author(oid);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a repo list-tags response (repoResult → listTags).
+    pub fn repo_list_tags(request_id: u64, tags: &[String]) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let repo_resp = response.init_repo_result();
+        let mut tags_builder = repo_resp.init_list_tags(tags.len() as u32);
+        for (i, tag) in tags.iter().enumerate() {
+            tags_builder.set(i as u32, tag);
+        }
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+}
+
+/// Enum for repo-scoped void response variants.
+#[derive(Clone, Copy)]
+pub enum RepoVoidVariant {
+    RemoveWorktree,
+    CreateBranch,
+    Checkout,
+    StageAll,
+    StageFiles,
+    Merge,
+    AbortMerge,
+    ContinueMerge,
+    QuitMerge,
+    AddRemote,
+    RemoveRemote,
+    SetRemoteUrl,
+    RenameRemote,
+    Push,
+    StageAllIncludingUntracked,
+    CreateTag,
+    DeleteTag,
+    Update,
 }
 
 // ============================================================================
@@ -470,21 +635,19 @@ pub struct CloneRequest {
     pub branch: String,
 }
 
-/// Commit request.
+/// Commit request (repo_id is now in the outer RepositoryRequest).
 #[derive(Debug, Clone, ToCapnp)]
 #[capnp(registry_capnp::commit_request)]
 pub struct CommitRequest {
-    pub repo_id: String,
     pub message: String,
     pub author: String,
     pub email: String,
 }
 
-/// Add remote request.
+/// Add remote request (repo_id is now in the outer RepositoryRequest).
 #[derive(Debug, Clone, ToCapnp)]
 #[capnp(registry_capnp::add_remote_request)]
 pub struct AddRemoteRequest {
-    pub repo_id: String,
     pub name: String,
     pub url: String,
 }
@@ -594,7 +757,7 @@ impl InferenceResponse {
         let mut response = msg.init_root::<inference_capnp::inference_response::Builder>();
         response.set_request_id(request_id);
 
-        let mut gen_result = response.init_generation_result();
+        let mut gen_result = response.init_generate_result();
         gen_result.set_text(&result.text);
         gen_result.set_tokens_generated(result.tokens_generated as u32);
         gen_result.set_finish_reason(Self::finish_reason_to_capnp(&result.finish_reason));
@@ -626,7 +789,7 @@ impl InferenceResponse {
         let mut response = msg.init_root::<inference_capnp::inference_response::Builder>();
         response.set_request_id(request_id);
 
-        let mut stream_info = response.init_stream_started();
+        let mut stream_info = response.init_generate_stream_result();
         stream_info.set_stream_id(stream_id);
         stream_info.set_endpoint(endpoint);
         stream_info.set_server_pubkey(server_pubkey);
@@ -645,7 +808,7 @@ impl InferenceResponse {
         let mut response = msg.init_root::<inference_capnp::inference_response::Builder>();
         response.set_request_id(request_id);
 
-        let mut auth_response = response.init_stream_authorized();
+        let mut auth_response = response.init_start_stream_result();
         auth_response.set_stream_id(stream_id);
 
         let mut bytes = Vec::new();
@@ -659,7 +822,7 @@ impl InferenceResponse {
         let mut response = msg.init_root::<inference_capnp::inference_response::Builder>();
         response.set_request_id(request_id);
 
-        let mut model_info = response.init_model_info();
+        let mut model_info = response.init_model_info_result();
         model_info.set_model_id(&info.name);
         model_info.set_architecture(&info.architecture);
         model_info.set_vocab_size(info.vocab_size as u32);
@@ -681,7 +844,7 @@ impl InferenceResponse {
         let mut msg = Builder::new_default();
         let mut response = msg.init_root::<inference_capnp::inference_response::Builder>();
         response.set_request_id(request_id);
-        response.set_ready(ready);
+        response.set_is_ready_result(ready);
 
         let mut bytes = Vec::new();
         serialize::write_message(&mut bytes, &msg).unwrap_or_default();
@@ -693,7 +856,7 @@ impl InferenceResponse {
         let mut msg = Builder::new_default();
         let mut response = msg.init_root::<inference_capnp::inference_response::Builder>();
         response.set_request_id(request_id);
-        response.set_template_result(result);
+        response.set_apply_chat_template_result(result);
 
         let mut bytes = Vec::new();
         serialize::write_message(&mut bytes, &msg).unwrap_or_default();
@@ -718,7 +881,7 @@ impl InferenceResponse {
         let mut response = msg.init_root::<inference_capnp::inference_response::Builder>();
         response.set_request_id(request_id);
 
-        let mut health = response.init_health();
+        let mut health = response.init_health_check_result();
         health.set_status("healthy");
         health.set_model_loaded(model_loaded);
         health.set_kv_cache_usage_percent(0.0);
@@ -1112,29 +1275,14 @@ pub struct TokenInfo {
 
 /// Helper for building policy service responses.
 ///
-/// Eliminates boilerplate by providing typed response builders.
-///
-/// # Example
-///
-/// ```ignore
-/// // Before (manual - 12 lines):
-/// let mut msg = Builder::new_default();
-/// let mut response = msg.init_root::<policy_response::Builder>();
-/// response.set_request_id(id);
-/// let mut token_info = response.init_success();
-/// token_info.set_token(&token);
-/// // ... 7 more lines
-///
-/// // After (1 line):
-/// PolicyResponse::token_success(id, &token, expires_at)
-/// ```
+/// Uses the unified `PolicyResponse` schema (no more separate `IssueTokenResponse`).
 pub struct PolicyResponse;
 
 impl PolicyResponse {
     /// Build an error response.
     pub fn error(request_id: u64, message: &str, code: &str) -> Vec<u8> {
         let mut msg = Builder::new_default();
-        let mut response = msg.init_root::<policy_capnp::issue_token_response::Builder>();
+        let mut response = msg.init_root::<policy_capnp::policy_response::Builder>();
         response.set_request_id(request_id);
 
         let mut error_info = response.init_error();
@@ -1147,31 +1295,13 @@ impl PolicyResponse {
         bytes
     }
 
-    /// Build an unauthorized error response.
-    pub fn unauthorized(request_id: u64, scope: &str) -> Vec<u8> {
-        Self::error(
-            request_id,
-            &format!("Access denied for scope: {scope}"),
-            "UNAUTHORIZED"
-        )
-    }
-
-    /// Build a TTL exceeded error response.
-    pub fn ttl_exceeded(request_id: u64, requested: u32, max: u32) -> Vec<u8> {
-        Self::error(
-            request_id,
-            &format!("TTL exceeds maximum: {requested} > {max}"),
-            "TTL_EXCEEDED"
-        )
-    }
-
     /// Build a token success response.
     pub fn token_success(request_id: u64, token: &str, expires_at: i64) -> Vec<u8> {
         let mut msg = Builder::new_default();
-        let mut response = msg.init_root::<policy_capnp::issue_token_response::Builder>();
+        let mut response = msg.init_root::<policy_capnp::policy_response::Builder>();
         response.set_request_id(request_id);
 
-        let mut token_info = response.init_success();
+        let mut token_info = response.init_token_success();
         token_info.set_token(token);
         token_info.set_expires_at(expires_at);
 

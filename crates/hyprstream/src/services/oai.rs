@@ -10,7 +10,7 @@
 //! HTTP Clients ──► HTTP Server (Axum) ──► OAIService
 //!                        │
 //!                        ├──► ModelZmqClient ──► ModelService
-//!                        └──► PolicyZmqClient ──► PolicyService
+//!                        └──► PolicyClient ──► PolicyService
 //!
 //! Control ──► ZMQ REP Socket ──► OAIService (health, metrics)
 //! ```

@@ -76,6 +76,10 @@ pub struct HyprConfig {
     #[serde(default)]
     pub flight: FlightConfig,
 
+    /// MCP service configuration (HTTP/SSE for Model Context Protocol)
+    #[serde(default)]
+    pub mcp: MCPConfig,
+
     /// StreamService configuration (buffer sizes, TTL, etc.)
     #[serde(default)]
     pub streaming: StreamingConfig,
@@ -186,6 +190,33 @@ impl Default for FlightConfig {
 
 fn default_flight_host() -> String { "0.0.0.0".to_owned() }
 fn default_flight_port() -> u16 { 50051 }
+
+/// MCP service configuration (Model Context Protocol)
+///
+/// This service provides an MCP-compliant interface for AI coding assistants
+/// (Claude Code, Cursor, etc.) to interact with hyprstream via HTTP/SSE.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MCPConfig {
+    /// Host address for HTTP/SSE server
+    #[serde(default = "default_mcp_host")]
+    pub host: String,
+
+    /// Port for HTTP/SSE server
+    #[serde(default = "default_mcp_port")]
+    pub http_port: u16,
+}
+
+impl Default for MCPConfig {
+    fn default() -> Self {
+        Self {
+            host: default_mcp_host(),
+            http_port: default_mcp_port(),
+        }
+    }
+}
+
+fn default_mcp_host() -> String { "0.0.0.0".to_owned() }
+fn default_mcp_port() -> u16 { 8080 }
 
 /// StreamService configuration
 ///
@@ -306,6 +337,7 @@ fn default_startup_services() -> Vec<String> {
         "model".to_owned(),     // Model management
         "oai".to_owned(),       // OpenAI-compatible HTTP API
         "flight".to_owned(),    // Arrow Flight SQL server
+        "mcp".to_owned(),       // Model Context Protocol service
     ]
 }
 
@@ -488,6 +520,7 @@ pub struct HyprConfigBuilder {
     token: TokenConfig,
     oai: OAIConfig,
     flight: FlightConfig,
+    mcp: MCPConfig,
     streaming: StreamingConfig,
 }
 
@@ -507,6 +540,7 @@ impl HyprConfigBuilder {
             token: TokenConfig::default(),
             oai: OAIConfig::default(),
             flight: FlightConfig::default(),
+            mcp: MCPConfig::default(),
             streaming: StreamingConfig::default(),
         }
     }
@@ -526,6 +560,7 @@ impl HyprConfigBuilder {
             token: config.token,
             oai: config.oai,
             flight: config.flight,
+            mcp: config.mcp,
             streaming: config.streaming,
         }
     }
@@ -557,6 +592,7 @@ impl HyprConfigBuilder {
             token: self.token,
             oai: self.oai,
             flight: self.flight,
+            mcp: self.mcp,
             streaming: self.streaming,
         }
     }

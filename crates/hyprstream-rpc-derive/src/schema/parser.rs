@@ -1,0 +1,642 @@
+//! Cap'n Proto schema text parser.
+
+use super::types::*;
+use crate::util::{to_pascal_case, to_snake_case};
+
+pub fn parse_capnp_schema(text: &str, service_name: &str) -> Option<ParsedSchema> {
+    let pascal = to_pascal_case(service_name);
+    let request_struct_name = format!("{pascal}Request");
+    let response_struct_name = format!("{pascal}Response");
+
+    let structs_parsed = parse_all_structs(text);
+    let enums = parse_all_enums(text);
+
+    let has_request = structs_parsed.iter().any(|s| s.name == request_struct_name);
+    let has_response = structs_parsed.iter().any(|s| s.name == response_struct_name);
+    if !has_request || !has_response {
+        return None;
+    }
+
+    let request_variants = parse_union_variants(text, &request_struct_name);
+    let response_variants = parse_union_variants(text, &response_struct_name);
+
+    if request_variants.is_empty() || response_variants.is_empty() {
+        return None;
+    }
+
+    // Detect scoped clients from nested union patterns
+    let mut scoped_clients = Vec::new();
+    for req_variant in &request_variants {
+        if matches!(
+            req_variant.type_name.as_str(),
+            "Void" | "Text" | "Data" | "Bool"
+                | "UInt32" | "UInt64" | "Int32" | "Int64" | "Float32" | "Float64"
+        ) || req_variant.type_name.starts_with("List(")
+        {
+            continue;
+        }
+
+        if let Some(inner_struct) = structs_parsed
+            .iter()
+            .find(|s| s.name == req_variant.type_name)
+        {
+            if inner_struct.has_union && !inner_struct.fields.is_empty() {
+                let response_variant_name = format!("{}Result", req_variant.name);
+                if let Some(resp_variant) = response_variants
+                    .iter()
+                    .find(|v| v.name == response_variant_name)
+                {
+                    let inner_req_variants =
+                        parse_union_variants(text, &req_variant.type_name);
+                    let inner_resp_variants =
+                        parse_union_variants(text, &resp_variant.type_name);
+
+                    if !inner_req_variants.is_empty() && !inner_resp_variants.is_empty() {
+                        let client_name = if req_variant.type_name.ends_with("Request") {
+                            format!(
+                                "{}Client",
+                                &req_variant.type_name
+                                    [..req_variant.type_name.len() - 7]
+                            )
+                        } else {
+                            format!("{}Client", req_variant.type_name)
+                        };
+
+                        scoped_clients.push(ScopedClient {
+                            factory_name: req_variant.name.clone(),
+                            client_name,
+                            scope_fields: inner_struct.fields.clone(),
+                            inner_request_variants: inner_req_variants,
+                            inner_response_variants: inner_resp_variants,
+                            capnp_inner_response: to_snake_case(&resp_variant.type_name),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let referenced: Vec<StructDef> = structs_parsed
+        .into_iter()
+        .filter(|s| s.name != request_struct_name && s.name != response_struct_name)
+        .collect();
+
+    Some(ParsedSchema {
+        request_variants,
+        response_variants,
+        structs: referenced,
+        scoped_clients,
+        enums,
+    })
+}
+
+pub fn parse_all_structs(text: &str) -> Vec<StructDef> {
+    let mut structs = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i].trim();
+
+        if line.starts_with("struct ") && line.ends_with('{') {
+            let name = line["struct ".len()..line.len() - 1].trim().to_string();
+
+            let mut fields = Vec::new();
+            let mut has_union = false;
+            i += 1;
+
+            let mut depth = 1;
+            let mut in_union = false;
+            while i < lines.len() && depth > 0 {
+                let inner = lines[i].trim();
+                if inner.contains('{') {
+                    depth += 1;
+                    if inner.starts_with("union") && depth == 2 {
+                        has_union = true;
+                    }
+                    if inner.starts_with("union") {
+                        in_union = true;
+                    }
+                }
+                if inner.contains('}') {
+                    depth -= 1;
+                    if depth == 1 {
+                        in_union = false;
+                    }
+                }
+
+                if !in_union
+                    && depth == 1
+                    && !inner.starts_with('#')
+                    && !inner.is_empty()
+                    && !inner.starts_with('}')
+                    && !inner.starts_with("union")
+                {
+                    if let Some(field) = parse_field_line(inner) {
+                        fields.push(field);
+                    }
+                }
+                i += 1;
+            }
+
+            structs.push(StructDef {
+                name,
+                fields,
+                has_union,
+            });
+        } else {
+            i += 1;
+        }
+    }
+
+    structs
+}
+
+pub fn parse_all_enums(text: &str) -> Vec<EnumDef> {
+    let mut enums = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i].trim();
+
+        if line.starts_with("enum ") && line.ends_with('{') {
+            let name = line["enum ".len()..line.len() - 1].trim().to_string();
+
+            let mut variants = Vec::new();
+            i += 1;
+
+            while i < lines.len() {
+                let inner = lines[i].trim();
+                if inner == "}" {
+                    break;
+                }
+                if !inner.starts_with('#') && !inner.is_empty() && inner.contains('@') {
+                    let inner = inner
+                        .split('#')
+                        .next()
+                        .unwrap_or(inner)
+                        .trim()
+                        .trim_end_matches(';')
+                        .trim();
+                    if let Some(at_pos) = inner.find('@') {
+                        let variant_name = inner[..at_pos].trim().to_string();
+                        let ordinal_str = inner[at_pos + 1..].trim();
+                        if let Ok(ordinal) = ordinal_str.parse::<u32>() {
+                            variants.push((variant_name, ordinal));
+                        }
+                    }
+                }
+                i += 1;
+            }
+
+            enums.push(EnumDef { name, variants });
+        }
+        i += 1;
+    }
+
+    enums
+}
+
+pub fn parse_field_line(line: &str) -> Option<FieldDef> {
+    let line = line.split('#').next().unwrap_or(line);
+    let line = line.trim().trim_end_matches(';').trim();
+    if line.is_empty() {
+        return None;
+    }
+
+    let at_pos = line.find('@')?;
+    let colon_pos = line.find(':')?;
+    if colon_pos <= at_pos {
+        return None;
+    }
+
+    let name = line[..at_pos].trim().to_string();
+    let ordinal_str = line[at_pos + 1..colon_pos].trim();
+    let _ordinal: u32 = ordinal_str.parse().ok()?;
+    let type_name = line[colon_pos + 1..].trim().to_string();
+
+    Some(FieldDef { name, type_name })
+}
+
+pub fn parse_union_variants(text: &str, struct_name: &str) -> Vec<UnionVariant> {
+    let mut variants = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+
+    // Find the struct
+    while i < lines.len() {
+        let line = lines[i].trim();
+        if line == format!("struct {struct_name} {{") {
+            i += 1;
+            break;
+        }
+        i += 1;
+    }
+
+    // Find the union block inside this struct
+    let mut depth = 1;
+    while i < lines.len() && depth > 0 {
+        let line = lines[i].trim();
+
+        if line == "union {" {
+            i += 1;
+            let mut union_depth = 1;
+            while i < lines.len() && union_depth > 0 {
+                let inner = lines[i].trim();
+                if inner.contains('{') {
+                    union_depth += 1;
+                }
+                if inner.contains('}') {
+                    union_depth -= 1;
+                    if union_depth == 0 {
+                        break;
+                    }
+                }
+
+                if !inner.starts_with('#') && !inner.is_empty() && inner.contains('@') {
+                    if let Some(variant) = parse_variant_line(inner) {
+                        variants.push(variant);
+                    }
+                }
+                i += 1;
+            }
+            break;
+        }
+
+        if line.contains('}') {
+            depth -= 1;
+        }
+        if line.contains('{') && !line.starts_with("struct") {
+            depth += 1;
+        }
+        i += 1;
+    }
+
+    variants
+}
+
+pub fn parse_variant_line(line: &str) -> Option<UnionVariant> {
+    let line = line.split('#').next().unwrap_or(line);
+    let line = line.trim().trim_end_matches(';').trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+
+    let at_pos = line.find('@')?;
+    let colon_pos = line.find(':')?;
+
+    let name = line[..at_pos].trim().to_string();
+    let ordinal_str = line[at_pos + 1..colon_pos].trim();
+    let _ordinal: u32 = ordinal_str.parse().ok()?;
+    let type_name = line[colon_pos + 1..].trim().to_string();
+
+    Some(UnionVariant { name, type_name })
+}
+
+/// Collect all struct names that need Data structs generated.
+pub fn collect_list_struct_types(schema: &ParsedSchema) -> Vec<String> {
+    let mut types = Vec::new();
+    let is_primitive = |name: &str| {
+        matches!(
+            name,
+            "Text"
+                | "Data"
+                | "Bool"
+                | "Void"
+                | "UInt8"
+                | "UInt16"
+                | "UInt32"
+                | "UInt64"
+                | "Int8"
+                | "Int16"
+                | "Int32"
+                | "Int64"
+                | "Float32"
+                | "Float64"
+        )
+    };
+
+    let mut add_type = |type_name: &str| {
+        if type_name.starts_with("List(") {
+            let inner = &type_name[5..type_name.len() - 1];
+            if !is_primitive(inner)
+                && !types.contains(&inner.to_string())
+                && schema.enums.iter().all(|e| e.name != inner)
+            {
+                types.push(inner.to_string());
+            }
+        } else if !is_primitive(type_name)
+            && !type_name.starts_with("List(")
+            && schema.enums.iter().all(|e| e.name != type_name)
+            && schema.structs.iter().any(|s| s.name == type_name)
+            && !types.contains(&type_name.to_string())
+        {
+            types.push(type_name.to_string());
+        }
+    };
+
+    for v in &schema.response_variants {
+        add_type(&v.type_name);
+    }
+    for sc in &schema.scoped_clients {
+        for v in &sc.inner_response_variants {
+            add_type(&v.type_name);
+        }
+    }
+    for s in &schema.structs {
+        for f in &s.fields {
+            add_type(&f.type_name);
+        }
+    }
+    for v in &schema.request_variants {
+        if let Some(s) = schema.structs.iter().find(|s| s.name == v.type_name) {
+            for f in &s.fields {
+                add_type(&f.type_name);
+            }
+        }
+    }
+    for sc in &schema.scoped_clients {
+        for v in &sc.inner_request_variants {
+            if let Some(s) = schema.structs.iter().find(|s| s.name == v.type_name) {
+                for f in &s.fields {
+                    add_type(&f.type_name);
+                }
+            }
+        }
+    }
+
+    types
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const POLICY_SCHEMA: &str = r#"
+@0xf1a2b3c4d5e6f708;
+
+struct PolicyRequest {
+  id @0 :UInt64;
+  union {
+    check @1 :PolicyCheck;
+    issueToken @2 :IssueToken;
+  }
+}
+
+struct PolicyCheck {
+  subject @0 :Text;
+  domain @1 :Text;
+  resource @2 :Text;
+  operation @3 :Text;
+}
+
+struct IssueToken {
+  requestedScopes @0 :List(Text);
+  ttl @1 :UInt32;
+}
+
+struct PolicyResponse {
+  requestId @0 :UInt64;
+  union {
+    allowed @1 :Bool;
+    error @2 :ErrorInfo;
+    tokenSuccess @3 :TokenInfo;
+  }
+}
+
+struct TokenInfo {
+  token @0 :Text;
+  expiresAt @1 :Int64;
+}
+
+struct ErrorInfo {
+  message @0 :Text;
+  code @1 :Text;
+  details @2 :Text;
+}
+"#;
+
+    const ENUM_SCHEMA: &str = r#"
+@0xabcdef1234567890;
+
+enum Status {
+  active @0;
+  inactive @1;
+  pending @2;
+}
+
+struct ModelRequest {
+  id @0 :UInt64;
+  union {
+    getInfo @1 :Void;
+    setStatus @2 :Text;
+  }
+}
+
+struct ModelResponse {
+  requestId @0 :UInt64;
+  union {
+    getInfoResult @1 :ModelInfo;
+    setStatusResult @2 :Void;
+  }
+}
+
+struct ModelInfo {
+  name @0 :Text;
+  status @1 :Status;
+  tags @2 :List(Text);
+}
+"#;
+
+    const SCOPED_SCHEMA: &str = r#"
+@0x1234567890abcdef;
+
+struct RegistryRequest {
+  id @0 :UInt64;
+  union {
+    list @1 :Void;
+    repo @2 :RepositoryRequest;
+  }
+}
+
+struct RepositoryRequest {
+  repoId @0 :Text;
+  union {
+    clone @1 :CloneParams;
+    delete @2 :Void;
+  }
+}
+
+struct CloneParams {
+  url @0 :Text;
+  shallow @1 :Bool;
+}
+
+struct RegistryResponse {
+  requestId @0 :UInt64;
+  union {
+    listResult @1 :List(Text);
+    repoResult @2 :RepositoryResponse;
+    error @3 :ErrorInfo;
+  }
+}
+
+struct RepositoryResponse {
+  union {
+    cloneResult @0 :Text;
+    deleteResult @1 :Void;
+  }
+}
+
+struct ErrorInfo {
+  message @0 :Text;
+}
+"#;
+
+    #[test]
+    fn parse_policy_schema() {
+        let schema = parse_capnp_schema(POLICY_SCHEMA, "policy").unwrap();
+        assert_eq!(schema.request_variants.len(), 2);
+        assert_eq!(schema.request_variants[0].name, "check");
+        assert_eq!(schema.request_variants[0].type_name, "PolicyCheck");
+        assert_eq!(schema.request_variants[1].name, "issueToken");
+        assert_eq!(schema.request_variants[1].type_name, "IssueToken");
+
+        assert_eq!(schema.response_variants.len(), 3);
+        assert_eq!(schema.response_variants[0].name, "allowed");
+        assert_eq!(schema.response_variants[0].type_name, "Bool");
+        assert_eq!(schema.response_variants[1].name, "error");
+        assert_eq!(schema.response_variants[2].name, "tokenSuccess");
+    }
+
+    #[test]
+    fn parse_struct_fields() {
+        let schema = parse_capnp_schema(POLICY_SCHEMA, "policy").unwrap();
+        let check_struct = schema.structs.iter().find(|s| s.name == "PolicyCheck").unwrap();
+        assert_eq!(check_struct.fields.len(), 4);
+        assert_eq!(check_struct.fields[0].name, "subject");
+        assert_eq!(check_struct.fields[0].type_name, "Text");
+        assert_eq!(check_struct.fields[3].name, "operation");
+
+        let issue_struct = schema.structs.iter().find(|s| s.name == "IssueToken").unwrap();
+        assert_eq!(issue_struct.fields.len(), 2);
+        assert_eq!(issue_struct.fields[0].type_name, "List(Text)");
+        assert_eq!(issue_struct.fields[1].type_name, "UInt32");
+    }
+
+    #[test]
+    fn parse_enums() {
+        let enums = parse_all_enums(ENUM_SCHEMA);
+        assert_eq!(enums.len(), 1);
+        assert_eq!(enums[0].name, "Status");
+        assert_eq!(enums[0].variants.len(), 3);
+        assert_eq!(enums[0].variants[0], ("active".into(), 0));
+        assert_eq!(enums[0].variants[1], ("inactive".into(), 1));
+        assert_eq!(enums[0].variants[2], ("pending".into(), 2));
+    }
+
+    #[test]
+    fn parse_schema_with_enums() {
+        let schema = parse_capnp_schema(ENUM_SCHEMA, "model").unwrap();
+        assert_eq!(schema.enums.len(), 1);
+        assert_eq!(schema.enums[0].name, "Status");
+        assert_eq!(schema.request_variants.len(), 2);
+        assert_eq!(schema.response_variants.len(), 2);
+
+        let info_struct = schema.structs.iter().find(|s| s.name == "ModelInfo").unwrap();
+        assert_eq!(info_struct.fields.len(), 3);
+        assert_eq!(info_struct.fields[1].type_name, "Status");
+        assert_eq!(info_struct.fields[2].type_name, "List(Text)");
+    }
+
+    #[test]
+    fn parse_scoped_clients() {
+        let schema = parse_capnp_schema(SCOPED_SCHEMA, "registry").unwrap();
+        assert_eq!(schema.scoped_clients.len(), 1);
+
+        let sc = &schema.scoped_clients[0];
+        assert_eq!(sc.factory_name, "repo");
+        assert_eq!(sc.client_name, "RepositoryClient");
+        assert_eq!(sc.scope_fields.len(), 1);
+        assert_eq!(sc.scope_fields[0].name, "repoId");
+        assert_eq!(sc.scope_fields[0].type_name, "Text");
+
+        assert_eq!(sc.inner_request_variants.len(), 2);
+        assert_eq!(sc.inner_request_variants[0].name, "clone");
+        assert_eq!(sc.inner_request_variants[0].type_name, "CloneParams");
+        assert_eq!(sc.inner_request_variants[1].name, "delete");
+        assert_eq!(sc.inner_request_variants[1].type_name, "Void");
+
+        assert_eq!(sc.inner_response_variants.len(), 2);
+        assert_eq!(sc.inner_response_variants[0].name, "cloneResult");
+        assert_eq!(sc.inner_response_variants[1].name, "deleteResult");
+    }
+
+    #[test]
+    fn parse_all_structs_counts() {
+        let structs = parse_all_structs(POLICY_SCHEMA);
+        // PolicyRequest, PolicyCheck, IssueToken, PolicyResponse, TokenInfo, ErrorInfo
+        assert_eq!(structs.len(), 6);
+        let names: Vec<&str> = structs.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"PolicyRequest"));
+        assert!(names.contains(&"PolicyCheck"));
+        assert!(names.contains(&"TokenInfo"));
+    }
+
+    #[test]
+    fn parse_union_variants_from_struct() {
+        let variants = parse_union_variants(POLICY_SCHEMA, "PolicyRequest");
+        assert_eq!(variants.len(), 2);
+        assert_eq!(variants[0].name, "check");
+        assert_eq!(variants[1].name, "issueToken");
+    }
+
+    #[test]
+    fn parse_variant_line_basic() {
+        assert!(parse_variant_line("check @1 :PolicyCheck;").is_some());
+        let v = parse_variant_line("check @1 :PolicyCheck;").unwrap();
+        assert_eq!(v.name, "check");
+        assert_eq!(v.type_name, "PolicyCheck");
+    }
+
+    #[test]
+    fn parse_field_line_basic() {
+        let f = parse_field_line("subject @0 :Text;").unwrap();
+        assert_eq!(f.name, "subject");
+        assert_eq!(f.type_name, "Text");
+
+        let f = parse_field_line("ttl @1 :UInt32;").unwrap();
+        assert_eq!(f.name, "ttl");
+        assert_eq!(f.type_name, "UInt32");
+    }
+
+    #[test]
+    fn parse_field_with_comment() {
+        let f = parse_field_line("token @0 :Text; # Signed JWT").unwrap();
+        assert_eq!(f.name, "token");
+        assert_eq!(f.type_name, "Text");
+    }
+
+    #[test]
+    fn parse_returns_none_for_missing_schema() {
+        let result = parse_capnp_schema("struct Foo { }", "policy");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn collect_list_struct_types_finds_referenced() {
+        let schema = parse_capnp_schema(ENUM_SCHEMA, "model").unwrap();
+        let types = collect_list_struct_types(&schema);
+        assert!(types.contains(&"ModelInfo".to_string()));
+    }
+
+    #[test]
+    fn has_union_flag_set() {
+        let structs = parse_all_structs(POLICY_SCHEMA);
+        let req = structs.iter().find(|s| s.name == "PolicyRequest").unwrap();
+        assert!(req.has_union);
+        let check = structs.iter().find(|s| s.name == "PolicyCheck").unwrap();
+        assert!(!check.has_union);
+    }
+}

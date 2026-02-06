@@ -45,7 +45,7 @@
 //! ```
 
 use crate::auth::Operation;
-use crate::services::PolicyZmqClient;
+use crate::services::PolicyClient;
 use crate::config::{FinishReason, GenerationRequest, GenerationResult, ModelInfo, TrainingMode};
 use crate::inference_capnp;
 use anyhow::bail;
@@ -60,7 +60,6 @@ use crate::zmq::global_context;
 use anyhow::{anyhow, Result};
 use capnp::message::{Builder, ReaderOptions};
 use hyprstream_rpc::prelude::*;
-use hyprstream_rpc::serialize_message;
 use hyprstream_rpc::StreamChannel;
 use capnp::serialize;
 use std::path::{Path, PathBuf};
@@ -133,7 +132,7 @@ pub struct InferenceService {
     /// Nonce cache for replay protection
     nonce_cache: Arc<InMemoryNonceCache>,
     /// Policy client for authorization checks (async via TMQ)
-    policy_client: PolicyZmqClient,
+    policy_client: PolicyClient,
     /// Optional TTT trainer (initialized from config.json)
     ttt_trainer: Option<Arc<TestTimeTrainer>>,
     /// Tokenizer for TTT adaptation
@@ -147,7 +146,7 @@ impl InferenceService {
         config: RuntimeConfig,
         server_pubkey: VerifyingKey,
         signing_key: SigningKey,
-        policy_client: PolicyZmqClient,
+        policy_client: PolicyClient,
         endpoint: &str,
     ) -> Result<hyprstream_rpc::service::SpawnedService> {
         let model_path = model_path.as_ref().to_path_buf();
@@ -219,7 +218,7 @@ impl InferenceService {
         instance_id: String,
         callback_endpoint: String,
         config: RuntimeConfig,
-        policy_client: PolicyZmqClient,
+        policy_client: PolicyClient,
     ) -> Result<()> {
         info!(
             "Starting InferenceService {} in callback mode (callback={})",
@@ -241,7 +240,7 @@ impl InferenceService {
         instance_id: String,
         callback_endpoint: String,
         config: RuntimeConfig,
-        policy_client: PolicyZmqClient,
+        policy_client: PolicyClient,
     ) -> Result<()> {
         let ctx = global_context();
 
@@ -453,7 +452,7 @@ impl InferenceService {
         server_pubkey: VerifyingKey,
         signing_key: SigningKey,
         nonce_cache: Arc<InMemoryNonceCache>,
-        policy_client: PolicyZmqClient,
+        policy_client: PolicyClient,
     ) -> Result<Self> {
         // Capture runtime handle for reuse in handlers
         let runtime_handle = Handle::current();
@@ -1014,7 +1013,7 @@ impl InferenceService {
     /// Check authorization for an operation.
     ///
     /// Returns the unauthorized response if the check fails, or None if authorized.
-    /// Uses PolicyZmqClient for async policy checks via TMQ.
+    /// Uses PolicyClient for async policy checks via TMQ.
     async fn check_auth(
         &self,
         ctx: &EnvelopeContext,
@@ -1026,7 +1025,7 @@ impl InferenceService {
 
         // Async policy check via TMQ
         let allowed = self.policy_client
-            .check(&subject, resource, operation)
+            .check_policy(&subject, resource, operation)
             .await
             .unwrap_or(false);
 
@@ -1339,136 +1338,136 @@ impl InferenceService {
 /// - The service verifies signatures before processing
 /// - Identity is included for authorization checks
 ///
-/// Uses `ZmqClient` internally for TMQ-based async transport with auto-signing.
+/// Wraps a generated `InferenceClient`. Simple methods delegate to gen;
+/// `generate`, `apply_chat_template`, and streaming methods use manual
+/// request building because the generator doesn't fully support their types.
 #[derive(Clone)]
 pub struct InferenceZmqClient {
-    /// Unified ZMQ client (TMQ-based, auto-signing)
-    client: std::sync::Arc<crate::services::ZmqClient>,
+    /// Generated typed client (handles all transport including streaming via call_with_options)
+    pub(crate) gen: crate::services::generated::inference_client::InferenceClient,
 }
+
+use crate::services::generated::inference_client::InferenceResponseVariant;
 
 impl InferenceZmqClient {
     /// Create a new inference client with signing credentials
-    ///
-    /// # Note
-    /// Uses the same signing key for both request signing and response verification.
-    /// This is appropriate for internal communication where client and server share keys.
     pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
         Self::with_endpoint(INFERENCE_ENDPOINT, signing_key, identity)
     }
 
     /// Create an inference client connected to a specific endpoint
     pub fn with_endpoint(endpoint: &str, signing_key: SigningKey, identity: RequestIdentity) -> Self {
+        use hyprstream_rpc::service::factory::ServiceClient;
         let server_verifying_key = signing_key.verifying_key();
+        let base = crate::services::core::ZmqClientBase::new(
+            endpoint, global_context(), signing_key, server_verifying_key, identity,
+        );
         Self {
-            client: std::sync::Arc::new(crate::services::ZmqClient::new(endpoint, signing_key, server_verifying_key, identity)),
+            gen: crate::services::generated::inference_client::InferenceClient::from_zmq(base),
         }
     }
 
-    /// Get the next request ID (delegates to inner client)
-    fn next_id(&self) -> u64 {
-        self.client.next_id()
-    }
-
-    /// Convert capnp FinishReason to Rust enum
-    fn parse_finish_reason(
-        &self,
-        reason: inference_capnp::FinishReason,
+    /// Convert generated FinishReasonEnum to domain FinishReason
+    fn parse_finish_reason_enum(
+        reason: &crate::services::generated::inference_client::FinishReasonEnum,
     ) -> FinishReason {
+        use crate::services::generated::inference_client::FinishReasonEnum;
         match reason {
-            inference_capnp::FinishReason::MaxTokens => FinishReason::MaxTokens,
-            inference_capnp::FinishReason::StopToken => FinishReason::StopToken(String::new()),
-            inference_capnp::FinishReason::EndOfSequence => FinishReason::EndOfSequence,
-            inference_capnp::FinishReason::Error => FinishReason::Error(String::new()),
-            inference_capnp::FinishReason::Stop => FinishReason::Stop,
+            FinishReasonEnum::MaxTokens => FinishReason::MaxTokens,
+            FinishReasonEnum::StopToken => FinishReason::StopToken(String::new()),
+            FinishReasonEnum::EndOfSequence => FinishReason::EndOfSequence,
+            FinishReasonEnum::Error => FinishReason::Error(String::new()),
+            FinishReasonEnum::Stop => FinishReason::Stop,
         }
     }
 
-    /// Generate text (non-streaming)
+    /// Generate text (non-streaming) — delegates to generated client
     pub async fn generate(&self, request: &GenerationRequest) -> Result<GenerationResult> {
-        let id = self.next_id();
-
-        let mut message = Builder::new_default();
-        let mut req = message.init_root::<inference_capnp::inference_request::Builder>();
-        req.set_id(id);
-
-        let mut gen_req = req.init_generate();
-        gen_req.set_prompt(request.prompt.as_str());
-        gen_req.set_max_tokens(request.max_tokens as u32);
-        gen_req.set_temperature(request.temperature);
-        gen_req.set_top_p(request.top_p);
-        gen_req.set_top_k(request.top_k.unwrap_or(0) as u32);
-        gen_req.set_repeat_penalty(request.repeat_penalty);
-        gen_req.set_repeat_last_n(request.repeat_last_n as u32);
-        gen_req.set_seed(request.seed.unwrap_or(0));
-        gen_req.set_timeout_ms(request.timeout.unwrap_or(0));
-
-        // init_stop_tokens must be called last as it consumes the builder
-        if !request.stop_tokens.is_empty() {
-            let mut stop_list = gen_req.init_stop_tokens(request.stop_tokens.len() as u32);
-            for (i, token) in request.stop_tokens.iter().enumerate() {
-                stop_list.set(i as u32, token);
-            }
+        match self.gen.generate(
+            request.prompt.as_str(),
+            request.max_tokens as u32,
+            request.temperature,
+            request.top_p,
+            request.top_k.unwrap_or(0) as u32,
+            request.repeat_penalty,
+            request.repeat_last_n as u32,
+            &request.stop_tokens,
+            request.seed.unwrap_or(0),
+            &[], // images
+            request.timeout.unwrap_or(0),
+        ).await? {
+            InferenceResponseVariant::GenerateResult {
+                text, tokens_generated, finish_reason, generation_time_ms,
+                tokens_per_second, prefill_tokens, prefill_time_ms,
+                prefill_tokens_per_sec, inference_tokens, inference_time_ms,
+                inference_tokens_per_sec, ..
+            } => Ok(GenerationResult {
+                text,
+                tokens_generated: tokens_generated as usize,
+                finish_reason: Self::parse_finish_reason_enum(&finish_reason),
+                generation_time_ms,
+                tokens_per_second,
+                quality_metrics: None,
+                prefill_tokens: prefill_tokens as usize,
+                prefill_time_ms,
+                prefill_tokens_per_sec,
+                inference_tokens: inference_tokens as usize,
+                inference_time_ms,
+                inference_tokens_per_sec,
+            }),
+            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
+            _ => Err(anyhow!("Unexpected response type")),
         }
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-
-        let response = self.client.call(bytes, CallOptions::default()).await?;
-        self.parse_generation_result(&response)
     }
 
     /// Check if model is ready
     pub async fn is_ready(&self) -> Result<bool> {
-        let id = self.next_id();
-        let bytes = serialize_message(|msg| {
-            let mut req = msg.init_root::<inference_capnp::inference_request::Builder>();
-            req.set_id(id);
-            req.set_is_ready(());
-        })?;
-        let response = self.client.call(bytes, CallOptions::default()).await?;
-        self.parse_ready_response(&response)
+        match self.gen.is_ready().await? {
+            InferenceResponseVariant::IsReadyResult(ready) => Ok(ready),
+            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
+            _ => Err(anyhow!("Unexpected response type")),
+        }
     }
 
     /// Get model info
     pub async fn model_info(&self) -> Result<ModelInfo> {
-        let id = self.next_id();
-        let bytes = serialize_message(|msg| {
-            let mut req = msg.init_root::<inference_capnp::inference_request::Builder>();
-            req.set_id(id);
-            req.set_model_info(());
-        })?;
-        let response = self.client.call(bytes, CallOptions::default()).await?;
-        self.parse_model_info_response(&response)
+        match self.gen.model_info().await? {
+            InferenceResponseVariant::ModelInfoResult {
+                model_id, architecture, vocab_size, hidden_size,
+                num_layers, num_heads, max_sequence_length, quantization, ..
+            } => Ok(ModelInfo {
+                name: model_id,
+                architecture,
+                vocab_size: vocab_size as usize,
+                hidden_size: hidden_size as usize,
+                num_hidden_layers: Some(num_layers as usize),
+                num_attention_heads: Some(num_heads as usize),
+                context_length: max_sequence_length as usize,
+                quantization: Some(quantization),
+                parameters: 0,
+                intermediate_size: None,
+            }),
+            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
+            _ => Err(anyhow!("Unexpected response type")),
+        }
     }
 
     /// Health check
     pub async fn health_check(&self) -> Result<()> {
-        let id = self.next_id();
-        let bytes = serialize_message(|msg| {
-            let mut req = msg.init_root::<inference_capnp::inference_request::Builder>();
-            req.set_id(id);
-            req.set_health_check(());
-        })?;
-        let response = self.client.call(bytes, CallOptions::default()).await?;
-        self.parse_health_response(&response)
+        match self.gen.health_check().await? {
+            InferenceResponseVariant::HealthCheckResult { .. } => Ok(()),
+            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
+            _ => Err(anyhow!("Unexpected response type")),
+        }
     }
 
-    /// Start streaming generation with E2E authentication.
-    ///
-    /// Returns StreamStartedInfo containing:
-    /// - stream_id: For client display/logging
-    /// - endpoint: StreamService SUB endpoint
-    /// - server_pubkey: Server's ephemeral Ristretto255 public key for DH
-    ///
-    /// # Arguments
-    /// * `request` - Generation parameters
-    /// * `ephemeral_pubkey` - Client's ephemeral Ristretto255 public key for DH (enables E2E auth)
+    /// Start streaming generation with E2E authentication (manual — needs custom CallOptions)
     pub async fn generate_stream(
         &self,
         request: &GenerationRequest,
         ephemeral_pubkey: Option<[u8; 32]>,
     ) -> Result<StreamStartedInfo> {
-        let id = self.next_id();
+        let id = self.gen.next_id();
 
         let mut message = Builder::new_default();
         let mut req = message.init_root::<inference_capnp::inference_request::Builder>();
@@ -1499,26 +1498,13 @@ impl InferenceZmqClient {
             Some(pk) => CallOptions::default().ephemeral_pubkey(pk),
             None => CallOptions::default(),
         };
-        let response = self.client.call(bytes, opts).await?;
-        self.parse_stream_started_response(&response)
+        let response = self.gen.call_with_options(bytes, opts).await?;
+        Self::parse_stream_started_response(&response)
     }
 
-    /// Authorize a stream subscription
-    ///
-    /// After calling `generate_stream`, the client must call this method to authorize
-    /// subscription before subscribing to the stream. This sends an AUTHORIZE message
-    /// to StreamService which validates the stream_id and allows the subscription.
-    ///
-    /// # Arguments
-    /// * `stream_id` - The stream ID returned by `generate_stream`
-    ///
-    /// # Returns
-    /// The confirmed stream_id on success.
-    ///
-    /// # Future
-    /// Will support DH key exchange for encrypted streams.
+    /// Authorize a stream subscription (manual — preserves exact request shape)
     pub async fn start_stream(&self, stream_id: &str) -> Result<String> {
-        let id = self.next_id();
+        let id = self.gen.next_id();
 
         let mut message = Builder::new_default();
         let mut req = message.init_root::<inference_capnp::inference_request::Builder>();
@@ -1530,66 +1516,11 @@ impl InferenceZmqClient {
         let mut bytes = Vec::new();
         serialize::write_message(&mut bytes, &message)?;
 
-        let response = self.client.call(bytes, CallOptions::default()).await?;
-        self.parse_stream_authorized_response(&response)
+        let response = self.gen.call_with_options(bytes, CallOptions::default()).await?;
+        Self::parse_stream_authorized_response(&response)
     }
 
-    /// Start streaming generation and return a handle for receiving chunks.
-    ///
-    /// This is a convenience method that calls `generate_stream` and creates a `StreamHandle`
-    /// for receiving chunks from StreamService.
-    ///
-    /// # Arguments
-    /// * `request` - Generation request
-    ///
-    /// # Returns
-    /// A `StreamHandle` that can be used to receive stream chunks via `next_chunk()`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// let (stream_id, endpoint) = client.generate_stream(&request).await?;
-    /// let handle = StreamHandle::new(
-    ///     &context,
-    ///     stream_id,
-    ///     &endpoint,
-    ///     claims.clone(),
-    ///     signing_key.clone(),
-    /// )?;
-    ///
-    /// while let Some(chunk) = handle.next_chunk()? {
-    ///     match chunk {
-    ///         StreamChunkMessage::Chunk { text, .. } => {
-    ///             print!("{}", text);
-    ///         }
-    ///         StreamChunkMessage::Complete { stats, .. } => {
-    ///             println!("\nDone: {} tokens", stats.tokens_generated);
-    ///             break;
-    ///         }
-    ///         StreamChunkMessage::Error { error, .. } => {
-    ///             eprintln!("Error: {}", error);
-    ///             break;
-    ///         }
-    ///     }
-    /// }
-    /// ```
     /// Start streaming generation with E2E authenticated handle.
-    ///
-    /// # E2E Authentication Flow
-    ///
-    /// 1. Client generates ephemeral Ristretto255 keypair
-    /// 2. Client sends request (TODO: include client pubkey in envelope)
-    /// 3. Server returns server_pubkey in StreamInfo
-    /// 4. Client derives (topic, mac_key) from DH shared secret
-    /// 5. Client subscribes to DH-derived topic
-    /// 6. Client verifies HMAC chain on received chunks
-    ///
-    /// # Note
-    ///
-    /// Currently falls back to legacy mode because the ZmqClient doesn't yet
-    /// support setting ephemeral_pubkey in the request envelope. The infrastructure
-    /// for E2E authentication is in place; full integration requires:
-    /// - Adding `call_with_ephemeral` to ZmqClient
-    /// - Including client ephemeral pubkey in the envelope
     pub async fn generate_stream_handle(
         &self,
         request: &GenerationRequest,
@@ -1599,26 +1530,21 @@ impl InferenceZmqClient {
             derive_stream_keys, generate_ephemeral_keypair, ristretto_dh, RistrettoPublic,
         };
 
-        // Generate client ephemeral Ristretto255 keypair for DH
         let (client_secret, client_pubkey) = generate_ephemeral_keypair();
         let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
 
-        // Call generate_stream with ephemeral pubkey for E2E auth
         let info = self.generate_stream(request, Some(client_pubkey_bytes)).await?;
 
-        // Attempt E2E authentication if server provided pubkey
         let use_e2e = info.server_pubkey != [0u8; 32];
 
         use crate::zmq::global_context;
 
-        // E2E authentication is required - server must provide Ristretto255 public key
         if !use_e2e {
             anyhow::bail!(
                 "Server did not provide Ristretto255 public key - E2E authentication required"
             );
         }
 
-        // Derive stream keys from Ristretto255 DH
         let server_ristretto_pubkey = RistrettoPublic::from_bytes(&info.server_pubkey)
             .ok_or_else(|| anyhow::anyhow!("Invalid server Ristretto255 public key encoding"))?;
 
@@ -1643,343 +1569,133 @@ impl InferenceZmqClient {
             keys.topic,
             *keys.mac_key,
             claims,
-            self.client.signing_key().clone(),
+            self.gen.signing_key().clone(),
         )
     }
 
-    /// Apply chat template to messages
+    /// Apply chat template — delegates to generated client
     pub async fn apply_chat_template(
         &self,
         messages: &[crate::runtime::template_engine::ChatMessage],
         add_generation_prompt: bool,
     ) -> Result<String> {
-        let id = self.next_id();
-
-        let mut message = Builder::new_default();
-        let mut req = message.init_root::<inference_capnp::inference_request::Builder>();
-        req.set_id(id);
-
-        let mut template_req = req.init_apply_chat_template();
-        template_req.set_add_generation_prompt(add_generation_prompt);
-        let mut msg_list = template_req.init_messages(messages.len() as u32);
-        for (i, msg) in messages.iter().enumerate() {
-            let mut m = msg_list.reborrow().get(i as u32);
-            m.set_role(&msg.role);
-            m.set_content(&msg.content);
+        use crate::services::generated::inference_client::ChatMessageData;
+        let msg_data: Vec<ChatMessageData> = messages.iter().map(|m| ChatMessageData {
+            role: m.role.clone(),
+            content: m.content.clone(),
+        }).collect();
+        match self.gen.apply_chat_template(&msg_data, add_generation_prompt).await? {
+            InferenceResponseVariant::ApplyChatTemplateResult(text) => Ok(text),
+            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
+            _ => Err(anyhow!("Unexpected response type")),
         }
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-
-        let response = self.client.call(bytes, CallOptions::default()).await?;
-        self.parse_template_result_response(&response)
     }
 
     /// Create a new LoRA adapter
     pub async fn create_lora(&self, config: &LoRAConfig) -> Result<()> {
-        let id = self.next_id();
-
-        let mut message = Builder::new_default();
-        let mut req = message.init_root::<inference_capnp::inference_request::Builder>();
-        req.set_id(id);
-
-        let mut lora_config = req.init_create_lora();
-        lora_config.set_rank(config.rank as u32);
-        lora_config.set_alpha(config.alpha);
-        lora_config.set_dropout(config.dropout);
-        let mut modules = lora_config.init_target_modules(config.target_modules.len() as u32);
-        for (i, module) in config.target_modules.iter().enumerate() {
-            modules.set(i as u32, module);
+        match self.gen.create_lora(
+            config.rank as u32, config.alpha, config.dropout, &config.target_modules,
+        ).await? {
+            InferenceResponseVariant::CreateLoraResult => Ok(()),
+            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
+            _ => Err(anyhow!("Unexpected response type")),
         }
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-
-        let response = self.client.call(bytes, CallOptions::default()).await?;
-        self.parse_success_response(&response)
     }
 
     /// Load a LoRA adapter from file
     pub async fn load_lora(&self, path: &Path) -> Result<()> {
-        let id = self.next_id();
-        let path_str = path.to_string_lossy().to_string();
-        let bytes = serialize_message(|msg| {
-            let mut req = msg.init_root::<inference_capnp::inference_request::Builder>();
-            req.set_id(id);
-            req.set_load_lora(&path_str);
-        })?;
-        let response = self.client.call(bytes, CallOptions::default()).await?;
-        self.parse_success_response(&response)
+        match self.gen.load_lora(&path.to_string_lossy()).await? {
+            InferenceResponseVariant::LoadLoraResult => Ok(()),
+            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
+            _ => Err(anyhow!("Unexpected response type")),
+        }
     }
 
     /// Save the current LoRA adapter to file
     pub async fn save_lora(&self, path: &str) -> Result<()> {
-        let id = self.next_id();
-        let bytes = serialize_message(|msg| {
-            let mut req = msg.init_root::<inference_capnp::inference_request::Builder>();
-            req.set_id(id);
-            req.set_save_lora(path);
-        })?;
-        let response = self.client.call(bytes, CallOptions::default()).await?;
-        self.parse_success_response(&response)
+        match self.gen.save_lora(path).await? {
+            InferenceResponseVariant::SaveLoraResult => Ok(()),
+            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
+            _ => Err(anyhow!("Unexpected response type")),
+        }
     }
 
     /// Unload the current LoRA adapter
     pub async fn unload_lora(&self) -> Result<()> {
-        let id = self.next_id();
-        let bytes = serialize_message(|msg| {
-            let mut req = msg.init_root::<inference_capnp::inference_request::Builder>();
-            req.set_id(id);
-            req.set_unload_lora(());
-        })?;
-        let response = self.client.call(bytes, CallOptions::default()).await?;
-        self.parse_success_response(&response)
+        match self.gen.unload_lora().await? {
+            InferenceResponseVariant::UnloadLoraResult => Ok(()),
+            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
+            _ => Err(anyhow!("Unexpected response type")),
+        }
     }
 
     /// Check if a LoRA adapter is loaded
     pub async fn has_lora(&self) -> Result<bool> {
-        let id = self.next_id();
-        let bytes = serialize_message(|msg| {
-            let mut req = msg.init_root::<inference_capnp::inference_request::Builder>();
-            req.set_id(id);
-            req.set_has_lora(());
-        })?;
-        let response = self.client.call(bytes, CallOptions::default()).await?;
-        self.parse_has_lora_response(&response)
+        match self.gen.has_lora().await? {
+            InferenceResponseVariant::HasLoraResult(has_lora) => Ok(has_lora),
+            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
+            _ => Err(anyhow!("Unexpected response type")),
+        }
     }
 
     /// Set the current session ID for KV cache management
     pub async fn set_session(&self, session_id: &str) -> Result<()> {
-        let id = self.next_id();
-        let bytes = serialize_message(|msg| {
-            let mut req = msg.init_root::<inference_capnp::inference_request::Builder>();
-            req.set_id(id);
-            req.set_set_session(session_id);
-        })?;
-        let response = self.client.call(bytes, CallOptions::default()).await?;
-        self.parse_success_response(&response)
+        match self.gen.set_session(session_id).await? {
+            InferenceResponseVariant::SetSessionResult => Ok(()),
+            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
+            _ => Err(anyhow!("Unexpected response type")),
+        }
     }
 
     /// Clear the current session's KV cache
     pub async fn clear_session(&self) -> Result<()> {
-        let id = self.next_id();
-        let bytes = serialize_message(|msg| {
-            let mut req = msg.init_root::<inference_capnp::inference_request::Builder>();
-            req.set_id(id);
-            req.set_clear_session(());
-        })?;
-        let response = self.client.call(bytes, CallOptions::default()).await?;
-        self.parse_success_response(&response)
+        match self.gen.clear_session().await? {
+            InferenceResponseVariant::ClearSessionResult => Ok(()),
+            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
+            _ => Err(anyhow!("Unexpected response type")),
+        }
     }
 
     /// Release a session's KV cache
     pub async fn release_session(&self, session_id: &str) -> Result<()> {
-        let id = self.next_id();
-        let bytes = serialize_message(|msg| {
-            let mut req = msg.init_root::<inference_capnp::inference_request::Builder>();
-            req.set_id(id);
-            req.set_release_session(session_id);
-        })?;
-        let response = self.client.call(bytes, CallOptions::default()).await?;
-        self.parse_success_response(&response)
+        match self.gen.release_session(session_id).await? {
+            InferenceResponseVariant::ReleaseSessionResult => Ok(()),
+            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
+            _ => Err(anyhow!("Unexpected response type")),
+        }
     }
 
     /// Request service shutdown
     pub async fn shutdown(&self) -> Result<()> {
-        let id = self.next_id();
-        let bytes = serialize_message(|msg| {
-            let mut req = msg.init_root::<inference_capnp::inference_request::Builder>();
-            req.set_id(id);
-            req.set_shutdown(());
-        })?;
-        let response = self.client.call(bytes, CallOptions::default()).await?;
-        self.parse_success_response(&response)
+        match self.gen.shutdown().await? {
+            InferenceResponseVariant::Success => Ok(()),
+            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
+            _ => Err(anyhow!("Unexpected response type")),
+        }
     }
 
-    /// Parse generation result
-    fn parse_generation_result(&self, response: &[u8]) -> Result<GenerationResult> {
-        let reader = serialize::read_message(response, ReaderOptions::new())?;
-        let resp = reader.get_root::<inference_capnp::inference_response::Reader>()?;
-
-        use inference_capnp::inference_response::Which;
-        match resp.which()? {
-            Which::GenerationResult(result) => {
-                let result = result?;
-                Ok(GenerationResult {
-                    text: result.get_text()?.to_str()?.to_owned(),
-                    tokens_generated: result.get_tokens_generated() as usize,
-                    finish_reason: self.parse_finish_reason(result.get_finish_reason()?),
-                    generation_time_ms: result.get_generation_time_ms(),
-                    tokens_per_second: result.get_tokens_per_second(),
-                    quality_metrics: None, // TODO: Parse from capnp when schema is updated
-                    // Prefill metrics
-                    prefill_tokens: result.get_prefill_tokens() as usize,
-                    prefill_time_ms: result.get_prefill_time_ms(),
-                    prefill_tokens_per_sec: result.get_prefill_tokens_per_sec(),
-                    // Inference metrics
-                    inference_tokens: result.get_inference_tokens() as usize,
-                    inference_time_ms: result.get_inference_time_ms(),
-                    inference_tokens_per_sec: result.get_inference_tokens_per_sec(),
+    /// Parse stream started response — uses generated response parser
+    fn parse_stream_started_response(response: &[u8]) -> Result<StreamStartedInfo> {
+        use crate::services::generated::inference_client::InferenceClient;
+        match InferenceClient::parse_response(response)? {
+            InferenceResponseVariant::GenerateStreamResult { stream_id, endpoint, server_pubkey } => {
+                Ok(StreamStartedInfo {
+                    stream_id,
+                    endpoint,
+                    server_pubkey: server_pubkey.try_into().unwrap_or([0u8; 32]),
                 })
             }
-            Which::Error(err) => {
-                let err = err?;
-                Err(anyhow!("{}", err.get_message()?.to_str()?))
-            }
+            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
             _ => Err(anyhow!("Unexpected response type")),
         }
     }
 
-    /// Parse ready response
-    fn parse_ready_response(&self, response: &[u8]) -> Result<bool> {
-        let reader = serialize::read_message(response, ReaderOptions::new())?;
-        let resp = reader.get_root::<inference_capnp::inference_response::Reader>()?;
-
-        use inference_capnp::inference_response::Which;
-        match resp.which()? {
-            Which::Ready(ready) => Ok(ready),
-            Which::Error(err) => {
-                let err = err?;
-                Err(anyhow!("{}", err.get_message()?.to_str()?))
-            }
-            _ => Err(anyhow!("Unexpected response type")),
-        }
-    }
-
-    /// Parse model info response
-    fn parse_model_info_response(&self, response: &[u8]) -> Result<ModelInfo> {
-        let reader = serialize::read_message(response, ReaderOptions::new())?;
-        let resp = reader.get_root::<inference_capnp::inference_response::Reader>()?;
-
-        use inference_capnp::inference_response::Which;
-        match resp.which()? {
-            Which::ModelInfo(info) => {
-                let info = info?;
-                Ok(ModelInfo {
-                    name: info.get_model_id()?.to_str()?.to_owned(),
-                    architecture: info.get_architecture()?.to_str()?.to_owned(),
-                    vocab_size: info.get_vocab_size() as usize,
-                    hidden_size: info.get_hidden_size() as usize,
-                    num_hidden_layers: Some(info.get_num_layers() as usize),
-                    num_attention_heads: Some(info.get_num_heads() as usize),
-                    context_length: info.get_max_sequence_length() as usize,
-                    quantization: Some(info.get_quantization()?.to_str()?.to_owned()),
-                    parameters: 0,
-                    intermediate_size: None,
-                })
-            }
-            Which::Error(err) => {
-                let err = err?;
-                Err(anyhow!("{}", err.get_message()?.to_str()?))
-            }
-            _ => Err(anyhow!("Unexpected response type")),
-        }
-    }
-
-    /// Parse health response
-    fn parse_health_response(&self, response: &[u8]) -> Result<()> {
-        let reader = serialize::read_message(response, ReaderOptions::new())?;
-        let resp = reader.get_root::<inference_capnp::inference_response::Reader>()?;
-
-        use inference_capnp::inference_response::Which;
-        match resp.which()? {
-            Which::Health(_) => Ok(()),
-            Which::Error(err) => {
-                let err = err?;
-                Err(anyhow!("{}", err.get_message()?.to_str()?))
-            }
-            _ => Err(anyhow!("Unexpected response type")),
-        }
-    }
-
-    /// Parse stream started response
-    /// Parse stream started response (with server_pubkey for E2E authentication)
-    fn parse_stream_started_response(&self, response: &[u8]) -> Result<StreamStartedInfo> {
-        use hyprstream_rpc::capnp::FromCapnp;
-
-        let reader = serialize::read_message(response, ReaderOptions::new())?;
-        let resp = reader.get_root::<inference_capnp::inference_response::Reader>()?;
-
-        use inference_capnp::inference_response::Which;
-        match resp.which()? {
-            Which::StreamStarted(info) => {
-                let info = info?;
-                StreamStartedInfo::read_from(info)
-            }
-            Which::Error(err) => {
-                let err = err?;
-                Err(anyhow!("{}", err.get_message()?.to_str()?))
-            }
-            _ => Err(anyhow!("Unexpected response type")),
-        }
-    }
-
-    /// Parse stream authorized response
-    fn parse_stream_authorized_response(&self, response: &[u8]) -> Result<String> {
-        let reader = serialize::read_message(response, ReaderOptions::new())?;
-        let resp = reader.get_root::<inference_capnp::inference_response::Reader>()?;
-
-        use inference_capnp::inference_response::Which;
-        match resp.which()? {
-            Which::StreamAuthorized(auth) => {
-                let auth = auth?;
-                let stream_id = auth.get_stream_id()?.to_str()?.to_owned();
-                Ok(stream_id)
-            }
-            Which::Error(err) => {
-                let err = err?;
-                Err(anyhow!("{}", err.get_message()?.to_str()?))
-            }
-            _ => Err(anyhow!("Unexpected response type")),
-        }
-    }
-
-    /// Parse template result response
-    fn parse_template_result_response(&self, response: &[u8]) -> Result<String> {
-        let reader = serialize::read_message(response, ReaderOptions::new())?;
-        let resp = reader.get_root::<inference_capnp::inference_response::Reader>()?;
-
-        use inference_capnp::inference_response::Which;
-        match resp.which()? {
-            Which::TemplateResult(result) => {
-                Ok(result?.to_str()?.to_owned())
-            }
-            Which::Error(err) => {
-                let err = err?;
-                Err(anyhow!("{}", err.get_message()?.to_str()?))
-            }
-            _ => Err(anyhow!("Unexpected response type")),
-        }
-    }
-
-    /// Parse success response
-    fn parse_success_response(&self, response: &[u8]) -> Result<()> {
-        let reader = serialize::read_message(response, ReaderOptions::new())?;
-        let resp = reader.get_root::<inference_capnp::inference_response::Reader>()?;
-
-        use inference_capnp::inference_response::Which;
-        match resp.which()? {
-            Which::Success(()) => Ok(()),
-            Which::Error(err) => {
-                let err = err?;
-                Err(anyhow!("{}", err.get_message()?.to_str()?))
-            }
-            _ => Err(anyhow!("Unexpected response type")),
-        }
-    }
-
-    /// Parse has LoRA response
-    fn parse_has_lora_response(&self, response: &[u8]) -> Result<bool> {
-        let reader = serialize::read_message(response, ReaderOptions::new())?;
-        let resp = reader.get_root::<inference_capnp::inference_response::Reader>()?;
-
-        use inference_capnp::inference_response::Which;
-        match resp.which()? {
-            Which::HasLoraResult(has_lora) => Ok(has_lora),
-            Which::Error(err) => {
-                let err = err?;
-                Err(anyhow!("{}", err.get_message()?.to_str()?))
-            }
+    /// Parse stream authorized response — uses generated response parser
+    fn parse_stream_authorized_response(response: &[u8]) -> Result<String> {
+        use crate::services::generated::inference_client::InferenceClient;
+        match InferenceClient::parse_response(response)? {
+            InferenceResponseVariant::StartStreamResult { stream_id, .. } => Ok(stream_id),
+            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
             _ => Err(anyhow!("Unexpected response type")),
         }
     }

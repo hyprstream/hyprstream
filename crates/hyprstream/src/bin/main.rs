@@ -39,7 +39,7 @@ use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
 
 // Registry and policy services - uses ZMQ-based services from hyprstream_core
-use hyprstream_core::services::{PolicyZmqClient, RegistryClient, RegistryZmqClient};
+use hyprstream_core::services::{PolicyClient, RegistryClient, RegistryZmqClient};
 // Worker service for Kata-based workload execution
 use hyprstream_workers::runtime::WorkerService;
 use hyprstream_workers::workflow::WorkflowService;
@@ -1394,7 +1394,7 @@ fn main() -> Result<()> {
                                         .join("hyprstream");
                                     let keys_dir = data_dir.join("keys");
                                     let signing_key = load_or_generate_signing_key(&keys_dir).await?;
-                                    let policy_client = PolicyZmqClient::new(
+                                    let policy_client = PolicyClient::new(
                                         signing_key.clone(),
                                         hyprstream_rpc::RequestIdentity::local(),
                                     );

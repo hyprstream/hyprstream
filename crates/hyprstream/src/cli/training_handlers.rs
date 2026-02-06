@@ -15,7 +15,7 @@ use crate::cli::commands::KVQuantArg;
 use crate::config::{HyprstreamTrainingConfig, TrainingMode, TTTTrainingConfig};
 use crate::runtime::model_config::ModelConfig;
 use crate::runtime::template_engine::ChatMessage;
-use crate::services::{InferenceZmqClient, PolicyZmqClient, RegistryClient, INFERENCE_ENDPOINT};
+use crate::services::{InferenceZmqClient, PolicyClient, RegistryClient, INFERENCE_ENDPOINT};
 use crate::storage::ModelRef;
 use hyprstream_rpc::{RequestIdentity, SigningKey, VerifyingKey};
 use std::path::PathBuf;
@@ -325,7 +325,7 @@ pub async fn handle_training_infer(
     info!("Using model at: {} (TTT enabled)", model_path.display());
 
     // Create policy client
-    let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
+    let policy_client = PolicyClient::new(signing_key.clone(), RequestIdentity::local());
 
     // Configure runtime
     let mut runtime_config = RuntimeConfig::default();
@@ -540,7 +540,7 @@ pub async fn handle_training_batch(
     runtime_config.max_context = max_context;
     runtime_config.kv_quant_type = kv_quant.into();
 
-    let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
+    let policy_client = PolicyClient::new(signing_key.clone(), RequestIdentity::local());
     // Start InferenceService with TTT enabled
     let mut service_handle = InferenceService::start_at(
         &model_path,

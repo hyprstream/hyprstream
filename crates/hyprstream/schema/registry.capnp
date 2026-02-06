@@ -4,6 +4,11 @@
 #
 # The registry service manages git repositories (models).
 # Uses REQ/REP pattern for all operations.
+#
+# Convention: Request variants use camelCase names. Response variants
+# use the same name suffixed with "Result" to avoid Cap'n Proto naming
+# collisions. The code generator strips "Result" to pair them.
+# Repo-scoped ops are nested under `repo`/`repoResult`.
 
 struct RegistryRequest {
   # Request ID for tracking
@@ -11,75 +16,57 @@ struct RegistryRequest {
 
   # Request payload (union of request types)
   union {
-    # Repository queries
+    # Global operations (top-level)
     list @1 :Void;
     get @2 :Text;           # repo_id
     getByName @3 :Text;     # name
-
-    # Repository operations
     clone @4 :CloneRequest;
     register @5 :RegisterRequest;
     remove @6 :Text;        # repo_id
-    update @7 :UpdateRequest;
+    healthCheck @7 :Void;
+    cloneStream @8 :CloneRequest;  # Clone with streaming progress
 
-    # Worktree operations
-    createWorktree @8 :WorktreeRequest;
-    listWorktrees @9 :Text; # repo_id
-    removeWorktree @10 :RemoveWorktreeRequest;
+    # Repository-scoped operations (requires repoId)
+    repo @9 :RepositoryRequest;
+  }
+}
 
-    # Branch operations
-    createBranch @11 :BranchRequest;
-    listBranches @12 :Text; # repo_id
-    checkout @13 :CheckoutRequest;
-
-    # Staging operations
-    stageAll @14 :Text;     # repo_id
-    stageFiles @15 :StageFilesRequest;
-    commit @16 :CommitRequest;
-
-    # Merge operations
-    merge @25 :MergeRequest;
-
-    # Status operations
-    status @26 :Text;      # repo_id
-
-    # Reference operations
-    getHead @17 :Text;      # repo_id
-    getRef @18 :GetRefRequest;
-
-    # Health/Lifecycle
-    healthCheck @19 :Void;
-
-    # Remote operations
-    listRemotes @20 :Text;  # repo_id
-    addRemote @21 :AddRemoteRequest;
-    removeRemote @22 :RemoveRemoteRequest;
-    setRemoteUrl @23 :SetRemoteUrlRequest;
-    renameRemote @24 :RenameRemoteRequest;
-
-    # Streaming operations
-    cloneStream @27 :CloneRequest;  # Clone with streaming progress
-
-    # Push operations
-    push @28 :PushRequest;
-
-    # Advanced commit operations
-    amendCommit @29 :AmendCommitRequest;
-    commitWithAuthor @30 :CommitWithAuthorRequest;
-    stageAllIncludingUntracked @31 :Text;  # repo_id
-
-    # Merge conflict resolution
-    abortMerge @32 :Text;    # repo_id
-    continueMerge @33 :ContinueMergeRequest;
-    quitMerge @34 :Text;     # repo_id
-
-    # Tag operations
-    listTags @35 :Text;      # repo_id
-    createTag @36 :CreateTagRequest;
-    deleteTag @37 :DeleteTagRequest;
-
-    # Detailed status
-    detailedStatus @38 :Text; # repo_id
+# Repository-scoped request: operations on a specific repository.
+# Generator detects the non-union field (repoId) + inner union pattern
+# and produces a RepositoryClient with repoId curried in.
+struct RepositoryRequest {
+  repoId @0 :Text;
+  union {
+    createWorktree @1 :WorktreeRequest;
+    listWorktrees @2 :Void;
+    removeWorktree @3 :RemoveWorktreeRequest;
+    createBranch @4 :BranchRequest;
+    listBranches @5 :Void;
+    checkout @6 :CheckoutRequest;
+    stageAll @7 :Void;
+    stageFiles @8 :StageFilesRequest;
+    commit @9 :CommitRequest;
+    merge @10 :MergeRequest;
+    abortMerge @11 :Void;
+    continueMerge @12 :ContinueMergeRequest;
+    quitMerge @13 :Void;
+    getHead @14 :Void;
+    getRef @15 :GetRefRequest;
+    status @16 :Void;
+    detailedStatus @17 :Void;
+    listRemotes @18 :Void;
+    addRemote @19 :AddRemoteRequest;
+    removeRemote @20 :RemoveRemoteRequest;
+    setRemoteUrl @21 :SetRemoteUrlRequest;
+    renameRemote @22 :RenameRemoteRequest;
+    push @23 :PushRequest;
+    amendCommit @24 :AmendCommitRequest;
+    commitWithAuthor @25 :CommitWithAuthorRequest;
+    stageAllIncludingUntracked @26 :Void;
+    listTags @27 :Void;
+    createTag @28 :CreateTagRequest;
+    deleteTag @29 :DeleteTagRequest;
+    update @30 :UpdateRequest;
   }
 }
 
@@ -87,23 +74,55 @@ struct RegistryResponse {
   # Request ID this response corresponds to
   requestId @0 :UInt64;
 
-  # Response payload (union of response types)
+  # Response payload — variants suffixed with "Result" to pair with request
   union {
-    success @1 :Void;
-    error @2 :ErrorInfo;
-    repository @3 :TrackedRepository;
-    repositories @4 :List(TrackedRepository);
-    worktrees @5 :List(WorktreeInfo);
-    branches @6 :List(Text);
-    path @7 :Text;
-    commitOid @8 :Text;
-    refOid @9 :Text;
-    health @10 :HealthStatus;
-    remotes @11 :List(RemoteInfo);
-    repositoryStatus @12 :RepositoryStatus;
-    streamStarted @13 :StreamStartedInfo;  # For streaming operations
-    tags @14 :List(Text);
-    detailedStatus @15 :DetailedStatusInfo;
+    error @1 :ErrorInfo;
+    listResult @2 :List(TrackedRepository);
+    getResult @3 :TrackedRepository;
+    getByNameResult @4 :TrackedRepository;
+    cloneResult @5 :TrackedRepository;
+    registerResult @6 :TrackedRepository;
+    removeResult @7 :Void;
+    healthCheckResult @8 :HealthStatus;
+    cloneStreamResult @9 :StreamStartedInfo;
+    repoResult @10 :RepositoryResponse;
+  }
+}
+
+# Repository-scoped response: inner union variants match request names exactly.
+struct RepositoryResponse {
+  union {
+    error @0 :ErrorInfo;
+    createWorktree @1 :Text;
+    listWorktrees @2 :List(WorktreeInfo);
+    removeWorktree @3 :Void;
+    createBranch @4 :Void;
+    listBranches @5 :List(Text);
+    checkout @6 :Void;
+    stageAll @7 :Void;
+    stageFiles @8 :Void;
+    commit @9 :Text;
+    merge @10 :Void;
+    abortMerge @11 :Void;
+    continueMerge @12 :Void;
+    quitMerge @13 :Void;
+    getHead @14 :Text;
+    getRef @15 :Text;
+    status @16 :RepositoryStatus;
+    detailedStatus @17 :DetailedStatusInfo;
+    listRemotes @18 :List(RemoteInfo);
+    addRemote @19 :Void;
+    removeRemote @20 :Void;
+    setRemoteUrl @21 :Void;
+    renameRemote @22 :Void;
+    push @23 :Void;
+    amendCommit @24 :Text;
+    commitWithAuthor @25 :Text;
+    stageAllIncludingUntracked @26 :Void;
+    listTags @27 :List(Text);
+    createTag @28 :Void;
+    deleteTag @29 :Void;
+    update @30 :Void;
   }
 }
 
@@ -132,26 +151,17 @@ struct RegisterRequest {
   trackingRef @2 :Text;
 }
 
-# Update Request
-
-struct UpdateRequest {
-  repoId @0 :Text;
-  refspec @1 :Text;
-}
-
-# Worktree Request
+# Worktree Request (repoId removed — curried into RepositoryClient)
 
 struct WorktreeRequest {
-  repoId @0 :Text;
-  path @1 :Text;
-  branchName @2 :Text;
-  createBranch @3 :Bool;
+  path @0 :Text;
+  branchName @1 :Text;
+  createBranch @2 :Bool;
 }
 
 struct RemoveWorktreeRequest {
-  repoId @0 :Text;
-  worktreePath @1 :Text;
-  force @2 :Bool;
+  worktreePath @0 :Text;
+  force @1 :Bool;
 }
 
 struct WorktreeInfo {
@@ -162,43 +172,38 @@ struct WorktreeInfo {
   isDirty @4 :Bool;
 }
 
-# Branch Request
+# Branch Request (repoId removed — curried)
 
 struct BranchRequest {
-  repoId @0 :Text;
-  branchName @1 :Text;
-  startPoint @2 :Text;
+  branchName @0 :Text;
+  startPoint @1 :Text;
 }
 
-# Checkout Request
+# Checkout Request (repoId removed — curried)
 
 struct CheckoutRequest {
-  repoId @0 :Text;
-  refName @1 :Text;
-  createBranch @2 :Bool;
+  refName @0 :Text;
+  createBranch @1 :Bool;
 }
 
-# Stage Files Request
+# Stage Files Request (repoId removed — curried)
 
 struct StageFilesRequest {
-  repoId @0 :Text;
-  files @1 :List(Text);
+  files @0 :List(Text);
 }
 
-# Commit Request
+# Commit Request (repoId removed — curried)
 
 struct CommitRequest {
-  repoId @0 :Text;
-  message @1 :Text;
-  author @2 :Text;
-  email @3 :Text;
+  message @0 :Text;
+  author @1 :Text;
+  email @2 :Text;
 }
 
-# Get Ref Request
+# Get Ref Request (repoId removed — curried)
 
 struct GetRefRequest {
-  repoId @0 :Text;
-  refName @1 :Text;
+  refName @0 :Text;
 }
 
 # Tracked Repository
@@ -240,34 +245,29 @@ struct RemoteInfo {
 }
 
 struct AddRemoteRequest {
-  repoId @0 :Text;
-  name @1 :Text;
-  url @2 :Text;
+  name @0 :Text;
+  url @1 :Text;
 }
 
 struct RemoveRemoteRequest {
-  repoId @0 :Text;
-  name @1 :Text;
+  name @0 :Text;
 }
 
 struct SetRemoteUrlRequest {
-  repoId @0 :Text;
-  name @1 :Text;
-  url @2 :Text;
+  name @0 :Text;
+  url @1 :Text;
 }
 
 struct RenameRemoteRequest {
-  repoId @0 :Text;
-  oldName @1 :Text;
-  newName @2 :Text;
+  oldName @0 :Text;
+  newName @1 :Text;
 }
 
-# Merge Request
+# Merge Request (repoId removed — curried)
 
 struct MergeRequest {
-  repoId @0 :Text;
-  source @1 :Text;
-  message @2 :Text;           # Optional merge message
+  source @0 :Text;
+  message @1 :Text;           # Optional merge message
 }
 
 # Repository Status
@@ -281,51 +281,51 @@ struct RepositoryStatus {
   modifiedFiles @5 :List(Text); # Paths of modified files
 }
 
-# Push Request
+# Push Request (repoId removed — curried)
 
 struct PushRequest {
-  repoId @0 :Text;
-  remote @1 :Text;
-  refspec @2 :Text;
-  force @3 :Bool;
+  remote @0 :Text;
+  refspec @1 :Text;
+  force @2 :Bool;
 }
 
-# Amend Commit Request
+# Amend Commit Request (repoId removed — curried)
 
 struct AmendCommitRequest {
-  repoId @0 :Text;
-  message @1 :Text;
+  message @0 :Text;
 }
 
-# Commit with Author Request
+# Commit with Author Request (repoId removed — curried)
 
 struct CommitWithAuthorRequest {
-  repoId @0 :Text;
-  message @1 :Text;
-  authorName @2 :Text;
-  authorEmail @3 :Text;
+  message @0 :Text;
+  authorName @1 :Text;
+  authorEmail @2 :Text;
 }
 
-# Continue Merge Request
+# Continue Merge Request (repoId removed — curried)
 
 struct ContinueMergeRequest {
-  repoId @0 :Text;
-  message @1 :Text;  # Optional merge message
+  message @0 :Text;  # Optional merge message
 }
 
-# Create Tag Request
+# Create Tag Request (repoId removed — curried)
 
 struct CreateTagRequest {
-  repoId @0 :Text;
-  name @1 :Text;
-  target @2 :Text;  # Optional target (defaults to HEAD)
+  name @0 :Text;
+  target @1 :Text;  # Optional target (defaults to HEAD)
 }
 
-# Delete Tag Request
+# Delete Tag Request (repoId removed — curried)
 
 struct DeleteTagRequest {
-  repoId @0 :Text;
-  name @1 :Text;
+  name @0 :Text;
+}
+
+# Update Request (repoId removed — curried)
+
+struct UpdateRequest {
+  refspec @0 :Text;
 }
 
 # Detailed Status Info

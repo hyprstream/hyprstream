@@ -7,6 +7,11 @@
 # to the appropriate InferenceService based on model reference.
 #
 # Endpoint: inproc://hyprstream/model
+#
+# Convention: Request variants use camelCase names. Response variants
+# use the same name suffixed with "Result" to avoid Cap'n Proto naming
+# collisions. The code generator strips "Result" to pair them.
+# Session-scoped ops are nested under `session`/`sessionResult`.
 
 struct ModelRequest {
   # Request ID for tracking
@@ -14,26 +19,28 @@ struct ModelRequest {
 
   # Request payload (union of request types)
   union {
-    # Model lifecycle
+    # Model lifecycle (top-level)
     load @1 :LoadModelRequest;
     unload @2 :UnloadModelRequest;
     list @3 :Void;
-    status @4 :ModelStatusRequest;
+    healthCheck @4 :Void;
 
-    # Inference routing (convenience methods that route to InferenceService)
-    # The request field contains serialized InferenceRequest bytes
-    infer @5 :InferRequest;
-    inferStream @6 :InferRequest;
+    # Session-scoped operations (requires modelRef)
+    session @5 :ModelSessionRequest;
+  }
+}
 
-    # Stream authorization handshake (routes to InferenceService)
-    # Client must call this after inferStream to authorize SUB subscription
-    startStream @9 :StartStreamRequest;
-
-    # Health/Lifecycle
-    healthCheck @7 :Void;
-
-    # Template application (routes to InferenceService's ApplyChatTemplate)
-    applyChatTemplate @8 :ApplyChatTemplateRequest;
+# Session-scoped request: operations that target a specific loaded model.
+# Generator detects the non-union field (modelRef) + inner union pattern
+# and produces a ModelSessionClient with modelRef curried in.
+struct ModelSessionRequest {
+  modelRef @0 :Text;
+  union {
+    status @1 :Void;
+    infer @2 :InferRequest;
+    inferStream @3 :InferRequest;
+    startStream @4 :StartStreamRequest;
+    applyChatTemplate @5 :ApplyChatTemplateRequest;
   }
 }
 
@@ -41,21 +48,26 @@ struct ModelResponse {
   # Request ID this response corresponds to
   requestId @0 :UInt64;
 
-  # Response payload (union of response types)
+  # Response payload — variants suffixed with "Result" to pair with request
   union {
-    ok @1 :Void;
-    error @2 :ErrorInfo;
-    loaded @3 :LoadedModelResponse;
-    list @4 :ModelListResponse;
-    status @5 :ModelStatusResponse;
-    # Inference responses contain serialized InferenceResponse bytes
-    inferResult @6 :Data;
-    streamStarted @7 :StreamInfo;
-    health @8 :ModelHealthStatus;
-    # Templated prompt string
-    templateResult @9 :Text;
-    # Stream authorization confirmation
-    streamAuthorized @10 :StreamAuthInfo;
+    error @1 :ErrorInfo;
+    loadResult @2 :LoadedModelResponse;
+    unloadResult @3 :Void;
+    listResult @4 :ModelListResponse;
+    healthCheckResult @5 :ModelHealthStatus;
+    sessionResult @6 :ModelSessionResponse;
+  }
+}
+
+# Session-scoped response: inner union variants match request names exactly.
+struct ModelSessionResponse {
+  union {
+    error @0 :ErrorInfo;
+    status @1 :ModelStatusResponse;
+    infer @2 :Data;
+    inferStream @3 :StreamInfo;
+    startStream @4 :StreamAuthResponse;
+    applyChatTemplate @5 :Text;
   }
 }
 
@@ -63,6 +75,7 @@ struct ModelResponse {
 struct ErrorInfo {
   message @0 :Text;
   code @1 :Text;
+  details @2 :Text;
 }
 
 # =============================================================================
@@ -97,30 +110,24 @@ struct UnloadModelRequest {
   modelRef @0 :Text;
 }
 
-# Model status request
-struct ModelStatusRequest {
-  modelRef @0 :Text;
-}
-
 # Inference request (routes to InferenceService)
 # The request field contains serialized GenerationRequest bytes
+# Note: modelRef removed — curried into ModelSessionClient
 struct InferRequest {
-  modelRef @0 :Text;
-  request @1 :Data;  # Serialized GenerationRequest (Cap'n Proto bytes)
+  request @0 :Data;  # Serialized GenerationRequest (Cap'n Proto bytes)
 }
 
 # Start stream request (authorizes SUB subscription)
 # Client must call this after inferStream to authorize subscription
-# Note: Aligns with streaming.capnp::StreamStartRequest
+# Note: modelRef removed — curried into ModelSessionClient
 struct StartStreamRequest {
-  modelRef @0 :Text;      # Model that started the stream
-  streamId @1 :Text;      # Stream ID from inferStream response (e.g., "stream-uuid")
-  clientPubkey @2 :Data;  # Client's ephemeral Ristretto255 public key (32 bytes) for DH
+  streamId @0 :Text;      # Stream ID from inferStream response (e.g., "stream-uuid")
+  clientPubkey @1 :Data;  # Client's ephemeral Ristretto255 public key (32 bytes) for DH
 }
 
 # Stream authorization response
 # Note: Aligns with streaming.capnp::StreamAuthResponse
-struct StreamAuthInfo {
+struct StreamAuthResponse {
   streamId @0 :Text;
   serverPubkey @1 :Data;  # Server's ephemeral Ristretto255 public key (if not in StreamInfo)
 }
@@ -169,10 +176,10 @@ struct ChatMessage {
 }
 
 # Apply chat template request
+# Note: modelRef removed — curried into ModelSessionClient
 struct ApplyChatTemplateRequest {
-  modelRef @0 :Text;
-  messages @1 :List(ChatMessage);
-  addGenerationPrompt @2 :Bool;  # Whether to add assistant prompt at end
+  messages @0 :List(ChatMessage);
+  addGenerationPrompt @1 :Bool;  # Whether to add assistant prompt at end
 }
 
 # =============================================================================

@@ -149,6 +149,8 @@ pub struct ServiceEntry {
     pub endpoints: HashMap<SocketKind, TransportConfig>,
     /// Optional description
     pub description: Option<String>,
+    /// Raw `.capnp` schema bytes (compile-time embedded via `include_bytes!`)
+    pub schema: Option<&'static [u8]>,
 }
 
 /// Centralized endpoint registry with self-registration.
@@ -200,6 +202,7 @@ impl EndpointRegistry {
             name: name.to_owned(),
             endpoints: HashMap::new(),
             description: description.map(String::from),
+            schema: None,
         });
         // Update description if provided
         if let Some(desc) = description {
@@ -303,6 +306,36 @@ impl EndpointRegistry {
     /// Get all endpoints for a service.
     pub fn service_endpoints(&self, name: &str) -> Option<HashMap<SocketKind, TransportConfig>> {
         self.services.read().get(name).map(|e| e.endpoints.clone())
+    }
+
+    /// Register a service endpoint with schema bytes.
+    pub fn register_with_schema(
+        &self,
+        name: &str,
+        socket_kind: SocketKind,
+        endpoint: TransportConfig,
+        description: Option<&str>,
+        schema: Option<&'static [u8]>,
+    ) {
+        let mut services = self.services.write();
+        let entry = services.entry(name.to_owned()).or_insert_with(|| ServiceEntry {
+            name: name.to_owned(),
+            endpoints: HashMap::new(),
+            description: description.map(String::from),
+            schema: None,
+        });
+        if let Some(desc) = description {
+            entry.description = Some(desc.to_owned());
+        }
+        if schema.is_some() {
+            entry.schema = schema;
+        }
+        entry.endpoints.insert(socket_kind, endpoint);
+    }
+
+    /// Get schema bytes for a service (if registered with a schema).
+    pub fn service_schema(&self, name: &str) -> Option<&'static [u8]> {
+        self.services.read().get(name).and_then(|e| e.schema)
     }
 }
 
