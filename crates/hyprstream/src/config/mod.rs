@@ -149,7 +149,7 @@ impl Default for OAIConfig {
 }
 
 fn default_oai_host() -> String { "0.0.0.0".to_owned() }
-fn default_oai_port() -> u16 { 8080 }
+fn default_oai_port() -> u16 { 6789 }
 fn default_oai_timeout() -> u64 { 300 }
 
 /// Arrow Flight SQL server configuration
@@ -216,7 +216,7 @@ impl Default for MCPConfig {
 }
 
 fn default_mcp_host() -> String { "0.0.0.0".to_owned() }
-fn default_mcp_port() -> u16 { 8080 }
+fn default_mcp_port() -> u16 { 6790 }
 
 /// StreamService configuration
 ///

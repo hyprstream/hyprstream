@@ -343,7 +343,7 @@ impl ModelService {
     }
 
     /// Route inference request to the appropriate InferenceService
-    async fn infer(&self, model_ref_str: &str, request_bytes: &[u8]) -> Result<Vec<u8>> {
+    async fn infer(&self, model_ref_str: &str, request: GenerationRequest) -> Result<GenerationResult> {
         // Ensure model is loaded (use service defaults)
         let _endpoint = self.load_model(model_ref_str, None).await?;
 
@@ -357,21 +357,8 @@ impl ModelService {
             model.client.clone()
         };
 
-        // Parse the GenerationRequest
-        let reader = serialize::read_message(
-            &mut std::io::Cursor::new(request_bytes),
-            ReaderOptions::new(),
-        )?;
-        let gen_req_reader =
-            reader.get_root::<crate::inference_capnp::generation_request::Reader>()?;
-
-        let request = parse_generation_request(gen_req_reader)?;
-
         // Call inference
-        let result = client.generate(&request).await?;
-
-        // Serialize result
-        serialize_generation_result(&result)
+        client.generate(&request).await
     }
 
     /// Route streaming inference request with E2E authentication.
@@ -380,7 +367,7 @@ impl ModelService {
     async fn infer_stream(
         &self,
         model_ref_str: &str,
-        request_bytes: &[u8],
+        request: GenerationRequest,
         client_ephemeral_pubkey: Option<[u8; 32]>,
     ) -> Result<StreamStartedInfo> {
         // Ensure model is loaded (use service defaults)
@@ -395,16 +382,6 @@ impl ModelService {
             model.last_used = Instant::now();
             model.client.clone()
         };
-
-        // Parse the GenerationRequest
-        let reader = serialize::read_message(
-            &mut std::io::Cursor::new(request_bytes),
-            ReaderOptions::new(),
-        )?;
-        let gen_req_reader =
-            reader.get_root::<crate::inference_capnp::generation_request::Reader>()?;
-
-        let request = parse_generation_request(gen_req_reader)?;
 
         // Pass through ephemeral pubkey for E2E authentication
         client.generate_stream(&request, client_ephemeral_pubkey).await
@@ -539,13 +516,24 @@ impl ModelService {
     }
 
     /// Build a session infer result response (nested inside sessionResult)
-    fn build_session_infer_response(request_id: u64, result_bytes: Vec<u8>) -> Result<Vec<u8>> {
+    fn build_session_infer_response(request_id: u64, result: &GenerationResult) -> Result<Vec<u8>> {
         let mut message = Builder::new_default();
         {
             let mut response = message.init_root::<model_capnp::model_response::Builder>();
             response.set_request_id(request_id);
-            let mut session_resp = response.init_session_result();
-            session_resp.set_infer(&result_bytes);
+            let session_resp = response.init_session_result();
+            let mut infer = session_resp.init_infer();
+            infer.set_text(&result.text);
+            infer.set_tokens_generated(result.tokens_generated as u32);
+            infer.set_finish_reason(&finish_reason_to_str(&result.finish_reason));
+            infer.set_generation_time_ms(result.generation_time_ms);
+            infer.set_tokens_per_second(result.tokens_per_second);
+            infer.set_prefill_tokens(result.prefill_tokens as u32);
+            infer.set_prefill_time_ms(result.prefill_time_ms);
+            infer.set_prefill_tokens_per_sec(result.prefill_tokens_per_sec);
+            infer.set_inference_tokens(result.inference_tokens as u32);
+            infer.set_inference_time_ms(result.inference_time_ms);
+            infer.set_inference_tokens_per_sec(result.inference_tokens_per_sec);
         }
         let mut bytes = Vec::new();
         serialize::write_message(&mut bytes, &message)?;
@@ -740,9 +728,9 @@ impl crate::services::ZmqService for ModelService {
                             }
                             SessionWhich::Infer(infer_req) => {
                                 let infer = infer_req?;
-                                let request_data = infer.get_request()?;
-                                match self.infer(model_ref, request_data).await {
-                                    Ok(result_bytes) => Self::build_session_infer_response(request_id, result_bytes),
+                                let request = parse_infer_request(infer)?;
+                                match self.infer(model_ref, request).await {
+                                    Ok(result) => Self::build_session_infer_response(request_id, &result),
                                     Err(e) => Self::build_session_error_response(
                                         request_id,
                                         &format!("Inference failed: {e}"),
@@ -752,8 +740,8 @@ impl crate::services::ZmqService for ModelService {
                             }
                             SessionWhich::InferStream(infer_req) => {
                                 let infer = infer_req?;
-                                let request_data = infer.get_request()?;
-                                match self.infer_stream(model_ref, request_data, client_ephemeral_pubkey).await {
+                                let request = parse_infer_request(infer)?;
+                                match self.infer_stream(model_ref, request, client_ephemeral_pubkey).await {
                                     Ok(info) => Self::build_session_infer_stream_response(
                                         request_id,
                                         &info.stream_id,
@@ -951,10 +939,48 @@ impl ModelZmqClient {
 
     /// Run inference on a model (session-scoped)
     pub async fn infer(&self, model_ref: &str, request: &GenerationRequest) -> Result<GenerationResult> {
-        let gen_request_bytes = serialize_generation_request(request)?;
-        match self.gen.session(model_ref).infer(&gen_request_bytes).await? {
-            ModelSessionClientResponseVariant::Infer(result_data) => {
-                parse_generation_result(&result_data)
+        // Images are file paths in GenerationRequest but raw bytes in schema — not yet used over wire
+        let images: Vec<Vec<u8>> = Vec::new();
+        match self.gen.session(model_ref).infer(
+            request.prompt.as_str(),
+            request.max_tokens as u32,
+            request.temperature,
+            request.top_p,
+            request.top_k.unwrap_or(0) as u32,
+            request.repeat_penalty,
+            request.repeat_last_n as u32,
+            &request.stop_tokens,
+            request.seed.unwrap_or(0),
+            &images,
+            request.timeout.unwrap_or(0),
+        ).await? {
+            ModelSessionClientResponseVariant::Infer {
+                text,
+                tokens_generated,
+                finish_reason,
+                generation_time_ms,
+                tokens_per_second,
+                prefill_tokens,
+                prefill_time_ms,
+                prefill_tokens_per_sec,
+                inference_tokens,
+                inference_time_ms,
+                inference_tokens_per_sec,
+            } => {
+                Ok(GenerationResult {
+                    text,
+                    tokens_generated: tokens_generated as usize,
+                    finish_reason: parse_finish_reason_str(&finish_reason),
+                    generation_time_ms,
+                    tokens_per_second,
+                    quality_metrics: None,
+                    prefill_tokens: prefill_tokens as usize,
+                    prefill_time_ms,
+                    prefill_tokens_per_sec,
+                    inference_tokens: inference_tokens as usize,
+                    inference_time_ms,
+                    inference_tokens_per_sec,
+                })
             }
             ModelSessionClientResponseVariant::Error { message, code, .. } => {
                 Err(anyhow!("{}: {}", code, message))
@@ -971,7 +997,6 @@ impl ModelZmqClient {
         client_ephemeral_pubkey: [u8; 32],
     ) -> Result<StreamStartedInfo> {
         let request_id = self.gen.next_id();
-        let gen_request_bytes = serialize_generation_request(request)?;
 
         let mut message = Builder::new_default();
         {
@@ -980,7 +1005,7 @@ impl ModelZmqClient {
             let mut session = req.init_session();
             session.set_model_ref(model_ref);
             let mut infer = session.init_infer_stream();
-            infer.set_request(&gen_request_bytes);
+            set_infer_request_fields(&mut infer, request);
         }
 
         let mut request_bytes = Vec::new();
@@ -1092,9 +1117,9 @@ pub struct ModelHealthInfo {
 // Serialization helpers
 // ============================================================================
 
-/// Parse a GenerationRequest from Cap'n Proto
-fn parse_generation_request(
-    reader: crate::inference_capnp::generation_request::Reader,
+/// Parse inline InferRequest fields from model.capnp into GenerationRequest
+fn parse_infer_request(
+    reader: model_capnp::infer_request::Reader,
 ) -> Result<GenerationRequest> {
     Ok(GenerationRequest {
         prompt: TemplatedPrompt::new(reader.get_prompt()?.to_str()?.to_owned()),
@@ -1109,7 +1134,7 @@ fn parse_generation_request(
         repeat_penalty: reader.get_repeat_penalty(),
         repeat_last_n: reader.get_repeat_last_n() as usize,
         seed: if reader.get_seed() > 0 {
-            Some(reader.get_seed())
+            Some(reader.get_seed() as u32)
         } else {
             None
         },
@@ -1128,130 +1153,56 @@ fn parse_generation_request(
     })
 }
 
-/// Serialize a GenerationRequest to Cap'n Proto bytes
-fn serialize_generation_request(request: &GenerationRequest) -> Result<Vec<u8>> {
-    let mut message = Builder::new_default();
-    {
-        let mut req = message.init_root::<crate::inference_capnp::generation_request::Builder>();
-        req.set_prompt(request.prompt.as_str());
-        req.set_max_tokens(request.max_tokens as u32);
-        req.set_temperature(request.temperature);
-        req.set_top_p(request.top_p);
-        req.set_top_k(request.top_k.unwrap_or(0) as u32);
-        req.set_repeat_penalty(request.repeat_penalty);
-        req.set_repeat_last_n(request.repeat_last_n as u32);
-        req.set_seed(request.seed.unwrap_or(0));
-        req.set_timeout_ms(request.timeout.unwrap_or(0));
-
-        if !request.stop_tokens.is_empty() {
-            let mut stop_list = req.init_stop_tokens(request.stop_tokens.len() as u32);
-            for (i, token) in request.stop_tokens.iter().enumerate() {
-                stop_list.set(i as u32, token);
-            }
-        }
+/// Convert FinishReason to string for InferResult.finishReason field
+fn finish_reason_to_str(reason: &crate::config::FinishReason) -> String {
+    match reason {
+        crate::config::FinishReason::MaxTokens => "max_tokens".to_owned(),
+        crate::config::FinishReason::StopToken(t) => format!("stop_token:{}", t),
+        crate::config::FinishReason::EndOfSequence => "end_of_sequence".to_owned(),
+        crate::config::FinishReason::Error(e) => format!("error:{}", e),
+        crate::config::FinishReason::Stop => "stop".to_owned(),
     }
-
-    let mut bytes = Vec::new();
-    serialize::write_message(&mut bytes, &message)?;
-    Ok(bytes)
 }
 
-/// Serialize a GenerationResult to Cap'n Proto bytes
-fn serialize_generation_result(result: &GenerationResult) -> Result<Vec<u8>> {
-    let mut message = Builder::new_default();
-    {
-        let mut res = message.init_root::<crate::inference_capnp::generation_result::Builder>();
-        res.set_text(&result.text);
-        res.set_tokens_generated(result.tokens_generated as u32);
-        res.set_generation_time_ms(result.generation_time_ms);
-        res.set_tokens_per_second(result.tokens_per_second);
+/// Set InferRequest fields from a GenerationRequest (for manual message building)
+fn set_infer_request_fields(
+    infer: &mut model_capnp::infer_request::Builder,
+    request: &GenerationRequest,
+) {
+    infer.set_prompt(request.prompt.as_str());
+    infer.set_max_tokens(request.max_tokens as u32);
+    infer.set_temperature(request.temperature);
+    infer.set_top_p(request.top_p);
+    infer.set_top_k(request.top_k.unwrap_or(0) as u32);
+    infer.set_repeat_penalty(request.repeat_penalty);
+    infer.set_repeat_last_n(request.repeat_last_n as u32);
+    infer.set_seed(request.seed.unwrap_or(0));
+    infer.set_timeout_ms(request.timeout.unwrap_or(0));
 
-        // Set finish reason
-        let finish_reason = match &result.finish_reason {
-            crate::config::FinishReason::MaxTokens => {
-                crate::inference_capnp::FinishReason::MaxTokens
-            }
-            crate::config::FinishReason::StopToken(_) => {
-                crate::inference_capnp::FinishReason::StopToken
-            }
-            crate::config::FinishReason::EndOfSequence => {
-                crate::inference_capnp::FinishReason::EndOfSequence
-            }
-            crate::config::FinishReason::Error(_) => crate::inference_capnp::FinishReason::Error,
-            crate::config::FinishReason::Stop => crate::inference_capnp::FinishReason::Stop,
-        };
-        res.set_finish_reason(finish_reason);
-
-        // Set prefill/inference metrics BEFORE init_quality_metrics (which consumes the builder)
-        res.set_prefill_tokens(result.prefill_tokens as u32);
-        res.set_prefill_time_ms(result.prefill_time_ms);
-        res.set_prefill_tokens_per_sec(result.prefill_tokens_per_sec);
-        res.set_inference_tokens(result.inference_tokens as u32);
-        res.set_inference_time_ms(result.inference_time_ms);
-        res.set_inference_tokens_per_sec(result.inference_tokens_per_sec);
-
-        // Set quality metrics if present (init_quality_metrics consumes the builder)
-        if let Some(qm) = &result.quality_metrics {
-            let mut metrics = res.init_quality_metrics();
-            metrics.set_perplexity(qm.perplexity);
-            metrics.set_avg_entropy(qm.avg_entropy);
-            metrics.set_entropy_variance(qm.entropy_variance);
-            metrics.set_repetition_ratio(qm.repetition_ratio);
+    if !request.stop_tokens.is_empty() {
+        let mut stop_list = infer.reborrow().init_stop_tokens(request.stop_tokens.len() as u32);
+        for (i, token) in request.stop_tokens.iter().enumerate() {
+            stop_list.set(i as u32, token);
         }
     }
-
-    let mut bytes = Vec::new();
-    serialize::write_message(&mut bytes, &message)?;
-    Ok(bytes)
 }
 
-/// Parse a GenerationResult from Cap'n Proto bytes
-fn parse_generation_result(bytes: &[u8]) -> Result<GenerationResult> {
-    let reader = serialize::read_message(&mut std::io::Cursor::new(bytes), ReaderOptions::new())?;
-    let res = reader.get_root::<crate::inference_capnp::generation_result::Reader>()?;
-
-    let finish_reason = match res.get_finish_reason()? {
-        crate::inference_capnp::FinishReason::MaxTokens => crate::config::FinishReason::MaxTokens,
-        crate::inference_capnp::FinishReason::StopToken => {
-            crate::config::FinishReason::StopToken(String::new())
-        }
-        crate::inference_capnp::FinishReason::EndOfSequence => {
-            crate::config::FinishReason::EndOfSequence
-        }
-        crate::inference_capnp::FinishReason::Error => {
-            crate::config::FinishReason::Error(String::new())
-        }
-        crate::inference_capnp::FinishReason::Stop => crate::config::FinishReason::Stop,
-    };
-
-    let quality_metrics = if res.has_quality_metrics() {
-        let qm = res.get_quality_metrics()?;
-        Some(crate::runtime::generation_metrics::GenerationQualityMetrics {
-            perplexity: qm.get_perplexity(),
-            avg_entropy: qm.get_avg_entropy(),
-            entropy_variance: qm.get_entropy_variance(),
-            repetition_ratio: qm.get_repetition_ratio(),
-            token_count: res.get_tokens_generated(),
-        })
+/// Parse a finish reason string back into FinishReason enum
+fn parse_finish_reason_str(s: &str) -> crate::config::FinishReason {
+    if s.starts_with("stop_token:") {
+        crate::config::FinishReason::StopToken(s.strip_prefix("stop_token:").unwrap_or("").to_owned())
+    } else if s.starts_with("error:") {
+        crate::config::FinishReason::Error(s.strip_prefix("error:").unwrap_or("").to_owned())
     } else {
-        None
-    };
-
-    Ok(GenerationResult {
-        text: res.get_text()?.to_str()?.to_owned(),
-        tokens_generated: res.get_tokens_generated() as usize,
-        finish_reason,
-        generation_time_ms: res.get_generation_time_ms(),
-        tokens_per_second: res.get_tokens_per_second(),
-        quality_metrics,
-        prefill_tokens: res.get_prefill_tokens() as usize,
-        prefill_time_ms: res.get_prefill_time_ms(),
-        prefill_tokens_per_sec: res.get_prefill_tokens_per_sec(),
-        inference_tokens: res.get_inference_tokens() as usize,
-        inference_time_ms: res.get_inference_time_ms(),
-        inference_tokens_per_sec: res.get_inference_tokens_per_sec(),
-    })
+        match s {
+            "max_tokens" => crate::config::FinishReason::MaxTokens,
+            "end_of_sequence" => crate::config::FinishReason::EndOfSequence,
+            "stop" => crate::config::FinishReason::Stop,
+            _ => crate::config::FinishReason::Stop,
+        }
+    }
 }
+
 
 #[cfg(test)]
 mod tests {

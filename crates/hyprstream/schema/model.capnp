@@ -64,11 +64,27 @@ struct ModelSessionResponse {
   union {
     error @0 :ErrorInfo;
     status @1 :ModelStatusResponse;
-    infer @2 :Data;
+    infer @2 :InferResult;
     inferStream @3 :StreamInfo;
     startStream @4 :StreamAuthResponse;
     applyChatTemplate @5 :Text;
   }
+}
+
+# Inference result — flattened from inference.capnp::GenerationResult
+# for transparent MCP/JSON bridging.
+struct InferResult {
+  text @0 :Text;
+  tokensGenerated @1 :UInt32;
+  finishReason @2 :Text;         # "max_tokens", "stop_token", "end_of_sequence", "error", "stop"
+  generationTimeMs @3 :UInt64;
+  tokensPerSecond @4 :Float32;
+  prefillTokens @5 :UInt32;
+  prefillTimeMs @6 :UInt64;
+  prefillTokensPerSec @7 :Float32;
+  inferenceTokens @8 :UInt32;
+  inferenceTimeMs @9 :UInt64;
+  inferenceTokensPerSec @10 :Float32;
 }
 
 # Error information
@@ -111,10 +127,20 @@ struct UnloadModelRequest {
 }
 
 # Inference request (routes to InferenceService)
-# The request field contains serialized GenerationRequest bytes
+# Fields match inference.capnp::GenerationRequest for transparent MCP/JSON bridging.
 # Note: modelRef removed — curried into ModelSessionClient
 struct InferRequest {
-  request @0 :Data;  # Serialized GenerationRequest (Cap'n Proto bytes)
+  prompt @0 :Text;
+  maxTokens @1 :UInt32;
+  temperature @2 :Float32;
+  topP @3 :Float32;
+  topK @4 :UInt32;
+  repeatPenalty @5 :Float32;
+  repeatLastN @6 :UInt32;
+  stopTokens @7 :List(Text);
+  seed @8 :UInt32;
+  images @9 :List(Data);
+  timeoutMs @10 :UInt64;
 }
 
 # Start stream request (authorizes SUB subscription)
