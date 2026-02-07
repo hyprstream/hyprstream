@@ -333,20 +333,20 @@ fn register_schema_tools(reg: &mut ToolRegistry, existing_names: &std::collectio
         model_client, registry_client, policy_client, inference_client,
     };
 
-    // Helper: extract (name, type_name, required) tuples from any generated ParamSchema
+    // Helper: extract (name, description, params) tuples from any generated ParamSchema
     macro_rules! extract_params {
         ($methods:expr) => {
             $methods.iter().map(|m| {
-                let params: Vec<(&str, &str, bool)> = m.params.iter()
-                    .map(|p| (p.name, p.type_name, p.required))
+                let params: Vec<(&str, &str, bool, &str)> = m.params.iter()
+                    .map(|p| (p.name, p.type_name, p.required, p.description))
                     .collect();
-                (m.name, params)
+                (m.name, m.description, params)
             }).collect::<Vec<_>>()
         };
     }
 
     // Top-level methods from all services
-    let all_schemas: &[(&str, Vec<(&str, Vec<(&str, &str, bool)>)>)] = &[
+    let all_schemas: &[(&str, Vec<(&str, &str, Vec<(&str, &str, bool, &str)>)>)] = &[
         { let (svc, methods) = model_client::schema_metadata(); (svc, extract_params!(methods)) },
         { let (svc, methods) = registry_client::schema_metadata(); (svc, extract_params!(methods)) },
         { let (svc, methods) = policy_client::schema_metadata(); (svc, extract_params!(methods)) },
@@ -354,7 +354,7 @@ fn register_schema_tools(reg: &mut ToolRegistry, existing_names: &std::collectio
     ];
 
     for (service_name, methods) in all_schemas {
-        for (method_name, params) in methods {
+        for (method_name, description, params) in methods {
             let tool_name = format!("{service_name}.{method_name}");
             if existing_names.contains(&tool_name) {
                 continue;
@@ -363,11 +363,16 @@ fn register_schema_tools(reg: &mut ToolRegistry, existing_names: &std::collectio
             let json_schema = params_to_json_schema(params);
             let service_name = service_name.to_string();
             let method_name = method_name.to_string();
+            let description = if description.is_empty() {
+                format!("{service_name}::{method_name}")
+            } else {
+                description.to_string()
+            };
 
             reg.register(ToolEntry {
                 uuid: Uuid::new_v5(&MCP_NS, tool_name.as_bytes()),
                 name: tool_name.clone(),
-                description: format!("{service_name}::{}", method_name),
+                description,
                 args_schema: json_schema,
                 required_scope: format!("read:{service_name}:*"),
                 streaming: false,
@@ -392,8 +397,8 @@ fn register_schema_tools(reg: &mut ToolRegistry, existing_names: &std::collectio
                 continue;
             }
 
-            let params: Vec<(&str, &str, bool)> = method.params.iter()
-                .map(|p| (p.name, p.type_name, p.required))
+            let params: Vec<(&str, &str, bool, &str)> = method.params.iter()
+                .map(|p| (p.name, p.type_name, p.required, p.description))
                 .collect();
             let mut json_schema = params_to_json_schema(&params);
             if let Value::Object(ref mut map) = json_schema {
@@ -406,10 +411,15 @@ fn register_schema_tools(reg: &mut ToolRegistry, existing_names: &std::collectio
             }
 
             let method_name = method.name.to_string();
+            let description = if method.description.is_empty() {
+                format!("registry.repo::{}", method.name)
+            } else {
+                method.description.to_string()
+            };
             reg.register(ToolEntry {
                 uuid: Uuid::new_v5(&MCP_NS, tool_name.as_bytes()),
                 name: tool_name.clone(),
-                description: format!("registry.repo::{}", method.name),
+                description,
                 args_schema: json_schema,
                 required_scope: "read:registry:*".into(),
                 streaming: false,
@@ -437,8 +447,8 @@ fn register_schema_tools(reg: &mut ToolRegistry, existing_names: &std::collectio
                 continue;
             }
 
-            let params: Vec<(&str, &str, bool)> = method.params.iter()
-                .map(|p| (p.name, p.type_name, p.required))
+            let params: Vec<(&str, &str, bool, &str)> = method.params.iter()
+                .map(|p| (p.name, p.type_name, p.required, p.description))
                 .collect();
             let mut json_schema = params_to_json_schema(&params);
             if let Value::Object(ref mut map) = json_schema {
@@ -451,10 +461,15 @@ fn register_schema_tools(reg: &mut ToolRegistry, existing_names: &std::collectio
             }
 
             let method_name = method.name.to_string();
+            let description = if method.description.is_empty() {
+                format!("model.session::{}", method.name)
+            } else {
+                method.description.to_string()
+            };
             reg.register(ToolEntry {
                 uuid: Uuid::new_v5(&MCP_NS, tool_name.as_bytes()),
                 name: tool_name.clone(),
-                description: format!("model.session::{}", method.name),
+                description,
                 args_schema: json_schema,
                 required_scope: "read:model:*".into(),
                 streaming: false,
@@ -476,13 +491,13 @@ fn register_schema_tools(reg: &mut ToolRegistry, existing_names: &std::collectio
 
 /// Convert method params to a JSON Schema for tool arguments.
 ///
-/// Takes params as (name, type_name, required) tuples — works with any generated module's ParamSchema
+/// Takes params as (name, type_name, required, description) tuples — works with any generated module's ParamSchema
 /// since they all have the same layout.
-fn params_to_json_schema(params: &[(&str, &str, bool)]) -> Value {
+fn params_to_json_schema(params: &[(&str, &str, bool, &str)]) -> Value {
     let mut properties = serde_json::Map::new();
     let mut required = Vec::new();
 
-    for &(name, type_name, is_required) in params {
+    for &(name, type_name, is_required, description) in params {
         let json_type = match type_name {
             "Text" => "string",
             "Bool" => "boolean",
@@ -493,10 +508,13 @@ fn params_to_json_schema(params: &[(&str, &str, bool)]) -> Value {
             _ => "string",
         };
 
-        properties.insert(
-            name.to_string(),
-            serde_json::json!({"type": json_type}),
-        );
+        let mut param_schema = serde_json::Map::new();
+        param_schema.insert("type".to_string(), Value::String(json_type.to_string()));
+        if !description.is_empty() {
+            param_schema.insert("description".to_string(), Value::String(description.to_string()));
+        }
+
+        properties.insert(name.to_string(), Value::Object(param_schema));
         if is_required {
             required.push(Value::String(name.to_string()));
         }
@@ -526,10 +544,6 @@ async fn dispatch_schema_call(service: &str, method: &str, ctx: &ToolCallContext
         "policy" => {
             let client = PolicyClient::new(signing_key, identity);
             client.call_method(method, &ctx.args).await
-        }
-        "inference" => {
-            let client = crate::services::InferenceZmqClient::new(signing_key, identity);
-            client.gen.call_method(method, &ctx.args).await
         }
         _ => anyhow::bail!("Unknown service: {service}"),
     }

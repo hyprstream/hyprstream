@@ -16,15 +16,22 @@ struct RegistryRequest {
 
   # Request payload (union of request types)
   union {
-    # Global operations (top-level)
+    # List all models available in the registry
     list @1 :Void;
-    get @2 :Text;           # repo_id
-    getByName @3 :Text;     # name
+    # Get repository information by ID
+    get @2 :Text;
+    # Get repository information by name
+    getByName @3 :Text;
+    # Clone a model repository from a URL
     clone @4 :CloneRequest;
+    # Register an existing local repository
     register @5 :RegisterRequest;
-    remove @6 :Text;        # repo_id
+    # Remove a repository from the registry
+    remove @6 :Text;
+    # Check registry service health
     healthCheck @7 :Void;
-    cloneStream @8 :CloneRequest;  # Clone with streaming progress
+    # Clone a model repository from a URL (streaming progress)
+    cloneStream @8 :CloneRequest;
 
     # Repository-scoped operations (requires repoId)
     repo @9 :RepositoryRequest;
@@ -37,35 +44,65 @@ struct RegistryRequest {
 struct RepositoryRequest {
   repoId @0 :Text;
   union {
+    # Create a new worktree for the repository
     createWorktree @1 :WorktreeRequest;
+    # List all worktrees for the repository
     listWorktrees @2 :Void;
+    # Remove a worktree from the repository
     removeWorktree @3 :RemoveWorktreeRequest;
+    # Create a new branch in the repository
     createBranch @4 :BranchRequest;
+    # List all branches in the repository
     listBranches @5 :Void;
+    # Checkout a branch or reference
     checkout @6 :CheckoutRequest;
+    # Stage all modified files
     stageAll @7 :Void;
+    # Stage specific files
     stageFiles @8 :StageFilesRequest;
+    # Create a commit with staged changes
     commit @9 :CommitRequest;
+    # Merge a branch into current branch
     merge @10 :MergeRequest;
+    # Abort an in-progress merge
     abortMerge @11 :Void;
+    # Continue a merge after resolving conflicts
     continueMerge @12 :ContinueMergeRequest;
+    # Exit merge state without committing
     quitMerge @13 :Void;
+    # Get the current HEAD reference
     getHead @14 :Void;
+    # Get information about a specific reference
     getRef @15 :GetRefRequest;
+    # Get repository status (short format)
     status @16 :Void;
+    # Get detailed repository status with file changes
     detailedStatus @17 :Void;
+    # List all remotes for the repository
     listRemotes @18 :Void;
+    # Add a new remote to the repository
     addRemote @19 :AddRemoteRequest;
+    # Remove a remote from the repository
     removeRemote @20 :RemoveRemoteRequest;
+    # Set the URL for a remote
     setRemoteUrl @21 :SetRemoteUrlRequest;
+    # Rename a remote
     renameRemote @22 :RenameRemoteRequest;
+    # Push commits to a remote repository
     push @23 :PushRequest;
+    # Amend the last commit with new changes
     amendCommit @24 :AmendCommitRequest;
+    # Create a commit with specified author information
     commitWithAuthor @25 :CommitWithAuthorRequest;
+    # Stage all files including untracked files
     stageAllIncludingUntracked @26 :Void;
+    # List all tags in the repository
     listTags @27 :Void;
+    # Create a new tag
     createTag @28 :CreateTagRequest;
+    # Delete a tag from the repository
     deleteTag @29 :DeleteTagRequest;
+    # Pull and update from remote repository
     update @30 :UpdateRequest;
   }
 }

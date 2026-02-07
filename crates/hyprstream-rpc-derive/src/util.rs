@@ -225,8 +225,8 @@ mod tests {
         vec![StructDef {
             name: "ModelInfo".into(),
             fields: vec![
-                FieldDef { name: "name".into(), type_name: "Text".into() },
-                FieldDef { name: "size".into(), type_name: "UInt64".into() },
+                FieldDef { name: "name".into(), type_name: "Text".into(), description: String::new() },
+                FieldDef { name: "size".into(), type_name: "UInt64".into(), description: String::new() },
             ],
             has_union: false,
         }]

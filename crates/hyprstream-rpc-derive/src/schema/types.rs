@@ -18,6 +18,7 @@ pub struct ParsedSchema {
 pub struct UnionVariant {
     pub name: String,
     pub type_name: String,
+    pub description: String,
 }
 
 #[derive(Debug)]
@@ -31,6 +32,7 @@ pub struct StructDef {
 pub struct FieldDef {
     pub name: String,
     pub type_name: String,
+    pub description: String,
 }
 
 #[derive(Debug)]

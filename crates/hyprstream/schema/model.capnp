@@ -1,5 +1,8 @@
 @0xd4e5f6a7b8c9d0e1;
 
+using import "annotations.capnp".mcpDescription;
+using import "annotations.capnp".paramDescription;
+
 # Cap'n Proto schema for model service
 #
 # ModelService manages the lifecycle of InferenceService instances.
@@ -19,11 +22,10 @@ struct ModelRequest {
 
   # Request payload (union of request types)
   union {
-    # Model lifecycle (top-level)
-    load @1 :LoadModelRequest;
-    unload @2 :UnloadModelRequest;
-    list @3 :Void;
-    healthCheck @4 :Void;
+    load @1 :LoadModelRequest $mcpDescription("Load a model into memory for inference");
+    unload @2 :UnloadModelRequest $mcpDescription("Unload a model from memory to free resources");
+    list @3 :Void $mcpDescription("List all models currently loaded in memory");
+    healthCheck @4 :Void $mcpDescription("Check model service health and status");
 
     # Session-scoped operations (requires modelRef)
     session @5 :ModelSessionRequest;
@@ -36,11 +38,18 @@ struct ModelRequest {
 struct ModelSessionRequest {
   modelRef @0 :Text;
   union {
-    status @1 :Void;
-    infer @2 :InferRequest;
-    inferStream @3 :InferRequest;
-    startStream @4 :StartStreamRequest;
-    applyChatTemplate @5 :ApplyChatTemplateRequest;
+    status @1 :Void $mcpDescription("Get detailed status information about a model");
+    infer @2 :InferRequest $mcpDescription("Run inference on a loaded model (non-streaming)");
+    inferStream @3 :InferRequest $mcpDescription("Run inference on a loaded model (streaming)");
+    startStream @4 :StartStreamRequest $mcpDescription("Authorize a streaming subscription (client must call after inferStream)");
+    applyChatTemplate @5 :ApplyChatTemplateRequest $mcpDescription("Apply chat template to messages for a loaded model");
+
+    # LoRA adapter operations
+    createLora @6 :CreateLoraRequest $mcpDescription("Create a new LoRA adapter on a loaded model");
+    loadLora @7 :Text $mcpDescription("Load a LoRA adapter from a safetensors file");
+    saveLora @8 :Text $mcpDescription("Save the current LoRA adapter to a safetensors file");
+    unloadLora @9 :Void $mcpDescription("Unload the current LoRA adapter from memory");
+    hasLora @10 :Void $mcpDescription("Check if a LoRA adapter is currently loaded");
   }
 }
 
@@ -68,6 +77,11 @@ struct ModelSessionResponse {
     inferStream @3 :StreamInfo;
     startStream @4 :StreamAuthResponse;
     applyChatTemplate @5 :Text;
+    createLora @6 :Void;
+    loadLora @7 :Void;
+    saveLora @8 :Void;
+    unloadLora @9 :Void;
+    hasLora @10 :Bool;
   }
 }
 
@@ -116,9 +130,9 @@ enum KVQuantType {
 
 # Load model request with optional runtime configuration
 struct LoadModelRequest {
-  modelRef @0 :Text;       # e.g., "qwen3-small:main"
-  maxContext @1 :UInt32;   # Maximum context length (0 = use default)
-  kvQuant @2 :KVQuantType; # KV cache quantization type
+  modelRef @0 :Text $paramDescription("Model reference in format name:branch (e.g., 'qwen3-small:main')");
+  maxContext @1 :UInt32 $paramDescription("Maximum context length (0 = use default)");
+  kvQuant @2 :KVQuantType $paramDescription("KV cache quantization type");
 }
 
 # Unload model request
@@ -206,6 +220,15 @@ struct ChatMessage {
 struct ApplyChatTemplateRequest {
   messages @0 :List(ChatMessage);
   addGenerationPrompt @1 :Bool;  # Whether to add assistant prompt at end
+}
+
+# LoRA adapter configuration for creation
+struct CreateLoraRequest {
+  rank @0 :UInt32 $paramDescription("LoRA rank (e.g., 8, 16, 32)");
+  alpha @1 :Float32 $paramDescription("LoRA alpha scaling factor");
+  dropout @2 :Float32 $paramDescription("Dropout rate during training");
+  targetModules @3 :List(Text) $paramDescription("Model layers to apply LoRA (e.g., ['q_proj','v_proj'])");
+  learningRate @4 :Float32 $paramDescription("Learning rate for training (default: 1e-4)");
 }
 
 # =============================================================================

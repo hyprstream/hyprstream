@@ -50,6 +50,7 @@ fn generate_metadata_structs() -> TokenStream {
             pub params: &'static [ParamSchema],
             pub is_scoped: bool,
             pub scope_field: &'static str,
+            pub description: &'static str,
         }
     }
 }
@@ -100,6 +101,7 @@ fn generate_method_schema_entry(
     scope_field: &str,
 ) -> TokenStream {
     let method_name = to_snake_case(&v.name);
+    let method_desc = &v.description;
     let ct = CapnpType::classify_primitive(&v.type_name);
 
     let params = match ct {
@@ -111,8 +113,9 @@ fn generate_method_schema_entry(
                     .map(|f| {
                         let fname = to_snake_case(&f.name);
                         let ftype = &f.type_name;
+                        let fdesc = &f.description;
                         quote! {
-                            ParamSchema { name: #fname, type_name: #ftype, required: true, description: "" }
+                            ParamSchema { name: #fname, type_name: #ftype, required: true, description: #fdesc }
                         }
                     })
                     .collect()
@@ -130,7 +133,7 @@ fn generate_method_schema_entry(
     };
 
     quote! {
-        MethodSchema { name: #method_name, params: &[#(#params),*], is_scoped: #is_scoped, scope_field: #scope_field }
+        MethodSchema { name: #method_name, params: &[#(#params),*], is_scoped: #is_scoped, scope_field: #scope_field, description: #method_desc }
     }
 }
 

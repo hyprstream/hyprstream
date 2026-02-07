@@ -156,6 +156,8 @@ experimental = []  # EXPERIMENTAL: Enable git write operations (commit/push/merg
 
 [build-dependencies]
 capnpc.workspace = true  # Cap'n Proto schema compiler
+capnp.workspace = true   # Cap'n Proto runtime for schema parsing
+serde_json.workspace = true  # JSON output for metadata
 
 [dev-dependencies]
 criterion.workspace = true

@@ -55,9 +55,6 @@ use tracing::{debug, info};
 /// Default endpoint for the model service
 pub const MODEL_ENDPOINT: &str = "inproc://hyprstream/model";
 
-/// Base endpoint for inference services (per-model endpoints are suffixed)
-const INFERENCE_ENDPOINT_BASE: &str = "inproc://hyprstream/inference";
-
 // ============================================================================
 // ModelService (server-side)
 // ============================================================================
@@ -238,9 +235,10 @@ impl ModelService {
             ));
         }
 
-        // Create unique endpoint for this model
+        // Create unique endpoint for this model using registry
+        let base = registry().endpoint("inference", SocketKind::Rep).to_zmq_string();
         let safe_name = model_ref_str.replace([':', '/', '\\'], "-");
-        let endpoint = format!("{INFERENCE_ENDPOINT_BASE}/{safe_name}");
+        let endpoint = format!("{base}/{safe_name}");
 
         info!("Loading model {} at endpoint {}", model_ref_str, endpoint);
 
@@ -344,20 +342,7 @@ impl ModelService {
 
     /// Route inference request to the appropriate InferenceService
     async fn infer(&self, model_ref_str: &str, request: GenerationRequest) -> Result<GenerationResult> {
-        // Ensure model is loaded (use service defaults)
-        let _endpoint = self.load_model(model_ref_str, None).await?;
-
-        // Get client
-        let client = {
-            let mut cache = self.loaded_models.write().await;
-            let model = cache
-                .get_mut(model_ref_str)
-                .ok_or_else(|| anyhow!("Model {} not found after loading", model_ref_str))?;
-            model.last_used = Instant::now();
-            model.client.clone()
-        };
-
-        // Call inference
+        let client = self.get_inference_client(model_ref_str).await?;
         client.generate(&request).await
     }
 
@@ -370,20 +355,7 @@ impl ModelService {
         request: GenerationRequest,
         client_ephemeral_pubkey: Option<[u8; 32]>,
     ) -> Result<StreamStartedInfo> {
-        // Ensure model is loaded (use service defaults)
-        let _endpoint = self.load_model(model_ref_str, None).await?;
-
-        // Get client
-        let client = {
-            let mut cache = self.loaded_models.write().await;
-            let model = cache
-                .get_mut(model_ref_str)
-                .ok_or_else(|| anyhow!("Model {} not found after loading", model_ref_str))?;
-            model.last_used = Instant::now();
-            model.client.clone()
-        };
-
-        // Pass through ephemeral pubkey for E2E authentication
+        let client = self.get_inference_client(model_ref_str).await?;
         client.generate_stream(&request, client_ephemeral_pubkey).await
     }
 
@@ -392,21 +364,19 @@ impl ModelService {
     /// Client must call this after infer_stream() to authorize the SUB subscription.
     /// This sends an AUTHORIZE message to StreamService via InferenceService.
     async fn start_stream(&self, model_ref_str: &str, stream_id: &str) -> Result<()> {
-        // Ensure model is loaded (use service defaults)
-        let _endpoint = self.load_model(model_ref_str, None).await?;
-
-        // Get client
-        let client = {
-            let mut cache = self.loaded_models.write().await;
-            let model = cache
-                .get_mut(model_ref_str)
-                .ok_or_else(|| anyhow!("Model {} not found after loading", model_ref_str))?;
-            model.last_used = Instant::now();
-            model.client.clone()
-        };
-
-        // Authorize stream via InferenceService
+        let client = self.get_inference_client(model_ref_str).await?;
         client.start_stream(stream_id).await.map(|_| ())
+    }
+
+    /// Helper: Get inference client for a model (ensures loaded, updates last_used)
+    async fn get_inference_client(&self, model_ref_str: &str) -> Result<InferenceZmqClient> {
+        let _endpoint = self.load_model(model_ref_str, None).await?;
+        let mut cache = self.loaded_models.write().await;
+        let model = cache
+            .get_mut(model_ref_str)
+            .ok_or_else(|| anyhow!("Model {} not found after loading", model_ref_str))?;
+        model.last_used = Instant::now();
+        Ok(model.client.clone())
     }
 
     /// Apply chat template via the model's InferenceService
@@ -416,18 +386,7 @@ impl ModelService {
         messages: Vec<ChatMessage>,
         add_generation_prompt: bool,
     ) -> Result<TemplatedPrompt> {
-        // Ensure model is loaded (use service defaults)
-        let _endpoint = self.load_model(model_ref_str, None).await?;
-
-        // Get client
-        let client = {
-            let mut cache = self.loaded_models.write().await;
-            let model = cache
-                .get_mut(model_ref_str)
-                .ok_or_else(|| anyhow!("Model {} not found after loading", model_ref_str))?;
-            model.last_used = Instant::now();
-            model.client.clone()
-        };
+        let client = self.get_inference_client(model_ref_str).await?;
 
         // Convert ChatMessage to the template engine's format
         let template_messages: Vec<crate::runtime::template_engine::ChatMessage> = messages
@@ -442,6 +401,36 @@ impl ModelService {
         let prompt_str = client.apply_chat_template(&template_messages, add_generation_prompt).await?;
 
         Ok(TemplatedPrompt::new(prompt_str))
+    }
+
+    /// Create a new LoRA adapter on the loaded model
+    async fn create_lora(&self, model_ref_str: &str, config: crate::lora::LoRAConfig) -> Result<()> {
+        let client = self.get_inference_client(model_ref_str).await?;
+        client.create_lora(&config).await
+    }
+
+    /// Load a LoRA adapter from a file
+    async fn load_lora(&self, model_ref_str: &str, path: &str) -> Result<()> {
+        let client = self.get_inference_client(model_ref_str).await?;
+        client.load_lora(std::path::Path::new(path)).await
+    }
+
+    /// Save the current LoRA adapter to a file
+    async fn save_lora(&self, model_ref_str: &str, path: &str) -> Result<()> {
+        let client = self.get_inference_client(model_ref_str).await?;
+        client.save_lora(path).await
+    }
+
+    /// Unload the current LoRA adapter
+    async fn unload_lora(&self, model_ref_str: &str) -> Result<()> {
+        let client = self.get_inference_client(model_ref_str).await?;
+        client.unload_lora().await
+    }
+
+    /// Check if a LoRA adapter is loaded
+    async fn has_lora(&self, model_ref_str: &str) -> Result<bool> {
+        let client = self.get_inference_client(model_ref_str).await?;
+        client.has_lora().await
     }
 
     /// Build a load result response
@@ -638,6 +627,40 @@ impl ModelService {
         serialize::write_message(&mut bytes, &message)?;
         Ok(bytes)
     }
+
+    /// Build a session Void response (for createLora, loadLora, saveLora, unloadLora)
+    fn build_session_void_response(request_id: u64, method_name: &str) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut response = message.init_root::<model_capnp::model_response::Builder>();
+            response.set_request_id(request_id);
+            let mut session_resp = response.init_session_result();
+            match method_name {
+                "createLora" => session_resp.set_create_lora(()),
+                "loadLora" => session_resp.set_load_lora(()),
+                "saveLora" => session_resp.set_save_lora(()),
+                "unloadLora" => session_resp.set_unload_lora(()),
+                _ => return Err(anyhow!("Unknown void method: {}", method_name)),
+            }
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    /// Build a session hasLora response
+    fn build_session_has_lora_response(request_id: u64, has_lora: bool) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut response = message.init_root::<model_capnp::model_response::Builder>();
+            response.set_request_id(request_id);
+            let mut session_resp = response.init_session_result();
+            session_resp.set_has_lora(has_lora);
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
 }
 
 /// ZmqService implementation for ModelService
@@ -788,6 +811,68 @@ impl crate::services::ZmqService for ModelService {
                                         request_id,
                                         &format!("Template application failed: {e}"),
                                         "TEMPLATE_FAILED",
+                                    ),
+                                }
+                            }
+                            SessionWhich::CreateLora(lora_req) => {
+                                let lora = lora_req?;
+                                let config = crate::lora::LoRAConfig {
+                                    rank: lora.get_rank() as usize,
+                                    alpha: lora.get_alpha(),
+                                    dropout: lora.get_dropout(),
+                                    target_modules: lora.get_target_modules()?.iter()
+                                        .filter_map(|s| s.ok().and_then(|t| t.to_str().ok().map(|s| s.to_owned())))
+                                        .collect(),
+                                    learning_rate: lora.get_learning_rate(),
+                                };
+                                match self.create_lora(model_ref, config).await {
+                                    Ok(()) => Self::build_session_void_response(request_id, "createLora"),
+                                    Err(e) => Self::build_session_error_response(
+                                        request_id,
+                                        &format!("LoRA creation failed: {e}"),
+                                        "LORA_CREATE_FAILED",
+                                    ),
+                                }
+                            }
+                            SessionWhich::LoadLora(path_req) => {
+                                let path = path_req?.to_str()?;
+                                match self.load_lora(model_ref, path).await {
+                                    Ok(()) => Self::build_session_void_response(request_id, "loadLora"),
+                                    Err(e) => Self::build_session_error_response(
+                                        request_id,
+                                        &format!("LoRA load failed: {e}"),
+                                        "LORA_LOAD_FAILED",
+                                    ),
+                                }
+                            }
+                            SessionWhich::SaveLora(path_req) => {
+                                let path = path_req?.to_str()?;
+                                match self.save_lora(model_ref, path).await {
+                                    Ok(()) => Self::build_session_void_response(request_id, "saveLora"),
+                                    Err(e) => Self::build_session_error_response(
+                                        request_id,
+                                        &format!("LoRA save failed: {e}"),
+                                        "LORA_SAVE_FAILED",
+                                    ),
+                                }
+                            }
+                            SessionWhich::UnloadLora(()) => {
+                                match self.unload_lora(model_ref).await {
+                                    Ok(()) => Self::build_session_void_response(request_id, "unloadLora"),
+                                    Err(e) => Self::build_session_error_response(
+                                        request_id,
+                                        &format!("LoRA unload failed: {e}"),
+                                        "LORA_UNLOAD_FAILED",
+                                    ),
+                                }
+                            }
+                            SessionWhich::HasLora(()) => {
+                                match self.has_lora(model_ref).await {
+                                    Ok(has_lora) => Self::build_session_has_lora_response(request_id, has_lora),
+                                    Err(e) => Self::build_session_error_response(
+                                        request_id,
+                                        &format!("LoRA check failed: {e}"),
+                                        "LORA_CHECK_FAILED",
                                     ),
                                 }
                             }
@@ -1064,6 +1149,69 @@ impl ModelZmqClient {
             ModelSessionClientResponseVariant::ApplyChatTemplate(prompt_str) => {
                 Ok(TemplatedPrompt::new(prompt_str))
             }
+            ModelSessionClientResponseVariant::Error { message, code, .. } => {
+                Err(anyhow!("{}: {}", code, message))
+            }
+            _ => Err(anyhow!("Unexpected session response type")),
+        }
+    }
+
+    /// Create a new LoRA adapter on a loaded model (session-scoped)
+    pub async fn create_lora(
+        &self,
+        model_ref: &str,
+        rank: u32,
+        alpha: f32,
+        dropout: f32,
+        target_modules: &[String],
+        learning_rate: f32,
+    ) -> Result<()> {
+        match self.gen.session(model_ref).create_lora(rank, alpha, dropout, target_modules, learning_rate).await? {
+            ModelSessionClientResponseVariant::CreateLora => Ok(()),
+            ModelSessionClientResponseVariant::Error { message, code, .. } => {
+                Err(anyhow!("{}: {}", code, message))
+            }
+            _ => Err(anyhow!("Unexpected session response type")),
+        }
+    }
+
+    /// Load a LoRA adapter from a file (session-scoped)
+    pub async fn load_lora(&self, model_ref: &str, path: &str) -> Result<()> {
+        match self.gen.session(model_ref).load_lora(path).await? {
+            ModelSessionClientResponseVariant::LoadLora => Ok(()),
+            ModelSessionClientResponseVariant::Error { message, code, .. } => {
+                Err(anyhow!("{}: {}", code, message))
+            }
+            _ => Err(anyhow!("Unexpected session response type")),
+        }
+    }
+
+    /// Save the current LoRA adapter to a file (session-scoped)
+    pub async fn save_lora(&self, model_ref: &str, path: &str) -> Result<()> {
+        match self.gen.session(model_ref).save_lora(path).await? {
+            ModelSessionClientResponseVariant::SaveLora => Ok(()),
+            ModelSessionClientResponseVariant::Error { message, code, .. } => {
+                Err(anyhow!("{}: {}", code, message))
+            }
+            _ => Err(anyhow!("Unexpected session response type")),
+        }
+    }
+
+    /// Unload the current LoRA adapter (session-scoped)
+    pub async fn unload_lora(&self, model_ref: &str) -> Result<()> {
+        match self.gen.session(model_ref).unload_lora().await? {
+            ModelSessionClientResponseVariant::UnloadLora => Ok(()),
+            ModelSessionClientResponseVariant::Error { message, code, .. } => {
+                Err(anyhow!("{}: {}", code, message))
+            }
+            _ => Err(anyhow!("Unexpected session response type")),
+        }
+    }
+
+    /// Check if a LoRA adapter is loaded (session-scoped)
+    pub async fn has_lora(&self, model_ref: &str) -> Result<bool> {
+        match self.gen.session(model_ref).has_lora().await? {
+            ModelSessionClientResponseVariant::HasLora(has_lora) => Ok(has_lora),
             ModelSessionClientResponseVariant::Error { message, code, .. } => {
                 Err(anyhow!("{}: {}", code, message))
             }
