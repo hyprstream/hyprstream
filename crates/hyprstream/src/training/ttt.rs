@@ -113,6 +113,25 @@ pub struct TTTResult {
 
     /// Reason for skipping (if skipped)
     pub skip_reason: Option<String>,
+
+    // Advanced metrics (for ML practitioners)
+    /// Average gradient norm across steps
+    pub avg_grad_norm: f32,
+
+    /// Maximum gradient norm observed
+    pub max_grad_norm: f32,
+
+    /// Whether gradients were clipped
+    pub gradient_clipped: bool,
+
+    /// Number of tokens actually used for adaptation (after truncation)
+    pub tokens_used: usize,
+
+    /// Total tokens provided in input
+    pub tokens_provided: usize,
+
+    /// Whether input was truncated (exceeded max_ttt_context)
+    pub was_truncated: bool,
 }
 
 impl TTTResult {
@@ -125,6 +144,12 @@ impl TTTResult {
             adaptation_time_ms: 0,
             skipped: true,
             skip_reason: Some(reason.to_owned()),
+            avg_grad_norm: 0.0,
+            max_grad_norm: 0.0,
+            gradient_clipped: false,
+            tokens_used: 0,
+            tokens_provided: 0,
+            was_truncated: false,
         }
     }
 }
@@ -164,7 +189,7 @@ pub struct TTTContext {
 /// let response = engine.generate(request)?;
 /// ```
 pub struct TestTimeTrainer {
-    config: TTTConfig,
+    pub config: TTTConfig,
     device: Device,
 }
 
@@ -224,16 +249,21 @@ impl TestTimeTrainer {
             return Ok(TTTResult::skipped("No LoRA adapter loaded"));
         }
 
+        // Track whether input was truncated
+        let tokens_provided = input_tokens.len();
+        let was_truncated = tokens_provided > self.config.max_ttt_context;
+
         // Truncate if too long (use last N tokens for recency)
-        let tokens: Vec<u32> = if input_tokens.len() > self.config.max_ttt_context {
+        let tokens: Vec<u32> = if was_truncated {
             input_tokens[input_tokens.len() - self.config.max_ttt_context..].to_vec()
         } else {
             input_tokens.to_vec()
         };
+        let tokens_used = tokens.len();
 
         // TTT adaptation loop
         let mut losses = Vec::with_capacity(self.config.gradient_steps);
-        
+        let mut grad_norms = Vec::with_capacity(self.config.gradient_steps);
 
         // First step to get initial loss
         let loss = self.compute_ntp_loss(engine, &tokens)?;
@@ -241,7 +271,8 @@ impl TestTimeTrainer {
         losses.push(initial_loss);
 
         // Gradient step
-        self.ttt_step(engine, &loss)?;
+        let grad_norm = self.ttt_step(engine, &loss)?;
+        grad_norms.push(grad_norm as f32);
 
         // Remaining steps
         for _ in 1..self.config.gradient_steps {
@@ -249,11 +280,21 @@ impl TestTimeTrainer {
             let loss_value = loss.double_value(&[]) as f32;
             losses.push(loss_value);
 
-            self.ttt_step(engine, &loss)?;
+            let grad_norm = self.ttt_step(engine, &loss)?;
+            grad_norms.push(grad_norm as f32);
         }
 
         let final_loss = *losses.last().unwrap_or(&initial_loss);
         let avg_loss = losses.iter().sum::<f32>() / losses.len() as f32;
+
+        // Compute gradient norm statistics
+        let avg_grad_norm = if !grad_norms.is_empty() {
+            grad_norms.iter().sum::<f32>() / grad_norms.len() as f32
+        } else {
+            0.0
+        };
+        let max_grad_norm = grad_norms.iter().copied().fold(0.0f32, f32::max);
+        let gradient_clipped = max_grad_norm >= self.config.max_grad_norm as f32;
 
         Ok(TTTResult {
             avg_loss,
@@ -262,6 +303,12 @@ impl TestTimeTrainer {
             adaptation_time_ms: start.elapsed().as_millis() as u64,
             skipped: false,
             skip_reason: None,
+            avg_grad_norm,
+            max_grad_norm,
+            gradient_clipped,
+            tokens_used,
+            tokens_provided,
+            was_truncated,
         })
     }
 

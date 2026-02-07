@@ -103,6 +103,9 @@ struct GenerationResult {
   inferenceTokens @9 :UInt32;
   inferenceTimeMs @10 :UInt64;
   inferenceTokensPerSec @11 :Float32;
+
+  # Online training adaptation metrics (optional)
+  onlineTrainingMetrics @12 :OnlineTrainingMetrics;
 }
 
 # Quality metrics for self-supervised training
@@ -111,6 +114,32 @@ struct QualityMetrics {
   avgEntropy @1 :Float32;
   entropyVariance @2 :Float32;
   repetitionRatio @3 :Float32;
+}
+
+# Online Training Metrics
+#
+# Online training adapts the model to input context BEFORE generation
+# using next-token prediction loss. Metrics show adaptation effectiveness.
+#
+# Populated when:
+# - Online training enabled in model config (mode = "test_time_training")
+# - Input length >= min_input_length (default: 32 tokens)
+# - LoRA adapter is loaded
+struct OnlineTrainingMetrics {
+  avgLoss @0 :Float32;              # Average loss across gradient steps
+  lossImprovement @1 :Float32;       # Loss reduction (initial - final)
+  stepsPerformed @2 :UInt32;         # Gradient steps executed
+  adaptationTimeMs @3 :UInt64;       # Time spent on adaptation (ms)
+  skipped @4 :Bool;                  # Whether adaptation was skipped
+  skipReason @5 :Text;               # Why skipped (if applicable)
+
+  # Advanced metrics for ML practitioners (expert recommendation)
+  avgGradNorm @6 :Float32;           # Average gradient norm across steps
+  maxGradNorm @7 :Float32;           # Maximum gradient norm observed
+  gradientClipped @8 :Bool;          # Whether gradients were clipped
+  tokensUsed @9 :UInt32;             # Tokens actually used for adaptation
+  tokensProvided @10 :UInt32;        # Total tokens in input
+  wasTruncated @11 :Bool;            # Whether input was truncated (>max_ttt_context)
 }
 
 enum FinishReason {
@@ -187,6 +216,9 @@ struct InferenceComplete {
   # Optional quality metrics (0.0 means not set)
   perplexity @11 :Float32;
   avgEntropy @12 :Float32;
+
+  # Online training metrics in streaming completion
+  onlineTrainingMetrics @13 :OnlineTrainingMetrics;
 }
 
 # Legacy inference stats (kept for backwards compatibility)

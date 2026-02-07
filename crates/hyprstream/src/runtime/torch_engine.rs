@@ -1071,6 +1071,7 @@ impl RuntimeEngine for TorchEngine {
             inference_tokens: stats.inference_tokens,
             inference_time_ms: stats.inference_time_ms,
             inference_tokens_per_sec: stats.inference_tokens_per_sec,
+            ttt_metrics: None,  // TTT metrics attached by InferenceService
         })
     }
 

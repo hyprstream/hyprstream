@@ -38,9 +38,9 @@ struct ModelRequest {
 struct ModelSessionRequest {
   modelRef @0 :Text;
   union {
-    status @1 :Void $mcpDescription("Get detailed status information about a model");
-    infer @2 :InferRequest $mcpDescription("Run inference on a loaded model (non-streaming)");
-    inferStream @3 :InferRequest $mcpDescription("Run inference on a loaded model (streaming)");
+    status @1 :Void $mcpDescription("Get detailed status information about a model including online training configuration");
+    infer @2 :InferRequest $mcpDescription("Run inference with automatic domain adaptation. When enabled, the model learns from your prompt's style and terminology before responding—reducing errors in specialized contexts (legal, medical, code) and matching your writing style. Adds ~78ms overhead for inputs >32 tokens. Check onlineTrainingMetrics for adaptation effectiveness.");
+    inferStream @3 :InferRequest $mcpDescription("Stream inference with automatic domain adaptation. Model learns from your prompt before streaming (adds ~78ms delay). Reduces errors in specialized contexts and matches writing style. Check onlineTrainingMetrics in completion for adaptation quality.");
     startStream @4 :StartStreamRequest $mcpDescription("Authorize a streaming subscription (client must call after inferStream)");
     applyChatTemplate @5 :ApplyChatTemplateRequest $mcpDescription("Apply chat template to messages for a loaded model");
 
@@ -193,12 +193,28 @@ struct LoadedModelInfo {
   sessionCount @5 :UInt32; # Active session count
 }
 
+# Online Training (Test-Time Training) configuration
+#
+# Shows current online training settings for a loaded model.
+# Online training adapts the model to input style/domain before generation.
+struct OnlineTrainingConfig {
+  enabled @0 :Bool;            # Whether online training is enabled
+  learningRate @1 :Float64;    # Learning rate for adaptation (e.g., 0.0003)
+  gradientSteps @2 :UInt32;    # Number of gradient steps per input (e.g., 3)
+  maxGradNorm @3 :Float64;     # Maximum gradient norm for clipping (e.g., 1.0)
+  minInputLength @4 :UInt32;   # Minimum tokens required to trigger (e.g., 32)
+  maxTttContext @5 :UInt32;    # Maximum tokens to process (truncates if longer)
+}
+
 # Model status response
 struct ModelStatusResponse {
   loaded @0 :Bool;
   memoryBytes @1 :UInt64;
   sessionCount @2 :UInt32;
   endpoint @3 :Text;       # Only set if loaded
+
+  # Online training configuration (if model loaded)
+  onlineTrainingConfig @4 :OnlineTrainingConfig;
 }
 
 # Model service health status

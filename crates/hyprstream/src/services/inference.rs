@@ -82,8 +82,8 @@ struct PendingStream {
     stream_ctx: hyprstream_rpc::StreamContext,
     /// Generation request to execute
     request: GenerationRequest,
-    /// Prompt text for TTT training collection
-    prompt: String,
+    /// TTT adaptation metrics (if TTT was run in prepare_stream)
+    ttt_result: Option<crate::training::ttt::TTTResult>,
 }
 
 /// Default endpoint for the inference service
@@ -670,62 +670,74 @@ impl InferenceService {
     }
 
     /// Apply TTT adaptation if enabled (adapts model to input BEFORE generation)
-    fn apply_ttt_adaptation(&self, prompt: &str) {
-        let ttt_trainer = match &self.ttt_trainer {
-            Some(t) => t.clone(),
-            None => return,
+    ///
+    /// Returns:
+    /// - Ok(Some(result)) if TTT was configured and ran (or was skipped)
+    /// - Ok(None) if TTT is not configured
+    /// - Err(e) if TTT failed unexpectedly
+    fn apply_ttt_adaptation(&self, prompt: &str) -> Result<Option<crate::training::ttt::TTTResult>> {
+        use anyhow::anyhow;
+
+        let ttt_trainer = match self.ttt_trainer.as_ref() {
+            Some(t) => t,
+            None => return Ok(None),  // TTT not configured
         };
 
-        let tokenizer = match &self.tokenizer {
-            Some(t) => t.clone(),
-            None => {
-                trace!("No tokenizer available for TTT adaptation");
-                return;
-            }
+        let tokenizer = match self.tokenizer.as_ref() {
+            Some(t) => t,
+            None => return Ok(None),  // No tokenizer available
         };
 
-        // Tokenize prompt for TTT
-        let encoding = match tokenizer.encode(prompt, false) {
-            Ok(enc) => enc,
-            Err(e) => {
-                warn!("Failed to tokenize for TTT: {}", e);
-                return;
-            }
-        };
-
+        let encoding = tokenizer.encode(prompt, false)
+            .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
         let input_tokens: Vec<u32> = encoding.get_ids().to_vec();
 
-        // Apply TTT adaptation BEFORE generation
         let engine = self.engine.read();
         match ttt_trainer.adapt(&engine, &input_tokens) {
             Ok(result) => {
-                if result.skipped {
-                    trace!("TTT skipped: {:?}", result.skip_reason);
-                } else {
+                if !result.skipped {
                     debug!(
-                        "TTT adaptation: steps={}, loss_improvement={:.4}, time={}ms",
-                        result.steps_performed, result.loss_improvement, result.adaptation_time_ms
+                        "TTT: steps={}, improvement={:.4}, time={}ms, grad_norm={:.4}",
+                        result.steps_performed,
+                        result.loss_improvement,
+                        result.adaptation_time_ms,
+                        result.avg_grad_norm
                     );
                 }
+                Ok(Some(result))
             }
             Err(e) => {
                 warn!("TTT adaptation failed: {}", e);
+                Err(e)  // Propagate error instead of silently swallowing
             }
         }
     }
 
     /// Handle non-streaming generation
     fn handle_generate(&self, request: GenerationRequest) -> Result<GenerationResult> {
-        // Apply TTT adaptation BEFORE generation (if enabled)
-        self.apply_ttt_adaptation(request.prompt.as_str());
+        // Apply TTT adaptation BEFORE generation (if enabled) and capture metrics
+        let ttt_result = match self.apply_ttt_adaptation(request.prompt.as_str()) {
+            Ok(Some(result)) => Some(result),
+            Ok(None) => None,  // TTT not configured/applicable
+            Err(e) => {
+                // Log error but continue with generation
+                warn!("TTT adaptation failed, continuing without: {}", e);
+                None
+            }
+        };
 
         // Use futures::executor::block_on because we're already inside a tokio runtime
         // (run_service_loop runs in rt.block_on), and tokio's block_on can't be nested.
         // futures::executor::block_on works because it's a simple single-threaded executor.
         let engine = self.engine.read();
-        futures::executor::block_on(async {
+        let mut result = futures::executor::block_on(async {
             RuntimeEngine::generate_with_params(&*engine, request).await
-        })
+        })?;
+
+        // Attach TTT metrics to response
+        result.ttt_metrics = ttt_result.map(|r| r.into());
+
+        Ok(result)
     }
 
     /// Prepare for streaming generation with DH-based key derivation.
@@ -751,7 +763,16 @@ impl InferenceService {
         claims: Option<hyprstream_rpc::auth::Claims>,
         expiry_secs: i64,
     ) -> Result<(String, [u8; 32], PendingStream)> {
-        let prompt = request.prompt.as_str().to_owned();
+        // Apply TTT adaptation BEFORE streaming (capture metrics for completion)
+        let ttt_result = match self.apply_ttt_adaptation(request.prompt.as_str()) {
+            Ok(Some(result)) => Some(result),
+            Ok(None) => None,  // TTT not configured/applicable
+            Err(e) => {
+                // Log error but continue with streaming
+                warn!("TTT adaptation failed, continuing without: {}", e);
+                None
+            }
+        };
 
         // DH key derivation is required - no legacy fallback
         let client_pub_bytes = client_ephemeral_pubkey
@@ -777,7 +798,7 @@ impl InferenceService {
         let pending = PendingStream {
             stream_ctx,
             request,
-            prompt,
+            ttt_result,
         };
 
         Ok((stream_id, server_pubkey, pending))
@@ -806,10 +827,7 @@ impl InferenceService {
 
         let stream_ctx = &pending.stream_ctx;
         let request = pending.request;
-        let prompt = pending.prompt;
-
-        // Apply TTT adaptation BEFORE streaming generation (if enabled)
-        self.apply_ttt_adaptation(&prompt);
+        let ttt_result = pending.ttt_result;  // TTT metrics captured in prepare_stream
 
         // Get StreamChannel
         let stream_channel = match &self.stream_channel {
@@ -861,7 +879,11 @@ impl InferenceService {
                     // Complete the stream if no errors occurred
                     if !had_error {
                         let stats = stream.stats();
-                        let complete = crate::services::rpc_types::InferenceComplete::from(&stats);
+                        let mut complete = crate::services::rpc_types::InferenceComplete::from(&stats);
+
+                        // Attach TTT metrics to completion (captured in prepare_stream)
+                        complete.ttt_metrics = ttt_result.map(|r| r.into());
+
                         publisher.complete_ref(&complete.to_bytes()).await?;
                     }
                     Ok(())
@@ -929,6 +951,11 @@ impl InferenceService {
     /// Handle has LoRA
     fn handle_has_lora(&self) -> bool {
         self.engine.read().has_lora_model()
+    }
+
+    /// Get TTT configuration (for status queries)
+    fn get_ttt_config(&self) -> Option<crate::training::ttt::TTTConfig> {
+        self.ttt_trainer.as_ref().map(|trainer| trainer.config.clone())
     }
 
     /// Handle set session
@@ -1414,6 +1441,7 @@ impl InferenceZmqClient {
                 inference_tokens: inference_tokens as usize,
                 inference_time_ms,
                 inference_tokens_per_sec,
+                ttt_metrics: None,  // TODO: Extract from response when available
             }),
             InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
             _ => Err(anyhow!("Unexpected response type")),

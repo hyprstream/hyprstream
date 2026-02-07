@@ -1060,6 +1060,9 @@ pub struct InferenceComplete {
     pub perplexity: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avg_entropy: Option<f32>,
+    // Online training (TTT) metrics
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttt_metrics: Option<crate::config::TTTMetrics>,
 }
 
 impl InferenceComplete {
@@ -1097,6 +1100,7 @@ impl From<&crate::runtime::GenerationStats> for InferenceComplete {
             inference_tokens_per_sec_ema: stats.inference_tokens_per_sec_ema,
             perplexity: stats.quality_metrics.as_ref().map(|m| m.perplexity),
             avg_entropy: stats.quality_metrics.as_ref().map(|m| m.avg_entropy),
+            ttt_metrics: None,  // Attached by execute_stream in InferenceService
         }
     }
 }

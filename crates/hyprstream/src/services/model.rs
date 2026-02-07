@@ -82,6 +82,8 @@ pub struct LoadedModel {
     pub loaded_at: Instant,
     /// When the model was last used
     pub last_used: Instant,
+    /// Online training (TTT) configuration (if enabled)
+    pub ttt_config: Option<crate::training::ttt::TTTConfig>,
 }
 
 /// How InferenceService instances are spawned
@@ -266,6 +268,23 @@ impl ModelService {
             RequestIdentity::local(),
         );
 
+        // Load TTT config from model's config.json (if TTT is enabled)
+        let ttt_config = crate::runtime::model_config::ModelConfig::load_training_config(&model_path)
+            .and_then(|tc| {
+                if tc.is_enabled() && tc.mode == crate::config::TrainingMode::TestTimeTraining {
+                    Some(crate::training::ttt::TTTConfig {
+                        learning_rate: tc.ttt.learning_rate,
+                        gradient_steps: tc.ttt.gradient_steps,
+                        max_grad_norm: tc.ttt.max_grad_norm,
+                        min_input_length: tc.ttt.min_input_length,
+                        max_ttt_context: tc.ttt.max_ttt_context,
+                        enabled: true,
+                    })
+                } else {
+                    None
+                }
+            });
+
         // Check if we need to evict
         {
             let mut cache = self.loaded_models.write().await;
@@ -290,6 +309,7 @@ impl ModelService {
                     client,
                     loaded_at: Instant::now(),
                     last_used: Instant::now(),
+                    ttt_config,
                 },
             );
         }
@@ -331,11 +351,13 @@ impl ModelService {
             ModelStatusInfo {
                 loaded: true,
                 endpoint: Some(model.endpoint.clone()),
+                online_training_config: model.ttt_config.as_ref().map(OnlineTrainingConfigInfo::from),
             }
         } else {
             ModelStatusInfo {
                 loaded: false,
                 endpoint: None,
+                online_training_config: None,
             }
         }
     }
@@ -497,6 +519,17 @@ impl ModelService {
             status_builder.set_session_count(0);
             if let Some(endpoint) = status.endpoint {
                 status_builder.set_endpoint(&endpoint);
+            }
+
+            // Populate online training config if available
+            if let Some(ttt_config) = status.online_training_config {
+                let mut config_builder = status_builder.init_online_training_config();
+                config_builder.set_enabled(ttt_config.enabled);
+                config_builder.set_learning_rate(ttt_config.learning_rate);
+                config_builder.set_gradient_steps(ttt_config.gradient_steps as u32);
+                config_builder.set_max_grad_norm(ttt_config.max_grad_norm);
+                config_builder.set_min_input_length(ttt_config.min_input_length as u32);
+                config_builder.set_max_ttt_context(ttt_config.max_ttt_context as u32);
             }
         }
         let mut bytes = Vec::new();
@@ -915,10 +948,35 @@ pub struct LoadedModelInfo {
     pub last_used: i64,
 }
 
+/// Online training (TTT) configuration information
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OnlineTrainingConfigInfo {
+    pub enabled: bool,
+    pub learning_rate: f64,
+    pub gradient_steps: usize,
+    pub max_grad_norm: f64,
+    pub min_input_length: usize,
+    pub max_ttt_context: usize,
+}
+
+impl From<&crate::training::ttt::TTTConfig> for OnlineTrainingConfigInfo {
+    fn from(config: &crate::training::ttt::TTTConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            learning_rate: config.learning_rate,
+            gradient_steps: config.gradient_steps,
+            max_grad_norm: config.max_grad_norm,
+            min_input_length: config.min_input_length,
+            max_ttt_context: config.max_ttt_context,
+        }
+    }
+}
+
 /// Model status information
 pub struct ModelStatusInfo {
     pub loaded: bool,
     pub endpoint: Option<String>,
+    pub online_training_config: Option<OnlineTrainingConfigInfo>,
 }
 
 // ============================================================================
@@ -1009,10 +1067,22 @@ impl ModelZmqClient {
     /// Get model status (session-scoped)
     pub async fn status(&self, model_ref: &str) -> Result<ModelStatusInfo> {
         match self.gen.session(model_ref).status().await? {
-            ModelSessionClientResponseVariant::Status { loaded, endpoint, .. } => {
+            ModelSessionClientResponseVariant::Status { loaded, endpoint, online_training_config, .. } => {
                 Ok(ModelStatusInfo {
                     loaded,
                     endpoint: if endpoint.is_empty() { None } else { Some(endpoint) },
+                    online_training_config: if online_training_config.enabled {
+                        Some(OnlineTrainingConfigInfo {
+                            enabled: online_training_config.enabled,
+                            learning_rate: online_training_config.learning_rate,
+                            gradient_steps: online_training_config.gradient_steps as usize,
+                            max_grad_norm: online_training_config.max_grad_norm,
+                            min_input_length: online_training_config.min_input_length as usize,
+                            max_ttt_context: online_training_config.max_ttt_context as usize,
+                        })
+                    } else {
+                        None
+                    },
                 })
             }
             ModelSessionClientResponseVariant::Error { message, code, .. } => {
@@ -1065,6 +1135,7 @@ impl ModelZmqClient {
                     inference_tokens: inference_tokens as usize,
                     inference_time_ms,
                     inference_tokens_per_sec,
+                    ttt_metrics: None,  // TODO: Extract from response when available
                 })
             }
             ModelSessionClientResponseVariant::Error { message, code, .. } => {

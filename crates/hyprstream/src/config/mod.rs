@@ -1316,6 +1316,51 @@ pub struct GenerationResult {
     pub inference_time_ms: u64,
     #[serde(default)]
     pub inference_tokens_per_sec: f32,
+
+    /// Online training (TTT) adaptation metrics
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttt_metrics: Option<TTTMetrics>,
+}
+
+/// TTT adaptation metrics (mirrors training::ttt::TTTResult)
+///
+/// Exposed as "Online Training" metrics in user-facing APIs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TTTMetrics {
+    pub avg_loss: f32,
+    pub loss_improvement: f32,
+    pub steps_performed: usize,
+    pub adaptation_time_ms: u64,
+    pub skipped: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+
+    // Advanced metrics (expert recommendation)
+    pub avg_grad_norm: f32,
+    pub max_grad_norm: f32,
+    pub gradient_clipped: bool,
+    pub tokens_used: usize,
+    pub tokens_provided: usize,
+    pub was_truncated: bool,
+}
+
+impl From<crate::training::ttt::TTTResult> for TTTMetrics {
+    fn from(r: crate::training::ttt::TTTResult) -> Self {
+        Self {
+            avg_loss: r.avg_loss,
+            loss_improvement: r.loss_improvement,
+            steps_performed: r.steps_performed,
+            adaptation_time_ms: r.adaptation_time_ms,
+            skipped: r.skipped,
+            skip_reason: r.skip_reason,
+            avg_grad_norm: r.avg_grad_norm,
+            max_grad_norm: r.max_grad_norm,
+            gradient_clipped: r.gradient_clipped,
+            tokens_used: r.tokens_used,
+            tokens_provided: r.tokens_provided,
+            was_truncated: r.was_truncated,
+        }
+    }
 }
 
 /// Why generation stopped
